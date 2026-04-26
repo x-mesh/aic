@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e1f088e9aac26720b1e743611a4873ea40860566a2431107fc7e9066b95d0006 # shrinks to xdg_dir = "/a"
+cc cbfe5b3c23eabee099b5e2e9e8a4b6b2f2f44d55d079eb8bff4bff5badbd5868 # shrinks to xdg_dir = "/1u_6/4y_3_/5m"
+cc 3b60b8500fef69f941671a260ff4b896f4cf8703e6e5ffe3004b84d20c1c3e55 # shrinks to xdg_dir = "/jp4y/s/8od"
+cc dcbae90692c2de1a911d1dd0e8e1a691deba66d13ac95402da3e98b9b3f47a86 # shrinks to xdg_dir = "/1h43ihg/_s/uq7_9i"
+cc 406e6d18843897f3f38dae129e56081106bc235631c8cbd0e5bd434ee2d950b8 # shrinks to os = "linux"
+cc a32d8e9f5688b5fc1f6e8038bfdf5e7a9846c4e4491b1050bbe3f5a2ae681215 # shrinks to xdg_dir = "/_psp6/_6__w/2_v_6q"
