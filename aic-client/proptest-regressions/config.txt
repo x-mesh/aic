@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 464beec7862cec268d6a1f34958994b0b965666a5d23099fc8c0281d0086eed4 # shrinks to os = "linux", xdg_dir = "/j7h__/l0o1"
+cc c1ca44ec4d0ae50c9b59920808a2350b7db8cbd926ec8bf91842406b60397c17 # shrinks to os = "linux", xdg_dir = "/q1242/_e2xqw_m/g1q7_09f"
+cc 3b84a994b4f38dade06b5d85d8ab17f3f79199b51fd794fed262bd94734f9f33 # shrinks to os = "linux", xdg_dir = "/2/1qm__ka4/783"
+cc b778ef53594eae5382dedff3655b5fb82eddeec92e0abb37b0ff5714d0b438f6 # shrinks to os = "linux", xdg_dir = "/ze77/_l__"
+cc 47b2eba69b701014149a99bc7f40eca4a0ddf0bd06784a98db538b981fb079b1 # shrinks to os = "linux"
+cc 3f23650be1c8a59ea97bc52e6d99b3dd70779933dda899d9387093fa98bae550 # shrinks to os = "linux", xdg_dir = "/88_a_80/px0"
+cc 29bad95ed09518f7448753b303dc6acf3424d64dff3bdbcf2343ff872dd1f1e9 # shrinks to os = "linux", xdg_dir = "/fct_"

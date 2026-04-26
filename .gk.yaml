@@ -1,0 +1,40 @@
+# .gk.yaml — gk 프로젝트 설정 (팀 공유)
+base_branch: main
+branch:
+    protected:
+        - main
+        - develop
+    patterns:
+        - ^(feat|fix|chore|docs|refactor|test|perf|build|ci|revert)/[a-z0-9._-]+
+commit:
+    types: [feat, fix, chore, docs, style, refactor, perf, test, build, ci, revert]
+    scope_required: false
+    max_subject_length: 72
+preflight:
+    steps:
+        - name: commit-lint
+          command: commit-lint
+        - name: branch-check
+          command: branch-check
+        - name: no-conflict
+          command: no-conflict
+        - name: test
+          command: make test
+        - name: lint
+          command: make lint
+ai:
+    commit:
+        deny_paths:
+            - .env
+            - .env.*
+            - '*.pem'
+            - id_rsa*
+            - credentials.json
+        trailer: false
+        audit: false
+
+# policies: (commented-out, opt-in)
+#   secret_patterns:
+#     enabled: true
+#     mode: git
+#     redact: true

@@ -1,0 +1,43 @@
+[package]
+name = "aic-client"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "aic_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aic"
+path = "src/main.rs"
+
+[dependencies]
+aic-common = { path = "../aic-common" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+libc = "0.2"
+dirs = "5"
+dialoguer = "0.12.0"
+terminal_size = "0.4"
+unicode-width = "0.2"
+regex = "1"
+sha2 = "0.10"
+hmac = "0.12"
+keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
+ratatui = "0.29"
+
+[dev-dependencies]
+proptest = "1"
+tokio-test = "0.4"
+tempfile = "3"
+http = "1"
+aic-server = { path = "../aic-server" }
+strip-ansi-escapes = "0.2"
