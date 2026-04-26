@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mgrep \"boundary_strategy method values options\")",
+      "mcp__mem-mesh__pin_add",
+      "Bash(cargo test *)",
+      "mcp__mem-mesh__pin_complete"
+    ]
+  }
+}

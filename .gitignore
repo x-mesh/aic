@@ -1,0 +1,44 @@
+# Language: Rust
+target/
+
+# Security
+.env
+.env.*
+*.pem
+id_rsa*
+credentials.json
+*.pfx
+*.kdbx
+*.keystore
+service-account*.json
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE/Editor
+.cursor/
+.kiro/
+.xm/
+.omc/
+
+# AI-suggested
+coverage/
+aic-client/.cargo/registry/
+aic-common/.cargo/registry/
+aic-server/.cargo/registry/
+aic-client/.vscode/
+aic-common/.vscode/
+aic-server/.vscode/
+aic-client/.cargo/registry.lock/
+aic-common/.cargo/registry.lock/
+aic-server/.cargo/registry.lock/
+aic-client/.git/
+aic-common/.git/
+aic-server/.git/
+aic-client/.gitignore
+aic-common/.gitignore
+aic-server/.gitignore

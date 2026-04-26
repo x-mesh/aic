@@ -1,0 +1,3 @@
+[workspace]
+members = ["aic-common", "aic-server", "aic-client"]
+resolver = "2"
