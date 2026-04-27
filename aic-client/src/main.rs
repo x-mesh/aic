@@ -1635,6 +1635,7 @@ fn configure_openai(
                 api_key: None,
                 model: None,
                 cli_path: None,
+                cli_args: None,
             },
         );
     }
@@ -1659,6 +1660,7 @@ fn configure_openai(
             api_key: final_key,
             model: Some(models[model_idx].to_string()),
             cli_path: None,
+            cli_args: None,
         },
     )
 }
@@ -1706,6 +1708,7 @@ fn configure_anthropic(
                 api_key: None,
                 model: None,
                 cli_path: None,
+                cli_args: None,
             },
         );
     }
@@ -1736,6 +1739,7 @@ fn configure_anthropic(
             api_key: final_key,
             model: Some(models[model_idx].to_string()),
             cli_path: None,
+            cli_args: None,
         },
     )
 }
@@ -1783,6 +1787,7 @@ fn configure_groq(
                 api_key: None,
                 model: None,
                 cli_path: None,
+                cli_args: None,
             },
         );
     }
@@ -1812,6 +1817,7 @@ fn configure_groq(
             api_key: final_key,
             model: Some(models[model_idx].to_string()),
             cli_path: None,
+            cli_args: None,
         },
     )
 }
@@ -1859,6 +1865,7 @@ fn configure_nvidia(
                 api_key: None,
                 model: None,
                 cli_path: None,
+                cli_args: None,
             },
         );
     }
@@ -1891,6 +1898,7 @@ fn configure_nvidia(
             api_key: final_key,
             model: Some(models[model_idx].to_string()),
             cli_path: None,
+            cli_args: None,
         },
     )
 }
@@ -1924,6 +1932,7 @@ fn configure_kiro_cli(
             api_key: None,
             model: None,
             cli_path: Some(cli_path),
+            cli_args: None,
         },
     )
 }
@@ -1957,6 +1966,7 @@ fn configure_claude_cli(
             api_key: None,
             model: None,
             cli_path: Some(cli_path),
+            cli_args: None,
         },
     )
 }

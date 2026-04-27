@@ -236,6 +236,7 @@ mod tests {
     fn arb_provider_type() -> impl Strategy<Value = ProviderType> {
         prop_oneof![
             Just(ProviderType::OpenAiCompatible),
+            Just(ProviderType::Groq),
             Just(ProviderType::Anthropic),
             Just(ProviderType::CliBackend),
         ]
@@ -256,6 +257,7 @@ mod tests {
                     api_key,
                     model,
                     cli_path,
+                    cli_args: None,
                 }
             })
     }

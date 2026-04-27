@@ -246,7 +246,7 @@ pub struct BoundaryStrategyConfig {
 /// LLM Provider 설정.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// 기본 Provider 이름 ("openai", "nvidia", "anthropic", "kiro-cli", "claude-cli")
+    /// 기본 Provider 이름 ("openai", "nvidia", "groq", "anthropic", "kiro-cli", "claude-cli")
     pub default_provider: String,
     /// Provider별 설정. config.toml에 누락되면 빈 맵으로 처리 (런타임에 resolve_provider가 ConfigError 반환).
     #[serde(default)]
@@ -311,12 +311,24 @@ pub struct ProviderConfig {
     pub model: Option<String>,
     /// CLI 실행 파일 경로 (CLI Backend 타입만)
     pub cli_path: Option<String>,
+    /// CLI 호출 시 prompt 앞에 prepend되는 인자 (CLI Backend 타입만).
+    ///
+    /// 예: kiro-cli는 `chat` subcommand가 필요하므로 `["chat"]`,
+    /// claude-cli는 `["-p"]` (non-interactive print). 비워두면 cli_path basename으로
+    /// 합리적 default를 자동 선택한다(`kiro-cli/kiro` → `["chat"]`,
+    /// `claude/claude-cli` → `["-p"]`, 그 외 → `[]`).
+    ///
+    /// 레거시 config 호환을 위해 `#[serde(default)]`. None은 "auto"와 동치.
+    #[serde(default)]
+    pub cli_args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProviderType {
-    /// OpenAI 호환 API (OpenAI, NVIDIA)
+    /// OpenAI 호환 API (OpenAI, NVIDIA 등 — endpoint/model을 직접 지정)
     OpenAiCompatible,
+    /// Groq Cloud API (OpenAI 호환 — endpoint/model 미지정 시 Groq 기본값 적용)
+    Groq,
     /// Anthropic 전용 API
     Anthropic,
     /// 로컬 CLI 실행 (kiro-cli, claude-cli)
@@ -433,6 +445,7 @@ mod tests {
                         api_key: Some("sk-test".to_string()),
                         model: Some("gpt-4o".to_string()),
                         cli_path: None,
+                        cli_args: None,
                     },
                 )]),
                 lang: "korean".to_string(),
@@ -509,6 +522,7 @@ method = "prompt_marker"
     fn provider_type_variants_serialize() {
         for (variant, expected) in [
             (ProviderType::OpenAiCompatible, "\"OpenAiCompatible\""),
+            (ProviderType::Groq, "\"Groq\""),
             (ProviderType::Anthropic, "\"Anthropic\""),
             (ProviderType::CliBackend, "\"CliBackend\""),
         ] {

@@ -486,6 +486,7 @@ mod tests {
                 api_key: None,
                 model: Some("gpt-4o-mini".to_string()),
                 cli_path: None,
+                cli_args: None,
             },
         );
         let cfg = AppConfig {
@@ -568,6 +569,7 @@ mod tests {
                 api_key: Some("sk-ant-xxx".to_string()),
                 model: Some("claude-3-5-haiku-20241022".to_string()),
                 cli_path: None,
+                cli_args: None,
             },
         );
         let cfg = AppConfig {

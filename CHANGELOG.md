@@ -71,6 +71,34 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
 
+### Fixed — CLI Backend(`kiro-cli`/`claude`) 호출 형식 수정
+
+`send_cli`가 prompt를 첫 positional argument로 그대로 전달하는 바람에:
+- `kiro-cli`는 prompt 첫 단어를 unknown subcommand로 해석 → "unrecognized
+  subcommand 'ssdsd...'" 에러
+- `claude` (claude-cli)는 interactive session 시작 시도 → non-interactive
+  컨텍스트에서 행 또는 깨짐
+
+해결:
+- **`ProviderConfig::cli_args: Option<Vec<String>>`** 신규 필드
+  (`#[serde(default)]`, 레거시 config 호환). prompt 앞에 prepend되는 인자.
+- **`resolve_cli_args(cli_path, override)` helper** — 사용자 명시값이
+  있으면 그대로, 없으면 `cli_path` basename에서 자동 추론:
+  - `kiro-cli` / `kiro` → `["chat"]`
+  - `claude` / `claude-cli` → `["-p"]`
+  - 그 외 → `[]` (legacy 동작 보존)
+- `send_cli`은 `<cli_path> <args...> <prompt>` 순서로 spawn.
+- 모든 ProviderConfig literal site에 `cli_args: None` 마이그레이션
+  (perl 일괄 + nested struct 2건 수동).
+- 4개 unit test: kiro chat 자동 추론, claude -p 자동 추론, unknown CLI
+  no-op, user override 우선.
+
+사용자 측 영향:
+- 기존 `cli_path = "kiro-cli"` config는 자동으로 `chat` subcommand가
+  붙는다 — config 수정 불필요.
+- 다른 인자가 필요한 경우 `cli_args = ["chat", "--no-color"]` 식으로
+  명시 가능.
+
 ### Fixed — Anthropic 모델 ID 갱신 (HTTP 404 회귀)
 
 옛 모델 ID(`claude-3-5-haiku-20241022`, `claude-sonnet-4-20250514` 등)가

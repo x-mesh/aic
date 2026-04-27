@@ -19,6 +19,7 @@ fn make_cli_config(cli_path: &str) -> LlmConfig {
                 api_key: None,
                 model: None,
                 cli_path: Some(cli_path.to_string()),
+                cli_args: None,
             },
         )]),
         lang: "korean".to_string(),

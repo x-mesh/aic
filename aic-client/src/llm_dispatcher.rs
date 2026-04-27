@@ -515,27 +515,38 @@ impl LlmDispatcher {
     }
 
     /// CLI Backend 실행 (kiro-cli, claude-cli).
+    ///
+    /// 호출 형식:
+    /// - `cli_args`가 명시되어 있으면: `<cli_path> <cli_args...> <prompt>`
+    /// - 비어 있으면 `cli_path` basename으로 자동 분기:
+    ///   - `kiro-cli` / `kiro` → `chat <prompt>` (kiro-cli는 첫 인자를
+    ///     subcommand로 해석하므로 `chat`이 필수)
+    ///   - `claude` / `claude-cli` → `-p <prompt>` (non-interactive print)
+    ///   - 그 외 → `<prompt>` (legacy 동작)
     fn send_cli(&self, provider: &ProviderConfig, prompt: &str) -> Result<String, AicError> {
         let cli_path = provider
             .cli_path
             .as_deref()
             .unwrap_or(&self.config.default_provider);
+        let args = resolve_cli_args(cli_path, provider.cli_args.as_deref());
 
-        let output = std::process::Command::new(cli_path)
-            .arg(prompt)
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    AicError::CliNotFound {
-                        cli_name: cli_path.to_string(),
-                    }
-                } else {
-                    AicError::LlmApiError {
-                        status: 0,
-                        message: format!("CLI 실행 실패: {e}"),
-                    }
+        let mut cmd = std::process::Command::new(cli_path);
+        for a in &args {
+            cmd.arg(a);
+        }
+        cmd.arg(prompt);
+        let output = cmd.output().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AicError::CliNotFound {
+                    cli_name: cli_path.to_string(),
                 }
-            })?;
+            } else {
+                AicError::LlmApiError {
+                    status: 0,
+                    message: format!("CLI 실행 실패: {e}"),
+                }
+            }
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -549,6 +560,29 @@ impl LlmDispatcher {
             status: 0,
             message: format!("CLI 출력 디코딩 실패: {e}"),
         })
+    }
+}
+
+/// CLI Backend 호출 시 prompt 앞에 prepend할 인자를 결정한다.
+///
+/// 결정 규칙:
+/// 1. 사용자가 `cli_args`를 명시했으면 그대로 사용한다 (override).
+/// 2. 안 했으면 `cli_path` basename에서 자동 추론:
+///    - `kiro-cli`, `kiro` → `["chat"]` (chat subcommand 필수)
+///    - `claude`, `claude-cli` → `["-p"]` (non-interactive print 모드)
+///    - 그 외 → `[]` (legacy: prompt만 그대로 전달)
+pub(crate) fn resolve_cli_args(cli_path: &str, override_args: Option<&[String]>) -> Vec<String> {
+    if let Some(args) = override_args {
+        return args.to_vec();
+    }
+    let basename = std::path::Path::new(cli_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cli_path);
+    match basename {
+        "kiro-cli" | "kiro" => vec!["chat".to_string()],
+        "claude" | "claude-cli" => vec!["-p".to_string()],
+        _ => Vec::new(),
     }
 }
 
@@ -658,6 +692,7 @@ mod tests {
                     api_key: api_key.map(|s| s.to_string()),
                     model: Some("test-model".to_string()),
                     cli_path: cli_path.map(|s| s.to_string()),
+                    cli_args: None,
                 },
             )]),
             lang: "korean".to_string(),
@@ -801,6 +836,46 @@ mod tests {
     fn extract_openai_content_empty_choices() {
         let json = json!({ "choices": [] });
         assert!(extract_openai_content(&json).is_err());
+    }
+
+    // ── resolve_cli_args ───────────────────────────────────────
+
+    #[test]
+    fn resolve_cli_args_kiro_uses_chat_subcommand() {
+        // kiro-cli/kiro는 첫 인자를 subcommand로 해석하므로 chat이 필수.
+        assert_eq!(resolve_cli_args("kiro-cli", None), vec!["chat".to_string()]);
+        assert_eq!(resolve_cli_args("kiro", None), vec!["chat".to_string()]);
+        // 절대경로도 basename으로 매칭.
+        assert_eq!(
+            resolve_cli_args("/usr/local/bin/kiro-cli", None),
+            vec!["chat".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_cli_args_claude_uses_print_flag() {
+        // claude는 기본이 interactive — -p로 non-interactive print 필요.
+        assert_eq!(resolve_cli_args("claude", None), vec!["-p".to_string()]);
+        assert_eq!(resolve_cli_args("claude-cli", None), vec!["-p".to_string()]);
+    }
+
+    #[test]
+    fn resolve_cli_args_unknown_cli_no_args() {
+        assert!(resolve_cli_args("my-custom-llm", None).is_empty());
+        assert!(resolve_cli_args("/opt/foo/bar-cli", None).is_empty());
+    }
+
+    #[test]
+    fn resolve_cli_args_user_override_wins() {
+        // 사용자가 cli_args를 명시했으면 cli basename 자동 추론을 무시한다.
+        let custom = vec!["chat".to_string(), "--no-color".to_string()];
+        assert_eq!(
+            resolve_cli_args("kiro-cli", Some(&custom)),
+            vec!["chat".to_string(), "--no-color".to_string()]
+        );
+        // 빈 vec override는 명시적 "no extra args" — basename 추론보다 우선.
+        let empty: Vec<String> = vec![];
+        assert!(resolve_cli_args("kiro-cli", Some(&empty)).is_empty());
     }
 
     #[test]

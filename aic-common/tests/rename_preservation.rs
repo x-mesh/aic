@@ -14,6 +14,7 @@ use std::path::PathBuf;
 fn arb_provider_type() -> impl Strategy<Value = ProviderType> {
     prop_oneof![
         Just(ProviderType::OpenAiCompatible),
+        Just(ProviderType::Groq),
         Just(ProviderType::Anthropic),
         Just(ProviderType::CliBackend),
     ]
@@ -34,6 +35,7 @@ fn arb_provider_config() -> impl Strategy<Value = ProviderConfig> {
                 api_key,
                 model,
                 cli_path,
+                cli_args: None,
             },
         )
 }
