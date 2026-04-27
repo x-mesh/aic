@@ -187,7 +187,7 @@ fn check_provider(cfg: &AppConfig) -> CheckResult {
     };
 
     match provider.provider_type {
-        ProviderType::OpenAiCompatible | ProviderType::Anthropic => {
+        ProviderType::OpenAiCompatible | ProviderType::Groq | ProviderType::Anthropic => {
             if provider
                 .api_key
                 .as_ref()
@@ -201,6 +201,22 @@ fn check_provider(cfg: &AppConfig) -> CheckResult {
                 );
             }
             let model = provider.model.as_deref().unwrap_or("(미지정)");
+            // Anthropic의 retired 모델은 404로 응답해 분석이 통째로 실패한다.
+            // 사용자가 dry-run 단계에서 알 수 있도록 doctor에서 미리 경고한다.
+            if matches!(provider.provider_type, ProviderType::Anthropic)
+                && is_anthropic_retired_model(model)
+            {
+                return CheckResult::warn(
+                    format!("provider '{name}'"),
+                    format!(
+                        "{:?} · model={model} · 이 모델은 retire되어 호출 시 HTTP 404가 \
+                         발생할 수 있습니다",
+                        provider.provider_type
+                    ),
+                    "claude-sonnet-4-6 / claude-opus-4-7 / claude-haiku-4-5-20251001 중 하나로 \
+                     교체하세요 (`aic config` → 'LLM Provider 설정')",
+                );
+            }
             CheckResult::pass(
                 format!("provider '{name}'"),
                 format!("{:?} · model={model} · key=설정됨", provider.provider_type),
@@ -237,6 +253,22 @@ fn check_provider(cfg: &AppConfig) -> CheckResult {
             }
         }
     }
+}
+
+/// Anthropic API에서 retire되었거나 retire가 임박한 모델 ID인지 휴리스틱 판정.
+///
+/// 보수적 매칭 — 새 모델(`claude-sonnet-4-6`, `claude-opus-4-7`,
+/// `claude-haiku-4-5-*`)에는 false. 알려진 옛 모델 prefix만 잡는다.
+fn is_anthropic_retired_model(model: &str) -> bool {
+    // claude-3-* 시리즈 (3, 3-5, 3-7) — Anthropic이 단계적으로 retire 중.
+    // claude-2-*, claude-instant-*는 이미 retire.
+    // claude-sonnet-4-20250514 는 4.6에 의해 superseded — retire 가능성 표시.
+    let m = model;
+    m.starts_with("claude-2")
+        || m.starts_with("claude-instant")
+        || m.starts_with("claude-3-")
+        || m == "claude-sonnet-4-20250514"
+        || m == "claude-opus-4-20250514"
 }
 
 fn check_socket_path(path: &std::path::Path) -> CheckResult {
@@ -504,6 +536,63 @@ mod tests {
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Fail);
         assert!(result.detail.contains("정의되지 않음"));
+    }
+
+    #[test]
+    fn retired_anthropic_models_are_detected() {
+        assert!(is_anthropic_retired_model("claude-3-5-haiku-20241022"));
+        assert!(is_anthropic_retired_model("claude-3-5-sonnet-20241022"));
+        assert!(is_anthropic_retired_model("claude-3-opus-20240229"));
+        assert!(is_anthropic_retired_model("claude-3-7-sonnet-20250219"));
+        assert!(is_anthropic_retired_model("claude-2.1"));
+        assert!(is_anthropic_retired_model("claude-instant-1.2"));
+        assert!(is_anthropic_retired_model("claude-sonnet-4-20250514"));
+    }
+
+    #[test]
+    fn current_anthropic_models_are_not_retired() {
+        assert!(!is_anthropic_retired_model("claude-sonnet-4-6"));
+        assert!(!is_anthropic_retired_model("claude-opus-4-7"));
+        assert!(!is_anthropic_retired_model("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn check_provider_warns_on_retired_anthropic_model() {
+        use std::collections::HashMap;
+        let mut providers = HashMap::new();
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                provider_type: ProviderType::Anthropic,
+                endpoint: Some("https://api.anthropic.com/v1/messages".to_string()),
+                api_key: Some("sk-ant-xxx".to_string()),
+                model: Some("claude-3-5-haiku-20241022".to_string()),
+                cli_path: None,
+            },
+        );
+        let cfg = AppConfig {
+            llm: aic_common::LlmConfig {
+                default_provider: "anthropic".to_string(),
+                providers,
+                lang: "korean".to_string(),
+                connect_timeout_secs: 5,
+                request_timeout_secs: 30,
+            },
+            server: aic_common::ServerConfig {
+                max_buffer_lines: 500,
+                socket_path: None,
+                boundary_strategy: aic_common::BoundaryStrategyConfig {
+                    method: "prompt_marker".to_string(),
+                    idle_threshold_ms: None,
+                },
+            },
+            session: aic_common::SessionConfig::default(),
+        };
+        let result = check_provider(&cfg);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("retire"));
+        let hint = result.fix_hint.unwrap();
+        assert!(hint.contains("claude-sonnet-4-6"));
     }
 
     #[test]

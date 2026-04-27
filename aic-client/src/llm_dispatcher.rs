@@ -1,6 +1,6 @@
 //! LLM Provider 및 CLI Backend 디스패처
 //!
-//! 설정된 LLM Provider(OpenAI 호환, Anthropic) 또는
+//! 설정된 LLM Provider(OpenAI 호환, Groq, Anthropic) 또는
 //! CLI Backend(kiro-cli, claude-cli)로 요청을 라우팅한다.
 
 use aic_common::{AicError, LlmConfig, ProviderConfig, ProviderType};
@@ -11,6 +11,20 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// OpenAI 호환 provider의 기본 endpoint·모델 결정.
+/// 사용자가 ProviderConfig에 endpoint·model을 비워둬도 즉시 동작하도록
+/// `ProviderType`에 따른 합리적 기본값을 돌려준다.
+pub(crate) fn openai_compat_defaults(ptype: &ProviderType) -> (&'static str, &'static str) {
+    match ptype {
+        ProviderType::Groq => (
+            "https://api.groq.com/openai/v1/chat/completions",
+            "llama-3.3-70b-versatile",
+        ),
+        // OpenAI / NVIDIA 등 일반 OpenAI-compat — OpenAI 기본값
+        _ => ("https://api.openai.com/v1/chat/completions", "gpt-4o"),
+    }
+}
 
 /// 모델 이름에서 응답 시간을 추정해 request timeout을 결정한다.
 /// `base` (사용자 config의 request_timeout_secs)는 floor 역할 — 사용자가 명시적으로
@@ -214,7 +228,9 @@ impl LlmDispatcher {
             }
 
             let result = match provider.provider_type {
-                ProviderType::OpenAiCompatible => self.send_openai(provider, prompt).await,
+                ProviderType::OpenAiCompatible | ProviderType::Groq => {
+                    self.send_openai(provider, prompt).await
+                }
                 ProviderType::Anthropic => self.send_anthropic(provider, prompt).await,
                 ProviderType::CliBackend => unreachable!("filtered above"),
             };
@@ -312,12 +328,11 @@ impl LlmDispatcher {
         })?;
 
         let result = match provider.provider_type {
-            ProviderType::OpenAiCompatible => {
-                let endpoint = provider
-                    .endpoint
-                    .as_deref()
-                    .unwrap_or("https://api.openai.com/v1/chat/completions");
-                let model = provider.model.as_deref().unwrap_or("gpt-4o");
+            ProviderType::OpenAiCompatible | ProviderType::Groq => {
+                let (default_endpoint, default_model) =
+                    openai_compat_defaults(&provider.provider_type);
+                let endpoint = provider.endpoint.as_deref().unwrap_or(default_endpoint);
+                let model = provider.model.as_deref().unwrap_or(default_model);
                 let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
                 crate::streaming::stream_openai_compat(
                     &self.http_client,
@@ -335,10 +350,7 @@ impl LlmDispatcher {
                     .endpoint
                     .as_deref()
                     .unwrap_or("https://api.anthropic.com/v1/messages");
-                let model = provider
-                    .model
-                    .as_deref()
-                    .unwrap_or("claude-sonnet-4-20250514");
+                let model = provider.model.as_deref().unwrap_or("claude-sonnet-4-6");
                 let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
                 crate::streaming::stream_anthropic(
                     &self.http_client,
@@ -377,16 +389,15 @@ impl LlmDispatcher {
             })
     }
 
-    /// OpenAI 호환 API 요청 (OpenAI, NVIDIA 등).
+    /// OpenAI 호환 API 요청 (OpenAI, NVIDIA, Groq 등).
+    /// endpoint·model이 비어 있으면 `provider_type`에 따라 기본값을 적용한다.
     async fn send_openai(
         &self,
         provider: &ProviderConfig,
         prompt: &str,
     ) -> Result<String, AicError> {
-        let endpoint = provider
-            .endpoint
-            .as_deref()
-            .unwrap_or("https://api.openai.com/v1/chat/completions");
+        let (default_endpoint, default_model) = openai_compat_defaults(&provider.provider_type);
+        let endpoint = provider.endpoint.as_deref().unwrap_or(default_endpoint);
         let raw = provider
             .api_key
             .as_deref()
@@ -398,7 +409,7 @@ impl LlmDispatcher {
             provider: format!("{} ({e})", self.config.default_provider),
         })?;
         let api_key = resolved.as_str();
-        let model = provider.model.as_deref().unwrap_or("gpt-4o");
+        let model = provider.model.as_deref().unwrap_or(default_model);
 
         let body = json!({
             "model": model,
@@ -462,7 +473,7 @@ impl LlmDispatcher {
         let model = provider
             .model
             .as_deref()
-            .unwrap_or("claude-sonnet-4-20250514");
+            .unwrap_or("claude-sonnet-4-6");
 
         let body = json!({
             "model": model,
@@ -633,6 +644,7 @@ mod tests {
     ) -> LlmConfig {
         let name = match provider_type {
             ProviderType::OpenAiCompatible => "openai",
+            ProviderType::Groq => "groq",
             ProviderType::Anthropic => "anthropic",
             ProviderType::CliBackend => "cli",
         };
@@ -652,6 +664,22 @@ mod tests {
             connect_timeout_secs: 5,
             request_timeout_secs: 30,
         }
+    }
+
+    // ── openai_compat_defaults ─────────────────────────────────
+
+    #[test]
+    fn openai_compat_defaults_groq_returns_groq_endpoint() {
+        let (endpoint, model) = openai_compat_defaults(&ProviderType::Groq);
+        assert_eq!(endpoint, "https://api.groq.com/openai/v1/chat/completions");
+        assert_eq!(model, "llama-3.3-70b-versatile");
+    }
+
+    #[test]
+    fn openai_compat_defaults_openai_returns_openai_endpoint() {
+        let (endpoint, model) = openai_compat_defaults(&ProviderType::OpenAiCompatible);
+        assert_eq!(endpoint, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(model, "gpt-4o");
     }
 
     // ── from_config ────────────────────────────────────────────
@@ -818,14 +846,21 @@ mod tests {
 
     #[test]
     fn estimate_timeout_for_sonnet_uses_90s_floor() {
-        let t = estimate_request_timeout("claude-sonnet-4-20250514", 30);
+        let t = estimate_request_timeout("claude-sonnet-4-6", 30);
         assert_eq!(t, std::time::Duration::from_secs(90));
     }
 
     #[test]
     fn estimate_timeout_for_haiku_uses_45s_floor() {
-        let t = estimate_request_timeout("claude-3-5-haiku-20241022", 30);
+        let t = estimate_request_timeout("claude-haiku-4-5-20251001", 30);
         assert_eq!(t, std::time::Duration::from_secs(45));
+    }
+
+    #[test]
+    fn estimate_timeout_for_opus_4x_uses_180s_floor() {
+        // 새 ID 명명(`claude-opus-4-7`)도 substring "opus" 매칭으로 잡혀야 한다.
+        let t = estimate_request_timeout("claude-opus-4-7", 30);
+        assert_eq!(t, std::time::Duration::from_secs(180));
     }
 
     #[test]

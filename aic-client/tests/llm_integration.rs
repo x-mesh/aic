@@ -29,6 +29,26 @@ fn make_openai_config(api_key: Option<&str>) -> LlmConfig {
     }
 }
 
+fn make_groq_config(api_key: Option<&str>) -> LlmConfig {
+    LlmConfig {
+        default_provider: "groq".to_string(),
+        providers: HashMap::from([(
+            "groq".to_string(),
+            ProviderConfig {
+                provider_type: ProviderType::Groq,
+                // endpoint·model 미지정 — dispatcher 기본값(Groq Cloud + llama-3.3-70b-versatile)이 적용되어야 함
+                endpoint: None,
+                api_key: api_key.map(|s| s.to_string()),
+                model: None,
+                cli_path: None,
+            },
+        )]),
+        lang: "korean".to_string(),
+        connect_timeout_secs: 5,
+        request_timeout_secs: 30,
+    }
+}
+
 fn make_anthropic_config(api_key: Option<&str>) -> LlmConfig {
     LlmConfig {
         default_provider: "anthropic".to_string(),
@@ -38,7 +58,7 @@ fn make_anthropic_config(api_key: Option<&str>) -> LlmConfig {
                 provider_type: ProviderType::Anthropic,
                 endpoint: Some("https://api.anthropic.com/v1/messages".to_string()),
                 api_key: api_key.map(|s| s.to_string()),
-                model: Some("claude-sonnet-4-20250514".to_string()),
+                model: Some("claude-sonnet-4-6".to_string()),
                 cli_path: None,
             },
         )]),
@@ -72,6 +92,19 @@ fn make_cli_config(cli_path: &str) -> LlmConfig {
 #[tokio::test]
 async fn openai_missing_api_key_returns_api_key_missing() {
     let config = make_openai_config(None);
+    let dispatcher = aic_client::llm_dispatcher::LlmDispatcher::from_config(config);
+
+    let err = dispatcher.send("test prompt").await.unwrap_err();
+    assert!(
+        matches!(err, AicError::ApiKeyMissing { .. }),
+        "ApiKeyMissing 에러를 기대했지만 {:?}를 받았습니다",
+        err
+    );
+}
+
+#[tokio::test]
+async fn groq_missing_api_key_returns_api_key_missing() {
+    let config = make_groq_config(None);
     let dispatcher = aic_client::llm_dispatcher::LlmDispatcher::from_config(config);
 
     let err = dispatcher.send("test prompt").await.unwrap_err();
@@ -157,6 +190,29 @@ fn openai_response_format_parsing() {
 }
 
 #[test]
+fn groq_response_format_parsing() {
+    // Groq는 OpenAI 호환 — 응답 포맷도 동일
+    let response_json = serde_json::json!({
+        "id": "chatcmpl-groq-xyz",
+        "object": "chat.completion",
+        "model": "llama-3.3-70b-versatile",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The build failed because of a missing dependency."
+            },
+            "finish_reason": "stop"
+        }]
+    });
+
+    let content = response_json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "The build failed because of a missing dependency.");
+}
+
+#[test]
 fn anthropic_response_format_parsing() {
     // Anthropic API 응답 형식
     let response_json = serde_json::json!({
@@ -194,7 +250,7 @@ fn openai_request_body_format() {
 
 #[test]
 fn anthropic_request_body_format() {
-    let model = "claude-sonnet-4-20250514";
+    let model = "claude-sonnet-4-6";
     let prompt = "Analyze this error";
 
     let body = serde_json::json!({

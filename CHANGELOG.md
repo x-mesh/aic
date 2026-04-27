@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Added — Groq Cloud provider 정식 지원
+
+- **`ProviderType::Groq` enum variant 추가** (aic-common). OpenAI 호환 API path를
+  재사용하지만, `provider_type = "Groq"`로 지정하면 `endpoint`/`model`을 비워둬도
+  `https://api.groq.com/openai/v1/chat/completions` + `llama-3.3-70b-versatile`
+  기본값이 자동 적용된다. 기존 `OpenAiCompatible`로 endpoint를 직접 지정하던
+  설정도 그대로 동작.
+- **`aic config` wizard에 Groq 항목** — API key 입력 후 모델 선택
+  (`llama-3.1-8b-instant` / `llama-3.3-70b-versatile` /
+  `deepseek-r1-distill-llama-70b` / `gemma2-9b-it`).
+- **`aic doctor`** — Groq variant도 OpenAI 호환과 동일한 검증 path를 탄다
+  (api_key 존재, endpoint reachability, keychain 접근).
+- **Streaming 지원** — Groq도 OpenAI-compat SSE를 사용하므로 TTY 환경에서
+  자동 streaming.
+- **`--dry-run` cost 추정** — Groq 공시 단가($/1M tokens) 매핑 추가.
+
 ### Added — `aicd` supervisor daemon (Phase 0~2.1)
 
 PRD-AICD-SUPERVISOR의 control plane 부분. PTY ownership은 그대로 두고
@@ -54,6 +70,27 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   실시간 echo하면서 동시에 ring(line cap 1000, byte cap 256 KiB)에 수집.
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
+
+### Fixed — Anthropic 모델 ID 갱신 (HTTP 404 회귀)
+
+옛 모델 ID(`claude-3-5-haiku-20241022`, `claude-sonnet-4-20250514` 등)가
+Anthropic API에서 retire되어 호출 시 HTTP 404를 반환하던 회귀를 차단.
+
+- `LlmDispatcher::send_anthropic` / `streaming` Anthropic path의 default
+  모델을 `claude-sonnet-4-6`로 갱신 (두 곳 모두).
+- `aic config` wizard의 Anthropic 모델 선택 옵션을
+  `claude-sonnet-4-6` / `claude-opus-4-7` / `claude-haiku-4-5-20251001`로
+  교체. 라벨도 함께 갱신.
+- example `config.toml` 템플릿 (`aic config show example`) 모델 + 권장 안내
+  코멘트 추가.
+- `dry-run` cost 매핑(`estimate_cost_usd`)에 4.x family 단가 추가
+  (sonnet 4.6 = $3/$15, opus 4.7 = $15/$75, haiku 4.5 = $1/$5; 정확한
+  단가는 https://www.anthropic.com/pricing 참조).
+- `aic doctor`가 retired 모델 ID 사용 시 WARN으로 안내 + fix hint 제공
+  (`is_anthropic_retired_model` heuristic으로 `claude-2*`, `claude-instant*`,
+  `claude-3-*`, `claude-{sonnet,opus}-4-20250514` 매칭). 새 4.x family는
+  PASS.
+- 통합 테스트(`aic-client/tests/llm_integration.rs`)도 새 모델 ID로 갱신.
 
 ### Added — Hybrid mode + capture quality hint (Phase 4)
 

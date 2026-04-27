@@ -760,9 +760,7 @@ async fn handle_hook_event(op: HookEventOp) {
 /// 또는 `aic daemon start` 하라고 안내한다.
 async fn handle_session_stop(id: String) {
     if !aic_common::is_valid_session_id(&id) {
-        eprintln!(
-            "{COL_RED}✗{COL_RESET} 유효하지 않은 세션 ID: '{id}' (1~8자 lowercase hex 필요)"
-        );
+        eprintln!("{COL_RED}✗{COL_RESET} 유효하지 않은 세션 ID: '{id}' (1~8자 lowercase hex 필요)");
         std::process::exit(2);
     }
     let client = UdsClient::new(aic_common::aicd_socket_path());
@@ -1041,11 +1039,7 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
 fn install_hook_mode(shell_name: &str) {
     use aic_client::hook_install;
     let (rc_filename, hook_filename, script) = match shell_name {
-        "zsh" => (
-            ".zshrc",
-            "hook-events.zsh",
-            hook_install::zsh_hook_script(),
-        ),
+        "zsh" => (".zshrc", "hook-events.zsh", hook_install::zsh_hook_script()),
         "bash" => (
             ".bashrc",
             "hook-events.bash",
@@ -1475,7 +1469,8 @@ fn configure_llm_provider() {
 
     let providers = &[
         "OpenAI (gpt-4o, gpt-4o-mini)",
-        "Anthropic (claude-3-5-sonnet)",
+        "Anthropic (claude-sonnet-4-6, claude-opus-4-7, claude-haiku-4-5)",
+        "Groq (llama-3.3-70b, llama-3.1-8b-instant)",
         "NVIDIA NIM (qwen, nemotron, llama)",
         "Kiro CLI (로컬)",
         "Claude CLI (로컬)",
@@ -1487,14 +1482,15 @@ fn configure_llm_provider() {
         .items(providers)
         .default(0)
         .interact()
-        .unwrap_or(5);
+        .unwrap_or(6);
 
     let (provider_name, provider_config) = match selection {
         0 => configure_openai(&theme, &existing_config),
         1 => configure_anthropic(&theme, &existing_config),
-        2 => configure_nvidia(&theme, &existing_config),
-        3 => configure_kiro_cli(&theme, &existing_config),
-        4 => configure_claude_cli(&theme, &existing_config),
+        2 => configure_groq(&theme, &existing_config),
+        3 => configure_nvidia(&theme, &existing_config),
+        4 => configure_kiro_cli(&theme, &existing_config),
+        5 => configure_claude_cli(&theme, &existing_config),
         _ => return,
     };
 
@@ -1714,10 +1710,12 @@ fn configure_anthropic(
         );
     }
 
+    // 권장: claude-sonnet-4-6 (균형, 기본). claude-3-* 시리즈는 retire되어
+    // 404를 반환할 수 있으므로 옵션에 두지 않는다 — 사용자가 직접 명시할 수는 있다.
     let models = &[
-        "claude-3-5-haiku-20241022",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-opus-20240229",
+        "claude-sonnet-4-6",
+        "claude-opus-4-7",
+        "claude-haiku-4-5-20251001",
     ];
     let default_idx = existing_model
         .and_then(|m| models.iter().position(|&x| x == m))
@@ -1735,6 +1733,82 @@ fn configure_anthropic(
         ProviderConfig {
             provider_type: ProviderType::Anthropic,
             endpoint: Some("https://api.anthropic.com/v1/messages".to_string()),
+            api_key: final_key,
+            model: Some(models[model_idx].to_string()),
+            cli_path: None,
+        },
+    )
+}
+
+fn configure_groq(
+    theme: &ColorfulTheme,
+    existing_config: &Option<AppConfig>,
+) -> (String, ProviderConfig) {
+    println!("\nGroq 설정");
+    println!("API Key: https://console.groq.com/keys\n");
+
+    let existing = get_existing_provider(existing_config, "groq");
+    let existing_key = existing.as_ref().and_then(|p| p.api_key.as_ref());
+    let existing_model = existing.as_ref().and_then(|p| p.model.as_ref());
+
+    if let Some(key) = existing_key {
+        println!("현재 API Key: {}", mask_api_key(key));
+    }
+    if let Some(model) = existing_model {
+        println!("현재 모델: {}", model);
+    }
+    if existing_key.is_some() {
+        println!();
+    }
+
+    let api_key: String = Input::with_theme(theme)
+        .with_prompt("API Key (gsk_..., 유지하려면 Enter)")
+        .allow_empty(true)
+        .interact_text()
+        .unwrap_or_default();
+
+    let final_key = if api_key.is_empty() {
+        existing_key.cloned()
+    } else {
+        Some(api_key)
+    };
+
+    if final_key.is_none() {
+        println!("API Key가 필요합니다.");
+        return (
+            String::new(),
+            ProviderConfig {
+                provider_type: ProviderType::Groq,
+                endpoint: None,
+                api_key: None,
+                model: None,
+                cli_path: None,
+            },
+        );
+    }
+
+    let models = &[
+        "llama-3.1-8b-instant",
+        "llama-3.3-70b-versatile",
+        "deepseek-r1-distill-llama-70b",
+        "gemma2-9b-it",
+    ];
+    let default_idx = existing_model
+        .and_then(|m| models.iter().position(|&x| x == m))
+        .unwrap_or(1);
+
+    let model_idx = Select::with_theme(theme)
+        .with_prompt("모델 선택")
+        .items(models)
+        .default(default_idx)
+        .interact()
+        .unwrap_or(1);
+
+    (
+        "groq".to_string(),
+        ProviderConfig {
+            provider_type: ProviderType::Groq,
+            endpoint: Some("https://api.groq.com/openai/v1/chat/completions".to_string()),
             api_key: final_key,
             model: Some(models[model_idx].to_string()),
             cli_path: None,
@@ -1894,7 +1968,7 @@ fn show_config_example() {
 # 파일 위치: ~/.config/aic/config.toml
 
 [llm]
-# 기본 Provider 선택: "openai", "anthropic", "nvidia", "kiro-cli", "claude-cli"
+# 기본 Provider 선택: "openai", "anthropic", "groq", "nvidia", "kiro-cli", "claude-cli"
 default_provider = "openai"
 # 응답 언어: "korean", "english", "japanese", "chinese" 등
 lang = "korean"
@@ -1911,11 +1985,25 @@ api_key = "sk-your-api-key-here"
 model = "gpt-4o-mini"
 
 # Anthropic 설정 (선택)
+# 모델 권장: claude-sonnet-4-6 (균형) / claude-opus-4-7 (최강) /
+#            claude-haiku-4-5-20251001 (저렴/빠름).
+# claude-3-5-* 시리즈는 retire되어 404가 발생할 수 있습니다.
 [llm.providers.anthropic]
 provider_type = "Anthropic"
 endpoint = "https://api.anthropic.com/v1/messages"
 api_key = "sk-ant-your-api-key-here"
-model = "claude-3-5-haiku-20241022"
+model = "claude-sonnet-4-6"
+
+# Groq 설정 (선택, OpenAI 호환 — endpoint/model 미지정 시 Groq 기본값 적용)
+[llm.providers.groq]
+provider_type = "Groq"
+api_key = "gsk_your-api-key-here"
+model = "llama-3.3-70b-versatile"
+# 다른 모델 옵션:
+# - llama-3.1-8b-instant
+# - deepseek-r1-distill-llama-70b
+# - gemma2-9b-it
+# endpoint를 명시하지 않으면 https://api.groq.com/openai/v1/chat/completions 사용
 
 # NVIDIA NIM 설정 (선택)
 [llm.providers.nvidia]
@@ -2068,7 +2156,9 @@ async fn handle_sessions() {
                 return;
             }
             Ok(list) => {
-                println!("{COL_BOLD}aic sessions{COL_RESET} {COL_DIM}(from aicd registry){COL_RESET}");
+                println!(
+                    "{COL_BOLD}aic sessions{COL_RESET} {COL_DIM}(from aicd registry){COL_RESET}"
+                );
                 for s in &list {
                     let marker = match &current_id {
                         Some(cid) if cid == &s.id => format!(" {COL_GREEN}*{COL_RESET}"),
@@ -2408,7 +2498,9 @@ async fn handle_record(
                     .providers
                     .get(provider_name)
                     .map(|p| &p.provider_type),
-                Some(ProviderType::OpenAiCompatible) | Some(ProviderType::Anthropic)
+                Some(ProviderType::OpenAiCompatible)
+                    | Some(ProviderType::Groq)
+                    | Some(ProviderType::Anthropic)
             );
             use std::io::IsTerminal;
             let streaming_enabled = streamable
@@ -3023,15 +3115,24 @@ fn estimate_cost_usd(model: &str, input_tokens: usize, output_tokens: usize) -> 
         "gpt-4o" => (5.00, 20.00),
         "gpt-4-turbo" => (10.00, 30.00),
         "gpt-3.5-turbo" => (0.50, 1.50),
-        // Anthropic
-        "claude-3-5-sonnet-20241022" | "claude-sonnet-4-20250514" => (3.00, 15.00),
-        "claude-3-5-haiku-20241022" => (1.00, 5.00),
-        "claude-3-opus-20240229" => (15.00, 75.00),
+        // Anthropic — 4.x family 단가는 sonnet 4 시리즈 공시 기준($3 in / $15 out).
+        // 정확한 단가는 https://www.anthropic.com/pricing 참조; 여기 매핑은 dry-run
+        // 추정용이라 실제 결제와 다를 수 있다.
+        "claude-3-5-sonnet-20241022"
+        | "claude-sonnet-4-20250514"
+        | "claude-sonnet-4-6" => (3.00, 15.00),
+        "claude-3-5-haiku-20241022" | "claude-haiku-4-5-20251001" => (1.00, 5.00),
+        "claude-3-opus-20240229" | "claude-opus-4-7" => (15.00, 75.00),
         // NVIDIA NIM (대부분 무료 tier)
         m if m.starts_with("meta/llama") => (0.0, 0.0),
         m if m.starts_with("nvidia/") => (0.0, 0.0),
         m if m.starts_with("qwen/") => (0.0, 0.0),
         m if m.starts_with("mistralai/") => (0.0, 0.0),
+        // Groq (2025 공시 단가, $/1M tokens)
+        "llama-3.3-70b-versatile" => (0.59, 0.79),
+        "llama-3.1-8b-instant" => (0.05, 0.08),
+        "deepseek-r1-distill-llama-70b" => (0.75, 0.99),
+        "gemma2-9b-it" => (0.20, 0.20),
         _ => return None,
     };
     let cin = in_per_1m * (input_tokens as f64) / 1_000_000.0;

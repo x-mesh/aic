@@ -31,7 +31,7 @@ graph LR
 - ✅ 명령어 경계 감지 — OSC 133 마커 + Timing Heuristic 폴백
 - ✅ 에러 자동 분석 — exit code ≠ 0이면 LLM으로 원인 분석 및 수정 제안
 - ✅ Interactive REPL — exit code = 0이면 LLM과 자유 대화
-- ✅ 다중 LLM Provider — OpenAI 호환, Anthropic, CLI Backend (kiro-cli, claude-cli)
+- ✅ 다중 LLM Provider — OpenAI 호환, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
 - ✅ TUI 호환 — Alternate Screen Buffer 감지로 vim, htop 등 정상 동작
 - ✅ Cross-Platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
 
@@ -89,7 +89,7 @@ graph LR
 
 - Rust 1.75+ (2021 edition)
 - macOS 또는 Linux
-- LLM API key (OpenAI, Anthropic 등) 또는 CLI Backend (kiro-cli, claude-cli)
+- LLM API key (OpenAI, Anthropic, Groq 등) 또는 CLI Backend (kiro-cli, claude-cli)
 
 ### 빌드 및 설치
 
@@ -259,12 +259,25 @@ endpoint = "https://integrate.api.nvidia.com/v1/chat/completions"
 api_key = "nvapi-..."
 model = "meta/llama-3.1-70b-instruct"
 
+# ── Groq (OpenAI 호환 — endpoint/model 미지정 시 Groq 기본값 자동 적용) ──
+[llm.providers.groq]
+provider_type = "Groq"
+api_key = "gsk_..."
+model = "llama-3.3-70b-versatile"
+# endpoint 생략 시 https://api.groq.com/openai/v1/chat/completions 사용
+# 다른 모델: llama-3.1-8b-instant · deepseek-r1-distill-llama-70b · gemma2-9b-it
+
 # ── Anthropic ──
+# 모델 ID는 https://docs.anthropic.com/en/docs/about-claude/models 참조.
+# 권장: claude-opus-4-7 (최강), claude-sonnet-4-6 (균형, 기본값),
+#       claude-haiku-4-5-20251001 (저렴/빠름).
+# 옛 모델(claude-sonnet-4-20250514, claude-3-5-haiku-20241022 등)은 retire 시
+# 404로 응답할 수 있으니 위 ID로 갱신하세요.
 [llm.providers.anthropic]
 provider_type = "Anthropic"
 endpoint = "https://api.anthropic.com/v1/messages"
 api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
+model = "claude-sonnet-4-6"
 
 # ── CLI Backend (로컬 CLI 도구) ──
 [llm.providers.kiro-cli]
