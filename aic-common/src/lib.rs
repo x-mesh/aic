@@ -9,8 +9,8 @@ pub use error::AicError;
 pub use ipc::{decode_frame, encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
 pub use paths::{
     aicd_lock_path, aicd_registry_path, aicd_socket_path, default_socket_path, extract_session_id,
-    list_session_sockets, resolve_active_socket, resolve_socket_path, session_dir,
-    session_socket_path,
+    list_session_sockets, local_command_record_path, local_hook_pending_path,
+    resolve_active_socket, resolve_socket_path, session_dir, session_socket_path,
 };
 pub use session::{generate_session_id, is_valid_session_id};
 

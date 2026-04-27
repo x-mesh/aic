@@ -3,6 +3,7 @@ use aic_client::cache;
 use aic_client::config::ConfigManager;
 use aic_client::error_analyzer::{clean_output_lines, ErrorAnalyzer};
 use aic_client::llm_dispatcher::LlmDispatcher;
+use aic_client::local_record;
 use aic_client::repl::ReplSession;
 use aic_client::uds_client::UdsClient;
 use aic_common::{
@@ -798,6 +799,41 @@ async fn handle_run(cmd: Vec<String>) {
         d = duration.num_milliseconds().max(0)
     );
 
+    let _ = local_record::save_last(&record);
+    if record.exit_code != 0 {
+        match ConfigManager::load() {
+            Ok(config) => {
+                let provider_name = config.llm.default_provider.clone();
+                let model_name = config
+                    .llm
+                    .providers
+                    .get(&provider_name)
+                    .and_then(|p| p.model.clone())
+                    .unwrap_or_else(|| "(CLI)".to_string());
+                let lang = aic_common::resolve_lang(&config.llm.lang);
+                let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+                if let Err(e) = handle_record(
+                    record.clone(),
+                    dispatcher,
+                    &config,
+                    &provider_name,
+                    &model_name,
+                    &lang,
+                    false,
+                )
+                .await
+                {
+                    eprintln!("{COL_YELLOW}⚠{COL_RESET} 분석 실패: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{COL_DIM}분석은 건너뜀: 설정 로드 실패 ({e}). 나중에 `aic`로 마지막 기록을 분석할 수 있습니다.{COL_RESET}"
+                );
+            }
+        }
+    }
+
     std::process::exit(exit_code);
 }
 
@@ -809,6 +845,7 @@ async fn handle_run(cmd: Vec<String>) {
 /// - 모든 출력은 stderr에만 (stdout 오염 금지).
 async fn handle_hook_event(op: HookEventOp) {
     let sock = aic_common::aicd_socket_path();
+    let now = chrono::Utc::now();
     let request = match op {
         HookEventOp::Start {
             session,
@@ -817,27 +854,42 @@ async fn handle_hook_event(op: HookEventOp) {
             cwd,
             shell,
             pid,
-        } => aic_common::IpcRequest::CommandStarted {
-            session_id: session,
-            command_id,
-            command,
-            cwd: cwd.map(std::path::PathBuf::from),
-            shell,
-            pid,
-            started_at: chrono::Utc::now(),
-        },
+        } => {
+            let cwd = cwd.map(std::path::PathBuf::from);
+            let _ = local_record::save_hook_start(
+                session.clone(),
+                command_id.clone(),
+                command.clone(),
+                cwd.clone(),
+                shell.clone(),
+                pid,
+                now,
+            );
+            aic_common::IpcRequest::CommandStarted {
+                session_id: session,
+                command_id,
+                command,
+                cwd,
+                shell,
+                pid,
+                started_at: now,
+            }
+        }
         HookEventOp::End {
             session,
             command_id,
             exit,
             duration_ms,
-        } => aic_common::IpcRequest::CommandFinished {
-            session_id: session,
-            command_id,
-            exit_code: exit,
-            finished_at: chrono::Utc::now(),
-            duration_ms,
-        },
+        } => {
+            let _ = local_record::finish_hook(&session, &command_id, exit, now);
+            aic_common::IpcRequest::CommandFinished {
+                session_id: session,
+                command_id,
+                exit_code: exit,
+                finished_at: now,
+                duration_ms,
+            }
+        }
     };
     let client = UdsClient::new(sock);
     let send = async {
@@ -2432,27 +2484,34 @@ async fn get_hook_metadata_record(config: &AppConfig) -> Option<aic_common::Comm
     if !hook_lookup_enabled(config) {
         return None;
     }
-    let session_id = current_session_id_from_env()?;
-    let client = UdsClient::new(aic_common::aicd_socket_path());
-    match client.get_last_command_for_session(&session_id).await {
-        Ok(record) => {
-            debug_log!(
-                "aicd     hook metadata · session={} exit={} cmd={}",
-                session_id,
-                record.exit_code,
-                record.command.as_deref().unwrap_or("∅")
-            );
-            Some(record)
-        }
-        Err(e) => {
-            debug_log!(
-                "aicd     hook metadata miss · session={} · {}",
-                session_id,
-                e
-            );
-            None
+    if let Some(session_id) = current_session_id_from_env() {
+        let client = UdsClient::new(aic_common::aicd_socket_path());
+        match client.get_last_command_for_session(&session_id).await {
+            Ok(record) => {
+                debug_log!(
+                    "aicd     hook metadata · session={} exit={} cmd={}",
+                    session_id,
+                    record.exit_code,
+                    record.command.as_deref().unwrap_or("∅")
+                );
+                return Some(record);
+            }
+            Err(e) => {
+                debug_log!(
+                    "aicd     hook metadata miss · session={} · {}",
+                    session_id,
+                    e
+                );
+            }
         }
     }
+    let record = local_record::load_last()?;
+    debug_log!(
+        "local    hook metadata · exit={} cmd={}",
+        record.exit_code,
+        record.command.as_deref().unwrap_or("∅")
+    );
+    Some(record)
 }
 
 /// `AIC_SESSION_ID` 환경변수를 확인하여 소켓 경로를 결정한다.
@@ -2547,6 +2606,58 @@ async fn history_fallback_or_repl(
     }
 }
 
+async fn stdin_record_if_piped() -> anyhow::Result<Option<aic_common::CommandRecord>> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    use tokio::io::AsyncReadExt;
+    let mut input = String::new();
+    tokio::io::stdin().read_to_string(&mut input).await?;
+    if input.trim().is_empty() {
+        return Ok(None);
+    }
+
+    const LINE_CAP: usize = 1000;
+    let command = std::env::var("AIC_COMMAND")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let exit_code = std::env::var("AIC_EXIT_CODE")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(1);
+    let raw_lines: Vec<String> = input.lines().map(ToString::to_string).collect();
+    let start = raw_lines.len().saturating_sub(LINE_CAP);
+    let output_lines = clean_output_lines(&raw_lines[start..], command.as_deref());
+    let original_bytes = input.len() as u64;
+    let stored_bytes = output_lines.iter().map(|line| line.len() as u64 + 1).sum();
+    let stored_lines = output_lines.len();
+    let truncated = start > 0;
+
+    Ok(Some(aic_common::CommandRecord {
+        command,
+        exit_code,
+        output_lines,
+        timestamp: chrono::Utc::now(),
+        capture_mode: aic_common::CaptureMode::ExplicitCapture,
+        capture_quality: if truncated {
+            aic_common::CaptureQuality::TruncatedOutput
+        } else {
+            aic_common::CaptureQuality::FullOutput
+        },
+        output_metadata: Some(aic_common::OutputMetadata {
+            original_bytes: Some(original_bytes),
+            stored_bytes,
+            stored_lines,
+            truncated,
+            binary: false,
+            sha256: None,
+        }),
+    }))
+}
+
 /// 기본 동작: 서버 연결 → 직전 명령어 조회 → 자동 분기
 /// 또는 직접 프롬프트가 주어지면 LLM에 바로 질문
 async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow::Result<()> {
@@ -2585,6 +2696,25 @@ async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow:
         let r = handle_direct_prompt(&dispatcher, &prompt, &model_name, &lang).await;
         debug_step!(total_start, "total");
         return r;
+    }
+
+    if let Some(record) = stdin_record_if_piped().await? {
+        debug_log!(
+            "mode     stdin · exit={} lines={}",
+            record.exit_code,
+            record.output_lines.len()
+        );
+        let _ = local_record::save_last(&record);
+        return handle_record(
+            record,
+            dispatcher,
+            &config,
+            &provider_name,
+            &model_name,
+            &lang,
+            dry_run,
+        )
+        .await;
     }
 
     // 서버에서 마지막 명령어 조회, 실패 시 히스토리 폴백
@@ -2661,11 +2791,16 @@ async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow:
             if let Some(hook_record) = get_hook_metadata_record(&config).await {
                 hook_record
             } else {
-                eprintln!(
-                "{COL_YELLOW}ℹ{COL_RESET} aic-session 안에서 실행해주세요. 직접 질문은 {COL_BOLD}aic \"질문\"{COL_RESET} 형식으로 가능합니다."
-            );
-                debug_step!(total_start, "total");
-                return Ok(());
+                history_fallback_or_repl(
+                    &dispatcher,
+                    &provider_name,
+                    &model_name,
+                    &config,
+                    &lang,
+                    dry_run,
+                    total_start,
+                )
+                .await?
             }
         }
     };

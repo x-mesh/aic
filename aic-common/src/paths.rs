@@ -72,6 +72,31 @@ pub fn aicd_registry_path() -> PathBuf {
     session_dir().join("aicd-registry.json")
 }
 
+/// daemonless mode에서 `aic`가 읽는 마지막 command record 경로.
+pub fn local_command_record_path() -> PathBuf {
+    session_dir().join("last-command.json")
+}
+
+/// shell hook start/end 사이의 임시 metadata 경로.
+pub fn local_hook_pending_path(session_id: &str, command_id: &str) -> PathBuf {
+    let safe_session = sanitize_path_token(session_id);
+    let safe_command = sanitize_path_token(command_id);
+    session_dir().join(format!("hook-pending-{safe_session}-{safe_command}.json"))
+}
+
+fn sanitize_path_token(value: &str) -> String {
+    let out: String = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .take(64)
+        .collect();
+    if out.is_empty() {
+        "none".to_string()
+    } else {
+        out
+    }
+}
+
 /// 소켓 경로에서 Session_ID를 추출한다.
 /// `session-{id}.sock` 형식의 파일명에서 `{id}` 부분을 반환한다.
 /// 형식이 맞지 않으면 `None`을 반환한다.
@@ -202,6 +227,20 @@ mod tests {
         let path = aicd_registry_path();
         assert_eq!(path.parent().unwrap(), session_dir());
         assert!(path.ends_with("aicd-registry.json"));
+    }
+
+    #[test]
+    fn local_command_record_path_under_session_dir() {
+        let path = local_command_record_path();
+        assert_eq!(path.parent().unwrap(), session_dir());
+        assert!(path.ends_with("last-command.json"));
+    }
+
+    #[test]
+    fn local_hook_pending_path_sanitizes_tokens() {
+        let path = local_hook_pending_path("../bad", "cmd/123!");
+        let name = path.file_name().unwrap().to_string_lossy();
+        assert_eq!(name, "hook-pending-bad-cmd123.json");
     }
 
     // ── extract_session_id tests ───────────────────────────────

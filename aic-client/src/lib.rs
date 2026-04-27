@@ -8,6 +8,7 @@ pub mod error_analyzer;
 pub mod hook_install;
 pub mod keychain;
 pub mod llm_dispatcher;
+pub mod local_record;
 pub mod redaction;
 pub mod repl;
 pub mod spinner;
