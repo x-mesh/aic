@@ -7,6 +7,10 @@ edition = "2021"
 name = "aic-session"
 path = "src/main.rs"
 
+[[bin]]
+name = "aicd"
+path = "src/aicd_main.rs"
+
 [dependencies]
 aic-common = { path = "../aic-common" }
 serde = { version = "1", features = ["derive"] }

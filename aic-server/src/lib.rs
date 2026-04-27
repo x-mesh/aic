@@ -1,4 +1,5 @@
 pub mod boundary_detector;
+pub mod control_server;
 pub mod lock;
 pub mod metrics;
 pub mod output_processor;

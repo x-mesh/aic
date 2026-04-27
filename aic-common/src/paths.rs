@@ -54,6 +54,17 @@ pub fn session_socket_path(session_id: &str) -> PathBuf {
     session_dir().join(format!("session-{}.sock", session_id))
 }
 
+/// `aicd` supervisor daemon의 control UDS 소켓 경로.
+/// 사용자당 하나만 존재한다.
+pub fn aicd_socket_path() -> PathBuf {
+    session_dir().join("aicd.sock")
+}
+
+/// `aicd` supervisor daemon의 PID lock 파일 경로.
+pub fn aicd_lock_path() -> PathBuf {
+    session_dir().join("aicd.pid")
+}
+
 /// 소켓 경로에서 Session_ID를 추출한다.
 /// `session-{id}.sock` 형식의 파일명에서 `{id}` 부분을 반환한다.
 /// 형식이 맞지 않으면 `None`을 반환한다.
