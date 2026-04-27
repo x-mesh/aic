@@ -32,6 +32,27 @@ pub enum IpcRequest {
     /// 현재 구현: `aicd`가 registry에서 PID를 찾아 `SIGTERM`을 보낸다.
     /// 향후 PTY ownership을 `aicd`가 가져오면 `aicd`가 직접 child를 종료한다.
     StopSession { id: String },
+    /// shell hook이 보내는 command-start 이벤트 (Phase 3).
+    ///
+    /// hook mode에서 `preexec`/`DEBUG trap`이 발화하며, 출력은 캡처하지 않고
+    /// metadata만 등록한다. `aicd` 미실행 시 hook은 silent skip.
+    CommandStarted {
+        session_id: String,
+        command_id: String,
+        command: String,
+        cwd: Option<std::path::PathBuf>,
+        shell: Option<String>,
+        pid: u32,
+        started_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// shell hook이 보내는 command-finish 이벤트 (Phase 3).
+    CommandFinished {
+        session_id: String,
+        command_id: String,
+        exit_code: i32,
+        finished_at: chrono::DateTime<chrono::Utc>,
+        duration_ms: u64,
+    },
 }
 
 /// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
@@ -275,6 +296,42 @@ mod tests {
             arb_session_info().prop_map(IpcRequest::RegisterSession),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::UnregisterSession { id }),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
+            (
+                "[0-9a-f]{1,8}",
+                "[0-9a-f]{1,16}",
+                "[a-z ]{1,40}",
+                proptest::option::of("[a-zA-Z0-9/_-]{1,32}".prop_map(std::path::PathBuf::from)),
+                proptest::option::of("[a-zA-Z0-9/_-]{1,32}"),
+                any::<u32>(),
+                0i64..4_102_444_800_000i64,
+            )
+                .prop_map(|(session_id, command_id, command, cwd, shell, pid, ts)| {
+                    IpcRequest::CommandStarted {
+                        session_id,
+                        command_id,
+                        command,
+                        cwd,
+                        shell,
+                        pid,
+                        started_at: chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+                    }
+                }),
+            (
+                "[0-9a-f]{1,8}",
+                "[0-9a-f]{1,16}",
+                any::<i32>(),
+                0i64..4_102_444_800_000i64,
+                any::<u64>(),
+            )
+                .prop_map(|(session_id, command_id, exit_code, ts, dur)| {
+                    IpcRequest::CommandFinished {
+                        session_id,
+                        command_id,
+                        exit_code,
+                        finished_at: chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+                        duration_ms: dur,
+                    }
+                }),
         ]
     }
 

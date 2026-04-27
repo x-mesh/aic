@@ -85,6 +85,12 @@ impl UdsClient {
         }
     }
 
+    /// fire-and-forget 송신용 generic wrapper. 응답을 그대로 돌려준다.
+    /// hook event 같은 best-effort 호출에서 사용한다.
+    pub async fn send_raw(&self, request: IpcRequest) -> Result<IpcResponse, AicError> {
+        self.send_request(request).await
+    }
+
     /// `aicd`에 특정 세션을 graceful 종료시키도록 요청한다 (Phase 2.1).
     pub async fn stop_session(&self, id: &str) -> Result<(), AicError> {
         match self

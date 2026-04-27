@@ -212,6 +212,43 @@ enum Commands {
         #[command(subcommand)]
         op: SessionOp,
     },
+    /// (internal) shell hook이 호출하는 metadata-only 이벤트 송신 (Phase 3).
+    /// 사용자 직접 호출 용도가 아니다 — `~/.aic/hook-events.{zsh,bash}`가 백그라운드로 실행한다.
+    #[command(name = "_hook-event", hide = true)]
+    HookEvent {
+        #[command(subcommand)]
+        op: HookEventOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookEventOp {
+    /// preexec/DEBUG-trap에서 발화 — command 시작 metadata 전송.
+    Start {
+        #[arg(long)]
+        session: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        command: String,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        shell: Option<String>,
+        #[arg(long)]
+        pid: u32,
+    },
+    /// precmd/PROMPT_COMMAND에서 발화 — command 종료 metadata 전송.
+    End {
+        #[arg(long)]
+        session: String,
+        #[arg(long = "command-id")]
+        command_id: String,
+        #[arg(long)]
+        exit: i32,
+        #[arg(long = "duration-ms", default_value = "0")]
+        duration_ms: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -295,6 +332,7 @@ async fn main() {
         Some(Commands::Session { op }) => match op {
             SessionOp::Stop { id } => handle_session_stop(id).await,
         },
+        Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -502,6 +540,52 @@ async fn handle_daemon_start() {
             std::process::exit(1);
         }
     }
+}
+
+/// `aic _hook-event {start,end}`: shell hook이 호출하는 metadata 송신.
+///
+/// 정책:
+/// - aicd가 미실행이면 silent skip + exit 0. shell prompt를 절대 막지 않는다.
+/// - 100ms timeout. shell prompt latency를 방해하면 안 된다.
+/// - 모든 출력은 stderr에만 (stdout 오염 금지).
+async fn handle_hook_event(op: HookEventOp) {
+    let sock = aic_common::aicd_socket_path();
+    let request = match op {
+        HookEventOp::Start {
+            session,
+            command_id,
+            command,
+            cwd,
+            shell,
+            pid,
+        } => aic_common::IpcRequest::CommandStarted {
+            session_id: session,
+            command_id,
+            command,
+            cwd: cwd.map(std::path::PathBuf::from),
+            shell,
+            pid,
+            started_at: chrono::Utc::now(),
+        },
+        HookEventOp::End {
+            session,
+            command_id,
+            exit,
+            duration_ms,
+        } => aic_common::IpcRequest::CommandFinished {
+            session_id: session,
+            command_id,
+            exit_code: exit,
+            finished_at: chrono::Utc::now(),
+            duration_ms,
+        },
+    };
+    let client = UdsClient::new(sock);
+    let send = async {
+        let _ = client.send_raw(request).await;
+    };
+    // 짧은 timeout — aicd가 hang 또는 미실행이면 프롬프트 멈추지 않게 즉시 포기.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), send).await;
 }
 
 /// `aic session stop <id>`: 특정 세션을 종료한다 (Phase 2.1).

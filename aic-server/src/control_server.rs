@@ -7,6 +7,7 @@
 //! Phase 1 sub-step 1: 최소 동작 — `Ping → Pong`만 처리한다. 이후 sub-step에서
 //! `ListSessions`, `GetMetrics`, `Shutdown` 등을 단계적으로 추가한다.
 
+use crate::hook_events::HookEventStore;
 use crate::session_registry::SessionRegistry;
 use aic_common::{encode_frame, IpcRequest, IpcResponse};
 use std::path::{Path, PathBuf};
@@ -16,11 +17,12 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
 /// Daemon 측에서 control_server가 외부 상태를 변경할 때 사용하는 핸들.
-/// shutdown trigger와 session registry를 보유한다.
+/// shutdown trigger, session registry, hook event buffer를 보유한다.
 #[derive(Clone)]
 pub struct ControlContext {
     pub shutdown: Arc<Notify>,
     pub registry: SessionRegistry,
+    pub hook_events: HookEventStore,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -137,10 +139,46 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             IpcResponse::Pong
         }
         IpcRequest::StopSession { id } => stop_session(ctx, &id).await,
-        // session-level request는 aicd의 책임이 아니다.
-        IpcRequest::GetLastCommand
-        | IpcRequest::GetRecentLines { .. }
-        | IpcRequest::GetMetrics => IpcResponse::Error {
+        IpcRequest::CommandStarted {
+            session_id,
+            command_id,
+            command,
+            cwd,
+            shell: _,
+            pid: _,
+            started_at,
+        } => {
+            ctx.hook_events
+                .on_started(&session_id, &command_id, command, cwd, started_at)
+                .await;
+            IpcResponse::Pong
+        }
+        IpcRequest::CommandFinished {
+            session_id,
+            command_id,
+            exit_code,
+            finished_at,
+            duration_ms,
+        } => {
+            ctx.hook_events
+                .on_finished(&session_id, &command_id, exit_code, finished_at, duration_ms)
+                .await;
+            IpcResponse::Pong
+        }
+        // hook mode에서 마지막 metadata-only record를 조회한다.
+        // 일반 GetLastCommand는 aic-session ring buffer 전용이지만, AIC_SESSION_ID가
+        // 있고 aicd hook_events에 record가 있으면 hook record를 반환한다.
+        IpcRequest::GetLastCommand => {
+            // Phase 3.x: 정확한 session 라우팅이 필요해 일단 graceful Error.
+            // 사용자가 aic --session <id> 형태로 호출하면 client가 적절히 routing.
+            IpcResponse::Error {
+                message: "aicd hook GetLastCommand는 세션 ID 라우팅을 거쳐야 합니다 \
+                    (--session 인자 사용)"
+                    .to_string(),
+            }
+        }
+        // 그 외 session-level request는 aicd의 책임이 아니다.
+        IpcRequest::GetRecentLines { .. } | IpcRequest::GetMetrics => IpcResponse::Error {
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
     }
@@ -204,6 +242,7 @@ mod tests {
         ControlContext {
             shutdown: Arc::new(Notify::new()),
             registry: SessionRegistry::new(),
+            hook_events: HookEventStore::new(),
         }
     }
 
@@ -345,13 +384,64 @@ mod tests {
 
     #[tokio::test]
     async fn session_data_request_rejected_with_error() {
-        let resp = process_control_request(IpcRequest::GetLastCommand, &ctx()).await;
+        // Phase 3 이후 GetLastCommand는 hook routing 안내 에러를, 나머지 세션-데이터 요청은
+        // 기존 "aicd는 세션 데이터" 에러를 반환한다.
+        let resp = process_control_request(IpcRequest::GetMetrics, &ctx()).await;
         match resp {
             IpcResponse::Error { message } => {
                 assert!(message.contains("aicd는 세션 데이터"), "actual: {message}");
             }
             other => panic!("Error 응답을 기대했지만 {other:?}"),
         }
+
+        let last = process_control_request(IpcRequest::GetLastCommand, &ctx()).await;
+        match last {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("세션 ID 라우팅"),
+                    "GetLastCommand 라우팅 안내 기대 — actual: {message}"
+                );
+            }
+            other => panic!("Error 응답을 기대했지만 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_event_pair_lands_in_store() {
+        let c = ctx();
+        let now = chrono::Utc::now();
+        let start = process_control_request(
+            IpcRequest::CommandStarted {
+                session_id: "abcd1234".to_string(),
+                command_id: "c1".to_string(),
+                command: "ls -la".to_string(),
+                cwd: Some(std::path::PathBuf::from("/tmp")),
+                shell: Some("/bin/zsh".to_string()),
+                pid: 9999,
+                started_at: now,
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(start, IpcResponse::Pong);
+
+        let end = process_control_request(
+            IpcRequest::CommandFinished {
+                session_id: "abcd1234".to_string(),
+                command_id: "c1".to_string(),
+                exit_code: 7,
+                finished_at: now,
+                duration_ms: 12,
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(end, IpcResponse::Pong);
+
+        let rec = c.hook_events.last("abcd1234").await.unwrap();
+        assert_eq!(rec.command.as_deref(), Some("ls -la"));
+        assert_eq!(rec.exit_code, 7);
+        assert_eq!(rec.capture_mode, aic_common::CaptureMode::Hook);
     }
 
     async fn ping_through_socket(sock_path: &Path) -> IpcResponse {

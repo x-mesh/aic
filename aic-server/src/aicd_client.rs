@@ -124,6 +124,7 @@ mod tests {
         let ctx = ControlContext {
             shutdown: Arc::new(Notify::new()),
             registry: registry.clone(),
+            hook_events: crate::hook_events::HookEventStore::new(),
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 

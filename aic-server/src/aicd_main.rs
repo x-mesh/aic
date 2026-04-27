@@ -11,6 +11,7 @@
 
 use aic_common::{aicd_lock_path, aicd_socket_path};
 use aic_server::control_server::{ControlContext, ControlServer};
+use aic_server::hook_events::HookEventStore;
 use aic_server::lock::DaemonLock;
 use aic_server::session_registry::SessionRegistry;
 use clap::Parser;
@@ -72,8 +73,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let registry = SessionRegistry::new();
+    let hook_events = HookEventStore::new();
     server
-        .serve(ControlContext { shutdown, registry })
+        .serve(ControlContext {
+            shutdown,
+            registry,
+            hook_events,
+        })
         .await;
     tracing::info!("aicd 종료");
     Ok(())

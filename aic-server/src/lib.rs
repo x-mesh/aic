@@ -1,6 +1,7 @@
 pub mod aicd_client;
 pub mod boundary_detector;
 pub mod control_server;
+pub mod hook_events;
 pub mod lock;
 pub mod metrics;
 pub mod output_processor;

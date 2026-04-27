@@ -132,7 +132,9 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)
         | IpcRequest::UnregisterSession { .. }
-        | IpcRequest::StopSession { .. } => IpcResponse::Error {
+        | IpcRequest::StopSession { .. }
+        | IpcRequest::CommandStarted { .. }
+        | IpcRequest::CommandFinished { .. } => IpcResponse::Error {
             message: format!(
                 "{request:?}는 aicd control plane 요청입니다 — aicd 소켓에 연결하세요"
             ),
