@@ -1,0 +1,128 @@
+# GoReleaser config (Rust builder) — pairs with .github/workflows/release.yml.
+#
+# Mirrors x-mesh/gk's release pipeline so the team uses one toolchain. The
+# only Rust-specific bits are `builder: rust` per build and the cargo-zigbuild
+# tool for cross-compilation (installed in the workflow).
+#
+# Three workspace binaries are each built as a separate entry so
+# GoReleaser can fan out across the four target triples, then bundled into
+# one archive per (os, arch) so a single brew install lays down all three.
+
+version: 2
+
+project_name: aic
+
+before:
+  hooks:
+    # Pre-fetch the lockfile so each cross-compile job doesn't re-resolve.
+    - cargo fetch --locked
+
+builds:
+  - id: aic-cli
+    builder: rust
+    binary: aic
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+    tool: cargo-zigbuild
+    flags:
+      - --release
+      - --bin=aic
+      - --manifest-path=aic-client/Cargo.toml
+
+  - id: aic-session
+    builder: rust
+    binary: aic-session
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+    tool: cargo-zigbuild
+    flags:
+      - --release
+      - --bin=aic-session
+      - --manifest-path=aic-server/Cargo.toml
+
+  - id: aicd
+    builder: rust
+    binary: aicd
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+    tool: cargo-zigbuild
+    flags:
+      - --release
+      - --bin=aicd
+      - --manifest-path=aic-server/Cargo.toml
+
+archives:
+  - id: aic-archive
+    # 한 tar.gz에 세 binary를 모두 담아 brew install이 한 번에 끝나게 한다.
+    ids:
+      - aic-cli
+      - aic-session
+      - aicd
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README.md
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  # GoReleaser가 git log에서 자동 생성. 조용한 carve-out 패턴은 gk와 동일.
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+
+brews:
+  - name: aic
+    repository:
+      owner: x-mesh
+      name: homebrew-tap
+      branch: main
+      # gk와 같은 secret 이름 — org-level이면 등록 불필요.
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/x-mesh/aic
+    description: "Shell command error analyzer with LLM (PTY wrapper + supervisor daemon)"
+    license: MIT
+    commit_author:
+      name: aic-bot
+      email: bot@x-mesh.dev
+    install: |
+      bin.install "aic"
+      bin.install "aic-session"
+      bin.install "aicd"
+    test: |
+      system "#{bin}/aic", "--version"
+      system "#{bin}/aic-session", "--version"
+      system "#{bin}/aicd", "--version"
+    caveats: |
+      To run aicd in the background and on login:
+
+        aic daemon install        # writes the right unit for your OS
+
+      What this does:
+        macOS  -> ~/Library/LaunchAgents/com.x-mesh.aicd.plist (launchctl)
+        Linux  -> ~/.config/systemd/user/aicd.service (systemctl --user)
+
+      First-time setup:
+        aic config                # interactive provider/api_key/model wizard
+        aic init zsh              # add 'source ~/.aic/hooks.zsh' to your rc

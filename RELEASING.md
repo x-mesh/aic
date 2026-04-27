@@ -1,68 +1,83 @@
 # Releasing aic
 
-> 새 버전을 GitHub Release로 게시하고 [`x-mesh/homebrew-tap`](https://github.com/x-mesh/homebrew-tap)의 Formula를 자동 갱신한다.
+> 새 버전을 GitHub Release로 게시하고 [`x-mesh/homebrew-tap`](https://github.com/x-mesh/homebrew-tap)의 Formula를 자동 갱신한다. `x-mesh/gk`와 동일한 GoReleaser 패턴.
 
 ## TL;DR
 
 ```sh
-# 1. CHANGELOG의 [Unreleased]를 [vX.Y.Z] 헤더로 닫기 (선택 — 비워둬도 됨)
-# 2. Cargo.toml 버전 bump (workspace 멤버 모두) — 스크립트 없으면 수동
+# 1. CHANGELOG의 [Unreleased]를 정리 (선택)
+# 2. workspace Cargo.toml 버전 bump
 # 3. tag + push
 git tag v0.3.0 -m "v0.3.0"
 git push origin v0.3.0
 ```
 
 이 한 번이 다음을 자동으로 트리거한다:
-- `.github/workflows/release.yml`이 발화
-- 소스 tarball SHA256 계산
-- CHANGELOG의 `[Unreleased]` 또는 `[v0.3.0]` 섹션을 release notes로 추출 + Homebrew 안내 footer 추가
-- `gh release create v0.3.0` (이미 있으면 update)
-- `x-mesh/homebrew-tap`에 Formula bump PR 자동 생성
+- `.github/workflows/release.yml`이 발화 (Rust toolchain + zig + cargo-zigbuild 설치)
+- GoReleaser가 4개 target triple로 binary 빌드:
+  - `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
+  - `x86_64-apple-darwin`, `aarch64-apple-darwin`
+- 각 (os, arch)별로 `aic_<version>_<os>_<arch>.tar.gz`에 `aic` + `aic-session` + `aicd` 세 binary 묶음
+- `checksums.txt` SHA256 자동 생성
+- GitHub Release 게시 (git log 기반 changelog)
+- `x-mesh/homebrew-tap/Formula/aic.rb` 자동 갱신 (4개 OS/arch url + sha256 + bin.install 3개)
 
 ## 사전 준비 (1회)
 
-### `HOMEBREW_TAP_TOKEN` secret 등록
+### `HOMEBREW_TAP_GITHUB_TOKEN` secret
 
-`mislav/bump-homebrew-formula-action`이 다른 repo (`x-mesh/homebrew-tap`)에 PR을 만들려면 별도 PAT이 필요하다. 기본 `GITHUB_TOKEN`은 동일 repo만 접근 가능.
+`x-mesh` org에 이미 `gk` release용 동일 이름 secret이 등록되어 있다면 **추가 작업 불필요** — org-level secret은 모든 repo에서 접근 가능. 그렇지 않다면:
 
 1. GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens
 2. **Resource owner**: `x-mesh`
 3. **Repository access**: only `x-mesh/homebrew-tap`
-4. **Permissions**:
-   - Contents: Read and write
-   - Pull requests: Read and write
-   - Metadata: Read (자동)
-5. 생성된 토큰을 `x-mesh/aic` repo의 Settings → Secrets and variables → Actions →
-   New repository secret으로 등록:
-   - **Name**: `HOMEBREW_TAP_TOKEN`
-   - **Value**: `<생성된 토큰>`
+4. **Permissions**: Contents (write), Pull requests (write), Metadata (read, 자동)
+5. 등록 위치 (둘 중 하나):
+   - **Org level (권장)**: `x-mesh` org Settings → Secrets and variables → Actions → New organization secret. Repository access는 "Selected repositories"로 `x-mesh/aic` (그리고 `x-mesh/gk`)만.
+   - **Repo level**: `x-mesh/aic` Settings → Secrets and variables → Actions → New repository secret.
+6. **Name**: `HOMEBREW_TAP_GITHUB_TOKEN`
 
-### `x-mesh/homebrew-tap`의 초기 Formula
+### `x-mesh/homebrew-tap`은 seed 불필요
 
-`packaging/homebrew/aic.rb`를 그대로 복사해 `x-mesh/homebrew-tap/Formula/aic.rb`에 둔다. 이후엔 release 워크플로우가 `url` + `sha256`만 자동 bump한다 (`bump-homebrew-formula-action`이 정규식으로 두 줄을 교체).
+GoReleaser의 `brews:` block이 첫 release에서 `Formula/aic.rb`를 직접 만든다. tap에 미리 placeholder Formula를 둘 필요 없음 — `gk.rb` 옆에 `aic.rb`가 자동으로 생긴다.
 
 ## 정상 흐름
 
 1. 작업 브랜치를 main에 머지.
-2. CHANGELOG 정리 — `## [Unreleased]` 아래 항목들을 점검하고, 필요하면 `## [v0.3.0]` 헤더로 한 번 더 감싼다 (워크플로우는 둘 중 하나를 매칭).
-3. workspace Cargo.toml 버전 bump — `aic-common`/`aic-server`/`aic-client` 모두 동일 버전.
+2. CHANGELOG 정리 — `## [Unreleased]` 아래 항목들이 release notes로 그대로 노출되지는 않는다 (GoReleaser는 git log 기반). 사람이 읽을 changelog는 따로 유지.
+3. workspace Cargo.toml 버전 bump (`aic-common`/`aic-server`/`aic-client` 모두 동일 버전).
 4. `git commit -am "release: v0.3.0"`.
 5. `git tag v0.3.0 -m "v0.3.0" && git push origin main v0.3.0`.
-6. Actions 탭에서 Release workflow가 그린이면 끝.
+6. Actions 탭에서 release workflow가 그린이면 끝.
 
 ## 수동 dry-run
 
-태그 없이 발화하려면 Actions → Release → "Run workflow"에서 `tag: v0.3.0-rc1` 같이 넣는다. 같은 tag로 재실행 시 release는 update, Formula PR은 idempotent하게 갱신된다.
+태그 없이 발화하려면 Actions → release → "Run workflow"에서 그냥 실행. 이때 GoReleaser는 `--snapshot` 모드가 아니므로 실제 release 시도 — tag가 없으면 실패한다. 진정한 dry-run이 필요하면 `args: release --snapshot --skip=publish --clean`으로 임시 변경 후 실행.
+
+`.goreleaser.yaml` 자체 syntax 검증만 빠르게 하려면 로컬에서:
+
+```sh
+brew install goreleaser/tap/goreleaser
+goreleaser check
+```
 
 ## 트러블슈팅
 
 | 증상 | 원인 / 해결 |
 |---|---|
-| `Resource not accessible by integration` (bump-formula step) | `HOMEBREW_TAP_TOKEN` 미등록 또는 권한 부족. 위 사전 준비 확인. |
-| Formula PR이 안 열림 | bump-homebrew-formula-action이 url/sha256 정규식 매칭에 실패. `Formula/aic.rb`의 `url "..."` / `sha256 "..."` 줄이 한 줄에 있는지 확인. |
-| Release notes가 비어 있음 | CHANGELOG에 `## [Unreleased]` 섹션 자체가 없음. 워크플로우가 `Release <tag>` 한 줄로 fallback. |
-| SHA256이 사용자 환경과 다름 | GitHub source tarball은 deterministic하지만 timezone/내용이 바뀌면 달라짐. Formula bump는 워크플로우가 계산한 값을 사용하므로 신경쓰지 않아도 됨. |
+| `HOMEBREW_TAP_GITHUB_TOKEN: required` | org/repo secret 미등록. 위 사전 준비 섹션 확인. |
+| zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. 워크플로우의 `mlugg/setup-zig` 버전과 `cargo-zigbuild` 버전을 함께 bump. |
+| `aarch64-apple-darwin` 빌드만 실패 | macOS SDK 이슈. zigbuild는 SDK 없이 동작하지만 일부 crate(`portable-pty`/`libc` 등)가 native 헤더를 요구할 수 있음. 그 경우 macos-latest runner 별도 matrix로 split. |
+| Formula PR이 안 열림 | secret 권한 부족(`Resource not accessible`). PAT scope를 `Contents + Pull requests write`로 다시 발급. |
+| Release notes가 휑함 | git log 필터(`docs:`/`test:`/`chore:`/Merge PR)가 너무 광범위. `.goreleaser.yaml`의 `changelog.filters.exclude` 조정. |
 
-## 왜 binary artifact를 빌드하지 않나
+## 왜 source-build Formula(cargo install)를 안 쓰는가
 
-Homebrew는 source build (Formula의 `system "cargo", "install", ...`)로도 충분하고, 그 편이 platform별 binary 배포보다 단순하다. Linux/macOS, x86_64/aarch64 모두 자동 처리된다. binary release가 필요해지면 (예: Rust toolchain 없는 환경) `release.yml`에 별도 matrix job을 추가한다.
+이전 commit에서 `packaging/homebrew/aic.rb` (source-build) 초안을 두었다가 GoReleaser 도입과 함께 제거했다. 이유:
+
+- gk와 같은 패턴으로 통일 (팀 한 토큰, 한 워크플로우 마인드).
+- `brew install` 시 Rust toolchain 불필요 (binary 다운로드).
+- `brew install` 속도가 압도적으로 빠름 (cargo build 30초+ → tar.gz 다운로드 1초).
+- multi-arch가 자동 — `Hardware::CPU.intel?` / `Hardware::CPU.arm?` 분기를 GoReleaser가 알아서 만든다.
+
+toolchain만 있는 환경(예: Docker 빌드)에서 binary 없이 빌드하려면 `cargo install --git https://github.com/x-mesh/aic`로 우회.

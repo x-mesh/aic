@@ -71,22 +71,35 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
 
-### Added — Release workflow + Homebrew Formula auto-bump
+### Added — Release workflow (GoReleaser, gk 패턴 통일)
 
-`v*` 태그 push 한 번으로 GitHub Release 생성과 `x-mesh/homebrew-tap`
-Formula 자동 갱신까지 처리. release 절차 문서는 `RELEASING.md`.
+`v*` 태그 push 한 번으로 multi-arch binary 빌드 + GitHub Release +
+`x-mesh/homebrew-tap` Formula 자동 갱신까지 처리. `x-mesh/gk`와 동일한
+GoReleaser 파이프라인이라 팀 한 secret/한 멘탈 모델로 통일.
 
+- **`.goreleaser.yaml`**:
+  - 3 binary(`aic`/`aic-session`/`aicd`) × 4 target triple(linux/darwin
+    × x86_64/aarch64) = 12 cross-compile job
+  - `builder: rust` + `tool: cargo-zigbuild`로 ubuntu runner 단일에서
+    darwin/linux 모두 cross-compile
+  - 한 (os, arch)당 tar.gz 1개에 세 binary 모두 묶어 `brew install`
+    한 번에 끝나게 함
+  - `brews:` block이 `x-mesh/homebrew-tap/Formula/aic.rb`를 자동
+    생성/갱신 — `Hardware::CPU.intel? / arm?` 분기 + url + sha256 +
+    `bin.install` 3줄 + caveats(aic daemon install 안내)
 - **`.github/workflows/release.yml`**:
-  1. tag push (`v*`) 또는 manual dispatch로 발화
-  2. GitHub source tarball SHA256 계산
-  3. CHANGELOG의 `[Unreleased]` 또는 `[v<version>]` 섹션을 awk로 추출해
-     release notes로 사용 + Homebrew 설치 안내 footer 자동 첨부
-  4. `gh release create/edit`로 Release 게시 (idempotent)
-  5. `mislav/bump-homebrew-formula-action@v3`로
-     `x-mesh/homebrew-tap/Formula/aic.rb`의 `url` + `sha256` 자동 bump PR
-- **`HOMEBREW_TAP_TOKEN` secret** — fine-grained PAT, scope: tap repo의
-  Contents + Pull requests write. 등록 절차는 `RELEASING.md` 참조.
-- **수동 dry-run** 지원 — Actions UI에서 `tag` 입력으로 발화 가능.
+  - `tags: ['v*']` push 또는 workflow_dispatch로 발화
+  - Rust stable + 4 targets 설치 → cargo registry 캐시 → setup-zig +
+    cargo-zigbuild 설치 → `goreleaser check` → `goreleaser release --clean`
+  - `HOMEBREW_TAP_GITHUB_TOKEN` secret (gk와 동일 — org-level이면
+    추가 등록 불필요)
+- **`packaging/homebrew/aic.rb` 제거** — source-build Formula는
+  GoReleaser binary path와 충돌하므로 단일 출처화 (GoReleaser가 master).
+- **`RELEASING.md`** — TL;DR, secret 등록 절차(org-level 우선), 수동
+  dry-run, 트러블슈팅, "왜 source-build를 안 쓰는가" 결정 기록.
+
+이전 minimum 워크플로우(`mislav/bump-homebrew-formula-action` +
+source tarball)는 GoReleaser 패턴으로 완전 교체됐다.
 
 ### Added — `aic daemon install` / `uninstall` (OS-native auto-start)
 
