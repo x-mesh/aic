@@ -8,6 +8,17 @@
 
 use aic_common::{resolve_socket_path, AicError};
 use proptest::prelude::*;
+use std::sync::{Mutex, MutexGuard};
+
+// process-global `XDG_RUNTIME_DIR`를 set/remove하는 테스트들이 병렬로 돌면
+// 서로의 setup을 덮어 쓰므로 race가 난다 (CI에서 발견됨). 한 곳에서만 변경하도록 직렬화.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ── Unit tests: 구체적 counterexample 탐색 ─────────────────────
 
@@ -42,6 +53,7 @@ fn socket_path_macos_should_contain_aic_prefix() {
 
 #[test]
 fn socket_path_linux_xdg_should_contain_aic_prefix() {
+    let _g = env_lock();
     std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
     let path = resolve_socket_path("linux");
     std::env::remove_var("XDG_RUNTIME_DIR");
@@ -99,6 +111,7 @@ proptest! {
     /// 임의의 XDG 경로에서 Linux 소켓 경로가 aic prefix를 사용하는지 검증
     #[test]
     fn socket_path_linux_xdg_uses_aic_prefix(xdg_dir in arb_absolute_path()) {
+        let _g = env_lock();
         std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
         let path = resolve_socket_path("linux");
         std::env::remove_var("XDG_RUNTIME_DIR");
@@ -117,6 +130,7 @@ proptest! {
     /// 임의의 OS에서 XDG 미설정 시 소켓 경로가 aic prefix를 사용하는지 검증
     #[test]
     fn socket_path_without_xdg_uses_aic_prefix(os in arb_os()) {
+        let _g = env_lock();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let path = resolve_socket_path(os);
 
