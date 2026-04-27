@@ -24,7 +24,7 @@ Thumbs.db
 .kiro/
 .xm/
 .omc/
-
+.claude/settings.local.json
 # AI-suggested
 coverage/
 aic-client/.cargo/registry/
