@@ -282,6 +282,14 @@ enum DaemonOp {
     Start,
     /// aicd에 graceful Shutdown을 요청한다.
     Stop,
+    /// 부팅 시 자동 시작용 OS unit을 설치한다 (macOS launchd / Linux systemd --user).
+    Install {
+        /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
+        #[arg(long)]
+        no_load: bool,
+    },
+    /// 자동 시작 unit을 unload + 제거한다.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -342,6 +350,8 @@ async fn main() {
             DaemonOp::Status => handle_daemon_status().await,
             DaemonOp::Start => handle_daemon_start().await,
             DaemonOp::Stop => handle_daemon_stop().await,
+            DaemonOp::Install { no_load } => handle_daemon_install(no_load),
+            DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
         Some(Commands::Session { op }) => match op {
             SessionOp::Stop { id } => handle_session_stop(id).await,
@@ -505,6 +515,83 @@ async fn handle_daemon_status() {
         _ => {
             println!("  status: {COL_DIM}stopped{COL_RESET}");
             println!("  start with: {COL_BOLD}aic daemon start{COL_RESET}");
+        }
+    }
+
+    // 자동 시작 unit 설치 상태 (Phase 5)
+    if let Some(unit) = aic_client::daemon_install::current_unit_path() {
+        let installed = unit.exists();
+        let label = if installed {
+            format!("{COL_GREEN}installed{COL_RESET}")
+        } else {
+            format!(
+                "{COL_DIM}not installed (run: {COL_BOLD}aic daemon install{COL_RESET}{COL_DIM}){COL_RESET}"
+            )
+        };
+        println!("  autostart: {label}");
+        if installed {
+            println!("    {COL_DIM}unit: {}{COL_RESET}", unit.display());
+        }
+    }
+}
+
+/// `aic daemon install [--no-load]`: OS-native auto-start unit 설치.
+fn handle_daemon_install(no_load: bool) {
+    match aic_client::daemon_install::install(no_load) {
+        Ok(report) => {
+            let plat = match report.platform {
+                aic_client::daemon_install::Platform::Macos => "macOS launchd",
+                aic_client::daemon_install::Platform::Linux => "Linux systemd --user",
+                aic_client::daemon_install::Platform::Unsupported => "unsupported",
+            };
+            println!("{COL_GREEN}✓{COL_RESET} {plat} unit 설치 완료");
+            println!("  unit:    {}", report.unit_path.display());
+            println!("  aicd:    {}", report.aicd_path.display());
+            println!("  logs:    {}/aicd.{{out,err}}.log", report.log_dir.display());
+            if report.loaded {
+                println!(
+                    "  loaded:  {COL_GREEN}yes{COL_RESET} — 부팅 시 자동 시작 + 즉시 실행"
+                );
+            } else {
+                let cmd = match report.platform {
+                    aic_client::daemon_install::Platform::Macos => {
+                        "launchctl bootstrap gui/$UID <plist>"
+                    }
+                    _ => "systemctl --user enable --now aicd.service",
+                };
+                println!(
+                    "  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 설치 실패: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `aic daemon uninstall`: unit unload + 파일 제거.
+fn handle_daemon_uninstall() {
+    match aic_client::daemon_install::uninstall() {
+        Ok(report) => {
+            let plat = match report.platform {
+                aic_client::daemon_install::Platform::Macos => "macOS launchd",
+                aic_client::daemon_install::Platform::Linux => "Linux systemd --user",
+                aic_client::daemon_install::Platform::Unsupported => "unsupported",
+            };
+            if report.removed {
+                println!("{COL_GREEN}✓{COL_RESET} {plat} unit 제거 완료");
+                println!("  unit: {}", report.unit_path.display());
+            } else {
+                println!(
+                    "{COL_DIM}{plat} unit 파일이 이미 없습니다 (이전 unload만 정리){COL_RESET}"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 제거 실패: {e}");
+            std::process::exit(1);
         }
     }
 }

@@ -2,6 +2,7 @@ pub mod audit;
 pub mod auto_brancher;
 pub mod cache;
 pub mod config;
+pub mod daemon_install;
 pub mod doctor;
 pub mod error_analyzer;
 pub mod hook_install;

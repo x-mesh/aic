@@ -71,6 +71,41 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
 
+### Added — `aic daemon install` / `uninstall` (OS-native auto-start)
+
+부팅 시 `aicd` 자동 시작을 한 명령으로 양 OS 모두 처리. `brew services`는
+macOS launchd만 잘 통합하고 Linux brew에선 stub이라 이 경로를 직접 둔다.
+
+- **macOS**: `~/Library/LaunchAgents/com.x-mesh.aicd.plist`
+  - `RunAtLoad=true`, `KeepAlive=true`, `ProcessType=Background`
+  - stdout/stderr → `~/.local/state/aic/aicd.{out,err}.log`
+  - `launchctl bootstrap gui/$UID <plist>` (modern), 실패 시 `launchctl load`
+    fallback. uninstall은 `bootout`/`unload` 둘 다 시도.
+- **Linux**: `~/.config/systemd/user/aicd.service` (또는 `$XDG_CONFIG_HOME`)
+  - `Type=simple`, `Restart=on-failure`, `WantedBy=default.target`
+  - `systemctl --user daemon-reload && enable --now aicd.service`. uninstall은
+    `disable --now` + `daemon-reload`.
+- **공통**: `--no-load`로 파일만 쓰고 OS 호출은 건너뛸 수 있음 (CI / 시스템
+  영향 없는 dry-run). 멱등 — 같은 내용이면 mtime 보존을 위해 write도 skip.
+  Unit 내용이 바뀌면 자동 재작성.
+- **`aic daemon status`** 가 unit 설치 상태도 함께 표시
+  (`autostart: installed (unit: ...)` 또는 `not installed (run: aic daemon install)`).
+- **`aicd` 경로 결정**: `current_exe()` 옆의 `aicd`를 우선 사용 (brew/cargo
+  install 모두 같은 디렉토리에 둠). 없으면 PATH fallback.
+
+테스트:
+- `daemon_install::tests` 5개 — plist/unit 렌더링, OS 감지,
+  `XDG_CONFIG_HOME` 존중, plist 경로 형식. OS 호출은 manual smoke로 검증
+  (임시 HOME으로 install/uninstall 사이클 PASS).
+
+사용자 흐름:
+```sh
+brew install x-mesh/tap/aic   # 또는 source 빌드
+aic daemon install            # 부팅 시 자동 시작 + 즉시 실행
+aic daemon status             # ✓ running, ✓ installed
+aic daemon uninstall          # 정리
+```
+
 ### Fixed — CLI Backend(`kiro-cli`/`claude`) 호출 형식 수정
 
 `send_cli`가 prompt를 첫 positional argument로 그대로 전달하는 바람에:
