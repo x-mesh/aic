@@ -52,13 +52,18 @@ impl SessionRegistry {
     pub async fn list(&self) -> Vec<SessionInfo> {
         let guard = self.inner.read().await;
         let mut out: Vec<SessionInfo> = guard.values().cloned().collect();
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|s| s.created_at);
         out
     }
 
     /// 등록된 세션 수.
     pub async fn len(&self) -> usize {
         self.inner.read().await.len()
+    }
+
+    /// 등록된 세션이 없는지 확인. clippy `len_without_is_empty` 보강.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.read().await.is_empty()
     }
 }
 

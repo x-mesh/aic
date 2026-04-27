@@ -100,7 +100,8 @@ pub fn list_session_sockets_in(dir: &Path) -> Vec<PathBuf> {
             Some((p, mtime))
         })
         .collect();
-    paths.sort_by(|a, b| b.1.cmp(&a.1));
+    // mtime 내림차순(최신 우선). clippy::unnecessary_sort_by 회피용 sort_by_key + Reverse.
+    paths.sort_by_key(|p| std::cmp::Reverse(p.1));
     paths.into_iter().map(|(p, _)| p).collect()
 }
 
