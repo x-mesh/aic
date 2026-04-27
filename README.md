@@ -1,126 +1,128 @@
 # aic
 
-> 셸 명령어 에러를 자동으로 분석하고 수정 명령어를 제안하는 지능형 CLI 도우미
+> An intelligent CLI assistant that automatically analyzes shell command errors and suggests fix commands
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
+**Languages:** English · [한국어](./README.ko.md)
+
 ## Overview
 
-`aic`는 터미널에서 명령어 실행 중 발생하는 에러를 LLM으로 분석하여 원인을 설명하고 수정 명령어를 제안하는 도구입니다.
+`aic` is a tool that uses an LLM to analyze errors that occur during command execution in your terminal, explain their cause, and suggest fix commands.
 
-PTY 기반 셸 래퍼 데몬(`aic-session`)이 사용자의 셸을 투명하게 감싸서 입출력을 중계하면서 출력을 캡처하고, CLI 클라이언트(`aic`)가 직전 명령어의 exit code에 따라 자동으로 에러 분석 또는 Interactive REPL 모드로 분기합니다.
+A PTY-based shell wrapper daemon (`aic-session`) transparently wraps your shell, relaying I/O while capturing output. The CLI client (`aic`) then automatically branches into either error-analysis mode or an interactive REPL based on the previous command's exit code.
 
-추가로, 사용자당 하나의 supervisor daemon(`aicd`)이 세션 lifecycle/registry/cleanup을 중앙 관리하고, 출력 캡처가 부담스러운 워크플로우를 위한 metadata-only **hook capture mode**도 제공합니다 (PRD: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
+In addition, a per-user supervisor daemon (`aicd`) centrally manages session lifecycle, registry, and cleanup, and a metadata-only **hook capture mode** is available for workflows where output capture would be too costly (PRDs: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
 
 ```mermaid
 graph LR
-    User[사용자 터미널] --> Session[aic-session]
-    Session -->|PTY 중계| Shell[셸 zsh/bash]
-    Session -->|출력 캡처| RB[Ring Buffer]
+    User[User Terminal] --> Session[aic-session]
+    Session -->|PTY relay| Shell[Shell zsh/bash]
+    Session -->|capture output| RB[Ring Buffer]
     Session -.register/unregister.-> AICD[aicd supervisor]
     Hook[shell hook] -.metadata only.-> AICD
     Client[aic] -->|UDS| Session
     Client -->|control UDS| AICD
-    Client -->|에러 분석| LLM[LLM Provider]
+    Client -->|error analysis| LLM[LLM Provider]
 ```
 
 ## Features
 
 ### Core
-- ✅ PTY 셸 래퍼 — 기존 워크플로우 변경 없이 투명하게 출력 캡처
-- ✅ 명령어 경계 감지 — OSC 133 마커 + Timing Heuristic 폴백
-- ✅ 에러 자동 분석 — exit code ≠ 0이면 LLM으로 원인 분석 및 수정 제안
-- ✅ Interactive REPL — exit code = 0이면 LLM과 자유 대화
-- ✅ 다중 LLM Provider — OpenAI 호환, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
-- ✅ TUI 호환 — Alternate Screen Buffer 감지로 vim, htop 등 정상 동작
-- ✅ Cross-Platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
+- ✅ PTY shell wrapper — captures output transparently without changing your existing workflow
+- ✅ Command boundary detection — OSC 133 markers + timing-heuristic fallback
+- ✅ Automatic error analysis — when exit code ≠ 0, the LLM explains the cause and suggests fixes
+- ✅ Interactive REPL — when exit code = 0, freeform chat with the LLM
+- ✅ Multiple LLM providers — OpenAI-compatible, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
+- ✅ TUI compatibility — alternate-screen-buffer detection keeps vim, htop, etc. working correctly
+- ✅ Cross-platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
 
-### 안정성·진단
-- ✅ 단일 인스턴스 보장 — `fcntl(F_SETLK)` PID lock + stale 자동 정리
-- ✅ Graceful shutdown — SIGTERM/SIGINT 핸들링, drain 후 cleanup
-- ✅ 구조화 trace 로그 — JSONL daily rotate (7일 보존), `AIC_LOG=info|debug`
-- ✅ `aic doctor` — 8축 환경 진단 (config/데몬/셸hook/LLM endpoint/keychain/audit)
-- ✅ `aic status` — 데몬 PID/ping/마지막 명령어 1회 출력
+### Reliability & Diagnostics
+- ✅ Single-instance guarantee — `fcntl(F_SETLK)` PID lock with automatic stale cleanup
+- ✅ Graceful shutdown — SIGTERM/SIGINT handling, drain then cleanup
+- ✅ Structured trace logs — JSONL daily-rotate (7-day retention), `AIC_LOG=info|debug`
+- ✅ `aic doctor` — 8-axis environment diagnosis (config / daemon / shell hook / LLM endpoint / keychain / audit)
+- ✅ `aic status` — daemon PID / ping / last command, one-shot output
 
-### 보안 baseline
-- ✅ Secret/PII redaction — secret 5종(AWS/GitHub/OpenAI/Anthropic/JWT) + PII 4종(email/한국 전화/주민번호/IPv4) 자동 마스킹, `AIC_REDACT=off` opt-out
-- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, `aic audit verify` 무결성 검증
-- ✅ OS keychain — macOS Keychain / Linux Secret Service / Windows Credential Manager로 API key 저장, `aic migrate-keys`로 평문 일괄 이동
+### Security baseline
+- ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
+- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, integrity verification via `aic audit verify`
+- ✅ OS keychain — store API keys in macOS Keychain / Linux Secret Service / Windows Credential Manager; bulk migrate plaintext via `aic migrate-keys`
 
 ### LLM UX
-- ✅ Streaming — OpenAI-compat 자동 streaming (TTY 환경), `AIC_NO_STREAM=1` opt-out
-- ✅ 결과 캐시 — 같은 (cmd, exit, output) 24h TTL, 즉시 응답
-- ✅ Dry-run 미리보기 — `aic --dry-run "..."`로 토큰·비용·timeout 사전 확인
-- ✅ Retry circuit breaker — 60s window 5회 실패 시 30s fail-fast
-- ✅ i18n 자동 감지 — `lang = "auto"` 시 `$LC_ALL`/`$LANG` 추론
+- ✅ Streaming — automatic streaming for OpenAI-compatible providers (in TTY environments); opt-out via `AIC_NO_STREAM=1`
+- ✅ Result cache — same (cmd, exit, output) for 24h TTL, instant response
+- ✅ Dry-run preview — `aic --dry-run "..."` previews tokens, cost, and timeout in advance
+- ✅ Retry circuit breaker — after 5 failures within a 60s window, fail-fast for 30s
+- ✅ i18n auto-detect — when `lang = "auto"`, infer from `$LC_ALL` / `$LANG`
 
 ### Onboarding
-- ✅ `aic init zsh|bash` — 셸 hook 자동 설치 (마커 기반 멱등)
-- ✅ `aic init --hook-mode` — Phase 3 metadata-only hook 추가 설치
-- ✅ `aic config` 인터랙티브 wizard
+- ✅ `aic init zsh|bash` — automatic shell-hook installation (idempotent via markers)
+- ✅ `aic init --hook-mode` — additionally install Phase 3 metadata-only hook
+- ✅ `aic config` interactive wizard
 
-### Supervisor / Capture Modes (신규)
-- ✅ `aicd` supervisor daemon — 사용자당 1개. 세션 registry, control UDS,
+### Supervisor / Capture Modes (new)
+- ✅ `aicd` supervisor daemon — one per user. Session registry, control UDS,
   graceful shutdown
-- ✅ `aic daemon { status | start | stop }` — supervisor 제어
-- ✅ `aic session stop <id>` — registry 기반 세션 종료
+- ✅ `aic daemon { status | start | stop }` — supervisor control
+- ✅ `aic session stop <id>` — registry-backed session termination
 - ✅ `aic sessions` — aicd registry-first, fallback to socket scan
-- ✅ Hook capture mode — `~/.aic/hook-events.{zsh,bash}`로 metadata만 수집
+- ✅ Hook capture mode — collects metadata only via `~/.aic/hook-events.{zsh,bash}`
 - ✅ `aic run -- <cmd>` — explicit FullOutput capture wrapper
-- ✅ `CommandRecord.capture_mode/quality` + 분석 시 capture quality hint
+- ✅ `CommandRecord.capture_mode/quality` + capture-quality hint during analysis
 
 ### Roadmap
-- 🚧 `aic-proxy` — LLM API 프록시 서버 (개발 예정)
-- 🚧 PTY ownership을 `aicd`로 이동 (PRD-AICD-SUPERVISOR Phase 2 본 구현)
-- 🚧 `aic capture-last` — destructive command 감지 + confirm UX
-- 🚧 launchd/systemd unit 자동 설치
+- 🚧 `aic-proxy` — LLM API proxy server (planned)
+- 🚧 Move PTY ownership into `aicd` (full implementation of PRD-AICD-SUPERVISOR Phase 2)
+- 🚧 `aic capture-last` — destructive-command detection + confirm UX
+- 🚧 Automatic launchd / systemd unit installation
 
-## 동작 원리
+## How it works
 
-1. `aic-session`이 사용자의 기본 셸을 PTY 자식 프로세스로 실행
-2. 셸 입출력을 투명하게 중계하면서, ANSI Escape를 제거한 clean text를 Ring Buffer에 저장
-3. OSC 133 마커 또는 Timing Heuristic으로 명령어 경계를 식별하여 CommandRecord 생성
-4. 사용자가 `aic`를 실행하면 UDS를 통해 직전 명령어 데이터를 조회
-5. exit code에 따라 에러 분석(LLM) 또는 Interactive REPL로 자동 분기
+1. `aic-session` runs your default shell as a PTY child process
+2. It transparently relays shell I/O while saving an ANSI-stripped clean-text copy into a ring buffer
+3. OSC 133 markers or a timing heuristic identify command boundaries and produce a `CommandRecord`
+4. When you run `aic`, it queries the previous command's data via UDS
+5. Based on exit code it auto-branches into error analysis (LLM) or an interactive REPL
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.75+ (2021 edition)
-- macOS 또는 Linux
-- LLM API key (OpenAI, Anthropic, Groq 등) 또는 CLI Backend (kiro-cli, claude-cli)
+- macOS or Linux
+- An LLM API key (OpenAI, Anthropic, Groq, etc.) or a CLI Backend (kiro-cli, claude-cli)
 
-### 빌드 및 설치
+### Build & Install
 
 #### Homebrew (macOS / Linux)
 
 ```bash
 brew tap x-mesh/tap
 brew install aic
-# 자동 시작은 설치 후 한 번:
-aic daemon install     # macOS launchd / Linux systemd user unit 자동 분기
+# Enable autostart, once after install:
+aic daemon install     # auto-branches between macOS launchd and Linux systemd user unit
 ```
 
-`brew services`는 macOS launchd만 잘 통합하고 Linux systemd 통합이 부실해서
-`aic daemon install`이 양 OS 모두를 일관되게 처리합니다.
+`brew services` integrates well with macOS launchd but its Linux-systemd
+integration is weak, so `aic daemon install` handles both OSes consistently.
 
-#### Source 빌드
+#### Build from source
 
 ```bash
 git clone https://github.com/x-mesh/aic.git && cd aic
 cargo build --workspace --release
-cargo install --path aic-server   # aic-session + aicd 설치
-cargo install --path aic-client   # aic 설치
+cargo install --path aic-server   # installs aic-session + aicd
+cargo install --path aic-client   # installs aic
 ```
 
-또는 Makefile 사용:
+Or via Makefile:
 
 ```bash
 make install
 ```
 
-### 설정
+### Configuration
 
 ```bash
 mkdir -p ~/.config/aic
@@ -142,75 +144,75 @@ model = "gpt-4o"
 EOF
 ```
 
-### 사용
+### Usage
 
 ```bash
-# 1. 첫 셋업 — config + 셸 hook 자동 설치
-aic config             # provider/api_key/model 인터랙티브 설정
-aic init zsh           # ~/.zshrc에 'source ~/.aic/hooks.zsh' 멱등 추가
-aic migrate-keys       # 평문 API key를 OS keychain으로 이동 (선택)
-aic doctor             # 9축 진단 — PASS/WARN/FAIL 한눈에 확인
+# 1. First-time setup — config + automatic shell-hook install
+aic config             # interactive provider/api_key/model setup
+aic init zsh           # idempotently appends 'source ~/.aic/hooks.zsh' to ~/.zshrc
+aic migrate-keys       # move plaintext API keys into the OS keychain (optional)
+aic doctor             # 9-axis diagnosis — see PASS/WARN/FAIL at a glance
 
-# 2. (선택) supervisor 시작 — 멀티 세션 lifecycle 중앙 관리
-aic daemon start       # aicd 백그라운드 spawn
-aic daemon status      # 떠 있는지 + 등록 세션 수 확인
+# 2. (optional) Start the supervisor — central multi-session lifecycle
+aic daemon start       # spawns aicd in the background
+aic daemon status      # check liveness + registered session count
 
-# 3. aic-session으로 셸 시작 — aicd가 떠 있으면 자동 register
+# 3. Start a shell with aic-session — auto-registers if aicd is up
 aic-session
 
-# 4. 평소처럼 명령어 실행
-cargo build   # 에러 발생!
+# 4. Use commands as usual
+cargo build   # error!
 
-# 5. aic로 에러 분석
+# 5. Analyze the error with aic
 aic
-# → LLM이 에러 원인을 설명하고 수정 명령어를 제안 (TTY는 자동 streaming)
+# → LLM explains the cause and suggests fix commands (auto-streams in TTY)
 
-# 6. 에러가 없을 때 aic 실행하면 REPL 모드
+# 6. Running aic with no error → REPL mode
 aic
-# → LLM과 자유 대화 (exit/quit/Ctrl+D로 종료)
+# → Freeform chat with the LLM (exit/quit/Ctrl+D to leave)
 
-# 7. 직접 질문 + dry-run으로 비용 미리보기
-aic --dry-run "이 에러 어떻게 해결해?"
+# 7. Direct question + dry-run for cost preview
+aic --dry-run "how do I fix this error?"
 
-# 8. 운영
-aic status             # 데몬 PID/ping/마지막 명령어
-aic sessions           # 모든 활성 세션 (aicd registry-first)
-aic session stop <id>  # 특정 세션 종료 (aicd 필요)
-aic audit verify       # audit log HMAC chain 무결성 (exit 0/2/3)
+# 8. Operations
+aic status             # daemon PID / ping / last command
+aic sessions           # all active sessions (aicd registry-first)
+aic session stop <id>  # terminate a specific session (requires aicd)
+aic audit verify       # audit-log HMAC-chain integrity (exit 0/2/3)
 ```
 
-### 옵션: Hook capture mode (PTY wrapper 없이 metadata만)
+### Optional: Hook capture mode (metadata only, no PTY wrapper)
 
-PTY 래핑 부담 없이 명령어 metadata만 수집하고 싶을 때:
+When you want to collect command metadata without paying the PTY-wrapping cost:
 
 ```bash
-aic daemon start                    # aicd 필수 (hook 이벤트 수신)
-aic init zsh --hook-mode            # ~/.aic/hook-events.zsh 설치
-exec zsh                            # 새 셸 → preexec/precmd hook 활성
+aic daemon start                    # aicd required (receives hook events)
+aic init zsh --hook-mode            # installs ~/.aic/hook-events.zsh
+exec zsh                            # new shell → preexec/precmd hooks active
 
-# 평소처럼 명령어 실행 — aic-session 없어도 metadata 누적
+# Run commands as usual — metadata accumulates without aic-session
 ls -la
 cargo build
 
-# 정확한 출력이 필요할 때만 explicit capture
-aic run -- cargo build              # stdout/stderr 보존, exit code 그대로
+# Use explicit capture only when exact output is needed
+aic run -- cargo build              # preserves stdout/stderr and exit code
 ```
 
-### 환경 변수
+### Environment variables
 
-| 변수 | 효과 |
+| Variable | Effect |
 |---|---|
-| `AIC_LOG=info|debug|trace` | aic-session/aicd tracing 레벨 (기본 info) |
-| `AIC_REDACT=off` | secret/PII redaction 비활성 (audit 기록됨) |
-| `AIC_NO_STREAM=1` | streaming 비활성 (spinner + sectional 출력) |
-| `AIC_DEBUG=1` | client `[debug +X.XXXs]` prefix 출력 |
-| `AIC_SESSION_ID` | 활성 세션 ID. `aic-session`이 자동 export, hook도 참조 |
+| `AIC_LOG=info|debug|trace` | aic-session/aicd tracing level (default info) |
+| `AIC_REDACT=off` | disable secret/PII redaction (recorded in audit) |
+| `AIC_NO_STREAM=1` | disable streaming (spinner + sectional output) |
+| `AIC_DEBUG=1` | client emits `[debug +X.XXXs]` prefix |
+| `AIC_SESSION_ID` | active session ID. Exported automatically by `aic-session`; hooks reference it too |
 
 ## Project Structure
 
 ```
 aic/
-├── aic-common/                      # 공유 데이터 모델, IPC 프로토콜, 에러
+├── aic-common/                      # shared data models, IPC protocol, errors
 │   └── src/
 │       ├── lib.rs                   # CommandRecord (+ capture_mode/quality),
 │       │                            # SessionInfo/SessionState, SessionConfig,
@@ -219,7 +221,7 @@ aic/
 │       ├── error.rs                 # AicError
 │       └── paths.rs                 # session_socket_path, aicd_socket_path,
 │                                    # aicd_lock_path
-├── aic-server/                      # 두 binary: aic-session + aicd
+├── aic-server/                      # two binaries: aic-session + aicd
 │   └── src/
 │       ├── main.rs                  # aic-session: PTY wrapper + register/
 │       │                            # unregister to aicd
@@ -230,37 +232,37 @@ aic/
 │       ├── aicd_client.rs           # aic-session → aicd best-effort RPC
 │       ├── pty_manager.rs / output_processor.rs / boundary_detector.rs /
 │       │   ring_buffer.rs / uds_server.rs / lock.rs / metrics.rs / telemetry.rs
-├── aic-client/                      # CLI 클라이언트 (바이너리: aic)
+├── aic-client/                      # CLI client (binary: aic)
 │   └── src/
-│       ├── main.rs                  # clap CLI: 11+ subcommand
+│       ├── main.rs                  # clap CLI: 11+ subcommands
 │       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
 │       ├── uds_client.rs            # session UDS + aicd control client
-│       ├── doctor.rs                # 9축 진단 (aicd supervisor 포함)
+│       ├── doctor.rs                # 9-axis diagnosis (incl. aicd supervisor)
 │       ├── config.rs / auto_brancher.rs / error_analyzer.rs /
 │       │   llm_dispatcher.rs / repl.rs / cache.rs / redaction.rs /
 │       │   audit.rs / keychain.rs / streaming.rs / spinner.rs / top.rs
-├── docs/                            # PRD, capture mode trade-off
-├── Cargo.toml                       # Workspace 정의
+├── docs/                            # PRDs, capture-mode trade-offs
+├── Cargo.toml                       # workspace definition
 └── Makefile
 ```
 
-## 설정 파일
+## Configuration file
 
-설정 파일 경로: `~/.config/aic/config.toml` (XDG Base Directory 준수)
+Config file path: `~/.config/aic/config.toml` (XDG Base Directory compliant)
 
 ```toml
 [server]
 max_buffer_lines = 500
-# socket_path = "/custom/path/session.sock"  # 선택: 소켓 경로 직접 지정
+# socket_path = "/custom/path/session.sock"  # optional: override the socket path
 
 [server.boundary_strategy]
-method = "prompt_marker"           # "prompt_marker" 또는 "timing_heuristic"
-# idle_threshold_ms = 500          # timing_heuristic 사용 시 idle 임계값
+method = "prompt_marker"           # "prompt_marker" or "timing_heuristic"
+# idle_threshold_ms = 500          # idle threshold when using timing_heuristic
 
 [llm]
-default_provider = "openai"        # 기본 Provider 이름
+default_provider = "openai"        # default provider name
 
-# ── OpenAI 호환 (OpenAI, NVIDIA 등) ──
+# ── OpenAI-compatible (OpenAI, NVIDIA, etc.) ──
 [llm.providers.openai]
 provider_type = "OpenAiCompatible"
 endpoint = "https://api.openai.com/v1/chat/completions"
@@ -273,27 +275,27 @@ endpoint = "https://integrate.api.nvidia.com/v1/chat/completions"
 api_key = "nvapi-..."
 model = "meta/llama-3.1-70b-instruct"
 
-# ── Groq (OpenAI 호환 — endpoint/model 미지정 시 Groq 기본값 자동 적용) ──
+# ── Groq (OpenAI-compatible — defaults applied automatically when endpoint/model are omitted) ──
 [llm.providers.groq]
 provider_type = "Groq"
 api_key = "gsk_..."
 model = "llama-3.3-70b-versatile"
-# endpoint 생략 시 https://api.groq.com/openai/v1/chat/completions 사용
-# 다른 모델: llama-3.1-8b-instant · deepseek-r1-distill-llama-70b · gemma2-9b-it
+# When endpoint is omitted, https://api.groq.com/openai/v1/chat/completions is used.
+# Other models: llama-3.1-8b-instant · deepseek-r1-distill-llama-70b · gemma2-9b-it
 
 # ── Anthropic ──
-# 모델 ID는 https://docs.anthropic.com/en/docs/about-claude/models 참조.
-# 권장: claude-opus-4-7 (최강), claude-sonnet-4-6 (균형, 기본값),
-#       claude-haiku-4-5-20251001 (저렴/빠름).
-# 옛 모델(claude-sonnet-4-20250514, claude-3-5-haiku-20241022 등)은 retire 시
-# 404로 응답할 수 있으니 위 ID로 갱신하세요.
+# Model IDs: see https://docs.anthropic.com/en/docs/about-claude/models
+# Recommended: claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced, default),
+#              claude-haiku-4-5-20251001 (cheap/fast).
+# Older models (claude-sonnet-4-20250514, claude-3-5-haiku-20241022, etc.) may
+# return 404 once retired — update to the IDs above.
 [llm.providers.anthropic]
 provider_type = "Anthropic"
 endpoint = "https://api.anthropic.com/v1/messages"
 api_key = "sk-ant-..."
 model = "claude-sonnet-4-6"
 
-# ── CLI Backend (로컬 CLI 도구) ──
+# ── CLI Backend (local CLI tools) ──
 [llm.providers.kiro-cli]
 provider_type = "CliBackend"
 cli_path = "kiro"
@@ -305,128 +307,128 @@ cli_path = "claude"
 
 ## Environment Variables
 
-| 변수 | 설명 | 기본값 |
+| Variable | Description | Default |
 |------|------|--------|
-| `XDG_CONFIG_HOME` | 설정 파일 디렉토리 | `~/.config` |
-| `XDG_RUNTIME_DIR` | 소켓 경로 (Linux) | `/tmp/aic-{uid}` |
-| `AIC_SESSION_ID` | 활성 세션 식별자 — `aic-session`이 셸에 export. 클라이언트(`aic`/`status`/`doctor`/`top`)가 이 값으로 sock을 찾는다. | (자동 생성) |
-| `AIC_NO_RUN` | 설정 시 LLM 제안 명령 인라인 실행 prompt 비활성화 | unset |
-| `AIC_AUTO_RUN` | `1`이면 인라인 실행 prompt 없이 자동 실행 (destructive 명령 제외) | unset |
-| `AIC_DEBUG` | `1` 또는 `true`면 디버그 로그 stderr 출력 | unset |
-| `AIC_REDACT` | `1`이면 LLM 송신 직전 prompt에서 secret/PII 마스킹 | unset |
-| `AIC_NO_STREAM` | 설정 시 streaming 응답 비활성화 (한 번에 받아 표시) | unset |
+| `XDG_CONFIG_HOME` | config-file directory | `~/.config` |
+| `XDG_RUNTIME_DIR` | socket path (Linux) | `/tmp/aic-{uid}` |
+| `AIC_SESSION_ID` | active session identifier — `aic-session` exports it into the shell. Clients (`aic`/`status`/`doctor`/`top`) use it to locate the socket. | (auto-generated) |
+| `AIC_NO_RUN` | when set, disables the inline-run prompt for LLM-suggested commands | unset |
+| `AIC_AUTO_RUN` | when `1`, auto-runs without an inline-run prompt (excluding destructive commands) | unset |
+| `AIC_DEBUG` | when `1` or `true`, emits debug logs to stderr | unset |
+| `AIC_REDACT` | when `1`, masks secrets/PII in the prompt right before sending to the LLM | unset |
+| `AIC_NO_STREAM` | when set, disables streaming responses (received and displayed all at once) | unset |
 
-## 소켓 경로 (멀티세션)
+## Socket paths (multi-session)
 
-`aic-session`을 여러 터미널에서 실행하면 각각 독립된 소켓을 만든다.
+Running `aic-session` from multiple terminals creates an independent socket for each.
 
-| 플랫폼 | 경로 패턴 |
+| Platform | Path pattern |
 |--------|-----------|
 | macOS | `/tmp/aic-{uid}/session-{id}.sock` |
-| Linux (XDG 설정) | `$XDG_RUNTIME_DIR/aic/session-{id}.sock` |
-| Linux (XDG 미설정) | `/tmp/aic-{uid}/session-{id}.sock` |
+| Linux (XDG set) | `$XDG_RUNTIME_DIR/aic/session-{id}.sock` |
+| Linux (XDG unset) | `/tmp/aic-{uid}/session-{id}.sock` |
 
-`{id}`는 `aic-session`이 자동 생성하는 16-hex 식별자(`AIC_SESSION_ID` env로 export됨).
+`{id}` is a 16-hex identifier auto-generated by `aic-session` (exported as the `AIC_SESSION_ID` env var).
 
-### 클라이언트의 세션 결정 우선순위
-`aic status` / `aic doctor` / `aic top` 등이 어떤 세션을 보는지:
+### Client session-resolution priority
+How `aic status` / `aic doctor` / `aic top` etc. pick a session:
 
-1. `--session <id>` (명시적 인자)
-2. `$AIC_SESSION_ID` (셸 export — 보통 자동)
-3. `config.server.socket_path` (사용자 override)
-4. `session-*.sock` 중 mtime 최신 (활성 세션 자동 선택)
-5. legacy `session.sock` (구버전 호환)
+1. `--session <id>` (explicit argument)
+2. `$AIC_SESSION_ID` (shell export — typically automatic)
+3. `config.server.socket_path` (user override)
+4. Most recently mtime-updated `session-*.sock` (auto-pick the active session)
+5. Legacy `session.sock` (backwards compatibility)
 
-`aic sessions` 또는 `aic status --all`로 전체 목록 확인.
+Use `aic sessions` or `aic status --all` to see the full list.
 
-## IPC 프로토콜
+## IPC Protocol
 
-서버-클라이언트 간 JSON-over-UDS 통신. Length-prefixed framing 사용:
+JSON-over-UDS communication between server and client. Length-prefixed framing:
 
 ```
 [4 bytes: payload length (u32 big-endian)][JSON payload]
 ```
 
-세션 데몬 (`aic-session`) 소켓:
+Session daemon (`aic-session`) socket:
 
-| Request | 설명 |
+| Request | Description |
 |---------|------|
-| `GetLastCommand` | 직전 명령어의 CommandRecord 조회 |
-| `GetRecentLines { count }` | 최근 N 라인 텍스트 조회 |
+| `GetLastCommand` | retrieve the previous command's CommandRecord |
+| `GetRecentLines { count }` | retrieve the last N lines of text |
 | `Ping` / `GetMetrics` | health / metrics |
 
-Supervisor (`aicd`) control 소켓:
+Supervisor (`aicd`) control socket:
 
-| Request | 설명 |
+| Request | Description |
 |---------|------|
 | `Ping` | aicd health |
-| `ListSessions` | registry의 모든 SessionInfo |
-| `RegisterSession(SessionInfo)` | 세션 등록 (aic-session이 호출) |
-| `UnregisterSession { id }` | 세션 해제 |
-| `StopSession { id }` | registry PID에 SIGTERM |
-| `Shutdown` | aicd graceful 종료 |
-| `CommandStarted/Finished` | shell hook이 보내는 metadata 이벤트 |
+| `ListSessions` | every SessionInfo in the registry |
+| `RegisterSession(SessionInfo)` | register a session (called by aic-session) |
+| `UnregisterSession { id }` | deregister a session |
+| `StopSession { id }` | SIGTERM the registry's PID |
+| `Shutdown` | aicd graceful termination |
+| `CommandStarted/Finished` | metadata events sent by the shell hook |
 
-잘못된 소켓에 보내면 graceful `Error` 응답 ("aicd 소켓에 연결하세요").
+Sending to the wrong socket returns a graceful `Error` response ("connect to the aicd socket").
 
-## 개발 가이드
+## Development guide
 
-### 빌드
-
-```bash
-make              # debug 빌드
-make release      # release 빌드 (최적화)
-make check        # 빠른 컴파일 체크
-```
-
-### 테스트
+### Build
 
 ```bash
-make test         # 전체 테스트
-make test-unit    # 유닛 테스트만
-make e2e          # E2E 테스트만
-make test-prop    # Property-Based 테스트 (1024 cases)
-make test-pty     # PTY 통합 테스트 (터미널 필요)
+make              # debug build
+make release      # release build (optimized)
+make check        # quick compile check
 ```
 
-### 린트
+### Test
+
+```bash
+make test         # full test suite
+make test-unit    # unit tests only
+make e2e          # E2E tests only
+make test-prop    # property-based tests (1024 cases)
+make test-pty     # PTY integration tests (requires a terminal)
+```
+
+### Lint
 
 ```bash
 make lint         # clippy + fmt check
-make fix          # 자동 수정
+make fix          # autofix
 ```
 
-### 실행 (개발 모드)
+### Run (development mode)
 
 ```bash
-make run-server   # aic-session 실행
-make run-client   # aic 실행
-make run-config   # aic config 실행
+make run-server   # run aic-session
+make run-client   # run aic
+make run-config   # run aic config
 ```
 
-### 기타
+### Misc
 
 ```bash
-make ci           # CI 로컬 재현 (lint + test)
-make doc          # rustdoc 생성 및 열기
-make loc          # 코드 라인 수 통계
-make deps         # 의존성 트리
-make help         # 전체 명령어 목록
+make ci           # reproduce CI locally (lint + test)
+make doc          # generate and open rustdoc
+make loc          # lines-of-code statistics
+make deps         # dependency tree
+make help         # full command list
 ```
 
-## 기술 스택
+## Tech stack
 
-| 영역 | 기술 |
+| Area | Technology |
 |------|------|
-| 언어 | Rust (2021 edition) |
-| PTY 관리 | `portable-pty` |
-| Async Runtime | `tokio` |
-| HTTP Client | `reqwest` (rustls) |
+| Language | Rust (2021 edition) |
+| PTY management | `portable-pty` |
+| Async runtime | `tokio` |
+| HTTP client | `reqwest` (rustls) |
 | IPC | Unix Domain Socket (`tokio::net::UnixListener`) |
 | Serialization | `serde` + `serde_json` / `toml` |
-| CLI Parsing | `clap` |
-| ANSI 제거 | `strip-ansi-escapes` |
-| 테스트 | `proptest` (Property-Based Testing) |
+| CLI parsing | `clap` |
+| ANSI stripping | `strip-ansi-escapes` |
+| Testing | `proptest` (property-based testing) |
 
 ## License
 
