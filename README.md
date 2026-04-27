@@ -10,12 +10,17 @@
 
 PTY 기반 셸 래퍼 데몬(`aic-session`)이 사용자의 셸을 투명하게 감싸서 입출력을 중계하면서 출력을 캡처하고, CLI 클라이언트(`aic`)가 직전 명령어의 exit code에 따라 자동으로 에러 분석 또는 Interactive REPL 모드로 분기합니다.
 
+추가로, 사용자당 하나의 supervisor daemon(`aicd`)이 세션 lifecycle/registry/cleanup을 중앙 관리하고, 출력 캡처가 부담스러운 워크플로우를 위한 metadata-only **hook capture mode**도 제공합니다 (PRD: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
+
 ```mermaid
 graph LR
     User[사용자 터미널] --> Session[aic-session]
     Session -->|PTY 중계| Shell[셸 zsh/bash]
     Session -->|출력 캡처| RB[Ring Buffer]
+    Session -.register/unregister.-> AICD[aicd supervisor]
+    Hook[shell hook] -.metadata only.-> AICD
     Client[aic] -->|UDS| Session
+    Client -->|control UDS| AICD
     Client -->|에러 분석| LLM[LLM Provider]
 ```
 
@@ -51,11 +56,23 @@ graph LR
 
 ### Onboarding
 - ✅ `aic init zsh|bash` — 셸 hook 자동 설치 (마커 기반 멱등)
+- ✅ `aic init --hook-mode` — Phase 3 metadata-only hook 추가 설치
 - ✅ `aic config` 인터랙티브 wizard
+
+### Supervisor / Capture Modes (신규)
+- ✅ `aicd` supervisor daemon — 사용자당 1개. 세션 registry, control UDS,
+  graceful shutdown
+- ✅ `aic daemon { status | start | stop }` — supervisor 제어
+- ✅ `aic session stop <id>` — registry 기반 세션 종료
+- ✅ `aic sessions` — aicd registry-first, fallback to socket scan
+- ✅ Hook capture mode — `~/.aic/hook-events.{zsh,bash}`로 metadata만 수집
+- ✅ `aic run -- <cmd>` — explicit FullOutput capture wrapper
+- ✅ `CommandRecord.capture_mode/quality` + 분석 시 capture quality hint
 
 ### Roadmap
 - 🚧 `aic-proxy` — LLM API 프록시 서버 (개발 예정)
-- 🚧 `aic top` — 라이브 TUI (ratatui)
+- 🚧 PTY ownership을 `aicd`로 이동 (PRD-AICD-SUPERVISOR Phase 2 본 구현)
+- 🚧 `aic capture-last` — destructive command 감지 + confirm UX
 - 🚧 launchd/systemd unit 자동 설치
 
 ## 동작 원리
@@ -118,67 +135,98 @@ EOF
 aic config             # provider/api_key/model 인터랙티브 설정
 aic init zsh           # ~/.zshrc에 'source ~/.aic/hooks.zsh' 멱등 추가
 aic migrate-keys       # 평문 API key를 OS keychain으로 이동 (선택)
-aic doctor             # 8축 진단 — PASS/WARN/FAIL 한눈에 확인
+aic doctor             # 9축 진단 — PASS/WARN/FAIL 한눈에 확인
 
-# 2. aic-session으로 셸 시작
+# 2. (선택) supervisor 시작 — 멀티 세션 lifecycle 중앙 관리
+aic daemon start       # aicd 백그라운드 spawn
+aic daemon status      # 떠 있는지 + 등록 세션 수 확인
+
+# 3. aic-session으로 셸 시작 — aicd가 떠 있으면 자동 register
 aic-session
 
-# 3. 평소처럼 명령어 실행
+# 4. 평소처럼 명령어 실행
 cargo build   # 에러 발생!
 
-# 4. aic로 에러 분석
+# 5. aic로 에러 분석
 aic
 # → LLM이 에러 원인을 설명하고 수정 명령어를 제안 (TTY는 자동 streaming)
 
-# 5. 에러가 없을 때 aic 실행하면 REPL 모드
+# 6. 에러가 없을 때 aic 실행하면 REPL 모드
 aic
 # → LLM과 자유 대화 (exit/quit/Ctrl+D로 종료)
 
-# 6. 직접 질문 + dry-run으로 비용 미리보기
+# 7. 직접 질문 + dry-run으로 비용 미리보기
 aic --dry-run "이 에러 어떻게 해결해?"
 
-# 7. 운영
+# 8. 운영
 aic status             # 데몬 PID/ping/마지막 명령어
+aic sessions           # 모든 활성 세션 (aicd registry-first)
+aic session stop <id>  # 특정 세션 종료 (aicd 필요)
 aic audit verify       # audit log HMAC chain 무결성 (exit 0/2/3)
+```
+
+### 옵션: Hook capture mode (PTY wrapper 없이 metadata만)
+
+PTY 래핑 부담 없이 명령어 metadata만 수집하고 싶을 때:
+
+```bash
+aic daemon start                    # aicd 필수 (hook 이벤트 수신)
+aic init zsh --hook-mode            # ~/.aic/hook-events.zsh 설치
+exec zsh                            # 새 셸 → preexec/precmd hook 활성
+
+# 평소처럼 명령어 실행 — aic-session 없어도 metadata 누적
+ls -la
+cargo build
+
+# 정확한 출력이 필요할 때만 explicit capture
+aic run -- cargo build              # stdout/stderr 보존, exit code 그대로
 ```
 
 ### 환경 변수
 
 | 변수 | 효과 |
 |---|---|
-| `AIC_LOG=info|debug|trace` | aic-session tracing 레벨 (기본 info) |
+| `AIC_LOG=info|debug|trace` | aic-session/aicd tracing 레벨 (기본 info) |
 | `AIC_REDACT=off` | secret/PII redaction 비활성 (audit 기록됨) |
 | `AIC_NO_STREAM=1` | streaming 비활성 (spinner + sectional 출력) |
 | `AIC_DEBUG=1` | client `[debug +X.XXXs]` prefix 출력 |
+| `AIC_SESSION_ID` | 활성 세션 ID. `aic-session`이 자동 export, hook도 참조 |
 
 ## Project Structure
 
 ```
 aic/
-├── aic-common/          # 공유 데이터 모델, IPC 프로토콜, 에러 타입
+├── aic-common/                      # 공유 데이터 모델, IPC 프로토콜, 에러
 │   └── src/
-│       ├── lib.rs       # CommandRecord, AppConfig, ProviderType 등
-│       ├── ipc.rs       # IpcRequest/IpcResponse, Length-prefixed framing
-│       ├── error.rs     # AicError 통합 에러 타입
-│       └── paths.rs     # Cross-platform 소켓/설정 경로
-├── aic-server/          # PTY 셸 래퍼 데몬 (바이너리: aic-session)
+│       ├── lib.rs                   # CommandRecord (+ capture_mode/quality),
+│       │                            # SessionInfo/SessionState, SessionConfig,
+│       │                            # AppConfig, capture_quality_hint()
+│       ├── ipc.rs                   # IpcRequest/Response — session/control/hook
+│       ├── error.rs                 # AicError
+│       └── paths.rs                 # session_socket_path, aicd_socket_path,
+│                                    # aicd_lock_path
+├── aic-server/                      # 두 binary: aic-session + aicd
 │   └── src/
-│       ├── main.rs      # 진입점: PTY + UDS + SIGWINCH
-│       ├── pty_manager.rs
-│       ├── output_processor.rs
-│       ├── boundary_detector.rs
-│       ├── ring_buffer.rs
-│       └── uds_server.rs
-├── aic-client/          # CLI 클라이언트 (바이너리: aic)
+│       ├── main.rs                  # aic-session: PTY wrapper + register/
+│       │                            # unregister to aicd
+│       ├── aicd_main.rs             # aicd: singleton + control UDS + signal
+│       ├── control_server.rs        # aicd control plane (RingBuffer-free)
+│       ├── session_registry.rs      # in-memory HashMap registry
+│       ├── hook_events.rs           # per-session bounded ring (Phase 3)
+│       ├── aicd_client.rs           # aic-session → aicd best-effort RPC
+│       ├── pty_manager.rs / output_processor.rs / boundary_detector.rs /
+│       │   ring_buffer.rs / uds_server.rs / lock.rs / metrics.rs / telemetry.rs
+├── aic-client/                      # CLI 클라이언트 (바이너리: aic)
 │   └── src/
-│       ├── main.rs      # 진입점: clap CLI 파싱
-│       ├── config.rs    # ConfigManager (TOML 로드)
-│       ├── uds_client.rs
-│       ├── auto_brancher.rs
-│       ├── error_analyzer.rs
-│       ├── llm_dispatcher.rs
-│       └── repl.rs
-├── Cargo.toml           # Workspace 정의
+│       ├── main.rs                  # clap CLI: 11+ subcommand
+│       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
+│       ├── uds_client.rs            # session UDS + aicd control client
+│       ├── doctor.rs                # 9축 진단 (aicd supervisor 포함)
+│       ├── config.rs / auto_brancher.rs / error_analyzer.rs /
+│       │   llm_dispatcher.rs / repl.rs / cache.rs / redaction.rs /
+│       │   audit.rs / keychain.rs / streaming.rs / spinner.rs / top.rs
+├── docs/                            # PRD, capture mode trade-off
+├── Cargo.toml                       # Workspace 정의
 └── Makefile
 ```
 
@@ -272,11 +320,27 @@ cli_path = "claude"
 [4 bytes: payload length (u32 big-endian)][JSON payload]
 ```
 
+세션 데몬 (`aic-session`) 소켓:
+
 | Request | 설명 |
 |---------|------|
 | `GetLastCommand` | 직전 명령어의 CommandRecord 조회 |
 | `GetRecentLines { count }` | 최근 N 라인 텍스트 조회 |
-| `Ping` | 서버 상태 확인 |
+| `Ping` / `GetMetrics` | health / metrics |
+
+Supervisor (`aicd`) control 소켓:
+
+| Request | 설명 |
+|---------|------|
+| `Ping` | aicd health |
+| `ListSessions` | registry의 모든 SessionInfo |
+| `RegisterSession(SessionInfo)` | 세션 등록 (aic-session이 호출) |
+| `UnregisterSession { id }` | 세션 해제 |
+| `StopSession { id }` | registry PID에 SIGTERM |
+| `Shutdown` | aicd graceful 종료 |
+| `CommandStarted/Finished` | shell hook이 보내는 metadata 이벤트 |
+
+잘못된 소켓에 보내면 graceful `Error` 응답 ("aicd 소켓에 연결하세요").
 
 ## 개발 가이드
 

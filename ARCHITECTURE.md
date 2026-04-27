@@ -11,10 +11,18 @@ graph LR
     Session -->|출력 캡처| RB[Ring Buffer]
     Session -.SIGTERM/SIGINT.-> Cleanup[graceful shutdown]
 
-    Client[aic CLI] -->|UDS Length-prefixed JSON| Session
+    Session -.register/unregister.-> AICD[aicd supervisor]
+    Hook[shell hook<br/>preexec/precmd] -.metadata only.-> AICD
+    AICD -->|HookEventStore| HEB[per-session ring]
+    AICD -->|SessionRegistry| REG[HashMap]
+
+    Client[aic CLI] -->|session UDS| Session
+    Client -->|control UDS| AICD
     Session -->|CommandRecord / Metrics| Client
+    AICD -->|SessionInfo / hook records| Client
 
     Client -->|exit_code 분기| Branch{ErrorAnalysis or REPL}
+    Branch -->|capture_quality hint| User
     Branch -->|prompt + redact| Cache[Cache 24h TTL]
     Branch -->|cache miss| LLM[LLM Provider]
 
@@ -26,10 +34,20 @@ graph LR
     Client -->|key resolve| Keychain[OS Keychain]
 
     style Session fill:#fff4e6
+    style AICD fill:#fff0f5
     style Client fill:#e6f0ff
     style Audit fill:#fef3f3
     style Keychain fill:#fef3f3
 ```
+
+**Two daemons, separate planes**:
+- `aic-session` (per-terminal): **data plane** — PTY wrapper + RingBuffer + 출력
+  캡처. 변경 없음.
+- `aicd` (per-user, singleton): **control plane** — registry / lifecycle /
+  hook event sink. 출력을 소유하지 않으므로 RingBuffer 결합 없는 별도
+  `ControlServer`를 사용한다.
+- 두 데몬은 직교한다 — `aicd` 없이도 `aic-session`은 정상 동작하고, hook
+  mode는 `aic-session` 없이도 metadata만 수집한다.
 
 ## Workspace 구조
 
@@ -42,34 +60,47 @@ ac-rust/
 │       ├── error.rs     # AicError + user_message + is_retryable
 │       └── paths.rs     # default_socket_path, resolve_socket_path
 │
-├── aic-server/          # PTY 셸 래퍼 데몬 (바이너리: aic-session)
+├── aic-server/          # 두 binary: aic-session + aicd
 │   └── src/
-│       ├── main.rs      # 진입점: telemetry → metrics::init → PID lock → PTY → UDS → SIGWINCH/wait
-│       ├── pty_manager.rs   # PtyManager (master + child Option). take_child()로 mutex 외부 wait
-│       ├── output_processor.rs  # ANSI strip + Alternate Screen 감지 + OSC 133 추출
-│       ├── boundary_detector.rs # OSC 133 또는 timing heuristic으로 명령어 경계
-│       ├── ring_buffer.rs   # 출력 라인 인메모리 buffer (max_lines, capacity, total_lines)
-│       ├── uds_server.rs    # IPC 핸들러: GetLastCommand/GetRecentLines/Ping/GetMetrics + graceful unknown variant
-│       ├── lock.rs          # fcntl(F_SETLK) PID lock + stale GC
-│       ├── telemetry.rs     # tracing-subscriber + tracing-appender (JSONL daily rotate, 7일)
-│       └── metrics.rs       # uptime + ipc_request_count atomic counter
+│       ├── main.rs              # aic-session: telemetry → PID lock → PTY → UDS
+│       │                        # → aicd register → SIGWINCH/wait
+│       ├── aicd_main.rs         # aicd: telemetry → DaemonLock(aicd.pid) →
+│       │                        # ControlServer(aicd.sock) → SIGINT/SIGTERM
+│       ├── control_server.rs    # aicd control plane (RingBuffer-free).
+│       │                        # ControlContext { shutdown, registry, hook_events }
+│       ├── session_registry.rs  # Arc<RwLock<HashMap<id, SessionInfo>>>.
+│       │                        # register/unregister/set_state/list/len.
+│       ├── hook_events.rs       # per-session bounded ring (cap 64). pending
+│       │                        # start ↔ finish 매칭, MetadataOnly record 생성.
+│       ├── aicd_client.rs       # aic-session → aicd best-effort RPC.
+│       │                        # 100ms timeout, silent skip if aicd down.
+│       ├── pty_manager.rs       # PtyManager (master + child Option). take_child()
+│       ├── output_processor.rs  # ANSI strip + Alternate Screen 감지 + OSC 133
+│       ├── boundary_detector.rs # OSC 133 또는 timing heuristic으로 경계 감지
+│       ├── ring_buffer.rs       # 출력 라인 인메모리 buffer
+│       ├── uds_server.rs        # 세션 IPC 핸들러 (RingBuffer 결합)
+│       ├── lock.rs              # fcntl(F_SETLK) PID lock + stale GC
+│       ├── telemetry.rs         # tracing-subscriber + appender
+│       └── metrics.rs           # uptime + ipc_request_count
 │
 └── aic-client/          # CLI 클라이언트 (바이너리: aic)
     └── src/
-        ├── main.rs              # clap CLI: 8 subcommand + --dry-run flag
-        ├── config.rs            # ConfigManager (TOML 로드/저장, 기본값)
-        ├── uds_client.rs        # UDS client: get_last_command/ping/get_metrics + 1s/3s timeout
-        ├── llm_dispatcher.rs    # LLM Provider 라우터: send + send_streaming. retry+circuit breaker+redaction+audit 통합
-        ├── error_analyzer.rs    # build_prompt (다국어 라벨 강제) + parse_response (영/한/일/중) + clean_output_lines
-        ├── streaming.rs         # OpenAI compat SSE 파서 (직접 구현)
-        ├── repl.rs              # Interactive REPL (exit_code = 0 시)
+        ├── main.rs              # clap CLI: 11+ subcommand + --dry-run flag
+        ├── hook_install.rs      # zsh/bash hook script generator + RC marker
+        ├── uds_client.rs        # session + aicd control client.
+        │                        # list_sessions/stop_session/shutdown/send_raw 추가
+        ├── doctor.rs            # 9축 진단 (aicd supervisor 포함)
+        ├── config.rs            # ConfigManager (TOML 로드/저장)
+        ├── llm_dispatcher.rs    # LLM Provider 라우터: send/send_streaming
+        ├── error_analyzer.rs    # build_prompt + parse_response + clean
+        ├── streaming.rs         # OpenAI compat SSE 파서
+        ├── repl.rs              # Interactive REPL
         ├── auto_brancher.rs     # ErrorAnalysis vs InteractiveRepl 분기
-        ├── doctor.rs            # 8축 환경 진단 (config/provider/socket/daemon/hook/endpoint/keychain/audit)
-        ├── cache.rs             # 분석 결과 캐시 (~/.cache/aic/analyses/<hash>.json, 24h TTL)
-        ├── redaction.rs         # secret 5종 + PII 4종 + Shannon entropy 보조
-        ├── audit.rs             # HMAC-SHA256 chain (~/.local/state/aic/audit.log)
-        ├── keychain.rs          # OS keychain 통합 (apple/linux/windows native)
-        └── spinner.rs           # tokio 비동기 spinner (isatty stderr 체크)
+        ├── cache.rs             # 결과 캐시 (24h TTL)
+        ├── redaction.rs         # secret 5종 + PII 4종 + entropy
+        ├── audit.rs             # HMAC-SHA256 chain
+        ├── keychain.rs          # OS keychain 통합
+        └── spinner.rs           # tokio 비동기 spinner
 ```
 
 ## 핵심 데이터 흐름
@@ -177,26 +208,90 @@ PtyManager를 `Arc<Mutex<...>>`로 공유했을 때 wait_handle이 `wait_for_exi
 
 ## CLI 표면
 
-8 subcommand + 1 root flag:
+11+ subcommand + 1 root flag:
 
 ```
-aic config [show|get <path>]    # 설정 (인터랙티브 wizard 또는 CI 친화 출력)
-aic doctor [--json]             # 8축 진단
+aic config [show|get <path>]                   # 설정 (wizard / CI 출력)
+aic doctor [--json]                            # 9축 진단 (aicd 포함)
 aic status [--watch] [--interval N] / aic top  # 데몬 상태 + metrics
-aic audit verify                 # HMAC chain (exit 0/2/3)
-aic migrate-keys                 # 평문 → keychain 일괄 이동
-aic init <shell>                 # rc 파일에 hook source 멱등 추가
-aic --dry-run "<prompt>"         # 토큰·비용·timeout 미리보기
+aic sessions                                   # aicd registry-first 세션 목록
+aic audit verify                               # HMAC chain (exit 0/2/3)
+aic migrate-keys                               # 평문 → keychain 일괄 이동
+aic init <shell> [--hook-mode]                 # rc hook source + (옵션) hook-mode
+aic daemon { status | start | stop }           # aicd supervisor 제어
+aic session stop <id>                          # registry 기반 세션 종료
+aic run -- <cmd...>                            # explicit FullOutput capture
+aic _hook-event { start | end }                # (hidden) shell hook → aicd
+aic --dry-run "<prompt>"                       # 토큰·비용·timeout 미리보기
 aic --version
+```
+
+### 새 데이터 흐름 (Phase 1~4)
+
+#### 4) 세션 등록 / 해제
+```mermaid
+sequenceDiagram
+    participant Sess as aic-session
+    participant AICD as aicd
+    participant Reg as SessionRegistry
+
+    Sess->>AICD: RegisterSession(SessionInfo) — best-effort, 100ms timeout
+    Note over Sess: aicd 미실행 → silent skip
+    AICD->>Reg: insert(id, info)
+    AICD-->>Sess: Pong
+
+    Note over Sess: ... 셸 사용 ...
+
+    Sess->>AICD: UnregisterSession { id } — shutdown 직전
+    AICD->>Reg: remove(id)
+    AICD-->>Sess: Pong (unknown id도 OK — best-effort)
+```
+
+#### 5) Hook capture mode (PTY 없음)
+```mermaid
+sequenceDiagram
+    participant Sh as zsh / bash
+    participant Hook as ~/.aic/hook-events.{zsh,bash}
+    participant CLI as aic _hook-event
+    participant AICD as aicd
+    participant HES as HookEventStore
+
+    Sh->>Hook: preexec / DEBUG trap
+    Hook->>CLI: aic _hook-event start (background &, /dev/null)
+    CLI->>AICD: CommandStarted { session, command_id, command, cwd, ... }
+    AICD->>HES: pending.insert((session, cmd_id), start_info)
+
+    Note over Sh: ... 명령 실행 ...
+
+    Sh->>Hook: precmd / PROMPT_COMMAND
+    Hook->>CLI: aic _hook-event end (background &, /dev/null)
+    CLI->>AICD: CommandFinished { session, command_id, exit_code, ... }
+    AICD->>HES: 매칭된 start 합쳐 MetadataOnly CommandRecord 저장
+```
+
+#### 6) Capture quality hint
+```mermaid
+graph LR
+    Rec[CommandRecord] -->|capture_quality 검사| Hint{quality?}
+    Hint -->|FullOutput / Unknown| Silent[무음]
+    Hint -->|MetadataOnly| Sug[aic run -- &lt;cmd&gt; 안내<br/>Hybrid mode면 더 actionable]
+    Hint -->|TruncatedOutput| TruncMsg[일부만 저장됨 안내]
+    Hint -->|BinaryOmitted / RedactedOutput| Other[해당 사실 1줄]
+    Sug --> Stderr[stderr dim line]
+    TruncMsg --> Stderr
+    Other --> Stderr
 ```
 
 ## 테스트
 
 | Crate | Lib tests | 형태 |
 |---|---|---|
-| aic-common | 42 | property-based (proptest) IPC roundtrip + 에러 메시지 + path resolution |
-| aic-server | 56 | unit (lock 8 / telemetry 2 / metrics 2 / boundary / output / ring / uds 13+) |
-| aic-client | 130 | unit (redaction 21 + audit 8 + cache 7 + doctor 6 + circuit 3 + streaming 4 + spinner 2 + keychain 3 + 외) |
+| aic-common | 64 | property-based (proptest) IPC/AppConfig roundtrip + capture mode/quality + hint helper + legacy compat |
+| aic-server | 95 | unit (lock 8 / control_server 8 / session_registry 7 / hook_events 4 / aicd_client 4 / boundary / output / ring / uds 13+ / telemetry / metrics) |
+| aic-client | 162 | unit (redaction 21 + audit 8 + cache 7 + doctor 7 + hook_install 3 + circuit / streaming / spinner / keychain + 외) |
+
+`cargo test --workspace --no-fail-fast -- --test-threads=1` 직렬 실행 권장
+(통합 테스트가 `/tmp/aic-{uid}/` 공유 디렉토리를 쓰므로).
 
 `cargo clippy --workspace --all-targets -- -D warnings` ✅ 깨끗.
 

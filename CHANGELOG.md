@@ -4,6 +4,96 @@
 
 ## [Unreleased]
 
+### Added — `aicd` supervisor daemon (Phase 0~2.1)
+
+PRD-AICD-SUPERVISOR의 control plane 부분. PTY ownership은 그대로 두고
+사용자당 하나의 supervisor daemon으로 lifecycle/registry/cleanup을 중앙화.
+
+- **`aicd` binary** (aic-server에 추가) — 사용자당 1개. `aicd.pid` singleton
+  lock + `aicd.sock` control UDS. SIGINT/SIGTERM graceful shutdown.
+- **Session registry** — `Arc<RwLock<HashMap<String, SessionInfo>>>`,
+  read-heavy 동시성 (ListSessions가 압도적). `aic-session`이 시작 시
+  `RegisterSession`, 종료 시 `UnregisterSession`을 best-effort로 호출.
+- **Control IPC** — `Ping`/`ListSessions`/`Shutdown`/`RegisterSession`/
+  `UnregisterSession`/`StopSession`. 모든 변종은 `IpcRequest` enum에
+  통합되며 잘못된 데몬으로 보내면 graceful "wrong socket" Error 반환.
+- **`SessionInfo` / `SessionState`** — id / pid / state / created_at /
+  attached_tty / shell / cwd. PRD §10.2와 일치하는 6-state lifecycle.
+- **CLI surface**
+  - `aic daemon { status | start | stop }` — supervisor 제어. start는
+    `current_exe()` 옆의 `aicd`를 우선, 없으면 PATH fallback.
+  - `aic session stop <id>` — registry lookup → `SIGTERM` (PTY ownership
+    이동 전까지의 bridge 구현; 프로세스 없음(ESRCH)이면 registry만 정리).
+  - `aic sessions` — aicd registry-first. aicd 없으면 기존 socket scan
+    fallback.
+  - `aic doctor` — `aicd supervisor` 항목 추가. 실행 중이면 PASS+세션 수,
+    아니면 WARN(선택사항이라 명확히 표시).
+
+### Added — Hook capture mode (Phase 0, 3.1~3.3)
+
+PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
+공존 가능.
+
+- **`CommandRecord` 확장** — `capture_mode`(Pty/Hook/ExplicitCapture),
+  `capture_quality`(FullOutput/MetadataOnly/RedactedOutput/BinaryOmitted/
+  TruncatedOutput/Unknown), `output_metadata`(stored bytes/lines, truncated
+  flag, sha256). 모두 `#[serde(default)]` — 레거시 JSON/IPC 호환.
+- **Hook event protocol** — `IpcRequest::CommandStarted` / `CommandFinished`.
+  `aicd`가 per-session bounded ring(64)에 누적, command_id로 start/finish
+  매칭, 매칭 실패 시 partial record(`command = None`)로 저장.
+- **Hidden CLI** — `aic _hook-event { start | end }` (clap `hide=true`).
+  Shell hook이 백그라운드로 호출. 100ms timeout, stderr only, aicd 미실행
+  시 silent skip.
+- **Shell hook installer** — `aic init --hook-mode` 시 `~/.aic/hook-events.
+  {zsh,bash}` 설치 (version marker 1). zsh는 `preexec`/`precmd` +
+  `add-zsh-hook`, bash는 `DEBUG trap` + `PROMPT_COMMAND`. 모든 호출은
+  `(... &)`로 detach, redirect to `/dev/null` — prompt latency 영향 0.
+  rc 파일에는 `# >>> aic hook-events >>>` ~ `# <<< aic hook-events <<<`
+  마커로 멱등 source 라인 추가.
+- **Explicit capture wrapper** — `aic run -- <cmd...>`. stdout/stderr를
+  실시간 echo하면서 동시에 ring(line cap 1000, byte cap 256 KiB)에 수집.
+  exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
+  ExplicitCapture, quality = FullOutput / TruncatedOutput.
+
+### Added — Hybrid mode + capture quality hint (Phase 4)
+
+- **`SessionCaptureMode`** — `Pty` / `Hook` / `Hybrid`. `[session]
+  capture_mode` config. 레거시 config는 default(Pty)로 자동 채움.
+- **`capture_quality_hint(record, mode)`** — FullOutput에선 무음, 그 외
+  품질에서는 사용자에게 신뢰도 + 대안(`aic run -- <cmd>` 등) 안내.
+  `aic` 분석 시 `print_error_context` 직후 stderr에 dim line으로 출력.
+
+### Removed
+- root의 `PRD-AICD-SUPERVISOR.md` / `PRD-HOOK-CAPTURE-MODE.md` /
+  `CAPTURE-MODE-TRADEOFFS.md` — `docs/` 하위로 이동, 단일 출처화.
+
+### Tests
+- aic-common lib: 42 → 64 (capture mode/quality, hint, registry serde,
+  legacy compat, hook event proptest 확장)
+- aic-server lib: 56 → 95 (control_server 6, session_registry 7,
+  hook_events 4, aicd_client 4 + 통합)
+- aic-client lib: 130 → 162 (hook_install 3, doctor aicd, daemon CLI 등)
+- 전 워크스페이스 직렬 실행: failed = 0
+
+### Architectural Decisions
+- **PTY ownership 이동(PRD-AICD-SUPERVISOR Phase 2 본 구현)은 보류** —
+  raw mode 복원/relay regression 위험이 커서 별도 sprint로 분리. 현재
+  `aic session stop`은 PID에 SIGTERM을 보내는 bridge 구현이며,
+  `aic-session`의 기존 shutdown 핸들러가 PTY/소켓을 정리한다.
+- **Control plane 분리** — `UdsServer`(RingBuffer 결합)와 별도로
+  `ControlServer` 신규. aicd는 출력을 소유하지 않으므로 같은 서버를
+  재사용하면 layering이 흐려진다.
+- **Hook event는 외부 명령(`aic _hook-event`) 호출** — shell에서 raw UDS
+  바이트 전송이 어려워 단순함을 우선. 백그라운드(`&`) detach + 100ms
+  timeout으로 prompt latency 영향 방지. 향후 socket connector로 최적화 여지.
+- **aicd 자동 spawn은 명시 명령에서만** — `aic daemon start` /
+  `aic doctor --fix`(미구현). `aic-session`/`aic` 자동 spawn은 사용자
+  의도 모호 + 권한 이슈로 보류.
+
+---
+
+## [0.2.0] — Pre-Phase Baseline
+
 ### Added — Subcommand
 - `aic doctor [--json]` — 8축 환경 진단 (config / provider / UDS 소켓 / 데몬 / 셸 hook / LLM endpoint / keychain / audit log). FAIL 시 exit 1.
 - `aic status [--watch] [--interval N]` — 데몬 PID/ping/마지막 명령어 + metrics(uptime, IPC count, RingBuffer 사용률, last cmd ago). watch 모드는 1초 polling + clear-screen.
