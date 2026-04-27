@@ -129,10 +129,13 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
         }
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::ListSessions
+        | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)
         | IpcRequest::UnregisterSession { .. }
+        | IpcRequest::HeartbeatSession { .. }
         | IpcRequest::StopSession { .. }
+        | IpcRequest::GetLastCommandForSession { .. }
         | IpcRequest::CommandStarted { .. }
         | IpcRequest::CommandFinished { .. } => IpcResponse::Error {
             message: format!(

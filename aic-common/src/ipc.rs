@@ -17,10 +17,18 @@ pub enum IpcRequest {
     GetRecentLines {
         count: usize,
     },
+    /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
+    GetLastCommandForSession {
+        id: String,
+    },
     Ping,
     GetMetrics,
     /// `aicd`에 등록된 세션 목록을 요청한다 (Phase 1.2~1.3).
     ListSessions,
+    /// 오래된 inactive(detached/stopping/stopped/failed) 세션을 registry에서 제거한다.
+    PruneSessions {
+        older_than_secs: u64,
+    },
     /// `aicd`를 graceful 종료 시킨다 (active sessions 정리는 향후 sub-step).
     Shutdown,
     /// 세션을 `aicd` registry에 등록한다 (Phase 1.3).
@@ -30,6 +38,12 @@ pub enum IpcRequest {
     /// `aic-session`이 정상 종료 직전에 보낸다.
     UnregisterSession {
         id: String,
+    },
+    /// 실행 중인 세션이 아직 살아 있음을 `aicd` registry에 알린다.
+    HeartbeatSession {
+        id: String,
+        seen_at: chrono::DateTime<chrono::Utc>,
+        cwd: Option<std::path::PathBuf>,
     },
     /// 특정 세션에 graceful 종료 신호를 보낸다 (Phase 2.1).
     ///
@@ -70,6 +84,10 @@ pub enum IpcResponse {
     Metrics(MetricsSnapshot),
     /// `ListSessions` 응답 — `aicd` registry 기준 세션 목록.
     Sessions(Vec<SessionInfo>),
+    /// `PruneSessions` 응답 — 제거된 세션 수.
+    PrunedSessions {
+        count: usize,
+    },
     Error {
         message: String,
     },
@@ -155,6 +173,16 @@ mod tests {
     #[test]
     fn ipc_request_ping_roundtrip() {
         let req = IpcRequest::Ping;
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn ipc_request_get_last_command_for_session_roundtrip() {
+        let req = IpcRequest::GetLastCommandForSession {
+            id: "deadbeef".to_string(),
+        };
         let json = serde_json::to_string(&req).unwrap();
         let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, deserialized);
@@ -300,9 +328,21 @@ mod tests {
             Just(IpcRequest::Ping),
             Just(IpcRequest::GetMetrics),
             Just(IpcRequest::ListSessions),
+            any::<u64>().prop_map(|older_than_secs| IpcRequest::PruneSessions { older_than_secs }),
             Just(IpcRequest::Shutdown),
             arb_session_info().prop_map(IpcRequest::RegisterSession),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::UnregisterSession { id }),
+            (
+                "[0-9a-f]{1,8}",
+                0i64..4_102_444_800_000i64,
+                proptest::option::of("[a-zA-Z0-9/_-]{1,64}".prop_map(std::path::PathBuf::from)),
+            )
+                .prop_map(|(id, ts, cwd)| IpcRequest::HeartbeatSession {
+                    id,
+                    seen_at: chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+                    cwd,
+                }),
+            "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::GetLastCommandForSession { id }),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
             (
                 "[0-9a-f]{1,8}",
@@ -362,23 +402,43 @@ mod tests {
             any::<u32>(),
             arb_session_state(),
             0i64..4_102_444_800_000i64,
+            proptest::option::of(0i64..4_102_444_800_000i64),
+            proptest::option::of(0i64..4_102_444_800_000i64),
             proptest::option::of("[a-zA-Z0-9/_]{1,32}"),
             proptest::option::of("[a-zA-Z0-9/_-]{1,32}"),
             proptest::option::of("[a-zA-Z0-9/_-]{1,64}".prop_map(std::path::PathBuf::from)),
         )
-            .prop_map(|(id, pid, state, ts_millis, attached_tty, shell, cwd)| {
-                let created_at =
-                    chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default();
-                crate::SessionInfo {
+            .prop_map(
+                |(
                     id,
                     pid,
                     state,
-                    created_at,
+                    ts_millis,
+                    seen_millis,
+                    command_millis,
                     attached_tty,
                     shell,
                     cwd,
-                }
-            })
+                )| {
+                    let created_at =
+                        chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default();
+                    let last_seen_at =
+                        seen_millis.and_then(chrono::DateTime::from_timestamp_millis);
+                    let last_command_at =
+                        command_millis.and_then(chrono::DateTime::from_timestamp_millis);
+                    crate::SessionInfo {
+                        id,
+                        pid,
+                        state,
+                        created_at,
+                        last_seen_at,
+                        last_command_at,
+                        attached_tty,
+                        shell,
+                        cwd,
+                    }
+                },
+            )
     }
 
     fn arb_ipc_response() -> impl Strategy<Value = IpcResponse> {
@@ -387,6 +447,7 @@ mod tests {
             proptest::collection::vec(any::<String>(), 0..8).prop_map(IpcResponse::Lines),
             Just(IpcResponse::Pong),
             proptest::collection::vec(arb_session_info(), 0..8).prop_map(IpcResponse::Sessions),
+            any::<usize>().prop_map(|count| IpcResponse::PrunedSessions { count }),
             any::<String>().prop_map(|message| IpcResponse::Error { message }),
         ]
     }

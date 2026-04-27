@@ -26,6 +26,14 @@ typeset -g _AIC_HOOK_VERSION={HOOK_VERSION}
 typeset -g _AIC_HOOK_CMD_ID=""
 typeset -g _AIC_HOOK_START_NS=0
 
+if [[ -z "${{AIC_SESSION_ID:-}}" ]]; then
+    _AIC_HOOK_SESSION_ID="$(aic-session --print-session-id 2>/dev/null || printf 'none')"
+    if [[ "$_AIC_HOOK_SESSION_ID" != "none" ]]; then
+        export AIC_SESSION_ID="$_AIC_HOOK_SESSION_ID"
+        export AIC_SESSION=1
+    fi
+fi
+
 _aic_hook_now_ns() {{
     if zmodload -F zsh/datetime b:strftime 2>/dev/null; then
         printf '%d' $(( EPOCHREALTIME * 1000000000 ))
@@ -80,6 +88,14 @@ pub fn bash_hook_script() -> String {
 _AIC_HOOK_VERSION={HOOK_VERSION}
 _AIC_HOOK_CMD_ID=""
 _AIC_HOOK_START_NS=0
+
+if [[ -z "${{AIC_SESSION_ID:-}}" ]]; then
+    _AIC_HOOK_SESSION_ID="$(aic-session --print-session-id 2>/dev/null || printf 'none')"
+    if [[ "$_AIC_HOOK_SESSION_ID" != "none" ]]; then
+        export AIC_SESSION_ID="$_AIC_HOOK_SESSION_ID"
+        export AIC_SESSION=1
+    fi
+fi
 
 _aic_hook_now_ns() {{
     if [[ -n "${{EPOCHREALTIME:-}}" ]]; then
@@ -139,6 +155,8 @@ mod tests {
         assert!(s.contains("precmd _aic_hook_precmd"));
         assert!(s.contains("aic _hook-event start"));
         assert!(s.contains("aic _hook-event end"));
+        assert!(s.contains("aic-session --print-session-id"));
+        assert!(s.contains("export AIC_SESSION_ID"));
         assert!(s.contains(&format!("version {HOOK_VERSION}")));
     }
 
@@ -149,6 +167,8 @@ mod tests {
         assert!(s.contains("PROMPT_COMMAND"));
         assert!(s.contains("aic _hook-event start"));
         assert!(s.contains("aic _hook-event end"));
+        assert!(s.contains("aic-session --print-session-id"));
+        assert!(s.contains("export AIC_SESSION_ID"));
     }
 
     #[test]

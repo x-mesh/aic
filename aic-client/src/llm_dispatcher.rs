@@ -470,10 +470,7 @@ impl LlmDispatcher {
             provider: format!("{} ({e})", self.config.default_provider),
         })?;
         let api_key = resolved.as_str();
-        let model = provider
-            .model
-            .as_deref()
-            .unwrap_or("claude-sonnet-4-6");
+        let model = provider.model.as_deref().unwrap_or("claude-sonnet-4-6");
 
         let body = json!({
             "model": model,

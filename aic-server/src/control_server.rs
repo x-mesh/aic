@@ -16,6 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
+const STALE_ACTIVE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
+
 /// Daemon 측에서 control_server가 외부 상태를 변경할 때 사용하는 핸들.
 /// shutdown trigger, session registry, hook event buffer를 보유한다.
 #[derive(Clone)]
@@ -23,6 +25,7 @@ pub struct ControlContext {
     pub shutdown: Arc<Notify>,
     pub registry: SessionRegistry,
     pub hook_events: HookEventStore,
+    pub registry_path: Option<PathBuf>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -119,15 +122,43 @@ async fn handle_client(mut stream: UnixStream, ctx: ControlContext) -> anyhow::R
 async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::Pong,
-        IpcRequest::ListSessions => IpcResponse::Sessions(ctx.registry.list().await),
+        IpcRequest::ListSessions => {
+            reconcile_stale_sessions(ctx).await;
+            IpcResponse::Sessions(ctx.registry.list().await)
+        }
+        IpcRequest::PruneSessions { older_than_secs } => {
+            reconcile_stale_sessions(ctx).await;
+            let older_than_secs = older_than_secs.min(i64::MAX as u64) as i64;
+            let count = ctx
+                .registry
+                .prune_inactive_older_than(
+                    chrono::Utc::now(),
+                    chrono::Duration::seconds(older_than_secs),
+                )
+                .await;
+            if count > 0 {
+                persist_registry(ctx).await;
+            }
+            IpcResponse::PrunedSessions { count }
+        }
         IpcRequest::RegisterSession(info) => {
             tracing::info!(session_id = %info.id, pid = info.pid, "세션 등록");
             ctx.registry.register(info).await;
+            persist_registry(ctx).await;
             IpcResponse::Pong
         }
         IpcRequest::UnregisterSession { id } => {
             let removed = ctx.registry.unregister(&id).await;
             tracing::info!(session_id = %id, removed, "세션 등록 해제");
+            persist_registry(ctx).await;
+            IpcResponse::Pong
+        }
+        IpcRequest::HeartbeatSession { id, seen_at, cwd } => {
+            let updated = ctx.registry.heartbeat(&id, seen_at, cwd).await;
+            tracing::debug!(session_id = %id, updated, "세션 heartbeat");
+            if updated {
+                persist_registry(ctx).await;
+            }
             IpcResponse::Pong
         }
         IpcRequest::Shutdown => {
@@ -139,15 +170,25 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             IpcResponse::Pong
         }
         IpcRequest::StopSession { id } => stop_session(ctx, &id).await,
+        IpcRequest::GetLastCommandForSession { id } => match ctx.hook_events.last(&id).await {
+            Some(record) => IpcResponse::CommandData(record),
+            None => IpcResponse::Error {
+                message: format!("hook metadata record를 찾을 수 없습니다: {id}"),
+            },
+        },
         IpcRequest::CommandStarted {
             session_id,
             command_id,
             command,
             cwd,
-            shell: _,
-            pid: _,
+            shell,
+            pid,
             started_at,
         } => {
+            ctx.registry
+                .upsert_hook_session(&session_id, pid, shell, cwd.clone(), started_at)
+                .await;
+            persist_registry(ctx).await;
             ctx.hook_events
                 .on_started(&session_id, &command_id, command, cwd, started_at)
                 .await;
@@ -160,6 +201,9 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             finished_at,
             duration_ms,
         } => {
+            if ctx.registry.touch_seen(&session_id, finished_at).await {
+                persist_registry(ctx).await;
+            }
             ctx.hook_events
                 .on_finished(
                     &session_id,
@@ -187,6 +231,26 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         IpcRequest::GetRecentLines { .. } | IpcRequest::GetMetrics => IpcResponse::Error {
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
+    }
+}
+
+async fn reconcile_stale_sessions(ctx: &ControlContext) {
+    let count = ctx
+        .registry
+        .mark_stale_active_detached(chrono::Utc::now(), STALE_ACTIVE_AFTER)
+        .await;
+    if count > 0 {
+        tracing::info!(count, "stale active 세션을 detached로 전환");
+        persist_registry(ctx).await;
+    }
+}
+
+async fn persist_registry(ctx: &ControlContext) {
+    let Some(path) = ctx.registry_path.as_ref() else {
+        return;
+    };
+    if let Err(e) = ctx.registry.save_snapshot(path).await {
+        tracing::warn!(path = %path.display(), error = %e, "registry snapshot 저장 실패");
     }
 }
 
@@ -244,15 +308,19 @@ mod tests {
             shutdown: Arc::new(Notify::new()),
             registry: SessionRegistry::new(),
             hook_events: HookEventStore::new(),
+            registry_path: None,
         }
     }
 
     fn sample_info(id: &str) -> aic_common::SessionInfo {
+        let now = chrono::Utc::now();
         aic_common::SessionInfo {
             id: id.to_string(),
             pid: 4242,
             state: aic_common::SessionState::Attached,
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_seen_at: Some(now),
+            last_command_at: None,
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(std::path::PathBuf::from("/tmp")),
@@ -294,6 +362,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_marks_stale_active_detached() {
+        let c = ctx();
+        let mut stale = sample_info("aaaaaaaa");
+        stale.last_seen_at = Some(chrono::Utc::now() - chrono::Duration::minutes(2));
+        stale.attached_tty = Some("/dev/ttys001".to_string());
+        c.registry.register(stale).await;
+
+        let resp = process_control_request(IpcRequest::ListSessions, &c).await;
+
+        match resp {
+            IpcResponse::Sessions(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].state, aic_common::SessionState::Detached);
+                assert_eq!(list[0].attached_tty, None);
+            }
+            other => panic!("expected Sessions, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_sessions_removes_old_detached_entries() {
+        let c = ctx();
+        let mut old = sample_info("aaaaaaaa");
+        old.state = aic_common::SessionState::Detached;
+        old.last_seen_at = Some(chrono::Utc::now() - chrono::Duration::hours(2));
+        c.registry.register(old).await;
+
+        let resp = process_control_request(
+            IpcRequest::PruneSessions {
+                older_than_secs: 3600,
+            },
+            &c,
+        )
+        .await;
+
+        assert_eq!(resp, IpcResponse::PrunedSessions { count: 1 });
+        assert!(c.registry.is_empty().await);
+    }
+
+    #[tokio::test]
     async fn unregister_removes_session() {
         let c = ctx();
         process_control_request(IpcRequest::RegisterSession(sample_info("aaaaaaaa")), &c).await;
@@ -306,6 +414,105 @@ mod tests {
         .await;
         assert_eq!(resp, IpcResponse::Pong);
         assert_eq!(c.registry.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_registered_session() {
+        let c = ctx();
+        process_control_request(IpcRequest::RegisterSession(sample_info("aaaaaaaa")), &c).await;
+        let seen_at = chrono::Utc::now();
+        let resp = process_control_request(
+            IpcRequest::HeartbeatSession {
+                id: "aaaaaaaa".to_string(),
+                seen_at,
+                cwd: Some(std::path::PathBuf::from("/work")),
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
+
+        let sessions = c.registry.list().await;
+        assert_eq!(sessions[0].last_seen_at, Some(seen_at));
+        assert_eq!(
+            sessions[0].cwd.as_deref(),
+            Some(std::path::Path::new("/work"))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_last_command_for_session_returns_hook_record() {
+        let c = ctx();
+        let started_at = chrono::Utc::now();
+        process_control_request(
+            IpcRequest::CommandStarted {
+                session_id: "aaaaaaaa".to_string(),
+                command_id: "cmd1".to_string(),
+                command: "cargo build".to_string(),
+                cwd: Some(std::path::PathBuf::from("/tmp")),
+                shell: Some("zsh".to_string()),
+                pid: 1234,
+                started_at,
+            },
+            &c,
+        )
+        .await;
+        process_control_request(
+            IpcRequest::CommandFinished {
+                session_id: "aaaaaaaa".to_string(),
+                command_id: "cmd1".to_string(),
+                exit_code: 1,
+                finished_at: chrono::Utc::now(),
+                duration_ms: 12,
+            },
+            &c,
+        )
+        .await;
+
+        let resp = process_control_request(
+            IpcRequest::GetLastCommandForSession {
+                id: "aaaaaaaa".to_string(),
+            },
+            &c,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::CommandData(record) => {
+                assert_eq!(record.command.as_deref(), Some("cargo build"));
+                assert_eq!(record.exit_code, 1);
+                assert_eq!(record.capture_mode, aic_common::CaptureMode::Hook);
+                assert_eq!(
+                    record.capture_quality,
+                    aic_common::CaptureQuality::MetadataOnly
+                );
+            }
+            other => panic!("CommandData 응답을 기대 — actual: {other:?}"),
+        }
+
+        let sessions = c.registry.list().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "aaaaaaaa");
+        assert_eq!(sessions[0].last_command_at, Some(started_at));
+    }
+
+    #[tokio::test]
+    async fn get_last_command_for_session_missing_returns_error() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::GetLastCommandForSession {
+                id: "missing".to_string(),
+            },
+            &c,
+        )
+        .await;
+
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(message.contains("찾을 수 없습니다"), "actual: {message}");
+            }
+            other => panic!("Error 응답을 기대 — actual: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -333,11 +540,14 @@ mod tests {
         // permission denied 또는 ESRCH 한쪽이 나오는지 확인한다 — kill(1, SIGTERM)은
         // 일반 사용자가 EPERM을 받는다.
         let c = ctx();
+        let now = chrono::Utc::now();
         let info = aic_common::SessionInfo {
             id: "abcd1234".to_string(),
             pid: 1,
             state: aic_common::SessionState::Attached,
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_seen_at: Some(now),
+            last_command_at: None,
             attached_tty: None,
             shell: None,
             cwd: None,

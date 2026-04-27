@@ -40,6 +40,22 @@ impl UdsClient {
         }
     }
 
+    /// `aicd` hook-event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
+    pub async fn get_last_command_for_session(&self, id: &str) -> Result<CommandRecord, AicError> {
+        let response = self
+            .send_request(IpcRequest::GetLastCommandForSession { id: id.to_string() })
+            .await?;
+
+        match response {
+            IpcResponse::CommandData(record) => Ok(record),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {:?}", other),
+            ))),
+        }
+    }
+
     /// 연결 가능 여부를 확인한다 (health check).
     pub async fn ping(&self) -> Result<bool, AicError> {
         match self.send_request(IpcRequest::Ping).await {
@@ -65,6 +81,21 @@ impl UdsClient {
     pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, AicError> {
         match self.send_request(IpcRequest::ListSessions).await? {
             IpcResponse::Sessions(list) => Ok(list),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
+    /// `aicd` registry에서 오래된 inactive 세션을 제거한다.
+    pub async fn prune_sessions(&self, older_than_secs: u64) -> Result<usize, AicError> {
+        match self
+            .send_request(IpcRequest::PruneSessions { older_than_secs })
+            .await?
+        {
+            IpcResponse::PrunedSessions { count } => Ok(count),
             IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
             other => Err(AicError::IpcError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

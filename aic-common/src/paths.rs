@@ -65,6 +65,13 @@ pub fn aicd_lock_path() -> PathBuf {
     session_dir().join("aicd.pid")
 }
 
+/// `aicd` supervisor daemon의 registry snapshot 경로.
+///
+/// 런타임 세션 복구용이므로 control socket/lock과 같은 session_dir 아래에 둔다.
+pub fn aicd_registry_path() -> PathBuf {
+    session_dir().join("aicd-registry.json")
+}
+
 /// 소켓 경로에서 Session_ID를 추출한다.
 /// `session-{id}.sock` 형식의 파일명에서 `{id}` 부분을 반환한다.
 /// 형식이 맞지 않으면 `None`을 반환한다.
@@ -188,6 +195,13 @@ mod tests {
     fn session_socket_path_under_session_dir() {
         let path = session_socket_path("deadbeef");
         assert_eq!(path.parent().unwrap(), session_dir());
+    }
+
+    #[test]
+    fn aicd_registry_path_under_session_dir() {
+        let path = aicd_registry_path();
+        assert_eq!(path.parent().unwrap(), session_dir());
+        assert!(path.ends_with("aicd-registry.json"));
     }
 
     // ── extract_session_id tests ───────────────────────────────

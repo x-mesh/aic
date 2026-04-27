@@ -212,16 +212,32 @@ async fn main() -> anyhow::Result<()> {
     //      Phase 1.4: 이 단계에서는 PTY ownership을 옮기지 않고, 단지 supervisor에게
     //      "이 세션이 활성"임을 알려 `aic sessions`/`status`가 중앙 registry를
     //      소스 오브 트루스로 쓰게 한다.
+    let now = chrono::Utc::now();
     let session_info_for_register = aic_common::SessionInfo {
         id: session_id.clone(),
         pid: std::process::id(),
         state: aic_common::SessionState::Attached,
-        created_at: chrono::Utc::now(),
+        created_at: now,
+        last_seen_at: Some(now),
+        last_command_at: None,
         attached_tty: aic_server::aicd_client::current_tty(),
         shell: Some(shell_name.clone()),
         cwd: std::env::current_dir().ok(),
     };
     aic_server::aicd_client::register_session(session_info_for_register).await;
+
+    let heartbeat_session_id = session_id.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            aic_server::aicd_client::heartbeat_session(
+                &heartbeat_session_id,
+                std::env::current_dir().ok(),
+            )
+            .await;
+        }
+    });
 
     // 6. stdin → PTY 입력 relay (blocking thread)
     let stdin_handle = tokio::task::spawn_blocking(move || {
@@ -371,6 +387,7 @@ async fn main() -> anyhow::Result<()> {
     aic_server::aicd_client::unregister_session(&session_id).await;
     uds_handle.abort();
     stdin_handle.abort();
+    heartbeat_handle.abort();
     sigwinch_handle.abort();
     let _ = std::fs::remove_file(&sock); // session-{session_id}.sock 삭제
 

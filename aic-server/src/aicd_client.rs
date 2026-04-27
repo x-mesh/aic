@@ -40,6 +40,22 @@ pub async fn unregister_session(id: &str) {
     }
 }
 
+/// 세션 heartbeat를 `aicd`에 보낸다 (best-effort).
+pub async fn heartbeat_session(id: &str, cwd: Option<std::path::PathBuf>) {
+    if let Err(e) = send(
+        &aicd_socket_path(),
+        IpcRequest::HeartbeatSession {
+            id: id.to_string(),
+            seen_at: chrono::Utc::now(),
+            cwd,
+        },
+    )
+    .await
+    {
+        tracing::debug!(error = %e, "aicd heartbeat 실패 (무시)");
+    }
+}
+
 /// 단발성 IPC: connect → write request → read response → close. 타임아웃 안에 끝낸다.
 async fn send(socket_path: &Path, request: IpcRequest) -> anyhow::Result<IpcResponse> {
     let fut = async {
@@ -90,11 +106,14 @@ mod tests {
     #[tokio::test]
     async fn register_session_silent_when_aicd_down() {
         // aicd가 없는 상태에서도 panic 없이 반환해야 한다.
+        let now = chrono::Utc::now();
         let info = SessionInfo {
             id: "deadbeef".to_string(),
             pid: std::process::id(),
             state: aic_common::SessionState::Attached,
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_seen_at: Some(now),
+            last_command_at: None,
             attached_tty: None,
             shell: None,
             cwd: None,
@@ -125,14 +144,18 @@ mod tests {
             shutdown: Arc::new(Notify::new()),
             registry: registry.clone(),
             hook_events: crate::hook_events::HookEventStore::new(),
+            registry_path: None,
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 
+        let now = chrono::Utc::now();
         let info = SessionInfo {
             id: "abcd1234".to_string(),
             pid: 9999,
             state: aic_common::SessionState::Attached,
-            created_at: chrono::Utc::now(),
+            created_at: now,
+            last_seen_at: Some(now),
+            last_command_at: None,
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(std::path::PathBuf::from("/tmp")),

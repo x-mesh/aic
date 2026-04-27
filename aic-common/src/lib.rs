@@ -8,7 +8,7 @@ pub mod session;
 pub use error::AicError;
 pub use ipc::{decode_frame, encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
 pub use paths::{
-    aicd_lock_path, aicd_socket_path, default_socket_path, extract_session_id,
+    aicd_lock_path, aicd_registry_path, aicd_socket_path, default_socket_path, extract_session_id,
     list_session_sockets, resolve_active_socket, resolve_socket_path, session_dir,
     session_socket_path,
 };
@@ -164,8 +164,7 @@ pub enum SessionState {
     Failed,
 }
 
-/// `aicd` registry의 세션 한 건. 향후 sub-step에서 `last_seen_at`,
-/// `last_command_at` 등을 추가한다.
+/// `aicd` registry의 세션 한 건.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     /// Session_ID (8자 lowercase hex). `session::generate_session_id` 참조.
@@ -176,6 +175,12 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// 세션이 처음 등록된 시각.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// 마지막 heartbeat 또는 hook event 수신 시각.
+    #[serde(default)]
+    pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 마지막 command start 시각.
+    #[serde(default)]
+    pub last_command_at: Option<chrono::DateTime<chrono::Utc>>,
     /// 현재 attach된 TTY 경로 (예: `/dev/ttys003`). attach가 없으면 `None`.
     pub attached_tty: Option<String>,
     /// 셸 실행 파일 경로 (예: `/bin/zsh`). 알 수 없으면 `None`.

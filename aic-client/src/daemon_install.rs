@@ -74,7 +74,11 @@ pub fn macos_plist_path() -> Result<PathBuf> {
 pub fn linux_unit_path() -> Result<PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".config"));
+        .unwrap_or_else(|_| {
+            home_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".config")
+        });
     Ok(base.join("systemd").join("user").join(SYSTEMD_UNIT))
 }
 
@@ -422,7 +426,10 @@ mod tests {
     fn linux_unit_path_respects_xdg_config_home() {
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/aic-test-xdg");
         let p = linux_unit_path().unwrap();
-        assert_eq!(p, PathBuf::from("/tmp/aic-test-xdg/systemd/user/aicd.service"));
+        assert_eq!(
+            p,
+            PathBuf::from("/tmp/aic-test-xdg/systemd/user/aicd.service")
+        );
         std::env::remove_var("XDG_CONFIG_HOME");
     }
 

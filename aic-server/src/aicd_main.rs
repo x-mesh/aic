@@ -9,7 +9,7 @@
 //! 의도적으로 비범위:
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
-use aic_common::{aicd_lock_path, aicd_socket_path};
+use aic_common::{aicd_lock_path, aicd_registry_path, aicd_socket_path};
 use aic_server::control_server::{ControlContext, ControlServer};
 use aic_server::hook_events::HookEventStore;
 use aic_server::lock::DaemonLock;
@@ -72,15 +72,29 @@ async fn main() -> anyhow::Result<()> {
         signal_shutdown.notify_one();
     });
 
-    let registry = SessionRegistry::new();
+    let registry_path = aicd_registry_path();
+    let registry = match SessionRegistry::load_snapshot(&registry_path, chrono::Utc::now()) {
+        Ok(registry) => {
+            tracing::info!(path = %registry_path.display(), count = registry.len().await, "registry snapshot 로드");
+            registry
+        }
+        Err(e) => {
+            tracing::warn!(path = %registry_path.display(), error = %e, "registry snapshot 로드 실패, 빈 registry 사용");
+            SessionRegistry::new()
+        }
+    };
     let hook_events = HookEventStore::new();
     server
         .serve(ControlContext {
             shutdown,
-            registry,
+            registry: registry.clone(),
             hook_events,
+            registry_path: Some(registry_path.clone()),
         })
         .await;
+    if let Err(e) = registry.save_snapshot(&registry_path).await {
+        tracing::warn!(path = %registry_path.display(), error = %e, "registry snapshot 최종 저장 실패");
+    }
     tracing::info!("aicd 종료");
     Ok(())
 }

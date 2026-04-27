@@ -272,6 +272,12 @@ enum SessionOp {
         /// 세션 ID (8자 lowercase hex)
         id: String,
     },
+    /// 오래된 inactive(detached/stopping/stopped/failed) 세션을 registry에서 제거한다.
+    Prune {
+        /// 이 시간보다 오래된 inactive 세션 제거. 기본 1h.
+        #[arg(long, default_value = "3600")]
+        older_than_secs: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -355,6 +361,7 @@ async fn main() {
         },
         Some(Commands::Session { op }) => match op {
             SessionOp::Stop { id } => handle_session_stop(id).await,
+            SessionOp::Prune { older_than_secs } => handle_session_prune(older_than_secs).await,
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::Run { cmd }) => handle_run(cmd).await,
@@ -547,11 +554,12 @@ fn handle_daemon_install(no_load: bool) {
             println!("{COL_GREEN}✓{COL_RESET} {plat} unit 설치 완료");
             println!("  unit:    {}", report.unit_path.display());
             println!("  aicd:    {}", report.aicd_path.display());
-            println!("  logs:    {}/aicd.{{out,err}}.log", report.log_dir.display());
+            println!(
+                "  logs:    {}/aicd.{{out,err}}.log",
+                report.log_dir.display()
+            );
             if report.loaded {
-                println!(
-                    "  loaded:  {COL_GREEN}yes{COL_RESET} — 부팅 시 자동 시작 + 즉시 실행"
-                );
+                println!("  loaded:  {COL_GREEN}yes{COL_RESET} — 부팅 시 자동 시작 + 즉시 실행");
             } else {
                 let cmd = match report.platform {
                     aic_client::daemon_install::Platform::Macos => {
@@ -559,9 +567,7 @@ fn handle_daemon_install(no_load: bool) {
                     }
                     _ => "systemctl --user enable --now aicd.service",
                 };
-                println!(
-                    "  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}"
-                );
+                println!("  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}");
             }
         }
         Err(e) => {
@@ -862,6 +868,21 @@ async fn handle_session_stop(id: String) {
         }
         Err(e) => {
             eprintln!("{COL_RED}✗{COL_RESET} 세션 종료 실패: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_session_prune(older_than_secs: u64) {
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    match client.prune_sessions(older_than_secs).await {
+        Ok(count) => println!("{COL_GREEN}✓{COL_RESET} inactive 세션 {count}개 정리"),
+        Err(AicError::ServerNotRunning) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} aicd가 실행 중이 아닙니다 — `aic daemon start` 후 다시 시도하세요.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 세션 정리 실패: {e}");
             std::process::exit(1);
         }
     }
@@ -1330,6 +1351,27 @@ async fn print_status_json(session: Option<&str>) {
 
 /// `aic status --all --json`: 모든 활성 세션 list를 JSON으로 출력.
 async fn print_sessions_json() {
+    let aicd_client = UdsClient::new(aic_common::aicd_socket_path());
+    if let Ok(true) = aicd_client.ping().await {
+        match aicd_client.list_sessions().await {
+            Ok(list) => {
+                let arr: Vec<serde_json::Value> =
+                    list.into_iter().map(registry_session_json).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+                        .unwrap_or_else(|_| "[]".into())
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} aicd registry 조회 실패 — file-system scan으로 fallback: {e}"
+                );
+            }
+        }
+    }
+
     let sessions = list_sessions();
     let arr: Vec<serde_json::Value> = sessions
         .into_iter()
@@ -1349,6 +1391,20 @@ async fn print_sessions_json() {
         serde_json::to_string_pretty(&serde_json::Value::Array(arr))
             .unwrap_or_else(|_| "[]".into())
     );
+}
+
+fn registry_session_json(s: aic_common::SessionInfo) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": s.id,
+        "pid": s.pid,
+        "state": format!("{:?}", s.state).to_lowercase(),
+        "created_at": s.created_at,
+        "last_seen_at": s.last_seen_at,
+        "last_command_at": s.last_command_at,
+        "attached_tty": s.attached_tty,
+        "shell": s.shell,
+        "cwd": s.cwd,
+    })
 }
 
 /// `aic status [--watch] [--interval N] [--session ID] [--json] [--all]`: 데몬 상태 출력.
@@ -2267,12 +2323,21 @@ async fn handle_sessions() {
                         .as_deref()
                         .and_then(|p| p.rsplit('/').next())
                         .unwrap_or("?");
+                    let state = format_session_state(&s.state);
+                    let seen = format_optional_time(s.last_seen_at);
+                    let command = format_optional_time(s.last_command_at);
+                    let cwd = s
+                        .cwd
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "?".to_string());
                     println!(
-                        "  {COL_CYAN}{id}{COL_RESET}{marker}  {COL_DIM}pid {pid}  {tty}  {shell}{COL_RESET}",
+                        "  {COL_CYAN}{id}{COL_RESET}{marker}  {state}  {COL_DIM}pid {pid}  {tty}  {shell}  seen {seen}  cmd {command}  {cwd}{COL_RESET}",
                         id = s.id,
                         pid = s.pid,
                     );
                 }
+                println!("{COL_DIM}정리: aic session prune [--older-than-secs 3600]{COL_RESET}");
                 return;
             }
             Err(e) => {
@@ -2306,6 +2371,36 @@ async fn handle_sessions() {
     }
 }
 
+fn format_session_state(state: &aic_common::SessionState) -> String {
+    match state {
+        aic_common::SessionState::Attached => format!("{COL_GREEN}attached{COL_RESET}"),
+        aic_common::SessionState::Creating => format!("{COL_CYAN}creating{COL_RESET}"),
+        aic_common::SessionState::Detached => format!("{COL_YELLOW}detached{COL_RESET}"),
+        aic_common::SessionState::Stopping => format!("{COL_YELLOW}stopping{COL_RESET}"),
+        aic_common::SessionState::Stopped => format!("{COL_DIM}stopped{COL_RESET}"),
+        aic_common::SessionState::Failed => format!("{COL_RED}failed{COL_RESET}"),
+    }
+}
+
+fn format_optional_time(ts: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    ts.map(format_relative_time)
+        .unwrap_or_else(|| "never".to_string())
+}
+
+fn format_relative_time(ts: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = chrono::Utc::now() - ts;
+    let secs = elapsed.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
 // ── 세션 소켓 결정 ──────────────────────────────────────────────
 
 /// `AIC_SESSION_ID` 환경변수 기반 소켓 경로 결정 결과.
@@ -2314,6 +2409,50 @@ enum SessionSocket {
     Path(std::path::PathBuf),
     /// 히스토리 폴백 (세션 소켓 사용 불가)
     HistoryFallback,
+}
+
+fn hook_lookup_enabled(config: &AppConfig) -> bool {
+    matches!(
+        config.session.capture_mode,
+        aic_common::SessionCaptureMode::Hook | aic_common::SessionCaptureMode::Hybrid
+    )
+}
+
+fn current_session_id_from_env() -> Option<String> {
+    let id = std::env::var("AIC_SESSION_ID").ok()?;
+    let trimmed = id.trim();
+    if aic_common::is_valid_session_id(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+async fn get_hook_metadata_record(config: &AppConfig) -> Option<aic_common::CommandRecord> {
+    if !hook_lookup_enabled(config) {
+        return None;
+    }
+    let session_id = current_session_id_from_env()?;
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    match client.get_last_command_for_session(&session_id).await {
+        Ok(record) => {
+            debug_log!(
+                "aicd     hook metadata · session={} exit={} cmd={}",
+                session_id,
+                record.exit_code,
+                record.command.as_deref().unwrap_or("∅")
+            );
+            Some(record)
+        }
+        Err(e) => {
+            debug_log!(
+                "aicd     hook metadata miss · session={} · {}",
+                session_id,
+                e
+            );
+            None
+        }
+    }
 }
 
 /// `AIC_SESSION_ID` 환경변수를 확인하여 소켓 경로를 결정한다.
@@ -2479,9 +2618,31 @@ async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow:
                         .map(str::trim)
                         .is_none_or(str::is_empty);
                     if cmd_unknown {
-                        eprintln!(
-                            "{COL_YELLOW}ℹ{COL_RESET} 데몬이 직전 명령을 캡처하지 못했습니다. 셸 히스토리에서 폴백합니다.\n   {COL_DIM}hook 미설치 의심 — `aic init`으로 설치 후 새 셸에서 시도하세요.{COL_RESET}"
-                        );
+                        if let Some(hook_record) = get_hook_metadata_record(&config).await {
+                            hook_record
+                        } else {
+                            eprintln!(
+                                "{COL_YELLOW}ℹ{COL_RESET} 데몬이 직전 명령을 캡처하지 못했습니다. 셸 히스토리에서 폴백합니다.\n   {COL_DIM}hook 미설치 의심 — `aic init`으로 설치 후 새 셸에서 시도하세요.{COL_RESET}"
+                            );
+                            history_fallback_or_repl(
+                                &dispatcher,
+                                &provider_name,
+                                &model_name,
+                                &config,
+                                &lang,
+                                dry_run,
+                                total_start,
+                            )
+                            .await?
+                        }
+                    } else {
+                        rec
+                    }
+                }
+                Err(_) => {
+                    if let Some(hook_record) = get_hook_metadata_record(&config).await {
+                        hook_record
+                    } else {
                         history_fallback_or_repl(
                             &dispatcher,
                             &provider_name,
@@ -2492,31 +2653,20 @@ async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow:
                             total_start,
                         )
                         .await?
-                    } else {
-                        rec
                     }
-                }
-                Err(_) => {
-                    // 서버 없음 → 히스토리 폴백
-                    history_fallback_or_repl(
-                        &dispatcher,
-                        &provider_name,
-                        &model_name,
-                        &config,
-                        &lang,
-                        dry_run,
-                        total_start,
-                    )
-                    .await?
                 }
             }
         }
         SessionSocket::HistoryFallback => {
-            eprintln!(
+            if let Some(hook_record) = get_hook_metadata_record(&config).await {
+                hook_record
+            } else {
+                eprintln!(
                 "{COL_YELLOW}ℹ{COL_RESET} aic-session 안에서 실행해주세요. 직접 질문은 {COL_BOLD}aic \"질문\"{COL_RESET} 형식으로 가능합니다."
             );
-            debug_step!(total_start, "total");
-            return Ok(());
+                debug_step!(total_start, "total");
+                return Ok(());
+            }
         }
     };
 
@@ -3215,9 +3365,9 @@ fn estimate_cost_usd(model: &str, input_tokens: usize, output_tokens: usize) -> 
         // Anthropic — 4.x family 단가는 sonnet 4 시리즈 공시 기준($3 in / $15 out).
         // 정확한 단가는 https://www.anthropic.com/pricing 참조; 여기 매핑은 dry-run
         // 추정용이라 실제 결제와 다를 수 있다.
-        "claude-3-5-sonnet-20241022"
-        | "claude-sonnet-4-20250514"
-        | "claude-sonnet-4-6" => (3.00, 15.00),
+        "claude-3-5-sonnet-20241022" | "claude-sonnet-4-20250514" | "claude-sonnet-4-6" => {
+            (3.00, 15.00)
+        }
         "claude-3-5-haiku-20241022" | "claude-haiku-4-5-20251001" => (1.00, 5.00),
         "claude-3-opus-20240229" | "claude-opus-4-7" => (15.00, 75.00),
         // NVIDIA NIM (대부분 무료 tier)
