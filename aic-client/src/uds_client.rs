@@ -85,6 +85,21 @@ impl UdsClient {
         }
     }
 
+    /// `aicd`에 특정 세션을 graceful 종료시키도록 요청한다 (Phase 2.1).
+    pub async fn stop_session(&self, id: &str) -> Result<(), AicError> {
+        match self
+            .send_request(IpcRequest::StopSession { id: id.to_string() })
+            .await?
+        {
+            IpcResponse::Pong => Ok(()),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// IPC 요청을 전송하고 응답을 수신하는 공통 메서드.
     ///
     /// UDS는 local IPC라 응답 시간은 ms 단위가 정상이다. 데몬이 hang된 경우 빠르게

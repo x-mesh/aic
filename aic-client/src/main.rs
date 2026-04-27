@@ -207,6 +207,20 @@ enum Commands {
         #[command(subcommand)]
         op: DaemonOp,
     },
+    /// 세션 lifecycle 제어 (Phase 2.1).
+    Session {
+        #[command(subcommand)]
+        op: SessionOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionOp {
+    /// 특정 세션에 graceful 종료(SIGTERM)를 보낸다.
+    Stop {
+        /// 세션 ID (8자 lowercase hex)
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +291,9 @@ async fn main() {
             DaemonOp::Status => handle_daemon_status().await,
             DaemonOp::Start => handle_daemon_start().await,
             DaemonOp::Stop => handle_daemon_stop().await,
+        },
+        Some(Commands::Session { op }) => match op {
+            SessionOp::Stop { id } => handle_session_stop(id).await,
         },
         Some(Commands::Sessions { json }) => {
             if json {
@@ -482,6 +499,34 @@ async fn handle_daemon_start() {
                 "{COL_RED}✗{COL_RESET} aicd 실행 실패: {e}\n  시도한 경로: {}",
                 aicd_bin.display()
             );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `aic session stop <id>`: 특정 세션을 종료한다 (Phase 2.1).
+///
+/// aicd가 떠 있어야 한다. 떠 있지 않다면 사용자에게 자체적으로 `kill <pid>`
+/// 또는 `aic daemon start` 하라고 안내한다.
+async fn handle_session_stop(id: String) {
+    if !aic_common::is_valid_session_id(&id) {
+        eprintln!(
+            "{COL_RED}✗{COL_RESET} 유효하지 않은 세션 ID: '{id}' (1~8자 lowercase hex 필요)"
+        );
+        std::process::exit(2);
+    }
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    match client.stop_session(&id).await {
+        Ok(()) => println!("{COL_GREEN}✓{COL_RESET} 세션 {id}에 SIGTERM 전송"),
+        Err(AicError::ServerNotRunning) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} aicd가 실행 중이 아닙니다 — 세션 종료를 위해 \
+                 `aic daemon start` 후 다시 시도하거나 직접 `kill` 명령을 사용하세요."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 세션 종료 실패: {e}");
             std::process::exit(1);
         }
     }

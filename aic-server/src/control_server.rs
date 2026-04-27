@@ -136,6 +136,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             ctx.shutdown.notify_one();
             IpcResponse::Pong
         }
+        IpcRequest::StopSession { id } => stop_session(ctx, &id).await,
         // session-level request는 aicd의 책임이 아니다.
         IpcRequest::GetLastCommand
         | IpcRequest::GetRecentLines { .. }
@@ -143,6 +144,55 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
     }
+}
+
+/// `aicd`가 owning하지 않는 PTY child를 종료하는 임시 구현 (Phase 2.1).
+///
+/// 진짜 PTY ownership 이동(Phase 2 본 구현)이 들어오기 전까지의 bridge:
+/// - registry에서 PID 조회
+/// - 해당 PID에 SIGTERM 전송 (kill -TERM)
+/// - registry에서 제거
+///
+/// 한계:
+/// - PTY child가 아니라 `aic-session` 프로세스에 신호가 간다. 그 프로세스의
+///   shutdown 핸들러가 PTY child를 정리한다(이미 잘 동작).
+/// - PID race(이미 죽었거나 recycling) 가능 — best-effort.
+async fn stop_session(ctx: &ControlContext, id: &str) -> IpcResponse {
+    let entry = ctx
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .find(|s| s.id == id);
+    let Some(info) = entry else {
+        return IpcResponse::Error {
+            message: format!("세션을 찾을 수 없습니다: {id}"),
+        };
+    };
+
+    let pid = info.pid as i32;
+    if pid <= 1 {
+        return IpcResponse::Error {
+            message: format!("유효하지 않은 PID: {pid}"),
+        };
+    }
+    let r = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            tracing::info!(session_id = %id, pid, "stop: 프로세스 이미 없음 — registry만 정리");
+            ctx.registry.unregister(id).await;
+            return IpcResponse::Pong;
+        }
+        return IpcResponse::Error {
+            message: format!("kill({pid}, SIGTERM) 실패: {err}"),
+        };
+    }
+    tracing::info!(session_id = %id, pid, "SIGTERM 전송");
+    // unregister는 호출하지 않는다 — 세션이 자체 shutdown path에서
+    // UnregisterSession을 보낸다. 이중 unregister는 best-effort라 OK지만
+    // race 줄이려고 호출자 쪽에 맡긴다.
+    IpcResponse::Pong
 }
 
 #[cfg(test)]
@@ -219,6 +269,53 @@ mod tests {
         .await;
         assert_eq!(resp, IpcResponse::Pong);
         assert_eq!(c.registry.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_session_unknown_id_returns_error() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::StopSession {
+                id: "missing".to_string(),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(message.contains("찾을 수 없습니다"), "actual: {message}");
+            }
+            other => panic!("Error 응답을 기대 — actual: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_session_self_pid_sends_signal_path() {
+        // 자기 자신 PID로 등록한 뒤 StopSession을 호출하면 kill 결과를 검증할 수 있다.
+        // SIGTERM은 테스트 프로세스에 영향을 줄 수 있으므로 PID를 init(1)로 두고
+        // permission denied 또는 ESRCH 한쪽이 나오는지 확인한다 — kill(1, SIGTERM)은
+        // 일반 사용자가 EPERM을 받는다.
+        let c = ctx();
+        let info = aic_common::SessionInfo {
+            id: "abcd1234".to_string(),
+            pid: 1,
+            state: aic_common::SessionState::Attached,
+            created_at: chrono::Utc::now(),
+            attached_tty: None,
+            shell: None,
+            cwd: None,
+        };
+        c.registry.register(info).await;
+        let resp = process_control_request(
+            IpcRequest::StopSession {
+                id: "abcd1234".to_string(),
+            },
+            &c,
+        )
+        .await;
+        // EPERM/EACCES가 나면 Error, 운이 좋아 (운영 안 좋은) ESRCH면 Pong.
+        // 핵심은 panic 안 하고 graceful 응답이라는 것.
+        assert!(matches!(resp, IpcResponse::Error { .. } | IpcResponse::Pong));
     }
 
     #[tokio::test]

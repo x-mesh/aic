@@ -27,6 +27,11 @@ pub enum IpcRequest {
     /// 세션을 `aicd` registry에서 제거한다 (Phase 1.3).
     /// `aic-session`이 정상 종료 직전에 보낸다.
     UnregisterSession { id: String },
+    /// 특정 세션에 graceful 종료 신호를 보낸다 (Phase 2.1).
+    ///
+    /// 현재 구현: `aicd`가 registry에서 PID를 찾아 `SIGTERM`을 보낸다.
+    /// 향후 PTY ownership을 `aicd`가 가져오면 `aicd`가 직접 child를 종료한다.
+    StopSession { id: String },
 }
 
 /// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
@@ -269,6 +274,7 @@ mod tests {
             Just(IpcRequest::Shutdown),
             arb_session_info().prop_map(IpcRequest::RegisterSession),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::UnregisterSession { id }),
+            "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
         ]
     }
 
