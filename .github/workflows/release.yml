@@ -1,0 +1,146 @@
+name: Release
+
+# trigger 정책:
+# - 'v*' 태그 push 시에만 release 흐름 시작 (예: v0.3.0)
+# - workflow_dispatch는 수동 발화용 — 태그 없이 dry-run 가능
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.3.0). 비우면 마지막 tag 사용"
+        required: false
+
+permissions:
+  contents: write   # GitHub Release 생성
+
+jobs:
+  # ── 1) 소스 tarball SHA256 계산 + GitHub Release 생성 ─────────
+  # Homebrew Formula는 GitHub이 tag에 자동 제공하는 source tarball을 받는다
+  # (`https://github.com/x-mesh/aic/archive/refs/tags/<TAG>.tar.gz`).
+  # 우리는 그 tarball의 SHA256만 계산해 Formula PR에 넘기면 된다.
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha256: ${{ steps.sha.outputs.sha256 }}
+      tarball_url: ${{ steps.sha.outputs.tarball_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tag 메타데이터 + CHANGELOG diff 추출용
+
+      - name: Resolve tag
+        id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "::error::release할 tag를 결정할 수 없습니다"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved release tag: $tag"
+
+      - name: Compute source tarball SHA256
+        id: sha
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # GitHub source tarball은 deterministic — tag-archive URL이 바뀌지 않는 한
+          # SHA256도 동일하다. release 후 Formula의 sha256과 정확히 일치해야 한다.
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          curl -sSL "$url" -o /tmp/source.tar.gz
+          sha=$(shasum -a 256 /tmp/source.tar.gz | awk '{print $1}')
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "tarball_url=$url" >> "$GITHUB_OUTPUT"
+          echo "Tarball SHA256: $sha"
+
+      - name: Extract CHANGELOG section
+        id: changelog
+        env:
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # CHANGELOG.md의 [Unreleased] 또는 [<TAG>] 섹션을 추출해 release notes로 사용.
+          # 헤더 매칭: `## [Unreleased]` 또는 `## [v0.3.0]` 또는 `## [0.3.0]`
+          version="${TAG#v}"
+          {
+            awk -v ver="$version" '
+              /^## \[/ {
+                if (capture) exit
+                if ($0 ~ ("\\[Unreleased\\]|\\[v?" ver "\\]")) { capture=1; next }
+              }
+              capture { print }
+            ' CHANGELOG.md
+          } > /tmp/release-notes.md
+          if [[ ! -s /tmp/release-notes.md ]]; then
+            echo "Release ${TAG}" > /tmp/release-notes.md
+          fi
+          # SHA256과 brew tap 안내를 항상 footer로 추가
+          cat >> /tmp/release-notes.md <<EOF
+
+          ---
+
+          ## Homebrew
+
+          \`\`\`sh
+          brew install x-mesh/tap/aic
+          aic daemon install
+          \`\`\`
+
+          Source tarball SHA256:
+          \`${{ steps.sha.outputs.sha256 }}\`
+          EOF
+          echo "notes_path=/tmp/release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # 같은 tag에 release가 이미 있으면 update, 없으면 create.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --notes-file /tmp/release-notes.md \
+              --title "$TAG"
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file /tmp/release-notes.md
+          fi
+
+  # ── 2) Homebrew Formula 자동 갱신 PR ──────────────────────────
+  # x-mesh/homebrew-tap에 새 url + sha256으로 Formula를 bump하는 PR을
+  # 자동으로 연다. mislav/bump-homebrew-formula-action이 표준.
+  bump-formula:
+    name: Bump Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    # workflow_dispatch는 사람이 직접 trigger한 경우에도 PR을 만든다.
+    if: needs.release.outputs.tag != ''
+    steps:
+      - name: Bump x-mesh/homebrew-tap
+        uses: mislav/bump-homebrew-formula-action@v3
+        with:
+          formula-name: aic
+          formula-path: Formula/aic.rb
+          homebrew-tap: x-mesh/homebrew-tap
+          base-branch: main
+          download-url: ${{ needs.release.outputs.tarball_url }}
+          commit-message: |
+            aic ${{ needs.release.outputs.tag }}
+
+            Source tarball SHA256: ${{ needs.release.outputs.sha256 }}
+        env:
+          # x-mesh/homebrew-tap에 push할 PAT.
+          # repo settings → Secrets → HOMEBREW_TAP_TOKEN에 등록 필요.
+          # scope: contents:write + pull-requests:write on x-mesh/homebrew-tap.
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

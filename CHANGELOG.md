@@ -71,6 +71,23 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
 
+### Added — Release workflow + Homebrew Formula auto-bump
+
+`v*` 태그 push 한 번으로 GitHub Release 생성과 `x-mesh/homebrew-tap`
+Formula 자동 갱신까지 처리. release 절차 문서는 `RELEASING.md`.
+
+- **`.github/workflows/release.yml`**:
+  1. tag push (`v*`) 또는 manual dispatch로 발화
+  2. GitHub source tarball SHA256 계산
+  3. CHANGELOG의 `[Unreleased]` 또는 `[v<version>]` 섹션을 awk로 추출해
+     release notes로 사용 + Homebrew 설치 안내 footer 자동 첨부
+  4. `gh release create/edit`로 Release 게시 (idempotent)
+  5. `mislav/bump-homebrew-formula-action@v3`로
+     `x-mesh/homebrew-tap/Formula/aic.rb`의 `url` + `sha256` 자동 bump PR
+- **`HOMEBREW_TAP_TOKEN` secret** — fine-grained PAT, scope: tap repo의
+  Contents + Pull requests write. 등록 절차는 `RELEASING.md` 참조.
+- **수동 dry-run** 지원 — Actions UI에서 `tag` 입력으로 발화 가능.
+
 ### Added — `aic daemon install` / `uninstall` (OS-native auto-start)
 
 부팅 시 `aicd` 자동 시작을 한 명령으로 양 OS 모두 처리. `brew services`는
