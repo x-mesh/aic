@@ -82,6 +82,13 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# release.mode = replace
+# 기본값(`append`)은 같은 이름 asset이 이미 있으면 422 already_exists로 실패한다.
+# rerun이나 부분 실패 후 재실행 시 매번 release를 손으로 지우는 부담이 생긴다.
+# `replace`는 conflict 시 기존 asset을 삭제 후 새로 업로드 — 멱등 release 보장.
+release:
+  mode: replace
+
 snapshot:
   version_template: "{{ .Tag }}-next"
 
