@@ -21,6 +21,12 @@ pub enum IpcRequest {
     ListSessions,
     /// `aicd`를 graceful 종료 시킨다 (active sessions 정리는 향후 sub-step).
     Shutdown,
+    /// 세션을 `aicd` registry에 등록한다 (Phase 1.3).
+    /// `aic-session`이 시작 직후 보낸다. 같은 id가 이미 있으면 덮어쓴다.
+    RegisterSession(SessionInfo),
+    /// 세션을 `aicd` registry에서 제거한다 (Phase 1.3).
+    /// `aic-session`이 정상 종료 직전에 보낸다.
+    UnregisterSession { id: String },
 }
 
 /// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
@@ -261,6 +267,8 @@ mod tests {
             Just(IpcRequest::GetMetrics),
             Just(IpcRequest::ListSessions),
             Just(IpcRequest::Shutdown),
+            arb_session_info().prop_map(IpcRequest::RegisterSession),
+            "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::UnregisterSession { id }),
         ]
     }
 

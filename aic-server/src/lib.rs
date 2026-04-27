@@ -5,5 +5,6 @@ pub mod metrics;
 pub mod output_processor;
 pub mod pty_manager;
 pub mod ring_buffer;
+pub mod session_registry;
 pub mod telemetry;
 pub mod uds_server;

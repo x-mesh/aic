@@ -12,6 +12,7 @@
 use aic_common::{aicd_lock_path, aicd_socket_path};
 use aic_server::control_server::{ControlContext, ControlServer};
 use aic_server::lock::DaemonLock;
+use aic_server::session_registry::SessionRegistry;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -70,7 +71,10 @@ async fn main() -> anyhow::Result<()> {
         signal_shutdown.notify_one();
     });
 
-    server.serve(ControlContext { shutdown }).await;
+    let registry = SessionRegistry::new();
+    server
+        .serve(ControlContext { shutdown, registry })
+        .await;
     tracing::info!("aicd 종료");
     Ok(())
 }
