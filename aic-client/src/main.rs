@@ -174,6 +174,10 @@ enum Commands {
         /// 셸 종류 (자동 감지: $SHELL)
         #[arg(value_parser = ["zsh", "bash"])]
         shell: Option<String>,
+        /// Phase 3 metadata-only hook(`~/.aic/hook-events.{zsh,bash}`)을 함께 설치한다.
+        /// PTY hook과 충돌하지 않으며, aicd가 떠 있을 때만 실제로 동작한다.
+        #[arg(long)]
+        hook_mode: bool,
     },
     /// 데몬 라이브 모니터링 — `aic status --watch` alias (interval 1s)
     Top {
@@ -218,6 +222,16 @@ enum Commands {
     HookEvent {
         #[command(subcommand)]
         op: HookEventOp,
+    },
+    /// 명시적 capture wrapper (Phase 3.3) — hook mode에서도 정확한 출력을 잡고 싶을 때.
+    ///
+    /// `aic run -- <cmd...>`로 실행하면 wrapper가 stdout/stderr tail을 캡처하고
+    /// FullOutput 품질의 record로 분석 흐름에 등록한다. exit code는 wrapped 명령의
+    /// 결과를 그대로 보존한다.
+    Run {
+        /// 실행할 명령어와 인자. `--` 뒤에 그대로 전달.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        cmd: Vec<String>,
     },
 }
 
@@ -322,7 +336,7 @@ async fn main() {
             AuditOp::Verify => handle_audit_verify(),
         },
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
-        Some(Commands::Init { shell }) => handle_init(shell),
+        Some(Commands::Init { shell, hook_mode }) => handle_init(shell, hook_mode),
         Some(Commands::Top { interval, session }) => handle_top(interval, session).await,
         Some(Commands::Daemon { op }) => match op {
             DaemonOp::Status => handle_daemon_status().await,
@@ -333,6 +347,7 @@ async fn main() {
             SessionOp::Stop { id } => handle_session_stop(id).await,
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
+        Some(Commands::Run { cmd }) => handle_run(cmd).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -542,6 +557,157 @@ async fn handle_daemon_start() {
     }
 }
 
+/// `aic run -- <cmd...>`: explicit capture wrapper.
+///
+/// 동작:
+/// 1. cmd를 spawn하고 stdout/stderr tail을 byte cap 안에서 수집한다.
+/// 2. wrapped 명령의 exit code를 그대로 보존하여 종료한다.
+/// 3. 분석 record는 capture_mode = ExplicitCapture, capture_quality = FullOutput
+///    (또는 truncation/binary 시 그에 맞는 quality)로 표시된다.
+///
+/// 현재 구현 한계:
+/// - aicd registry/buffer로 보내는 단계는 이후 sub-step에서 추가한다.
+///   (구조 정의만 하고 stdout으로 record JSON을 hint로 표시 — 사용자가 결과를 확인)
+/// - line cap 1000, byte cap 256 KiB. 초과 시 tail만 보존.
+async fn handle_run(cmd: Vec<String>) {
+    if cmd.is_empty() {
+        eprintln!("{COL_RED}✗{COL_RESET} 실행할 명령이 없습니다 — `aic run -- <cmd...>`");
+        std::process::exit(2);
+    }
+
+    const LINE_CAP: usize = 1000;
+    const BYTE_CAP: u64 = 256 * 1024;
+
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let started_at = chrono::Utc::now();
+    let mut child = match tokio::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {} 실행 실패: {e}", cmd[0]);
+            std::process::exit(127);
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+
+    // tail 수집을 위한 ring (실제 cap을 enforce하기 위해 VecDeque 사용).
+    let lines: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+    let truncated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stored_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    async fn pump<R: tokio::io::AsyncRead + Unpin>(
+        reader: R,
+        sink: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
+        truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stored_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        write_to: bool, // true=stdout, false=stderr — 사용자에게는 그대로 echo
+    ) {
+        let mut br = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = br.next_line().await {
+            if write_to {
+                println!("{line}");
+            } else {
+                eprintln!("{line}");
+            }
+            let line_bytes = line.len() as u64 + 1;
+            let cur = stored_bytes.fetch_add(line_bytes, std::sync::atomic::Ordering::Relaxed);
+            let mut q = sink.lock().await;
+            if cur + line_bytes > BYTE_CAP || q.len() >= LINE_CAP {
+                if !q.is_empty() {
+                    q.pop_front();
+                }
+                truncated.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            q.push_back(line);
+        }
+    }
+
+    let lines_out = std::sync::Arc::clone(&lines);
+    let trunc_out = std::sync::Arc::clone(&truncated);
+    let bytes_out = std::sync::Arc::clone(&stored_bytes);
+    let stdout_task = tokio::spawn(pump(stdout, lines_out, trunc_out, bytes_out, true));
+
+    let lines_err = std::sync::Arc::clone(&lines);
+    let trunc_err = std::sync::Arc::clone(&truncated);
+    let bytes_err = std::sync::Arc::clone(&stored_bytes);
+    let stderr_task = tokio::spawn(pump(stderr, lines_err, trunc_err, bytes_err, false));
+
+    let status = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} child wait 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+
+    let exit_code = status.code().unwrap_or_else(|| {
+        // signal 종료 — POSIX 관례 128 + signal
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            128 + status.signal().unwrap_or(15)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+
+    let collected: Vec<String> = lines.lock().await.iter().cloned().collect();
+    let stored = stored_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let was_truncated = truncated.load(std::sync::atomic::Ordering::Relaxed);
+
+    let record = aic_common::CommandRecord {
+        command: Some(cmd.join(" ")),
+        exit_code,
+        output_lines: collected.clone(),
+        timestamp: chrono::Utc::now(),
+        capture_mode: aic_common::CaptureMode::ExplicitCapture,
+        capture_quality: if was_truncated {
+            aic_common::CaptureQuality::TruncatedOutput
+        } else {
+            aic_common::CaptureQuality::FullOutput
+        },
+        output_metadata: Some(aic_common::OutputMetadata {
+            original_bytes: None,
+            stored_bytes: stored,
+            stored_lines: collected.len(),
+            truncated: was_truncated,
+            binary: false,
+            sha256: None,
+        }),
+    };
+
+    // duration은 trace 로그에만 — record schema에 duration 필드는 향후 확장.
+    let duration = chrono::Utc::now() - started_at;
+    eprintln!(
+        "{COL_DIM}── aic run: exit={exit} lines={n} bytes={b} truncated={t} duration={d}ms ──{COL_RESET}",
+        exit = record.exit_code,
+        n = record.output_lines.len(),
+        b = record
+            .output_metadata
+            .as_ref()
+            .map(|m| m.stored_bytes)
+            .unwrap_or(0),
+        t = was_truncated,
+        d = duration.num_milliseconds().max(0)
+    );
+
+    std::process::exit(exit_code);
+}
+
 /// `aic _hook-event {start,end}`: shell hook이 호출하는 metadata 송신.
 ///
 /// 정책:
@@ -672,7 +838,7 @@ async fn handle_setup(shell: Option<String>) {
 
     // 2) shell hook 설치
     println!("{COL_CYAN}2/4{COL_RESET} 셸 hook 설치 (idempotent)...");
-    handle_init(shell);
+    handle_init(shell, false);
     println!();
 
     // 3) migrate-keys (config 로드 후 평문 key 있는지 확인 후만)
@@ -793,7 +959,7 @@ async fn handle_debug_bundle() {
 
 /// `aic init <shell>`: 셸 rc 파일에 `source ~/.aic/hooks.{shell}` 라인을 멱등 추가.
 /// 마커 `# >>> aic hooks >>>` ~ `# <<< aic hooks <<<` 로 감싸서 안전하게 롤백 가능.
-fn handle_init(shell_arg: Option<String>) {
+fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
     const MARKER_BEGIN: &str = "# >>> aic hooks >>>";
     const MARKER_END: &str = "# <<< aic hooks <<<";
 
@@ -814,6 +980,10 @@ fn handle_init(shell_arg: Option<String>) {
             std::process::exit(1);
         }
     };
+
+    if hook_mode {
+        install_hook_mode(&shell_name);
+    }
 
     let home = match std::env::var("HOME") {
         Ok(h) => std::path::PathBuf::from(h),
@@ -859,6 +1029,99 @@ fn handle_init(shell_arg: Option<String>) {
         "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨\n  새 셸을 띄우거나 `source {rc}`로 활성화하세요",
         rc = rc_path.display()
     );
+}
+
+/// `aic init --hook-mode`: Phase 3 metadata-only hook 설치.
+///
+/// 정책:
+/// - hook 파일은 항상 덮어쓴다 (멱등 — 버전/내용이 바뀌면 다음 init이 갱신).
+/// - rc source 라인은 marker 사이에서만 작업 — 기존 라인 유지.
+/// - hook 파일이 없으면 만들고, 있으면 새 내용으로 덮어쓴다 (생성된 파일이라
+///   사용자가 수정할 일이 없다).
+fn install_hook_mode(shell_name: &str) {
+    use aic_client::hook_install;
+    let (rc_filename, hook_filename, script) = match shell_name {
+        "zsh" => (
+            ".zshrc",
+            "hook-events.zsh",
+            hook_install::zsh_hook_script(),
+        ),
+        "bash" => (
+            ".bashrc",
+            "hook-events.bash",
+            hook_install::bash_hook_script(),
+        ),
+        other => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} hook-mode 지원하지 않는 셸: {other}");
+            return;
+        }
+    };
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h),
+        Err(_) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} HOME 환경 변수 없음 — hook-mode skip");
+            return;
+        }
+    };
+
+    let aic_dir = home.join(".aic");
+    if let Err(e) = std::fs::create_dir_all(&aic_dir) {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} {} 생성 실패: {e}",
+            aic_dir.display()
+        );
+        return;
+    }
+    let hook_path = aic_dir.join(hook_filename);
+    if let Err(e) = std::fs::write(&hook_path, &script) {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} hook 파일 쓰기 실패: {} — {e}",
+            hook_path.display()
+        );
+        return;
+    }
+    println!(
+        "{COL_GREEN}✔{COL_RESET} {} 작성 (version {})",
+        hook_path.display(),
+        hook_install::HOOK_VERSION
+    );
+
+    // rc 파일에 source 라인 추가 (marker 기반 멱등).
+    let rc_path = home.join(rc_filename);
+    let snippet = format!(
+        "{begin}\nsource {hook}\n{end}\n",
+        begin = hook_install::RC_MARKER_BEGIN,
+        hook = hook_path.display(),
+        end = hook_install::RC_MARKER_END,
+    );
+    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+    if existing.contains(hook_install::RC_MARKER_BEGIN) {
+        println!(
+            "{COL_DIM}↪ {} 에 hook-events 마커가 이미 있음 (skip){COL_RESET}",
+            rc_path.display()
+        );
+        return;
+    }
+    let new_content = if existing.is_empty() {
+        snippet
+    } else if existing.ends_with('\n') {
+        format!("{existing}\n{snippet}")
+    } else {
+        format!("{existing}\n\n{snippet}")
+    };
+    if let Err(e) = std::fs::write(&rc_path, new_content) {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} {} 쓰기 실패: {e}",
+            rc_path.display()
+        );
+        return;
+    }
+    println!(
+        "{COL_GREEN}✔{COL_RESET} {} 에 hook-events source 라인 추가",
+        rc_path.display()
+    );
+    println!("  {COL_DIM}aicd가 떠 있어야 실제로 동작합니다 — `aic daemon start`{COL_RESET}");
 }
 
 /// `aic migrate-keys`: config.toml의 평문 API key를 OS keychain으로 일괄 이동.

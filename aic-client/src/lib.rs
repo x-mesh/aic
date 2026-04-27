@@ -4,6 +4,7 @@ pub mod cache;
 pub mod config;
 pub mod doctor;
 pub mod error_analyzer;
+pub mod hook_install;
 pub mod keychain;
 pub mod llm_dispatcher;
 pub mod redaction;
