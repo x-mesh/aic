@@ -13,7 +13,13 @@ permissions:
 
 jobs:
   goreleaser:
-    runs-on: ubuntu-latest
+    # macos-latest로 결정한 이유:
+    #   aic-client → keyring → security-framework가 macOS Security/CoreFoundation
+    #   framework에 link한다. ubuntu runner에서 zigbuild로 darwin cross-compile
+    #   시도 시 SDK framework를 못 찾아 link 단계에서 실패한다 (run 24985180591).
+    #   macos runner는 darwin을 native 빌드하고, linux 두 target은 zigbuild로
+    #   cross-compile한다 — 한 runner로 4 target 안전 처리.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,8 +42,8 @@ jobs:
             ${{ runner.os }}-cargo-release-
             ${{ runner.os }}-cargo-
 
-      # zig + cargo-zigbuild — ubuntu runner에서 darwin/linux 모두 cross-compile.
-      # GoReleaser Rust builder가 `tool: cargo-zigbuild`를 호출한다.
+      # zig + cargo-zigbuild — linux 두 target을 cross-compile.
+      # darwin은 native(macOS SDK 자동 발견).
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.13.0
