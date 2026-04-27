@@ -748,6 +748,7 @@ mod tests {
             exit_code,
             output_lines: lines.into_iter().map(|s| s.to_string()).collect(),
             timestamp: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -765,6 +766,7 @@ mod tests {
                 exit_code,
                 output_lines: lines.clone(),
                 timestamp: Utc::now(),
+                ..Default::default()
             };
 
             let prompt = ErrorAnalyzer::build_prompt(&record, "korean");
@@ -1198,6 +1200,7 @@ INFO: ok";
             exit_code: 1,
             output_lines: vec!["cat: sd: No such file or directory".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         };
         let p = ErrorAnalyzer::build_prompt(&r, "korean");
         println!("\n===== ACTUAL PROMPT BEGIN =====");

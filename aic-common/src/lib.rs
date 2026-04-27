@@ -13,13 +13,65 @@ pub use paths::{
 };
 pub use session::{generate_session_id, is_valid_session_id};
 
+// CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 // ── CommandRecord ──────────────────────────────────────────────
 
+/// 레코드를 만든 캡처 경로.
+///
+/// `Pty`는 PTY wrapper 기반 정확 캡처, `Hook`은 shell hook 기반 metadata-only,
+/// `ExplicitCapture`는 `aic run -- <cmd>` 같은 명시적 wrapper 캡처.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CaptureMode {
+    #[default]
+    Pty,
+    Hook,
+    ExplicitCapture,
+}
+
+/// 레코드 출력의 품질 등급. 분석 prompt와 cache key가 신뢰도를 인식하기 위해 사용.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CaptureQuality {
+    /// PTY 또는 explicit capture로 stdout/stderr tail이 있음
+    FullOutput,
+    /// command/cwd/exit/duration만 있음
+    MetadataOnly,
+    /// 출력이 있었지만 policy에 따라 일부 제거됨
+    RedactedOutput,
+    /// binary/non-UTF8 출력이 감지되어 본문 생략됨
+    BinaryOmitted,
+    /// line/byte cap으로 일부만 저장됨
+    TruncatedOutput,
+    /// legacy record 또는 품질 판단 불가
+    #[default]
+    Unknown,
+}
+
+/// 출력 본문에 대한 메타데이터. 본문이 일부/전부 잘렸거나 해시만 남는 경우에 채운다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OutputMetadata {
+    /// 잘리기 전 원본 byte 크기 (알 수 있는 경우)
+    pub original_bytes: Option<u64>,
+    /// 실제 저장된 byte 크기
+    pub stored_bytes: u64,
+    /// 실제 저장된 라인 수
+    pub stored_lines: usize,
+    /// truncation 여부
+    pub truncated: bool,
+    /// binary/non-UTF8 감지 여부
+    pub binary: bool,
+    /// 본문 hash (생략된 binary 출력의 식별용)
+    pub sha256: Option<String>,
+}
+
 /// 하나의 명령어 실행에 대한 레코드.
+///
+/// `capture_mode`/`capture_quality`/`output_metadata`는 레거시 JSON 호환을 위해
+/// `#[serde(default)]`로 채워진다. 새 코드는 가능하면 명시적으로 채운다.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandRecord {
     /// 실행된 명령어 텍스트 (가능한 경우)
@@ -30,6 +82,30 @@ pub struct CommandRecord {
     pub output_lines: Vec<String>,
     /// 명령어 완료 시각
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// 캡처 경로 (Phase 0). 레거시 JSON에선 `Pty`로 기본화.
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
+    /// 출력 품질 등급. 레거시 JSON에선 `Unknown`으로 기본화.
+    #[serde(default)]
+    pub capture_quality: CaptureQuality,
+    /// 출력 본문 메타데이터. 본문 cap/redaction/binary 시에만 채운다.
+    #[serde(default)]
+    pub output_metadata: Option<OutputMetadata>,
+}
+
+impl Default for CommandRecord {
+    fn default() -> Self {
+        Self {
+            command: None,
+            exit_code: 0,
+            output_lines: Vec::new(),
+            timestamp: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .expect("UNIX epoch is a valid timestamp"),
+            capture_mode: CaptureMode::default(),
+            capture_quality: CaptureQuality::default(),
+            output_metadata: None,
+        }
+    }
 }
 
 // ── AppConfig / ServerConfig ───────────────────────────────────
@@ -166,6 +242,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["error: not found".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: CommandRecord = serde_json::from_str(&json).unwrap();
@@ -179,10 +256,62 @@ mod tests {
             exit_code: 0,
             output_lines: vec![],
             timestamp: Utc::now(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: CommandRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(record, deserialized);
+    }
+
+    #[test]
+    fn legacy_command_record_json_deserializes_with_defaults() {
+        // capture_mode/capture_quality/output_metadata 필드 없는 옛 JSON.
+        // 기본값(Pty/Unknown/None)으로 채워져야 한다.
+        let legacy = r#"{
+            "command": "cargo build",
+            "exit_code": 1,
+            "output_lines": ["error[E0308]"],
+            "timestamp": "2026-01-01T00:00:00Z"
+        }"#;
+        let record: CommandRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.command.as_deref(), Some("cargo build"));
+        assert_eq!(record.exit_code, 1);
+        assert_eq!(record.capture_mode, CaptureMode::Pty);
+        assert_eq!(record.capture_quality, CaptureQuality::Unknown);
+        assert!(record.output_metadata.is_none());
+    }
+
+    #[test]
+    fn command_record_with_capture_metadata_roundtrip() {
+        let record = CommandRecord {
+            command: Some("vim README.md".to_string()),
+            exit_code: 0,
+            output_lines: vec![],
+            timestamp: Utc::now(),
+            capture_mode: CaptureMode::Hook,
+            capture_quality: CaptureQuality::MetadataOnly,
+            output_metadata: Some(OutputMetadata {
+                original_bytes: Some(0),
+                stored_bytes: 0,
+                stored_lines: 0,
+                truncated: false,
+                binary: false,
+                sha256: None,
+            }),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: CommandRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(record, deserialized);
+    }
+
+    #[test]
+    fn capture_mode_default_is_pty() {
+        assert_eq!(CaptureMode::default(), CaptureMode::Pty);
+    }
+
+    #[test]
+    fn capture_quality_default_is_unknown() {
+        assert_eq!(CaptureQuality::default(), CaptureQuality::Unknown);
     }
 
     #[test]

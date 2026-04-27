@@ -112,6 +112,7 @@ mod tests {
             exit_code: 0,
             output_lines: lines.into_iter().map(String::from).collect(),
             timestamp: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -255,6 +256,7 @@ mod tests {
                 exit_code,
                 output_lines,
                 timestamp: Utc::now(),
+                ..Default::default()
             })
     }
 

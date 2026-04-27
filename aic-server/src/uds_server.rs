@@ -161,6 +161,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["error[E0308]".to_string(), "help: try".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         });
         Arc::new(RwLock::new(buf))
     }

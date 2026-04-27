@@ -94,6 +94,7 @@ fn arb_command_record() -> impl Strategy<Value = CommandRecord> {
                 exit_code,
                 output_lines,
                 timestamp,
+                ..Default::default()
             }
         })
 }

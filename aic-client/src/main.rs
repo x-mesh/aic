@@ -1660,6 +1660,7 @@ async fn history_fallback_or_repl(
                 exit_code: 0,
                 output_lines: vec![],
                 timestamp: chrono::Utc::now(),
+                ..Default::default()
             };
             let mut session = ReplSession::new(dispatcher.clone(), dummy, lang.to_string());
             session.run().await?;
@@ -2084,6 +2085,7 @@ fn get_last_command_from_shell() -> Option<aic_common::CommandRecord> {
         exit_code: -1,
         output_lines: vec!["(히스토리에서 가져옴 - 출력 없음)".to_string()],
         timestamp: chrono::Utc::now(),
+        ..Default::default()
     })
 }
 

@@ -46,6 +46,7 @@ fn record(cmd: &str, exit_code: i32, lines: &[&str]) -> CommandRecord {
         exit_code,
         output_lines: lines.iter().map(|s| s.to_string()).collect(),
         timestamp: Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -55,6 +56,7 @@ fn record_no_cmd(exit_code: i32, lines: &[&str]) -> CommandRecord {
         exit_code,
         output_lines: lines.iter().map(|s| s.to_string()).collect(),
         timestamp: Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -343,6 +345,7 @@ async fn e2e_large_output_through_pipeline() {
         exit_code: 0,
         output_lines: lines.clone(),
         timestamp: Utc::now(),
+        ..Default::default()
     });
 
     let (_buf, handle) = start_server(&sock_path, ring).await;
@@ -955,6 +958,7 @@ async fn e2e_scenario_rust_compile_error() {
             "error: could not compile `myapp` (bin \"myapp\") due to 1 previous error".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let (_buf, handle) = start_server(&sock_path, ring).await;
 
@@ -1001,6 +1005,7 @@ async fn e2e_scenario_npm_test_success() {
             "Coverage:    87.5%".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let (_buf, handle) = start_server(&sock_path, ring).await;
 
@@ -1046,6 +1051,7 @@ async fn e2e_scenario_docker_build_failure() {
                 .to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let (_buf, handle) = start_server(&sock_path, ring).await;
 
@@ -1085,6 +1091,7 @@ async fn e2e_scenario_git_push_rejected() {
             "hint: its remote counterpart.".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let (_buf, handle) = start_server(&sock_path, ring).await;
 

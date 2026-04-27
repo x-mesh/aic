@@ -25,6 +25,7 @@ fn make_buffer_with_record() -> Arc<RwLock<RingBuffer>> {
             "help: try using a conversion method".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     Arc::new(RwLock::new(buf))
 }

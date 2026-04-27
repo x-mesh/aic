@@ -38,6 +38,7 @@ fn make_error_record() -> CommandRecord {
             "help: try using a conversion method".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -50,6 +51,7 @@ fn make_success_record() -> CommandRecord {
             "test result: ok. 5 passed".to_string(),
         ],
         timestamp: Utc::now(),
+        ..Default::default()
     }
 }
 
@@ -486,18 +488,21 @@ async fn e2e_multiple_commands_last_record() {
         exit_code: 0,
         output_lines: vec!["file1.txt".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     ring.push(CommandRecord {
         command: Some("cat nonexistent".to_string()),
         exit_code: 1,
         output_lines: vec!["cat: nonexistent: No such file or directory".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     ring.push(CommandRecord {
         command: Some("echo done".to_string()),
         exit_code: 0,
         output_lines: vec!["done".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
 
     let buffer = Arc::new(RwLock::new(ring));
@@ -536,12 +541,14 @@ async fn e2e_ring_buffer_eviction() {
         exit_code: 0,
         output_lines: vec!["old1".to_string(), "old2".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     ring.push(CommandRecord {
         command: Some("cmd2".to_string()),
         exit_code: 1,
         output_lines: vec!["new1".to_string(), "new2".to_string(), "new3".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     // 총 5줄 → 정확히 max_lines
     // 하나 더 push하면 eviction 발생
@@ -550,6 +557,7 @@ async fn e2e_ring_buffer_eviction() {
         exit_code: 0,
         output_lines: vec!["latest1".to_string(), "latest2".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
 
     assert!(ring.total_lines() <= 5);

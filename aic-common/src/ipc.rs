@@ -118,6 +118,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["error[E0308]: mismatched types".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         };
         let resp = IpcResponse::CommandData(record);
         let json = serde_json::to_string(&resp).unwrap();
@@ -236,6 +237,7 @@ mod tests {
                     exit_code,
                     output_lines,
                     timestamp,
+                    ..Default::default()
                 }
             })
     }

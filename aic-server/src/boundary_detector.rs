@@ -149,6 +149,7 @@ impl CommandBoundaryDetector {
             exit_code,
             output_lines: std::mem::take(&mut self.current_output),
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
 
         self.reset_state();

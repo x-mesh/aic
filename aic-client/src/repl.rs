@@ -405,6 +405,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["error: rejected".to_string()],
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
         let prefix = build_prefix_for(&r).expect("expected prefix");
         assert!(prefix.contains("<previous_failure>"));
@@ -424,6 +425,7 @@ mod tests {
             exit_code: 0,
             output_lines: vec![],
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
         assert!(build_prefix_for(&r).is_none());
     }
@@ -435,6 +437,7 @@ mod tests {
             exit_code: 0,
             output_lines: vec![],
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
         let prefix = build_prefix_for(&r).expect("expected prefix");
         assert!(!prefix.contains("<output_tail"));
@@ -449,6 +452,7 @@ mod tests {
             exit_code: 1,
             output_lines: lines,
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
         let prefix = build_prefix_for(&r).expect("expected prefix");
         assert!(prefix.contains("<output_tail lines=\"10\">"));
@@ -464,6 +468,7 @@ mod tests {
             exit_code: -1,
             output_lines: vec!["(히스토리에서 가져옴)".to_string()],
             timestamp: chrono::Utc::now(),
+            ..Default::default()
         };
         assert!(build_prefix_for(&r).is_none());
     }

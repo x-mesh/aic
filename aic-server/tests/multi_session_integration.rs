@@ -90,6 +90,7 @@ async fn two_sessions_independent_ring_buffers() {
         exit_code: 0,
         output_lines: vec!["ok".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let buffer_a = Arc::new(RwLock::new(buf_a));
 
@@ -150,6 +151,7 @@ async fn two_sessions_concurrent_requests() {
         exit_code: 0,
         output_lines: vec!["total 42".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let buffer_a = Arc::new(RwLock::new(buf_a));
 
@@ -160,6 +162,7 @@ async fn two_sessions_concurrent_requests() {
         exit_code: 0,
         output_lines: vec!["/home/user".to_string()],
         timestamp: Utc::now(),
+        ..Default::default()
     });
     let buffer_b = Arc::new(RwLock::new(buf_b));
 

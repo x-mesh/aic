@@ -379,6 +379,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["output".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         }
     }
 

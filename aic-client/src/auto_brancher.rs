@@ -41,6 +41,7 @@ mod tests {
             exit_code,
             output_lines: vec!["output".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         }
     }
 
@@ -108,6 +109,7 @@ mod tests {
                     exit_code,
                     output_lines,
                     timestamp,
+                    ..Default::default()
                 }
             })
     }

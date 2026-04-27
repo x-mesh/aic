@@ -191,6 +191,7 @@ mod tests {
             exit_code: 1,
             output_lines: vec!["error[E0308]".to_string()],
             timestamp: Utc::now(),
+            ..Default::default()
         };
         let (sock_path, server, _dir) =
             start_mock_server(IpcResponse::CommandData(record.clone())).await;
