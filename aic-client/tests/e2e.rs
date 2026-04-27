@@ -179,7 +179,7 @@ default_provider = "openai"
 
     let bin = env!("CARGO_BIN_EXE_aic");
     // HOME과 세션 env를 격리해서 현재 개발 터미널의 aic-session을 상속하지 않게 한다.
-    // 세션 밖에서 직접 `aic`를 실행하면 사용법 안내 후 정상 종료한다.
+    // 세션 밖에서 직접 `aic`를 실행해도 daemonless fallback으로 정상 종료한다.
     let output = std::process::Command::new(bin)
         .env("XDG_CONFIG_HOME", config_dir.to_str().unwrap())
         .env("HOME", config_dir.to_str().unwrap())
@@ -191,15 +191,15 @@ default_provider = "openai"
 
     assert!(
         output.status.success(),
-        "세션 밖 aic는 안내 후 정상 종료해야 합니다. stdout: {}, stderr: {}",
+        "세션 밖 aic는 daemonless fallback 후 정상 종료해야 합니다. stdout: {}, stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("aic-session"),
-        "stderr에 세션 안내 메시지가 포함되어야 합니다. 실제: {stderr}"
+        !stderr.contains("aic-session 안에서 실행해주세요"),
+        "daemonless mode에서 세션 필수 안내를 출력하면 안 됩니다. 실제: {stderr}"
     );
 }
 
