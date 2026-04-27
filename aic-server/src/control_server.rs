@@ -161,7 +161,13 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             duration_ms,
         } => {
             ctx.hook_events
-                .on_finished(&session_id, &command_id, exit_code, finished_at, duration_ms)
+                .on_finished(
+                    &session_id,
+                    &command_id,
+                    exit_code,
+                    finished_at,
+                    duration_ms,
+                )
                 .await;
             IpcResponse::Pong
         }
@@ -196,12 +202,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
 ///   shutdown 핸들러가 PTY child를 정리한다(이미 잘 동작).
 /// - PID race(이미 죽었거나 recycling) 가능 — best-effort.
 async fn stop_session(ctx: &ControlContext, id: &str) -> IpcResponse {
-    let entry = ctx
-        .registry
-        .list()
-        .await
-        .into_iter()
-        .find(|s| s.id == id);
+    let entry = ctx.registry.list().await.into_iter().find(|s| s.id == id);
     let Some(info) = entry else {
         return IpcResponse::Error {
             message: format!("세션을 찾을 수 없습니다: {id}"),
@@ -278,11 +279,8 @@ mod tests {
     #[tokio::test]
     async fn register_then_list_returns_session() {
         let c = ctx();
-        let resp = process_control_request(
-            IpcRequest::RegisterSession(sample_info("aaaaaaaa")),
-            &c,
-        )
-        .await;
+        let resp =
+            process_control_request(IpcRequest::RegisterSession(sample_info("aaaaaaaa")), &c).await;
         assert_eq!(resp, IpcResponse::Pong);
 
         let list_resp = process_control_request(IpcRequest::ListSessions, &c).await;
@@ -354,7 +352,10 @@ mod tests {
         .await;
         // EPERM/EACCES가 나면 Error, 운이 좋아 (운영 안 좋은) ESRCH면 Pong.
         // 핵심은 panic 안 하고 graceful 응답이라는 것.
-        assert!(matches!(resp, IpcResponse::Error { .. } | IpcResponse::Pong));
+        assert!(matches!(
+            resp,
+            IpcResponse::Error { .. } | IpcResponse::Pong
+        ));
     }
 
     #[tokio::test]

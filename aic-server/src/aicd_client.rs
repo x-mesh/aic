@@ -137,7 +137,9 @@ mod tests {
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(std::path::PathBuf::from("/tmp")),
         };
-        let resp = send(&sock_path, IpcRequest::RegisterSession(info)).await.unwrap();
+        let resp = send(&sock_path, IpcRequest::RegisterSession(info))
+            .await
+            .unwrap();
         assert_eq!(resp, IpcResponse::Pong);
 
         let list_resp = send(&sock_path, IpcRequest::ListSessions).await.unwrap();

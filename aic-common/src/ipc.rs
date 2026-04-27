@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     GetLastCommand,
-    GetRecentLines { count: usize },
+    GetRecentLines {
+        count: usize,
+    },
     Ping,
     GetMetrics,
     /// `aicd`에 등록된 세션 목록을 요청한다 (Phase 1.2~1.3).
@@ -26,12 +28,16 @@ pub enum IpcRequest {
     RegisterSession(SessionInfo),
     /// 세션을 `aicd` registry에서 제거한다 (Phase 1.3).
     /// `aic-session`이 정상 종료 직전에 보낸다.
-    UnregisterSession { id: String },
+    UnregisterSession {
+        id: String,
+    },
     /// 특정 세션에 graceful 종료 신호를 보낸다 (Phase 2.1).
     ///
     /// 현재 구현: `aicd`가 registry에서 PID를 찾아 `SIGTERM`을 보낸다.
     /// 향후 PTY ownership을 `aicd`가 가져오면 `aicd`가 직접 child를 종료한다.
-    StopSession { id: String },
+    StopSession {
+        id: String,
+    },
     /// shell hook이 보내는 command-start 이벤트 (Phase 3).
     ///
     /// hook mode에서 `preexec`/`DEBUG trap`이 발화하며, 출력은 캡처하지 않고
@@ -64,7 +70,9 @@ pub enum IpcResponse {
     Metrics(MetricsSnapshot),
     /// `ListSessions` 응답 — `aicd` registry 기준 세션 목록.
     Sessions(Vec<SessionInfo>),
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// 데몬 metric 스냅샷 (`aic top`/`aic-session metrics` 응답용).
@@ -328,7 +336,8 @@ mod tests {
                         session_id,
                         command_id,
                         exit_code,
-                        finished_at: chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default(),
+                        finished_at: chrono::DateTime::from_timestamp_millis(ts)
+                            .unwrap_or_default(),
                         duration_ms: dur,
                     }
                 }),

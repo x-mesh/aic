@@ -95,7 +95,10 @@ mod tests {
         r.register(info("newer", 10)).await;
         r.register(info("older", -10)).await;
         let list = r.list().await;
-        assert_eq!(list.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["older", "newer"]);
+        assert_eq!(
+            list.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+            vec!["older", "newer"]
+        );
     }
 
     #[tokio::test]

@@ -163,7 +163,8 @@ mod tests {
         for i in 0..(PER_SESSION_CAPACITY + 5) {
             s.on_started("s1", &format!("c{i}"), format!("cmd{i}"), None, Utc::now())
                 .await;
-            s.on_finished("s1", &format!("c{i}"), 0, Utc::now(), 0).await;
+            s.on_finished("s1", &format!("c{i}"), 0, Utc::now(), 0)
+                .await;
         }
         assert_eq!(s.len("s1").await, PER_SESSION_CAPACITY);
         let last = s.last("s1").await.unwrap();
@@ -176,9 +177,11 @@ mod tests {
     #[tokio::test]
     async fn separate_sessions_do_not_collide() {
         let s = HookEventStore::new();
-        s.on_started("a", "c1", "in-a".into(), None, Utc::now()).await;
+        s.on_started("a", "c1", "in-a".into(), None, Utc::now())
+            .await;
         s.on_finished("a", "c1", 0, Utc::now(), 0).await;
-        s.on_started("b", "c1", "in-b".into(), None, Utc::now()).await;
+        s.on_started("b", "c1", "in-b".into(), None, Utc::now())
+            .await;
         s.on_finished("b", "c1", 0, Utc::now(), 0).await;
         assert_eq!(s.last("a").await.unwrap().command.as_deref(), Some("in-a"));
         assert_eq!(s.last("b").await.unwrap().command.as_deref(), Some("in-b"));
