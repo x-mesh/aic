@@ -6,8 +6,8 @@ use aic_client::llm_dispatcher::LlmDispatcher;
 use aic_client::repl::ReplSession;
 use aic_client::uds_client::UdsClient;
 use aic_common::{
-    AnalysisResult, AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType,
-    ServerConfig,
+    AicError, AnalysisResult, AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig,
+    ProviderType, ServerConfig,
 };
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
@@ -202,6 +202,21 @@ enum Commands {
         #[command(subcommand)]
         op: DebugOp,
     },
+    /// aicd supervisor daemon 관리 (Phase 1.5).
+    Daemon {
+        #[command(subcommand)]
+        op: DaemonOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonOp {
+    /// aicd가 실행 중인지 확인하고 PID/socket을 출력한다.
+    Status,
+    /// aicd를 백그라운드로 시작한다 (이미 실행 중이면 no-op).
+    Start,
+    /// aicd에 graceful Shutdown을 요청한다.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -258,11 +273,16 @@ async fn main() {
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
         Some(Commands::Init { shell }) => handle_init(shell),
         Some(Commands::Top { interval, session }) => handle_top(interval, session).await,
+        Some(Commands::Daemon { op }) => match op {
+            DaemonOp::Status => handle_daemon_status().await,
+            DaemonOp::Start => handle_daemon_start().await,
+            DaemonOp::Stop => handle_daemon_stop().await,
+        },
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
             } else {
-                handle_sessions();
+                handle_sessions().await;
             }
         }
         Some(Commands::Setup { shell }) => handle_setup(shell).await,
@@ -385,6 +405,102 @@ fn resolve_socket(explicit_id: Option<&str>) -> std::path::PathBuf {
         return p;
     }
     aic_common::default_socket_path()
+}
+
+// ── aicd supervisor (Phase 1.5) ────────────────────────────────────
+
+/// `aic daemon status`: aicd가 떠 있는지 ping으로 확인하고 PID/socket을 표시.
+async fn handle_daemon_status() {
+    let sock = aic_common::aicd_socket_path();
+    let lock_path = aic_common::aicd_lock_path();
+    println!("{COL_BOLD}aicd supervisor{COL_RESET}");
+    println!("  socket: {}", sock.display());
+    println!("  lock:   {}", lock_path.display());
+
+    let client = UdsClient::new(sock.clone());
+    match client.ping().await {
+        Ok(true) => {
+            // PID는 lock 파일에서 읽는다 — aicd가 ping에 응답한다면 lock도 살아있을 것.
+            let pid = std::fs::read_to_string(&lock_path)
+                .ok()
+                .and_then(|c| c.lines().next().map(|s| s.trim().to_string()));
+            let pid_label = pid.as_deref().unwrap_or("unknown");
+            println!("  status: {COL_GREEN}running{COL_RESET} (pid {pid_label})");
+            // 등록된 세션 수 함께 표시
+            match client.list_sessions().await {
+                Ok(sessions) => println!("  sessions: {}", sessions.len()),
+                Err(e) => println!("  sessions: {COL_YELLOW}조회 실패{COL_RESET} ({e})"),
+            }
+        }
+        _ => {
+            println!("  status: {COL_DIM}stopped{COL_RESET}");
+            println!("  start with: {COL_BOLD}aic daemon start{COL_RESET}");
+        }
+    }
+}
+
+/// `aic daemon start`: aicd binary를 백그라운드 spawn한다 (이미 떠 있으면 no-op).
+async fn handle_daemon_start() {
+    let sock = aic_common::aicd_socket_path();
+    let client = UdsClient::new(sock.clone());
+    if let Ok(true) = client.ping().await {
+        println!("{COL_GREEN}✓{COL_RESET} aicd가 이미 실행 중입니다");
+        return;
+    }
+
+    // aic 실행 파일과 같은 디렉토리에 있는 aicd를 우선 시도, 없으면 PATH로 폴백.
+    let aicd_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("aicd")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("aicd"));
+
+    match std::process::Command::new(&aicd_bin)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            println!(
+                "{COL_GREEN}✓{COL_RESET} aicd 시작 — pid {pid} ({bin})",
+                pid = child.id(),
+                bin = aicd_bin.display()
+            );
+            // 짧게 기다린 뒤 ping이 되는지 검증
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            match client.ping().await {
+                Ok(true) => println!("  socket: {}", sock.display()),
+                _ => eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} aicd가 spawn 됐으나 아직 응답이 없습니다. \
+                     `aic daemon status`로 다시 확인하세요."
+                ),
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "{COL_RED}✗{COL_RESET} aicd 실행 실패: {e}\n  시도한 경로: {}",
+                aicd_bin.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `aic daemon stop`: aicd에 graceful Shutdown 요청.
+async fn handle_daemon_stop() {
+    let sock = aic_common::aicd_socket_path();
+    let client = UdsClient::new(sock);
+    match client.shutdown().await {
+        Ok(()) => println!("{COL_GREEN}✓{COL_RESET} aicd Shutdown 요청 전송"),
+        Err(AicError::ServerNotRunning) => {
+            println!("{COL_DIM}aicd가 실행 중이 아닙니다{COL_RESET}");
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} aicd Shutdown 실패: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `aic top [--interval N]`: ratatui 라이브 TUI. 비-TTY는 status --watch로 fallback.
@@ -768,7 +884,7 @@ async fn handle_status(watch: bool, interval: u64, session: Option<String>, json
         if json {
             print_sessions_json().await;
         } else {
-            handle_sessions();
+            handle_sessions().await;
         }
         return;
     }
@@ -1543,10 +1659,52 @@ fn list_sessions() -> Vec<SessionInfo> {
 }
 
 /// `aic sessions`: 실행 중인 세션 목록을 출력한다.
-fn handle_sessions() {
-    let sessions = list_sessions();
+///
+/// Phase 1.5 이후 우선순위:
+/// 1. `aicd`가 떠 있으면 control registry를 source-of-truth로 사용한다.
+/// 2. `aicd`가 없으면 기존 file-system scan(`list_sessions()`)으로 fallback —
+///    aicd 없이도 멀티세션은 동작해야 하므로.
+async fn handle_sessions() {
     let current_id = std::env::var("AIC_SESSION_ID").ok();
 
+    let aicd_client = UdsClient::new(aic_common::aicd_socket_path());
+    if let Ok(true) = aicd_client.ping().await {
+        match aicd_client.list_sessions().await {
+            Ok(list) if list.is_empty() => {
+                println!("{COL_DIM}aicd registry: 등록된 세션 없음{COL_RESET}");
+                return;
+            }
+            Ok(list) => {
+                println!("{COL_BOLD}aic sessions{COL_RESET} {COL_DIM}(from aicd registry){COL_RESET}");
+                for s in &list {
+                    let marker = match &current_id {
+                        Some(cid) if cid == &s.id => format!(" {COL_GREEN}*{COL_RESET}"),
+                        _ => String::new(),
+                    };
+                    let tty = s.attached_tty.as_deref().unwrap_or("?");
+                    let shell = s
+                        .shell
+                        .as_deref()
+                        .and_then(|p| p.rsplit('/').next())
+                        .unwrap_or("?");
+                    println!(
+                        "  {COL_CYAN}{id}{COL_RESET}{marker}  {COL_DIM}pid {pid}  {tty}  {shell}{COL_RESET}",
+                        id = s.id,
+                        pid = s.pid,
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} aicd registry 조회 실패 — file-system scan으로 fallback: {e}"
+                );
+            }
+        }
+    }
+
+    // Fallback: 기존 file-system scan 동작.
+    let sessions = list_sessions();
     let alive_sessions: Vec<&SessionInfo> = sessions.iter().filter(|s| s.is_alive).collect();
 
     if alive_sessions.is_empty() {
@@ -1554,7 +1712,7 @@ fn handle_sessions() {
         return;
     }
 
-    println!("{COL_BOLD}aic sessions{COL_RESET}");
+    println!("{COL_BOLD}aic sessions{COL_RESET} {COL_DIM}(from socket scan){COL_RESET}");
     for s in &alive_sessions {
         let marker = match &current_id {
             Some(cid) if cid == &s.session_id => format!(" {COL_GREEN}*{COL_RESET}"),

@@ -87,6 +87,7 @@ pub async fn run_all_checks(socket: &std::path::Path) -> Vec<CheckResult> {
         results.push(check_provider(cfg));
         results.push(check_socket_path(socket));
         results.push(check_daemon_alive(socket).await);
+        results.push(check_aicd_supervisor().await);
         results.push(check_shell_hooks());
         if let Some(provider) = cfg.llm.providers.get(&cfg.llm.default_provider) {
             results.push(check_llm_endpoint(provider).await);
@@ -263,6 +264,32 @@ async fn check_daemon_alive(path: &std::path::Path) -> CheckResult {
             "aic-session 데몬",
             "응답 없음 — 데몬이 실행되지 않았거나 hang 상태",
             "터미널에서 `aic-session`을 실행하세요",
+        ),
+    }
+}
+
+/// `aicd` supervisor 진단 (Phase 1.5).
+///
+/// 정책:
+/// - `aicd`가 떠 있으면 PASS — 등록된 세션 수를 함께 표시한다.
+/// - `aicd`가 없는 상태는 FAIL이 아니라 INFO/WARN — 현재 제품은 aicd 없이도
+///   정상 동작하므로(legacy multi-session path) 강한 경고를 띄우면 신규 사용자가
+///   당황한다. 따라서 "선택적 supervisor — `aic daemon start`로 켜세요" WARN.
+async fn check_aicd_supervisor() -> CheckResult {
+    let sock = aic_common::aicd_socket_path();
+    let client = UdsClient::new(sock.clone());
+    match tokio::time::timeout(Duration::from_secs(1), client.ping()).await {
+        Ok(Ok(true)) => match client.list_sessions().await {
+            Ok(list) => CheckResult::pass(
+                "aicd supervisor",
+                format!("Ping 응답 정상, 등록 세션 {}개", list.len()),
+            ),
+            Err(_) => CheckResult::pass("aicd supervisor", "Ping 응답 정상"),
+        },
+        _ => CheckResult::warn(
+            "aicd supervisor",
+            "실행되지 않음 (선택사항 — 미설치 시 기존 멀티세션 path로 동작)",
+            "백그라운드 supervisor를 쓰려면 `aic daemon start`",
         ),
     }
 }

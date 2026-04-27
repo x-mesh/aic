@@ -3,7 +3,7 @@
 //! AIC_Server에 UDS로 연결하여 IPC 요청을 전송하고 응답을 수신한다.
 //! Length-prefixed JSON 프레이밍(`aic_common::encode_frame`)을 사용한다.
 
-use aic_common::{encode_frame, AicError, CommandRecord, IpcRequest, IpcResponse};
+use aic_common::{encode_frame, AicError, CommandRecord, IpcRequest, IpcResponse, SessionInfo};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -53,6 +53,30 @@ impl UdsClient {
     pub async fn get_metrics(&self) -> Result<aic_common::MetricsSnapshot, AicError> {
         match self.send_request(IpcRequest::GetMetrics).await? {
             IpcResponse::Metrics(snap) => Ok(snap),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
+    /// `aicd` registry의 세션 목록 조회. control plane 전용.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>, AicError> {
+        match self.send_request(IpcRequest::ListSessions).await? {
+            IpcResponse::Sessions(list) => Ok(list),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
+    /// `aicd`에 graceful Shutdown을 요청한다. 응답으로 Pong을 받으면 daemon이 종료 중.
+    pub async fn shutdown(&self) -> Result<(), AicError> {
+        match self.send_request(IpcRequest::Shutdown).await? {
+            IpcResponse::Pong => Ok(()),
             IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
             other => Err(AicError::IpcError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
