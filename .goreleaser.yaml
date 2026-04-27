@@ -18,6 +18,10 @@ before:
     - cargo fetch --locked
 
 builds:
+  # workspace에서 cargo는 --manifest-path만으로는 어떤 package인지 결정 못 한다.
+  # 첫 release 시도에서 다음 에러로 실패함:
+  #   "you need to specify which workspace to build, please add '--package=[name]'"
+  # 따라서 -p <crate> + --bin <name> 두 인자를 함께 명시한다.
   - id: aic-cli
     builder: rust
     binary: aic
@@ -29,8 +33,8 @@ builds:
     tool: cargo-zigbuild
     flags:
       - --release
+      - --package=aic-client
       - --bin=aic
-      - --manifest-path=aic-client/Cargo.toml
 
   - id: aic-session
     builder: rust
@@ -43,8 +47,8 @@ builds:
     tool: cargo-zigbuild
     flags:
       - --release
+      - --package=aic-server
       - --bin=aic-session
-      - --manifest-path=aic-server/Cargo.toml
 
   - id: aicd
     builder: rust
@@ -57,8 +61,8 @@ builds:
     tool: cargo-zigbuild
     flags:
       - --release
+      - --package=aic-server
       - --bin=aicd
-      - --manifest-path=aic-server/Cargo.toml
 
 archives:
   - id: aic-archive
