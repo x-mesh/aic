@@ -109,6 +109,39 @@ impl Default for CommandRecord {
     }
 }
 
+// ── Session registry types ─────────────────────────────────────
+
+/// 세션 lifecycle 상태. PRD-AICD-SUPERVISOR §10.2와 일치한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionState {
+    Creating,
+    Attached,
+    Detached,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+/// `aicd` registry의 세션 한 건. 향후 sub-step에서 `last_seen_at`,
+/// `last_command_at` 등을 추가한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Session_ID (8자 lowercase hex). `session::generate_session_id` 참조.
+    pub id: String,
+    /// 세션 owner 프로세스 PID (현재는 `aic-session` PID, 향후 PTY child PID).
+    pub pid: u32,
+    /// 현재 lifecycle 상태.
+    pub state: SessionState,
+    /// 세션이 처음 등록된 시각.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// 현재 attach된 TTY 경로 (예: `/dev/ttys003`). attach가 없으면 `None`.
+    pub attached_tty: Option<String>,
+    /// 셸 실행 파일 경로 (예: `/bin/zsh`). 알 수 없으면 `None`.
+    pub shell: Option<String>,
+    /// 세션 cwd. 셸 시작 시점 또는 마지막 보고 시점 기준.
+    pub cwd: Option<std::path::PathBuf>,
+}
+
 // ── AppConfig / ServerConfig ───────────────────────────────────
 
 /// 애플리케이션 설정.

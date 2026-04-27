@@ -10,7 +10,7 @@
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
 use aic_common::{aicd_lock_path, aicd_socket_path};
-use aic_server::control_server::ControlServer;
+use aic_server::control_server::{ControlContext, ControlServer};
 use aic_server::lock::DaemonLock;
 use clap::Parser;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         signal_shutdown.notify_one();
     });
 
-    server.serve(shutdown).await;
+    server.serve(ControlContext { shutdown }).await;
     tracing::info!("aicd 종료");
     Ok(())
 }

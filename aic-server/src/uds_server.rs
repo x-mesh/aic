@@ -128,6 +128,11 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
             IpcResponse::Lines(lines.into_iter().map(String::from).collect())
         }
         IpcRequest::Ping => IpcResponse::Pong,
+        IpcRequest::ListSessions | IpcRequest::Shutdown => IpcResponse::Error {
+            message: format!(
+                "{request:?}는 aicd control plane 요청입니다 — aicd 소켓에 연결하세요"
+            ),
+        },
         IpcRequest::GetMetrics => {
             let buf = buffer.read().await;
             let last_command_secs_ago = buf.last().map(|rec| {

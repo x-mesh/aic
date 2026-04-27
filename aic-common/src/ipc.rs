@@ -1,26 +1,37 @@
 //! IPC 프로토콜 타입 및 Length-prefixed framing 유틸리티
 
-use crate::CommandRecord;
+use crate::{CommandRecord, SessionInfo};
 use serde::{Deserialize, Serialize};
 
 // ── IPC Request / Response ─────────────────────────────────────
 
-/// AC_Client → AC_Server 요청 메시지 (externally tagged JSON)
+/// 클라이언트 → 데몬 요청 메시지 (externally tagged JSON).
+///
+/// `Ping`/`GetMetrics`는 양 데몬(`aic-session`, `aicd`) 모두에서 의미를 가진다.
+/// `GetLastCommand`/`GetRecentLines`는 세션 단위 데이터라 `aicd`에서는 거부된다.
+/// `ListSessions`/`Shutdown`은 `aicd` control plane 전용이며, 세션 데몬은
+/// graceful Error로 응답한다.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcRequest {
     GetLastCommand,
     GetRecentLines { count: usize },
     Ping,
     GetMetrics,
+    /// `aicd`에 등록된 세션 목록을 요청한다 (Phase 1.2~1.3).
+    ListSessions,
+    /// `aicd`를 graceful 종료 시킨다 (active sessions 정리는 향후 sub-step).
+    Shutdown,
 }
 
-/// AC_Server → AC_Client 응답 메시지 (externally tagged JSON)
+/// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcResponse {
     CommandData(CommandRecord),
     Lines(Vec<String>),
     Pong,
     Metrics(MetricsSnapshot),
+    /// `ListSessions` 응답 — `aicd` registry 기준 세션 목록.
+    Sessions(Vec<SessionInfo>),
     Error { message: String },
 }
 
@@ -247,7 +258,47 @@ mod tests {
             Just(IpcRequest::GetLastCommand),
             any::<usize>().prop_map(|count| IpcRequest::GetRecentLines { count }),
             Just(IpcRequest::Ping),
+            Just(IpcRequest::GetMetrics),
+            Just(IpcRequest::ListSessions),
+            Just(IpcRequest::Shutdown),
         ]
+    }
+
+    fn arb_session_state() -> impl Strategy<Value = crate::SessionState> {
+        use crate::SessionState::*;
+        prop_oneof![
+            Just(Creating),
+            Just(Attached),
+            Just(Detached),
+            Just(Stopping),
+            Just(Stopped),
+            Just(Failed),
+        ]
+    }
+
+    fn arb_session_info() -> impl Strategy<Value = crate::SessionInfo> {
+        (
+            "[0-9a-f]{1,8}",
+            any::<u32>(),
+            arb_session_state(),
+            0i64..4_102_444_800_000i64,
+            proptest::option::of("[a-zA-Z0-9/_]{1,32}"),
+            proptest::option::of("[a-zA-Z0-9/_-]{1,32}"),
+            proptest::option::of("[a-zA-Z0-9/_-]{1,64}".prop_map(std::path::PathBuf::from)),
+        )
+            .prop_map(|(id, pid, state, ts_millis, attached_tty, shell, cwd)| {
+                let created_at =
+                    chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default();
+                crate::SessionInfo {
+                    id,
+                    pid,
+                    state,
+                    created_at,
+                    attached_tty,
+                    shell,
+                    cwd,
+                }
+            })
     }
 
     fn arb_ipc_response() -> impl Strategy<Value = IpcResponse> {
@@ -255,6 +306,7 @@ mod tests {
             arb_command_record().prop_map(IpcResponse::CommandData),
             proptest::collection::vec(any::<String>(), 0..8).prop_map(IpcResponse::Lines),
             Just(IpcResponse::Pong),
+            proptest::collection::vec(arb_session_info(), 0..8).prop_map(IpcResponse::Sessions),
             any::<String>().prop_map(|message| IpcResponse::Error { message }),
         ]
     }
