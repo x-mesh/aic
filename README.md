@@ -2,7 +2,7 @@
 
 > 셸 명령어 에러를 자동으로 분석하고 수정 명령어를 제안하는 지능형 CLI 도우미
 
-[![CI](https://github.com/user/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/user/aic/actions/workflows/ci.yml)
+[![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
 ## Overview
 
@@ -93,10 +93,24 @@ graph LR
 
 ### 빌드 및 설치
 
+#### Homebrew (macOS / Linux)
+
 ```bash
-git clone https://github.com/user/aic.git && cd aic
+brew tap x-mesh/tap
+brew install aic
+# 자동 시작은 설치 후 한 번:
+aic daemon install     # macOS launchd / Linux systemd user unit 자동 분기
+```
+
+`brew services`는 macOS launchd만 잘 통합하고 Linux systemd 통합이 부실해서
+`aic daemon install`이 양 OS 모두를 일관되게 처리합니다.
+
+#### Source 빌드
+
+```bash
+git clone https://github.com/x-mesh/aic.git && cd aic
 cargo build --workspace --release
-cargo install --path aic-server   # aic-session 설치
+cargo install --path aic-server   # aic-session + aicd 설치
 cargo install --path aic-client   # aic 설치
 ```
 
