@@ -1992,6 +1992,7 @@ fn default_config() -> AppConfig {
                 idle_threshold_ms: None,
             },
         },
+        session: aic_common::SessionConfig::default(),
     }
 }
 
@@ -2361,6 +2362,7 @@ async fn handle_record(
         ExecutionMode::ErrorAnalysis(rec) => {
             debug_log!("mode     error-analysis");
             print_error_context(&rec);
+            print_capture_quality_hint(&rec, config);
 
             if let Some(result) = ErrorAnalyzer::deterministic_result(&rec, lang) {
                 debug_log!("analysis builtin · exit={}", rec.exit_code);
@@ -2685,6 +2687,16 @@ fn term_width() -> usize {
 }
 
 /// 에러 컨텍스트 표시 (주황색 왼쪽 선 + 명령어 + 노이즈 정제된 마지막 5줄)
+/// 분석 직전, capture quality에 따라 사용자에게 신뢰도/대안 안내 (Phase 4).
+///
+/// `aic_common::capture_quality_hint`를 한 번 감싸 ANSI 색상을 입혀 출력한다.
+/// FullOutput에서는 무음.
+fn print_capture_quality_hint(rec: &aic_common::CommandRecord, config: &AppConfig) {
+    if let Some(msg) = aic_common::capture_quality_hint(rec, config.session.capture_mode) {
+        eprintln!("{COL_DIM}ℹ {msg}{COL_RESET}");
+    }
+}
+
 fn print_error_context(rec: &aic_common::CommandRecord) {
     let prefix = format!("{COL_YELLOW}▐{COL_RESET} ");
     let empty_prefix = format!("{COL_YELLOW}▐{COL_RESET}");

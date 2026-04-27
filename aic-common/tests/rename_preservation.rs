@@ -75,6 +75,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                         socket_path,
                         boundary_strategy,
                     },
+                    session: SessionConfig::default(),
                 }
             },
         )

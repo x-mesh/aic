@@ -472,6 +472,7 @@ mod tests {
                     idle_threshold_ms: None,
                 },
             },
+            session: aic_common::SessionConfig::default(),
         };
 
         let result = check_provider(&cfg);
@@ -498,6 +499,7 @@ mod tests {
                     idle_threshold_ms: None,
                 },
             },
+            session: aic_common::SessionConfig::default(),
         };
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Fail);
@@ -522,6 +524,7 @@ mod tests {
                     idle_threshold_ms: None,
                 },
             },
+            session: aic_common::SessionConfig::default(),
         };
         let path = cfg
             .server

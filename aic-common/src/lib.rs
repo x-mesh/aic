@@ -109,6 +109,48 @@ impl Default for CommandRecord {
     }
 }
 
+/// 분석 직전에 사용자에게 capture quality를 안내하는 hint 메시지 (Phase 4).
+///
+/// 의도:
+/// - PTY wrapper의 FullOutput 결과는 hint를 내지 않는다(noise).
+/// - hook mode 등에서 MetadataOnly이면 분석 신뢰도가 떨어진다는 사실과
+///   `aic capture-last` / `aic run --` 옵션을 알린다.
+/// - TruncatedOutput/BinaryOmitted는 사실만 짧게 알린다.
+///
+/// `mode`는 사용자의 SessionCaptureMode — Hybrid에서는 hook→hint 흐름이 product 기본
+/// 동작이므로 메시지를 좀 더 actionable하게 표현한다.
+pub fn capture_quality_hint(record: &CommandRecord, mode: SessionCaptureMode) -> Option<String> {
+    match record.capture_quality {
+        CaptureQuality::FullOutput | CaptureQuality::Unknown => None,
+        CaptureQuality::MetadataOnly => {
+            let cmd = record.command.as_deref().unwrap_or("(이전 명령)");
+            let suggest = match mode {
+                SessionCaptureMode::Hybrid => format!(
+                    "정확한 분석을 위해 `aic run -- {cmd}`로 다시 실행하거나 \
+                     `aic capture-last`(추후 지원)로 capture 모드 재실행하세요."
+                ),
+                _ => format!(
+                    "출력 없이 metadata만 있어 분석 신뢰도가 낮습니다. \
+                     `aic run -- {cmd}` 또는 PTY 세션(`aic-session`)에서 다시 실행해 보세요."
+                ),
+            };
+            Some(format!("이 기록은 metadata-only 입니다 — {suggest}"))
+        }
+        CaptureQuality::TruncatedOutput => Some(
+            "출력이 cap을 초과해 일부만 저장되었습니다. 전체 분석에는 일부 누락이 있을 수 있습니다."
+                .to_string(),
+        ),
+        CaptureQuality::BinaryOmitted => Some(
+            "binary/non-UTF8 출력이라 본문이 생략되었습니다. metadata 기반 분석으로만 진행됩니다."
+                .to_string(),
+        ),
+        CaptureQuality::RedactedOutput => Some(
+            "출력이 redaction 정책에 의해 일부 제거되었습니다 — 분석 결과가 보수적일 수 있습니다."
+                .to_string(),
+        ),
+    }
+}
+
 // ── Session registry types ─────────────────────────────────────
 
 /// 세션 lifecycle 상태. PRD-AICD-SUPERVISOR §10.2와 일치한다.
@@ -142,6 +184,33 @@ pub struct SessionInfo {
     pub cwd: Option<std::path::PathBuf>,
 }
 
+// ── Session capture mode (Phase 4) ─────────────────────────────
+
+/// 사용자가 config로 선택하는 capture 동작.
+///
+/// `CaptureMode`(record-level)와는 구분된다. `SessionCaptureMode`는 "어떤 mode로
+/// 캡처할 것인가"를 표현하고, `CaptureMode`는 "이 record가 실제로 어떻게 만들어졌는가"를
+/// 표현한다. Hybrid는 record-level enum에는 없다(record는 항상 둘 중 하나로 만들어진다).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionCaptureMode {
+    /// 기존 PTY wrapper. 출력 정확도 높음.
+    #[default]
+    Pty,
+    /// shell hook 기반 metadata-only.
+    Hook,
+    /// 평소 metadata-only, 분석 시 capture suggestion 자동 노출.
+    Hybrid,
+}
+
+/// 세션 동작 관련 사용자 설정.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SessionConfig {
+    /// 어느 capture mode를 쓸지. 기본 "pty".
+    #[serde(default)]
+    pub capture_mode: SessionCaptureMode,
+}
+
 // ── AppConfig / ServerConfig ───────────────────────────────────
 
 /// 애플리케이션 설정.
@@ -149,6 +218,9 @@ pub struct SessionInfo {
 pub struct AppConfig {
     pub llm: LlmConfig,
     pub server: ServerConfig,
+    /// 세션 capture 모드 설정 (Phase 4). 레거시 config 호환을 위해 default.
+    #[serde(default)]
+    pub session: SessionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -375,10 +447,62 @@ mod tests {
                     idle_threshold_ms: None,
                 },
             },
+            session: SessionConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn legacy_app_config_without_session_section_deserializes() {
+        // Phase 4: 기존 config.toml에 [session] 섹션이 없어도 default(Pty)로 채워져야 한다.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+lang = "korean"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Pty);
+    }
+
+    #[test]
+    fn capture_quality_hint_silent_for_full_output() {
+        let rec = CommandRecord {
+            command: Some("ls".into()),
+            capture_quality: CaptureQuality::FullOutput,
+            ..Default::default()
+        };
+        assert!(capture_quality_hint(&rec, SessionCaptureMode::Pty).is_none());
+    }
+
+    #[test]
+    fn capture_quality_hint_metadata_only_suggests_run() {
+        let rec = CommandRecord {
+            command: Some("cargo build".into()),
+            capture_quality: CaptureQuality::MetadataOnly,
+            ..Default::default()
+        };
+        let msg = capture_quality_hint(&rec, SessionCaptureMode::Hook).unwrap();
+        assert!(msg.contains("metadata-only"));
+        assert!(msg.contains("aic run"));
+    }
+
+    #[test]
+    fn capture_quality_hint_hybrid_mode_message_differs() {
+        let rec = CommandRecord {
+            command: Some("cargo build".into()),
+            capture_quality: CaptureQuality::MetadataOnly,
+            ..Default::default()
+        };
+        let hybrid = capture_quality_hint(&rec, SessionCaptureMode::Hybrid).unwrap();
+        let hook = capture_quality_hint(&rec, SessionCaptureMode::Hook).unwrap();
+        assert_ne!(hybrid, hook, "hybrid 메시지는 hook 메시지와 달라야 한다");
     }
 
     #[test]

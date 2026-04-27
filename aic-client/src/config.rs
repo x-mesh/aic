@@ -78,6 +78,7 @@ impl ConfigManager {
                     idle_threshold_ms: None,
                 },
             },
+            session: aic_common::SessionConfig::default(),
         }
     }
 }
@@ -324,7 +325,11 @@ mod tests {
     }
 
     fn arb_app_config() -> impl Strategy<Value = AppConfig> {
-        (arb_llm_config(), arb_server_config()).prop_map(|(llm, server)| AppConfig { llm, server })
+        (arb_llm_config(), arb_server_config()).prop_map(|(llm, server)| AppConfig {
+            llm,
+            server,
+            session: aic_common::SessionConfig::default(),
+        })
     }
 
     // Feature: ac-cli-tool, Property 7: Config Serialization Round-Trip
