@@ -71,6 +71,22 @@ PRD-HOOK-CAPTURE-MODE의 metadata-only 캡처 옵션. PTY hook과 충돌 없이
   exit code 보존 (signal-killed는 128+sig). 결과 record는 capture_mode =
   ExplicitCapture, quality = FullOutput / TruncatedOutput.
 
+### Added — Makefile release helpers
+
+3개 workspace Cargo.toml의 버전을 손으로 바꾸는 부담 제거. release
+워크플로우와 함께 동작.
+
+- `make bump-version VERSION=0.3.0` — `[package]` section 안의 첫
+  `version =` 줄만 awk로 교체. `[dependencies]` block의 `version`은
+  안 건드린다 (`libc = "0.2"` 같은 entry 안전). cargo build로
+  Cargo.lock도 자동 동기화.
+- `make tag VERSION=0.3.0` — bump + commit + annotated tag(`v0.3.0`).
+  버전 변경이 없으면 commit은 skip하고 tag만 생성.
+- `make release-publish VERSION=0.3.0` — tag + push origin main + push
+  tag. CI(GoReleaser)가 발화. origin remote가 `git@github.com:x-mesh/aic.git`을
+  가리키는지 사용자가 사전에 확인.
+- 0.2.0 round-trip 검증 — dependency version은 그대로 유지됨.
+
 ### Added — Release workflow (GoReleaser, gk 패턴 통일)
 
 `v*` 태그 push 한 번으로 multi-arch binary 빌드 + GitHub Release +

@@ -28,18 +28,42 @@ SOCKET_DIR := /tmp/aic-$(shell id -u)
 SOCKET_PATH := $(SOCKET_DIR)/session.sock
 
 # ─── 빌드 ───────────────────────────────────────────────────
+# target/ 누적 방지: 빌드 후 오래된 산출물(7일 이상 미사용)과
+# incremental 캐시 비대화 시 자동 정리. 새 빌드 영향 최소.
+
+# 7일 기준. 짧게 두면 깨끗하지만 재컴파일이 잦아진다.
+SWEEP_DAYS ?= 7
+# incremental 캐시가 이 크기를 넘으면 정리 (MB 단위, du -sm 기준)
+INCREMENTAL_MAX_MB ?= 2048
 
 .PHONY: build
 build:
 	cargo build --workspace
+	@$(MAKE) --no-print-directory _post_build_cleanup
 
 .PHONY: release
 release:
 	cargo build --workspace --release
+	@$(MAKE) --no-print-directory _post_build_cleanup
 
 .PHONY: check
 check:
 	cargo check --workspace
+
+# 빌드 후 자동 정리 (조용히 실행, 도구 없으면 skip)
+.PHONY: _post_build_cleanup
+_post_build_cleanup:
+	@if command -v cargo-sweep >/dev/null 2>&1; then \
+		cargo sweep --time $(SWEEP_DAYS) >/dev/null 2>&1 && \
+			echo "  [sweep] $(SWEEP_DAYS)일 이상 미사용 산출물 정리 완료" || true; \
+	fi
+	@if [ -d target/debug/incremental ]; then \
+		size_mb=$$(du -sm target/debug/incremental 2>/dev/null | cut -f1); \
+		if [ "$$size_mb" -gt "$(INCREMENTAL_MAX_MB)" ]; then \
+			rm -rf target/debug/incremental && \
+			echo "  [sweep] incremental 캐시 정리 ($${size_mb}MB > $(INCREMENTAL_MAX_MB)MB)"; \
+		fi; \
+	fi
 
 # ─── 테스트 ─────────────────────────────────────────────────
 
@@ -260,12 +284,86 @@ clean:
 clean-all: clean socket-clean
 	@rm -rf aic-*/proptest-regressions
 
+# 수동 정리: cargo-sweep으로 N일 이상 미사용 산출물 제거
+# 사용: make sweep              (기본 7일)
+#       make sweep SWEEP_DAYS=3 (3일 기준)
+.PHONY: sweep
+sweep:
+	@if command -v cargo-sweep >/dev/null 2>&1; then \
+		echo "── cargo sweep --time $(SWEEP_DAYS) ──"; \
+		cargo sweep --time $(SWEEP_DAYS); \
+	else \
+		echo "cargo-sweep 미설치. 설치: cargo install cargo-sweep"; \
+		exit 1; \
+	fi
+
+# incremental 캐시만 즉시 삭제 (수 GB 회수, 다음 빌드 약간 느려짐)
+.PHONY: clean-incremental
+clean-incremental:
+	@before=$$(du -sh target/debug/incremental 2>/dev/null | cut -f1 || echo "0"); \
+	rm -rf target/debug/incremental target/release/incremental; \
+	echo "  incremental 캐시 삭제 완료 (회수: $$before)"
+
+# target/ 크기 현황
+.PHONY: target-size
+target-size:
+	@echo "── target/ 크기 ──"
+	@du -sh target 2>/dev/null || echo "(target 없음)"
+	@du -sh target/debug target/release target/debug/deps target/debug/incremental 2>/dev/null | sort -hr
+
 # ─── CI 로컬 재현 ──────────────────────────────────────────
 # 위쪽 lint 섹션의 ci/help-snapshot target이 표준. 여기서는 alias만 남긴다.
 
 .PHONY: ci-quick
 ci-quick: lint test
 	@echo "✅ ci-quick 통과 (fmt/clippy 엄격 검사 없음 — 풀 검사는 make ci)"
+
+# ─── 릴리스 ─────────────────────────────────────────────────
+# bump-version VERSION=0.3.0
+#   workspace 3 crate(common/server/client)의 [package].version을 한 번에 갱신.
+#   awk로 [package] section 안의 첫 `version =` 줄만 교체 — [dependencies]
+#   block의 version은 건드리지 않는다. cargo build로 Cargo.lock도 동기화.
+#
+# tag VERSION=0.3.0
+#   bump-version 후 git commit + annotated tag까지 한 번에. push는 따로.
+#
+# release VERSION=0.3.0
+#   tag VERSION=... + push origin main + push tag. CI가 GoReleaser 발화.
+#   첫 사용 전에 origin remote가 git@github.com:x-mesh/aic.git을 가리키는지 확인.
+
+.PHONY: bump-version
+bump-version:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make bump-version VERSION=0.3.0"; exit 2; \
+	fi
+	@for f in aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml; do \
+		awk -v v="$(VERSION)" '\
+			BEGIN{in_pkg=0; done=0} \
+			/^\[package\]/{in_pkg=1; print; next} \
+			/^\[/ && !/^\[package\]/{in_pkg=0} \
+			in_pkg && !done && /^version[[:space:]]*=/ {print "version = \"" v "\""; done=1; next} \
+			{print}' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
+	done
+	@echo "✓ workspace version → $(VERSION)"
+	@grep -E "^version" aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml
+	@cargo build --workspace --quiet >/dev/null 2>&1 && echo "✓ Cargo.lock 동기화" || echo "⚠ cargo build 실패 — Cargo.lock 미동기화"
+
+.PHONY: tag
+tag: bump-version
+	@if git diff --quiet --exit-code aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock; then \
+		echo "⚠ 버전 변경이 없습니다 (이미 v$(VERSION)?). tag만 생성합니다."; \
+	else \
+		git add aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock && \
+		git commit -m "release: v$(VERSION)"; \
+	fi
+	@git tag v$(VERSION) -m "v$(VERSION)"
+	@echo "✓ tag v$(VERSION) 생성됨. push: git push origin main v$(VERSION)"
+
+.PHONY: release
+release-publish: tag
+	@git push origin main && git push origin v$(VERSION)
+	@echo "✓ push 완료. Actions 탭에서 release workflow 확인:"
+	@echo "  https://github.com/x-mesh/aic/actions"
 
 # ─── 도움말 ─────────────────────────────────────────────────
 
@@ -297,6 +395,11 @@ help:
 	@echo "  make fmt          코드 포맷팅"
 	@echo "  make fix          자동 수정 (clippy + fmt)"
 	@echo ""
+	@echo "릴리스"
+	@echo "  make bump-version VERSION=0.3.0   workspace 3 crate 버전 갱신"
+	@echo "  make tag VERSION=0.3.0            bump + commit + annotated tag"
+	@echo "  make release-publish VERSION=0.3.0  tag + push (CI 발화)"
+	@echo ""
 	@echo "실행"
 	@echo "  make run-server   aic-session 서버 실행"
 	@echo "  make run-client   ac 클라이언트 실행"
@@ -317,9 +420,12 @@ help:
 	@echo "  make audit        보안 취약점 감사"
 	@echo ""
 	@echo "기타"
-	@echo "  make doc          문서 생성 및 열기"
-	@echo "  make watch        파일 변경 시 자동 테스트"
-	@echo "  make ci           CI 로컬 재현 (lint + test)"
-	@echo "  make clean        빌드 산출물 삭제"
-	@echo "  make clean-all    전체 정리 (빌드 + 소켓 + proptest)"
+	@echo "  make doc              문서 생성 및 열기"
+	@echo "  make watch            파일 변경 시 자동 테스트"
+	@echo "  make ci               CI 로컬 재현 (lint + test)"
+	@echo "  make clean            빌드 산출물 삭제"
+	@echo "  make clean-all        전체 정리 (빌드 + 소켓 + proptest)"
+	@echo "  make sweep            오래된 산출물 정리 (cargo-sweep, 기본 7일)"
+	@echo "  make clean-incremental incremental 캐시만 즉시 삭제"
+	@echo "  make target-size      target/ 크기 현황"
 	@echo ""
