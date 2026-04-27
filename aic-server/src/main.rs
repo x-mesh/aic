@@ -208,6 +208,21 @@ async fn main() -> anyhow::Result<()> {
         uds_server.serve(buf_for_uds).await;
     });
 
+    // 5.5. aicd registry에 best-effort 등록 — aicd가 미실행이면 silent skip한다.
+    //      Phase 1.4: 이 단계에서는 PTY ownership을 옮기지 않고, 단지 supervisor에게
+    //      "이 세션이 활성"임을 알려 `aic sessions`/`status`가 중앙 registry를
+    //      소스 오브 트루스로 쓰게 한다.
+    let session_info_for_register = aic_common::SessionInfo {
+        id: session_id.clone(),
+        pid: std::process::id(),
+        state: aic_common::SessionState::Attached,
+        created_at: chrono::Utc::now(),
+        attached_tty: aic_server::aicd_client::current_tty(),
+        shell: Some(shell_name.clone()),
+        cwd: std::env::current_dir().ok(),
+    };
+    aic_server::aicd_client::register_session(session_info_for_register).await;
+
     // 6. stdin → PTY 입력 relay (blocking thread)
     let stdin_handle = tokio::task::spawn_blocking(move || {
         let mut stdin = std::io::stdin().lock();
@@ -350,8 +365,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 10. Graceful 정리
-    //     순서: 터미널 복원 → 백그라운드 task abort → 세션 소켓 unlink → DaemonLock drop(자동 lock 해제)
+    //     순서: 터미널 복원 → aicd unregister → 백그라운드 task abort → 세션 소켓 unlink
+    //     → DaemonLock drop(자동 lock 해제)
     restore_terminal(&orig_termios);
+    aic_server::aicd_client::unregister_session(&session_id).await;
     uds_handle.abort();
     stdin_handle.abort();
     sigwinch_handle.abort();

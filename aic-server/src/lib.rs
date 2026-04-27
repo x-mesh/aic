@@ -1,3 +1,4 @@
+pub mod aicd_client;
 pub mod boundary_detector;
 pub mod control_server;
 pub mod lock;
