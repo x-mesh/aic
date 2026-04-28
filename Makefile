@@ -8,7 +8,7 @@
 # make lint         clippy + fmt check
 # make fix          자동 수정 (clippy + fmt)
 # make clean        빌드 산출물 삭제
-# make install      release 빌드 후 ~/.cargo/bin에 설치
+# make install      release 빌드 후 $(HOME)/.local/bin에 설치
 # make run-server   aic-session 서버 실행
 # make run-client   ac 클라이언트 실행
 # make check        빠른 컴파일 체크 (코드 생성 없이)
@@ -22,6 +22,9 @@
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := build
+
+PREFIX    ?= $(HOME)/.local
+BINDIR    := $(PREFIX)/bin
 
 # 소켓 경로 (디버깅용)
 SOCKET_DIR := /tmp/aic-$(shell id -u)
@@ -163,13 +166,15 @@ run-config: build
 
 .PHONY: install
 install:
-	cargo install --path aic-server
-	cargo install --path aic-client
+	@mkdir -p "$(BINDIR)"
+	cargo install --path aic-server --root "$(PREFIX)"
+	cargo install --path aic-client --root "$(PREFIX)"
+	@echo "설치 경로: $(BINDIR)"
 
 .PHONY: uninstall
 uninstall:
-	cargo uninstall aic-server 2>/dev/null || true
-	cargo uninstall aic-client 2>/dev/null || true
+	cargo uninstall aic-server --root "$(PREFIX)" 2>/dev/null || true
+	cargo uninstall aic-client --root "$(PREFIX)" 2>/dev/null || true
 
 # ─── 디버깅 ─────────────────────────────────────────────────
 

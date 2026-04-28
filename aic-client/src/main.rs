@@ -285,8 +285,12 @@ enum SessionOp {
 enum DaemonOp {
     /// aicd가 실행 중인지 확인하고 PID/socket을 출력한다.
     Status,
-    /// aicd를 백그라운드로 시작한다 (이미 실행 중이면 no-op).
-    Start,
+    /// aicd를 시작한다 (이미 실행 중이면 no-op).
+    Start {
+        /// 현재 터미널에 붙여 실행한다. aicd 디버깅용.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// aicd에 graceful Shutdown을 요청한다.
     Stop,
     /// 부팅 시 자동 시작용 OS unit을 설치한다 (macOS launchd / Linux systemd --user).
@@ -355,7 +359,7 @@ async fn main() {
         Some(Commands::Top { interval, session }) => handle_top(interval, session).await,
         Some(Commands::Daemon { op }) => match op {
             DaemonOp::Status => handle_daemon_status().await,
-            DaemonOp::Start => handle_daemon_start().await,
+            DaemonOp::Start { foreground } => handle_daemon_start(foreground).await,
             DaemonOp::Stop => handle_daemon_stop().await,
             DaemonOp::Install { no_load } => handle_daemon_install(no_load),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
@@ -603,8 +607,8 @@ fn handle_daemon_uninstall() {
     }
 }
 
-/// `aic daemon start`: aicd binary를 백그라운드 spawn한다 (이미 떠 있으면 no-op).
-async fn handle_daemon_start() {
+/// `aic daemon start`: aicd binary를 시작한다 (이미 떠 있으면 no-op).
+async fn handle_daemon_start(foreground: bool) {
     let sock = aic_common::aicd_socket_path();
     let client = UdsClient::new(sock.clone());
     if let Ok(true) = client.ping().await {
@@ -618,6 +622,27 @@ async fn handle_daemon_start() {
         .and_then(|p| p.parent().map(|d| d.join("aicd")))
         .filter(|p| p.exists())
         .unwrap_or_else(|| std::path::PathBuf::from("aicd"));
+
+    if foreground {
+        println!(
+            "{COL_GREEN}▶{COL_RESET} aicd foreground 실행 — {bin}",
+            bin = aicd_bin.display()
+        );
+        let status = std::process::Command::new(&aicd_bin)
+            .arg("--foreground")
+            .status();
+        match status {
+            Ok(status) if status.success() => return,
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!(
+                    "{COL_RED}✗{COL_RESET} aicd 실행 실패: {e}\n  시도한 경로: {}",
+                    aicd_bin.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 
     match std::process::Command::new(&aicd_bin)
         .stdin(std::process::Stdio::null())
@@ -3398,7 +3423,7 @@ fn maybe_run_suggested(cmd: &str, lang: &str) {
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let status = std::process::Command::new(&shell)
-        .arg("-lc")
+        .arg("-c")
         .arg(cmd)
         .status();
 
