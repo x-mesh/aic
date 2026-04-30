@@ -188,7 +188,7 @@ fn current_exe_path() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn process_exe_path(pid: u32) -> Option<String> {
+pub(crate) fn process_exe_path(pid: u32) -> Option<String> {
     let mut buf = vec![0u8; 4096];
     let r = unsafe {
         libc::proc_pidpath(
@@ -206,14 +206,14 @@ fn process_exe_path(pid: u32) -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn process_exe_path(pid: u32) -> Option<String> {
+pub(crate) fn process_exe_path(pid: u32) -> Option<String> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .and_then(|p| p.to_str().map(String::from))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn process_exe_path(_pid: u32) -> Option<String> {
+pub(crate) fn process_exe_path(_pid: u32) -> Option<String> {
     None
 }
 

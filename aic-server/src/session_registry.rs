@@ -332,6 +332,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_without_cwd_preserves_existing_cwd() {
+        let r = SessionRegistry::new();
+        r.register(info("aaaaaaaa", 0)).await;
+        let before = r.list().await[0].cwd.clone();
+        let seen = Utc::now();
+
+        assert!(r.heartbeat("aaaaaaaa", seen, None).await);
+
+        let list = r.list().await;
+        assert_eq!(list[0].last_seen_at, Some(seen));
+        assert_eq!(list[0].cwd, before);
+    }
+
+    #[tokio::test]
     async fn upsert_hook_session_creates_missing_entry() {
         let r = SessionRegistry::new();
         let at = Utc::now();

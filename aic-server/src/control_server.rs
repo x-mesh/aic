@@ -279,6 +279,20 @@ async fn stop_session(ctx: &ControlContext, id: &str) -> IpcResponse {
             message: format!("유효하지 않은 PID: {pid}"),
         };
     }
+    if !pid_looks_like_aic_session(pid as u32) {
+        tracing::warn!(
+            session_id = %id,
+            pid,
+            "stop: PID가 aic-session 프로세스로 보이지 않아 SIGTERM 거부"
+        );
+        ctx.registry
+            .set_state(id, aic_common::SessionState::Failed)
+            .await;
+        persist_registry(ctx).await;
+        return IpcResponse::Error {
+            message: format!("PID {pid}가 aic-session 프로세스로 보이지 않아 종료를 거부했습니다"),
+        };
+    }
     let r = unsafe { libc::kill(pid, libc::SIGTERM) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
@@ -296,6 +310,21 @@ async fn stop_session(ctx: &ControlContext, id: &str) -> IpcResponse {
     // UnregisterSession을 보낸다. 이중 unregister는 best-effort라 OK지만
     // race 줄이려고 호출자 쪽에 맡긴다.
     IpcResponse::Pong
+}
+
+fn pid_looks_like_aic_session(pid: u32) -> bool {
+    match crate::lock::process_exe_path(pid) {
+        Some(path) => path_matches_aic_session(&path),
+        // Unsupported or inaccessible platforms keep the old best-effort behavior.
+        None => true,
+    }
+}
+
+fn path_matches_aic_session(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("aic-session")
 }
 
 #[cfg(test)]
@@ -566,6 +595,15 @@ mod tests {
             resp,
             IpcResponse::Error { .. } | IpcResponse::Pong
         ));
+    }
+
+    #[test]
+    fn stop_session_pid_path_must_look_like_aic_session() {
+        assert!(path_matches_aic_session("/tmp/bin/aic-session"));
+        assert!(path_matches_aic_session("aic-session"));
+        assert!(!path_matches_aic_session("/bin/sh"));
+        assert!(!path_matches_aic_session("/usr/bin/aicd"));
+        assert!(!path_matches_aic_session(""));
     }
 
     #[tokio::test]

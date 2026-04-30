@@ -17,9 +17,21 @@ pub struct PtyManager {
     hook_file: Option<tempfile::NamedTempFile>,
     /// 셸 이름 (zsh, bash 등)
     shell_name: String,
+    /// 훅 파일 생성/폴백 주입 정책
+    hook_policy: HookPolicy,
+}
+
+/// PTY 셸에 적용할 훅 관리 정책.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookPolicy {
+    /// 기존 동작: ~/.aic/hooks.*를 갱신하고, rc 설정이 없으면 임시 fallback hook을 source한다.
+    AutoInstall,
+    /// 훅 파일 갱신과 fallback hook source를 모두 비활성화한다.
+    Disabled,
 }
 
 /// 훅 설정 상태
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookStatus {
     /// 사용자가 이미 ~/.aic/hooks.{shell}을 설정함
     Configured,
@@ -27,6 +39,8 @@ pub enum HookStatus {
     NeedsSetup { fallback_path: PathBuf },
     /// 지원하지 않는 셸
     Unsupported,
+    /// 사용자가 명시적으로 hook 관리를 껐다.
+    Disabled,
 }
 
 impl PtyManager {
@@ -34,6 +48,16 @@ impl PtyManager {
     /// $SHELL 환경변수가 없으면 "/bin/sh"를 기본값으로 사용한다.
     /// `session_id`는 PTY 셸에 `AIC_SESSION_ID` 환경변수로 전파된다.
     pub fn spawn_shell(rows: u16, cols: u16, session_id: &str) -> Result<Self> {
+        Self::spawn_shell_with_hook_policy(rows, cols, session_id, HookPolicy::AutoInstall)
+    }
+
+    /// 훅 관리 정책을 명시해 사용자의 기본 셸($SHELL)을 PTY 자식 프로세스로 실행한다.
+    pub fn spawn_shell_with_hook_policy(
+        rows: u16,
+        cols: u16,
+        session_id: &str,
+        hook_policy: HookPolicy,
+    ) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let shell_name = std::path::Path::new(&shell)
             .file_name()
@@ -71,21 +95,7 @@ impl PtyManager {
             cmd.env("LC_CTYPE", "UTF-8");
         }
 
-        // ~/.aic/ 디렉토리에 훅 스크립트 생성 (없으면)
-        let _ = ensure_hook_files();
-
-        // 폴백용 임시 파일 생성
-        let hooks = generate_shell_hooks(&shell_name);
-        let hook_file = if !hooks.is_empty() {
-            let mut file =
-                tempfile::NamedTempFile::new().context("훅 스크립트 임시 파일 생성 실패")?;
-            file.write_all(hooks.as_bytes())
-                .context("훅 스크립트 쓰기 실패")?;
-            file.flush()?;
-            Some(file)
-        } else {
-            None
-        };
+        let hook_file = prepare_hook_file(&shell_name, hook_policy)?;
 
         let child = pair
             .slave
@@ -100,6 +110,7 @@ impl PtyManager {
             writer: Some(writer),
             hook_file,
             shell_name,
+            hook_policy,
         })
     }
 
@@ -111,6 +122,10 @@ impl PtyManager {
 
     /// 훅 설정 상태를 확인한다.
     pub fn check_hook_status(&self) -> HookStatus {
+        if self.hook_policy == HookPolicy::Disabled {
+            return HookStatus::Disabled;
+        }
+
         let hooks = generate_shell_hooks(&self.shell_name);
         if hooks.is_empty() {
             return HookStatus::Unsupported;
@@ -185,6 +200,30 @@ impl PtyManager {
 
 // ── 훅 파일 관리 유틸리티 ──────────────────────────────────────
 
+fn prepare_hook_file(
+    shell_name: &str,
+    policy: HookPolicy,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    if policy == HookPolicy::Disabled {
+        return Ok(None);
+    }
+
+    // ~/.aic/ 디렉토리에 훅 스크립트 생성 (없으면)
+    let _ = ensure_hook_files();
+
+    // 폴백용 임시 파일 생성
+    let hooks = generate_shell_hooks(shell_name);
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut file = tempfile::NamedTempFile::new().context("훅 스크립트 임시 파일 생성 실패")?;
+    file.write_all(hooks.as_bytes())
+        .context("훅 스크립트 쓰기 실패")?;
+    file.flush()?;
+    Ok(Some(file))
+}
+
 /// ~/.aic/ 디렉토리에 훅 스크립트 파일들을 생성한다.
 /// 항상 최신 버전으로 덮어쓴다.
 fn ensure_hook_files() -> Result<()> {
@@ -249,4 +288,15 @@ pub fn get_hook_setup_message(shell_name: &str) -> String {
         "\n💡 더 나은 경험을 위해 {}에 다음을 추가하세요:\n   source {}\n",
         rc_file, hook_file
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_hook_policy_creates_no_fallback_file() {
+        let file = prepare_hook_file("zsh", HookPolicy::Disabled).unwrap();
+        assert!(file.is_none());
+    }
 }
