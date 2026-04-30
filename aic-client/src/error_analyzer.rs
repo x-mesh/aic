@@ -78,7 +78,7 @@ impl ErrorAnalyzer {
     /// 오해해 임의의 재실행 명령을 제안할 수 있으므로 로컬에서 막는다.
     pub fn deterministic_result(record: &CommandRecord, lang: &str) -> Option<AnalysisResult> {
         if record.exit_code != 130 {
-            return None;
+            return deterministic_known_error(record, lang);
         }
 
         let command_known = record
@@ -631,6 +631,123 @@ fn assign_section(sections: &mut ParsedSections, kind: SectionKind, body: String
     }
 }
 
+fn deterministic_known_error(record: &CommandRecord, lang: &str) -> Option<AnalysisResult> {
+    let output = record.output_lines.join("\n");
+    let output_lower = output.to_lowercase();
+    let command = record.command.as_deref().unwrap_or("").trim();
+    let command_lower = command.to_lowercase();
+
+    if record.exit_code == 127
+        || output_lower.contains("command not found")
+        || output_lower.contains("not recognized as an internal or external")
+    {
+        return Some(rule_result(
+            lang,
+            "shell.command_not_found",
+            "명령을 찾을 수 없습니다. 실행 파일이 설치되어 있지 않거나 PATH에 없거나 명령 이름에 오타가 있을 가능성이 큽니다.",
+            "Command was not found. It is likely not installed, not on PATH, or misspelled.",
+            None,
+            "설치 여부와 PATH를 먼저 확인하세요. 예: `which <command>` 또는 package manager 설치 상태를 확인합니다.",
+            "Check whether the executable exists and is on PATH. For example, run `which <command>` or inspect the package manager install state.",
+        ));
+    }
+
+    if record.exit_code == 126
+        || output_lower.contains("permission denied")
+        || output_lower.contains("operation not permitted")
+    {
+        let suggested =
+            executable_path_from_command(command).map(|path| format!("chmod +x {path}"));
+        return Some(rule_result(
+            lang,
+            "shell.permission_denied",
+            "명령을 실행할 권한이 없습니다. 파일 실행 비트가 없거나 현재 사용자가 해당 파일/디렉토리에 접근할 권한이 없을 수 있습니다.",
+            "The command could not be executed because permission was denied. The file may lack execute permission or the current user may not have access.",
+            suggested,
+            "파일이면 `ls -l`로 권한과 소유자를 확인하세요. 디렉토리/시스템 경로라면 소유자와 권한 정책을 먼저 확인해야 합니다.",
+            "Check permissions and ownership with `ls -l`. For system paths, confirm ownership and access policy before changing permissions.",
+        ));
+    }
+
+    if output_lower.contains("eaddrinuse")
+        || output_lower.contains("address already in use")
+        || output_lower.contains("port is already allocated")
+    {
+        return Some(rule_result(
+            lang,
+            "network.port_in_use",
+            "사용하려는 포트가 이미 다른 프로세스에 의해 점유되어 있습니다.",
+            "The port is already in use by another process.",
+            None,
+            "점유 프로세스를 확인한 뒤 종료하거나 다른 포트를 지정하세요. macOS/Linux 예: `lsof -nP -iTCP:<port> -sTCP:LISTEN`.",
+            "Find the owning process and stop it or choose another port. On macOS/Linux: `lsof -nP -iTCP:<port> -sTCP:LISTEN`.",
+        ));
+    }
+
+    if command_lower.starts_with("git ")
+        && (output_lower.contains("non-fast-forward")
+            || output_lower.contains("fetch first")
+            || output_lower.contains("failed to push some refs"))
+    {
+        return Some(rule_result(
+            lang,
+            "git.non_fast_forward",
+            "원격 브랜치에 로컬에 없는 커밋이 있어 push가 거부되었습니다.",
+            "The push was rejected because the remote branch contains commits that are not in your local branch.",
+            Some("git pull --rebase".to_string()),
+            "rebase 후 충돌을 해결하고 테스트한 뒤 다시 push하세요. 공유 브랜치에서 force push는 피하세요.",
+            "Rebase, resolve conflicts, run the relevant checks, then push again. Avoid force-pushing shared branches.",
+        ));
+    }
+
+    if command_lower.starts_with("docker ")
+        && output_lower.contains("cannot connect to the docker daemon")
+    {
+        return Some(rule_result(
+            lang,
+            "docker.daemon_not_running",
+            "Docker daemon에 연결할 수 없습니다. Docker Desktop 또는 docker service가 실행 중이지 않을 가능성이 큽니다.",
+            "The Docker daemon is not reachable. Docker Desktop or the docker service is likely not running.",
+            None,
+            "Docker Desktop/service를 시작한 뒤 `docker info`로 연결 상태를 확인하세요.",
+            "Start Docker Desktop or the docker service, then verify with `docker info`.",
+        ));
+    }
+
+    None
+}
+
+fn rule_result(
+    lang: &str,
+    rule_id: &str,
+    explanation_ko: &str,
+    explanation_en: &str,
+    suggested_command: Option<String>,
+    info_ko: &str,
+    info_en: &str,
+) -> AnalysisResult {
+    let english = lang == "english";
+    let info = if english { info_en } else { info_ko };
+    AnalysisResult {
+        explanation: if english {
+            explanation_en.to_string()
+        } else {
+            explanation_ko.to_string()
+        },
+        suggested_command,
+        additional_info: Some(format!("{info} [rule: {rule_id}]")),
+    }
+}
+
+fn executable_path_from_command(command: &str) -> Option<String> {
+    let first = command.split_whitespace().next()?.trim();
+    if first.starts_with("./") || first.starts_with('/') {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
 fn output_looks_like_aic_transcript(lines: &[String]) -> bool {
     let joined = lines.join("\n").to_lowercase();
     let markers = [
@@ -954,6 +1071,75 @@ mod tests {
         assert!(result.explanation.contains("AIC"));
         assert!(result.suggested_command.is_none());
         assert!(result.additional_info.unwrap().contains("원래 명령"));
+    }
+
+    #[test]
+    fn deterministic_result_command_not_found() {
+        let record = make_record(
+            Some("frobnicate"),
+            127,
+            vec!["zsh: command not found: frobnicate"],
+        );
+        let result = ErrorAnalyzer::deterministic_result(&record, "korean").unwrap();
+
+        assert!(result.explanation.contains("명령을 찾을 수 없습니다"));
+        assert!(result.suggested_command.is_none());
+        assert!(result
+            .additional_info
+            .unwrap()
+            .contains("shell.command_not_found"));
+    }
+
+    #[test]
+    fn deterministic_result_permission_denied_suggests_chmod_for_local_path() {
+        let record = make_record(Some("./deploy.sh"), 126, vec!["permission denied"]);
+        let result = ErrorAnalyzer::deterministic_result(&record, "english").unwrap();
+
+        assert!(result.explanation.contains("permission was denied"));
+        assert_eq!(
+            result.suggested_command.as_deref(),
+            Some("chmod +x ./deploy.sh")
+        );
+        assert!(result
+            .additional_info
+            .unwrap()
+            .contains("shell.permission_denied"));
+    }
+
+    #[test]
+    fn deterministic_result_port_in_use() {
+        let record = make_record(
+            Some("npm run dev"),
+            1,
+            vec!["Error: listen EADDRINUSE: address already in use :::3000"],
+        );
+        let result = ErrorAnalyzer::deterministic_result(&record, "korean").unwrap();
+
+        assert!(result.explanation.contains("포트"));
+        assert!(result
+            .additional_info
+            .unwrap()
+            .contains("network.port_in_use"));
+    }
+
+    #[test]
+    fn deterministic_result_git_non_fast_forward() {
+        let record = make_record(
+            Some("git push"),
+            1,
+            vec!["! [rejected] main -> main (non-fast-forward)"],
+        );
+        let result = ErrorAnalyzer::deterministic_result(&record, "english").unwrap();
+
+        assert_eq!(
+            result.suggested_command.as_deref(),
+            Some("git pull --rebase")
+        );
+        assert!(result.explanation.contains("remote branch"));
+        assert!(result
+            .additional_info
+            .unwrap()
+            .contains("git.non_fast_forward"));
     }
 
     // ── parse_response: 영어 라벨 ──────────────────────────────
