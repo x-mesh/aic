@@ -293,6 +293,25 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// 분석 결과의 suggested_command를 risk_guard 검증 후 실행 (P1 'aic fix').
+    ///
+    /// 사용 흐름: 먼저 `aic`로 분석을 한 번 돌려 cache/deterministic 결과를
+    /// 만들어둔 뒤, `aic fix`로 그 제안 명령을 안전하게 적용한다.
+    /// 명령 실행만 지원한다 — 파일 패치(diff)는 향후 슬라이스에서.
+    Fix {
+        /// 분석 대상 record의 id prefix. 미지정 시 마지막 record.
+        #[arg(long, value_name = "PREFIX")]
+        record: Option<String>,
+        /// Safe 등급에서만 자동 진행.
+        #[arg(long)]
+        yes: bool,
+        /// 실제 실행 없이 plan(record/analysis/suggested/risk)만 출력.
+        #[arg(long)]
+        dry_run: bool,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -439,6 +458,12 @@ async fn main() {
         Some(Commands::CaptureLast { yes, session }) => {
             handle_capture_last(yes, session, cli.provider).await
         }
+        Some(Commands::Fix {
+            record,
+            yes,
+            dry_run,
+            session,
+        }) => handle_fix(record, yes, dry_run, session, cli.provider).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -2746,6 +2771,199 @@ async fn handle_capture_last(
         argv.first().map(String::as_str).unwrap_or("sh")
     );
     handle_run(argv, provider_override).await;
+}
+
+async fn handle_fix(
+    record_prefix: Option<String>,
+    yes: bool,
+    dry_run: bool,
+    session: Option<String>,
+    _provider_override: Option<String>,
+) {
+    use aic_client::risk_guard::{classify, RiskLevel};
+
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+
+    // 1. record 결정 — prefix가 있으면 매칭, 없으면 last.
+    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
+        if !aic_common::is_valid_record_id(prefix) {
+            eprintln!(
+                "{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'"
+            );
+            std::process::exit(2);
+        }
+        match client.get_recent_commands(200).await {
+            Ok(records) => {
+                let matched: Vec<_> = records
+                    .into_iter()
+                    .filter(|r| r.id.starts_with(prefix))
+                    .collect();
+                match matched.len() {
+                    0 => {
+                        eprintln!(
+                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'와 일치하는 record 없음"
+                        );
+                        std::process::exit(2);
+                    }
+                    1 => matched.into_iter().next().unwrap(),
+                    n => {
+                        eprintln!(
+                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match client.get_last_command().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let config = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} config 로드 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+    let lang = aic_common::resolve_lang(&config.llm.lang);
+
+    // 2. 분석 결과 결정 — deterministic 우선, 그 다음 cache.
+    let analysis = if let Some(det) = ErrorAnalyzer::deterministic_result(&record, &lang) {
+        det
+    } else {
+        let project_context = aic_client::project_context::build_context_pack();
+        let key = cache::cache_key_with_context(
+            record.command.as_deref().unwrap_or(""),
+            record.exit_code,
+            &record.output_lines,
+            project_context.as_deref(),
+        );
+        match cache::load(&key) {
+            Some(hit) => hit.result,
+            None => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 분석 결과를 찾지 못했습니다 — \
+                     먼저 `aic` 또는 `aic --record {}`로 분석을 한 번 돌리고 다시 시도하세요.",
+                    &record.id[..record.id.len().min(8)]
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // 3. plan 출력.
+    let id_short = if record.id.is_empty() {
+        "-"
+    } else {
+        &record.id[..record.id.len().min(8)]
+    };
+    let cmd_str = record.command.as_deref().unwrap_or("(no command)");
+    println!("{COL_BOLD}aic fix{COL_RESET}");
+    println!("  record  : {COL_CYAN}{id_short}{COL_RESET}");
+    println!("  command : {cmd_str}");
+    println!(
+        "  exit    : {}",
+        if record.exit_code == 0 {
+            format!("{COL_GREEN}{}{COL_RESET}", record.exit_code)
+        } else {
+            format!("{COL_RED}{}{COL_RESET}", record.exit_code)
+        }
+    );
+    println!();
+    println!("{COL_BOLD}analysis{COL_RESET}");
+    for line in analysis.explanation.lines() {
+        println!("  {line}");
+    }
+
+    let Some(suggested) = analysis
+        .suggested_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        println!();
+        println!(
+            "{COL_DIM}(분석 결과에 실행 가능한 suggested_command가 없습니다 — \
+             설명을 참고해 수동으로 처리하세요){COL_RESET}"
+        );
+        return;
+    };
+
+    let assessment = classify(suggested);
+    println!();
+    println!("{COL_BOLD}plan{COL_RESET}");
+    println!("  suggested: {suggested}");
+    println!(
+        "  risk     : {} {COL_DIM}({}){COL_RESET}",
+        risk_label(assessment.level),
+        assessment.rule.unwrap_or("(unrated)")
+    );
+    if let Some(reason) = assessment.reason.as_deref() {
+        println!("  reason   : {reason}");
+    }
+
+    if dry_run {
+        println!();
+        println!("{COL_DIM}--dry-run: 실행 없이 종료{COL_RESET}");
+        return;
+    }
+
+    // 4. risk-aware confirm.
+    match assessment.level {
+        RiskLevel::Dangerous => {
+            eprintln!(
+                "{COL_RED}✗{COL_RESET} dangerous로 분류되어 실행을 거부했습니다 — \
+                 직접 검토 후 `aic run -- {suggested}` 형태로 실행을 검토하세요."
+            );
+            std::process::exit(2);
+        }
+        RiskLevel::Unknown => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 분류할 수 없어 안전을 위해 실행을 거부합니다 — \
+                 직접 `aic run -- {suggested}` 형태로 실행을 검토하세요."
+            );
+            std::process::exit(2);
+        }
+        RiskLevel::NeedsConfirm => {
+            if !confirm_yes_no("이 명령을 실행할까요?") {
+                eprintln!("{COL_DIM}취소됨{COL_RESET}");
+                return;
+            }
+        }
+        RiskLevel::Safe => {
+            if !yes && !confirm_yes_no("이 명령을 실행할까요?") {
+                eprintln!("{COL_DIM}취소됨{COL_RESET}");
+                return;
+            }
+        }
+    }
+
+    // 5. 실행 — $SHELL -c.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let argv = vec![shell, "-c".to_string(), suggested.to_string()];
+    println!(
+        "{COL_DIM}running via {} -c …{COL_RESET}",
+        argv.first().map(String::as_str).unwrap_or("sh")
+    );
+    handle_run(argv, _provider_override).await;
 }
 
 fn risk_label(level: aic_client::risk_guard::RiskLevel) -> String {
