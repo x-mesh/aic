@@ -130,6 +130,17 @@ struct Cli {
     #[arg(long, env = "AIC_PROVIDER", global = true)]
     provider: Option<String>,
 
+    /// 분석 대상 record를 id prefix로 명시 (P1).
+    ///
+    /// `aic history`로 본 8자 prefix를 그대로 사용하면 된다. 일치하는 record가
+    /// 0건/2건 이상이면 명시적 에러를 낸다.
+    #[arg(long = "record", value_name = "PREFIX")]
+    record_prefix: Option<String>,
+
+    /// 분석 대상 record 선택 시 참조할 세션 ID 명시 (기본: AIC_SESSION_ID env > 최신 세션).
+    #[arg(long)]
+    session: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -424,6 +435,22 @@ async fn main() {
             DebugOp::Bundle => handle_debug_bundle().await,
         },
         None => {
+            // --record <prefix>가 있으면 history에서 매칭되는 record를 분석 흐름에 투입.
+            if let Some(prefix) = cli.record_prefix.as_deref() {
+                if let Err(e) = handle_record_by_prefix(
+                    prefix,
+                    cli.session.clone(),
+                    cli.dry_run,
+                    cli.provider,
+                )
+                .await
+                {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+
             // 인자가 있으면 프롬프트로 사용, 없으면 기본 동작
             let prompt = if cli.prompt.is_empty() {
                 None
@@ -2899,6 +2926,93 @@ fn resolve_provider(config: &AppConfig, override_name: Option<&str>) -> anyhow::
 
 /// 기본 동작: 서버 연결 → 직전 명령어 조회 → 자동 분기
 /// 또는 직접 프롬프트가 주어지면 LLM에 바로 질문
+/// `--record <prefix>` 흐름. session ring buffer에서 prefix로 record를 찾아
+/// 분석 흐름에 투입한다 (P1 'aic history / record id' 가치 루프).
+async fn handle_record_by_prefix(
+    prefix: &str,
+    session: Option<String>,
+    dry_run: bool,
+    provider_override: Option<String>,
+) -> anyhow::Result<()> {
+    let total_start = Instant::now();
+
+    let prefix = prefix.trim();
+    if !aic_common::is_valid_record_id(prefix) {
+        anyhow::bail!(
+            "record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)"
+        );
+    }
+
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+
+    // 200개를 가져와서 prefix로 매칭. 충분히 길지 않은 prefix면 다중 매칭이 발생할 수 있다.
+    let records = client.get_recent_commands(200).await.map_err(|e| {
+        anyhow::anyhow!(
+            "세션 record 조회 실패 ({}): {e}",
+            sock.display()
+        )
+    })?;
+
+    let matches: Vec<aic_common::CommandRecord> = records
+        .into_iter()
+        .filter(|r| r.id.starts_with(prefix))
+        .collect();
+
+    let record = match matches.len() {
+        0 => anyhow::bail!("prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"),
+        1 => matches.into_iter().next().expect("len==1"),
+        n => {
+            let ids: Vec<String> = matches
+                .iter()
+                .take(5)
+                .map(|r| {
+                    format!(
+                        "  {} {}",
+                        &r.id[..r.id.len().min(8)],
+                        r.command.as_deref().unwrap_or("∅")
+                    )
+                })
+                .collect();
+            anyhow::bail!(
+                "prefix '{prefix}'가 {n}건 매칭됩니다 — 더 긴 prefix로 좁혀주세요:\n{}",
+                ids.join("\n")
+            );
+        }
+    };
+
+    debug_log!(
+        "record   prefix='{prefix}' → id={} cmd={} exit={}",
+        &record.id[..record.id.len().min(8)],
+        record.command.as_deref().unwrap_or("∅"),
+        record.exit_code
+    );
+
+    let config = ConfigManager::load()?;
+    let provider_name = resolve_provider(&config, provider_override.as_deref())?;
+    let model_name = config
+        .llm
+        .providers
+        .get(&provider_name)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "(CLI)".to_string());
+    let lang = aic_common::resolve_lang(&config.llm.lang);
+    let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+
+    let r = handle_record(
+        record,
+        dispatcher,
+        &config,
+        &provider_name,
+        &model_name,
+        &lang,
+        dry_run,
+    )
+    .await;
+    debug_step!(total_start, "total");
+    r
+}
+
 async fn handle_default(
     direct_prompt: Option<String>,
     dry_run: bool,
