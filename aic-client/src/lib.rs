@@ -12,6 +12,7 @@ pub mod local_record;
 pub mod project_context;
 pub mod redaction;
 pub mod repl;
+pub mod risk_guard;
 pub mod spinner;
 pub mod streaming;
 pub mod top;
