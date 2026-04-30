@@ -280,6 +280,19 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// hook mode metadata-only record를 risk_guard 통과 후 explicit capture로 재실행 (P1).
+    ///
+    /// 마지막 record의 command를 `$SHELL -c`로 다시 실행해 stdout/stderr tail을
+    /// 잡는다. risk_guard가 Dangerous/Unknown으로 판정한 명령은 거부하고,
+    /// NeedsConfirm은 사용자 확인을 받는다. `--yes`는 Safe 등급에만 효과가 있다.
+    CaptureLast {
+        /// Safe 등급에서만 자동 진행. NeedsConfirm/Dangerous에는 영향이 없다.
+        #[arg(long)]
+        yes: bool,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -423,6 +436,9 @@ async fn main() {
             session,
         }) => handle_history(limit, failed, json, session).await,
         Some(Commands::Last { json, session }) => handle_last(json, session).await,
+        Some(Commands::CaptureLast { yes, session }) => {
+            handle_capture_last(yes, session, cli.provider).await
+        }
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -2646,6 +2662,113 @@ async fn handle_history(limit: usize, failed: bool, json: bool, session: Option<
             "  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<10} {quality:<6}{COL_RESET}  {cmd}"
         );
     }
+}
+
+async fn handle_capture_last(
+    yes: bool,
+    session: Option<String>,
+    provider_override: Option<String>,
+) -> () {
+    use aic_client::risk_guard::{classify, RiskLevel};
+
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+    let record = match client.get_last_command().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
+                sock.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let Some(cmd) = record.command.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} 마지막 record에 command 정보가 없어 재실행할 수 없습니다."
+        );
+        std::process::exit(1);
+    };
+
+    if record.capture_quality == aic_common::CaptureQuality::FullOutput {
+        eprintln!(
+            "{COL_DIM}직전 record는 이미 FullOutput 입니다 — capture-last 없이도 분석에 충분합니다.{COL_RESET}"
+        );
+        eprintln!("  command: {cmd}");
+        return;
+    }
+
+    let assessment = classify(cmd);
+    println!("{COL_BOLD}aic capture-last{COL_RESET}");
+    println!("  command : {cmd}");
+    println!(
+        "  risk    : {} {COL_DIM}({}){COL_RESET}",
+        risk_label(assessment.level),
+        assessment.rule.unwrap_or("(unrated)")
+    );
+    if let Some(reason) = assessment.reason.as_deref() {
+        println!("  reason  : {reason}");
+    }
+
+    match assessment.level {
+        RiskLevel::Dangerous => {
+            eprintln!(
+                "{COL_RED}✗{COL_RESET} dangerous로 분류되어 재실행을 거부했습니다."
+            );
+            std::process::exit(2);
+        }
+        RiskLevel::Unknown => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 분류할 수 없어 안전을 위해 재실행을 거부합니다 — \
+                 직접 `aic run -- {cmd}` 형태로 실행을 검토하세요."
+            );
+            std::process::exit(2);
+        }
+        RiskLevel::NeedsConfirm => {
+            if !confirm_yes_no("이 명령을 다시 실행할까요?") {
+                eprintln!("{COL_DIM}취소됨{COL_RESET}");
+                return;
+            }
+        }
+        RiskLevel::Safe => {
+            if !yes && !confirm_yes_no("이 명령을 다시 실행할까요?") {
+                eprintln!("{COL_DIM}취소됨{COL_RESET}");
+                return;
+            }
+        }
+    }
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let argv = vec![shell, "-c".to_string(), cmd.to_string()];
+    println!(
+        "{COL_DIM}re-running via {} -c …{COL_RESET}",
+        argv.first().map(String::as_str).unwrap_or("sh")
+    );
+    handle_run(argv, provider_override).await;
+}
+
+fn risk_label(level: aic_client::risk_guard::RiskLevel) -> String {
+    use aic_client::risk_guard::RiskLevel;
+    match level {
+        RiskLevel::Safe => format!("{COL_GREEN}safe{COL_RESET}"),
+        RiskLevel::NeedsConfirm => format!("{COL_YELLOW}needs-confirm{COL_RESET}"),
+        RiskLevel::Dangerous => format!("{COL_RED}dangerous{COL_RESET}"),
+        RiskLevel::Unknown => format!("{COL_DIM}unknown{COL_RESET}"),
+    }
+}
+
+fn confirm_yes_no(question: &str) -> bool {
+    use std::io::{self, Write};
+    print!("{question} [y/N] ");
+    if io::stdout().flush().is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    if io::stdin().read_line(&mut buf).is_err() {
+        return false;
+    }
+    matches!(buf.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 async fn handle_last(json: bool, session: Option<String>) {
