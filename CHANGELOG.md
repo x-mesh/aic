@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-30
+
 ### Added — Groq Cloud provider 정식 지원
 
 - **`ProviderType::Groq` enum variant 추가** (aic-common). OpenAI 호환 API path를
