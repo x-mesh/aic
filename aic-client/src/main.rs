@@ -125,6 +125,11 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// 사용할 provider 이름 — config의 `default_provider`를 1회 override한다.
+    /// 환경변수 `AIC_PROVIDER`로도 지정 가능. 두 값이 모두 있으면 CLI 플래그가 우선한다.
+    #[arg(long, env = "AIC_PROVIDER", global = true)]
+    provider: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -369,7 +374,7 @@ async fn main() {
             SessionOp::Prune { older_than_secs } => handle_session_prune(older_than_secs).await,
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
-        Some(Commands::Run { cmd }) => handle_run(cmd).await,
+        Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -389,7 +394,7 @@ async fn main() {
                 Some(cli.prompt.join(" "))
             };
 
-            if let Err(e) = handle_default(prompt, cli.dry_run).await {
+            if let Err(e) = handle_default(prompt, cli.dry_run, cli.provider).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -688,7 +693,7 @@ async fn handle_daemon_start(foreground: bool) {
 /// - aicd registry/buffer로 보내는 단계는 이후 sub-step에서 추가한다.
 ///   (구조 정의만 하고 stdout으로 record JSON을 hint로 표시 — 사용자가 결과를 확인)
 /// - line cap 1000, byte cap 256 KiB. 초과 시 tail만 보존.
-async fn handle_run(cmd: Vec<String>) {
+async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
     if cmd.is_empty() {
         eprintln!("{COL_RED}✗{COL_RESET} 실행할 명령이 없습니다 — `aic run -- <cmd...>`");
         std::process::exit(2);
@@ -828,7 +833,13 @@ async fn handle_run(cmd: Vec<String>) {
     if record.exit_code != 0 {
         match ConfigManager::load() {
             Ok(config) => {
-                let provider_name = config.llm.default_provider.clone();
+                let provider_name = match resolve_provider(&config, provider_override.as_deref()) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        eprintln!("{COL_YELLOW}⚠{COL_RESET} 분석 건너뜀: {e}");
+                        std::process::exit(exit_code);
+                    }
+                };
                 let model_name = config
                     .llm
                     .providers
@@ -2683,14 +2694,47 @@ async fn stdin_record_if_piped() -> anyhow::Result<Option<aic_common::CommandRec
     }))
 }
 
+/// `--provider` 플래그 또는 `AIC_PROVIDER` env로 지정된 provider override를 검증한다.
+/// override가 없으면 config의 `default_provider`를 그대로 반환한다.
+/// override 이름이 `[llm.providers]`에 없으면 사용 가능한 목록을 포함한 에러를 돌려준다.
+fn resolve_provider(
+    config: &AppConfig,
+    override_name: Option<&str>,
+) -> anyhow::Result<String> {
+    match override_name {
+        Some(name) if !name.is_empty() => {
+            if config.llm.providers.contains_key(name) {
+                Ok(name.to_string())
+            } else {
+                let mut available: Vec<&str> =
+                    config.llm.providers.keys().map(String::as_str).collect();
+                available.sort_unstable();
+                let listed = if available.is_empty() {
+                    "(없음)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                anyhow::bail!(
+                    "provider '{name}'이(가) [llm.providers]에 없습니다. 사용 가능: {listed}"
+                )
+            }
+        }
+        _ => Ok(config.llm.default_provider.clone()),
+    }
+}
+
 /// 기본 동작: 서버 연결 → 직전 명령어 조회 → 자동 분기
 /// 또는 직접 프롬프트가 주어지면 LLM에 바로 질문
-async fn handle_default(direct_prompt: Option<String>, dry_run: bool) -> anyhow::Result<()> {
+async fn handle_default(
+    direct_prompt: Option<String>,
+    dry_run: bool,
+    provider_override: Option<String>,
+) -> anyhow::Result<()> {
     let total_start = Instant::now();
 
     let config_start = Instant::now();
     let config = ConfigManager::load()?;
-    let provider_name = config.llm.default_provider.clone();
+    let provider_name = resolve_provider(&config, provider_override.as_deref())?;
     let model_name = config
         .llm
         .providers
@@ -3556,7 +3600,12 @@ fn print_command_block(title: &str, cmd: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_destructive_command;
+    use super::{is_destructive_command, resolve_provider};
+    use aic_common::{
+        AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType, ServerConfig,
+        SessionConfig,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn destructive_rm_rf_root() {
@@ -3587,5 +3636,83 @@ mod tests {
         assert!(!is_destructive_command("git status"));
         assert!(!is_destructive_command("cat /etc/hosts"));
         assert!(!is_destructive_command("rm foo.txt")); // no -rf
+    }
+
+    fn config_with_providers(default: &str, names: &[&str]) -> AppConfig {
+        let mut providers = HashMap::new();
+        for name in names {
+            providers.insert(
+                (*name).to_string(),
+                ProviderConfig {
+                    provider_type: ProviderType::OpenAiCompatible,
+                    endpoint: None,
+                    api_key: None,
+                    model: None,
+                    cli_path: None,
+                    cli_args: None,
+                },
+            );
+        }
+        AppConfig {
+            llm: LlmConfig {
+                default_provider: default.to_string(),
+                providers,
+                lang: "korean".to_string(),
+                connect_timeout_secs: 5,
+                request_timeout_secs: 30,
+            },
+            server: ServerConfig {
+                max_buffer_lines: 500,
+                socket_path: None,
+                boundary_strategy: BoundaryStrategyConfig {
+                    method: "prompt_marker".to_string(),
+                    idle_threshold_ms: None,
+                },
+            },
+            session: SessionConfig::default(),
+        }
+    }
+
+    #[test]
+    fn resolve_provider_returns_default_when_override_is_none() {
+        let cfg = config_with_providers("openai", &["openai", "anthropic"]);
+        assert_eq!(resolve_provider(&cfg, None).unwrap(), "openai");
+    }
+
+    #[test]
+    fn resolve_provider_returns_override_when_known() {
+        let cfg = config_with_providers("openai", &["openai", "anthropic"]);
+        assert_eq!(
+            resolve_provider(&cfg, Some("anthropic")).unwrap(),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_errors_with_available_list_when_unknown() {
+        let cfg = config_with_providers("openai", &["openai", "anthropic"]);
+        let err = resolve_provider(&cfg, Some("ghost")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "msg should mention bad name: {msg}");
+        assert!(
+            msg.contains("anthropic") && msg.contains("openai"),
+            "msg should list available providers: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_provider_treats_empty_override_as_no_override() {
+        let cfg = config_with_providers("openai", &["openai"]);
+        assert_eq!(resolve_provider(&cfg, Some("")).unwrap(), "openai");
+    }
+
+    #[test]
+    fn resolve_provider_empty_providers_map_lists_none_marker() {
+        let cfg = config_with_providers("openai", &[]);
+        let err = resolve_provider(&cfg, Some("ghost")).unwrap_err();
+        assert!(
+            err.to_string().contains("(없음)"),
+            "msg should show (없음) when providers map is empty: {err}"
+        );
     }
 }
