@@ -35,6 +35,18 @@ fn cache_dir_in(home: &Path) -> PathBuf {
 
 /// 결정론적 캐시 키 (16자 hex). 같은 입력 → 같은 키.
 pub fn cache_key(cmd: &str, exit: i32, output_lines: &[String]) -> String {
+    cache_key_with_context(cmd, exit, output_lines, None)
+}
+
+/// Context-aware cache key. Project context changes can affect LLM output, so
+/// callers that append context to the prompt should include the same context in
+/// the key.
+pub fn cache_key_with_context(
+    cmd: &str,
+    exit: i32,
+    output_lines: &[String],
+    context: Option<&str>,
+) -> String {
     let mut hasher = DefaultHasher::new();
     cmd.hash(&mut hasher);
     exit.hash(&mut hasher);
@@ -50,6 +62,7 @@ pub fn cache_key(cmd: &str, exit: i32, output_lines: &[String]) -> String {
         &joined
     };
     tail.hash(&mut hasher);
+    context.unwrap_or("").hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -115,6 +128,14 @@ mod tests {
         let lines = vec!["error".to_string()];
         let k1 = cache_key("ls", 1, &lines);
         let k2 = cache_key("ls", 2, &lines);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn cache_key_changes_with_context() {
+        let lines = vec!["error".to_string()];
+        let k1 = cache_key_with_context("ls", 1, &lines, Some("branch: main"));
+        let k2 = cache_key_with_context("ls", 1, &lines, Some("branch: feature"));
         assert_ne!(k1, k2);
     }
 

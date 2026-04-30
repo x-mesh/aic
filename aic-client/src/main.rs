@@ -2911,10 +2911,16 @@ async fn handle_record(
                 return Ok(());
             }
 
-            let cache_key = cache::cache_key(
+            let project_context = aic_client::project_context::build_context_pack();
+            if let Some(context) = project_context.as_deref() {
+                debug_log!("context  project · {} chars", context.len());
+            }
+
+            let cache_key = cache::cache_key_with_context(
                 rec.command.as_deref().unwrap_or(""),
                 rec.exit_code,
                 &rec.output_lines,
+                project_context.as_deref(),
             );
             if let Some(hit) = cache::load(&cache_key) {
                 let age_min = (chrono::Utc::now() - hit.cached_at).num_minutes();
@@ -2929,7 +2935,10 @@ async fn handle_record(
             debug_log!("cache    MISS key={cache_key}");
 
             let prompt_start = Instant::now();
-            let prompt = ErrorAnalyzer::build_prompt(&rec, lang);
+            let prompt = aic_client::project_context::append_to_prompt(
+                ErrorAnalyzer::build_prompt(&rec, lang),
+                project_context.as_deref(),
+            );
             debug_step!(prompt_start, "prompt   {} chars", prompt.len());
 
             if dry_run {
