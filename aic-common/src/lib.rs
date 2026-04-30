@@ -12,7 +12,10 @@ pub use paths::{
     list_session_sockets, local_command_record_path, local_hook_pending_path,
     resolve_active_socket, resolve_socket_path, session_dir, session_socket_path,
 };
-pub use session::{generate_session_id, is_valid_session_id};
+pub use session::{
+    generate_record_id, generate_session_id, generate_unused_session_id, is_valid_record_id,
+    is_valid_session_id,
+};
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
 
@@ -75,6 +78,11 @@ pub struct OutputMetadata {
 /// `#[serde(default)]`로 채워진다. 새 코드는 가능하면 명시적으로 채운다.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandRecord {
+    /// Stable record id (16자 lowercase hex). `aic history`, `aic analyze --record`,
+    /// `aic fix --record`의 공통 키이다. 레거시 JSON 호환을 위해 `#[serde(default)]`로
+    /// 빈 문자열을 허용하며, ring buffer push 시 비어 있으면 자동 부여한다.
+    #[serde(default)]
+    pub id: String,
     /// 실행된 명령어 텍스트 (가능한 경우)
     pub command: Option<String>,
     /// 프로세스 종료 코드
@@ -97,6 +105,7 @@ pub struct CommandRecord {
 impl Default for CommandRecord {
     fn default() -> Self {
         Self {
+            id: String::new(),
             command: None,
             exit_code: 0,
             output_lines: Vec::new(),
@@ -407,6 +416,7 @@ mod tests {
     #[test]
     fn command_record_with_capture_metadata_roundtrip() {
         let record = CommandRecord {
+            id: "deadbeefcafef00d".to_string(),
             command: Some("vim README.md".to_string()),
             exit_code: 0,
             output_lines: vec![],

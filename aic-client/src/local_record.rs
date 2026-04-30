@@ -69,6 +69,7 @@ pub fn finish_hook(
     let _ = std::fs::remove_file(&path);
 
     let record = CommandRecord {
+        id: aic_common::generate_record_id(),
         command: Some(pending.command),
         exit_code,
         output_lines: Vec::new(),

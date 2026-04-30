@@ -3,7 +3,7 @@
 //! 용량 제약은 레코드 수가 아닌 **총 출력 라인 수** 기준이다.
 //! `max_lines`를 초과하면 가장 오래된 레코드부터 제거한다.
 
-use aic_common::CommandRecord;
+use aic_common::{generate_record_id, CommandRecord};
 use std::collections::VecDeque;
 
 pub struct RingBuffer {
@@ -23,7 +23,13 @@ impl RingBuffer {
     }
 
     /// 새 CommandRecord 추가. 총 라인 수가 max_lines 초과 시 오래된 레코드부터 제거.
-    pub fn push(&mut self, record: CommandRecord) {
+    ///
+    /// 입력 record의 `id`가 비어 있으면 stable한 16자 hex id를 자동 부여한다.
+    /// 이미 id가 있으면 (예: hook event store에서 온 record) 그대로 보존한다.
+    pub fn push(&mut self, mut record: CommandRecord) {
+        if record.id.is_empty() {
+            record.id = generate_record_id();
+        }
         let new_lines = record.output_lines.len();
 
         // 새 레코드 자체가 max_lines보다 크면 기존 레코드를 모두 비우고 새 레코드만 저장
@@ -51,6 +57,15 @@ impl RingBuffer {
     /// 가장 최근 CommandRecord 반환.
     pub fn last(&self) -> Option<&CommandRecord> {
         self.records.back()
+    }
+
+    /// 최근 N개 CommandRecord를 시간순(오래된 → 최신)으로 반환한다.
+    pub fn recent_records(&self, n: usize) -> Vec<CommandRecord> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let start = self.records.len().saturating_sub(n);
+        self.records.iter().skip(start).cloned().collect()
     }
 
     /// 전체 저장된 출력 라인 수 반환.
@@ -164,6 +179,58 @@ mod tests {
         let mut buf = RingBuffer::new(100);
         buf.push(make_record(vec!["a"]));
         assert!(buf.recent_lines(0).is_empty());
+    }
+
+    #[test]
+    fn recent_records_returns_time_ordered_tail() {
+        let mut buf = RingBuffer::new(100);
+        buf.push(CommandRecord {
+            command: Some("one".to_string()),
+            output_lines: vec!["1".to_string()],
+            ..Default::default()
+        });
+        buf.push(CommandRecord {
+            command: Some("two".to_string()),
+            output_lines: vec!["2".to_string()],
+            ..Default::default()
+        });
+
+        let records = buf.recent_records(1);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].command.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn push_assigns_record_id_when_missing() {
+        let mut buf = RingBuffer::new(100);
+        buf.push(make_record(vec!["a"]));
+        let stored = buf.last().expect("record present");
+        assert_eq!(stored.id.len(), 16, "id 자동 부여로 16자 hex 가 채워져야 함");
+        assert!(stored.id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn push_preserves_existing_record_id() {
+        let mut buf = RingBuffer::new(100);
+        let existing = "deadbeefcafef00d".to_string();
+        buf.push(CommandRecord {
+            id: existing.clone(),
+            output_lines: vec!["x".to_string()],
+            ..Default::default()
+        });
+        assert_eq!(buf.last().unwrap().id, existing);
+    }
+
+    #[test]
+    fn pushed_records_get_unique_ids() {
+        let mut buf = RingBuffer::new(100);
+        for _ in 0..16 {
+            buf.push(make_record(vec!["x"]));
+        }
+        let ids: std::collections::HashSet<String> =
+            buf.recent_records(16).into_iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 16, "auto-assigned record id에 중복이 있음");
     }
 
     #[test]

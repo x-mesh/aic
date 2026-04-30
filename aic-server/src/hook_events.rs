@@ -92,6 +92,7 @@ impl HookEventStore {
         }
 
         let record = CommandRecord {
+            id: aic_common::generate_record_id(),
             command,
             exit_code,
             output_lines: Vec::new(),

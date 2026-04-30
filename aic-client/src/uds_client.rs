@@ -40,6 +40,27 @@ impl UdsClient {
         }
     }
 
+    /// 세션 ring buffer의 최근 N개 CommandRecord를 시간순(오래된→최신)으로 조회한다.
+    ///
+    /// session-level 요청이므로 session socket에 연결한 UdsClient에서만 의미가 있다.
+    /// `aicd` control socket에 보내면 Error 응답이 돌아온다.
+    pub async fn get_recent_commands(
+        &self,
+        count: usize,
+    ) -> Result<Vec<CommandRecord>, AicError> {
+        match self
+            .send_request(IpcRequest::GetRecentCommands { count })
+            .await?
+        {
+            IpcResponse::CommandRecords(records) => Ok(records),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// `aicd` hook-event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     pub async fn get_last_command_for_session(&self, id: &str) -> Result<CommandRecord, AicError> {
         let response = self

@@ -239,6 +239,36 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         cmd: Vec<String>,
     },
+    /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
+    ///
+    /// 우선 source는 PTY 세션의 ring buffer. hook-only metadata record는
+    /// 별도 store(aicd hook-event)에 있어 향후 통합 예정.
+    History {
+        /// 표시할 최대 record 수 (기본 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// non-zero exit만 표시.
+        #[arg(long)]
+        failed: bool,
+        /// JSON 출력 (CI/스크립트 친화).
+        #[arg(long)]
+        json: bool,
+        /// 특정 세션 ID 명시 (기본: AIC_SESSION_ID env > 최신 세션).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// 가장 최근 command record를 한 건 표시 (P1).
+    ///
+    /// `aic` 기본 흐름이 분석을 트리거한다면, `aic last`는 분석 없이 record만
+    /// 빠르게 확인하는 비용 0 명령이다.
+    Last {
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +405,13 @@ async fn main() {
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
+        Some(Commands::History {
+            limit,
+            failed,
+            json,
+            session,
+        }) => handle_history(limit, failed, json, session).await,
+        Some(Commands::Last { json, session }) => handle_last(json, session).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -794,6 +831,7 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
     let was_truncated = truncated.load(std::sync::atomic::Ordering::Relaxed);
 
     let record = aic_common::CommandRecord {
+        id: aic_common::generate_record_id(),
         command: Some(cmd.join(" ")),
         exit_code,
         output_lines: collected.clone(),
@@ -2489,6 +2527,144 @@ fn format_relative_time(ts: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
+// ── aic history / aic last (P1 record listing) ─────────────────
+
+fn record_id_short(id: &str) -> &str {
+    if id.is_empty() {
+        "-"
+    } else {
+        &id[..id.len().min(8)]
+    }
+}
+
+fn capture_quality_short(q: aic_common::CaptureQuality) -> &'static str {
+    match q {
+        aic_common::CaptureQuality::FullOutput => "full",
+        aic_common::CaptureQuality::MetadataOnly => "meta",
+        aic_common::CaptureQuality::TruncatedOutput => "trunc",
+        aic_common::CaptureQuality::BinaryOmitted => "bin",
+        aic_common::CaptureQuality::RedactedOutput => "redact",
+        aic_common::CaptureQuality::Unknown => "?",
+    }
+}
+
+fn format_exit_code(code: i32) -> String {
+    if code == 0 {
+        format!("{COL_GREEN}{code:>3}{COL_RESET}")
+    } else {
+        format!("{COL_RED}{code:>3}{COL_RESET}")
+    }
+}
+
+fn truncate_command(cmd: &str, max: usize) -> String {
+    if cmd.chars().count() <= max {
+        cmd.to_string()
+    } else {
+        let mut s: String = cmd.chars().take(max.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    }
+}
+
+async fn handle_history(limit: usize, failed: bool, json: bool, session: Option<String>) {
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+    let records = match client.get_recent_commands(limit).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
+                sock.display()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let filtered: Vec<aic_common::CommandRecord> = if failed {
+        records.into_iter().filter(|r| r.exit_code != 0).collect()
+    } else {
+        records
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&filtered) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("JSON 직렬화 실패: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    if filtered.is_empty() {
+        println!("{COL_DIM}저장된 record 없음{COL_RESET}");
+        return;
+    }
+
+    println!(
+        "{COL_BOLD}aic history{COL_RESET} {COL_DIM}({} record){COL_RESET}",
+        filtered.len()
+    );
+    // 최신이 마지막 → 사용자 가독성을 위해 최신을 위쪽에 두지 않고 server 순서 그대로(시간순)
+    // 표시한다. 마지막 라인이 가장 최근이라 자연스러운 prompt 위치 위에 놓임.
+    for rec in &filtered {
+        let id = record_id_short(&rec.id);
+        let when = format_relative_time(rec.timestamp);
+        let exit = format_exit_code(rec.exit_code);
+        let quality = capture_quality_short(rec.capture_quality);
+        let cmd = rec.command.as_deref().unwrap_or("(no command)");
+        let cmd = truncate_command(cmd, 70);
+        println!(
+            "  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<10} {quality:<6}{COL_RESET}  {cmd}"
+        );
+    }
+}
+
+async fn handle_last(json: bool, session: Option<String>) {
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+    let records = match client.get_recent_commands(1).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
+                sock.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let Some(rec) = records.into_iter().next_back() else {
+        println!("{COL_DIM}저장된 record 없음{COL_RESET}");
+        return;
+    };
+
+    if json {
+        match serde_json::to_string_pretty(&rec) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("JSON 직렬화 실패: {e}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
+    let id_short = record_id_short(&rec.id);
+    let exit = format_exit_code(rec.exit_code);
+    let quality = capture_quality_short(rec.capture_quality);
+    let when = format_relative_time(rec.timestamp);
+    let cmd = rec.command.as_deref().unwrap_or("(no command)");
+    println!("{COL_BOLD}aic last{COL_RESET}");
+    println!("  id      : {COL_CYAN}{id_short}{COL_RESET}  ({})", rec.id);
+    println!("  command : {cmd}");
+    println!("  exit    : {exit}  {COL_DIM}({quality}){COL_RESET}");
+    println!("  when    : {when}  {COL_DIM}({}){COL_RESET}", rec.timestamp);
+    if !rec.output_lines.is_empty() {
+        println!("  output  : {} lines", rec.output_lines.len());
+    }
+}
+
 // ── 세션 소켓 결정 ──────────────────────────────────────────────
 
 /// `AIC_SESSION_ID` 환경변수 기반 소켓 경로 결정 결과.
@@ -2673,6 +2849,7 @@ async fn stdin_record_if_piped() -> anyhow::Result<Option<aic_common::CommandRec
     let truncated = start > 0;
 
     Ok(Some(aic_common::CommandRecord {
+        id: aic_common::generate_record_id(),
         command,
         exit_code,
         output_lines,
@@ -2697,10 +2874,7 @@ async fn stdin_record_if_piped() -> anyhow::Result<Option<aic_common::CommandRec
 /// `--provider` 플래그 또는 `AIC_PROVIDER` env로 지정된 provider override를 검증한다.
 /// override가 없으면 config의 `default_provider`를 그대로 반환한다.
 /// override 이름이 `[llm.providers]`에 없으면 사용 가능한 목록을 포함한 에러를 돌려준다.
-fn resolve_provider(
-    config: &AppConfig,
-    override_name: Option<&str>,
-) -> anyhow::Result<String> {
+fn resolve_provider(config: &AppConfig, override_name: Option<&str>) -> anyhow::Result<String> {
     match override_name {
         Some(name) if !name.is_empty() => {
             if config.llm.providers.contains_key(name) {

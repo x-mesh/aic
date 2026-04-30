@@ -17,6 +17,9 @@ pub enum IpcRequest {
     GetRecentLines {
         count: usize,
     },
+    GetRecentCommands {
+        count: usize,
+    },
     /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     GetLastCommandForSession {
         id: String,
@@ -79,6 +82,7 @@ pub enum IpcRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IpcResponse {
     CommandData(CommandRecord),
+    CommandRecords(Vec<CommandRecord>),
     Lines(Vec<String>),
     Pong,
     Metrics(MetricsSnapshot),
@@ -325,6 +329,7 @@ mod tests {
         prop_oneof![
             Just(IpcRequest::GetLastCommand),
             any::<usize>().prop_map(|count| IpcRequest::GetRecentLines { count }),
+            any::<usize>().prop_map(|count| IpcRequest::GetRecentCommands { count }),
             Just(IpcRequest::Ping),
             Just(IpcRequest::GetMetrics),
             Just(IpcRequest::ListSessions),
@@ -444,6 +449,8 @@ mod tests {
     fn arb_ipc_response() -> impl Strategy<Value = IpcResponse> {
         prop_oneof![
             arb_command_record().prop_map(IpcResponse::CommandData),
+            proptest::collection::vec(arb_command_record(), 0..8)
+                .prop_map(IpcResponse::CommandRecords),
             proptest::collection::vec(any::<String>(), 0..8).prop_map(IpcResponse::Lines),
             Just(IpcResponse::Pong),
             proptest::collection::vec(arb_session_info(), 0..8).prop_map(IpcResponse::Sessions),
