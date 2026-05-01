@@ -632,6 +632,11 @@ fn assign_section(sections: &mut ParsedSections, kind: SectionKind, body: String
 }
 
 fn deterministic_known_error(record: &CommandRecord, lang: &str) -> Option<AnalysisResult> {
+    // exit_code 0인 success 결과는 결정론적 분류 대상이 아니다 — 출력에 'permission
+    // denied' 같은 단어가 들어 있어도(예: grep 결과) false positive로 분류되면 안 된다.
+    if record.exit_code == 0 {
+        return None;
+    }
     let output = record.output_lines.join("\n");
     let output_lower = output.to_lowercase();
     let command = record.command.as_deref().unwrap_or("").trim();

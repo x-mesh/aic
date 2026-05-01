@@ -136,7 +136,7 @@ pub fn capture_quality_hint(record: &CommandRecord, mode: SessionCaptureMode) ->
             let suggest = match mode {
                 SessionCaptureMode::Hybrid => format!(
                     "정확한 분석을 위해 `aic run -- {cmd}`로 다시 실행하거나 \
-                     `aic capture-last`(추후 지원)로 capture 모드 재실행하세요."
+                     `aic capture-last`로 capture 모드 재실행하세요."
                 ),
                 _ => format!(
                     "출력 없이 metadata만 있어 분석 신뢰도가 낮습니다. \

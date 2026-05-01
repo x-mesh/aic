@@ -478,13 +478,9 @@ async fn main() {
         None => {
             // --record <prefix>가 있으면 history에서 매칭되는 record를 분석 흐름에 투입.
             if let Some(prefix) = cli.record_prefix.as_deref() {
-                if let Err(e) = handle_record_by_prefix(
-                    prefix,
-                    cli.session.clone(),
-                    cli.dry_run,
-                    cli.provider,
-                )
-                .await
+                if let Err(e) =
+                    handle_record_by_prefix(prefix, cli.session.clone(), cli.dry_run, cli.provider)
+                        .await
                 {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -2709,7 +2705,12 @@ async fn handle_capture_last(
         }
     };
 
-    let Some(cmd) = record.command.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(cmd) = record
+        .command
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         eprintln!(
             "{COL_YELLOW}⚠{COL_RESET} 마지막 record에 command 정보가 없어 재실행할 수 없습니다."
         );
@@ -2738,9 +2739,7 @@ async fn handle_capture_last(
 
     match assessment.level {
         RiskLevel::Dangerous => {
-            eprintln!(
-                "{COL_RED}✗{COL_RESET} dangerous로 분류되어 재실행을 거부했습니다."
-            );
+            eprintln!("{COL_RED}✗{COL_RESET} dangerous로 분류되어 재실행을 거부했습니다.");
             std::process::exit(2);
         }
         RiskLevel::Unknown => {
@@ -2778,7 +2777,7 @@ async fn handle_fix(
     yes: bool,
     dry_run: bool,
     session: Option<String>,
-    _provider_override: Option<String>,
+    provider_override: Option<String>,
 ) {
     use aic_client::risk_guard::{classify, RiskLevel};
 
@@ -2788,9 +2787,7 @@ async fn handle_fix(
     // 1. record 결정 — prefix가 있으면 매칭, 없으면 last.
     let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
         if !aic_common::is_valid_record_id(prefix) {
-            eprintln!(
-                "{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'"
-            );
+            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
             std::process::exit(2);
         }
         match client.get_recent_commands(200).await {
@@ -2801,9 +2798,7 @@ async fn handle_fix(
                     .collect();
                 match matched.len() {
                     0 => {
-                        eprintln!(
-                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'와 일치하는 record 없음"
-                        );
+                        eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}'와 일치하는 record 없음");
                         std::process::exit(2);
                     }
                     1 => matched.into_iter().next().unwrap(),
@@ -2963,7 +2958,7 @@ async fn handle_fix(
         "{COL_DIM}running via {} -c …{COL_RESET}",
         argv.first().map(String::as_str).unwrap_or("sh")
     );
-    handle_run(argv, _provider_override).await;
+    handle_run(argv, provider_override).await;
 }
 
 fn risk_label(level: aic_client::risk_guard::RiskLevel) -> String {
@@ -3027,7 +3022,10 @@ async fn handle_last(json: bool, session: Option<String>) {
     println!("  id      : {COL_CYAN}{id_short}{COL_RESET}  ({})", rec.id);
     println!("  command : {cmd}");
     println!("  exit    : {exit}  {COL_DIM}({quality}){COL_RESET}");
-    println!("  when    : {when}  {COL_DIM}({}){COL_RESET}", rec.timestamp);
+    println!(
+        "  when    : {when}  {COL_DIM}({}){COL_RESET}",
+        rec.timestamp
+    );
     if !rec.output_lines.is_empty() {
         println!("  output  : {} lines", rec.output_lines.len());
     }
@@ -3279,21 +3277,17 @@ async fn handle_record_by_prefix(
 
     let prefix = prefix.trim();
     if !aic_common::is_valid_record_id(prefix) {
-        anyhow::bail!(
-            "record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)"
-        );
+        anyhow::bail!("record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)");
     }
 
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
 
     // 200개를 가져와서 prefix로 매칭. 충분히 길지 않은 prefix면 다중 매칭이 발생할 수 있다.
-    let records = client.get_recent_commands(200).await.map_err(|e| {
-        anyhow::anyhow!(
-            "세션 record 조회 실패 ({}): {e}",
-            sock.display()
-        )
-    })?;
+    let records = client
+        .get_recent_commands(200)
+        .await
+        .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({}): {e}", sock.display()))?;
 
     let matches: Vec<aic_common::CommandRecord> = records
         .into_iter()
@@ -3301,7 +3295,9 @@ async fn handle_record_by_prefix(
         .collect();
 
     let record = match matches.len() {
-        0 => anyhow::bail!("prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"),
+        0 => anyhow::bail!(
+            "prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"
+        ),
         1 => matches.into_iter().next().expect("len==1"),
         n => {
             let ids: Vec<String> = matches

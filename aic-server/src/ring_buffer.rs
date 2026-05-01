@@ -206,7 +206,11 @@ mod tests {
         let mut buf = RingBuffer::new(100);
         buf.push(make_record(vec!["a"]));
         let stored = buf.last().expect("record present");
-        assert_eq!(stored.id.len(), 16, "id 자동 부여로 16자 hex 가 채워져야 함");
+        assert_eq!(
+            stored.id.len(),
+            16,
+            "id 자동 부여로 16자 hex 가 채워져야 함"
+        );
         assert!(stored.id.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 

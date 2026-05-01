@@ -44,10 +44,7 @@ impl UdsClient {
     ///
     /// session-level 요청이므로 session socket에 연결한 UdsClient에서만 의미가 있다.
     /// `aicd` control socket에 보내면 Error 응답이 돌아온다.
-    pub async fn get_recent_commands(
-        &self,
-        count: usize,
-    ) -> Result<Vec<CommandRecord>, AicError> {
+    pub async fn get_recent_commands(&self, count: usize) -> Result<Vec<CommandRecord>, AicError> {
         match self
             .send_request(IpcRequest::GetRecentCommands { count })
             .await?
