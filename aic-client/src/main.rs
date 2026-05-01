@@ -224,6 +224,9 @@ enum Commands {
         /// JSON 출력 (CI/스크립트 친화)
         #[arg(long)]
         json: bool,
+        /// 라인 모드 TUI로 세션을 골라 action을 실행 (status/last/analyze/stop) — P2.
+        #[arg(long, conflicts_with = "json")]
+        interactive: bool,
     },
     /// 첫 사용 통합 가이드 — config + init + migrate-keys + doctor 순으로 안내
     Setup {
@@ -588,8 +591,10 @@ async fn main() {
             note,
             session,
         }) => handle_feedback(verdict, record, note, session).await,
-        Some(Commands::Sessions { json }) => {
-            if json {
+        Some(Commands::Sessions { json, interactive }) => {
+            if interactive {
+                handle_sessions_interactive().await;
+            } else if json {
                 print_sessions_json().await;
             } else {
                 handle_sessions().await;
@@ -2784,6 +2789,164 @@ fn list_sessions() -> Vec<SessionInfo> {
 /// 1. `aicd`가 떠 있으면 control registry를 source-of-truth로 사용한다.
 /// 2. `aicd`가 없으면 기존 file-system scan(`list_sessions()`)으로 fallback —
 ///    aicd 없이도 멀티세션은 동작해야 하므로.
+async fn handle_sessions_interactive() {
+    use std::io::{self, BufRead, Write};
+
+    let aicd_client = UdsClient::new(aic_common::aicd_socket_path());
+    let aicd_alive = matches!(aicd_client.ping().await, Ok(true));
+    if !aicd_alive {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 — interactive 모드는 aicd가 필요합니다 (`aic daemon start`)."
+        );
+        std::process::exit(1);
+    }
+
+    let list = match aicd_client.list_sessions().await {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => {
+            println!("{COL_DIM}aicd registry: 등록된 세션 없음{COL_RESET}");
+            return;
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 세션 목록 조회 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let current_id = std::env::var("AIC_SESSION_ID").ok();
+
+    println!("{COL_BOLD}aic sessions{COL_RESET} {COL_DIM}(interactive){COL_RESET}");
+    for (idx, s) in list.iter().enumerate() {
+        let marker = match &current_id {
+            Some(cid) if cid == &s.id => format!(" {COL_GREEN}*current{COL_RESET}"),
+            _ => String::new(),
+        };
+        let label = s
+            .label
+            .as_deref()
+            .map(|l| format!(" [{COL_BOLD}{l}{COL_RESET}]"))
+            .unwrap_or_default();
+        let state = format_session_state(&s.state);
+        println!(
+            "  {n}) {COL_CYAN}{id}{COL_RESET}{marker}{label}  {state}",
+            n = idx + 1,
+            id = s.id,
+        );
+    }
+
+    let stdin = io::stdin();
+    let mut input = String::new();
+    print!("\nSelect [1-{}] (q to quit): ", list.len());
+    let _ = io::stdout().flush();
+    input.clear();
+    if stdin.lock().read_line(&mut input).is_err() {
+        return;
+    }
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("q") {
+        return;
+    }
+    let Ok(idx) = trimmed.parse::<usize>() else {
+        eprintln!("{COL_RED}✗{COL_RESET} 잘못된 선택");
+        std::process::exit(2);
+    };
+    let Some(selected) = list.get(idx.saturating_sub(1)) else {
+        eprintln!("{COL_RED}✗{COL_RESET} 범위를 벗어남");
+        std::process::exit(2);
+    };
+    let id = selected.id.clone();
+    let is_inactive = matches!(
+        selected.state,
+        aic_common::SessionState::Detached
+            | aic_common::SessionState::Stopping
+            | aic_common::SessionState::Stopped
+            | aic_common::SessionState::Failed
+    );
+
+    println!(
+        "\nActions for {COL_CYAN}{id}{COL_RESET}: (s)tatus  (l)ast  (a)nalyze  (k)ill  (q)uit"
+    );
+    print!("> ");
+    let _ = io::stdout().flush();
+    input.clear();
+    if stdin.lock().read_line(&mut input).is_err() {
+        return;
+    }
+    let action = input.trim().to_ascii_lowercase();
+
+    match action.as_str() {
+        "s" | "status" => handle_status(false, 1, Some(id), false, false).await,
+        "l" | "last" => handle_last(false, Some(id)).await,
+        "a" | "analyze" => {
+            // 직전 record 분석 흐름. ad-hoc — 가장 최근 record 1건을 받아 handle_record 호출.
+            let sock = resolve_socket(Some(&id));
+            let session_client = UdsClient::new(sock.clone());
+            match session_client.get_last_command().await {
+                Ok(record) => {
+                    let config = match ConfigManager::load() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("config 로드 실패: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let provider_name = match resolve_provider(&config, None) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    let model_name = config
+                        .llm
+                        .providers
+                        .get(&provider_name)
+                        .and_then(|p| p.model.clone())
+                        .unwrap_or_else(|| "(CLI)".to_string());
+                    let lang = aic_common::resolve_lang(&config.llm.lang);
+                    let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+                    if let Err(e) = handle_record(
+                        record,
+                        dispatcher,
+                        &config,
+                        &provider_name,
+                        &model_name,
+                        &lang,
+                        false,
+                    )
+                    .await
+                    {
+                        eprintln!("{e}");
+                    }
+                }
+                Err(e) => eprintln!("record 조회 실패: {e}"),
+            }
+        }
+        "k" | "kill" | "stop" => {
+            if is_inactive {
+                print!(
+                    "{COL_YELLOW}⚠{COL_RESET} 이미 inactive 상태입니다. 그래도 SIGTERM을 보낼까요? [y/N] "
+                );
+                let _ = io::stdout().flush();
+                input.clear();
+                if stdin.lock().read_line(&mut input).is_err() {
+                    return;
+                }
+                if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("{COL_DIM}취소됨{COL_RESET}");
+                    return;
+                }
+            }
+            handle_session_stop(id).await;
+        }
+        "q" | "quit" | "" => {}
+        other => {
+            eprintln!("{COL_RED}✗{COL_RESET} 알 수 없는 action: '{other}'");
+            std::process::exit(2);
+        }
+    }
+}
+
 async fn handle_sessions() {
     let current_id = std::env::var("AIC_SESSION_ID").ok();
 
