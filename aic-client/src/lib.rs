@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon_install;
 pub mod doctor;
 pub mod error_analyzer;
+pub mod feedback;
 pub mod hook_install;
 pub mod keychain;
 pub mod llm_dispatcher;

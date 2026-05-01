@@ -345,6 +345,25 @@ enum Commands {
         #[command(subcommand)]
         op: RecipesOp,
     },
+    /// 분석 결과의 품질 피드백 (P3 'Solution Feedback').
+    ///
+    /// `worked`/`not-worked`/`irrelevant`로 평가한다. `worked`는 자동으로 recipe로
+    /// 승격되어 다음 동일 fingerprint 발생 시 LLM 호출 없이 적용된다.
+    /// `not-worked`는 기존 recipe가 있으면 삭제한다.
+    Feedback {
+        /// 평가 — worked/not-worked/irrelevant.
+        #[arg(value_parser = ["worked", "not-worked", "irrelevant"])]
+        verdict: String,
+        /// 분석 대상 record id prefix (기본: 마지막 record).
+        #[arg(long, value_name = "PREFIX")]
+        record: Option<String>,
+        /// 사용자 메모.
+        #[arg(long)]
+        note: Option<String>,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -524,6 +543,12 @@ async fn main() {
             session,
         }) => handle_learn(record, note, session).await,
         Some(Commands::Recipes { op }) => handle_recipes(op),
+        Some(Commands::Feedback {
+            verdict,
+            record,
+            note,
+            session,
+        }) => handle_feedback(verdict, record, note, session).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -3246,6 +3271,138 @@ async fn handle_learn(
             eprintln!("{COL_RED}✗{COL_RESET} recipe 저장 실패: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+async fn handle_feedback(
+    verdict: String,
+    record_prefix: Option<String>,
+    note: Option<String>,
+    session: Option<String>,
+) {
+    use aic_client::feedback::{self, FeedbackEntry, Verdict};
+    use aic_client::recipes;
+
+    let verdict = match verdict.as_str() {
+        "worked" => Verdict::Worked,
+        "not-worked" => Verdict::NotWorked,
+        "irrelevant" => Verdict::Irrelevant,
+        other => {
+            eprintln!("{COL_RED}✗{COL_RESET} 알 수 없는 verdict: '{other}'");
+            std::process::exit(2);
+        }
+    };
+
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+
+    // record 결정 — handle_learn과 동일한 로직.
+    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
+        if !aic_common::is_valid_record_id(prefix) {
+            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
+            std::process::exit(2);
+        }
+        match client.find_record_by_prefix(prefix).await {
+            Ok(matched) => match matched.len() {
+                0 => {
+                    eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 record 없음");
+                    std::process::exit(2);
+                }
+                1 => matched.into_iter().next().unwrap(),
+                n => {
+                    eprintln!(
+                        "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} record 조회 실패: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match client.get_last_command().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // fingerprint 계산 (project context 포함).
+    let project_context = aic_client::project_context::build_context_pack();
+    let fingerprint = cache::cache_key_with_context(
+        record.command.as_deref().unwrap_or(""),
+        record.exit_code,
+        &record.output_lines,
+        project_context.as_deref(),
+    );
+
+    // verdict별 처리:
+    // - Worked → recipes::upsert로 자동 학습.
+    // - NotWorked → 기존 recipe 삭제.
+    // - Irrelevant → 로그만 남기고 다른 액션 없음.
+    let mut action_msg = String::new();
+    match verdict {
+        Verdict::Worked => {
+            let config = ConfigManager::load().ok();
+            let lang = config
+                .as_ref()
+                .map(|c| aic_common::resolve_lang(&c.llm.lang))
+                .unwrap_or_else(|| "korean".to_string());
+            let analysis = ErrorAnalyzer::deterministic_result(&record, &lang)
+                .or_else(|| cache::load(&fingerprint).map(|hit| hit.result));
+            if let Some(analysis) = analysis {
+                let recipe = recipes::Recipe {
+                    fingerprint: fingerprint.clone(),
+                    command: record.command.clone(),
+                    explanation: analysis.explanation.clone(),
+                    suggested_command: analysis.suggested_command.clone(),
+                    note: note.clone(),
+                    created_at: chrono::Utc::now(),
+                    hits: 1,
+                };
+                match recipes::upsert(recipe) {
+                    Ok(()) => action_msg = "recipe로 자동 학습됨".to_string(),
+                    Err(e) => action_msg = format!("recipe 저장 실패: {e}"),
+                }
+            } else {
+                action_msg =
+                    "분석 결과 없음 — 먼저 `aic`로 분석을 만들어두면 자동 학습됩니다."
+                        .to_string();
+            }
+        }
+        Verdict::NotWorked => match recipes::delete_by_prefix(&fingerprint) {
+            Ok(0) => action_msg = "관련 recipe 없음 (삭제할 것 없음)".to_string(),
+            Ok(n) => action_msg = format!("관련 recipe {n}건 삭제"),
+            Err(e) => action_msg = format!("recipe 삭제 실패: {e}"),
+        },
+        Verdict::Irrelevant => {
+            action_msg = "deterministic rule/prompt 개선 후보로 기록만 남깁니다.".to_string();
+        }
+    }
+
+    // feedback log append.
+    let entry = FeedbackEntry {
+        fingerprint: fingerprint.clone(),
+        verdict,
+        note,
+        at: chrono::Utc::now(),
+    };
+    if let Err(e) = feedback::append(entry) {
+        eprintln!("{COL_YELLOW}⚠{COL_RESET} feedback 저장 실패: {e}");
+        std::process::exit(1);
+    }
+
+    println!(
+        "{COL_GREEN}✓{COL_RESET} feedback 기록: {COL_CYAN}{}{COL_RESET} ({})",
+        verdict.label(),
+        &fingerprint[..fingerprint.len().min(8)]
+    );
+    if !action_msg.is_empty() {
+        println!("  {COL_DIM}↳{COL_RESET} {action_msg}");
     }
 }
 
