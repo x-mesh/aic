@@ -10,6 +10,7 @@ pub mod keychain;
 pub mod llm_dispatcher;
 pub mod local_record;
 pub mod project_context;
+pub mod recipes;
 pub mod redaction;
 pub mod repl;
 pub mod risk_guard;

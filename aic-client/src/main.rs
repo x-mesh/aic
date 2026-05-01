@@ -325,6 +325,46 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// 직전 분석 결과를 local recipe로 저장 (P2 'aic learn').
+    ///
+    /// 같은 fingerprint 에러가 다시 일어나면 LLM 호출 전 학습된 recipe를 먼저
+    /// 보여준다. recipe 데이터는 `~/.local/share/aic/recipes.json`에 저장된다.
+    Learn {
+        /// 분석 대상 record id prefix (기본: 마지막 record).
+        #[arg(long, value_name = "PREFIX")]
+        record: Option<String>,
+        /// 사용자 메모 — recipe와 함께 저장된다.
+        #[arg(long)]
+        note: Option<String>,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// 학습된 recipe 관리 (P2).
+    Recipes {
+        #[command(subcommand)]
+        op: RecipesOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecipesOp {
+    /// 저장된 recipe 목록을 표시.
+    List {
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// fingerprint prefix로 recipe를 표시.
+    Show {
+        /// fingerprint 또는 prefix.
+        prefix: String,
+    },
+    /// fingerprint prefix로 recipe를 삭제.
+    Delete {
+        /// fingerprint 또는 prefix.
+        prefix: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -478,6 +518,12 @@ async fn main() {
             session,
         }) => handle_fix(record, yes, dry_run, session, cli.provider).await,
         Some(Commands::Watch { interval, session }) => handle_watch(interval, session).await,
+        Some(Commands::Learn {
+            record,
+            note,
+            session,
+        }) => handle_learn(record, note, session).await,
+        Some(Commands::Recipes { op }) => handle_recipes(op),
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -3089,6 +3135,204 @@ fn print_watch_hint(record: &aic_common::CommandRecord, lang: &str) {
     }
 }
 
+async fn handle_learn(
+    record_prefix: Option<String>,
+    note: Option<String>,
+    session: Option<String>,
+) {
+    use aic_client::recipes::{self, Recipe};
+
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+
+    // 1. record 결정.
+    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
+        if !aic_common::is_valid_record_id(prefix) {
+            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
+            std::process::exit(2);
+        }
+        match client.get_recent_commands(200).await {
+            Ok(records) => {
+                let matched: Vec<_> = records
+                    .into_iter()
+                    .filter(|r| r.id.starts_with(prefix))
+                    .collect();
+                match matched.len() {
+                    0 => {
+                        eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 record 없음");
+                        std::process::exit(2);
+                    }
+                    1 => matched.into_iter().next().unwrap(),
+                    n => {
+                        eprintln!(
+                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} record 조회 실패: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match client.get_last_command().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // 2. 분석 결과 결정 — deterministic 우선, 그 다음 cache.
+    let config = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} config 로드 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+    let lang = aic_common::resolve_lang(&config.llm.lang);
+
+    let project_context = aic_client::project_context::build_context_pack();
+    let fingerprint = cache::cache_key_with_context(
+        record.command.as_deref().unwrap_or(""),
+        record.exit_code,
+        &record.output_lines,
+        project_context.as_deref(),
+    );
+
+    let analysis = if let Some(det) = ErrorAnalyzer::deterministic_result(&record, &lang) {
+        Some(det)
+    } else {
+        cache::load(&fingerprint).map(|hit| hit.result)
+    };
+
+    let Some(analysis) = analysis else {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} 분석 결과를 찾지 못했습니다 — \
+             먼저 `aic`로 분석을 한 번 돌려 cache를 만든 뒤 다시 시도하세요."
+        );
+        std::process::exit(1);
+    };
+
+    // 3. recipe 저장.
+    let recipe = Recipe {
+        fingerprint: fingerprint.clone(),
+        command: record.command.clone(),
+        explanation: analysis.explanation.clone(),
+        suggested_command: analysis.suggested_command.clone(),
+        note: note.clone(),
+        created_at: chrono::Utc::now(),
+        hits: 1,
+    };
+    match recipes::upsert(recipe) {
+        Ok(()) => {
+            let id_short = if record.id.is_empty() {
+                "-"
+            } else {
+                &record.id[..record.id.len().min(8)]
+            };
+            println!(
+                "{COL_GREEN}✓{COL_RESET} recipe 저장 ({COL_CYAN}{}{COL_RESET})",
+                &fingerprint[..fingerprint.len().min(8)]
+            );
+            println!("  record   : {id_short}");
+            if let Some(cmd) = record.command.as_deref() {
+                println!("  command  : {cmd}");
+            }
+            if let Some(suggested) = analysis.suggested_command.as_deref() {
+                println!("  suggested: {suggested}");
+            }
+            if let Some(n) = note.as_deref() {
+                println!("  note     : {n}");
+            }
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} recipe 저장 실패: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_recipes(op: RecipesOp) {
+    use aic_client::recipes;
+    let store = recipes::load();
+    match op {
+        RecipesOp::List { json } => {
+            if json {
+                match serde_json::to_string_pretty(&store.recipes) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("JSON 직렬화 실패: {e}");
+                        std::process::exit(2);
+                    }
+                }
+                return;
+            }
+            if store.recipes.is_empty() {
+                println!("{COL_DIM}저장된 recipe 없음{COL_RESET}");
+                return;
+            }
+            println!(
+                "{COL_BOLD}aic recipes{COL_RESET} {COL_DIM}({} 건){COL_RESET}",
+                store.recipes.len()
+            );
+            for r in &store.recipes {
+                let fp_short = &r.fingerprint[..r.fingerprint.len().min(8)];
+                let cmd = r.command.as_deref().unwrap_or("(no command)");
+                println!(
+                    "  {COL_CYAN}{fp_short}{COL_RESET}  hits={hits:<3}  {when}  {cmd}",
+                    hits = r.hits,
+                    when = format_relative_time(r.created_at),
+                );
+                if let Some(suggested) = r.suggested_command.as_deref() {
+                    println!("    {COL_DIM}↳ 제안:{COL_RESET} {suggested}");
+                }
+                if let Some(note) = r.note.as_deref() {
+                    println!("    {COL_DIM}↳ note:{COL_RESET} {note}");
+                }
+            }
+        }
+        RecipesOp::Show { prefix } => {
+            let matched: Vec<_> = store
+                .recipes
+                .iter()
+                .filter(|r| r.fingerprint.starts_with(&prefix))
+                .collect();
+            match matched.len() {
+                0 => {
+                    eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 recipe 없음");
+                    std::process::exit(2);
+                }
+                _ => {
+                    for r in matched {
+                        match serde_json::to_string_pretty(r) {
+                            Ok(s) => println!("{s}"),
+                            Err(e) => eprintln!("직렬화 실패: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+        RecipesOp::Delete { prefix } => match recipes::delete_by_prefix(&prefix) {
+            Ok(0) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} prefix '{prefix}' 매칭 recipe 없음");
+                std::process::exit(1);
+            }
+            Ok(n) => {
+                println!("{COL_GREEN}✓{COL_RESET} {n}개 recipe 삭제");
+            }
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} 삭제 실패: {e}");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
 fn risk_label(level: aic_client::risk_guard::RiskLevel) -> String {
     use aic_client::risk_guard::RiskLevel;
     match level {
@@ -3675,6 +3919,30 @@ async fn handle_record(
                 &rec.output_lines,
                 project_context.as_deref(),
             );
+            // 학습된 recipe가 있으면 LLM 호출 없이 먼저 보여준다 (P2 'aic learn').
+            if let Some(recipe) = aic_client::recipes::find(&cache_key) {
+                debug_log!(
+                    "recipe   HIT fp={} hits={}",
+                    &cache_key[..cache_key.len().min(8)],
+                    recipe.hits
+                );
+                println!(
+                    "{COL_DIM}(학습된 recipe — {} 적용 횟수 {}){COL_RESET}",
+                    format_relative_time(recipe.created_at),
+                    recipe.hits
+                );
+                let result = aic_common::AnalysisResult {
+                    explanation: recipe.explanation.clone(),
+                    suggested_command: recipe.suggested_command.clone(),
+                    additional_info: recipe.note.clone(),
+                };
+                print_analysis_result(&result, lang);
+                let _ = aic_client::recipes::touch(&cache_key);
+                if let Some(cmd) = &result.suggested_command {
+                    maybe_run_suggested(cmd, lang);
+                }
+                return Ok(());
+            }
             if let Some(hit) = cache::load(&cache_key) {
                 let age_min = (chrono::Utc::now() - hit.cached_at).num_minutes();
                 debug_log!("cache    HIT key={cache_key} age={age_min}min");
