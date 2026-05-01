@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 
 // ── IPC Request / Response ─────────────────────────────────────
 
+/// IPC 프레임 payload의 최대 허용 크기. 4-byte length prefix 디코딩 직후 buffer를
+/// 할당하기 전에 이 값을 초과하면 거절해 OOM/DoS를 방지한다. 16 MiB는 가장 큰 record
+/// (FullOutput byte cap 256 KiB + JSON overhead)도 충분히 수용할 수 있다.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
 /// 클라이언트 → 데몬 요청 메시지 (externally tagged JSON).
 ///
 /// `Ping`/`GetMetrics`는 양 데몬(`aic-session`, `aicd`) 모두에서 의미를 가진다.

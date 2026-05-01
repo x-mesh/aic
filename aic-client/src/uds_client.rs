@@ -254,6 +254,15 @@ impl UdsClient {
                 ))
             })??;
         let payload_len = u32::from_be_bytes(len_buf) as usize;
+        if payload_len > aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES {
+            return Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "응답 payload 크기({payload_len})가 허용 한계({})를 초과",
+                    aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES
+                ),
+            )));
+        }
 
         // 응답 payload 수신
         let mut payload_buf = vec![0u8; payload_len];

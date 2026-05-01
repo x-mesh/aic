@@ -123,11 +123,15 @@ impl SessionRegistry {
     }
 
     /// 세션 label을 설정 또는 제거한다 (None으로 untag).
-    /// 존재하지 않는 id면 false를 반환.
+    /// label은 64자 cap을 적용해 sessions 출력 레이아웃과 registry 크기가 통제 가능
+    /// 한 범위에 머무르도록 한다. 존재하지 않는 id면 false를 반환.
     pub async fn set_label(&self, id: &str, label: Option<String>) -> bool {
+        const MAX_LABEL_CHARS: usize = 64;
         let mut guard = self.inner.write().await;
         if let Some(info) = guard.get_mut(id) {
-            info.label = label.filter(|s| !s.is_empty());
+            info.label = label
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_LABEL_CHARS).collect());
             true
         } else {
             false

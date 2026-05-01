@@ -85,6 +85,12 @@ async fn handle_client(
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let payload_len = u32::from_be_bytes(len_buf) as usize;
+    if payload_len > aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES {
+        anyhow::bail!(
+            "IPC payload 크기({payload_len})가 허용 한계({})를 초과 — 연결 거절",
+            aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES
+        );
+    }
 
     // payload 읽기
     let mut payload_buf = vec![0u8; payload_len];

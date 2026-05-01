@@ -107,9 +107,14 @@ pub fn upsert(mut recipe: Recipe) -> io::Result<()> {
             existing.suggested_command = recipe.suggested_command.clone();
         }
     } else {
-        // explanation 크기 cap.
+        // explanation 크기 cap. UTF-8 char boundary를 존중해 multi-byte 문자
+        // 중간에 잘려서 panic하지 않도록 한다 (한글/이모지 LLM 응답 대비).
         if recipe.explanation.len() > EXPLANATION_CAP {
-            recipe.explanation.truncate(EXPLANATION_CAP);
+            let mut end = EXPLANATION_CAP;
+            while end > 0 && !recipe.explanation.is_char_boundary(end) {
+                end -= 1;
+            }
+            recipe.explanation.truncate(end);
         }
         recipe.hits = 1;
         store.recipes.push(recipe);
