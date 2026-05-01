@@ -141,6 +141,13 @@ struct Cli {
     #[arg(long)]
     session: Option<String>,
 
+    /// 직접 질문 흐름에 project context pack을 함께 첨부 (P3 'aic ask --context').
+    ///
+    /// 에러 record 없이도 "이 프로젝트에서 …" 같은 질문에 repo branch/runtime/
+    /// dirty 요약 등이 같이 LLM에 전달된다.
+    #[arg(long)]
+    context: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -580,7 +587,9 @@ async fn main() {
                 Some(cli.prompt.join(" "))
             };
 
-            if let Err(e) = handle_default(prompt, cli.dry_run, cli.provider).await {
+            if let Err(e) =
+                handle_default(prompt, cli.dry_run, cli.provider, cli.context).await
+            {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -3344,7 +3353,7 @@ async fn handle_feedback(
     // - Worked → recipes::upsert로 자동 학습.
     // - NotWorked → 기존 recipe 삭제.
     // - Irrelevant → 로그만 남기고 다른 액션 없음.
-    let mut action_msg = String::new();
+    let action_msg: String;
     match verdict {
         Verdict::Worked => {
             let config = ConfigManager::load().ok();
@@ -3870,6 +3879,7 @@ async fn handle_default(
     direct_prompt: Option<String>,
     dry_run: bool,
     provider_override: Option<String>,
+    with_context: bool,
 ) -> anyhow::Result<()> {
     let total_start = Instant::now();
 
@@ -3892,6 +3902,16 @@ async fn handle_default(
 
     // 직접 프롬프트가 주어진 경우
     if let Some(prompt) = direct_prompt {
+        // --context: project context pack을 prompt 끝에 붙인다 (P3 'aic ask --context').
+        let prompt = if with_context {
+            let ctx = aic_client::project_context::build_context_pack();
+            if let Some(c) = ctx.as_deref() {
+                debug_log!("context  project · {} chars", c.len());
+            }
+            aic_client::project_context::append_to_prompt(prompt, ctx.as_deref())
+        } else {
+            prompt
+        };
         debug_log!("mode     prompt · {} chars", prompt.len());
         if dry_run {
             print_dry_run(
