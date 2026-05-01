@@ -671,6 +671,53 @@ fn handle_config_show(json: bool, show_secrets: bool) {
     }
 }
 
+/// `--record <prefix>` 또는 last record를 조회해 단일 CommandRecord를 반환한다.
+/// `aic fix`/`aic capture-last`/`aic learn`/`aic feedback`/--record 분기에서
+/// 공유하는 record 결정 로직.
+async fn resolve_record(
+    client: &UdsClient,
+    sock_display: std::path::Display<'_>,
+    record_prefix: Option<&str>,
+) -> anyhow::Result<aic_common::CommandRecord> {
+    if let Some(prefix) = record_prefix.map(str::trim).filter(|s| !s.is_empty()) {
+        if !aic_common::is_valid_record_id(prefix) {
+            anyhow::bail!("record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)");
+        }
+        let matched = client
+            .find_record_by_prefix(prefix)
+            .await
+            .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({sock_display}): {e}"))?;
+        match matched.len() {
+            0 => anyhow::bail!(
+                "prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"
+            ),
+            1 => Ok(matched.into_iter().next().expect("len==1")),
+            n => {
+                let preview: Vec<String> = matched
+                    .iter()
+                    .take(5)
+                    .map(|r| {
+                        format!(
+                            "  {} {}",
+                            &r.id[..r.id.len().min(8)],
+                            r.command.as_deref().unwrap_or("∅")
+                        )
+                    })
+                    .collect();
+                anyhow::bail!(
+                    "prefix '{prefix}'가 {n}건 매칭됩니다 — 더 긴 prefix로 좁혀주세요:\n{}",
+                    preview.join("\n")
+                );
+            }
+        }
+    } else {
+        client
+            .get_last_command()
+            .await
+            .map_err(|e| anyhow::anyhow!("마지막 record 조회 실패 ({sock_display}): {e}"))
+    }
+}
+
 /// 활성 세션 소켓 경로 결정. 우선순위:
 /// 1) explicit `--session <id>`
 /// 2) `$AIC_SESSION_ID`
@@ -2783,7 +2830,7 @@ async fn handle_capture_last(
     yes: bool,
     session: Option<String>,
     provider_override: Option<String>,
-) -> () {
+) {
     use aic_client::risk_guard::{classify, RiskLevel};
 
     let sock = resolve_socket(session.as_deref());
@@ -2878,46 +2925,11 @@ async fn handle_fix(
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
 
-    // 1. record 결정 — prefix가 있으면 매칭, 없으면 last.
-    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
-        if !aic_common::is_valid_record_id(prefix) {
-            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
+    let record = match resolve_record(&client, sock.display(), record_prefix.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
             std::process::exit(2);
-        }
-        match client.find_record_by_prefix(prefix).await {
-            Ok(matched) => {
-                match matched.len() {
-                    0 => {
-                        eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}'와 일치하는 record 없음");
-                        std::process::exit(2);
-                    }
-                    1 => matched.into_iter().next().unwrap(),
-                    n => {
-                        eprintln!(
-                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
-                        );
-                        std::process::exit(2);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
-                    sock.display()
-                );
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match client.get_last_command().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!(
-                    "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
-                    sock.display()
-                );
-                std::process::exit(1);
-            }
         }
     };
 
@@ -3175,40 +3187,11 @@ async fn handle_learn(
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
 
-    // 1. record 결정.
-    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
-        if !aic_common::is_valid_record_id(prefix) {
-            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
+    let record = match resolve_record(&client, sock.display(), record_prefix.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
             std::process::exit(2);
-        }
-        match client.find_record_by_prefix(prefix).await {
-            Ok(matched) => {
-                match matched.len() {
-                    0 => {
-                        eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 record 없음");
-                        std::process::exit(2);
-                    }
-                    1 => matched.into_iter().next().unwrap(),
-                    n => {
-                        eprintln!(
-                            "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
-                        );
-                        std::process::exit(2);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("{COL_YELLOW}⚠{COL_RESET} record 조회 실패: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match client.get_last_command().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패: {e}");
-                std::process::exit(1);
-            }
         }
     };
 
@@ -3305,38 +3288,11 @@ async fn handle_feedback(
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
 
-    // record 결정 — handle_learn과 동일한 로직.
-    let record = if let Some(prefix) = record_prefix.as_deref().map(str::trim) {
-        if !aic_common::is_valid_record_id(prefix) {
-            eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
+    let record = match resolve_record(&client, sock.display(), record_prefix.as_deref()).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
             std::process::exit(2);
-        }
-        match client.find_record_by_prefix(prefix).await {
-            Ok(matched) => match matched.len() {
-                0 => {
-                    eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 record 없음");
-                    std::process::exit(2);
-                }
-                1 => matched.into_iter().next().unwrap(),
-                n => {
-                    eprintln!(
-                        "{COL_RED}✗{COL_RESET} prefix '{prefix}'가 {n}건 매칭 — 더 좁혀주세요"
-                    );
-                    std::process::exit(2);
-                }
-            },
-            Err(e) => {
-                eprintln!("{COL_YELLOW}⚠{COL_RESET} record 조회 실패: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match client.get_last_command().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패: {e}");
-                std::process::exit(1);
-            }
         }
     };
 
@@ -3805,43 +3761,9 @@ async fn handle_record_by_prefix(
 ) -> anyhow::Result<()> {
     let total_start = Instant::now();
 
-    let prefix = prefix.trim();
-    if !aic_common::is_valid_record_id(prefix) {
-        anyhow::bail!("record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)");
-    }
-
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
-
-    // server-side prefix 검색 — client에서 200개를 폴링해 필터하던 비효율을 제거.
-    let matches = client
-        .find_record_by_prefix(prefix)
-        .await
-        .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({}): {e}", sock.display()))?;
-
-    let record = match matches.len() {
-        0 => anyhow::bail!(
-            "prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"
-        ),
-        1 => matches.into_iter().next().expect("len==1"),
-        n => {
-            let ids: Vec<String> = matches
-                .iter()
-                .take(5)
-                .map(|r| {
-                    format!(
-                        "  {} {}",
-                        &r.id[..r.id.len().min(8)],
-                        r.command.as_deref().unwrap_or("∅")
-                    )
-                })
-                .collect();
-            anyhow::bail!(
-                "prefix '{prefix}'가 {n}건 매칭됩니다 — 더 긴 prefix로 좁혀주세요:\n{}",
-                ids.join("\n")
-            );
-        }
-    };
+    let record = resolve_record(&client, sock.display(), Some(prefix)).await?;
 
     debug_log!(
         "record   prefix='{prefix}' → id={} cmd={} exit={}",
