@@ -1111,11 +1111,14 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
 
     let _ = local_record::save_last(&record);
     // best-effort: 세션 ring buffer에도 등록해 history/--record/fix가 찾을 수 있게.
-    // 세션 소켓이 없으면 silent 무시 (daemonless 환경 호환).
+    // 세션 소켓이 없으면 silent 무시 (daemonless 환경 호환). 디버깅을 위해 실패
+    // 원인은 debug 로그로만 남긴다.
     {
         let sock = resolve_socket(None);
         let client = UdsClient::new(sock);
-        let _ = client.register_record(record.clone()).await;
+        if let Err(e) = client.register_record(record.clone()).await {
+            debug_log!("register_record 실패 (best-effort 무시): {e}");
+        }
     }
     if record.exit_code != 0 {
         match ConfigManager::load() {
@@ -2010,18 +2013,22 @@ async fn handle_doctor_fix(dry_run: bool) {
         "  {COL_DIM}↳ stale .sock/.pid 정리는 aicd 부팅 단계에서 자동 수행{COL_RESET}"
     );
 
-    // 4. registry inactive 1시간 초과 prune.
-    if aicd_alive || !dry_run {
-        // dry-run이 아니고 ping 실패로 daemon을 띄웠다면 ping 재시도.
+    // 4. registry inactive 1시간 초과 prune. dry-run이면 항상 안내만, 아니면 ping
+    //    재확인 후 실제 호출.
+    if dry_run {
+        println!(
+            "  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}"
+        );
+    } else {
         let recheck = matches!(aicd_client.ping().await, Ok(true));
-        if recheck && !dry_run {
+        if recheck {
             match aicd_client.prune_sessions(3600).await {
                 Ok(count) => println!("  {COL_GREEN}✓{COL_RESET} registry prune (제거 {count}개)"),
                 Err(e) => println!("  {COL_YELLOW}⚠{COL_RESET} prune 실패: {e}"),
             }
-        } else if dry_run {
+        } else {
             println!(
-                "  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}"
+                "  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 — registry prune 건너뜀 (단계 1을 다시 실행해 보세요)"
             );
         }
     }
@@ -2790,7 +2797,15 @@ fn list_sessions() -> Vec<SessionInfo> {
 /// 2. `aicd`가 없으면 기존 file-system scan(`list_sessions()`)으로 fallback —
 ///    aicd 없이도 멀티세션은 동작해야 하므로.
 async fn handle_sessions_interactive() {
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead, IsTerminal, Write};
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!(
+            "{COL_RED}✗{COL_RESET} --interactive는 TTY가 필요합니다 — pipe/CI 환경에서는 \
+             `aic sessions` 또는 `aic sessions --json`을 사용하세요."
+        );
+        std::process::exit(1);
+    }
 
     let aicd_client = UdsClient::new(aic_common::aicd_socket_path());
     let aicd_alive = matches!(aicd_client.ping().await, Ok(true));

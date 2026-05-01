@@ -93,8 +93,10 @@ pub fn save_to(path: &Path, log: &FeedbackLog) -> io::Result<()> {
 pub fn append(entry: FeedbackEntry) -> io::Result<()> {
     let mut log = load();
     log.entries.push(entry);
-    while log.entries.len() > ENTRY_CAP {
-        log.entries.remove(0);
+    if log.entries.len() > ENTRY_CAP {
+        // 가장 오래된 entry부터 제거. drain이 단일 memmove라 N회 remove(0)보다 효율적.
+        let overflow = log.entries.len() - ENTRY_CAP;
+        log.entries.drain(..overflow);
     }
     save(&log)
 }
