@@ -2850,12 +2850,8 @@ async fn handle_fix(
             eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
             std::process::exit(2);
         }
-        match client.get_recent_commands(200).await {
-            Ok(records) => {
-                let matched: Vec<_> = records
-                    .into_iter()
-                    .filter(|r| r.id.starts_with(prefix))
-                    .collect();
+        match client.find_record_by_prefix(prefix).await {
+            Ok(matched) => {
                 match matched.len() {
                     0 => {
                         eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}'와 일치하는 record 없음");
@@ -3151,12 +3147,8 @@ async fn handle_learn(
             eprintln!("{COL_RED}✗{COL_RESET} record id prefix가 유효하지 않음: '{prefix}'");
             std::process::exit(2);
         }
-        match client.get_recent_commands(200).await {
-            Ok(records) => {
-                let matched: Vec<_> = records
-                    .into_iter()
-                    .filter(|r| r.id.starts_with(prefix))
-                    .collect();
+        match client.find_record_by_prefix(prefix).await {
+            Ok(matched) => {
                 match matched.len() {
                     0 => {
                         eprintln!("{COL_RED}✗{COL_RESET} prefix '{prefix}' 매칭 record 없음");
@@ -3655,16 +3647,11 @@ async fn handle_record_by_prefix(
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
 
-    // 200개를 가져와서 prefix로 매칭. 충분히 길지 않은 prefix면 다중 매칭이 발생할 수 있다.
-    let records = client
-        .get_recent_commands(200)
+    // server-side prefix 검색 — client에서 200개를 폴링해 필터하던 비효율을 제거.
+    let matches = client
+        .find_record_by_prefix(prefix)
         .await
         .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({}): {e}", sock.display()))?;
-
-    let matches: Vec<aic_common::CommandRecord> = records
-        .into_iter()
-        .filter(|r| r.id.starts_with(prefix))
-        .collect();
 
     let record = match matches.len() {
         0 => anyhow::bail!(

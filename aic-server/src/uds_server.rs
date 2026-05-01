@@ -131,6 +131,10 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
             let buf = buffer.read().await;
             IpcResponse::CommandRecords(buf.recent_records(count))
         }
+        IpcRequest::FindRecordByPrefix { ref prefix } => {
+            let buf = buffer.read().await;
+            IpcResponse::CommandRecords(buf.find_by_prefix(prefix))
+        }
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::ListSessions
         | IpcRequest::PruneSessions { .. }

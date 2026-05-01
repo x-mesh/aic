@@ -68,6 +68,19 @@ impl RingBuffer {
         self.records.iter().skip(start).cloned().collect()
     }
 
+    /// record id prefix로 시작하는 모든 record를 시간순으로 반환한다.
+    /// 빈 prefix는 빈 결과를 돌려준다 (전체 dump 방지).
+    pub fn find_by_prefix(&self, prefix: &str) -> Vec<CommandRecord> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+        self.records
+            .iter()
+            .filter(|r| r.id.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
     /// 전체 저장된 출력 라인 수 반환.
     pub fn total_lines(&self) -> usize {
         self.current_line_count
@@ -224,6 +237,40 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(buf.last().unwrap().id, existing);
+    }
+
+    #[test]
+    fn find_by_prefix_returns_matching_records() {
+        let mut buf = RingBuffer::new(100);
+        buf.push(CommandRecord {
+            id: "deadbeefcafef00d".to_string(),
+            command: Some("a".to_string()),
+            ..Default::default()
+        });
+        buf.push(CommandRecord {
+            id: "deadbeef12345678".to_string(),
+            command: Some("b".to_string()),
+            ..Default::default()
+        });
+        buf.push(CommandRecord {
+            id: "1234567890abcdef".to_string(),
+            command: Some("c".to_string()),
+            ..Default::default()
+        });
+
+        let matched = buf.find_by_prefix("deadbeef");
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].command.as_deref(), Some("a"));
+        assert_eq!(matched[1].command.as_deref(), Some("b"));
+
+        // 더 긴 prefix는 1건만.
+        assert_eq!(buf.find_by_prefix("deadbeef1").len(), 1);
+
+        // 빈 prefix는 빈 결과 (전체 dump 방지).
+        assert!(buf.find_by_prefix("").is_empty());
+
+        // 매칭 없는 prefix.
+        assert!(buf.find_by_prefix("ffffffff").is_empty());
     }
 
     #[test]

@@ -20,6 +20,12 @@ pub enum IpcRequest {
     GetRecentCommands {
         count: usize,
     },
+    /// 세션 ring buffer에서 record id prefix로 일치하는 record를 모두 반환한다.
+    /// `aic --record <prefix>`/`aic fix --record`/`aic learn --record`가 200개를
+    /// 폴링해 client-side filter하던 비효율을 제거한다.
+    FindRecordByPrefix {
+        prefix: String,
+    },
     /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     GetLastCommandForSession {
         id: String,
@@ -330,6 +336,7 @@ mod tests {
             Just(IpcRequest::GetLastCommand),
             any::<usize>().prop_map(|count| IpcRequest::GetRecentLines { count }),
             any::<usize>().prop_map(|count| IpcRequest::GetRecentCommands { count }),
+            "[0-9a-f]{1,16}".prop_map(|prefix| IpcRequest::FindRecordByPrefix { prefix }),
             Just(IpcRequest::Ping),
             Just(IpcRequest::GetMetrics),
             Just(IpcRequest::ListSessions),

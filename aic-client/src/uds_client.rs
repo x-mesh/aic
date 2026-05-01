@@ -58,6 +58,28 @@ impl UdsClient {
         }
     }
 
+    /// 세션 ring buffer에서 record id prefix로 시작하는 record를 모두 조회한다.
+    /// `aic --record <prefix>`/`aic fix --record`/`aic learn --record`가 사용한다 —
+    /// client가 200개를 가져와 필터링하던 비효율을 server-side filter로 대체한다.
+    pub async fn find_record_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<CommandRecord>, AicError> {
+        match self
+            .send_request(IpcRequest::FindRecordByPrefix {
+                prefix: prefix.to_string(),
+            })
+            .await?
+        {
+            IpcResponse::CommandRecords(records) => Ok(records),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// `aicd` hook-event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     pub async fn get_last_command_for_session(&self, id: &str) -> Result<CommandRecord, AicError> {
         let response = self

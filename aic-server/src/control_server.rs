@@ -230,6 +230,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         // 그 외 session-level request는 aicd의 책임이 아니다.
         IpcRequest::GetRecentLines { .. }
         | IpcRequest::GetRecentCommands { .. }
+        | IpcRequest::FindRecordByPrefix { .. }
         | IpcRequest::GetMetrics => IpcResponse::Error {
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
