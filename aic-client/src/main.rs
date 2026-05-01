@@ -312,6 +312,19 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
     },
+    /// 세션 ring buffer를 polling해 실패 시 비침습 hint를 출력한다 (P2).
+    ///
+    /// LLM 호출 없이 deterministic_result만 사용한다. 기본은 다른 터미널에서
+    /// 백그라운드로 실행하는 용도 — `aic watch &` 또는 tmux pane.
+    /// Ctrl-C로 중단한다.
+    Watch {
+        /// polling 간격(초). 기본 2초.
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+        /// 특정 세션 ID 명시.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -464,6 +477,7 @@ async fn main() {
             dry_run,
             session,
         }) => handle_fix(record, yes, dry_run, session, cli.provider).await,
+        Some(Commands::Watch { interval, session }) => handle_watch(interval, session).await,
         Some(Commands::Sessions { json }) => {
             if json {
                 print_sessions_json().await;
@@ -2959,6 +2973,120 @@ async fn handle_fix(
         argv.first().map(String::as_str).unwrap_or("sh")
     );
     handle_run(argv, provider_override).await;
+}
+
+async fn handle_watch(interval_secs: u64, session: Option<String>) {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let sock = resolve_socket(session.as_deref());
+    let client = UdsClient::new(sock.clone());
+
+    let config = ConfigManager::load().ok();
+    let lang = config
+        .as_ref()
+        .map(|c| aic_common::resolve_lang(&c.llm.lang))
+        .unwrap_or_else(|| "korean".to_string());
+
+    eprintln!(
+        "{COL_BOLD}aic watch{COL_RESET} {COL_DIM}({}, interval={}s, Ctrl-C로 중단){COL_RESET}",
+        sock.display(),
+        interval.as_secs()
+    );
+
+    // 첫 fetch는 baseline — 기존 record는 hint 대상이 아님.
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Ok(records) = client.get_recent_commands(50).await {
+        for r in &records {
+            if !r.id.is_empty() {
+                seen.insert(r.id.clone());
+            }
+        }
+        eprintln!(
+            "{COL_DIM}baseline: {} record(s) — 이후 도착하는 실패만 알립니다.{COL_RESET}",
+            records.len()
+        );
+    } else {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 — daemon이 떠 있는지 확인하세요. 그래도 polling을 계속합니다."
+        );
+    }
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let records = match client.get_recent_commands(50).await {
+            Ok(r) => r,
+            Err(_) => continue, // best-effort — daemon 재시작 등 일시 오류는 다음 tick에서 재시도.
+        };
+
+        for rec in &records {
+            if rec.id.is_empty() || seen.contains(&rec.id) {
+                continue;
+            }
+            seen.insert(rec.id.clone());
+            if rec.exit_code == 0 {
+                continue;
+            }
+            print_watch_hint(rec, &lang);
+        }
+
+        // seen이 무한히 커지지 않도록 hard cap (가장 오래된 것부터 자르기는 어려우므로
+        // 단순 cap. record id는 16자 hex이므로 1000개 X 16바이트 = ~16KB로 충분히 작다).
+        if seen.len() > 1000 {
+            seen.clear();
+            for r in &records {
+                if !r.id.is_empty() {
+                    seen.insert(r.id.clone());
+                }
+            }
+        }
+    }
+}
+
+fn print_watch_hint(record: &aic_common::CommandRecord, lang: &str) {
+    let id_short = if record.id.is_empty() {
+        "-"
+    } else {
+        &record.id[..record.id.len().min(8)]
+    };
+    let cmd = record.command.as_deref().unwrap_or("(no command)");
+    let cmd_short = if cmd.chars().count() > 60 {
+        let mut s: String = cmd.chars().take(60).collect();
+        s.push('…');
+        s
+    } else {
+        cmd.to_string()
+    };
+
+    if let Some(result) = ErrorAnalyzer::deterministic_result(record, lang) {
+        // deterministic 분류된 경우 한 줄 hint.
+        let first_line = result
+            .explanation
+            .lines()
+            .next()
+            .unwrap_or(&result.explanation);
+        eprintln!(
+            "{COL_BOLD}aic{COL_RESET} {COL_RED}exit {}{COL_RESET} {COL_CYAN}{id_short}{COL_RESET} {cmd_short}",
+            record.exit_code
+        );
+        eprintln!("  {COL_DIM}↳{COL_RESET} {first_line}");
+        if let Some(suggested) = result.suggested_command.as_deref() {
+            eprintln!(
+                "  {COL_DIM}↳ 제안:{COL_RESET} {suggested} {COL_DIM}(직접 실행하지 않습니다){COL_RESET}"
+            );
+        }
+    } else {
+        // deterministic으로 분류 못 하면 분석 명령만 안내 (LLM 자동 호출 안 함).
+        eprintln!(
+            "{COL_BOLD}aic{COL_RESET} {COL_RED}exit {}{COL_RESET} {COL_CYAN}{id_short}{COL_RESET} {cmd_short}",
+            record.exit_code
+        );
+        eprintln!(
+            "  {COL_DIM}↳ 분석:{COL_RESET} `aic --record {id_short}` {COL_DIM}또는{COL_RESET} `aic`"
+        );
+    }
 }
 
 fn risk_label(level: aic_client::risk_guard::RiskLevel) -> String {
