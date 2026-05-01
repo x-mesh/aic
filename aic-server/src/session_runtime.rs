@@ -168,6 +168,7 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
         attached_tty: crate::aicd_client::current_tty(),
         shell: Some(shell_name.clone()),
         cwd: std::env::current_dir().ok(),
+        label: None,
     };
     crate::aicd_client::register_session(session_info_for_register).await;
 

@@ -118,7 +118,20 @@ impl SessionRegistry {
                 attached_tty: None,
                 shell,
                 cwd,
+                label: None,
             });
+    }
+
+    /// 세션 label을 설정 또는 제거한다 (None으로 untag).
+    /// 존재하지 않는 id면 false를 반환.
+    pub async fn set_label(&self, id: &str, label: Option<String>) -> bool {
+        let mut guard = self.inner.write().await;
+        if let Some(info) = guard.get_mut(id) {
+            info.label = label.filter(|s| !s.is_empty());
+            true
+        } else {
+            false
+        }
     }
 
     /// command finish처럼 시작 정보가 없는 이벤트에서도 liveness를 갱신한다.
@@ -247,6 +260,7 @@ mod tests {
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(PathBuf::from("/tmp")),
+            label: None,
         }
     }
 
@@ -398,6 +412,7 @@ mod tests {
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(PathBuf::from("/tmp")),
+            label: None,
         }]);
         r.save_snapshot(&path).await.unwrap();
 
@@ -420,6 +435,7 @@ mod tests {
                 attached_tty: None,
                 shell: None,
                 cwd: None,
+                label: None,
             },
             SessionInfo {
                 id: "oldlive".to_string(),
@@ -431,6 +447,7 @@ mod tests {
                 attached_tty: Some("/dev/ttys001".to_string()),
                 shell: None,
                 cwd: None,
+                label: None,
             },
             SessionInfo {
                 id: "newdead".to_string(),
@@ -442,6 +459,7 @@ mod tests {
                 attached_tty: None,
                 shell: None,
                 cwd: None,
+                label: None,
             },
         ]);
 
@@ -469,6 +487,7 @@ mod tests {
                 attached_tty: Some("/dev/ttys001".to_string()),
                 shell: None,
                 cwd: None,
+                label: None,
             },
             SessionInfo {
                 id: "newlive".to_string(),
@@ -480,6 +499,7 @@ mod tests {
                 attached_tty: Some("/dev/ttys002".to_string()),
                 shell: None,
                 cwd: None,
+                label: None,
             },
             SessionInfo {
                 id: "olddead".to_string(),
@@ -491,6 +511,7 @@ mod tests {
                 attached_tty: None,
                 shell: None,
                 cwd: None,
+                label: None,
             },
         ]);
 

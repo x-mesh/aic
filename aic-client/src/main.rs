@@ -436,6 +436,18 @@ enum SessionOp {
         #[arg(long, default_value = "3600")]
         older_than_secs: u64,
     },
+    /// 세션에 사용자 label을 부여한다 (status/sessions에 표시).
+    Tag {
+        /// 세션 ID (8자 lowercase hex).
+        id: String,
+        /// label 텍스트. 빈 문자열은 untag와 동일.
+        label: String,
+    },
+    /// 세션 label을 제거한다.
+    Untag {
+        /// 세션 ID.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -524,6 +536,8 @@ async fn main() {
         Some(Commands::Session { op }) => match op {
             SessionOp::Stop { id } => handle_session_stop(id).await,
             SessionOp::Prune { older_than_secs } => handle_session_prune(older_than_secs).await,
+            SessionOp::Tag { id, label } => handle_session_tag(id, Some(label)).await,
+            SessionOp::Untag { id } => handle_session_tag(id, None).await,
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
@@ -1199,6 +1213,38 @@ async fn handle_session_stop(id: String) {
         }
         Err(e) => {
             eprintln!("{COL_RED}✗{COL_RESET} 세션 종료 실패: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn handle_session_tag(id: String, label: Option<String>) {
+    if !aic_common::is_valid_session_id(&id) {
+        eprintln!("{COL_RED}✗{COL_RESET} 유효하지 않은 세션 ID: '{id}' (1~8자 lowercase hex 필요)");
+        std::process::exit(2);
+    }
+    let label = label.and_then(|l| {
+        let trimmed = l.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    match client.tag_session(&id, label.clone()).await {
+        Ok(()) => match label {
+            Some(l) => println!("{COL_GREEN}✓{COL_RESET} 세션 {id} label='{l}' 설정"),
+            None => println!("{COL_GREEN}✓{COL_RESET} 세션 {id} label 제거"),
+        },
+        Err(AicError::ServerNotRunning) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} aicd가 실행 중이 아닙니다 — `aic daemon start` 후 다시 시도하세요."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} session tag 실패: {e}");
             std::process::exit(1);
         }
     }
@@ -2648,6 +2694,11 @@ async fn handle_sessions() {
                         Some(cid) if cid == &s.id => format!(" {COL_GREEN}*{COL_RESET}"),
                         _ => String::new(),
                     };
+                    let label_part = s
+                        .label
+                        .as_deref()
+                        .map(|l| format!(" [{COL_BOLD}{l}{COL_RESET}]"))
+                        .unwrap_or_default();
                     let tty = s.attached_tty.as_deref().unwrap_or("?");
                     let shell = s
                         .shell
@@ -2663,12 +2714,14 @@ async fn handle_sessions() {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "?".to_string());
                     println!(
-                        "  {COL_CYAN}{id}{COL_RESET}{marker}  {state}  {COL_DIM}pid {pid}  {tty}  {shell}  seen {seen}  cmd {command}  {cwd}{COL_RESET}",
+                        "  {COL_CYAN}{id}{COL_RESET}{marker}{label_part}  {state}  {COL_DIM}pid {pid}  {tty}  {shell}  seen {seen}  cmd {command}  {cwd}{COL_RESET}",
                         id = s.id,
                         pid = s.pid,
                     );
                 }
-                println!("{COL_DIM}정리: aic session prune [--older-than-secs 3600]{COL_RESET}");
+                println!(
+                    "{COL_DIM}정리: aic session prune [--older-than-secs 3600] · 라벨: aic session tag <id> <label>{COL_RESET}"
+                );
                 return;
             }
             Err(e) => {

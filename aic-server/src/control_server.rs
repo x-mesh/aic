@@ -170,6 +170,18 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             IpcResponse::Pong
         }
         IpcRequest::StopSession { id } => stop_session(ctx, &id).await,
+        IpcRequest::TagSession { id, label } => {
+            let updated = ctx.registry.set_label(&id, label.clone()).await;
+            if updated {
+                persist_registry(ctx).await;
+                tracing::info!(session_id = %id, ?label, "세션 label 갱신");
+                IpcResponse::Pong
+            } else {
+                IpcResponse::Error {
+                    message: format!("세션을 찾을 수 없습니다: {id}"),
+                }
+            }
+        }
         IpcRequest::GetLastCommandForSession { id } => match ctx.hook_events.last(&id).await {
             Some(record) => IpcResponse::CommandData(record),
             None => IpcResponse::Error {
@@ -356,6 +368,7 @@ mod tests {
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(std::path::PathBuf::from("/tmp")),
+            label: None,
         }
     }
 
@@ -583,6 +596,7 @@ mod tests {
             attached_tty: None,
             shell: None,
             cwd: None,
+            label: None,
         };
         c.registry.register(info).await;
         let resp = process_control_request(

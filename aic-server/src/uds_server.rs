@@ -144,6 +144,7 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
         | IpcRequest::HeartbeatSession { .. }
         | IpcRequest::StopSession { .. }
         | IpcRequest::GetLastCommandForSession { .. }
+        | IpcRequest::TagSession { .. }
         | IpcRequest::CommandStarted { .. }
         | IpcRequest::CommandFinished { .. } => IpcResponse::Error {
             message: format!(

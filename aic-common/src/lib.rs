@@ -196,6 +196,10 @@ pub struct SessionInfo {
     pub shell: Option<String>,
     /// 세션 cwd. 셸 시작 시점 또는 마지막 보고 시점 기준.
     pub cwd: Option<std::path::PathBuf>,
+    /// 사용자가 부여한 label (예: "main", "test-runner"). 기본은 None — 레거시 JSON
+    /// 호환을 위해 `#[serde(default)]`. session id는 그대로 두고 별도 메타로만 쓴다.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 // ── Session capture mode (Phase 4) ─────────────────────────────

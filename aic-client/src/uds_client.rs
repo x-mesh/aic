@@ -162,6 +162,24 @@ impl UdsClient {
         self.send_request(request).await
     }
 
+    /// `aicd`에 세션 label을 설정/제거 요청한다 (label=None이면 untag).
+    pub async fn tag_session(&self, id: &str, label: Option<String>) -> Result<(), AicError> {
+        match self
+            .send_request(IpcRequest::TagSession {
+                id: id.to_string(),
+                label,
+            })
+            .await?
+        {
+            IpcResponse::Pong => Ok(()),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// `aicd`에 특정 세션을 graceful 종료시키도록 요청한다 (Phase 2.1).
     pub async fn stop_session(&self, id: &str) -> Result<(), AicError> {
         match self

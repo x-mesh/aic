@@ -26,6 +26,12 @@ pub enum IpcRequest {
     FindRecordByPrefix {
         prefix: String,
     },
+    /// 세션에 사용자 label을 붙이거나 제거한다 (label=None이면 untag).
+    /// `aic session tag <id> <label>` / `aic session untag <id>`가 사용한다.
+    TagSession {
+        id: String,
+        label: Option<String>,
+    },
     /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     GetLastCommandForSession {
         id: String,
@@ -358,6 +364,11 @@ mod tests {
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
             (
                 "[0-9a-f]{1,8}",
+                proptest::option::of("[a-zA-Z0-9_-]{1,32}"),
+            )
+                .prop_map(|(id, label)| IpcRequest::TagSession { id, label }),
+            (
+                "[0-9a-f]{1,8}",
                 "[0-9a-f]{1,16}",
                 "[a-z ]{1,40}",
                 proptest::option::of("[a-zA-Z0-9/_-]{1,32}".prop_map(std::path::PathBuf::from)),
@@ -448,6 +459,7 @@ mod tests {
                         attached_tty,
                         shell,
                         cwd,
+                        label: None,
                     }
                 },
             )

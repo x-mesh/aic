@@ -117,6 +117,7 @@ mod tests {
             attached_tty: None,
             shell: None,
             cwd: None,
+            label: None,
         };
         // socket path가 사용자 환경의 실제 aicd_socket_path()를 가리킬 수 있지만,
         // CI에서 aicd가 떠 있지 않다고 가정하면 silent skip 확인 가능.
@@ -159,6 +160,7 @@ mod tests {
             attached_tty: Some("/dev/ttys001".to_string()),
             shell: Some("/bin/zsh".to_string()),
             cwd: Some(std::path::PathBuf::from("/tmp")),
+            label: None,
         };
         let resp = send(&sock_path, IpcRequest::RegisterSession(info))
             .await
