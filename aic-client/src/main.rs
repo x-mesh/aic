@@ -167,6 +167,13 @@ enum Commands {
         /// 특정 세션 ID를 명시적으로 점검 (기본: AIC_SESSION_ID env > 최신 세션 > legacy)
         #[arg(long, value_name = "ID")]
         session: Option<String>,
+        /// 진단 후 자동 수정 시도 (P2 'doctor --fix'). aicd 시작/hook 재생성/
+        /// stale session cleanup/registry prune을 순서대로 시도한다.
+        #[arg(long)]
+        fix: bool,
+        /// `--fix`와 함께 사용. 실제 변경 없이 적용될 작업만 출력.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// 데몬 상태 표시 — PID, ping, 마지막 명령어 요약
     Status {
@@ -512,7 +519,18 @@ async fn main() {
             Some(ConfigOp::Show { json, show_secrets }) => handle_config_show(json, show_secrets),
             Some(ConfigOp::Get { path }) => handle_config_get(&path),
         },
-        Some(Commands::Doctor { json, session }) => handle_doctor(json, session).await,
+        Some(Commands::Doctor {
+            json,
+            session,
+            fix,
+            dry_run,
+        }) => {
+            if fix {
+                handle_doctor_fix(dry_run).await;
+            } else {
+                handle_doctor(json, session).await;
+            }
+        }
         Some(Commands::Status {
             watch,
             interval,
@@ -1924,6 +1942,90 @@ async fn print_status_once(session: Option<&str>) {
 }
 
 /// `aic doctor [--json]`: 환경 진단 리포트 출력. FAIL이 하나라도 있으면 exit 1.
+async fn handle_doctor_fix(dry_run: bool) {
+    println!(
+        "{COL_BOLD}aic doctor --fix{COL_RESET}{}",
+        if dry_run {
+            format!(" {COL_DIM}(dry-run){COL_RESET}")
+        } else {
+            String::new()
+        }
+    );
+
+    // 1. aicd ping → 응답 없으면 spawn 시도.
+    let aicd_sock = aic_common::aicd_socket_path();
+    let aicd_client = UdsClient::new(aicd_sock.clone());
+    let aicd_alive = matches!(aicd_client.ping().await, Ok(true));
+    if aicd_alive {
+        println!("  {COL_GREEN}✓{COL_RESET} aicd 응답 OK");
+    } else {
+        if dry_run {
+            println!(
+                "  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 — (dry-run) 데몬 시작 예정"
+            );
+        } else {
+            println!(
+                "  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 → 데몬 시작"
+            );
+            handle_daemon_start(false).await;
+        }
+    }
+
+    // 2. hook 파일 ensure (~/.aic/hooks.{zsh,bash}).
+    let hook_dir = dirs::home_dir().map(|h| h.join(".aic"));
+    match hook_dir {
+        Some(dir) => {
+            println!(
+                "  {COL_DIM}↳{COL_RESET} hook 파일 위치: {}",
+                dir.display()
+            );
+            if !dry_run {
+                let zsh_path = dir.join("hooks.zsh");
+                let bash_path = dir.join("hooks.bash");
+                let result = (|| -> std::io::Result<()> {
+                    std::fs::create_dir_all(&dir)?;
+                    std::fs::write(&zsh_path, aic_client::hook_install::zsh_hook_script())?;
+                    std::fs::write(&bash_path, aic_client::hook_install::bash_hook_script())?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => println!("  {COL_GREEN}✓{COL_RESET} hook 파일 재생성"),
+                    Err(e) => println!("  {COL_RED}✗{COL_RESET} hook 재생성 실패: {e}"),
+                }
+            } else {
+                println!("  {COL_DIM}↳ (dry-run) zsh/bash hook 스크립트 덮어쓰기 예정{COL_RESET}");
+            }
+        }
+        None => println!("  {COL_YELLOW}⚠{COL_RESET} HOME 경로를 알 수 없어 hook 재생성 건너뜀"),
+    }
+
+    // 3. stale session artifacts는 aicd가 부팅 시 정리한다.
+    //    여기서는 사용자에게 안내만 — 별도 client-side cleanup은 단계 4의 prune이 커버.
+    println!(
+        "  {COL_DIM}↳ stale .sock/.pid 정리는 aicd 부팅 단계에서 자동 수행{COL_RESET}"
+    );
+
+    // 4. registry inactive 1시간 초과 prune.
+    if aicd_alive || !dry_run {
+        // dry-run이 아니고 ping 실패로 daemon을 띄웠다면 ping 재시도.
+        let recheck = matches!(aicd_client.ping().await, Ok(true));
+        if recheck && !dry_run {
+            match aicd_client.prune_sessions(3600).await {
+                Ok(count) => println!("  {COL_GREEN}✓{COL_RESET} registry prune (제거 {count}개)"),
+                Err(e) => println!("  {COL_YELLOW}⚠{COL_RESET} prune 실패: {e}"),
+            }
+        } else if dry_run {
+            println!(
+                "  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}"
+            );
+        }
+    }
+
+    println!(
+        "{COL_DIM}완료. 자세한 진단은 `aic doctor`로 확인.{COL_RESET}"
+    );
+}
+
 async fn handle_doctor(json: bool, session: Option<String>) {
     let socket = resolve_socket(session.as_deref());
     let results = aic_client::doctor::run_all_checks(&socket).await;
