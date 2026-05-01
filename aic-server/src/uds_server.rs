@@ -135,6 +135,11 @@ async fn process_request(request: IpcRequest, buffer: &Arc<RwLock<RingBuffer>>) 
             let buf = buffer.read().await;
             IpcResponse::CommandRecords(buf.find_by_prefix(prefix))
         }
+        IpcRequest::RegisterRecord(ref record) => {
+            let mut buf = buffer.write().await;
+            buf.push(record.clone());
+            IpcResponse::Pong
+        }
         IpcRequest::Ping => IpcResponse::Pong,
         IpcRequest::ListSessions
         | IpcRequest::PruneSessions { .. }

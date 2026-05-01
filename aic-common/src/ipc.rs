@@ -32,6 +32,11 @@ pub enum IpcRequest {
         id: String,
         label: Option<String>,
     },
+    /// 외부에서 만든 CommandRecord를 세션 ring buffer에 등록한다.
+    /// `aic run -- ...`가 만든 ExplicitCapture record를 history/--record/fix
+    /// 흐름에 통합하기 위한 entry point. record.id가 비어 있으면 ring buffer
+    /// push 시 자동으로 부여된다.
+    RegisterRecord(CommandRecord),
     /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     GetLastCommandForSession {
         id: String,
@@ -367,6 +372,7 @@ mod tests {
                 proptest::option::of("[a-zA-Z0-9_-]{1,32}"),
             )
                 .prop_map(|(id, label)| IpcRequest::TagSession { id, label }),
+            arb_command_record().prop_map(IpcRequest::RegisterRecord),
             (
                 "[0-9a-f]{1,8}",
                 "[0-9a-f]{1,16}",

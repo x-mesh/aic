@@ -1087,6 +1087,13 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
     );
 
     let _ = local_record::save_last(&record);
+    // best-effort: 세션 ring buffer에도 등록해 history/--record/fix가 찾을 수 있게.
+    // 세션 소켓이 없으면 silent 무시 (daemonless 환경 호환).
+    {
+        let sock = resolve_socket(None);
+        let client = UdsClient::new(sock);
+        let _ = client.register_record(record.clone()).await;
+    }
     if record.exit_code != 0 {
         match ConfigManager::load() {
             Ok(config) => {

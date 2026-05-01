@@ -243,6 +243,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         IpcRequest::GetRecentLines { .. }
         | IpcRequest::GetRecentCommands { .. }
         | IpcRequest::FindRecordByPrefix { .. }
+        | IpcRequest::RegisterRecord(_)
         | IpcRequest::GetMetrics => IpcResponse::Error {
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
