@@ -229,9 +229,12 @@ pub(crate) fn process_exe_path(_pid: u32) -> Option<String> {
 ///
 /// Requirements: 6.3, 6.4
 pub fn cleanup_stale_sessions() {
-    let dir = aic_common::session_dir();
+    cleanup_stale_sessions_in(&aic_common::session_dir());
+}
 
-    let entries = match std::fs::read_dir(&dir) {
+/// `cleanup_stale_sessions()`의 디렉토리 주입 가능 변형. 테스트에서 tempdir 격리에 사용.
+pub fn cleanup_stale_sessions_in(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {

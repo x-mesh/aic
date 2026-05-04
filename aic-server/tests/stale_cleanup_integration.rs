@@ -1,58 +1,27 @@
 //! Stale 세션 정리 통합 테스트
 //!
-//! 가짜 소켓/PID 파일을 생성한 뒤 `cleanup_stale_sessions()`를 호출하여
-//! stale 파일이 올바르게 삭제되는지 검증한다.
+//! 가짜 소켓/PID 파일을 tempdir에 생성한 뒤 `cleanup_stale_sessions_in()`을
+//! 호출하여 stale 파일이 올바르게 삭제되는지 검증한다. 각 테스트가
+//! 격리된 tempdir을 사용하므로 병렬 실행 시 race condition이 없다.
 //!
 //! Requirements: 6.3, 6.4
 
 use std::fs;
-use std::path::PathBuf;
-
-/// 테스트 전용 가짜 파일을 session_dir에 생성하고,
-/// 테스트 종료(또는 panic) 시 자동으로 정리하는 guard.
-struct TestFileGuard {
-    paths: Vec<PathBuf>,
-}
-
-impl TestFileGuard {
-    fn new() -> Self {
-        Self { paths: Vec::new() }
-    }
-
-    fn track(&mut self, path: PathBuf) {
-        self.paths.push(path);
-    }
-}
-
-impl Drop for TestFileGuard {
-    fn drop(&mut self) {
-        for p in &self.paths {
-            let _ = fs::remove_file(p);
-        }
-    }
-}
 
 /// 가짜 .sock 파일(일반 파일)을 생성하면 UnixStream::connect가 실패하므로
-/// cleanup_stale_sessions()가 stale로 판정하여 삭제해야 한다.
+/// cleanup_stale_sessions_in()이 stale로 판정하여 삭제해야 한다.
 /// Requirements: 6.4
 #[test]
 fn cleanup_removes_stale_sock_files() {
-    let dir = aic_common::session_dir();
-    fs::create_dir_all(&dir).expect("session_dir 생성 실패");
+    let tmp = tempfile::tempdir().expect("tempdir 생성 실패");
+    let dir = tmp.path();
 
-    let mut guard = TestFileGuard::new();
-
-    // 테스트 전용 가짜 소켓 파일 생성 (일반 파일 — connect 실패)
     let sock_path = dir.join("session-deadbeef.sock");
     fs::write(&sock_path, "fake-socket").expect("가짜 소켓 파일 생성 실패");
-    guard.track(sock_path.clone());
-
     assert!(sock_path.exists(), "가짜 소켓 파일이 존재해야 합니다");
 
-    // stale 정리 실행
-    aic_server::lock::cleanup_stale_sessions();
+    aic_server::lock::cleanup_stale_sessions_in(dir);
 
-    // 가짜 소켓은 connect 실패 → 삭제되어야 함
     assert!(
         !sock_path.exists(),
         "stale 소켓 파일이 삭제되어야 합니다: {}",
@@ -61,30 +30,23 @@ fn cleanup_removes_stale_sock_files() {
 }
 
 /// 가짜 .sock + 대응하는 .pid 파일(존재하지 않는 PID)을 생성하면
-/// cleanup_stale_sessions()가 둘 다 삭제해야 한다.
+/// cleanup_stale_sessions_in()이 둘 다 삭제해야 한다.
 /// Requirements: 6.3, 6.4
 #[test]
 fn cleanup_removes_stale_sock_and_pid_files() {
-    let dir = aic_common::session_dir();
-    fs::create_dir_all(&dir).expect("session_dir 생성 실패");
-
-    let mut guard = TestFileGuard::new();
+    let tmp = tempfile::tempdir().expect("tempdir 생성 실패");
+    let dir = tmp.path();
 
     let sock_path = dir.join("session-fade0001.sock");
     let pid_path = dir.join("session-fade0001.pid");
 
-    // 가짜 소켓 파일 (일반 파일)
     fs::write(&sock_path, "fake-socket").expect("가짜 소켓 파일 생성 실패");
-    guard.track(sock_path.clone());
-
-    // 가짜 PID 파일 — 존재하지 않는 PID 기록
     fs::write(&pid_path, "2147483646\n").expect("가짜 PID 파일 생성 실패");
-    guard.track(pid_path.clone());
 
     assert!(sock_path.exists());
     assert!(pid_path.exists());
 
-    aic_server::lock::cleanup_stale_sessions();
+    aic_server::lock::cleanup_stale_sessions_in(dir);
 
     assert!(!sock_path.exists(), "stale 소켓 파일이 삭제되어야 합니다");
     assert!(!pid_path.exists(), "stale PID 파일이 삭제되어야 합니다");
@@ -94,22 +56,16 @@ fn cleanup_removes_stale_sock_and_pid_files() {
 /// Requirements: 6.4
 #[test]
 fn cleanup_ignores_non_session_files() {
-    let dir = aic_common::session_dir();
-    fs::create_dir_all(&dir).expect("session_dir 생성 실패");
+    let tmp = tempfile::tempdir().expect("tempdir 생성 실패");
+    let dir = tmp.path();
 
-    let mut guard = TestFileGuard::new();
-
-    // session- prefix가 없는 파일
     let other_file = dir.join("random-file.sock");
     fs::write(&other_file, "not-a-session").expect("기타 파일 생성 실패");
-    guard.track(other_file.clone());
 
-    // .sock 확장자가 아닌 파일
     let txt_file = dir.join("session-abcd1234.txt");
     fs::write(&txt_file, "not-a-socket").expect("txt 파일 생성 실패");
-    guard.track(txt_file.clone());
 
-    aic_server::lock::cleanup_stale_sessions();
+    aic_server::lock::cleanup_stale_sessions_in(dir);
 
     assert!(
         other_file.exists(),
@@ -125,10 +81,8 @@ fn cleanup_ignores_non_session_files() {
 /// Requirements: 6.3, 6.4
 #[test]
 fn cleanup_removes_multiple_stale_sessions() {
-    let dir = aic_common::session_dir();
-    fs::create_dir_all(&dir).expect("session_dir 생성 실패");
-
-    let mut guard = TestFileGuard::new();
+    let tmp = tempfile::tempdir().expect("tempdir 생성 실패");
+    let dir = tmp.path();
 
     let ids = ["fade0010", "fade0020", "fade0030"];
     let mut sock_paths = Vec::new();
@@ -141,14 +95,11 @@ fn cleanup_removes_multiple_stale_sessions() {
         fs::write(&sock, "fake").unwrap();
         fs::write(&pid, "2147483646\n").unwrap();
 
-        guard.track(sock.clone());
-        guard.track(pid.clone());
-
         sock_paths.push(sock);
         pid_paths.push(pid);
     }
 
-    aic_server::lock::cleanup_stale_sessions();
+    aic_server::lock::cleanup_stale_sessions_in(dir);
 
     for (i, sock) in sock_paths.iter().enumerate() {
         assert!(
