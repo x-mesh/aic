@@ -1,6 +1,6 @@
 # aic
 
-> 셸 명령어 에러를 자동으로 분석하고 수정 명령어를 제안하는 지능형 CLI 도우미
+> 셸 명령어 에러를 LLM으로 분석하고 수정 명령어를 제안하는 CLI 도구
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
@@ -8,11 +8,11 @@
 
 ## Overview
 
-`aic`는 터미널에서 명령어 실행 중 발생하는 에러를 LLM으로 분석하여 원인을 설명하고 수정 명령어를 제안하는 도구입니다.
+`aic`는 터미널에서 명령어 실행 중 발생하는 에러를 LLM에 넘겨서 원인을 설명받고 수정 명령어를 제안받는 도구입니다.
 
-PTY 기반 셸 래퍼 데몬(`aic-session`)이 사용자의 셸을 투명하게 감싸서 입출력을 중계하면서 출력을 캡처하고, CLI 클라이언트(`aic`)가 직전 명령어의 exit code에 따라 자동으로 에러 분석 또는 Interactive REPL 모드로 분기합니다.
+PTY 기반 셸 래퍼 데몬(`aic-session`)이 사용자의 셸을 감싸서 입출력을 중계하면서 출력을 캡처합니다. CLI 클라이언트(`aic`)는 직전 명령어의 exit code를 보고 에러 분석 또는 Interactive REPL 모드로 분기합니다.
 
-추가로, 사용자당 하나의 supervisor daemon(`aicd`)이 세션 lifecycle/registry/cleanup을 중앙 관리하고, 출력 캡처가 부담스러운 워크플로우를 위한 metadata-only **hook capture mode**도 제공합니다 (PRD: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
+사용자당 하나의 supervisor daemon(`aicd`)이 세션 lifecycle/registry/cleanup을 관리하고, 출력 캡처가 부담스러운 워크플로우를 위해 metadata만 수집하는 **hook capture mode**도 있습니다 (PRD: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
 
 ```mermaid
 graph LR
@@ -29,7 +29,7 @@ graph LR
 ## Features
 
 ### Core
-- ✅ PTY 셸 래퍼 — 기존 워크플로우 변경 없이 투명하게 출력 캡처
+- ✅ PTY 셸 래퍼 — 기존 워크플로우 변경 없이 출력 캡처
 - ✅ 명령어 경계 감지 — OSC 133 마커 + Timing Heuristic 폴백
 - ✅ 에러 자동 분석 — exit code ≠ 0이면 LLM으로 원인 분석 및 수정 제안
 - ✅ Interactive REPL — exit code = 0이면 LLM과 자유 대화
@@ -79,9 +79,9 @@ graph LR
 
 ## 동작 원리
 
-1. `aic-session`이 사용자의 기본 셸을 PTY 자식 프로세스로 실행
-2. 셸 입출력을 투명하게 중계하면서, ANSI Escape를 제거한 clean text를 Ring Buffer에 저장
-3. OSC 133 마커 또는 Timing Heuristic으로 명령어 경계를 식별하여 CommandRecord 생성
+1. `aic-session`이 사용자의 기본 셸을 PTY 자식 프로세스로 띄움
+2. 셸 입출력을 중계하면서, ANSI Escape를 제거한 clean text를 Ring Buffer에 저장
+3. OSC 133 마커 또는 Timing Heuristic으로 명령어 경계를 찾아 CommandRecord 생성
 4. 사용자가 `aic`를 실행하면 UDS를 통해 직전 명령어 데이터를 조회
 5. exit code에 따라 에러 분석(LLM) 또는 Interactive REPL로 자동 분기
 
@@ -104,8 +104,8 @@ brew install aic
 aic daemon install     # macOS launchd / Linux systemd user unit 자동 분기
 ```
 
-`brew services`는 macOS launchd만 잘 통합하고 Linux systemd 통합이 부실해서
-`aic daemon install`이 양 OS 모두를 일관되게 처리합니다.
+`brew services`는 macOS launchd만 잘 붙고 Linux systemd 쪽은 좀 부실해서,
+`aic daemon install`이 양 OS 모두 일관되게 처리합니다.
 
 #### Source 빌드
 
@@ -320,7 +320,7 @@ cli_path = "claude"
 
 ## 소켓 경로 (멀티세션)
 
-`aic-session`을 여러 터미널에서 실행하면 각각 독립된 소켓을 만든다.
+`aic-session`을 여러 터미널에서 실행하면 각각 독립된 소켓이 생긴다.
 
 | 플랫폼 | 경로 패턴 |
 |--------|-----------|
