@@ -1,6 +1,6 @@
 # aic
 
-> An intelligent CLI assistant that automatically analyzes shell command errors and suggests fix commands
+> CLI tool that analyzes shell command errors via LLM and suggests fixes
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
@@ -8,11 +8,11 @@
 
 ## Overview
 
-`aic` is a tool that uses an LLM to analyze errors that occur during command execution in your terminal, explain their cause, and suggest fix commands.
+`aic` feeds your terminal's error output to an LLM, which explains what went wrong and suggests a fix command.
 
-A PTY-based shell wrapper daemon (`aic-session`) transparently wraps your shell, relaying I/O while capturing output. The CLI client (`aic`) then automatically branches into either error-analysis mode or an interactive REPL based on the previous command's exit code.
+Under the hood, a PTY-based daemon (`aic-session`) wraps your shell, relaying I/O while capturing output into a ring buffer. The CLI client (`aic`) checks the previous command's exit code and branches into error-analysis mode or an interactive REPL.
 
-In addition, a per-user supervisor daemon (`aicd`) centrally manages session lifecycle, registry, and cleanup, and a metadata-only **hook capture mode** is available for workflows where output capture would be too costly (PRDs: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
+A per-user supervisor daemon (`aicd`) manages session lifecycle, registry, and cleanup. For workflows where PTY wrapping is too expensive, a metadata-only **hook capture mode** skips output capture entirely (PRDs: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
 
 ```mermaid
 graph LR
@@ -29,7 +29,7 @@ graph LR
 ## Features
 
 ### Core
-- ✅ PTY shell wrapper — captures output transparently without changing your existing workflow
+- ✅ PTY shell wrapper — captures output without changing your workflow
 - ✅ Command boundary detection — OSC 133 markers + timing-heuristic fallback
 - ✅ Automatic error analysis — when exit code ≠ 0, the LLM explains the cause and suggests fixes
 - ✅ Interactive REPL — when exit code = 0, freeform chat with the LLM
@@ -79,9 +79,9 @@ graph LR
 
 ## How it works
 
-1. `aic-session` runs your default shell as a PTY child process
-2. It transparently relays shell I/O while saving an ANSI-stripped clean-text copy into a ring buffer
-3. OSC 133 markers or a timing heuristic identify command boundaries and produce a `CommandRecord`
+1. `aic-session` spawns your default shell as a PTY child process
+2. Shell I/O passes through while an ANSI-stripped clean-text copy goes into a ring buffer
+3. OSC 133 markers (or a timing heuristic) identify command boundaries and produce a `CommandRecord`
 4. When you run `aic`, it queries the previous command's data via UDS
 5. Based on exit code it auto-branches into error analysis (LLM) or an interactive REPL
 
@@ -104,8 +104,8 @@ brew install aic
 aic daemon install     # auto-branches between macOS launchd and Linux systemd user unit
 ```
 
-`brew services` integrates well with macOS launchd but its Linux-systemd
-integration is weak, so `aic daemon install` handles both OSes consistently.
+`brew services` works well with macOS launchd but its Linux-systemd
+support is spotty, so `aic daemon install` handles both OSes consistently.
 
 #### Build from source
 
