@@ -95,6 +95,24 @@ graph LR
 
 ### 빌드 및 설치
 
+#### 원라이너 installer (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
+```
+
+OS/아키텍처(`linux`/`darwin` × `amd64`/`arm64`)를 감지해서 맞는 release
+archive를 받고, `checksums.txt`로 SHA-256을 검증한 다음 `aic` +
+`aic-session` + `aicd` 셋을 `/usr/local/bin`(쓰기 권한 없으면 sudo) 또는
+`~/.local/bin`에 설치합니다.
+
+옵션:
+
+```bash
+AIC_VERSION=v0.4.0 sh install.sh         # 특정 tag 고정
+AIC_INSTALL_DIR=$HOME/.local/bin sh ...  # 사용자 디렉토리에 설치
+```
+
 #### Homebrew (macOS / Linux)
 
 ```bash
@@ -121,6 +139,26 @@ cargo install --path aic-client   # aic 설치
 ```bash
 make install
 ```
+
+### 셀프 업데이트
+
+```bash
+aic update             # 설치 출처를 감지해 그 자리에서 갱신
+aic update --check     # 신버전이 있으면 exit 1, 최신이면 0
+aic update --to v0.4.0 # 특정 tag 고정 (manual install에서만 적용)
+aic update --force     # 같은 버전이어도 강제 재설치
+```
+
+`aic update`는 설치 경로를 보고 출처를 감지해 알맞은 경로로 갱신합니다:
+
+| 설치 출처 | 동작 |
+|---|---|
+| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | `brew upgrade x-mesh/tap/aic`로 위임 |
+| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | release archive 다운 + sha256 검증 + 세 binary atomic 교체 (`/usr/local/bin`은 필요 시 sudo) |
+| `cargo install` (`~/.cargo/bin`) | 자동 교체 거부, 동일 동작의 `cargo install` 명령 안내 |
+
+디스크의 binary를 교체한 뒤 새 버전을 적용하려면 `aicd`를 재시작하세요:
+`aic daemon restart`.
 
 ### 설정
 

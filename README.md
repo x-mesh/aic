@@ -95,6 +95,24 @@ graph LR
 
 ### Build & Install
 
+#### One-line installer (macOS / Linux)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
+```
+
+Detects OS/arch (`linux`/`darwin` × `amd64`/`arm64`), downloads the
+matching release archive, verifies its SHA-256 against the published
+`checksums.txt`, and installs `aic` + `aic-session` + `aicd` to
+`/usr/local/bin` (with sudo fallback) or `~/.local/bin`.
+
+Override targets:
+
+```bash
+AIC_VERSION=v0.4.0 sh install.sh        # pin a specific tag
+AIC_INSTALL_DIR=$HOME/.local/bin sh ... # install to a user dir
+```
+
 #### Homebrew (macOS / Linux)
 
 ```bash
@@ -121,6 +139,26 @@ Or via Makefile:
 ```bash
 make install
 ```
+
+### Self-update
+
+```bash
+aic update             # detect install source and upgrade in place
+aic update --check     # exit 1 if a newer release is available, 0 otherwise
+aic update --to v0.4.0 # pin a specific tag (manual installs only)
+aic update --force     # reinstall even if already on the latest version
+```
+
+`aic update` detects how `aic` was installed and chooses the right path:
+
+| Install source | Action |
+|---|---|
+| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | forwards to `brew upgrade x-mesh/tap/aic` |
+| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | downloads + verifies sha256 + atomic-replaces all 3 binaries (sudo fallback for `/usr/local/bin`) |
+| `cargo install` (`~/.cargo/bin`) | refuses self-replace, prints the equivalent `cargo install` command |
+
+After upgrading the binaries on disk, restart `aicd` to pick up the new
+version: `aic daemon restart`.
 
 ### Configuration
 

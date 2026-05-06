@@ -4,6 +4,70 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-06
+
+### Added — `aic update` 셀프업데이터 + `install.sh`
+
+배포 경로가 brew 한 줄, source 빌드 두세 단계, 그리고 (지금까지) 모자란
+manual install 경로로 흩어져 있어 신규 사용자 진입과 기존 사용자 갱신이
+모두 번거로웠다. `x-mesh/gk`의 패턴을 그대로 차용해 정리.
+
+- **`install.sh`** (POSIX sh) — `curl … | sh` 한 줄로 OS/arch
+  (`linux`/`darwin` × `amd64`/`arm64`) 감지 → release archive +
+  `checksums.txt` 다운 → SHA-256 검증 → `aic`/`aic-session`/`aicd`
+  세 binary를 `/usr/local/bin`(권한 없으면 sudo) 또는 `~/.local/bin`에
+  설치. `AIC_VERSION` / `AIC_INSTALL_DIR`로 핀/경로 override.
+- **`aic update`** — `current_exe()` 경로로 설치 출처를 분류:
+  - Brew(`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) →
+    `brew upgrade x-mesh/tap/aic`로 위임.
+  - Manual(`install.sh` 결과) → GitHub `releases/latest`의 tag을 받아
+    archive 다운 + sha256 검증 + flate2/tar로 추출 → 세 binary를
+    원자적으로 교체. 디렉토리 권한이 없으면 `sudo install`로 fallback.
+    같은 디렉토리에 사이드카 binary가 없으면 그 항목만 skip하고
+    경고 출력.
+  - Cargo(`~/.cargo/bin`) → 자동 교체 거부, `cargo install --git ...`
+    안내.
+- **옵션** — `--check`(버전만 비교, 신버전이면 exit 1), `--force`,
+  `--to <TAG>`(특정 tag 고정).
+- **버전 비교** — semver(major.minor.patch) 기반, `v` prefix와 `-rc1`
+  류 suffix는 무시. `dev` 같은 비-숫자 버전은 항상 "구버전"으로
+  간주해 강제 재설치 없이도 update 가능 안내.
+- **신규 의존성** — `flate2 = "1"`, `tar = "0.4"` (release archive
+  추출용).
+
+### Added — aicd 30s 주기 stale 세션 reconcile 루프
+
+이전에는 `mark_stale_active_detached`가 `ListSessions`/`PruneSessions`
+요청 처리 시점에만 돌아서, 외부 호출이 없으면 비정상 종료된 active
+세션이 detached로 수렴하지 않았다.
+
+- **`control_server::RECONCILE_INTERVAL`**(30s) 상수 +
+  `pub fn spawn_reconcile_loop(ctx) -> JoinHandle<()>`. `tokio::time::
+  interval` + `MissedTickBehavior::Skip`. 첫 즉시 tick은 건너뛰고
+  한 주기 뒤부터 reconcile 시작.
+- **`aicd_main`**: `ControlContext`를 변수로 묶어 `clone()`으로 백그라운드
+  태스크 spawn, `serve()`가 shutdown으로 반환되면 `JoinHandle::abort()`.
+  `Notify` 경합 없이 `serve()`만 shutdown 신호를 기다림.
+- **idle 비용 0** — `mark_stale_active_detached`가 변경분 0이면
+  `persist_registry`를 호출하지 않으므로 디스크 I/O 없음. STALE 후보가
+  생긴 주기에서만 snapshot이 갱신된다.
+- **주기 = STALE_ACTIVE_AFTER 동일** — active → detached 전환이 한
+  주기 안에 잡히도록 의도적으로 같은 값.
+
+### Docs
+
+- **README.md / README.ko.md** — 원라이너 installer 섹션 + `aic update`
+  서브커맨드 사용 가이드 추가. 한국어 README는 톤도 함께 다듬어 LLM
+  분석/REPL 분기 설명 문구를 자연스럽게 정리.
+
+### Tests
+
+- aic-client `update` 모듈 9개 단위 테스트 — semver 비교, brew/manual/
+  cargo 분류, asset 이름 템플릿(`aic_<ver>_<os>_<arch>.tar.gz`),
+  archive 화이트리스트 추출(BINARIES 외 항목 무시), writable probe.
+- 전 워크스페이스 테스트 통과(failed = 0), `cargo clippy --workspace
+  -- -D warnings` 깨끗.
+
 ## [0.2.1] - 2026-04-30
 
 ### Added — Groq Cloud provider 정식 지원
