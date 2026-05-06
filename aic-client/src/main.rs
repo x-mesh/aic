@@ -240,6 +240,18 @@ enum Commands {
         #[command(subcommand)]
         op: DebugOp,
     },
+    /// 셀프 업데이트 — 설치 출처(brew/manual/cargo)를 감지해 적절히 처리한다.
+    Update {
+        /// 다운로드 없이 신버전 존재 여부만 확인. 최신이면 exit 0, 신버전이면 exit 1.
+        #[arg(long)]
+        check: bool,
+        /// 동일 버전이어도 강제 재설치.
+        #[arg(long)]
+        force: bool,
+        /// 특정 tag으로 고정 (예: `v0.3.1`). manual install에만 적용.
+        #[arg(long, value_name = "TAG")]
+        to: Option<String>,
+    },
     /// aicd supervisor daemon 관리 (Phase 1.5).
     Daemon {
         #[command(subcommand)]
@@ -604,6 +616,18 @@ async fn main() {
         Some(Commands::Debug { op }) => match op {
             DebugOp::Bundle => handle_debug_bundle().await,
         },
+        Some(Commands::Update { check, force, to }) => {
+            if let Err(e) = aic_client::update::run(aic_client::update::UpdateOptions {
+                check,
+                force,
+                pinned: to,
+            })
+            .await
+            {
+                eprintln!("aic update 실패: {e}");
+                std::process::exit(1);
+            }
+        }
         None => {
             // --record <prefix>가 있으면 history에서 매칭되는 record를 분석 흐름에 투입.
             if let Some(prefix) = cli.record_prefix.as_deref() {

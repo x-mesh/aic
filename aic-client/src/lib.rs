@@ -19,3 +19,4 @@ pub mod spinner;
 pub mod streaming;
 pub mod top;
 pub mod uds_client;
+pub mod update;
