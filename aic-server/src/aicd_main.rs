@@ -10,7 +10,7 @@
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
 use aic_common::{aicd_lock_path, aicd_registry_path, aicd_socket_path};
-use aic_server::control_server::{ControlContext, ControlServer};
+use aic_server::control_server::{spawn_reconcile_loop, ControlContext, ControlServer};
 use aic_server::hook_events::HookEventStore;
 use aic_server::lock::DaemonLock;
 use aic_server::session_registry::SessionRegistry;
@@ -84,14 +84,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hook_events = HookEventStore::new();
-    server
-        .serve(ControlContext {
-            shutdown,
-            registry: registry.clone(),
-            hook_events,
-            registry_path: Some(registry_path.clone()),
-        })
-        .await;
+    let control_ctx = ControlContext {
+        shutdown,
+        registry: registry.clone(),
+        hook_events,
+        registry_path: Some(registry_path.clone()),
+    };
+
+    // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
+    let reconcile_handle = spawn_reconcile_loop(control_ctx.clone());
+
+    server.serve(control_ctx).await;
+    reconcile_handle.abort();
     if let Err(e) = registry.save_snapshot(&registry_path).await {
         tracing::warn!(path = %registry_path.display(), error = %e, "registry snapshot 최종 저장 실패");
     }

@@ -18,6 +18,10 @@ use tokio::sync::Notify;
 
 const STALE_ACTIVE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 
+/// 백그라운드 reconcile 루프 주기. `STALE_ACTIVE_AFTER`와 같은 값을 써서
+/// active → detached 전환이 한 주기 안에 잡히도록 한다.
+const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Daemon 측에서 control_server가 외부 상태를 변경할 때 사용하는 핸들.
 /// shutdown trigger, session registry, hook event buffer를 보유한다.
 #[derive(Clone)]
@@ -265,6 +269,21 @@ async fn reconcile_stale_sessions(ctx: &ControlContext) {
         tracing::info!(count, "stale active 세션을 detached로 전환");
         persist_registry(ctx).await;
     }
+}
+
+/// `RECONCILE_INTERVAL` 주기로 `reconcile_stale_sessions`를 호출하는 백그라운드
+/// 태스크를 spawn한다. 호출자는 종료 시 반환된 핸들을 `abort()`해야 한다.
+pub fn spawn_reconcile_loop(ctx: ControlContext) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 첫 즉시 tick은 건너뛰고 한 주기 뒤부터 reconcile 시작.
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            reconcile_stale_sessions(&ctx).await;
+        }
+    })
 }
 
 async fn persist_registry(ctx: &ControlContext) {
