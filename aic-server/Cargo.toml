@@ -11,8 +11,20 @@ path = "src/main.rs"
 name = "aicd"
 path = "src/aicd_main.rs"
 
+[features]
+# Phase features — aic-common 과 동기화된다. aic-common 이 Phase 의 단일 원천이고,
+# 이곳의 feature 는 해당 feature 를 forwarding 하기만 한다. 빌드 시점에 정확히
+# 하나만 활성이어야 하며, aic-common/build.rs 가 이를 assert 한다.
+default = ["phase-3_1"]
+phase-3_1 = ["aic-common/phase-3_1"]
+phase-3_2 = ["aic-common/phase-3_2"]
+phase-3_3 = ["aic-common/phase-3_3"]
+phase-3_4 = ["aic-common/phase-3_4"]
+phase-3_5 = ["aic-common/phase-3_5"]
+
 [dependencies]
-aic-common = { path = "../aic-common" }
+aic-common = { path = "../aic-common", default-features = false }
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -32,3 +44,7 @@ clap = { version = "4", features = ["derive"] }
 proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
+# attach_server 테스트에서 AttachClientFrame::PtyBytes 를 만들 때 `Bytes` 타입을 직접 쓴다.
+# aic-common 이 이미 bytes = "1" 을 선언하고 있어 wire format 은 공유되지만, 여기선
+# test-only 편의를 위해 명시적으로 dev-dependency 로 가져온다.
+bytes = "1"

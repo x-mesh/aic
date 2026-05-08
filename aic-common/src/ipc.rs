@@ -41,10 +41,52 @@ pub enum IpcRequest {
     /// `aic run -- ...`가 만든 ExplicitCapture record를 history/--record/fix
     /// 흐름에 통합하기 위한 entry point. record.id가 비어 있으면 ring buffer
     /// push 시 자동으로 부여된다.
+    ///
+    /// 이 variant는 **세션 local socket** 경로 전용이다 (aic-session의 `UdsServer`가
+    /// 자기 session_id를 이미 알고 있으므로 record만 보낸다). `aicd` Control_UDS에서는
+    /// session_id 라우팅이 필요해 [`IpcRequest::RegisterRecordForSession`]을 사용한다
+    /// (R12.5 backwards-compat을 위해 본 variant는 유지).
     RegisterRecord(CommandRecord),
+    /// `aicd` CommandRecordStore에 세션별로 record를 등록한다 (Phase 3.1 Dual-Write).
+    ///
+    /// `record.capture_mode`에 따라 `push_pty` 또는 `push_explicit`으로 라우팅되며,
+    /// `Hook` 모드는 `CommandStarted`/`CommandFinished` 경로를 사용해야 하므로 거부된다.
+    RegisterRecordForSession {
+        session_id: String,
+        record: CommandRecord,
+    },
     /// `aicd` hook event store에서 특정 세션의 마지막 metadata-only command를 조회한다.
     GetLastCommandForSession {
         id: String,
+    },
+    /// `aicd` CommandRecordStore에서 특정 세션의 최근 `count`개 record를 조회한다 (R13.1).
+    ///
+    /// Phase 3.1의 `aic history` 및 Phase 3.2 client default read path에서 사용된다.
+    /// 응답은 시간순(oldest→newest) `CommandRecords`. 해당 session_id에 record가
+    /// 하나도 없으면 빈 Vec를 포함하는 `CommandRecords`로 응답한다 — client가
+    /// "no records found" UI를 직접 결정할 수 있도록.
+    GetRecentCommandsForSession {
+        id: String,
+        count: usize,
+    },
+    /// `aicd` CommandRecordStore에서 특정 세션의 최근 record들을 시간순(oldest→newest)
+    /// 으로 나열하고 `output_lines`를 flatten한 뒤 마지막 `count` 라인만 `Lines`로
+    /// 반환한다 (R13.1, R4.4).
+    ///
+    /// Phase 3.2 client default read path가 `GetRecentLines { count }`를 aicd로
+    /// 라우팅할 때 사용된다. 세션에 record가 없거나 `output_lines`가 모두 비어 있으면
+    /// 빈 Vec를 `Lines`로 반환한다 — list-op 성격에 맞춘다.
+    GetRecentLinesForSession {
+        id: String,
+        count: usize,
+    },
+    /// `aicd` CommandRecordStore에서 특정 세션의 record id prefix 검색 결과를
+    /// 시간순으로 반환한다 (R13.1, R4.4).
+    ///
+    /// 세션이 없거나 매칭이 없으면 빈 `CommandRecords`를 반환한다.
+    FindRecordByPrefixForSession {
+        id: String,
+        prefix: String,
     },
     Ping,
     GetMetrics,
@@ -120,7 +162,12 @@ pub enum IpcResponse {
 }
 
 /// 데몬 metric 스냅샷 (`aic top`/`aic-session metrics` 응답용).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Phase 3 centralized-record-store 도입 이후 `aicd` 측 metric(`central_store_push_total`,
+/// `attach_connections`, `attach_open_total`)과 `aic-session` 측 metric(`dropped_bytes`,
+/// `attach_reconnect_total`)이 같은 snapshot에 합쳐진다. 구 버전 데몬이 내려 주는 JSON에는
+/// 해당 필드가 없을 수 있어 모두 `#[serde(default)]`로 backwards-compatible 하게 유지한다.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     /// 데몬 시작 이후 경과 시간(초)
     pub uptime_secs: u64,
@@ -134,6 +181,21 @@ pub struct MetricsSnapshot {
     pub rb_capacity: usize,
     /// 마지막 명령어 종료 후 경과 초 (없으면 None)
     pub last_command_secs_ago: Option<u64>,
+    /// `aicd` CommandRecordStore에 push된 record 누적 수 (R14.1).
+    #[serde(default)]
+    pub central_store_push_total: u64,
+    /// `aicd` Attach_UDS의 현재 활성 연결 수 (R14.2, gauge).
+    #[serde(default)]
+    pub attach_connections: u64,
+    /// `aicd`가 수신한 `AttachOpen` 프레임 누적 수 (R14.3).
+    #[serde(default)]
+    pub attach_open_total: u64,
+    /// `aic-session`에서 backpressure로 drop된 byte 누적 수 (R14.4).
+    #[serde(default)]
+    pub dropped_bytes: u64,
+    /// `aic-session`의 Attach_UDS 재연결 시도 누적 수 (R14.5).
+    #[serde(default)]
+    pub attach_reconnect_total: u64,
 }
 
 // ── Length-prefixed framing ────────────────────────────────────
@@ -214,6 +276,39 @@ mod tests {
         assert_eq!(req, deserialized);
     }
 
+    #[test]
+    fn ipc_request_get_recent_commands_for_session_roundtrip() {
+        let req = IpcRequest::GetRecentCommandsForSession {
+            id: "deadbeef".to_string(),
+            count: 20,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn ipc_request_get_recent_lines_for_session_roundtrip() {
+        let req = IpcRequest::GetRecentLinesForSession {
+            id: "deadbeef".to_string(),
+            count: 200,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
+    #[test]
+    fn ipc_request_find_record_by_prefix_for_session_roundtrip() {
+        let req = IpcRequest::FindRecordByPrefixForSession {
+            id: "deadbeef".to_string(),
+            prefix: "ab12".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
     // ── IpcResponse 직렬화 ─────────────────────────────────────
 
     #[test]
@@ -255,6 +350,71 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, deserialized);
+    }
+
+    // ── Metrics backwards-compatibility ────────────────────────
+
+    #[test]
+    fn metrics_snapshot_default_is_zero() {
+        let snap = MetricsSnapshot::default();
+        assert_eq!(snap.uptime_secs, 0);
+        assert_eq!(snap.pid, 0);
+        assert_eq!(snap.ipc_request_count, 0);
+        assert_eq!(snap.rb_used, 0);
+        assert_eq!(snap.rb_capacity, 0);
+        assert_eq!(snap.last_command_secs_ago, None);
+        assert_eq!(snap.central_store_push_total, 0);
+        assert_eq!(snap.attach_connections, 0);
+        assert_eq!(snap.attach_open_total, 0);
+        assert_eq!(snap.dropped_bytes, 0);
+        assert_eq!(snap.attach_reconnect_total, 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_deserializes_legacy_payload_without_new_fields() {
+        // Phase 3 이전 데몬이 내려주던 payload 형태 (central_store/attach 필드 없음).
+        // serde(default) 덕분에 여전히 deserialize 되어야 한다 (R14 backwards-compat).
+        let legacy = r#"{
+            "uptime_secs": 42,
+            "pid": 12345,
+            "ipc_request_count": 7,
+            "rb_used": 3,
+            "rb_capacity": 100,
+            "last_command_secs_ago": 8
+        }"#;
+        let snap: MetricsSnapshot = serde_json::from_str(legacy).unwrap();
+        assert_eq!(snap.uptime_secs, 42);
+        assert_eq!(snap.pid, 12345);
+        assert_eq!(snap.ipc_request_count, 7);
+        assert_eq!(snap.rb_used, 3);
+        assert_eq!(snap.rb_capacity, 100);
+        assert_eq!(snap.last_command_secs_ago, Some(8));
+        // 신규 필드는 기본값 0
+        assert_eq!(snap.central_store_push_total, 0);
+        assert_eq!(snap.attach_connections, 0);
+        assert_eq!(snap.attach_open_total, 0);
+        assert_eq!(snap.dropped_bytes, 0);
+        assert_eq!(snap.attach_reconnect_total, 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_roundtrip_with_new_fields() {
+        let snap = MetricsSnapshot {
+            uptime_secs: 10,
+            pid: 9,
+            ipc_request_count: 3,
+            rb_used: 1,
+            rb_capacity: 64,
+            last_command_secs_ago: Some(2),
+            central_store_push_total: 11,
+            attach_connections: 2,
+            attach_open_total: 5,
+            dropped_bytes: 4096,
+            attach_reconnect_total: 1,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        let back: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(snap, back);
     }
 
     // ── Framing ────────────────────────────────────────────────
@@ -371,6 +531,13 @@ mod tests {
                     cwd,
                 }),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::GetLastCommandForSession { id }),
+            ("[0-9a-f]{1,8}", any::<usize>())
+                .prop_map(|(id, count)| IpcRequest::GetRecentCommandsForSession { id, count }),
+            ("[0-9a-f]{1,8}", any::<usize>())
+                .prop_map(|(id, count)| IpcRequest::GetRecentLinesForSession { id, count }),
+            ("[0-9a-f]{1,8}", "[0-9a-f]{1,16}").prop_map(|(id, prefix)| {
+                IpcRequest::FindRecordByPrefixForSession { id, prefix }
+            }),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
             (
                 "[0-9a-f]{1,8}",
@@ -378,6 +545,9 @@ mod tests {
             )
                 .prop_map(|(id, label)| IpcRequest::TagSession { id, label }),
             arb_command_record().prop_map(IpcRequest::RegisterRecord),
+            ("[0-9a-f]{1,8}", arb_command_record()).prop_map(|(session_id, record)| {
+                IpcRequest::RegisterRecordForSession { session_id, record }
+            }),
             (
                 "[0-9a-f]{1,8}",
                 "[0-9a-f]{1,16}",

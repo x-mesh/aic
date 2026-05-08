@@ -7,9 +7,10 @@
 //! Phase 1 sub-step 1: 최소 동작 — `Ping → Pong`만 처리한다. 이후 sub-step에서
 //! `ListSessions`, `GetMetrics`, `Shutdown` 등을 단계적으로 추가한다.
 
-use crate::hook_events::HookEventStore;
+use crate::command_record_store::CommandRecordStore;
+use crate::metrics::AicdMetrics;
 use crate::session_registry::SessionRegistry;
-use aic_common::{encode_frame, IpcRequest, IpcResponse};
+use aic_common::{encode_frame, CaptureMode, CommandRecord, IpcRequest, IpcResponse};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,13 +24,16 @@ const STALE_ACTIVE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Daemon 측에서 control_server가 외부 상태를 변경할 때 사용하는 핸들.
-/// shutdown trigger, session registry, hook event buffer를 보유한다.
+/// shutdown trigger, session registry, hook event buffer, aicd metric 카운터를 보유한다.
 #[derive(Clone)]
 pub struct ControlContext {
     pub shutdown: Arc<Notify>,
     pub registry: SessionRegistry,
-    pub hook_events: HookEventStore,
+    pub record_store: CommandRecordStore,
     pub registry_path: Option<PathBuf>,
+    /// Phase 3.1: `RegisterRecordForSession` 등 central store 경로 metric을 증가시킨다.
+    /// `Arc`로 공유해 이후 `AttachServer`/`SessionProcessorPool`과 동일 counter를 참조한다.
+    pub metrics: Arc<AicdMetrics>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -192,12 +196,49 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
                 }
             }
         }
-        IpcRequest::GetLastCommandForSession { id } => match ctx.hook_events.last(&id).await {
+        IpcRequest::GetLastCommandForSession { id } => match ctx.record_store.last(&id).await {
             Some(record) => IpcResponse::CommandData(record),
             None => IpcResponse::Error {
                 message: format!("hook metadata record를 찾을 수 없습니다: {id}"),
             },
         },
+        // Phase 3.1 Task 1.8 / Phase 3.2 Task 2.1: `aic history` 및 Phase 3.2 read path가 사용한다.
+        // list-op 성격(recent / find_by_prefix / recent_lines)이므로 해당 세션에 record가
+        // 없어도 빈 Vec로 응답한다 — client가 "no records" UI를 직접 결정할 수 있도록.
+        IpcRequest::GetRecentCommandsForSession { id, count } => {
+            IpcResponse::CommandRecords(ctx.record_store.recent(&id, count).await)
+        }
+        IpcRequest::GetRecentLinesForSession { id, count } => {
+            // oldest→newest 순서로 record들을 가져온 뒤 output_lines를 flatten,
+            // 마지막 `count` 라인만 tail로 잘라낸다. `ring_buffer::recent_lines`와 동일 의미.
+            let records = ctx.record_store.recent(&id, usize::MAX).await;
+            let lines = tail_flatten_output_lines(&records, count);
+            IpcResponse::Lines(lines)
+        }
+        IpcRequest::FindRecordByPrefixForSession { id, prefix } => {
+            IpcResponse::CommandRecords(ctx.record_store.find_by_prefix(&id, &prefix).await)
+        }
+        IpcRequest::RegisterRecordForSession { session_id, record } => {
+            // Phase 3.1 Dual-Write: aic-session이 보낸 PTY/Explicit record를
+            // aicd CommandRecordStore에 라우팅한다 (R3.4, R14.1).
+            match record.capture_mode {
+                CaptureMode::Pty => {
+                    ctx.record_store.push_pty(&session_id, record).await;
+                    ctx.metrics.inc_central_store_push();
+                    IpcResponse::Pong
+                }
+                CaptureMode::ExplicitCapture => {
+                    ctx.record_store.push_explicit(&session_id, record).await;
+                    ctx.metrics.inc_central_store_push();
+                    IpcResponse::Pong
+                }
+                CaptureMode::Hook => IpcResponse::Error {
+                    message: "Hook capture_mode record는 RegisterRecordForSession 대신 \
+                        CommandStarted/CommandFinished 경로를 사용해야 합니다"
+                        .to_string(),
+                },
+            }
+        }
         IpcRequest::CommandStarted {
             session_id,
             command_id,
@@ -211,7 +252,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
                 .upsert_hook_session(&session_id, pid, shell, cwd.clone(), started_at)
                 .await;
             persist_registry(ctx).await;
-            ctx.hook_events
+            ctx.record_store
                 .on_started(&session_id, &command_id, command, cwd, started_at)
                 .await;
             IpcResponse::Pong
@@ -226,7 +267,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             if ctx.registry.touch_seen(&session_id, finished_at).await {
                 persist_registry(ctx).await;
             }
-            ctx.hook_events
+            ctx.record_store
                 .on_finished(
                     &session_id,
                     &command_id,
@@ -239,7 +280,7 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         }
         // hook mode에서 마지막 metadata-only record를 조회한다.
         // 일반 GetLastCommand는 aic-session ring buffer 전용이지만, AIC_SESSION_ID가
-        // 있고 aicd hook_events에 record가 있으면 hook record를 반환한다.
+        // 있고 aicd record_store에 record가 있으면 hook record를 반환한다.
         IpcRequest::GetLastCommand => {
             // Phase 3.x: 정확한 session 라우팅이 필요해 일단 graceful Error.
             // 사용자가 aic --session <id> 형태로 호출하면 client가 적절히 routing.
@@ -249,15 +290,58 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
                     .to_string(),
             }
         }
+        // Task 6.3: aicd의 central store / attach metric snapshot을 내려준다 (R14.1~R14.5).
+        //
+        // `AicdMetrics::snapshot()` 은 `central_store_push_total` / `attach_connections` /
+        // `attach_open_total` 을 채운 `MetricsSnapshot` 을 빌드한다. uptime/pid/ipc_request_count
+        // 같은 기본 필드도 함께 채워지므로 `aic top` 같은 구 버전 consumer 도 그대로 동작한다.
+        // aic-session 쪽의 `dropped_bytes` / `attach_reconnect_total` 은 aicd 에는 존재하지
+        // 않으므로 snapshot 기본값(0) 이 그대로 유지된다. client 는 세션 GetMetrics 를 별도로
+        // 조회해 합쳐 본다.
+        IpcRequest::GetMetrics => IpcResponse::Metrics(ctx.metrics.snapshot()),
         // 그 외 session-level request는 aicd의 책임이 아니다.
         IpcRequest::GetRecentLines { .. }
         | IpcRequest::GetRecentCommands { .. }
         | IpcRequest::FindRecordByPrefix { .. }
-        | IpcRequest::RegisterRecord(_)
-        | IpcRequest::GetMetrics => IpcResponse::Error {
+        | IpcRequest::RegisterRecord(_) => IpcResponse::Error {
             message: format!("aicd는 세션 데이터 요청을 직접 처리하지 않습니다: {request:?}"),
         },
     }
+}
+
+/// oldest→newest 순서의 record 슬라이스에서 `output_lines`를 flatten한 뒤
+/// 마지막 `count` 라인만 tail로 잘라낸다.
+///
+/// `aic-server/src/ring_buffer.rs::recent_lines`와 동일 시맨틱:
+/// - `count == 0` → 빈 Vec.
+/// - `output_lines` 전체 길이가 `count`보다 작으면 전체를 그대로 반환.
+/// - 그 이상이면 뒤에서부터 `count` 라인만 시간순으로 반환.
+fn tail_flatten_output_lines(records: &[CommandRecord], count: usize) -> Vec<String> {
+    if count == 0 {
+        return Vec::new();
+    }
+    // 뒤에서부터 필요한 만큼 수집한 뒤 뒤집어서 시간순으로 반환.
+    let mut collected: Vec<String> = Vec::with_capacity(count);
+    let mut remaining = count;
+    for record in records.iter().rev() {
+        let lines = &record.output_lines;
+        if lines.len() <= remaining {
+            for line in lines.iter().rev() {
+                collected.push(line.clone());
+            }
+            remaining -= lines.len();
+        } else {
+            for line in lines[lines.len() - remaining..].iter().rev() {
+                collected.push(line.clone());
+            }
+            remaining = 0;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    collected.reverse();
+    collected
 }
 
 async fn reconcile_stale_sessions(ctx: &ControlContext) {
@@ -371,14 +455,16 @@ fn path_matches_aic_session(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::AicdMetrics;
     use std::time::Duration;
 
     fn ctx() -> ControlContext {
         ControlContext {
             shutdown: Arc::new(Notify::new()),
             registry: SessionRegistry::new(),
-            hook_events: HookEventStore::new(),
+            record_store: CommandRecordStore::new(),
             registry_path: None,
+            metrics: Arc::new(AicdMetrics::new()),
         }
     }
 
@@ -676,9 +762,14 @@ mod tests {
 
     #[tokio::test]
     async fn session_data_request_rejected_with_error() {
-        // Phase 3 이후 GetLastCommand는 hook routing 안내 에러를, 나머지 세션-데이터 요청은
-        // 기존 "aicd는 세션 데이터" 에러를 반환한다.
-        let resp = process_control_request(IpcRequest::GetMetrics, &ctx()).await;
+        // Phase 3 이후 GetLastCommand는 hook routing 안내 에러를, session data 조회 request들은
+        // 기존 "aicd는 세션 데이터" 에러를 반환한다. GetMetrics는 aicd metric 스냅샷이라 별도
+        // 경로(아래 `get_metrics_returns_aicd_snapshot` 참조)로 처리된다.
+        let resp = process_control_request(
+            IpcRequest::GetRecentLines { count: 10 },
+            &ctx(),
+        )
+        .await;
         match resp {
             IpcResponse::Error { message } => {
                 assert!(message.contains("aicd는 세션 데이터"), "actual: {message}");
@@ -695,6 +786,77 @@ mod tests {
                 );
             }
             other => panic!("Error 응답을 기대했지만 {other:?}"),
+        }
+    }
+
+    /// Task 6.3: aicd Control_UDS의 `GetMetrics`는 `AicdMetrics::snapshot()`을 그대로
+    /// 내려준다. central_store_push_total/attach_connections/attach_open_total이 실제
+    /// 카운터 값을 반영하는지, aic-session 쪽 필드(dropped_bytes/attach_reconnect_total)는
+    /// 기본값 0 으로 유지되는지 함께 확인한다 (R14.1~R14.5).
+    #[tokio::test]
+    async fn get_metrics_returns_aicd_snapshot() {
+        // metric init 은 process-global latch 라 테스트마다 호출해도 무해하다.
+        crate::metrics::init();
+        let c = ctx();
+
+        // 카운터 몇 번 올린 뒤 snapshot 을 GetMetrics 로 조회한다. 직접 inc_* 를 호출해
+        // 다른 경로(store push 등) 부작용 없이 snapshot 빌더만 검증한다.
+        c.metrics.inc_central_store_push();
+        c.metrics.inc_central_store_push();
+        c.metrics.inc_central_store_push();
+        c.metrics.inc_attach_open();
+        c.metrics.inc_attach_connection();
+        c.metrics.inc_attach_connection();
+
+        let resp = process_control_request(IpcRequest::GetMetrics, &c).await;
+        match resp {
+            IpcResponse::Metrics(snap) => {
+                assert_eq!(snap.central_store_push_total, 3, "R14.1");
+                assert_eq!(snap.attach_open_total, 1, "R14.3");
+                assert_eq!(snap.attach_connections, 2, "R14.2 (gauge)");
+                // aic-session 전용 필드는 aicd snapshot 에서는 기본값 유지.
+                assert_eq!(snap.dropped_bytes, 0, "R14.4 — aicd에서는 0");
+                assert_eq!(snap.attach_reconnect_total, 0, "R14.5 — aicd에서는 0");
+                // 기본 필드도 채워져 있어야 `aic top` 같은 구 버전 consumer 가 동작한다.
+                assert_eq!(snap.pid, std::process::id());
+            }
+            other => panic!("Metrics 응답을 기대 — actual: {other:?}"),
+        }
+    }
+
+    /// `RegisterRecordForSession` 으로 push 가 성공하면 snapshot 의
+    /// `central_store_push_total` 이 함께 증가한다 — Task 1.5 의 metric wiring 이
+    /// GetMetrics 경로에서 실제로 관측되는지 end-to-end 로 검증한다 (R14.1).
+    #[tokio::test]
+    async fn get_metrics_reflects_register_record_push() {
+        crate::metrics::init();
+        let c = ctx();
+        // Pty record 2개 + Explicit record 1개 push.
+        for _ in 0..2 {
+            let _ = process_control_request(
+                IpcRequest::RegisterRecordForSession {
+                    session_id: "s1".to_string(),
+                    record: make_record(aic_common::CaptureMode::Pty, "ls"),
+                },
+                &c,
+            )
+            .await;
+        }
+        let _ = process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "s1".to_string(),
+                record: make_record(aic_common::CaptureMode::ExplicitCapture, "aic run ls"),
+            },
+            &c,
+        )
+        .await;
+
+        let resp = process_control_request(IpcRequest::GetMetrics, &c).await;
+        match resp {
+            IpcResponse::Metrics(snap) => {
+                assert_eq!(snap.central_store_push_total, 3);
+            }
+            other => panic!("Metrics 기대 — {other:?}"),
         }
     }
 
@@ -730,11 +892,489 @@ mod tests {
         .await;
         assert_eq!(end, IpcResponse::Pong);
 
-        let rec = c.hook_events.last("abcd1234").await.unwrap();
+        let rec = c.record_store.last("abcd1234").await.unwrap();
         assert_eq!(rec.command.as_deref(), Some("ls -la"));
         assert_eq!(rec.exit_code, 7);
         assert_eq!(rec.capture_mode, aic_common::CaptureMode::Hook);
     }
+
+    // ── Phase 3.1 Task 1.5: RegisterRecordForSession 라우팅 ───────────────
+
+    fn make_record(capture_mode: aic_common::CaptureMode, command: &str) -> aic_common::CommandRecord {
+        aic_common::CommandRecord {
+            id: String::new(),
+            command: Some(command.to_string()),
+            exit_code: 0,
+            output_lines: vec![format!("out-{command}")],
+            timestamp: chrono::Utc::now(),
+            capture_mode,
+            capture_quality: aic_common::CaptureQuality::FullOutput,
+            output_metadata: None,
+        }
+    }
+
+    /// PTY record는 `push_pty` 경로로 들어가고 metric이 증가한다 (R3.4, R14.1).
+    #[tokio::test]
+    async fn register_record_for_session_routes_pty_to_store() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "sess-pty".to_string(),
+                record: make_record(aic_common::CaptureMode::Pty, "ls"),
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
+
+        let recs = c.record_store.recent("sess-pty", 10).await;
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].command.as_deref(), Some("ls"));
+        assert_eq!(recs[0].capture_mode, aic_common::CaptureMode::Pty);
+        // id가 비어 있던 record는 store에서 16-hex id를 부여받는다.
+        assert_eq!(recs[0].id.len(), 16);
+        assert_eq!(c.metrics.central_store_push_total(), 1);
+    }
+
+    /// ExplicitCapture record는 `push_explicit` 경로로 들어간다 (R3.4, R14.1).
+    #[tokio::test]
+    async fn register_record_for_session_routes_explicit_to_store() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "sess-exp".to_string(),
+                record: make_record(aic_common::CaptureMode::ExplicitCapture, "aic run ls"),
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
+
+        let recs = c.record_store.recent("sess-exp", 10).await;
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].capture_mode, aic_common::CaptureMode::ExplicitCapture);
+        assert_eq!(recs[0].command.as_deref(), Some("aic run ls"));
+        assert_eq!(c.metrics.central_store_push_total(), 1);
+    }
+
+    /// Hook capture_mode는 CommandStarted/CommandFinished 경로 전용이라 Error로 거부된다.
+    #[tokio::test]
+    async fn register_record_for_session_rejects_hook_mode() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "sess-hook".to_string(),
+                record: make_record(aic_common::CaptureMode::Hook, "hook-cmd"),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("CommandStarted"),
+                    "expected Hook rejection message, got: {message}"
+                );
+            }
+            other => panic!("Error 응답을 기대 — actual: {other:?}"),
+        }
+        // store에 push되지 않았고 metric도 증가하지 않아야 한다.
+        assert_eq!(c.record_store.len("sess-hook").await, 0);
+        assert_eq!(c.metrics.central_store_push_total(), 0);
+    }
+
+    /// 알려지지 않은 session_id라도 push는 성공해야 한다 (session_id는 store에서 새 ring을 연다).
+    #[tokio::test]
+    async fn register_record_for_session_accepts_unknown_session() {
+        let c = ctx();
+        // registry에 미등록 + record_store에도 처음 보는 session_id.
+        assert_eq!(c.record_store.len("never-seen").await, 0);
+
+        let resp = process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "never-seen".to_string(),
+                record: make_record(aic_common::CaptureMode::Pty, "echo hi"),
+            },
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
+        assert_eq!(c.record_store.len("never-seen").await, 1);
+        assert_eq!(c.metrics.central_store_push_total(), 1);
+    }
+
+    /// 여러 세션에 번갈아 push해도 metric은 누적되고 세션 간 record는 섞이지 않는다.
+    #[tokio::test]
+    async fn register_record_for_session_isolates_sessions_and_counts() {
+        let c = ctx();
+        for _ in 0..3 {
+            process_control_request(
+                IpcRequest::RegisterRecordForSession {
+                    session_id: "sa".to_string(),
+                    record: make_record(aic_common::CaptureMode::Pty, "cmd-a"),
+                },
+                &c,
+            )
+            .await;
+        }
+        for _ in 0..2 {
+            process_control_request(
+                IpcRequest::RegisterRecordForSession {
+                    session_id: "sb".to_string(),
+                    record: make_record(aic_common::CaptureMode::ExplicitCapture, "cmd-b"),
+                },
+                &c,
+            )
+            .await;
+        }
+
+        assert_eq!(c.record_store.len("sa").await, 3);
+        assert_eq!(c.record_store.len("sb").await, 2);
+        assert_eq!(c.metrics.central_store_push_total(), 5);
+
+        // 각 세션의 recent에는 해당 세션 command만.
+        for r in c.record_store.recent("sa", 10).await {
+            assert_eq!(r.command.as_deref(), Some("cmd-a"));
+        }
+        for r in c.record_store.recent("sb", 10).await {
+            assert_eq!(r.command.as_deref(), Some("cmd-b"));
+        }
+    }
+
+    /// legacy `RegisterRecord(CommandRecord)` variant는 session socket 경로 전용이므로
+    /// aicd에서는 여전히 graceful Error로 거부된다 (R12.5 backwards-compat).
+    #[tokio::test]
+    async fn legacy_register_record_variant_still_rejected() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::RegisterRecord(make_record(aic_common::CaptureMode::Pty, "legacy")),
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("aicd는 세션 데이터"),
+                    "expected session-data rejection, got: {message}"
+                );
+            }
+            other => panic!("Error 응답을 기대 — actual: {other:?}"),
+        }
+        assert_eq!(c.metrics.central_store_push_total(), 0);
+    }
+
+    // ── Phase 3.2 Task 2.1: 세션-라우팅 read variants ────────────────────
+
+    /// GetRecentCommandsForSession: 세션의 recent를 시간순(oldest→newest) Vec로 반환한다.
+    /// 세션이 비어 있으면 빈 Vec (list-op 성격, R4.4).
+    #[tokio::test]
+    async fn get_recent_commands_for_session_returns_oldest_to_newest() {
+        let c = ctx();
+        for i in 0..3 {
+            process_control_request(
+                IpcRequest::RegisterRecordForSession {
+                    session_id: "sess".to_string(),
+                    record: make_record(aic_common::CaptureMode::Pty, &format!("cmd{i}")),
+                },
+                &c,
+            )
+            .await;
+        }
+        let resp = process_control_request(
+            IpcRequest::GetRecentCommandsForSession {
+                id: "sess".to_string(),
+                count: 10,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => {
+                assert_eq!(recs.len(), 3);
+                for (i, r) in recs.iter().enumerate() {
+                    assert_eq!(r.command.as_deref(), Some(format!("cmd{i}").as_str()));
+                }
+            }
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+    }
+
+    /// 세션에 record가 없으면 `GetRecentCommandsForSession`는 빈 Vec를 반환한다 (list-op).
+    #[tokio::test]
+    async fn get_recent_commands_for_session_empty_on_missing_session() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::GetRecentCommandsForSession {
+                id: "never".to_string(),
+                count: 5,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => assert!(recs.is_empty()),
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+    }
+
+    /// GetRecentLinesForSession: 해당 세션의 record들의 `output_lines`를 flatten하고
+    /// 마지막 `count` 라인만 시간순으로 반환한다 (R4.4).
+    #[tokio::test]
+    async fn get_recent_lines_for_session_tails_flattened_output() {
+        let c = ctx();
+        // record 2개: ["a","b"] + ["c","d","e"] → 총 5 라인.
+        let mut r1 = make_record(aic_common::CaptureMode::Pty, "first");
+        r1.output_lines = vec!["a".into(), "b".into()];
+        let mut r2 = make_record(aic_common::CaptureMode::Pty, "second");
+        r2.output_lines = vec!["c".into(), "d".into(), "e".into()];
+        process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "sess".to_string(),
+                record: r1,
+            },
+            &c,
+        )
+        .await;
+        process_control_request(
+            IpcRequest::RegisterRecordForSession {
+                session_id: "sess".to_string(),
+                record: r2,
+            },
+            &c,
+        )
+        .await;
+
+        // tail 3: record 경계를 넘겨서도 순서 유지.
+        let resp = process_control_request(
+            IpcRequest::GetRecentLinesForSession {
+                id: "sess".to_string(),
+                count: 3,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Lines(lines) => assert_eq!(lines, vec!["c", "d", "e"]),
+            other => panic!("Lines 기대 — {other:?}"),
+        }
+
+        // tail 4: 첫 record의 마지막 라인 + 두 번째 record 전체.
+        let resp = process_control_request(
+            IpcRequest::GetRecentLinesForSession {
+                id: "sess".to_string(),
+                count: 4,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Lines(lines) => assert_eq!(lines, vec!["b", "c", "d", "e"]),
+            other => panic!("Lines 기대 — {other:?}"),
+        }
+
+        // count=0 → 빈 Vec.
+        let resp = process_control_request(
+            IpcRequest::GetRecentLinesForSession {
+                id: "sess".to_string(),
+                count: 0,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Lines(lines) => assert!(lines.is_empty()),
+            other => panic!("Lines 기대 — {other:?}"),
+        }
+    }
+
+    /// 없는 세션에 대한 GetRecentLinesForSession은 빈 Lines를 반환한다.
+    #[tokio::test]
+    async fn get_recent_lines_for_session_empty_on_missing_session() {
+        let c = ctx();
+        let resp = process_control_request(
+            IpcRequest::GetRecentLinesForSession {
+                id: "never".to_string(),
+                count: 10,
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::Lines(lines) => assert!(lines.is_empty()),
+            other => panic!("Lines 기대 — {other:?}"),
+        }
+    }
+
+    /// FindRecordByPrefixForSession: 세션 scope 내에서만 prefix 매칭.
+    #[tokio::test]
+    async fn find_record_by_prefix_for_session_scopes_to_session() {
+        let c = ctx();
+        // 세션 "a"에는 id가 "aaaa..."인 record만, "b"에는 "bbbb..."인 것만.
+        let mut ra1 = make_record(aic_common::CaptureMode::Pty, "a-one");
+        ra1.id = "aaaa000000000001".into();
+        let mut ra2 = make_record(aic_common::CaptureMode::Pty, "a-two");
+        ra2.id = "aaaa000000000002".into();
+        let mut rb1 = make_record(aic_common::CaptureMode::Pty, "b-one");
+        rb1.id = "bbbb000000000001".into();
+        for (sess, rec) in [("a", ra1), ("a", ra2), ("b", rb1)] {
+            process_control_request(
+                IpcRequest::RegisterRecordForSession {
+                    session_id: sess.to_string(),
+                    record: rec,
+                },
+                &c,
+            )
+            .await;
+        }
+
+        // "a" scope에서 aaaa 매칭 → 2개.
+        let resp = process_control_request(
+            IpcRequest::FindRecordByPrefixForSession {
+                id: "a".to_string(),
+                prefix: "aaaa".to_string(),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => {
+                assert_eq!(recs.len(), 2);
+                assert!(recs.iter().all(|r| r.id.starts_with("aaaa")));
+            }
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+
+        // "b" scope에서 aaaa 매칭 → 0개.
+        let resp = process_control_request(
+            IpcRequest::FindRecordByPrefixForSession {
+                id: "b".to_string(),
+                prefix: "aaaa".to_string(),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => assert!(recs.is_empty()),
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+
+        // 빈 prefix → find_by_prefix는 빈 Vec를 반환 (store 계약, R1.5).
+        let resp = process_control_request(
+            IpcRequest::FindRecordByPrefixForSession {
+                id: "a".to_string(),
+                prefix: "".to_string(),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => assert!(recs.is_empty()),
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+
+        // 없는 session → 빈 Vec.
+        let resp = process_control_request(
+            IpcRequest::FindRecordByPrefixForSession {
+                id: "missing".to_string(),
+                prefix: "aaaa".to_string(),
+            },
+            &c,
+        )
+        .await;
+        match resp {
+            IpcResponse::CommandRecords(recs) => assert!(recs.is_empty()),
+            other => panic!("CommandRecords 기대 — {other:?}"),
+        }
+    }
+
+    /// `GetLastCommand` (session_id 없음)는 aicd에서 graceful Error 유지 (R7.3, R12.3).
+    #[tokio::test]
+    async fn get_last_command_without_session_returns_graceful_error() {
+        let c = ctx();
+        let resp = process_control_request(IpcRequest::GetLastCommand, &c).await;
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.contains("세션 ID 라우팅"),
+                    "expected routing hint, got: {message}"
+                );
+            }
+            other => panic!("Error 기대 — {other:?}"),
+        }
+    }
+
+    /// `tail_flatten_output_lines` 헬퍼 직접 검증 — record 경계를 넘는 flatten.
+    #[test]
+    fn tail_flatten_output_lines_mirrors_ring_buffer_semantics() {
+        let rec = |lines: &[&str]| CommandRecord {
+            id: String::new(),
+            command: None,
+            exit_code: 0,
+            output_lines: lines.iter().map(|s| (*s).to_string()).collect(),
+            timestamp: chrono::Utc::now(),
+            capture_mode: CaptureMode::Pty,
+            capture_quality: aic_common::CaptureQuality::FullOutput,
+            output_metadata: None,
+        };
+        let records = vec![rec(&["a", "b"]), rec(&["c", "d", "e"])];
+
+        assert_eq!(tail_flatten_output_lines(&records, 0), Vec::<String>::new());
+        assert_eq!(tail_flatten_output_lines(&records, 3), vec!["c", "d", "e"]);
+        assert_eq!(
+            tail_flatten_output_lines(&records, 4),
+            vec!["b", "c", "d", "e"]
+        );
+        assert_eq!(
+            tail_flatten_output_lines(&records, 5),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        // n > total → 모든 라인을 시간순으로.
+        assert_eq!(
+            tail_flatten_output_lines(&records, 10),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        // 빈 입력.
+        assert_eq!(tail_flatten_output_lines(&[], 5), Vec::<String>::new());
+    }
+
+    /// R12.4: IPC 역직렬화에 실패하면 handle_client가 graceful Error 응답을 돌려준다.
+    /// 이 테스트는 socket 레벨에서 raw JSON 문자열을 frame하여 불량 payload를 전송하고
+    /// 서버가 연결을 끊거나 panic 하지 않음을 확인한다.
+    #[tokio::test]
+    async fn malformed_ipc_request_returns_graceful_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("aicd.sock");
+        let server = ControlServer::bind(&sock_path).await.unwrap();
+        let c = ctx();
+        let shutdown = Arc::clone(&c.shutdown);
+        let serve_handle = tokio::spawn(async move { server.serve(c).await });
+
+        let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        // IpcRequest로 역직렬화되지 않는 JSON (미지 variant 이름).
+        let garbage = br#"{"UnknownVariantXyz":{"foo":42}}"#;
+        let frame = encode_frame(garbage);
+        client.write_all(&frame).await.unwrap();
+        let mut len_buf = [0u8; 4];
+        client.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp_buf = vec![0u8; resp_len];
+        client.read_exact(&mut resp_buf).await.unwrap();
+        let resp: IpcResponse = serde_json::from_slice(&resp_buf).unwrap();
+        match resp {
+            IpcResponse::Error { message } => {
+                assert!(
+                    message.starts_with("unknown request"),
+                    "expected 'unknown request' prefix, got: {message}"
+                );
+            }
+            other => panic!("Error 기대 — {other:?}"),
+        }
+
+        shutdown.notify_one();
+        let _ = tokio::time::timeout(Duration::from_secs(2), serve_handle).await;
+    }
+
+    // ── 기존 socket smoke tests ─────────────────────────────────────────
 
     async fn ping_through_socket(sock_path: &Path) -> IpcResponse {
         let mut client = tokio::net::UnixStream::connect(sock_path).await.unwrap();

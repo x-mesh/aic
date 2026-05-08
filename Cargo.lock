@@ -49,6 +49,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "toml",
+ "tracing",
  "unicode-width 0.2.0",
 ]
 
@@ -57,6 +58,7 @@ name = "aic-common"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "libc",
  "proptest",
@@ -64,8 +66,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-test",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -74,6 +78,7 @@ version = "0.4.0"
 dependencies = [
  "aic-common",
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "libc",

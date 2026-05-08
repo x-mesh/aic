@@ -5,7 +5,7 @@ use aic_client::error_analyzer::{clean_output_lines, ErrorAnalyzer};
 use aic_client::llm_dispatcher::LlmDispatcher;
 use aic_client::local_record;
 use aic_client::repl::ReplSession;
-use aic_client::uds_client::UdsClient;
+use aic_client::uds_client::{ReadCascade, UdsClient};
 use aic_common::{
     AicError, AnalysisResult, AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig,
     ProviderType, ServerConfig,
@@ -579,7 +579,7 @@ async fn main() {
             failed,
             json,
             session,
-        }) => handle_history(limit, failed, json, session).await,
+        }) => aic_client::history::run(session, limit, failed, json).await,
         Some(Commands::Last { json, session }) => handle_last(json, session).await,
         Some(Commands::CaptureLast { yes, session }) => {
             handle_capture_last(yes, session, cli.provider).await
@@ -735,19 +735,34 @@ fn handle_config_show(json: bool, show_secrets: bool) {
 /// `--record <prefix>` 또는 last record를 조회해 단일 CommandRecord를 반환한다.
 /// `aic fix`/`aic capture-last`/`aic learn`/`aic feedback`/--record 분기에서
 /// 공유하는 record 결정 로직.
+///
+/// Phase 3.2 Task 2.2: socket path 로부터 session_id 를 추출할 수 있으면
+/// `ReadCascade` 로 aicd → session socket 순으로 조회한다. session_id 추출이
+/// 실패하는 경우에만 legacy `UdsClient` 단일-소켓 경로로 폴백한다.
 async fn resolve_record(
     client: &UdsClient,
     sock_display: std::path::Display<'_>,
     record_prefix: Option<&str>,
 ) -> anyhow::Result<aic_common::CommandRecord> {
+    // cascade 대상 socket path 를 복원. display 는 PathBuf 의 reference 이므로
+    // 직접 재귀 추출하는 대신 sock_display 의 문자열에서 PathBuf 를 재구성한다.
+    let sock_path = std::path::PathBuf::from(sock_display.to_string());
+    let cascade = build_cascade_for_session_path(&sock_path);
+
     if let Some(prefix) = record_prefix.map(str::trim).filter(|s| !s.is_empty()) {
         if !aic_common::is_valid_record_id(prefix) {
             anyhow::bail!("record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)");
         }
-        let matched = client
-            .find_record_by_prefix(prefix)
-            .await
-            .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({sock_display}): {e}"))?;
+        let matched = if let Some(ref c) = cascade {
+            c.find_record_by_prefix(prefix)
+                .await
+                .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({sock_display}): {e}"))?
+        } else {
+            client
+                .find_record_by_prefix(prefix)
+                .await
+                .map_err(|e| anyhow::anyhow!("세션 record 조회 실패 ({sock_display}): {e}"))?
+        };
         match matched.len() {
             0 => anyhow::bail!(
                 "prefix '{prefix}'와 일치하는 record가 없습니다 — `aic history`로 id를 확인하세요"
@@ -770,6 +785,16 @@ async fn resolve_record(
                     preview.join("\n")
                 );
             }
+        }
+    } else if let Some(ref c) = cascade {
+        match c.get_last_command().await {
+            Ok(Some(rec)) => Ok(rec),
+            Ok(None) => Err(anyhow::anyhow!(
+                "마지막 record가 없습니다 ({sock_display}) — aic-session 안에서 명령을 실행한 뒤 다시 시도하세요"
+            )),
+            Err(e) => Err(anyhow::anyhow!(
+                "마지막 record 조회 실패 ({sock_display}): {e}"
+            )),
         }
     } else {
         client
@@ -1958,7 +1983,20 @@ async fn print_status_once(session: Option<&str>) {
             }
         }
 
-        match client.get_last_command().await {
+        // Phase 3.2 Task 2.2: cascade 를 선호하고, 가능하지 않으면 legacy 단일-소켓 경로.
+        let status_cascade = build_cascade_for_session_path(&socket_path);
+        let last_res = if let Some(ref c) = status_cascade {
+            match c.get_last_command().await {
+                Ok(Some(r)) => Ok(r),
+                Ok(None) => Err(aic_common::AicError::UserMessage(
+                    "저장된 명령어가 없습니다".to_string(),
+                )),
+                Err(e) => Err(e),
+            }
+        } else {
+            client.get_last_command().await
+        };
+        match last_res {
             Ok(rec) => {
                 let cmd = rec.command.as_deref().unwrap_or("(unknown)");
                 println!();
@@ -1972,7 +2010,6 @@ async fn print_status_once(session: Option<&str>) {
         }
     }
 }
-
 /// `aic doctor [--json]`: 환경 진단 리포트 출력. FAIL이 하나라도 있으면 exit 1.
 async fn handle_doctor_fix(dry_run: bool) {
     println!(
@@ -2065,8 +2102,21 @@ async fn handle_doctor_fix(dry_run: bool) {
 async fn handle_doctor(json: bool, session: Option<String>) {
     let socket = resolve_socket(session.as_deref());
     let results = aic_client::doctor::run_all_checks(&socket).await;
+    // Central Store 섹션 (R14.6): 세션 socket 이 실제로 존재할 때만 GetMetrics 를 시도.
+    // 없거나 실패하면 report 내부의 session_metrics_error 에 기록된다.
+    let session_socket: Option<&std::path::Path> = if socket.exists() { Some(&socket) } else { None };
+    let central_store = aic_client::doctor::probe_central_store_default(session_socket).await;
     if json {
-        match serde_json::to_string_pretty(&results) {
+        #[derive(serde::Serialize)]
+        struct DoctorReport<'a> {
+            checks: &'a [aic_client::doctor::CheckResult],
+            central_store: &'a aic_client::doctor::CentralStoreReport,
+        }
+        let report = DoctorReport {
+            checks: &results,
+            central_store: &central_store,
+        };
+        match serde_json::to_string_pretty(&report) {
             Ok(s) => println!("{s}"),
             Err(e) => {
                 eprintln!("JSON 직렬화 실패: {e}");
@@ -2075,6 +2125,7 @@ async fn handle_doctor(json: bool, session: Option<String>) {
         }
     } else {
         aic_client::doctor::print_report(&results);
+        aic_client::doctor::print_central_store_section(&central_store);
     }
     let any_fail = results
         .iter()
@@ -2920,7 +2971,21 @@ async fn handle_sessions_interactive() {
             // 직전 record 분석 흐름. ad-hoc — 가장 최근 record 1건을 받아 handle_record 호출.
             let sock = resolve_socket(Some(&id));
             let session_client = UdsClient::new(sock.clone());
-            match session_client.get_last_command().await {
+            // Phase 3.2 Task 2.2: cascade 가 가능한 경우 aicd → session 순으로 조회.
+            let cascade = build_cascade_for_session_path(&sock);
+            let lookup: Result<aic_common::CommandRecord, aic_common::AicError> =
+                if let Some(ref c) = cascade {
+                    match c.get_last_command().await {
+                        Ok(Some(r)) => Ok(r),
+                        Ok(None) => Err(aic_common::AicError::UserMessage(
+                            "저장된 명령어가 없습니다".to_string(),
+                        )),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    session_client.get_last_command().await
+                };
+            match lookup {
                 Ok(record) => {
                     let config = match ConfigManager::load() {
                         Ok(c) => c,
@@ -3125,71 +3190,6 @@ fn format_exit_code(code: i32) -> String {
     }
 }
 
-fn truncate_command(cmd: &str, max: usize) -> String {
-    if cmd.chars().count() <= max {
-        cmd.to_string()
-    } else {
-        let mut s: String = cmd.chars().take(max.saturating_sub(1)).collect();
-        s.push('…');
-        s
-    }
-}
-
-async fn handle_history(limit: usize, failed: bool, json: bool, session: Option<String>) {
-    let sock = resolve_socket(session.as_deref());
-    let client = UdsClient::new(sock.clone());
-    let records = match client.get_recent_commands(limit).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
-                sock.display()
-            );
-            std::process::exit(1);
-        }
-    };
-
-    let filtered: Vec<aic_common::CommandRecord> = if failed {
-        records.into_iter().filter(|r| r.exit_code != 0).collect()
-    } else {
-        records
-    };
-
-    if json {
-        match serde_json::to_string_pretty(&filtered) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("JSON 직렬화 실패: {e}");
-                std::process::exit(2);
-            }
-        }
-        return;
-    }
-
-    if filtered.is_empty() {
-        println!("{COL_DIM}저장된 record 없음{COL_RESET}");
-        return;
-    }
-
-    println!(
-        "{COL_BOLD}aic history{COL_RESET} {COL_DIM}({} record){COL_RESET}",
-        filtered.len()
-    );
-    // 최신이 마지막 → 사용자 가독성을 위해 최신을 위쪽에 두지 않고 server 순서 그대로(시간순)
-    // 표시한다. 마지막 라인이 가장 최근이라 자연스러운 prompt 위치 위에 놓임.
-    for rec in &filtered {
-        let id = record_id_short(&rec.id);
-        let when = format_relative_time(rec.timestamp);
-        let exit = format_exit_code(rec.exit_code);
-        let quality = capture_quality_short(rec.capture_quality);
-        let cmd = rec.command.as_deref().unwrap_or("(no command)");
-        let cmd = truncate_command(cmd, 70);
-        println!(
-            "  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<10} {quality:<6}{COL_RESET}  {cmd}"
-        );
-    }
-}
-
 async fn handle_capture_last(
     yes: bool,
     session: Option<String>,
@@ -3199,14 +3199,36 @@ async fn handle_capture_last(
 
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
-    let record = match client.get_last_command().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
-                sock.display()
-            );
-            std::process::exit(1);
+    // Phase 3.2 Task 2.2: cascade 로 aicd → session socket 순 조회.
+    let cascade = build_cascade_for_session_path(&sock);
+    let record = if let Some(ref c) = cascade {
+        match c.get_last_command().await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 마지막 record를 찾지 못했습니다 ({}). aic-session 안에서 명령을 먼저 실행하세요.",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match client.get_last_command().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 마지막 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
         }
     };
 
@@ -3434,6 +3456,8 @@ async fn handle_watch(interval_secs: u64, session: Option<String>) {
     let interval = Duration::from_secs(interval_secs.max(1));
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
+    // Phase 3.2 Task 2.2: cascade 로 aicd → session socket 순 조회.
+    let cascade = build_cascade_for_session_path(&sock);
 
     let config = ConfigManager::load().ok();
     let lang = config
@@ -3448,8 +3472,17 @@ async fn handle_watch(interval_secs: u64, session: Option<String>) {
     );
 
     // 첫 fetch는 baseline — 기존 record는 hint 대상이 아님.
+    //
+    // Phase 3.2 Task 2.2: 각 polling 호출에서 cascade 를 선호하고, 없으면
+    // legacy 단일-소켓으로 폴백한다. cascade 가 FnOnce 로 소비되는 것을 피하려고
+    // 인라인 헬퍼 매크로 대신 매 호출 지점에 동일 패턴을 복사한다.
     let mut seen: HashSet<String> = HashSet::new();
-    if let Ok(records) = client.get_recent_commands(50).await {
+    let baseline = if let Some(ref c) = cascade {
+        c.get_recent_commands(50).await
+    } else {
+        client.get_recent_commands(50).await
+    };
+    if let Ok(records) = baseline {
         for r in &records {
             if !r.id.is_empty() {
                 seen.insert(r.id.clone());
@@ -3468,7 +3501,11 @@ async fn handle_watch(interval_secs: u64, session: Option<String>) {
     loop {
         tokio::time::sleep(interval).await;
 
-        let records = match client.get_recent_commands(50).await {
+        let records = match if let Some(ref c) = cascade {
+            c.get_recent_commands(50).await
+        } else {
+            client.get_recent_commands(50).await
+        } {
             Ok(r) => r,
             Err(_) => continue, // best-effort — daemon 재시작 등 일시 오류는 다음 tick에서 재시도.
         };
@@ -3837,14 +3874,29 @@ fn confirm_yes_no(question: &str) -> bool {
 async fn handle_last(json: bool, session: Option<String>) {
     let sock = resolve_socket(session.as_deref());
     let client = UdsClient::new(sock.clone());
-    let records = match client.get_recent_commands(1).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
-                sock.display()
-            );
-            std::process::exit(1);
+    // Phase 3.2 Task 2.2: cascade 로 aicd → session socket 순 조회.
+    let cascade = build_cascade_for_session_path(&sock);
+    let records: Vec<aic_common::CommandRecord> = if let Some(ref c) = cascade {
+        match c.get_recent_commands(1).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match client.get_recent_commands(1).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 세션 record 조회 실패 ({}): {e}",
+                    sock.display()
+                );
+                std::process::exit(1);
+            }
         }
     };
     let Some(rec) = records.into_iter().next_back() else {
@@ -3889,6 +3941,48 @@ enum SessionSocket {
     Path(std::path::PathBuf),
     /// 히스토리 폴백 (세션 소켓 사용 불가)
     HistoryFallback,
+}
+
+/// `Central_Store_Flag` 를 현재 프로세스 env + config 로부터 평가한다.
+///
+/// Phase 3.2 read-path cascade 가 필요로 하는 단일 진입점. `aic_common` 의
+/// `resolve_central_store_flag` 가 내부적으로 `OnceLock` 캐시를 사용하므로
+/// 프로세스 수명 동안 동일 값이 반환된다 (R2.7).
+fn resolve_central_store_flag_from_env() -> bool {
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // `[daemon]` 섹션은 레거시 config 에 없을 수도 있으므로 best-effort 로 읽어본다.
+    // 파일을 직접 읽어 `AppConfigWithDaemon` 으로 파싱하고, 어떤 단계에서 실패해도
+    // env + Phase default 만으로 평가할 수 있게 None 을 넘긴다 (R2.6, R12.2).
+    let daemon_cfg = read_daemon_config_best_effort();
+    aic_common::central_store_flag::resolve_central_store_flag(&env, daemon_cfg.as_ref())
+}
+
+/// `config.toml` 에서 `[daemon]` 섹션만 best-effort 로 파싱한다. 어떤 오류도
+/// 조용히 삼키고 `None` 을 돌려준다 — config 전체 로드 실패가 read-path 평가를
+/// 막아서는 안 된다 (R12.2).
+fn read_daemon_config_best_effort() -> Option<aic_common::central_store_flag::DaemonConfig> {
+    let path = ConfigManager::config_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let parsed: aic_common::central_store_flag::AppConfigWithDaemon =
+        toml::from_str(&content).ok()?;
+    Some(parsed.daemon)
+}
+
+/// `SessionSocket::Path` 로부터 cascade 를 구성한다.
+///
+/// socket path 에서 session id 를 추출해 `ReadCascade::new` 로 넘긴다. socket path 가
+/// `session-{id}.sock` 형식이 아니면 `extract_session_id` 가 `None` 을 돌려주므로
+/// `AIC_SESSION_ID` env 로 한 번 더 확인한 뒤, 그마저 없으면 `None` 을 반환해
+/// 호출자가 session-scoped read 를 포기하고 기존 경로로 돌아가도록 한다.
+fn build_cascade_for_session_path(socket_path: &std::path::Path) -> Option<ReadCascade> {
+    let session_id = aic_common::extract_session_id(socket_path).or_else(|| {
+        std::env::var("AIC_SESSION_ID")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })?;
+    let flag = resolve_central_store_flag_from_env();
+    Some(ReadCascade::new(session_id, flag))
 }
 
 fn hook_lookup_enabled(config: &AppConfig) -> bool {
@@ -4242,14 +4336,37 @@ async fn handle_default(
     let record = match session_socket {
         SessionSocket::Path(socket_path) => {
             let connect_start = Instant::now();
-            let client = UdsClient::new(socket_path.clone());
 
-            match client.get_last_command().await {
-                Ok(rec) => {
+            // Phase 3.2 Task 2.2: aicd → session-socket cascade 로 전환.
+            // `Central_Store_Flag=true` 이면 (1) aicd `GetLastCommandForSession` 을 먼저,
+            // false 이면 기존대로 (2) session socket `GetLastCommand` 만 시도한다.
+            // cascade 가 socket_path 로부터 session_id 를 추출하지 못하면(일반적이지 않음)
+            // 기존 UdsClient 직행 경로로 폴백한다 — 레거시 socket 레이아웃 보호.
+            let cascaded = build_cascade_for_session_path(&socket_path);
+            let lookup_result: Result<Option<aic_common::CommandRecord>, aic_common::AicError> =
+                if let Some(ref cascade) = cascaded {
+                    cascade.get_last_command().await
+                } else {
+                    // cascade 를 만들 수 없는 경우에만 legacy 단일-소켓 경로.
+                    let client = UdsClient::new(socket_path.clone());
+                    match client.get_last_command().await {
+                        Ok(rec) => Ok(Some(rec)),
+                        Err(aic_common::AicError::UserMessage(_))
+                        | Err(aic_common::AicError::ServerNotRunning) => Ok(None),
+                        Err(other) => Err(other),
+                    }
+                };
+
+            match lookup_result {
+                Ok(Some(rec)) => {
                     debug_step!(
                         connect_start,
-                        "uds      {} · exit={} lines={} cmd={}",
+                        "cascade  {} · flag={} · exit={} lines={} cmd={}",
                         socket_path.display(),
+                        cascaded
+                            .as_ref()
+                            .map(|c| c.central_store_flag())
+                            .unwrap_or(false),
                         rec.exit_code,
                         rec.output_lines.len(),
                         rec.command.as_deref().unwrap_or("∅"),
@@ -4285,7 +4402,9 @@ async fn handle_default(
                         rec
                     }
                 }
-                Err(_) => {
+                Ok(None) | Err(_) => {
+                    // Ok(None) = cascade 가 "record 없음" 으로 수렴 — 상위 fallback 진입.
+                    // Err(_)  = 진짜 IPC 고장 — 동일하게 hook/shell history 폴백으로 처리.
                     if let Some(hook_record) = get_hook_metadata_record(&config).await {
                         hook_record
                     } else {

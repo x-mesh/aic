@@ -10,7 +10,9 @@
 //! 자동 spawn은 의도적으로 하지 않는다 (Phase 1.5에서 `aic daemon start` 또는
 //! `aic doctor --fix`로 명시 시작).
 
-use aic_common::{aicd_socket_path, encode_frame, IpcRequest, IpcResponse, SessionInfo};
+use aic_common::{
+    aicd_socket_path, encode_frame, CommandRecord, IpcRequest, IpcResponse, SessionInfo,
+};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -53,6 +55,36 @@ pub async fn heartbeat_session(id: &str, cwd: Option<std::path::PathBuf>) {
     .await
     {
         tracing::debug!(error = %e, "aicd heartbeat 실패 (무시)");
+    }
+}
+
+/// Phase 3.1 Dual-Write: `aic-session`이 만든 `CommandRecord`를 `aicd`의
+/// [`CommandRecordStore`](crate::command_record_store::CommandRecordStore) 로
+/// 세션 라우팅해 전송한다 (best-effort).
+///
+/// 본 함수는 연결/쓰기/응답 전체를 [`AICD_RPC_TIMEOUT`] (100ms) 이내로 제한한다.
+/// timeout / connection error / 역직렬화 오류 모두 `tracing::debug!`로만 기록하고
+/// silent skip 한다 (R3.3) — 호출 결과를 무시해도 안전하다.
+///
+/// # 인자
+/// - `session_id`: aicd 측 `CommandRecordStore`의 key 가 될 세션 식별자.
+/// - `record`: 이미 id 가 부여된 `CommandRecord`. 빈 id 여도 aicd 측에서 auto-assign 하지만,
+///   local store 와 id를 일치시키려면 호출 전에 id를 확정해 두는 것을 권장한다 (P2 전제).
+pub async fn register_record(session_id: &str, record: CommandRecord) {
+    if let Err(e) = send(
+        &aicd_socket_path(),
+        IpcRequest::RegisterRecordForSession {
+            session_id: session_id.to_string(),
+            record,
+        },
+    )
+    .await
+    {
+        tracing::debug!(
+            session_id,
+            error = %e,
+            "aicd register_record 실패 (무시) — aicd 미실행 또는 timeout"
+        );
     }
 }
 
@@ -130,6 +162,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_record_silent_when_aicd_down() {
+        // aicd 미실행 상태에서도 panic 없이 반환해야 한다 (R3.3).
+        let record = aic_common::CommandRecord {
+            command: Some("ls".to_string()),
+            capture_mode: aic_common::CaptureMode::Pty,
+            ..Default::default()
+        };
+        register_record("deadbeef", record).await;
+    }
+
+    #[tokio::test]
+    async fn register_record_completes_within_timeout() {
+        // aicd 소켓이 없는 환경에서 register_record 전체가 100ms 안에 끝나는지 확인한다.
+        // AICD_RPC_TIMEOUT(100ms)이 상한이므로 여유를 둔 500ms 안에 반드시 완료되어야 한다.
+        let record = aic_common::CommandRecord {
+            command: Some("cargo build".to_string()),
+            capture_mode: aic_common::CaptureMode::Pty,
+            ..Default::default()
+        };
+        let completed = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            register_record("abcd1234", record),
+        )
+        .await;
+        assert!(
+            completed.is_ok(),
+            "register_record가 500ms 안에 끝나지 않음 — AICD_RPC_TIMEOUT 상한 가드가 깨졌을 수 있음"
+        );
+    }
+
+    #[tokio::test]
     async fn end_to_end_register_then_list_via_socket() {
         // ControlServer를 한 번 띄우고 register → list가 통하는지 검증한다.
         use crate::control_server::{ControlContext, ControlServer};
@@ -144,8 +207,9 @@ mod tests {
         let ctx = ControlContext {
             shutdown: Arc::new(Notify::new()),
             registry: registry.clone(),
-            hook_events: crate::hook_events::HookEventStore::new(),
+            record_store: crate::command_record_store::CommandRecordStore::new(),
             registry_path: None,
+            metrics: Arc::new(crate::metrics::AicdMetrics::new()),
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 

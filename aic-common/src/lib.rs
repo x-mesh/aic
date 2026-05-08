@@ -1,5 +1,8 @@
 //! aic-common: 공유 데이터 모델, IPC 프로토콜, 에러 타입
 
+pub mod attach;
+pub mod bounded_byte_channel;
+pub mod central_store_flag;
 pub mod error;
 pub mod ipc;
 pub mod paths;
@@ -8,9 +11,10 @@ pub mod session;
 pub use error::AicError;
 pub use ipc::{decode_frame, encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
 pub use paths::{
-    aicd_lock_path, aicd_registry_path, aicd_socket_path, default_socket_path, extract_session_id,
-    list_session_sockets, local_command_record_path, local_hook_pending_path,
-    resolve_active_socket, resolve_socket_path, session_dir, session_socket_path,
+    aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
+    default_socket_path, extract_session_id, list_session_sockets, local_command_record_path,
+    local_hook_pending_path, resolve_active_socket, resolve_socket_path, session_dir,
+    session_socket_path,
 };
 pub use session::{
     generate_record_id, generate_session_id, generate_unused_session_id, is_valid_record_id,

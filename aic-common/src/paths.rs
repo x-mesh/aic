@@ -65,6 +65,15 @@ pub fn aicd_lock_path() -> PathBuf {
     session_dir().join("aicd.pid")
 }
 
+/// `aicd` supervisor daemon의 Attach_UDS 소켓 경로 (Phase 3.3).
+///
+/// `aic-session` 이 PTY raw byte stream 을 `aicd` 로 보낼 때 사용한다.
+/// Control_UDS(`aicd.sock`) 와 같은 부모 디렉토리(0700) 아래에 두며,
+/// 소켓 파일 자체 권한은 0600 (R15.3).
+pub fn aicd_attach_socket_path() -> PathBuf {
+    session_dir().join("aicd-attach.sock")
+}
+
 /// `aicd` supervisor daemon의 registry snapshot 경로.
 ///
 /// 런타임 세션 복구용이므로 control socket/lock과 같은 session_dir 아래에 둔다.
@@ -227,6 +236,13 @@ mod tests {
         let path = aicd_registry_path();
         assert_eq!(path.parent().unwrap(), session_dir());
         assert!(path.ends_with("aicd-registry.json"));
+    }
+
+    #[test]
+    fn aicd_attach_socket_path_under_session_dir() {
+        let path = aicd_attach_socket_path();
+        assert_eq!(path.parent().unwrap(), session_dir());
+        assert!(path.ends_with("aicd-attach.sock"));
     }
 
     #[test]
