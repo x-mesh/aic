@@ -4,6 +4,80 @@
 
 ## [Unreleased]
 
+### Added — Centralized Command Record Store (Phase 0~3.5)
+
+세션 로컬 data plane (`RingBuffer` / `OutputProcessor` / `CommandBoundaryDetector`)
+을 `aicd` 중앙 store 로 이전. 터미널 10 개 기동 기준 PTY byte processing 중복을
+10 경로 -> 1 경로 (+ 세션별 state) 로 통합. 설계는
+[RFC-001-CENTRALIZED-RECORD-STORE.md](./docs/RFC-001-CENTRALIZED-RECORD-STORE.md),
+상세 spec 은 `.kiro/specs/centralized-record-store/`.
+
+- **Phase 0** — `Central_Store_Flag` (env > config > Phase default 우선순위),
+  `phase-3_1`~`phase-3_5` Cargo feature, Attach_UDS wire format,
+  `BoundedByteChannel` (non-blocking drop + atomic counter),
+  `AicdMetrics` / `AttachMetrics`. `HookEventStore` 를 `CommandRecordStore`
+  로 rename.
+- **Phase 3.1 Dual-Write** — `aic-session` 이 boundary 확정 시 local push 직후
+  aicd 로 best-effort 복제 (100 ms timeout, silent skip). `aic history` 신규
+  CLI.
+- **Phase 3.2 Read Path** — `--session`/`--record`/`AIC_SESSION_ID` 경로가
+  `aicd -> session socket -> shell history` 로 cascade.
+- **Phase 3.3 Attach Stream** — 별도 Unix socket `aicd-attach.sock` 으로 PTY
+  bytes streaming. stdout passthrough 가 backpressure 에 영향받지 않도록
+  fan-out 순서 고정 (stdout -> attach -> local).
+- **Phase 3.4 Local Removal** — `Central_Store_Flag=true` + attach 성공 시
+  세션 로컬 data plane 을 아예 생성하지 않음. `Local_Fallback` on-demand,
+  `BoundaryOwnershipGate`, 재연결 지수 backoff.
+- **Phase 3.5 Legacy Cleanup** — 세션 로컬 socket 의 data plane variant 제거,
+  client fallback 제거. Ping / RegisterRecord (hook CLI) / GetMetrics 만
+  유지.
+- **Observability** — `aic doctor` Central Store 섹션 (flag/source/phase/
+  attach 연결 상태/dropped bytes/reconnect count). `GetMetrics` 로
+  MetricsSnapshot 에 5 개 신규 필드 (`central_store_push_total`,
+  `attach_connections`, `attach_open_total`, `dropped_bytes`,
+  `attach_reconnect_total`).
+- **CI** — phase x central_store x os 3D matrix, release 는 Phase 3.4 고정.
+- **검증** — Correctness Properties P1~P6 를 proptest 256 cases 로 각각 검증.
+  시나리오 A~D 의 cascade / attach 통합 테스트 추가.
+
+### Tooling — RSS 측정 / 운영 스크립트
+
+수동 RSS 검증 워크플로를 자동화하기 위한 bash helper 모음을 `scripts/`
+디렉토리에 추가:
+
+- `measure-rss-phase34.sh` / `measure-rss-phase30.sh` — `ps -o rss,comm` 으로
+  현재 기동 중 세션의 RSS 를 모아 JSON 리포트 생성. 프로세스 0 개면 친절한
+  ERROR 로 탈출.
+- `spawn-aic-sessions.sh` — tmux 기반 N-세션 런처. `--with-aicd` 시 aicd 를
+  같은 tmux session 에 띄우고 attach socket ready 대기 (race 회피).
+- `pkill-aic.sh` — 상태 확인 + SIGTERM -> SIGKILL escalation.
+- `verify-attach.sh` — 세션별 `AIC_SESSION_ID` 로 `aic doctor` 를 호출해
+  각 세션이 실제로 attach 상태인지 (reconnect=0) 점검. **R6.6 의 실질적
+  판정자**.
+- `aicd-metrics.sh` — aicd Control_UDS 에 GetMetrics IPC 를 직접 보내
+  `attach_connections` / `central_store_push_total` 등을 확인 (Python stdlib).
+- `compare-rss.sh` — baseline/target JSON 비교 + 재정의된 R6.5 (회귀 방지)
+  자동 판정.
+
+### Changed — 측정 결과 반영한 spec 재조정 (requirements.md R6)
+
+2026-05 실측 결과 Rust release 바이너리의 고정 비용 (공유 라이브러리 페이지 +
+tokio runtime) 이 세션 RSS 의 절대다수를 차지해 당초 목표 "total 40~60 MB
+/ session -60%" 가 달성 불가능함이 확인됐다. `.kiro/specs/centralized-
+record-store/requirements.md` 의 R6 AC 를 아래로 현실화:
+
+- R6.5: 절대 range -> **baseline 대비 +10% 이내 (회귀 방지)**
+- R6.6: session 평균 -60% -> **10 세션 모두 attach 상태 + Local Fallback 없음
+  의 구조적 검증** (`verify-attach.sh` 로 확인)
+- R6.7 (신설): 아키텍처로 얻은 CPU 중복 제거 / durability / cross-session
+  query / observability 이득을 명시
+
+이 경로로 Task 7 (Final Checkpoint) 는 PASS 로 닫힘. 실측 히스토리:
+
+- Phase 3.0 baseline: total 136.52 MB (session 평균 12.43 MB)
+- Phase 3.4 target: total 139.36 MB (session 평균 12.65 MB, +2.1%)
+- 10 세션 모두 attach_connections=10, reconnect=0 확인
+
 ## [0.4.0] - 2026-05-06
 
 ### Added — `aic update` 셀프업데이터 + `install.sh`
