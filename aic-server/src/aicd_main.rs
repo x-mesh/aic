@@ -9,10 +9,14 @@
 //! 의도적으로 비범위:
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
-use aic_common::{aicd_lock_path, aicd_registry_path, aicd_socket_path};
+use aic_common::{
+    aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
+};
+use aic_server::attach_server::AttachServer;
+use aic_server::command_record_store::CommandRecordStore;
 use aic_server::control_server::{spawn_reconcile_loop, ControlContext, ControlServer};
-use aic_server::hook_events::HookEventStore;
 use aic_server::lock::DaemonLock;
+use aic_server::session_processor_pool::SessionProcessorPool;
 use aic_server::session_registry::SessionRegistry;
 use clap::Parser;
 use std::sync::Arc;
@@ -83,19 +87,53 @@ async fn main() -> anyhow::Result<()> {
             SessionRegistry::new()
         }
     };
-    let hook_events = HookEventStore::new();
+    let record_store = CommandRecordStore::new();
+    let metrics = Arc::new(aic_server::metrics::AicdMetrics::new());
+
+    // Attach_UDS (R5.1, R5.2) — aic-session 이 PTY bytes 를 중앙으로 보내는 경로.
+    // Control_UDS 와는 완전히 분리된 소켓이며, SessionProcessorPool + CommandRecordStore
+    // 를 공유해 받은 bytes 를 바로 session 별 record 로 구성한다 (R5.9, R5.10).
+    //
+    // bind 에 실패하면 aicd 전체 기동을 abort — attach 가 없으면 Phase 3.4
+    // 빌드의 aic-session 은 Local_Fallback 으로 내려가 RSS 개선이 사라진다.
+    let attach_sock_path = aicd_attach_socket_path();
+    let attach_pool = Arc::new(SessionProcessorPool::new());
+    let attach_server = AttachServer::bind(
+        &attach_sock_path,
+        Arc::clone(&metrics),
+        Arc::clone(&attach_pool),
+        record_store.clone(),
+    )
+    .await?;
+    tracing::info!(path = %attach_sock_path.display(), "aicd attach 소켓 바인드");
+
     let control_ctx = ControlContext {
-        shutdown,
+        shutdown: Arc::clone(&shutdown),
         registry: registry.clone(),
-        hook_events,
+        record_store,
         registry_path: Some(registry_path.clone()),
+        metrics,
     };
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
     let reconcile_handle = spawn_reconcile_loop(control_ctx.clone());
 
+    // AttachServer 는 별도 task 로 spawn 하여 Control_UDS serve 루프와 나란히 동작한다.
+    // 같은 `shutdown` Notify 를 공유하므로 SIGTERM/Shutdown 요청 시 둘 다 깨어난다.
+    let attach_shutdown = Arc::clone(&shutdown);
+    let attach_handle = tokio::spawn(async move {
+        attach_server.serve(attach_shutdown).await;
+    });
+
     server.serve(control_ctx).await;
+
+    // Control 루프가 빠져나오면 attach 루프도 동일 notify 로 이미 깨어난 상태.
+    // join 하여 in-flight 연결 정리 시간을 준다.
+    let _ = attach_handle.await;
+
     reconcile_handle.abort();
+    // 소켓 파일 정리 — AttachServer 는 Drop 구현이 없으므로 명시 remove.
+    let _ = std::fs::remove_file(&attach_sock_path);
     if let Err(e) = registry.save_snapshot(&registry_path).await {
         tracing::warn!(path = %registry_path.display(), error = %e, "registry snapshot 최종 저장 실패");
     }
