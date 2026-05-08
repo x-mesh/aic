@@ -22,6 +22,11 @@ builds:
   # 첫 release 시도에서 다음 에러로 실패함:
   #   "you need to specify which workspace to build, please add '--package=[name]'"
   # 따라서 -p <crate> + --bin <name> 두 인자를 함께 명시한다.
+  # Release artifact 는 Phase 3.4 빌드만 배포한다 (R18.3).
+  # `aic-common/build.rs` 가 정확히 하나의 phase-3_N feature 만 활성임을 assert
+  # 하기 때문에, workspace default (phase-3_1) 를 끄고 phase-3_4 를 명시적으로
+  # 켜야 빌드가 성립한다. Phase 3.4 = Local Processing 제거 + Central Store
+  # 기본 활성 (R6, R19) 가 릴리스 기본이다.
   - id: aic-cli
     builder: rust
     binary: aic
@@ -35,6 +40,8 @@ builds:
       - --release
       - --package=aic-client
       - --bin=aic
+      - --no-default-features
+      - --features=phase-3_4
 
   - id: aic-session
     builder: rust
@@ -49,6 +56,8 @@ builds:
       - --release
       - --package=aic-server
       - --bin=aic-session
+      - --no-default-features
+      - --features=phase-3_4
 
   - id: aicd
     builder: rust
@@ -63,6 +72,8 @@ builds:
       - --release
       - --package=aic-server
       - --bin=aicd
+      - --no-default-features
+      - --features=phase-3_4
 
 archives:
   - id: aic-archive

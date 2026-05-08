@@ -10,8 +10,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Clippy 는 default feature (phase-3_1) 로 한 번만 돈다. 모든 Phase 에서 공통으로
+  # 유지되는 lint 규칙만 검사하기 때문에 phase × os × central_store 매트릭스로 부풀
+  # 필요는 없다. 아래 test job 과 분리해 실패 원인을 빨리 식별하기 쉽게 한다.
   check:
-    name: ${{ matrix.os }}
+    name: clippy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -39,5 +42,73 @@ jobs:
       - name: Clippy lint
         run: cargo clippy --workspace -- -D warnings
 
+  # Phase 3.3 / 3.4 의 test matrix. AIC_CENTRAL_STORE env 를 "0" / "1" 양쪽에서
+  # 돌려 Central_Store_Flag on/off 회귀를 모두 커버한다 (R18.1, R18.2).
+  #
+  # NOTE: aic-common/build.rs 는 정확히 하나의 phase-3_N feature 만 활성임을
+  # 빌드 시점에 assert 한다. workspace default 가 phase-3_1 이기 때문에 다른
+  # Phase 를 테스트할 때는 `--no-default-features` 를 반드시 붙여야 한다.
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.phase }}, central_store=${{ matrix.central_store }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        phase: [phase-3_3, phase-3_4]
+        central_store: ["0", "1"]
+    env:
+      AIC_CENTRAL_STORE: ${{ matrix.central_store }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.phase }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.phase }}-
+            ${{ runner.os }}-cargo-
+
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-default-features --features ${{ matrix.phase }}
+
+  # Phase 3.5 는 세션 로컬 data plane 이 제거된 빌드이므로 AIC_CENTRAL_STORE=0
+  # 조합이 의미를 잃는다 (R19.3). 따라서 central_store 매트릭스 없이 단일
+  # 변형만 돌린다. env 는 명시적으로 "1" 로 고정해 의도를 남긴다.
+  test-phase-3_5:
+    name: test phase-3_5 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      AIC_CENTRAL_STORE: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-phase-3_5-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-phase-3_5-
+            ${{ runner.os }}-cargo-
+
+      - name: Run tests
+        run: cargo test --workspace --no-default-features --features phase-3_5
