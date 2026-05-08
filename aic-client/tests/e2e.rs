@@ -10,6 +10,17 @@
 //! 5. 성공 명령어 → AutoBrancher → InteractiveRepl 분기 검증
 //! 6. OutputProcessor → CommandBoundaryDetector → RingBuffer → UdsServer → UdsClient 전체 파이프라인
 //! 7. CLI Backend를 통한 에러 분석 E2E
+//!
+//! ## Phase 3.5 feature gate (Task 5.1 / 5.2 / 5.3)
+//!
+//! Phase 3.5 에서는 세션 로컬 data plane (`RingBuffer` / `OutputProcessor` /
+//! `CommandBoundaryDetector`) 이 제거되고 `UdsServer` 는 Ping / RegisterRecord /
+//! GetMetrics 만 처리한다 (R7.1, R7.2). 본 파일의 E2E 시나리오는 session socket
+//! 으로 record 를 push 하고 조회하는 레거시 플로우를 검증하므로 Phase 3.5 빌드에서는
+//! 제외된다. 대응하는 Phase 3.5 전용 E2E 는 `aicd` 의 `CommandRecordStore` 를
+//! 직접 사용하는 `aic-server/tests/phase_3_3_attach.rs` 및 `uds_integration.rs` 의
+//! Ping 경로에서 커버한다.
+#![cfg(not(feature = "phase-3_5"))]
 
 use aic_client::auto_brancher::{AutoBrancher, ExecutionMode};
 use aic_client::error_analyzer::ErrorAnalyzer;

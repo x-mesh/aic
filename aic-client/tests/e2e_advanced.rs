@@ -3,6 +3,15 @@
 //! 기존 e2e.rs의 기본 흐름 테스트를 보완하여
 //! 동시 접속, 대용량 출력, 다양한 exit code, 한국어/유니코드,
 //! LlmDispatcher 통합, IPC 프로토콜 raw 레벨, 서버 재시작 등을 검증한다.
+//!
+//! ## Phase 3.5 feature gate (Task 5.1 / 5.2 / 5.3)
+//!
+//! Phase 3.5 에서는 세션 로컬 data plane 이 제거되어 본 파일의 E2E 시나리오가
+//! 검증하는 `OutputProcessor` → `CommandBoundaryDetector` → `RingBuffer` →
+//! `UdsServer` → `UdsClient` cascade 가 의미를 잃는다 (R7.1, R7.2). 대응하는
+//! Phase 3.5 전용 E2E 는 `aicd` 의 `CommandRecordStore` 를 직접 테스트하는
+//! `aic-server/tests/phase_3_3_attach.rs` 에서 커버한다.
+#![cfg(not(feature = "phase-3_5"))]
 
 use aic_client::auto_brancher::{AutoBrancher, ExecutionMode};
 use aic_client::error_analyzer::ErrorAnalyzer;

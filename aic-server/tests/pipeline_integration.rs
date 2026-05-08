@@ -178,7 +178,13 @@ fn pipeline_alternate_screen_skips_buffer() {
     assert!(!all_lines.iter().any(|l| l.contains("TUI content")));
 }
 
-/// 전체 파이프라인 + UDS 서버를 통한 end-to-end 테스트
+/// 전체 파이프라인 + UDS 서버를 통한 end-to-end 테스트.
+///
+/// Phase 3.5 (Task 5.2 / 5.3): 세션 로컬 data plane 이 제거되어 `GetLastCommand`
+/// 가 항상 Phase 3.5 전용 안내 에러로 거절된다 (R7.2). 본 테스트는 local
+/// RingBuffer 에 push 된 record 를 session UDS 로 조회하는 플로우를 검증하므로
+/// Phase 3.5 에서는 제외한다.
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn pipeline_to_uds_end_to_end() {
     let dir = tempfile::tempdir().unwrap();

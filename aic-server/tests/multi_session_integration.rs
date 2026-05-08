@@ -4,11 +4,22 @@
 //! 각각 독립적으로 Ping 응답 및 RingBuffer 격리를 검증한다.
 //!
 //! Requirements: 3.1, 3.2, 5.1, 5.2, 5.3
+//!
+//! ## Phase 3.5 feature gate (Task 5.2 / 5.3)
+//!
+//! Phase 3.5 빌드에서는 세션 로컬 data plane 이 제거되어 `GetLastCommand` 가
+//! 항상 안내 에러로 거절된다. 따라서 data plane 조회에 의존하는 두 테스트
+//! (`two_sessions_independent_ring_buffers`, `two_sessions_concurrent_requests`) 는
+//! `#[cfg(not(feature = "phase-3_5"))]` 로 gate 하고, Ping-only 검증인
+//! `two_sessions_independent_ping` 만 Phase 3.5 에서도 실행한다.
 
-use aic_common::{encode_frame, CommandRecord, IpcRequest, IpcResponse};
+use aic_common::{encode_frame, IpcRequest, IpcResponse};
+#[cfg(not(feature = "phase-3_5"))]
+use aic_common::CommandRecord;
 use aic_server::ring_buffer::RingBuffer;
 use aic_server::uds_server::UdsServer;
 
+#[cfg(not(feature = "phase-3_5"))]
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -73,6 +84,11 @@ async fn two_sessions_independent_ping() {
 /// 각 세션이 독립적인 RingBuffer를 유지하는지 검증한다.
 /// 세션 A에만 데이터를 넣고, 세션 B에서는 빈 상태를 확인한다.
 /// Requirements: 5.1, 5.2, 5.3
+///
+/// Phase 3.5 (Task 5.2 / 5.3): 세션 로컬 data plane 이 제거되어 `GetLastCommand`
+/// 는 항상 안내 에러로 거절된다 (R7.2). 본 테스트는 data plane 조회의 격리를
+/// 검증하므로 Phase 3.5 빌드에서는 제외된다.
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn two_sessions_independent_ring_buffers() {
     let dir = tempfile::tempdir().unwrap();
@@ -134,6 +150,10 @@ async fn two_sessions_independent_ring_buffers() {
 
 /// 두 세션에 동시에 여러 요청을 보내도 서로 간섭하지 않는지 검증한다.
 /// Requirements: 3.2, 5.2
+///
+/// Phase 3.5 (Task 5.2 / 5.3): data plane 조회가 Phase 3.5 전용 에러로 거절되므로
+/// 본 테스트는 Phase ≤ 3.4 에서만 유효하다.
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn two_sessions_concurrent_requests() {
     let dir = tempfile::tempdir().unwrap();

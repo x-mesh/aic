@@ -4,17 +4,28 @@
 //! Ping/Pong 검증
 //!
 //! Requirements: 3.1, 3.2
+//!
+//! ## Phase 3.5 feature gate (Task 5.2 / 5.3)
+//!
+//! Phase 3.5 에서는 세션 로컬 data plane 이 제거되어 `GetLastCommand` /
+//! `GetRecentLines` 는 항상 Phase 3.5 전용 안내 에러로 거절된다 (R7.2). 본
+//! 파일에서는 Ping/Pong 만 Phase 3.5 에서도 실행하며, 나머지 data plane 조회
+//! 테스트는 `#[cfg(not(feature = "phase-3_5"))]` 로 gate 한다.
 
-use aic_common::{CommandRecord, IpcResponse};
+#[cfg(not(feature = "phase-3_5"))]
+use aic_common::CommandRecord;
+use aic_common::IpcResponse;
 use aic_server::ring_buffer::RingBuffer;
 use aic_server::uds_server::UdsServer;
 
 use aic_common::{encode_frame, IpcRequest};
+#[cfg(not(feature = "phase-3_5"))]
 use chrono::Utc;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+#[cfg(not(feature = "phase-3_5"))]
 fn make_buffer_with_record() -> Arc<RwLock<RingBuffer>> {
     let mut buf = RingBuffer::new(100);
     buf.push(CommandRecord {
@@ -64,6 +75,7 @@ async fn ping_pong_round_trip() {
     handle.abort();
 }
 
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn get_last_command_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -89,6 +101,7 @@ async fn get_last_command_round_trip() {
     handle.abort();
 }
 
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn get_last_command_empty_buffer_returns_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -111,6 +124,7 @@ async fn get_last_command_empty_buffer_returns_error() {
     handle.abort();
 }
 
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn get_recent_lines_round_trip() {
     let dir = tempfile::tempdir().unwrap();
@@ -134,6 +148,7 @@ async fn get_recent_lines_round_trip() {
     handle.abort();
 }
 
+#[cfg(not(feature = "phase-3_5"))]
 #[tokio::test]
 async fn multiple_sequential_requests() {
     let dir = tempfile::tempdir().unwrap();
