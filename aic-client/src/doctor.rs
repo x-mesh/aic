@@ -7,12 +7,20 @@
 //! 4. aic-session 데몬 응답 (Ping)
 //! 5. 셸 hook 설치 여부 (~/.aic/hooks.* + ~/.zshrc·.bashrc source 라인)
 //! 6. LLM endpoint reachability (HEAD 요청, 2s timeout)
+//! 7. Central Store 상태 (R14.6) — Central_Store_Flag 값/소스, Attach_UDS
+//!    소켓 경로와 연결 가능 여부, 세션 metrics 의 `dropped_bytes` /
+//!    `attach_reconnect_total` 을 출력한다.
 
 use crate::config::ConfigManager;
 use crate::uds_client::UdsClient;
+use aic_common::central_store_flag::{
+    current_phase, resolve_central_store_flag_with_source_uncached, AppConfigWithDaemon,
+    DaemonConfig,
+};
 use aic_common::{AppConfig, ProviderConfig, ProviderType};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// 단일 체크 결과.
@@ -169,6 +177,186 @@ pub fn print_report(results: &[CheckResult]) {
     println!(
         "요약: \x1b[32m{pass_count} PASS\x1b[0m, \x1b[33m{warn_count} WARN\x1b[0m, \x1b[31m{fail_count} FAIL\x1b[0m"
     );
+}
+
+// ── Central Store 섹션 (R14.6) ───────────────────────────────────
+
+/// `aic doctor` 의 Central Store 섹션 리포트.
+///
+/// `run_all_checks` 가 돌려주는 `CheckResult` 벡터와는 별개의 구조체다 —
+/// Central Store 섹션은 단일 PASS/WARN/FAIL 로 환원되지 않고, 여러 개의 관측치
+/// (flag / phase / attach 경로 / metric) 를 한 번에 보여 주어야 하기 때문이다.
+/// `handle_doctor` 가 이 구조체를 `run_all_checks` 결과 다음에 별도 블록으로 출력한다.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CentralStoreReport {
+    /// Central_Store_Flag 의 현재 평가 값.
+    pub flag_resolved: bool,
+    /// flag 가 어디서 유래했는지 — "env" / "config" / "phase-default".
+    pub flag_source: String,
+    /// 빌드된 Phase 라벨 (예: "phase-3_4").
+    pub phase: String,
+    /// Attach_UDS 소켓 경로. aic-session 이 dial 하는 경로와 동일해야 한다.
+    pub attach_socket_path: PathBuf,
+    /// `UnixStream::connect` 를 짧은 타임아웃으로 시도한 결과. `true` 면 aicd 가
+    /// 해당 소켓을 listen 중이라는 신호다 (R14.6).
+    pub attach_connected: bool,
+    /// 현재 세션의 `aic-session` metric — backpressure 로 drop 된 byte 수 (R14.4).
+    pub dropped_bytes: u64,
+    /// 현재 세션의 `aic-session` metric — Attach_UDS 재연결 시도 수 (R14.5).
+    pub attach_reconnect_total: u64,
+    /// 세션 metric 조회 시 실패한 이유. 세션 소켓이 없거나 `GetMetrics` 가 실패한
+    /// 경우 사용자에게 어떤 필드가 누락되었는지 알려 준다. `Some` 이면
+    /// `dropped_bytes` / `attach_reconnect_total` 은 0 으로 채워진 placeholder 다.
+    pub session_metrics_error: Option<String>,
+}
+
+/// Central Store 섹션을 조사한다 (R14.6).
+///
+/// - `env`: `AIC_CENTRAL_STORE` 를 포함할 수 있는 환경변수 맵. 실제 호출은
+///   `std::env::vars().collect()` 를 넘기고, 테스트는 임의 맵으로 주입한다.
+/// - `config`: `[daemon]` 섹션. `None` 이면 env / Phase default 만으로 평가.
+/// - `session_socket`: 현재 세션의 UDS 경로. `dropped_bytes` /
+///   `attach_reconnect_total` 은 이 소켓의 `GetMetrics` 응답에서 읽는다. 세션이
+///   없거나 조회에 실패하면 값은 0, 원인은 `session_metrics_error` 에 저장된다.
+///
+/// 내부 I/O 에러는 결과 필드 (`attach_connected=false`, `session_metrics_error`)
+/// 로 표현되며 panic 하지 않는다 (doctor 는 어떤 상황에서도 완주해야 한다).
+pub async fn probe_central_store(
+    env: &HashMap<String, String>,
+    config: Option<&DaemonConfig>,
+    session_socket: Option<&Path>,
+) -> CentralStoreReport {
+    let (flag_resolved, source) =
+        resolve_central_store_flag_with_source_uncached(env, config);
+    let phase = current_phase();
+    let attach_socket_path = aic_common::aicd_attach_socket_path();
+    let attach_connected = probe_attach_socket(&attach_socket_path).await;
+
+    let (dropped_bytes, attach_reconnect_total, session_metrics_error) =
+        probe_session_metrics(session_socket).await;
+
+    CentralStoreReport {
+        flag_resolved,
+        flag_source: source.as_str().to_string(),
+        phase: phase.as_str().to_string(),
+        attach_socket_path,
+        attach_connected,
+        dropped_bytes,
+        attach_reconnect_total,
+        session_metrics_error,
+    }
+}
+
+/// 현재 프로세스의 환경변수 + config 파일 + 주어진 session socket 으로부터
+/// `probe_central_store` 를 실행하는 편의 wrapper.
+///
+/// `handle_doctor` 에서 사용한다. config 파일 파싱 실패는 `None` 으로 떨어져
+/// env + Phase default 로만 평가된다 (R12.2).
+pub async fn probe_central_store_default(
+    session_socket: Option<&Path>,
+) -> CentralStoreReport {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let daemon = read_daemon_config_best_effort();
+    probe_central_store(&env, daemon.as_ref(), session_socket).await
+}
+
+/// Attach_UDS 소켓이 listen 중인지 짧은 타임아웃으로 `connect` 를 시도한다.
+///
+/// 연결 직후 stream 을 drop 하므로 `AttachOpen` 은 보내지 않는다 — aicd 는 첫 프레임
+/// 읽기에서 EOF 를 관측하고 조용히 종료한다. probe 만의 부수효과는 metrics 증가
+/// 없이도 안전하다 (attach_open 카운터는 AttachOpen 프레임을 받아야만 증가).
+async fn probe_attach_socket(path: &Path) -> bool {
+    use tokio::net::UnixStream;
+    tokio::time::timeout(Duration::from_millis(100), UnixStream::connect(path))
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+}
+
+/// 세션 socket 의 `GetMetrics` 에서 dropped_bytes / attach_reconnect_total 을 뽑아 온다.
+///
+/// 두 필드는 `aic-session` 측 counter 이고 aicd 에는 존재하지 않는다 (R14.4, R14.5).
+/// 세션 소켓이 없거나 `GetMetrics` 가 에러로 끝나면 placeholder 0 값을 돌려주고
+/// 원인을 `Some(String)` 으로 반환한다.
+async fn probe_session_metrics(
+    session_socket: Option<&Path>,
+) -> (u64, u64, Option<String>) {
+    let Some(path) = session_socket else {
+        return (
+            0,
+            0,
+            Some("세션 소켓이 주어지지 않아 metric을 조회하지 못했습니다".to_string()),
+        );
+    };
+    if !path.exists() {
+        return (
+            0,
+            0,
+            Some(format!("세션 소켓 {} 이 존재하지 않습니다", path.display())),
+        );
+    }
+    let client = UdsClient::new(path.to_path_buf());
+    match tokio::time::timeout(Duration::from_secs(2), client.get_metrics()).await {
+        Ok(Ok(snap)) => (snap.dropped_bytes, snap.attach_reconnect_total, None),
+        Ok(Err(e)) => (0, 0, Some(format!("GetMetrics 실패: {e}"))),
+        Err(_) => (0, 0, Some("GetMetrics 2초 timeout".to_string())),
+    }
+}
+
+/// `config.toml` 의 `[daemon]` 섹션만 best-effort 로 읽어 온다.
+///
+/// 어떤 단계에서 실패해도 `None` 으로 떨어져 env / Phase default 로만 평가되도록
+/// 한다 (R12.2). `main.rs::read_daemon_config_best_effort` 와 같은 동작이지만
+/// doctor 모듈 단독으로도 사용할 수 있게 이곳에 복제해 둔다 — 두 경로 모두
+/// `AppConfigWithDaemon` 을 파싱하므로 동작은 동일하다.
+fn read_daemon_config_best_effort() -> Option<DaemonConfig> {
+    let path = ConfigManager::config_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let parsed: AppConfigWithDaemon = toml::from_str(&content).ok()?;
+    Some(parsed.daemon)
+}
+
+/// Central Store 섹션을 컬러 콘솔 출력한다. `print_report` 다음에 호출한다.
+///
+/// 출력 예:
+/// ```text
+/// Central Store:
+///   flag        : true (source: env)
+///   phase       : phase-3_4
+///   attach sock : /tmp/aic-501/aicd-attach.sock (connected)
+///   dropped     : 0 bytes
+///   reconnects  : 0
+/// ```
+pub fn print_central_store_section(report: &CentralStoreReport) {
+    let connected_label = if report.attach_connected {
+        "\x1b[32mconnected\x1b[0m"
+    } else {
+        "\x1b[33mnot connected\x1b[0m"
+    };
+    println!();
+    println!("\x1b[1mCentral Store:\x1b[0m");
+    println!(
+        "  flag        : {} (source: {})",
+        report.flag_resolved, report.flag_source
+    );
+    println!("  phase       : {}", report.phase);
+    println!(
+        "  attach sock : {} ({})",
+        report.attach_socket_path.display(),
+        connected_label
+    );
+    match &report.session_metrics_error {
+        None => {
+            println!("  dropped     : {} bytes", report.dropped_bytes);
+            println!("  reconnects  : {}", report.attach_reconnect_total);
+        }
+        Some(reason) => {
+            println!(
+                "  dropped     : \x1b[90mN/A\x1b[0m ({reason})"
+            );
+            println!("  reconnects  : \x1b[90mN/A\x1b[0m");
+        }
+    }
 }
 
 // ── 개별 체크 ───────────────────────────────────────────────────
@@ -624,5 +812,170 @@ mod tests {
             .unwrap_or_else(ConfigManager::socket_path);
         let result = check_socket_path(&path);
         assert_eq!(result.status, Status::Warn);
+    }
+
+    // ── Central Store 섹션 (R14.6) ────────────────────────────
+
+    fn env_with(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_reads_flag_from_env() {
+        // env=1 이면 flag_resolved=true, flag_source="env" 이어야 한다.
+        let env = env_with(&[("AIC_CENTRAL_STORE", "1")]);
+        let cfg = DaemonConfig {
+            central_store: Some(false),
+        };
+        let report = probe_central_store(&env, Some(&cfg), None).await;
+        assert!(report.flag_resolved);
+        assert_eq!(report.flag_source, "env");
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_reads_flag_from_config_when_env_absent() {
+        let env: HashMap<String, String> = HashMap::new();
+        let cfg = DaemonConfig {
+            central_store: Some(true),
+        };
+        let report = probe_central_store(&env, Some(&cfg), None).await;
+        assert!(report.flag_resolved);
+        assert_eq!(report.flag_source, "config");
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_falls_back_to_phase_default() {
+        // env 비고 config 도 없으면 Phase default 가 적용되고 source="phase-default".
+        let env: HashMap<String, String> = HashMap::new();
+        let report = probe_central_store(&env, None, None).await;
+        assert_eq!(
+            report.flag_resolved,
+            current_phase().default_central_store_flag()
+        );
+        assert_eq!(report.flag_source, "phase-default");
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_reports_phase_label() {
+        let env: HashMap<String, String> = HashMap::new();
+        let report = probe_central_store(&env, None, None).await;
+        assert_eq!(report.phase, current_phase().as_str());
+        assert!(report.phase.starts_with("phase-3_"));
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_uses_common_attach_socket_path() {
+        // attach_socket_path 는 항상 aic_common::aicd_attach_socket_path() 와 일치.
+        let env: HashMap<String, String> = HashMap::new();
+        let report = probe_central_store(&env, None, None).await;
+        assert_eq!(
+            report.attach_socket_path,
+            aic_common::aicd_attach_socket_path()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_reports_connected_when_socket_listens() {
+        // 실제 UnixListener 를 bind 해 두면 probe_attach_socket 이 true 여야 한다.
+        // 테스트는 임의 경로로 바인드한 뒤 `probe_attach_socket` 을 직접 호출해
+        // 공용 `aicd_attach_socket_path()` 를 건드리지 않는다 — 사용자 환경의 실제
+        // aicd 유무와 독립적이어야 하기 때문이다.
+        let tempdir = tempfile::tempdir().unwrap();
+        let sock = tempdir.path().join("attach-probe.sock");
+        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let ok = probe_attach_socket(&sock).await;
+        assert!(ok, "listener 가 떠 있으면 connect 에 성공해야 한다");
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_reports_not_connected_when_absent() {
+        // 없는 경로면 probe_attach_socket 은 false.
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing = tempdir.path().join("no-such-attach.sock");
+        let ok = probe_attach_socket(&missing).await;
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn probe_session_metrics_returns_error_when_session_missing() {
+        // session_socket=None → placeholder 0 + 에러 메시지.
+        let (dropped, reconnects, err) = probe_session_metrics(None).await;
+        assert_eq!(dropped, 0);
+        assert_eq!(reconnects, 0);
+        assert!(err.is_some());
+    }
+
+    #[tokio::test]
+    async fn probe_session_metrics_returns_error_when_socket_file_missing() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing = tempdir.path().join("session-missing.sock");
+        let (dropped, reconnects, err) = probe_session_metrics(Some(&missing)).await;
+        assert_eq!(dropped, 0);
+        assert_eq!(reconnects, 0);
+        let reason = err.expect("Some(String) 이어야 한다");
+        assert!(
+            reason.contains("존재하지 않습니다"),
+            "reason={reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_session_metrics_reads_snapshot_fields_from_server() {
+        // mock UDS 서버가 GetMetrics 에 대해 dropped_bytes/attach_reconnect_total 이 채워진
+        // MetricsSnapshot 을 돌려주면, probe_session_metrics 는 그 값을 그대로 돌려준다.
+        use aic_common::{encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let sock = tempdir.path().join("session-metrics.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let snap = MetricsSnapshot {
+            dropped_bytes: 4096,
+            attach_reconnect_total: 3,
+            ..Default::default()
+        };
+        let snap_resp = snap.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // 요청 수신 (내용은 확인만)
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await.unwrap();
+            let plen = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; plen];
+            stream.read_exact(&mut payload).await.unwrap();
+            let req: IpcRequest = serde_json::from_slice(&payload).unwrap();
+            assert!(matches!(req, IpcRequest::GetMetrics));
+
+            // 응답 송신
+            let resp = IpcResponse::Metrics(snap_resp);
+            let body = serde_json::to_vec(&resp).unwrap();
+            let frame = encode_frame(&body);
+            stream.write_all(&frame).await.unwrap();
+        });
+
+        let (dropped, reconnects, err) = probe_session_metrics(Some(&sock)).await;
+        assert_eq!(dropped, 4096);
+        assert_eq!(reconnects, 3);
+        assert!(err.is_none(), "err={err:?}");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn probe_central_store_merges_metric_error_without_panic() {
+        // 존재하지 않는 세션 소켓을 넘겨도 전체 리포트는 정상 생성되고
+        // session_metrics_error 만 Some 으로 채워진다.
+        let env: HashMap<String, String> = HashMap::new();
+        let tempdir = tempfile::tempdir().unwrap();
+        let missing = tempdir.path().join("not-a-socket.sock");
+        let report = probe_central_store(&env, None, Some(&missing)).await;
+        assert_eq!(report.dropped_bytes, 0);
+        assert_eq!(report.attach_reconnect_total, 0);
+        assert!(report.session_metrics_error.is_some());
     }
 }
