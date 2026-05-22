@@ -8,9 +8,9 @@
 
 ## Overview
 
-`aic` feeds your terminal's error output to an LLM, which explains what went wrong and suggests a fix command.
+When a command fails, `aic` hands its output to an LLM and gets back an explanation of what went wrong plus a suggested fix.
 
-Under the hood, a PTY-based daemon (`aic-session`) wraps your shell, relaying I/O while capturing output into a ring buffer. The CLI client (`aic`) checks the previous command's exit code and branches into error-analysis mode or an interactive REPL.
+It works through a PTY-based daemon (`aic-session`) that wraps your shell, relaying I/O while keeping a ring buffer of recent output. The CLI client (`aic`) reads the previous command's exit code and either explains the error or drops you into an interactive REPL.
 
 A per-user supervisor daemon (`aicd`) manages session lifecycle, registry, and cleanup. For workflows where PTY wrapping is too expensive, a metadata-only **hook capture mode** skips output capture entirely (PRDs: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
 
@@ -43,12 +43,13 @@ graph LR
 - ✅ Single-instance guarantee — `fcntl(F_SETLK)` PID lock with automatic stale cleanup
 - ✅ Graceful shutdown — SIGTERM/SIGINT handling, drain then cleanup
 - ✅ Structured trace logs — JSONL daily-rotate (7-day retention), `AIC_LOG=info|debug`
-- ✅ `aic doctor` — 8-axis environment diagnosis (config / daemon / shell hook / LLM endpoint / keychain / audit)
+- ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
 
 ### Security baseline
 - ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
-- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, integrity verification via `aic audit verify`
+- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, integrity verification via `aic audit verify`. The HMAC key uses a **file backend by default**; the OS keychain is opt-in (`AIC_AUDIT_KEYCHAIN=1`), and `AIC_NO_KEYCHAIN=1` forces it off
+  - **Upgrade note**: if you used an earlier version where the audit key lived only in the OS keychain, the new file-backend default may report a verify WARN/missing-key (or skip new appends to protect the chain). Either keep verifying/using the keychain-backed chain by running with `AIC_AUDIT_KEYCHAIN=1`, **or** start a fresh file-backed chain by backing up/rotating `~/.local/state/aic/audit.log` and re-running. `aic doctor` prints both options.
 - ✅ OS keychain — store API keys in macOS Keychain / Linux Secret Service / Windows Credential Manager; bulk migrate plaintext via `aic migrate-keys`
 
 ### LLM UX
@@ -63,7 +64,7 @@ graph LR
 - ✅ `aic init --hook-mode` — additionally install Phase 3 metadata-only hook
 - ✅ `aic config` interactive wizard
 
-### Supervisor / Capture Modes (new)
+### Supervisor / Capture Modes
 - ✅ `aicd` supervisor daemon — one per user. Session registry, control UDS,
   graceful shutdown
 - ✅ `aic daemon { status | start | stop }` — supervisor control
@@ -242,38 +243,9 @@ NO_COLOR=1 aic chat                         # plain output (no ANSI; also auto o
 # → On start, a banner + status line (mode/tools/policy/cwd/provider) prints to stderr.
 #   The chat prompt is "◇ you ❯ " on a TTY, plain "you> " when piped. LLM answers go
 #   to stdout; banner/status/command-cards/debug go to stderr (clean piping).
-# → In-session slash commands (not sent to the LLM, printed on screen only):
-#     /help · /last [N] · /raw [seq|corr]
-#     /local [section] [--raw]  (alias /sys, /snapshot) — local sysinfo snapshot + LLM analysis
-#                       probes (date/host/os/uptime/disk/memory/ip/route/ports), each a bounded Safe command.
-#                       Default sends the REDACTED snapshot to the provider for a brief summary (no chat
-#                       history). --raw/-r shows the raw snapshot only (no model call); --analyze/-a forces
-#                       analysis. On any provider error/timeout it falls back to raw with a short reason.
-#                       Opt out of analysis entirely with AIC_LOCAL_NO_ANALYZE=1.
-#                       The analysis is rendered for the terminal (markdown headings/bullets/bold/code as
-#                       ANSI structure, CJK-aware wrap, amber accent); NO_COLOR keeps structure without
-#                       color, and a pipe (non-TTY) emits raw markdown unchanged. A spinner shows analysis
-#                       progress on a TTY (no-op when piped).
-#     /diagnose [--raw] <symptom>  read-only SRE diagnosis. Picks safe probes from the symptom
-#                       (cpu/memory/disk/network/process/generic), collects evidence, and analyzes it into
-#                       hypotheses → cited evidence → next safe checks (no chat history). e.g.
-#                       /diagnose "the mac is slow", /diagnose memory pressure, /diagnose --raw slow.
-#                       No-arg = general health. --raw shows evidence only; falls back to raw on LLM failure.
-#     /explain-last [--raw] [seq|corr]  analyze the last (or given) tool record (cause/evidence/next checks).
-#     /incident [--raw] [name]  bundle system snapshot + git read-only evidence (in a repo) + recent tool
-#                       records, then analyze. "name" is a label only (never placed in a shell command).
-#     /doctor              AIC self-status: provider/model, tool-calling support, run_command on/off, and env
-#                       flags as set/unset only (no secret values, no config dump).
-#     /timeline [N]        session tool records in chronological order (redacted summaries).
-#     /compare             collect a fixed-Safe system snapshot and diff vs the previous baseline (no LLM).
-#     /bundle [name]       save incident evidence (system + git read-only + recent records) as redacted
-#                       markdown under ~/.aic/bundles/ (dir 0700 / file 0600 on Unix). "name" labels the file.
-#   Deferred: /runbook, /fix-preview, /config, a watch daemon, persistent /audit browsing.
-#   On a TTY, typing "/" instantly opens a candidate panel ("command  description"); ↑↓ to move
-#   (selected row highlighted), Tab to cycle, Enter to pick, Esc to close. Only the name is inserted.
-#   Matching is prefix-first with subsequence/fuzzy fallback (e.g. /lcl → /local). /local <section>
-#   completes sections. (Powered by reedline; NO_COLOR/non-TTY policy respected.)
-#   (persistent /audit browsing is planned for P2-2)
+# → In-session slash commands are intercepted locally and never sent to the LLM:
+#   /local /diagnose /explain-last /incident /doctor /timeline /compare /bundle /triage /watch /help.
+#   Type "/" on a TTY to open the completion panel. See "Chat slash commands" below for the full table.
 # (legacy flags --sre / --allow-run still parse but are now no-ops: run_command is on by default)
 # Design: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
 # → Preview cost with: aic chat --dry-run "ping"
@@ -304,13 +276,19 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/timeline [N]` | Session tool records in chronological order (redacted) |
 | `/compare` | Diff a fixed-Safe system snapshot against the previous baseline (no LLM) |
 | `/bundle [name]` | Save incident evidence as redacted markdown under `~/.aic/bundles/` (dir 0700 / file 0600 on Unix) |
+| `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail generic` |
+| `/watch [target] [--count N] [--every Ns]` | Re-run local probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is a section name, or omit it for a compact set |
+
+Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands
+(local sysinfo sections + `process` + git read-only); `/local`, `/compare`, `/diagnose`, `/incident`,
+`/bundle`, and `/triage` all draw from it.
 
 Analysis commands send a **redacted** evidence snapshot to the provider in a single, tool-less,
 stateless call. `--raw` (and `AIC_LOCAL_NO_ANALYZE=1`) skip the model and show evidence only; on any
 provider error/timeout they fall back to the raw evidence. Analysis output is rendered as a CLI-friendly
 markdown subset (amber accents) on a TTY, plain when piped, with a progress spinner.
 
-Deferred (roadmap): `/runbook`, `/fix-preview`, `/config`, a watch daemon, persistent `/audit` browsing.
+Deferred (roadmap): `/runbook`, `/fix-preview`, `/config`, a background watch daemon, persistent `/audit` browsing.
 
 ### Safety model (run_command)
 
@@ -353,6 +331,11 @@ aic run -- cargo build              # preserves stdout/stderr and exit code
 | `AIC_REDACT=off` | disable secret/PII redaction (recorded in audit) |
 | `AIC_NO_STREAM=1` | disable streaming (spinner + sectional output) |
 | `AIC_DEBUG=1` | client emits `[debug +X.XXXs]` prefix |
+| `AIC_AUDIT_KEYCHAIN=1` | store the audit HMAC key in the OS keychain (opt-in). **Default is a file key** |
+| `AIC_NO_KEYCHAIN=1` | force keychain off (highest priority) — overrides the opt-in; always uses the file key |
+| `AIC_LOCAL_NO_ANALYZE=1` | skip analysis for `/local`·`/diagnose` etc.; show raw evidence only |
+| `AIC_NO_BANNER=1` / `AIC_QUIET=1` | suppress the `aic chat` startup banner, status line, and context header (this chrome is unrelated to debug output) |
+| `AIC_VERBOSE=1` | show the detailed per-command `run_command` cards (preamble + `→ done` summary). Default is quiet (only section headers + security warnings). `AIC_DEBUG=1` also enables them |
 | `AIC_SESSION_ID` | active session ID. Exported automatically by `aic-session`; hooks reference it too |
 
 ## Project Structure

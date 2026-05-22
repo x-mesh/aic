@@ -4,6 +4,78 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-22
+
+`aic chat`을 SRE 진단 어시스턴트로 굳히는 릴리즈 — slash 명령 팔레트/안전성 개선, 새 진단 명령
+(`/watch`), `/compare` 강화, 더 깔끔한 `/local` 분석 출력, audit 키 backend 기본값 변경.
+
+### Added — chat slash UX (palette · prefix · `/watch` · `/compare` 강화)
+
+- **slash 명령 팔레트 카테고리화** — `/` 단독 입력 시 후보가 `[Diagnostics]`/`[System]`/`[Evidence]`/
+  `[Meta]` 카테고리로 묶여 정렬·표시된다(discovery만 적용; prefix 완성에는 영향 없음).
+- **prefix Enter 완성** — `/lo`처럼 유일하게 결정되는 prefix는 Enter 한 번에 `/local`로 확정·실행된다.
+  ambiguous prefix(`/d` → diagnose/doctor)는 첫 후보를 실수로 실행하지 않고 후보를 안내한다.
+- **`/watch [target] [--count N] [--every Ns]`** — 로컬 probe를 bounded하게 반복 실행하고 tick마다
+  변화량을 요약(LLM 미호출). 무한 watch 없음(기본 3회, 최대 20, 간격 1s clamp). `target`은 섹션 이름,
+  생략하면 compact 세트(uptime/memory/disk). unknown target은 조용한 fallback 대신 사용 가능 섹션을 안내.
+- **`/compare` 강화** — 변경/동일 섹션 수와 추가/삭제 라인 수를 요약하고 변경 섹션 이름을 보여준다.
+  run_command 실행 메타(duration_ms 등)는 비교에서 제외해 동일 상태가 changed로 보이는 false positive 제거.
+
+### Changed — `/local`·`/diagnose`·`/incident` 출력 정리
+
+- **분석 모드 출력 간소화** — `/local`(기본 analyze)에서 빈 `=== local system snapshot ===`/섹션 헤더를
+  더 이상 남기지 않는다. 수집 중에는 `<thinking> 수집 중: <probe> (i/n)` 진행 표시(같은 줄 갱신, TTY)만
+  보이고, 완료 후 `=== local analysis ===` 결과만 남는다. `--raw`(또는 `AIC_LOCAL_NO_ANALYZE=1`)는 기존처럼
+  헤더+본문을 보여준다.
+- **`/incident` 분석 입력 bounding** — 과대 evidence로 인한 provider parsing/context 오류를 막기 위해
+  섹션별 라인 cap·최근 기록 축소·전체 크기 cap을 적용한다(핵심 섹션은 보존). 분석 실패 시 사용자 친화
+  메시지와 함께 수집한 raw 증거를 보여준다.
+
+### Changed — run_command 상세 카드 기본 조용화 (`AIC_VERBOSE`)
+
+- **`/local`·`/diagnose`·`/triage --run` 등에서 probe마다 출력되던 상세 `run_command` 카드**
+  (`▌ run_command [corr]`, `cwd/policy/timeout/output cap`, `→ done duration`)를 **기본 OFF**로 바꿔
+  조용히 실행한다. 섹션 헤더(`[name]`)와 결과 본문만 보여 다수 probe 출력이 깔끔해진다.
+  - `AIC_VERBOSE=1`(또는 `AIC_DEBUG=1`)이면 기존 상세 카드 전체를 표시.
+  - **보안 경고는 기본에서도 항상 표시**: blocked/denied/NeedsConfirm/Dangerous/Unknown(`→ blocked`/
+    `→ denied`/확인 프롬프트/validator 차단 hint)는 flag와 무관하게 유지.
+
+### Changed — AIC_DEBUG 판정 통일 + 시작 배너 opt-out
+
+- **AIC_DEBUG는 `1`/`true`(대소문자·공백 무시)만 ON.** `0`/`false`/`off`/빈값/unset은 모두 OFF로 통일.
+  기존에 `var_os().is_some()`로 "값과 무관하게 set이면 ON" 취급하던 audit keychain 힌트와 chat
+  `/doctor`의 AIC_DEBUG 표기를 truthy 판정(`agent::debug`)으로 교체 — `AIC_DEBUG=0`에서 디버그 출력이
+  새지 않는다.
+- **`aic chat` 시작 배너 opt-out 추가.** `AIC_NO_BANNER=1`(또는 `AIC_QUIET=1`)이면 ASCII 배너,
+  status 줄, **context header**(직전 명령 컨텍스트)를 모두 출력하지 않는다(기본은 계속 표시). 이 시작
+  chrome은 debug 로그와 무관함을 명확히 하기 위한 분리.
+
+### Changed — audit key backend 기본값(file) + keychain opt-in
+
+- **audit HMAC 키 backend 기본을 file로 변경.** OS keychain은 이제 **opt-in**(`AIC_AUDIT_KEYCHAIN=1`)
+  일 때만 사용한다. `AIC_NO_KEYCHAIN=1`은 최우선으로 keychain을 끄며(opt-in보다 우선), 단위 테스트는
+  항상 file. 기본 환경(특히 macOS nested-PTY/headless)에서 keychain Mach IPC block으로 인한 hang을
+  피하기 위함. backend 라벨(`file (default)` / `keychain (opt-in: AIC_AUDIT_KEYCHAIN)` /
+  `file (keychain off: AIC_NO_KEYCHAIN)`)을 `aic doctor`와 chat `/doctor` 출력에 표시한다.
+  - **업그레이드/마이그레이션**: 이전 버전에서 audit 키가 keychain에만 있던 사용자는 file 기본 전환 후
+    `aic doctor`의 audit 검증이 WARN/키 없음을 보고하거나 chain 보호로 append가 skip될 수 있다. doctor
+    fix hint가 두 선택지를 안내한다 — (1) `AIC_AUDIT_KEYCHAIN=1`로 실행해 기존 keychain chain 유지,
+    (2) `~/.local/state/aic/audit.log`를 백업/rotate 후 재실행해 새 file chain 시작.
+
+### Added — Probe Catalog + `/triage`
+
+- **Probe Catalog (`agent::probes`)** — 읽기 전용 SRE probe의 단일 출처. `ProbeSpec{id, category,
+  tags, description, linux_command, macos_command, max_lines}`에 기존 local 섹션
+  (date/host/os/uptime/disk/memory/ip/route/ports) + `process` + git read-only
+  (status/branch/log/diff)를 모았다. 모든 명령은 고정 상수 bounded Safe.
+  `sysinfo::local_probes`/`probes_for`, `/diagnose` probe, `/incident`·`/bundle` git 증거가 catalog를
+  조회하도록 통일(동작 동일).
+- **`/triage [--run] [topic]`** — 토픽별 read-only 체크리스트 + 후보 probe(id/설명/명령)를 화면에
+  렌더. topic: `mac-slow web disk memory cpu network build-fail generic`(unknown은 generic으로
+  fallback하되 원 라벨 표시). 기본은 **LLM 미호출** 안내만, `--run`이면 run_command 활성 시 후보
+  probe를 `collect_local_snapshot`으로 실행해 redacted 증거 출력(여전히 LLM/history 미사용). topic은
+  라벨 선택에만 쓰고 셸 명령에 섞지 않는다.
+
 ## [0.5.0] - 2026-05-22
 
 ### Added — `aic chat` Agentic Assistant (RFC-002 Phase 0~2)

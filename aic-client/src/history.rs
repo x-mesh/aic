@@ -61,12 +61,13 @@ pub async fn run(session: Option<String>, limit: usize, failed: bool, json: bool
     };
 
     // aicd CommandRecordStore 조회.
-    let records = match client.get_recent_commands_for_session(&session_id, limit).await {
+    let records = match client
+        .get_recent_commands_for_session(&session_id, limit)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
-            eprintln!(
-                "{COL_RED}✗{COL_RESET} aicd record 조회 실패 (session={session_id}): {e}"
-            );
+            eprintln!("{COL_RED}✗{COL_RESET} aicd record 조회 실패 (session={session_id}): {e}");
             std::process::exit(1);
         }
     };
@@ -89,9 +90,7 @@ pub async fn run(session: Option<String>, limit: usize, failed: bool, json: bool
     }
 
     if filtered.is_empty() {
-        println!(
-            "{COL_DIM}저장된 record 없음 (session={session_id}){COL_RESET}"
-        );
+        println!("{COL_DIM}저장된 record 없음 (session={session_id}){COL_RESET}");
         return;
     }
 
@@ -158,9 +157,7 @@ fn print_table(session_id: &str, records: &[CommandRecord]) {
         let exit = format_exit_code(rec.exit_code);
         let cmd = rec.command.as_deref().unwrap_or("(no command)");
         let cmd = truncate_command(cmd, 70);
-        println!(
-            "  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<20}{COL_RESET}  {cmd}"
-        );
+        println!("  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<20}{COL_RESET}  {cmd}");
     }
 }
 
@@ -209,9 +206,7 @@ pub(crate) fn render_table_plain(session_id: &str, records: &[CommandRecord]) ->
         };
         let cmd = rec.command.as_deref().unwrap_or("(no command)");
         let cmd = truncate_command(cmd, 70);
-        out.push_str(&format!(
-            "  {id:<8}  {exit_str:<4}  {when:<20}  {cmd}\n"
-        ));
+        out.push_str(&format!("  {id:<8}  {exit_str:<4}  {when:<20}  {cmd}\n"));
     }
     out
 }
@@ -224,7 +219,10 @@ pub(crate) fn render_json(records: &[CommandRecord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aic_common::{encode_frame, CaptureMode, CaptureQuality, CommandRecord, IpcRequest, IpcResponse, SessionInfo, SessionState};
+    use aic_common::{
+        encode_frame, CaptureMode, CaptureQuality, CommandRecord, IpcRequest, IpcResponse,
+        SessionInfo, SessionState,
+    };
     use chrono::{TimeZone, Utc};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -434,7 +432,9 @@ aic history (session=abcd1234, 1 record)
         let _g = env_guard();
         // aicd에 연결되지 않아도 explicit이면 즉시 반환되어야 한다.
         let client = UdsClient::new(PathBuf::from("/tmp/nonexistent-aic-hist-test.sock"));
-        let id = resolve_session_id(&client, Some("  deadbeef  ")).await.unwrap();
+        let id = resolve_session_id(&client, Some("  deadbeef  "))
+            .await
+            .unwrap();
         assert_eq!(id, "deadbeef");
     }
 

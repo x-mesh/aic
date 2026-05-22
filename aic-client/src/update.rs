@@ -77,7 +77,8 @@ pub fn detect_install() -> Result<Install> {
     let exe = std::env::current_exe().context("실행 binary 경로 조회 실패")?;
     let resolved = std::fs::canonicalize(&exe).unwrap_or(exe);
 
-    let os = goreleaser_os().ok_or_else(|| anyhow!("지원하지 않는 OS: {}", std::env::consts::OS))?;
+    let os =
+        goreleaser_os().ok_or_else(|| anyhow!("지원하지 않는 OS: {}", std::env::consts::OS))?;
     let arch = goreleaser_arch()
         .ok_or_else(|| anyhow!("지원하지 않는 아키텍처: {}", std::env::consts::ARCH))?;
 
@@ -253,10 +254,7 @@ async fn fetch_expected_sum(tag: &str, asset: &str) -> Result<String> {
     if !resp.status().is_success() {
         bail!("checksums.txt 응답 {}", resp.status());
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .context("checksums.txt body 읽기 실패")?;
+    let bytes = resp.bytes().await.context("checksums.txt body 읽기 실패")?;
     if bytes.len() > MAX_CHECKSUMS_BYTES {
         bail!("checksums.txt가 비정상적으로 큼 ({} bytes)", bytes.len());
     }
@@ -353,9 +351,7 @@ fn extract_binaries(
 
         let dst = staging.join(format!("{name}.new"));
         let mut data = Vec::with_capacity(8 * 1024 * 1024);
-        entry
-            .read_to_end(&mut data)
-            .context("tar 내용 read 실패")?;
+        entry.read_to_end(&mut data).context("tar 내용 read 실패")?;
         std::fs::write(&dst, &data).with_context(|| format!("쓰기 실패: {}", dst.display()))?;
         #[cfg(unix)]
         {
@@ -616,10 +612,7 @@ mod tests {
 
     #[test]
     fn classify_brew_paths() {
-        assert_eq!(
-            classify(Path::new("/opt/homebrew/bin/aic")),
-            Source::Brew
-        );
+        assert_eq!(classify(Path::new("/opt/homebrew/bin/aic")), Source::Brew);
         assert_eq!(
             classify(Path::new("/usr/local/Cellar/aic/0.3.0/bin/aic")),
             Source::Brew
@@ -648,7 +641,10 @@ mod tests {
             os: "darwin",
             arch: "arm64",
         };
-        assert_eq!(install.asset_name("v0.3.0"), "aic_0.3.0_darwin_arm64.tar.gz");
+        assert_eq!(
+            install.asset_name("v0.3.0"),
+            "aic_0.3.0_darwin_arm64.tar.gz"
+        );
         assert_eq!(install.asset_name("0.3.0"), "aic_0.3.0_darwin_arm64.tar.gz");
     }
 

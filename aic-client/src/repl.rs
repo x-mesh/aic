@@ -287,6 +287,9 @@ impl Drop for LineReader {
 /// - **`/`** = 문자 삽입 후 즉시 메뉴 열기(`Multiple([Edit(InsertChar('/')), Menu]`)).
 ///   reedline 0.39에는 buffer-change hook이 없어, `/` 키에 삽입+메뉴 열기를 묶는다.
 ///   completer가 후보를 못 내면(`/`가 일반 문장 중간 등) 메뉴는 비어 자연히 닫힌다.
+/// - **Enter** = 메뉴 활성 여부와 무관하게 **현재 라인을 즉시 제출**(`Submit`). 기본 emacs는
+///   메뉴가 열려 있으면 Enter가 후보 선택에 소비되어 제출에 Enter 2회가 필요했다(Fix A).
+///   후보 삽입은 Tab으로 하고 Enter는 항상 제출한다.
 fn slash_keybindings() -> reedline::Keybindings {
     use reedline::{default_emacs_keybindings, EditCommand, KeyCode, KeyModifiers, ReedlineEvent};
     let mut kb = default_emacs_keybindings();
@@ -304,6 +307,19 @@ fn slash_keybindings() -> reedline::Keybindings {
         ReedlineEvent::Multiple(vec![
             ReedlineEvent::Edit(vec![EditCommand::InsertChar('/')]),
             ReedlineEvent::Menu(COMPLETION_MENU.to_string()),
+        ]),
+    );
+    // Enter 최종: slash/menu 활성 시 **유일 후보를 버퍼에 accept(Enter)한 뒤 같은 입력에서 제출(Submit)**
+    // 한다. reedline 0.39의 ColumnarMenu는 활성 상태에서 `Enter` 이벤트를 받으면 선택 후보를 버퍼에
+    // replace하고 Handled로 소비하므로(`/lo`→`/local`), 이어지는 Submit이 정식 명령을 제출한다.
+    // 그 묶음이 처리되지 못하는 모드(예: Ctrl-R history search)에서는 기본 `Enter`로 폴백해 기존
+    // 확정 동작을 보존한다. 메뉴가 닫혀 있을 때 첫 Enter는 라인 제출로 동작한다.
+    kb.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Enter,
+        ReedlineEvent::UntilFound(vec![
+            ReedlineEvent::Multiple(vec![ReedlineEvent::Enter, ReedlineEvent::Submit]),
+            ReedlineEvent::Enter,
         ]),
     );
     kb
@@ -650,6 +666,45 @@ mod tests {
         }
         // Tab 바인딩은 유지(메뉴 열기/순환).
         assert!(kb.find_binding(KeyModifiers::NONE, KeyCode::Tab).is_some());
+    }
+
+    #[test]
+    fn enter_accepts_menu_then_submits_with_history_fallback() {
+        use reedline::{KeyCode, KeyModifiers, ReedlineEvent};
+        let kb = slash_keybindings();
+        // Enter = UntilFound([Multiple([Enter, Submit]), Enter]):
+        //  - slash/menu 상태: Enter(유일 후보 버퍼 accept)+Submit(즉시 제출) → Enter 1회.
+        //  - 그 묶음이 안 먹는 모드(예: Ctrl-R history search): 기본 Enter로 폴백(확정 동작 보존).
+        let ev = kb
+            .find_binding(KeyModifiers::NONE, KeyCode::Enter)
+            .expect("Enter 바인딩 존재");
+        match ev {
+            ReedlineEvent::UntilFound(branches) => {
+                // 1순위: Multiple([Enter, Submit]).
+                match branches.first() {
+                    Some(ReedlineEvent::Multiple(inner)) => {
+                        assert_eq!(
+                            inner.first(),
+                            Some(&ReedlineEvent::Enter),
+                            "1순위 첫 이벤트는 Enter(메뉴 후보 accept): {inner:?}"
+                        );
+                        assert_eq!(
+                            inner.last(),
+                            Some(&ReedlineEvent::Submit),
+                            "1순위 마지막 이벤트는 Submit(제출): {inner:?}"
+                        );
+                    }
+                    other => panic!("1순위가 Multiple([Enter, Submit])이 아님: {other:?}"),
+                }
+                // 폴백: 기본 Enter(history search 확정 등).
+                assert_eq!(
+                    branches.last(),
+                    Some(&ReedlineEvent::Enter),
+                    "폴백은 기본 Enter여야 함: {branches:?}"
+                );
+            }
+            other => panic!("Enter 바인딩이 UntilFound가 아님: {other:?}"),
+        }
     }
 
     #[test]

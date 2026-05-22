@@ -13,6 +13,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -29,6 +31,10 @@ const MAX_TIMEOUT_SECS: u64 = 30;
 const MAX_STREAM_BYTES: usize = 64 * 1024;
 /// reader가 cap 이후 드레인할 최대 바이트(초과 시 reader 종료 → join hang 방지).
 const MAX_DRAIN_BYTES: usize = 8 * 1024 * 1024;
+/// 자식 종료(또는 timeout kill) 후 reader 스레드 완료를 기다리는 최대 시간.
+/// process group kill로 lingering descendant가 정리되면 EOF가 곧 오지만, 무기한 join을
+/// 막기 위한 hard watchdog. 초과 시 join을 포기하고 공유버퍼의 부분 출력을 스냅샷한다.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// 셸 제약(검증 실패) 시 사용자/모델에게 줄 actionable 안내.
 const SHELL_RESTRICTION_HINT: &str = "셸 특수문자($, glob `* ? [ ] { }`, 따옴표, 백슬래시, \
 redirect `> <`, `;`, `&`, `&&`/`||`, backtick)는 차단됩니다. 파이프 `|`는 허용되되 각 segment의 \
@@ -198,8 +204,27 @@ fn card_line(body: &str) {
     eprintln!("{} {}", paint("▌", "2"), paint(body, "2"));
 }
 
+/// 순수 결정 로직(테스트용): 상세 카드 표시 여부.
+fn detail_cards_from(debug: bool, verbose: bool) -> bool {
+    debug || verbose
+}
+
+/// 상세 command card(실행 preamble + `→ done` 요약)를 보일지. **기본 OFF(조용한 /local UX)**,
+/// `AIC_DEBUG` 또는 `AIC_VERBOSE`가 `1|true`면 ON. blocked/denied/NeedsConfirm 등 **보안 경고는
+/// 이 flag와 무관하게 항상 표시**한다.
+fn detail_cards_enabled() -> bool {
+    detail_cards_from(
+        crate::agent::debug::env_truthy("AIC_DEBUG"),
+        crate::agent::debug::env_truthy("AIC_VERBOSE"),
+    )
+}
+
 /// 실행/차단 직전 사용자에게 보여줄 command card(provenance)를 stderr에 출력한다.
+/// 기본 모드에서는 조용히(생략) — AIC_DEBUG/AIC_VERBOSE일 때만 상세 preamble을 보인다.
 fn print_command_card(command: &str, cwd: &str, policy_label: &str, timeout: Duration, corr: &str) {
+    if !detail_cards_enabled() {
+        return;
+    }
     eprintln!(
         "{} {} {} {}",
         paint("▌", "2"),
@@ -305,14 +330,16 @@ fn run_and_format(
     let outcome = spawn_with_timeout(command, cwd, timeout)?;
     let duration_ms = start.elapsed().as_millis();
     let truncated_any = outcome.stdout_truncated || outcome.stderr_truncated;
-    // 실행 완료 요약(사용자용, stderr).
-    card_line(&format!(
-        "→ done exit={} duration={duration_ms}ms truncated={truncated_any}",
-        outcome
-            .exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "timeout".into()),
-    ));
+    // 실행 완료 요약 — 상세 카드(AIC_DEBUG/AIC_VERBOSE)일 때만. 기본은 조용히.
+    if detail_cards_enabled() {
+        card_line(&format!(
+            "→ done exit={} duration={duration_ms}ms truncated={truncated_any}",
+            outcome
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "timeout".into()),
+        ));
+    }
 
     let (out_red, _) = prep_stream(&outcome.stdout);
     let (err_red, _) = prep_stream(&outcome.stderr);
@@ -329,6 +356,9 @@ fn run_and_format(
     );
     if outcome.timed_out {
         result.push_str(&format!("\n[timeout] {}s 초과로 중단됨", timeout.as_secs()));
+    }
+    if outcome.drain_timed_out {
+        result.push_str("\n[hint] output drain timed out; showing partial output");
     }
     if truncated {
         result.push_str(
@@ -349,34 +379,38 @@ struct Outcome {
     stderr_truncated: bool,
     exit_code: Option<i32>,
     timed_out: bool,
+    /// reader 스레드가 grace 내에 끝나지 않아 부분 출력만 스냅샷한 경우(드물게).
+    drain_timed_out: bool,
 }
 
-/// pipe에서 **bounded**로 읽는다: 최대 `MAX_STREAM_BYTES`까지만 메모리에 저장하고,
+/// pipe에서 **bounded**로 읽어 공유버퍼에 누적한다: 최대 `MAX_STREAM_BYTES`까지만 저장하고,
 /// 그 이후는 `MAX_DRAIN_BYTES`까지만 드레인한 뒤 종료한다(`read_to_end` 금지 →
-/// unbounded allocation·무한 join 방지). 반환: (저장 바이트, truncated 여부).
-fn bounded_read(stream: &mut impl Read) -> (Vec<u8>, bool) {
-    let mut buf: Vec<u8> = Vec::new();
+/// unbounded allocation·무한 join 방지). 청크마다 공유버퍼에 즉시 반영하므로, 호출 측이
+/// reader join을 포기하더라도 그 시점까지의 **부분 출력 스냅샷**을 회수할 수 있다.
+fn bounded_read_into(stream: &mut impl Read, buf: &Mutex<Vec<u8>>, truncated: &AtomicBool) {
     let mut chunk = [0u8; 8192];
-    let mut truncated = false;
     let mut total = 0usize;
     loop {
         match stream.read(&mut chunk) {
             Ok(0) => break, // EOF
             Ok(n) => {
                 total += n;
-                if buf.len() < MAX_STREAM_BYTES {
-                    let room = MAX_STREAM_BYTES - buf.len();
-                    let take = n.min(room);
-                    buf.extend_from_slice(&chunk[..take]);
-                    if take < n {
-                        truncated = true;
+                {
+                    let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                    if b.len() < MAX_STREAM_BYTES {
+                        let room = MAX_STREAM_BYTES - b.len();
+                        let take = n.min(room);
+                        b.extend_from_slice(&chunk[..take]);
+                        if take < n {
+                            truncated.store(true, Ordering::SeqCst);
+                        }
+                    } else {
+                        truncated.store(true, Ordering::SeqCst);
                     }
-                } else {
-                    truncated = true;
                 }
                 // 드레인 상한 초과 시 종료(grandchild가 pipe를 잡고 있어도 reader가 끝남).
                 if total >= MAX_DRAIN_BYTES {
-                    truncated = true;
+                    truncated.store(true, Ordering::SeqCst);
                     break;
                 }
             }
@@ -384,7 +418,6 @@ fn bounded_read(stream: &mut impl Read) -> (Vec<u8>, bool) {
             Err(_) => break,
         }
     }
-    (buf, truncated)
 }
 
 /// child를 새 process group의 leader로 만든다(Unix). timeout 시 group 전체를 kill해
@@ -427,6 +460,20 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// 공통 cleanup: process group 전체에 SIGKILL을 보내 **정상 종료 후에도** pipe write-end를
+/// 잡고 남은 descendant(예: 백그라운드 자식)를 정리한다 → reader가 EOF를 받아 join이 끝난다.
+/// leader가 이미 reaped이거나 그룹이 비어 있으면 ESRCH로 무해하다.
+#[cfg(unix)]
+fn reap_descendants(pgid: i32) {
+    // 음수 pid = process group 전체. setpgid(0,0)로 leader의 pgid == leader pid.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn reap_descendants(_pgid: i32) {}
+
 /// `sh -c <command>`를 실행하고 timeout 내 완료를 기다린다.
 /// stdout/stderr는 별도 스레드로 **bounded** 드레인해 pipe deadlock·unbounded alloc을 피한다.
 /// timeout 시 process group 전체를 kill해 descendant까지 정리한다(hard wall-clock cap).
@@ -444,16 +491,43 @@ fn spawn_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Result<Ou
     let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::new(format!("명령 실행 실패: {e}")))?;
+    // setpgid(0,0)로 child가 group leader이므로 pgid == child pid.
+    let pgid = child.id() as i32;
 
+    // 공유버퍼: reader가 청크마다 누적 → join을 포기해도 부분 출력 스냅샷 가능.
     let mut out = child.stdout.take();
     let mut err = child.stderr.take();
-    let out_handle = std::thread::spawn(move || match out.as_mut() {
-        Some(s) => bounded_read(s),
-        None => (Vec::new(), false),
+    let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let out_trunc = Arc::new(AtomicBool::new(false));
+    let out_done = Arc::new(AtomicBool::new(false));
+    let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let err_trunc = Arc::new(AtomicBool::new(false));
+    let err_done = Arc::new(AtomicBool::new(false));
+    let out_handle = std::thread::spawn({
+        let (buf, trunc, done) = (
+            Arc::clone(&out_buf),
+            Arc::clone(&out_trunc),
+            Arc::clone(&out_done),
+        );
+        move || {
+            if let Some(s) = out.as_mut() {
+                bounded_read_into(s, &buf, &trunc);
+            }
+            done.store(true, Ordering::SeqCst);
+        }
     });
-    let err_handle = std::thread::spawn(move || match err.as_mut() {
-        Some(s) => bounded_read(s),
-        None => (Vec::new(), false),
+    let err_handle = std::thread::spawn({
+        let (buf, trunc, done) = (
+            Arc::clone(&err_buf),
+            Arc::clone(&err_trunc),
+            Arc::clone(&err_done),
+        );
+        move || {
+            if let Some(s) = err.as_mut() {
+                bounded_read_into(s, &buf, &trunc);
+            }
+            done.store(true, Ordering::SeqCst);
+        }
     });
 
     let start = Instant::now();
@@ -474,9 +548,33 @@ fn spawn_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Result<Ou
         }
     };
 
-    // kill 후 reader 스레드는 EOF/드레인 상한으로 종료된다(부분 출력 회수).
-    let (stdout, stdout_truncated) = out_handle.join().unwrap_or_default();
-    let (stderr, stderr_truncated) = err_handle.join().unwrap_or_default();
+    // 공통 cleanup: 정상 종료라도 pipe write-end를 잡은 lingering descendant를 process group
+    // SIGKILL로 정리한다 → reader가 EOF로 끝난다(nested-PTY hang 방지). timeout 경로에서는
+    // 이미 kill되었지만 빈 그룹 재-kill은 무해하다.
+    reap_descendants(pgid);
+
+    // reader join watchdog: 위 kill 후 reader는 곧 끝나지만, 무기한 join을 막기 위해
+    // DRAIN_GRACE까지만 done 플래그를 기다린다. 초과 시 join을 포기하고(스레드는 detach)
+    // 공유버퍼에서 부분 출력을 스냅샷한다(Rust는 스레드 강제 종료가 불가).
+    let deadline = Instant::now() + DRAIN_GRACE;
+    while !(out_done.load(Ordering::SeqCst) && err_done.load(Ordering::SeqCst)) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let drain_timed_out = !(out_done.load(Ordering::SeqCst) && err_done.load(Ordering::SeqCst));
+    if !drain_timed_out {
+        let _ = out_handle.join();
+        let _ = err_handle.join();
+    }
+
+    // 공유버퍼 스냅샷(join 여부와 무관하게 그 시점까지의 출력을 회수). 락 poison은 무시.
+    let stdout = out_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stderr = err_buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let stdout_truncated = out_trunc.load(Ordering::SeqCst);
+    let stderr_truncated = err_trunc.load(Ordering::SeqCst);
+
     Ok(Outcome {
         stdout,
         stderr,
@@ -484,6 +582,7 @@ fn spawn_with_timeout(command: &str, cwd: &Path, timeout: Duration) -> Result<Ou
         stderr_truncated,
         exit_code,
         timed_out,
+        drain_timed_out,
     })
 }
 
@@ -712,7 +811,7 @@ fn validate_segment(segment: &str, sandbox: &Sandbox) -> Result<(), String> {
 ///
 /// 패턴 검색·glob·고급 quoting이 필요하면 전용 tool(`grep`/`rg` pattern, `glob`) 또는
 /// 후속 argv runner로 처리한다(shell의 expansion/quote-removal에 의존하지 않음).
-fn validate_command(command: &str, sandbox: &Sandbox) -> Result<(), String> {
+pub(crate) fn validate_command(command: &str, sandbox: &Sandbox) -> Result<(), String> {
     if command.contains('\n') || command.contains('\r') {
         return Err("개행 문자 불가".into());
     }
@@ -1011,12 +1110,20 @@ mod tests {
 
     // ── High finding 2: bounded reader ──────────────────────
 
+    /// 테스트 헬퍼: 공유버퍼 reader를 (Vec, truncated) 형태로 어댑트.
+    fn read_all(stream: &mut impl Read) -> (Vec<u8>, bool) {
+        let buf = Mutex::new(Vec::new());
+        let trunc = AtomicBool::new(false);
+        bounded_read_into(stream, &buf, &trunc);
+        (buf.into_inner().unwrap(), trunc.load(Ordering::SeqCst))
+    }
+
     #[test]
     fn bounded_read_caps_large_output() {
         // MAX_STREAM_BYTES보다 큰 입력을 줘도 저장은 cap까지만, truncated=true.
         let big = vec![b'a'; MAX_STREAM_BYTES + 50_000];
         let mut cursor = std::io::Cursor::new(big);
-        let (buf, truncated) = bounded_read(&mut cursor);
+        let (buf, truncated) = read_all(&mut cursor);
         assert_eq!(buf.len(), MAX_STREAM_BYTES, "저장은 cap까지만");
         assert!(truncated, "초과분은 truncated 표시");
     }
@@ -1024,7 +1131,7 @@ mod tests {
     #[test]
     fn bounded_read_small_output_not_truncated() {
         let mut cursor = std::io::Cursor::new(b"hello".to_vec());
-        let (buf, truncated) = bounded_read(&mut cursor);
+        let (buf, truncated) = read_all(&mut cursor);
         assert_eq!(buf, b"hello");
         assert!(!truncated);
     }
@@ -1182,6 +1289,41 @@ mod tests {
             start.elapsed() < Duration::from_secs(15),
             "process group kill 후 reader join이 빠르게 끝나야 함"
         );
+    }
+
+    #[test]
+    fn detail_cards_only_with_debug_or_verbose() {
+        // 기본(둘 다 off)은 상세 카드 숨김; AIC_DEBUG 또는 AIC_VERBOSE면 표시.
+        assert!(!detail_cards_from(false, false), "기본은 조용(카드 숨김)");
+        assert!(detail_cards_from(true, false), "AIC_DEBUG → 카드 표시");
+        assert!(detail_cards_from(false, true), "AIC_VERBOSE → 카드 표시");
+        assert!(detail_cards_from(true, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_exit_with_lingering_descendant_does_not_hang() {
+        // P0 nested-PTY hang 회귀: 부모 sh는 즉시 종료(`echo done`)하지만 백그라운드 자식
+        // `sleep 5 >&1`이 stdout pipe write-end를 잡고 남는다. 정상 종료 경로에서 process
+        // group kill이 없으면 reader가 EOF를 못 받아 join이 무한 대기(hang)한다.
+        let (_d, sb) = sandbox();
+        let start = Instant::now();
+        let outcome = spawn_with_timeout(
+            "(sleep 5 >&1 &); echo done",
+            sb.root(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        // 정상 종료(timeout 아님)이고 grace(2s) 내에 반환해야 한다.
+        assert!(!outcome.timed_out, "정상 종료여야 함(부모 즉시 exit)");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "lingering descendant가 있어도 reap+grace로 빠르게 반환해야 함(hang 아님): {:?}",
+            start.elapsed()
+        );
+        // descendant 종료 전이라도 부모가 쓴 stdout("done")은 회수돼야 한다.
+        let out = String::from_utf8_lossy(&outcome.stdout);
+        assert!(out.contains("done"), "부모 stdout 'done' 누락: {out:?}");
     }
 
     // ── SRE UX: shortcut normalization ────────────────────────

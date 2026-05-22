@@ -196,8 +196,61 @@ pub(crate) enum SlashCommand {
     Compare,
     /// `/bundle [name]` — 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장. name은 파일 라벨.
     Bundle(Option<String>),
+    /// `/triage [--run] [topic]` — 토픽별 read-only 체크리스트 + 후보 probe. `run`이면 probe 실행(LLM 없음).
+    /// topic은 라벨 선택에만 쓰고 셸 명령에 섞지 않는다.
+    Triage {
+        topic: Option<String>,
+        run: bool,
+    },
+    /// `/watch [target] [--count N] [--every Ns]` — local probe를 bounded하게 반복 실행(LLM 미호출).
+    /// `target`은 섹션 라벨 전용(미지정/`local`이면 compact 기본 세트). count/interval은 호출부에서 clamp.
+    Watch {
+        target: Option<String>,
+        count: usize,
+        every_ms: u64,
+    },
+    /// prefix가 2개 이상 명령과 일치(예: `/d` → diagnose/doctor). 후보를 안내만 한다.
+    Ambiguous {
+        input: String,
+        candidates: Vec<String>,
+    },
     /// 알 수 없는 slash — LLM에 보내지 않고 안내만.
     Unknown(String),
+}
+
+/// `/`명령 토큰 prefix resolve 결과.
+#[derive(Debug, PartialEq, Eq)]
+enum Resolution {
+    /// 알려진 토큰과 정확히 일치(별칭 `?`/`explain` 포함).
+    Exact(String),
+    /// 유일한 prefix 일치(예: `loc`→`local`).
+    Unique(String),
+    /// 2개 이상 prefix 일치 — 후보 목록.
+    Ambiguous(Vec<String>),
+    /// 일치 없음.
+    None,
+}
+
+/// 입력한 첫 토큰을 SLASH_COMMANDS 기준으로 resolve한다. exact 우선 → 유일 prefix → ambiguous/none.
+/// **prefix만** 사용하고 fuzzy/subsequence는 쓰지 않는다(Enter resolve의 예측 가능성 유지).
+fn resolve_slash_command(typed: &str) -> Resolution {
+    if typed.is_empty() {
+        return Resolution::None;
+    }
+    // exact: SLASH_COMMANDS + 특수 별칭(`?`=help, `explain`=explain-last).
+    if SLASH_COMMANDS.contains(&typed) || typed == "?" || typed == "explain" {
+        return Resolution::Exact(typed.to_string());
+    }
+    let matches: Vec<String> = SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(typed))
+        .map(|c| c.to_string())
+        .collect();
+    match matches.len() {
+        0 => Resolution::None,
+        1 => Resolution::Unique(matches.into_iter().next().unwrap()),
+        _ => Resolution::Ambiguous(matches),
+    }
 }
 
 /// 자동완성·도움말에 쓰는 slash 메타명령 목록(primary 이름).
@@ -215,7 +268,29 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "timeline",
     "compare",
     "bundle",
+    "triage",
+    "watch",
 ];
+
+/// slash 명령의 palette 카테고리(빈 `/` discovery 메뉴 그룹핑용). 표시 순서는 `slash_category_order`.
+pub(crate) fn slash_category(name: &str) -> &'static str {
+    match name {
+        "diagnose" | "incident" | "triage" | "doctor" => "Diagnostics",
+        "last" | "raw" | "timeline" | "compare" | "bundle" | "explain-last" => "Evidence",
+        "local" | "sys" | "snapshot" | "watch" => "System",
+        _ => "Meta", // help 등
+    }
+}
+
+/// 카테고리 표시 순서(Diagnostics→System→Evidence→Meta).
+fn slash_category_order(name: &str) -> u8 {
+    match slash_category(name) {
+        "Diagnostics" => 0,
+        "System" => 1,
+        "Evidence" => 2,
+        _ => 3,
+    }
+}
 
 /// 명령/섹션의 한 줄 설명(자동완성 패널 display·도움말에 공유).
 pub(crate) fn slash_description(name: &str) -> &'static str {
@@ -233,6 +308,8 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
+        "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
+        "watch" => "local probe를 짧게 반복 실행 (--count N --every Ns; 변화 요약, LLM 미호출)",
         // /local sections
         "date" => "현재 날짜/시간",
         "host" => "hostname",
@@ -271,10 +348,21 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
     let t = input.trim();
     let body = t.strip_prefix('/')?;
     let mut parts = body.split_whitespace();
-    let cmd = parts.next().unwrap_or("");
-    // 첫 토큰 이후의 raw 나머지(diagnose 증상처럼 공백 보존이 필요한 명령용).
-    let rest = body[cmd.len().min(body.len())..].trim_start();
-    Some(match cmd {
+    let typed = parts.next().unwrap_or("");
+    // 첫 토큰 이후의 raw 나머지(diagnose 증상처럼 공백 보존이 필요한 명령용) — 입력한 토큰 기준.
+    let rest = body[typed.len().min(body.len())..].trim_start();
+    // prefix Enter 지원: `/loc`→`/local`로 유일 prefix resolve(exact 우선). args(rest)는 그대로 보존.
+    let cmd: String = match resolve_slash_command(typed) {
+        Resolution::Exact(c) | Resolution::Unique(c) => c,
+        Resolution::None => return Some(SlashCommand::Unknown(typed.to_string())),
+        Resolution::Ambiguous(candidates) => {
+            return Some(SlashCommand::Ambiguous {
+                input: typed.to_string(),
+                candidates,
+            });
+        }
+    };
+    Some(match cmd.as_str() {
         "help" | "?" => SlashCommand::Help,
         "last" => SlashCommand::Last(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "raw" => SlashCommand::Raw(parts.next().map(|s| s.to_string())),
@@ -319,8 +407,88 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
                 Some(name.to_string())
             })
         }
+        "triage" => {
+            // [--run] [topic]. topic은 라벨 선택 전용(따옴표 strip), 셸 명령에 미포함.
+            let mut run = false;
+            let mut s = rest.trim_start();
+            while let Some(tok) = s.split_whitespace().next() {
+                if tok == "--run" || tok == "-r" {
+                    run = true;
+                    s = s[tok.len()..].trim_start();
+                } else {
+                    break;
+                }
+            }
+            let topic = strip_surrounding_quotes(s.trim());
+            SlashCommand::Triage {
+                topic: if topic.is_empty() {
+                    None
+                } else {
+                    Some(topic.to_string())
+                },
+                run,
+            }
+        }
+        "watch" => parse_watch_args(rest),
         other => SlashCommand::Unknown(other.to_string()),
     })
+}
+
+/// `/watch` 기본/한계값. 무한 watch 금지 — count·interval을 bounded하게 clamp한다.
+pub(crate) const WATCH_DEFAULT_COUNT: usize = 3;
+pub(crate) const WATCH_MAX_COUNT: usize = 20;
+pub(crate) const WATCH_DEFAULT_MS: u64 = 1000;
+pub(crate) const WATCH_MIN_MS: u64 = 200;
+pub(crate) const WATCH_MAX_MS: u64 = 60_000;
+
+/// interval 토큰을 ms로 파싱한다. `1s`=1000, `500ms`=500, `2`=2000(초). 실패 시 None.
+fn parse_interval_ms(tok: &str) -> Option<u64> {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(ms) = t.strip_suffix("ms") {
+        ms.trim().parse::<u64>().ok()
+    } else if let Some(s) = t.strip_suffix('s') {
+        s.trim().parse::<u64>().ok().map(|v| v * 1000)
+    } else {
+        t.parse::<u64>().ok().map(|v| v * 1000)
+    }
+}
+
+/// `/watch [target] [--count N|-n N] [--every Ns|-i Ns]`. target은 섹션 라벨 전용(없으면 compact 기본).
+/// count/interval은 [1, MAX]·[MIN, MAX]ms로 clamp(무한/과도 방지). 순수 함수(테스트 가능).
+fn parse_watch_args(rest: &str) -> SlashCommand {
+    let mut target: Option<String> = None;
+    let mut count = WATCH_DEFAULT_COUNT;
+    let mut every_ms = WATCH_DEFAULT_MS;
+    let mut it = rest.split_whitespace();
+    while let Some(tok) = it.next() {
+        match tok {
+            "--count" | "-n" => {
+                if let Some(v) = it.next() {
+                    if let Ok(n) = v.parse::<usize>() {
+                        count = n;
+                    }
+                }
+            }
+            "--every" | "-i" => {
+                if let Some(v) = it.next() {
+                    if let Some(ms) = parse_interval_ms(v) {
+                        every_ms = ms;
+                    }
+                }
+            }
+            s if !s.starts_with('-') && target.is_none() => target = Some(s.to_string()),
+            _ => {}
+        }
+    }
+    // "local"은 기본 compact 세트를 의미하므로 target 미지정과 동일 취급.
+    if target.as_deref() == Some("local") {
+        target = None;
+    }
+    SlashCommand::Watch {
+        target,
+        count: count.clamp(1, WATCH_MAX_COUNT),
+        every_ms: every_ms.clamp(WATCH_MIN_MS, WATCH_MAX_MS),
+    }
 }
 
 /// `/diagnose` 인자 파싱 — 선행 플래그(--raw/-r=off, --analyze/-a=on)를 소비한 뒤
@@ -372,6 +540,30 @@ fn is_subsequence(needle: &str, hay: &str) -> bool {
 
 /// `pool`에서 `typed`에 매칭되는 후보를 **예측 가능한 순서**(정렬)로 고른다.
 /// 우선 prefix 매칭. prefix 매칭이 하나도 없을 때만 subsequence(fuzzy) 폴백.
+/// 명령 토큰(`/d`, `/lo` …)의 completion 후보. **유일 prefix일 때만** commit 가능한 후보 1개를
+/// 반환하고, ambiguous(2+)·unknown(0)은 **빈 후보**로 둔다 — 그러면 메뉴가 첫 후보를 accept해 오실행
+/// 하지 않고 원문(`/d`)이 그대로 submit되어 parser resolve가 ambiguous 안내/Unknown을 담당한다.
+/// 예외: `/` 단독(빈 typed)은 메뉴 discovery를 위해 전체 명령을 보여준다.
+fn command_token_candidates(typed: &str) -> Vec<String> {
+    if typed.is_empty() {
+        let mut all: Vec<String> = SLASH_COMMANDS.iter().map(|c| c.to_string()).collect();
+        all.sort_unstable();
+        return all;
+    }
+    let t = typed.to_ascii_lowercase();
+    let matches: Vec<String> = SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(&t))
+        .map(|c| c.to_string())
+        .collect();
+    // 유일 prefix만 후보로 노출(예측 가능·오실행 방지). fuzzy는 명령 토큰에 쓰지 않는다.
+    if matches.len() == 1 {
+        matches
+    } else {
+        Vec::new()
+    }
+}
+
 fn match_candidates(typed: &str, pool: &[&'static str]) -> Vec<String> {
     let typed = typed.to_ascii_lowercase();
     let mut prefix: Vec<String> = pool
@@ -399,6 +591,8 @@ struct SlashContext {
     start: usize,
     cands: Vec<String>,
     is_command: bool,
+    /// `/` 단독 전체목록(discovery) — 이때만 카테고리 prefix/정렬을 적용한다.
+    full_palette: bool,
 }
 
 /// 현재 입력 위치에서 완성 컨텍스트를 계산한다. 슬래시 입력이 아니면 None.
@@ -410,24 +604,32 @@ fn slash_context(line: &str, pos: usize) -> Option<SlashContext> {
     let slash_at = before.find('/').unwrap();
     let after_slash = &before[slash_at + 1..];
     match after_slash.split_once(char::is_whitespace) {
-        // 명령 토큰 입력 중.
+        // 명령 토큰 입력 중 — 유일 prefix만 후보(ambiguous/unknown은 빈 후보 → 원문 submit).
         None => Some(SlashContext {
             start: slash_at + 1,
-            cands: match_candidates(after_slash, SLASH_COMMANDS),
+            cands: command_token_candidates(after_slash),
             is_command: true,
+            full_palette: after_slash.is_empty(),
         }),
-        // 명령 뒤 인자(섹션) 입력 중 — local/sys/snapshot만 섹션 완성.
+        // 명령 뒤 인자 입력 중 — local/sys/snapshot은 섹션, triage는 topic 완성.
         Some((cmd, _rest)) => {
-            if matches!(cmd, "local" | "sys" | "snapshot") {
-                let last = before.rsplit(char::is_whitespace).next().unwrap_or("");
-                Some(SlashContext {
-                    start: pos - last.len(),
-                    cands: match_candidates(last, super::sysinfo::LOCAL_SECTIONS),
-                    is_command: false,
-                })
-            } else {
-                None
-            }
+            let last = before.rsplit(char::is_whitespace).next().unwrap_or("");
+            // 플래그(`--run` 등)를 타이핑 중이면 인자 후보를 내지 않는다.
+            let pool: Option<&[&'static str]> = match cmd {
+                "local" | "sys" | "snapshot" | "watch" => Some(super::sysinfo::LOCAL_SECTIONS),
+                "triage" => Some(super::probes::TRIAGE_TOPICS),
+                _ => None,
+            };
+            pool.map(|pool| SlashContext {
+                start: pos - last.len(),
+                cands: if last.starts_with('-') {
+                    Vec::new()
+                } else {
+                    match_candidates(last, pool)
+                },
+                is_command: false,
+                full_palette: false,
+            })
         }
     }
 }
@@ -440,6 +642,25 @@ pub(crate) fn slash_completion_entries(
     pos: usize,
 ) -> (usize, Vec<(String, String)>, bool) {
     match slash_context(line, pos) {
+        Some(ctx) if ctx.full_palette => {
+            // `/` discovery: 카테고리별로 정렬하고 description에 [Category] prefix를 붙여 그룹이 보이게.
+            let mut cands = ctx.cands.clone();
+            cands.sort_by(|a, b| {
+                slash_category_order(a)
+                    .cmp(&slash_category_order(b))
+                    .then_with(|| a.cmp(b))
+            });
+            let entries = cands
+                .iter()
+                .map(|c| {
+                    (
+                        c.clone(),
+                        format!("[{}] {}", slash_category(c), slash_description(c)),
+                    )
+                })
+                .collect();
+            (ctx.start, entries, ctx.is_command)
+        }
         Some(ctx) => {
             let entries = ctx
                 .cands
@@ -469,8 +690,12 @@ pub(crate) fn help_text() -> String {
         "  /incident [--raw] [name]  시스템 스냅샷+git(repo)+최근 기록을 묶어 인시던트 분석",
         "  /doctor              AIC 자체 상태(provider/도구/플래그 presence; secret 미노출)",
         "  /timeline [N]        세션 tool 기록 시간순(최근 N개)",
-        "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출)",
+        "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(변경 섹션/±라인 요약; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
+        "  /triage [--run] [topic]  토픽 체크리스트+후보 probe (--run=실행; topic: mac-slow web disk",
+        "                       memory cpu network build-fail generic)",
+        "  /watch [target] [--count N] [--every Ns]  local probe 짧게 반복(변화 요약; 기본 3회/1s,",
+        "                       count≤20; target: 섹션 이름 또는 생략(compact 세트). LLM 미호출)",
         "  exit, quit           종료",
         "참고: persistent audit 파일 조회(/audit)는 추후(P2-2) 제공.",
     ]
@@ -555,6 +780,7 @@ pub(crate) fn build_doctor_report(
     model: Option<&str>,
     tool_calling: bool,
     run_command_on: bool,
+    audit_key_backend: &str,
     env_flags: &[(&str, bool)],
 ) -> String {
     let mut lines = vec!["## aic chat 상태".to_string()];
@@ -576,6 +802,7 @@ pub(crate) fn build_doctor_report(
             "off (read-only)"
         }
     ));
+    lines.push(format!("- audit key backend: {audit_key_backend}"));
     lines.push("## env flags (set/unset only)".to_string());
     for (name, present) in env_flags {
         lines.push(format!(
@@ -644,6 +871,129 @@ pub(crate) fn snapshot_diff(old: &str, new: &str) -> String {
     } else {
         out.join("\n")
     }
+}
+
+/// 스냅샷 비교용 정규화 — run_command envelope의 **volatile 실행 메타 라인**
+/// (`exit_code=… duration_ms=… truncated=… cwd=…`)을 제거한다. duration_ms는 매 실행마다 달라
+/// 동일 시스템 상태도 changed로 보이는 false positive를 유발하므로 비교 입력에서만 걷어낸다.
+/// 사용자에게 보여주는 raw snapshot 자체는 바꾸지 않는다(이 함수는 compare/watch 비교에만 사용).
+fn normalize_for_compare(snapshot: &str) -> String {
+    snapshot
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("exit_code="))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 두 스냅샷 간 변동(추가+삭제) 비-빈 라인 수(순수). `/watch` tick 변화 요약용.
+/// volatile 실행 메타(duration_ms 등)는 normalize로 제외해 false positive를 막는다.
+pub(crate) fn changed_line_count(old: &str, new: &str) -> usize {
+    use std::collections::HashSet;
+    let old = normalize_for_compare(old);
+    let new = normalize_for_compare(new);
+    let old_set: HashSet<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
+    let new_set: HashSet<&str> = new.lines().filter(|l| !l.trim().is_empty()).collect();
+    let removed = old
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !new_set.contains(l))
+        .count();
+    let added = new
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !old_set.contains(l))
+        .count();
+    added + removed
+}
+
+/// `## name\n<body>` 스냅샷을 (섹션이름, 본문) 목록으로 분해(순수). 헤더 없는 선행 라인은 무시.
+fn snapshot_sections(snapshot: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut cur: Option<(String, String)> = None;
+    for line in snapshot.lines() {
+        if let Some(name) = line.strip_prefix("## ") {
+            if let Some(sec) = cur.take() {
+                sections.push(sec);
+            }
+            cur = Some((name.trim().to_string(), String::new()));
+        } else if let Some((_, body)) = cur.as_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if let Some(sec) = cur.take() {
+        sections.push(sec);
+    }
+    sections
+}
+
+/// `/compare` 강화 리포트(순수, 테스트 가능) — 변경 섹션/추가·삭제 라인 수 요약 + diff(상한).
+/// baseline과 동일하면 짧은 안내. diff는 너무 길지 않게 cap한다.
+pub(crate) fn compare_report(old: &str, new: &str) -> String {
+    use std::collections::HashSet;
+    // volatile 실행 메타(duration_ms 등)를 제외해 false positive 변경을 막는다.
+    let old = normalize_for_compare(old);
+    let new = normalize_for_compare(new);
+    let old = old.as_str();
+    let new = new.as_str();
+    let old_set: HashSet<&str> = old.lines().filter(|l| !l.trim().is_empty()).collect();
+    let new_set: HashSet<&str> = new.lines().filter(|l| !l.trim().is_empty()).collect();
+    let removed = old
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !new_set.contains(l))
+        .count();
+    let added = new
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !old_set.contains(l))
+        .count();
+    if added == 0 && removed == 0 {
+        return "변화 없음(직전 baseline과 동일).".to_string();
+    }
+    // 변경된 섹션 이름(본문이 다른 섹션 — 추가/삭제 섹션 포함).
+    let old_secs = snapshot_sections(old);
+    let new_secs = snapshot_sections(new);
+    let new_map: std::collections::HashMap<&str, &str> = new_secs
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_str()))
+        .collect();
+    let old_map: std::collections::HashMap<&str, &str> = old_secs
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_str()))
+        .collect();
+    let mut changed: Vec<String> = Vec::new();
+    for (n, b) in &new_secs {
+        match old_map.get(n.as_str()) {
+            Some(ob) if *ob == b.as_str() => {}
+            _ => changed.push(n.clone()),
+        }
+    }
+    for (n, _) in &old_secs {
+        if !new_map.contains_key(n.as_str()) && !changed.contains(n) {
+            changed.push(n.clone());
+        }
+    }
+    let unchanged = new_secs
+        .len()
+        .saturating_sub(new_secs.iter().filter(|(n, _)| changed.contains(n)).count());
+
+    let mut s = format!(
+        "변경: 섹션 {} (변동), {} (동일) · 라인 +{added} / -{removed}",
+        changed.len(),
+        unchanged
+    );
+    if !changed.is_empty() {
+        s.push_str(&format!("\n변경 섹션: {}", changed.join(", ")));
+    }
+    // 상세 diff(상한 적용 — 과대 출력 방지).
+    const MAX_DIFF_LINES: usize = 40;
+    let diff = snapshot_diff(old, new);
+    let lines: Vec<&str> = diff.lines().collect();
+    s.push('\n');
+    if lines.len() > MAX_DIFF_LINES {
+        s.push_str(&lines[..MAX_DIFF_LINES].join("\n"));
+        s.push_str(&format!("\n… (+{}줄 더)", lines.len() - MAX_DIFF_LINES));
+    } else {
+        s.push_str(&diff);
+    }
+    s
 }
 
 /// `/explain-last` 분석 프롬프트(순수). 증거는 data-only로 취급(injection 방지), read-only 고정.
@@ -866,6 +1216,80 @@ mod tests {
     }
 
     #[test]
+    fn parse_slash_prefix_resolve() {
+        // 유일 prefix → canonical 명령.
+        assert_eq!(
+            parse_slash("/loc"),
+            Some(SlashCommand::Local {
+                section: None,
+                analyze: true
+            })
+        );
+        assert!(matches!(
+            parse_slash("/diag"),
+            Some(SlashCommand::Diagnose { .. })
+        ));
+        // exact는 prefix보다 우선(정확히 일치하는 명령 그대로).
+        assert_eq!(parse_slash("/doctor"), Some(SlashCommand::Doctor));
+        // prefix + args 보존: `/loc --raw` → Local{analyze:false}.
+        assert_eq!(
+            parse_slash("/loc --raw"),
+            Some(SlashCommand::Local {
+                section: None,
+                analyze: false
+            })
+        );
+        // `/tri --run disk` → Triage{run:true, topic:disk}.
+        assert_eq!(
+            parse_slash("/tri --run disk"),
+            Some(SlashCommand::Triage {
+                topic: Some("disk".to_string()),
+                run: true
+            })
+        );
+        // ambiguous(`/d` → diagnose, doctor) → Ambiguous(후보 포함).
+        match parse_slash("/d") {
+            Some(SlashCommand::Ambiguous { input, candidates }) => {
+                assert_eq!(input, "d");
+                assert!(candidates.contains(&"diagnose".to_string()));
+                assert!(candidates.contains(&"doctor".to_string()));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // unknown(매칭 없음) 유지.
+        assert_eq!(
+            parse_slash("/zzz"),
+            Some(SlashCommand::Unknown("zzz".to_string()))
+        );
+        // alias exact 유지.
+        assert!(matches!(
+            parse_slash("/sys"),
+            Some(SlashCommand::Local { .. })
+        ));
+        assert_eq!(parse_slash("/?"), Some(SlashCommand::Help));
+    }
+
+    #[test]
+    fn resolve_slash_command_rules() {
+        assert_eq!(
+            resolve_slash_command("loc"),
+            Resolution::Unique("local".into())
+        );
+        assert_eq!(
+            resolve_slash_command("doctor"),
+            Resolution::Exact("doctor".into())
+        );
+        assert_eq!(resolve_slash_command(""), Resolution::None);
+        assert_eq!(resolve_slash_command("zzz"), Resolution::None);
+        match resolve_slash_command("d") {
+            Resolution::Ambiguous(c) => {
+                assert!(c.contains(&"diagnose".to_string()) && c.contains(&"doctor".to_string()))
+            }
+            other => panic!("expected Ambiguous: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_slash_p0_commands() {
         assert_eq!(parse_slash("/doctor"), Some(SlashCommand::Doctor));
         assert_eq!(parse_slash("/compare"), Some(SlashCommand::Compare));
@@ -878,6 +1302,39 @@ mod tests {
         assert_eq!(
             parse_slash("/bundle db-outage"),
             Some(SlashCommand::Bundle(Some("db-outage".to_string())))
+        );
+    }
+
+    #[test]
+    fn parse_slash_triage() {
+        assert_eq!(
+            parse_slash("/triage"),
+            Some(SlashCommand::Triage {
+                topic: None,
+                run: false
+            })
+        );
+        assert_eq!(
+            parse_slash("/triage web"),
+            Some(SlashCommand::Triage {
+                topic: Some("web".to_string()),
+                run: false
+            })
+        );
+        assert_eq!(
+            parse_slash("/triage --run mac-slow"),
+            Some(SlashCommand::Triage {
+                topic: Some("mac-slow".to_string()),
+                run: true
+            })
+        );
+        // --run만 → topic None.
+        assert_eq!(
+            parse_slash("/triage --run"),
+            Some(SlashCommand::Triage {
+                topic: None,
+                run: true
+            })
         );
     }
 
@@ -913,18 +1370,26 @@ mod tests {
             ("AIC_AGENT_NO_RUN", false),
             ("SECRET_TOKEN", true), // 값이 아니라 set/unset만 노출되는지 확인용
         ];
-        let r = build_doctor_report(Some("ai-mesh"), Some("kiro/auto"), true, true, &flags);
+        let r = build_doctor_report(
+            Some("ai-mesh"),
+            Some("kiro/auto"),
+            true,
+            true,
+            "file (default)",
+            &flags,
+        );
         assert!(r.contains("provider: ai-mesh"));
         assert!(r.contains("model: kiro/auto"));
         assert!(r.contains("tool-calling: 지원"));
         assert!(r.contains("run_command: on"));
+        assert!(r.contains("audit key backend: file (default)"));
         assert!(r.contains("AIC_DEBUG: set"));
         assert!(r.contains("AIC_AGENT_NO_RUN: unset"));
         // env flag는 set/unset만 — 값(예: 1/true)이나 dump가 없어야 한다.
         assert!(r.contains("SECRET_TOKEN: set"));
         assert!(!r.contains("SECRET_TOKEN: 1") && !r.contains("SECRET_TOKEN=true"));
         // 미설정 표시.
-        let r2 = build_doctor_report(None, None, false, false, &[]);
+        let r2 = build_doctor_report(None, None, false, false, "file (default)", &[]);
         assert!(r2.contains("provider: (미설정)") && r2.contains("run_command: off"));
     }
 
@@ -1000,15 +1465,14 @@ mod tests {
         assert!(c.contains(&"local".to_string()));
         assert!(c.contains(&"help".to_string()));
 
-        // '/lo' → local만.
+        // '/lo' → local만(유일 prefix).
         let (start, c) = slash_completion("/lo", 3);
         assert_eq!(start, 1);
         assert_eq!(c, vec!["local".to_string()]);
 
-        // '/s' → sys, snapshot.
+        // '/s' → sys/snapshot ambiguous → 빈 후보(메뉴 오실행 방지, 원문 submit→parser 안내).
         let (_s, c) = slash_completion("/s", 2);
-        assert!(c.contains(&"sys".to_string()));
-        assert!(c.contains(&"snapshot".to_string()));
+        assert!(c.is_empty(), "ambiguous 명령 토큰은 빈 후보: {c:?}");
 
         // '/local d' → date, disk (섹션 완성).
         let (start, c) = slash_completion("/local d", 8);
@@ -1022,13 +1486,131 @@ mod tests {
     }
 
     #[test]
-    fn slash_completion_fuzzy_fallback_when_no_prefix() {
-        // prefix 매칭 0개일 때만 subsequence 폴백. "lcl" → local(l-o-c-a-l).
-        let (_s, c) = slash_completion("/lcl", 4);
-        assert_eq!(c, vec!["local".to_string()]);
-        // prefix 매칭이 있으면 fuzzy로 넓히지 않는다(예측 가능): "l" → last, local만.
-        let (_s, c) = slash_completion("/l", 2);
-        assert_eq!(c, vec!["last".to_string(), "local".to_string()]);
+    fn palette_categorizes_full_discovery_only() {
+        // '/' 단독: entries description에 [Category] prefix가 붙고 카테고리 순으로 정렬.
+        let (_s, entries, _a) = slash_completion_entries("/", 1);
+        assert!(!entries.is_empty());
+        // 카테고리 텍스트 포함.
+        assert!(entries.iter().any(|(_, d)| d.contains("[Diagnostics]")));
+        assert!(entries.iter().any(|(_, d)| d.contains("[System]")));
+        assert!(entries.iter().any(|(_, d)| d.contains("[Evidence]")));
+        // 첫 그룹은 Diagnostics.
+        assert!(
+            entries[0].1.starts_with("[Diagnostics]"),
+            "첫 항목은 Diagnostics: {:?}",
+            entries[0]
+        );
+        // prefix completion(유일/ambiguous)에는 카테고리 prefix를 붙이지 않음(안전 로직 유지).
+        let (_s, entries, _a) = slash_completion_entries("/lo", 3);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].1.contains("[System]"),
+            "prefix는 카테고리 prefix 미적용"
+        );
+        // ambiguous는 빈 후보 유지.
+        assert!(slash_completion("/d", 2).1.is_empty());
+    }
+
+    #[test]
+    fn watch_parse_defaults_and_clamps() {
+        // 기본값.
+        assert_eq!(
+            parse_slash("/watch"),
+            Some(SlashCommand::Watch {
+                target: None,
+                count: WATCH_DEFAULT_COUNT,
+                every_ms: WATCH_DEFAULT_MS
+            })
+        );
+        // target + count + every(1s).
+        assert_eq!(
+            parse_slash("/watch memory --count 2 --every 1s"),
+            Some(SlashCommand::Watch {
+                target: Some("memory".to_string()),
+                count: 2,
+                every_ms: 1000
+            })
+        );
+        // "local"은 compact 기본(target None)으로 정규화.
+        assert_eq!(
+            parse_slash("/watch local --count 5"),
+            Some(SlashCommand::Watch {
+                target: None,
+                count: 5,
+                every_ms: WATCH_DEFAULT_MS
+            })
+        );
+        // 과도한 count는 MAX로 clamp, 0/과소 interval은 MIN으로 clamp(무한/과도 방지).
+        match parse_slash("/watch --count 999 --every 10ms") {
+            Some(SlashCommand::Watch {
+                count, every_ms, ..
+            }) => {
+                assert_eq!(count, WATCH_MAX_COUNT);
+                assert_eq!(every_ms, WATCH_MIN_MS);
+            }
+            other => panic!("expected Watch: {other:?}"),
+        }
+        // ms/s/plain 파싱.
+        assert_eq!(parse_interval_ms("500ms"), Some(500));
+        assert_eq!(parse_interval_ms("2s"), Some(2000));
+        assert_eq!(parse_interval_ms("3"), Some(3000));
+        // '/wa' 유일 prefix → watch.
+        assert!(matches!(
+            parse_slash("/wa"),
+            Some(SlashCommand::Watch { .. })
+        ));
+    }
+
+    #[test]
+    fn compare_ignores_volatile_exec_metadata() {
+        // 동일 시스템 상태인데 envelope의 duration_ms/cwd만 다른 두 스냅샷 → 변화 없음으로 봐야 함.
+        let a = "## disk\ncommand: df -h\nexit_code=0 duration_ms=24 truncated=false cwd=.\n\
+                 --- stdout ---\n/dev 100G\n";
+        let b = "## disk\ncommand: df -h\nexit_code=0 duration_ms=99 truncated=false cwd=.\n\
+                 --- stdout ---\n/dev 100G\n";
+        assert_eq!(changed_line_count(a, b), 0, "duration_ms 차이는 무시");
+        assert_eq!(
+            compare_report(a, b),
+            "변화 없음(직전 baseline과 동일).",
+            "volatile 메타만 다르면 변화 없음"
+        );
+        // 본문(stdout)이 실제로 바뀌면 변경으로 감지.
+        let c = "## disk\ncommand: df -h\nexit_code=0 duration_ms=5 truncated=false cwd=.\n\
+                 --- stdout ---\n/dev 50G\n";
+        assert!(changed_line_count(a, c) >= 1, "stdout 변동은 감지");
+        assert!(compare_report(a, c).contains("변경 섹션: disk"));
+    }
+
+    #[test]
+    fn compare_report_summarizes_sections_and_lines() {
+        let old = "## date\nMon\n\n## memory\nfree 100\n";
+        let new = "## date\nMon\n\n## memory\nfree 50\n";
+        let r = compare_report(old, new);
+        // 변경 섹션(memory)·라인 ± 요약 + diff.
+        assert!(r.contains("변경 섹션: memory"), "report={r}");
+        assert!(r.contains("+1") && r.contains("-1"), "report={r}");
+        assert!(r.contains("free 50") && r.contains("free 100"));
+        // 동일하면 짧은 안내.
+        assert_eq!(compare_report(old, old), "변화 없음(직전 baseline과 동일).");
+    }
+
+    #[test]
+    fn command_token_completion_unique_only() {
+        // 유일 prefix만 commit 가능한 후보. ambiguous/unknown은 빈 후보 → 원문 submit + parser 처리.
+        assert_eq!(slash_completion("/lo", 3).1, vec!["local".to_string()]);
+        assert_eq!(slash_completion("/di", 3).1, vec!["diagnose".to_string()]);
+        assert_eq!(slash_completion("/do", 3).1, vec!["doctor".to_string()]);
+        // ambiguous → 빈 후보(첫 후보 오실행 방지).
+        assert!(slash_completion("/d", 2).1.is_empty()); // diagnose/doctor
+        assert!(slash_completion("/l", 2).1.is_empty()); // last/local
+        assert!(slash_completion("/t", 2).1.is_empty()); // timeline/triage
+                                                         // unknown(0 매칭) → 빈 후보(fuzzy commit 안 함).
+        assert!(slash_completion("/lcl", 4).1.is_empty());
+        assert!(slash_completion("/zzz", 4).1.is_empty());
+        // exact full도 유일 → 그대로.
+        assert_eq!(slash_completion("/local", 6).1, vec!["local".to_string()]);
+        // '/' 단독은 discovery(전체) 유지.
+        assert!(slash_completion("/", 1).1.contains(&"local".to_string()));
     }
 
     #[test]
@@ -1051,6 +1633,37 @@ mod tests {
         // 비-슬래시 → 빈 entries.
         let (_s, entries, _a) = slash_completion_entries("hello", 5);
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn triage_topic_completion() {
+        // `/triage ` 다음 빈 토큰 → 모든 TRIAGE_TOPICS 후보(섹션 완성처럼 append=false).
+        let line = "/triage ";
+        let (_s, entries, append) = slash_completion_entries(line, line.len());
+        assert!(!append, "topic 완성은 append_whitespace=false");
+        let cands: Vec<&str> = entries.iter().map(|(v, _)| v.as_str()).collect();
+        for t in super::super::probes::TRIAGE_TOPICS {
+            assert!(cands.contains(t), "topic {t} 후보 누락: {cands:?}");
+        }
+
+        // `/triage me` → prefix 매칭(memory).
+        let line = "/triage me";
+        let (start, entries, _a) = slash_completion_entries(line, line.len());
+        assert_eq!(start, line.len() - 2, "대체 시작은 'me' 토큰 위치");
+        assert!(entries.iter().any(|(v, _)| v == "memory"));
+
+        // `/triage --run ` 뒤에도 topic 후보(플래그는 무시하고 마지막 빈 토큰 완성).
+        let line = "/triage --run ";
+        let (_s, entries, _a) = slash_completion_entries(line, line.len());
+        assert!(entries.iter().any(|(v, _)| v == "mac-slow"));
+
+        // 플래그 타이핑 중(`/triage --r`)에는 topic 후보를 내지 않는다.
+        let line = "/triage --r";
+        let (_s, entries, _a) = slash_completion_entries(line, line.len());
+        assert!(
+            entries.is_empty(),
+            "플래그 토큰엔 topic 후보 없음: {entries:?}"
+        );
     }
 
     #[test]

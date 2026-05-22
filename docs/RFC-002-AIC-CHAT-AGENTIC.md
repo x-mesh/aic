@@ -386,7 +386,8 @@ cwd 쓰기 샌드박스.
 - **P2-1 audit 조회 UX(in-memory)** — agent REPL이 LLM 전송 전 slash 명령을 가로챈다:
   `/help`, `/last [N]`, `/raw [seq|corr]`, `/local [section]`(alias `/sys`·`/snapshot`),
   `/diagnose [--raw] <증상>`, `/explain-last [--raw] [seq|corr]`, `/incident [--raw] [name]`,
-  `/doctor`, `/timeline [N]`, `/compare`, `/bundle [name]`(P0, LLM 미호출). tool 실행은
+  `/doctor`, `/timeline [N]`, `/compare`, `/bundle [name]`(P0, LLM 미호출),
+  `/triage [--run] [topic]`(Probe Catalog 기반 체크리스트+probe, `--run`=실행, LLM 미사용). tool 실행은
   `agent::tool_record`의 ring(상한 20)에 저장 시 항상 redact해 기록하고, slash 출력은 stderr 전용
   (history/LLM 미전송 → stdout 미오염; `/local` 분석 호출만 예외적으로 provider에 전송하되 history 미push).
   `/local`은 `agent::sysinfo`의 개별 bounded Safe probe를 `run_command` 프리미티브로 실행
@@ -400,7 +401,10 @@ cwd 쓰기 샌드박스.
   Safe probe를 골라 수집하고, 증상+증거를 동일 stateless 분석 경로로 가설→증거 인용→다음 안전 확인 진단한다
   (audit kind=`diagnose`, raw fallback, agentic 적응형은 P2). `/explain-last`는 ring의 최근/지정 tool
   기록을, `/incident`는 시스템 스냅샷+git read-only 증거(repo, 고정 Safe 상수; name은 라벨이라 셸 명령
-  미포함)+최근 기록을 묶어 동일 stateless 분석 경로로 처리(audit kind=`explain-last`/`incident`). TTY는 **reedline 기반
+  미포함)+최근 기록을 묶어 동일 stateless 분석 경로로 처리(audit kind=`explain-last`/`incident`).
+  이 모든 probe는 `agent::probes` **Probe Catalog**(`ProbeSpec`: id/category/tags/OS별 command/max_lines)의
+  고정 Safe 상수에서 나오며 `/local`·`/compare`도 이를 참조한다. `/triage [--run] [topic]`은 catalog 기반
+  토픽 체크리스트+후보 probe를 렌더하고 `--run`이면 probe만 실행(LLM/history 미사용, topic은 라벨 전용). TTY는 **reedline 기반
   선택형 후보 패널**(`/` 입력 즉시 패널 열림, Tab으로도 열기/순환, ↑↓ 이동·선택행 highlight, Enter 선택,
   Esc 닫기, `/local <section>` 섹션; prefix + subsequence fuzzy; NO_COLOR/non-TTY 정책 준수).
 

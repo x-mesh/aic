@@ -34,8 +34,13 @@ fn is_debug_mode() -> bool {
 
 /// 불리언 환경변수 판정 — `1` 또는 `true`(대소문자 무시)면 true.
 fn env_flag(name: &str) -> bool {
+    // 공통 semantics: trim + case-insensitive로 `1`/`true`만 ON(그 외/unset=OFF).
+    // (lib의 `agent::debug::env_truthy`는 pub(crate)라 bin에서 못 쓰므로 동일 규칙을 둔다.)
     std::env::var(name)
-        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
         .unwrap_or(false)
 }
 
