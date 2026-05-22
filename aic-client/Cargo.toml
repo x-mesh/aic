@@ -12,13 +12,16 @@ name = "aic"
 path = "src/main.rs"
 
 [features]
-# Phase features — aic-common / aic-server 와 동기화된다.
+# Phase features — phase 의 단일 원천은 aic-common 이다(build.rs 가 assert).
+# aic-server 는 dev-dependency 라서 `cargo install`(dev-dep 제외) 시 참조가 깨지므로
+# 여기서 forwarding 하지 않는다. 테스트에서 dev-dep 로 빌드되는 aic-server 는 워크스페이스
+# feature 통합으로 동일한 aic-common phase 를 공유한다.
 default = ["phase-3_1"]
-phase-3_1 = ["aic-common/phase-3_1", "aic-server/phase-3_1"]
-phase-3_2 = ["aic-common/phase-3_2", "aic-server/phase-3_2"]
-phase-3_3 = ["aic-common/phase-3_3", "aic-server/phase-3_3"]
-phase-3_4 = ["aic-common/phase-3_4", "aic-server/phase-3_4"]
-phase-3_5 = ["aic-common/phase-3_5", "aic-server/phase-3_5"]
+phase-3_1 = ["aic-common/phase-3_1"]
+phase-3_2 = ["aic-common/phase-3_2"]
+phase-3_3 = ["aic-common/phase-3_3"]
+phase-3_4 = ["aic-common/phase-3_4"]
+phase-3_5 = ["aic-common/phase-3_5"]
 
 [dependencies]
 aic-common = { path = "../aic-common", default-features = false }
@@ -37,6 +40,12 @@ dirs = "5"
 dialoguer = "0.12.0"
 terminal_size = "0.4"
 unicode-width = "0.2"
+# TTY 대화형 입력 line editor — Claude 스타일 slash 후보 패널(ColumnarMenu, ↑↓/Tab/Enter/Esc)
+# + CJK Unicode-aware 편집 + history. crossterm 0.28(=ratatui 0.29와 동일)을 쓰는 0.39.x로 고정해
+# 중복 crossterm을 피한다. (rustyline에서 이주 — P2 reedline migration 완료.)
+reedline = "=0.39.0"
+# reedline 메뉴 스타일(NO_COLOR 시 plain) 구성용 — reedline과 동일 버전 사용.
+nu-ansi-term = "0.50"
 regex = "1"
 sha2 = "0.10"
 hmac = "0.12"

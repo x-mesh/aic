@@ -1,6 +1,6 @@
 # aic
 
-> 셸 명령어 에러를 LLM으로 분석하고 수정 명령어를 제안하는 CLI 도구
+> Rust 터미널 LLM 어시스턴트: 셸 에러 분석 + bounded·sandbox read-only 진단을 실행하는 SRE chat 에이전트. OpenAI 호환·Groq·Anthropic·CLI 백엔드 지원.
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
@@ -33,6 +33,8 @@ graph LR
 - ✅ 명령어 경계 감지 — OSC 133 마커 + Timing Heuristic 폴백
 - ✅ 에러 자동 분석 — exit code ≠ 0이면 LLM으로 원인 분석 및 수정 제안
 - ✅ Interactive REPL — exit code = 0이면 LLM과 자유 대화
+- ✅ `aic chat` agent 모드 — 명시적 대화 진입점. OpenAI 호환 provider에서는 tool-calling agent로 동작하며, provider가 tool을 지원하지 않으면 일반 대화로 자연스럽게 degrade
+- ✅ SRE 셸 실행 (기본 활성) — 대화형 agent가 **bounded·sandbox** 셸 명령을 `run_command`로 실행한다(`ps`/`df -h`/`grep` 같은 읽기 진단은 자동 실행, 상태 변경은 확인, 위험 명령은 차단). `--no-run`/`--read-only`/`AIC_AGENT_NO_RUN=1`로 끄면 읽기 전용 세션(`read_file`/`list_dir`/`grep`/`glob`만)
 - ✅ 다중 LLM Provider — OpenAI 호환, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
 - ✅ TUI 호환 — Alternate Screen Buffer 감지로 vim, htop 등 정상 동작
 - ✅ Cross-Platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
@@ -140,6 +142,14 @@ cargo install --path aic-client   # aic 설치
 make install
 ```
 
+개발 / 검증:
+
+```bash
+cargo check --workspace      # 빠른 타입 체크
+cargo test --workspace       # 테스트 실행 (커밋 전 필수)
+make check                   # fmt + clippy + check (Makefile 참고)
+```
+
 ### 셀프 업데이트
 
 ```bash
@@ -190,6 +200,7 @@ aic config             # provider/api_key/model 인터랙티브 설정
 aic init zsh           # ~/.zshrc에 'source ~/.aic/hooks.zsh' 멱등 추가
 aic migrate-keys       # 평문 API key를 OS keychain으로 이동 (선택)
 aic doctor             # 9축 진단 — PASS/WARN/FAIL 한눈에 확인
+aic doctor --probe-tools  # opt-in 라이브 probe: provider가 실제로 tool-calling을 지원하는지 진단
 
 # 2. (선택) supervisor 시작 — 멀티 세션 lifecycle 중앙 관리
 aic daemon start       # aicd 백그라운드 spawn
@@ -212,12 +223,105 @@ aic
 # 7. 직접 질문 + dry-run으로 비용 미리보기
 aic --dry-run "이 에러 어떻게 해결해?"
 
-# 8. 운영
+# 8. 명시적 chat / agent 모드 (exit code와 무관)
+aic chat "이 저장소가 뭐 하는지 요약해줘"   # 1회 답변 후 종료
+aic chat                                      # 대화형 SRE agent (run_command 기본 활성)
+# → OpenAI 호환 provider면 도구(read_file/list_dir/grep/glob)로 프로젝트를 읽는다.
+#   접근은 cwd sandbox로 제한되고 .gitignore를 존중한다. 또한 BOUNDED 셸 명령을
+#   run_command로 실행할 수 있다. 대화창에 다음처럼 입력:
+#     ps        → `ps aux | head -n 20` 실행
+#     disk      → `df -h` 실행
+#     cpu/memory/net → OS에 맞는 bounded 명령
+# → Safe 읽기 명령은 자동, 상태 변경은 TTY 확인, 위험/불명은 차단. 셸은 제한됨
+#   ($·glob·따옴표·redirect·;·& 등 차단).
+aic chat --no-run                             # 읽기 전용 세션(run_command 끔); --read-only 동의어
+AIC_AGENT_NO_RUN=1 aic chat                   # env로 동일 opt-out
+AIC_DEBUG=1 aic chat                          # stderr 디버그: tool_specs/run_command/provider_tools (banner는 계속 표시)
+NO_COLOR=1 aic chat                           # plain 출력(ANSI 없음; non-TTY에서도 자동)
+# → 시작 시 banner + status line(mode/tools/policy/cwd/provider)이 stderr로 출력된다.
+#   채팅 프롬프트는 TTY면 "◇ you ❯ ", 파이프면 plain "you> ". LLM 답변은 stdout,
+#   banner/status/command card/debug는 stderr로 분리(파이프 안전).
+# → 세션 내 slash 명령(LLM에 전송 안 됨, 화면에만 출력):
+#     /help · /last [N] · /raw [seq|corr]
+#     /local [section] [--raw]  (alias /sys, /snapshot) — 로컬 sysinfo 스냅샷 + LLM 분석
+#                       probe(date/host/os/uptime/disk/memory/ip/route/ports), 각 probe는 bounded Safe 명령.
+#                       기본은 redacted 스냅샷을 provider로 보내 짧은 요약(대화 history 미push). --raw/-r는
+#                       모델 호출 없이 원본만, --analyze/-a는 분석 강제. provider 오류/timeout 시 raw로 fallback.
+#                       AIC_LOCAL_NO_ANALYZE=1로 분석을 완전히 끔.
+#                       분석 결과는 터미널용으로 렌더(markdown 제목/불릿/굵게/코드를 ANSI 구조로, CJK 폭 wrap);
+#                       강조색은 amber, NO_COLOR는 색 없이 구조만, 파이프(non-TTY)는 raw markdown 그대로.
+#                       분석 진행은 TTY에서 spinner로 표시(파이프는 no-op).
+#     /diagnose [--raw] <증상>  read-only SRE 진단. 증상에서 Safe probe 선택
+#                       (cpu/memory/disk/network/process/generic) → 증거 수집 → 가설/증거 인용/다음 안전 확인
+#                       분석(대화 history 미push). 예: /diagnose "맥이 느림", /diagnose memory pressure,
+#                       /diagnose --raw 느림. no-arg=일반 health. --raw=증거만, LLM 실패 시 raw fallback.
+#     /explain-last [--raw] [seq|corr]  최근(또는 지정) tool 기록 분석(원인/증거/다음확인).
+#     /incident [--raw] [name]  시스템 스냅샷 + git read-only 증거(repo) + 최근 기록을 묶어 분석.
+#                       name은 라벨 전용(셸 명령에 미포함).
+#     /doctor              AIC 자체 상태: provider/model, tool-calling 지원, run_command on/off,
+#                       env flag는 set/unset만(secret 값·config dump 없음).
+#     /timeline [N]        세션 tool 기록 시간순(redacted 요약).
+#     /compare             고정 Safe probe로 현재 스냅샷 수집 후 직전 baseline과 diff(LLM 미호출).
+#     /bundle [name]       인시던트 증거(시스템+git read-only+최근 기록)를 redacted markdown으로
+#                       ~/.aic/bundles/ 에 저장(dir 0700/file 0600, Unix). name은 파일 라벨.
+#   보류: /runbook, /fix-preview, /config, watch daemon, persistent /audit 조회.
+#   TTY에서 "/" 입력 즉시 후보 패널("command  설명")이 열리고, ↑↓로 이동(선택행 highlight),
+#   Tab 순환, Enter 선택, Esc 닫기. 삽입은 이름만. 매칭은 prefix 우선, 없으면 subsequence/fuzzy
+#   폴백(예: /lcl → /local). /local <section> 섹션 후보 지원. (reedline 기반; NO_COLOR/non-TTY 정책 준수.)
+#   (persistent /audit 조회는 P2-2 예정)
+# (레거시 --sre / --allow-run은 파싱은 되지만 이제 no-op: run_command가 기본 활성)
+# 설계 문서: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
+# → 비용 미리보기: aic chat --dry-run "ping"
+
+# 9. 운영
 aic status             # 데몬 PID/ping/마지막 명령어
 aic sessions           # 모든 활성 세션 (aicd registry-first)
 aic session stop <id>  # 특정 세션 종료 (aicd 필요)
 aic audit verify       # audit log HMAC chain 무결성 (exit 0/2/3)
 ```
+
+### Chat slash 명령
+
+`aic chat` 안에서 `/`로 시작하는 줄은 로컬에서 가로채 처리한다 — **LLM에 전송되지 않고** 대화 history에도
+들어가지 않으며, 출력은 화면(stderr)에만 표시된다. TTY에서는 `/`를 입력하면 후보 패널이 열린다(↑↓ 이동,
+Tab 순환, Enter 선택, Esc 닫기).
+
+| 명령 | 설명 |
+|------|------|
+| `/help` | 사용 가능한 slash 명령 목록 |
+| `/last [N]` | 직전 tool 카드, 또는 최근 N개 tool 호출 요약 |
+| `/raw [seq\|corr]` | 마지막(또는 지정) tool 호출의 redacted 전체 출력 |
+| `/local [section] [--raw]` | 로컬 sysinfo 스냅샷 → LLM 요약 (`--raw`=증거만). alias: `/sys`, `/snapshot` |
+| `/diagnose [--raw] <증상>` | 증상에서 Safe probe 선택·수집 후 분석 → 가설 / 증거 인용 / 다음 안전 확인 |
+| `/explain-last [--raw] [seq\|corr]` | 마지막(또는 지정) tool 기록 분석: 원인 후보 / 증거 / 다음 확인 |
+| `/incident [--raw] [name]` | 시스템 스냅샷 + git read-only 증거(repo) + 최근 기록을 묶어 분석. `name`은 라벨 전용 |
+| `/doctor` | AIC 자체 상태: provider/model, tool-calling 지원, run_command on/off, env flag는 set/unset만(secret 값 없음) |
+| `/timeline [N]` | 세션 tool 기록 시간순(redacted) |
+| `/compare` | 고정 Safe 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출) |
+| `/bundle [name]` | 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장(dir 0700 / file 0600, Unix) |
+
+분석 명령은 **redacted** 증거 스냅샷을 tool 없는 stateless 단발 호출로 provider에 보낸다. `--raw`(및
+`AIC_LOCAL_NO_ANALYZE=1`)는 모델 호출을 건너뛰고 증거만 보여주며, provider 오류/timeout 시 raw 증거로
+fallback한다. 분석 출력은 TTY에서 CLI 친화 markdown subset(amber 강조)으로 렌더되고, 파이프에서는 plain,
+진행 중에는 spinner를 표시한다.
+
+보류(roadmap): `/runbook`, `/fix-preview`, `/config`, watch daemon, persistent `/audit` 조회.
+
+### 안전 모델 (run_command)
+
+`aic chat`은 모든 셸 명령을 실행 전에 분류하며, 가드는 약화하지 않는다:
+
+| Tier | 동작 | 예시 |
+|------|------|------|
+| **Safe** | 자동 실행 | `ps aux`, `df -h`, `cat`, `grep`, `dig name` |
+| **NeedsConfirm** | TTY 확인(비대화형은 거부) | `systemctl restart`, `git commit`, `curl https://…`(네트워크 egress) |
+| **Dangerous** | 차단 | `rm -rf`, `mkfs`, `dd`, `ssh`/`scp`/`nc`(원격/임의 네트워크) |
+| **Unknown** | 차단(보수적) | 파싱 불가 / subshell `$(…)` |
+
+추가 보장: 명령은 cwd 샌드박스 + 최소 env allowlist(API key 미전달)로 `sh -c` 실행되고, 출력 bounded +
+process-group timeout이 걸리며, **secret/PII redaction**이 LLM·화면·audit log에 닿기 전에 적용된다. 셸 실행
+자체를 끄려면 `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1`(읽기 도구 `read_file`/`list_dir`/`grep`/
+`glob`는 유지).
 
 ### 옵션: Hook capture mode (PTY wrapper 없이 metadata만)
 
@@ -352,7 +456,9 @@ cli_path = "claude"
 | `AIC_SESSION_ID` | 활성 세션 식별자 — `aic-session`이 셸에 export. 클라이언트(`aic`/`status`/`doctor`/`top`)가 이 값으로 sock을 찾는다. | (자동 생성) |
 | `AIC_NO_RUN` | 설정 시 LLM 제안 명령 인라인 실행 prompt 비활성화 | unset |
 | `AIC_AUTO_RUN` | `1`이면 인라인 실행 prompt 없이 자동 실행 (destructive 명령 제외) | unset |
-| `AIC_DEBUG` | `1` 또는 `true`면 디버그 로그 stderr 출력 | unset |
+| `AIC_DEBUG` | `1` 또는 `true`면 `[debug +X.XXXs]` 로그 stderr 출력 (agent loop는 `provider_tools=…`/`tool_specs=…` structured 라인 추가, banner는 계속 표시) | unset |
+| `AIC_AGENT_NO_RUN` | `1` 또는 `true`면 `aic chat`을 읽기 전용으로(`run_command` 끔; `--no-run`/`--read-only`와 동일) | unset |
+| `NO_COLOR` | 설정 시 `aic chat` banner/status/card/debug의 ANSI 색상 억제 (non-TTY stderr에서도 자동 억제) | unset |
 | `AIC_REDACT` | `1`이면 LLM 송신 직전 prompt에서 secret/PII 마스킹 | unset |
 | `AIC_NO_STREAM` | 설정 시 streaming 응답 비활성화 (한 번에 받아 표시) | unset |
 
@@ -470,4 +576,4 @@ make help         # 전체 명령어 목록
 
 ## License
 
-[MIT](./LICENSE)
+MIT (LICENSE 파일 미동봉)

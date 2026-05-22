@@ -4,6 +4,135 @@
 
 ## [Unreleased]
 
+### Added — `aic chat` Agentic Assistant (RFC-002 Phase 0~2)
+
+`aic chat` 서브커맨드 도입 — exit code와 무관한 명시적 대화 진입점. 단발성
+`send(prompt)` LLM 계층 위에 multi-turn + tool-calling 경로를 얹어 SRE/코딩
+어시스턴트로 확장. 설계는
+[RFC-002-AIC-CHAT-AGENTIC.md](./docs/RFC-002-AIC-CHAT-AGENTIC.md).
+
+- **Phase 0 — 진입점** — `aic chat "질문"`은 1회 답변, `aic chat`은 대화형 REPL
+  (exit code 무관, 직전 record best-effort 첨부). `--dry-run`(토큰·비용 미리보기),
+  `--context`(project context pack 첨부) 플래그.
+- **Phase 1 — 읽기 전용 agent** — OpenAI 호환 provider에서 `aic chat`이
+  tool-calling agent로 동작. 읽기 전용 도구 `read_file`/`list_dir`/`grep`/`glob`로
+  프로젝트를 탐색한다. `LlmDispatcher::send_messages`(OpenAI function-calling,
+  송신 전 redaction) + `AgentSession` agent loop(반복 한도 안전 종료).
+- **안전** — 파일 접근은 **현재 작업 디렉터리(canonical cwd) 샌드박스**로 제한
+  (symlink/`..`/절대경로 탈출 거부), **`.gitignore`/`.git/info/exclude`** 존중,
+  secrets·hidden·binary·대용량 파일 규칙 적용. 쓰기·실행 도구는 미등록(Phase 2 예정).
+- **호환/degrade** — Anthropic·CLI Backend는 기존 `ReplSession`으로 폴백.
+  OpenAI 호환이라도 provider가 `tools`를 거부하면 일반 대화 모드로 graceful degrade
+  (반복 실패 방지). 기존 `send`/`send_streaming`/direct prompt 동작 무변경.
+- **Phase 2 — SRE `run_command` (기본 활성)** — 대화형 `aic chat`이 **bounded·
+  sandbox** 셸 명령을 실행한다. `run_command`는 **기본 on**이며, 읽기 전용으로
+  끄려면 `--no-run`/`--read-only`/`AIC_AGENT_NO_RUN=1`. (레거시 `--sre`/`--allow-run`은
+  호환용 no-op으로 유지.) `risk_guard` 분류로 **Safe=자동 실행**, **NeedsConfirm=
+  TTY 확인**(비-TTY 거부), **Dangerous/Unknown=차단**. SRE shortcut: `ps`/`cpu` ⇒
+  `ps aux | head -n 20`, `disk` ⇒ `df -h`, `memory`/`net`은 OS별 bounded 명령.
+- **run_command 안전 모델** — `sh -c` 실행이되 cwd 샌드박스, env allowlist(API key
+  미전달), 출력 redaction, audit 기록, timeout(기본 15s/하드캡 30s, process group
+  SIGKILL로 descendant 정리), bounded stdout/stderr(64KB, truncated hint). 셸은 제한:
+  `$`·glob/brace(`* ? [ ] { }`)·따옴표·백슬래시·redirect·`;`·`&`·`||`·newline·`~`·
+  backtick·절대경로 인자·`..`·find/fd 위험 옵션 차단(패턴/고급 셸은 grep/glob tool 또는
+  후속 argv runner로 처리).
+- **대화형 입력 개선** — `aic chat` 입력기를 전용 라인 에디터로 교체: 한글/CJK 편집
+  잔상 수정, up/down 명령 history(`~/.config/aic/chat_history` 영속), 비-TTY는 기존
+  방식으로 fallback. `AIC_DEBUG=1`이면 iteration·tool 호출·`tools=5`(읽기전용 시 `tools=4`)
+  등 agent 디버그 로그를 stderr로 출력. (라인 에디터는 이후 reedline으로 이주 — 아래 항목 참조.)
+- **SRE 터미널 UI** — `aic chat` 시작 시 ASCII art banner + status line(mode/tools/policy/
+  cwd/provider/model) 출력(폭 좁으면 compact). 채팅 프롬프트 `◇ you ❯ `(TTY)/`you> `(non-TTY),
+  run_command command card·done·confirm·blocked/denied 액션 안내를 `▌` 스타일로 일관화.
+  LLM 답변은 stdout, banner/status/card/debug는 stderr로 분리.
+- **색상/디버그 정책** — `NO_COLOR` 설정 또는 non-TTY면 banner/status/card/debug의 ANSI 색상을
+  억제(`aic chat`). `AIC_DEBUG=1`은 banner를 유지하면서 `provider_tools=…`/`tool_specs=…` 등
+  grep 가능한 structured 라인을 출력.
+- **read-only 토글** — `aic chat`은 `run_command` 기본 활성. `--no-run`/`--read-only`/
+  `AIC_AGENT_NO_RUN=1`로 읽기 전용 전환(레거시 `--sre`/`--allow-run`은 no-op).
+- **설계 문서** — `aic chat` SRE Agent PRD([docs/PRD-AIC-SRE-CHAT.md](./docs/PRD-AIC-SRE-CHAT.md))
+  추가.
+- **GA Gate P0 반영** —
+  - **G2 네트워크 egress**: `curl`/`wget`이 **GET 포함 모두 NeedsConfirm**으로 분류된다
+    (`risk_guard`: GET=`http.egress`, POST/upload/output=`http.write`). 더 이상 GET이 자동 실행되지
+    않아 쿼리스트링을 통한 데이터 유출이 비-TTY에서 자동 거부된다(보안 강화, 정책 완화 아님).
+  - **G1 tool-calling 진단**: `aic doctor --probe-tools`(opt-in) — provider에 최소 tool spec으로
+    `send_messages` 1회를 보내 ok/unsupported/degraded/error/skip을 진단(세션 시작 시 자동 아님).
+    런타임 tool-calling degrade 시 사용자에게 1회 명시 고지 + audit `tool_calling_degraded` 기록.
+- **P1 안전 강화/관측성** —
+  - **DNS exfil 축소**: `dig @server`/`nslookup name server`/`host name server`처럼 custom
+    resolver/explicit server를 쓰는 DNS 조회를 Safe 자동실행에서 제외하고 NeedsConfirm
+    (`risk_guard` rule `dns.custom_resolver`)으로 올림. 기본 resolver 단순 조회(`dig name` 등)는
+    Safe 유지.
+  - **원격 네트워크 도구 명시 차단**: `ssh`/`scp`/`sftp`/`nc`/`ncat`/`netcat`/`socat`/`telnet`/
+    `rsh`/`rlogin`을 Unknown 의존이 아니라 명시적 **Dangerous**(`net.remote_access`)로 분류.
+  - **correlation id**: `AgentSession`이 세션마다 `run_id`를, tool call마다 `run_id.seq`를
+    부여해 AIC_DEBUG `tool_call`/`tool_result`, run_command command card, audit JSON(`corr`),
+    degrade audit(`run_id`)에서 동일 id로 추적 가능. stdout(LLM 답변)에는 노출하지 않음.
+  - argv runner / 외부 egress allowlist 실허용은 **P2**로 보류.
+- **P2-1 audit 조회 UX(in-memory)** — `aic chat` agent 모드 REPL에서 slash 명령 지원:
+  `/help`, `/last [N]`(직전 tool 카드 / 최근 N개 요약), `/raw [seq|corr]`(redacted 전체 출력,
+  cap 시 라벨 표기). slash 입력은 LLM에 전송하지 않고 history/context에도 넣지 않으며 출력은
+  화면(stderr)에만 — stdout(LLM 답변) 미오염. tool 실행은 in-memory ring(상한 20)에 `corr`·tool
+  이름·command(redacted)·status·exit/duration/truncated와 함께 기록(저장 시 항상 redact).
+  비-agent(ReplSession)에서는 slash가 agent 모드 전용임을 안내. persistent audit 파일 조회
+  (`/audit tail`)는 **P2-2**로 보류.
+- **`/local` 로컬 스냅샷 + slash 자동완성** — `/local`(alias `/sys`, `/snapshot`)은 내장 sysinfo
+  probe(date/host/os/uptime/disk/memory/ip/route/ports)를 **shell chain 없이 개별 bounded Safe
+  명령**으로 실행해 로컬 스냅샷을 보여준다(`/local <section>`으로 단일 섹션). 각 probe는 기존
+  `run_command` 프리미티브로 실행돼 timeout/cap/redaction/audit/`corr`가 동일 적용되고 결과는
+  `/last`·`/raw`로 재조회 가능. read-only 세션에서는 비활성.
+- **`/local` 기본값 = LLM 분석 요약** — `/local`은 이제 redacted 스냅샷을 **tool 없는 stateless 단발
+  LLM 호출**로 분석해 상태 요약을 보여준다(대화 history에 push하지 않음, 프롬프트는 스냅샷을 데이터로만
+  취급해 injection 방지·읽기 전용 진단 고정). provider 미설정/오류/rate-limit/timeout 등 분석 실패 시
+  사용자에게 명령 실패로 보이지 않게 **raw 스냅샷으로 fallback**하고 짧은 사유만 표시. `/local --raw`(`-r`)는
+  모델 호출 없이 원본만, `/local --analyze`(`-a`)는 명시 분석. 환경변수 `AIC_LOCAL_NO_ANALYZE=1`로 분석을
+  끄면 항상 raw. 분석/실패 여부는 audit(`local_analyze`)·`AIC_DEBUG`에 기록.
+- **`/local` 분석 CLI 렌더링** — 분석 출력이 raw `##`/`**` markdown 원문으로 보이지 않게, 제한된
+  markdown subset(heading/bullet/번호/bold/inline code/fenced/blockquote)을 ANSI 구조로 렌더한다
+  (의존성 없는 in-house `agent::markdown::render_markdown`, CJK 폭 wrap). 분석 prompt에 "CLI 친화 markdown
+  subset만(표/HTML 금지)" 제약 추가. TTY는 렌더, **NO_COLOR(TTY)는 ANSI 없이 구조만**, **non-TTY(파이프)는
+  raw markdown 그대로**(도구 파싱·손실 0). 출력 채널은 기존대로 stderr(stdout=chat 답변 전용 불변).
+  스트리밍은 buffer-then-render(P1). raw/fallback 출력에는 렌더를 적용하지 않는다.
+  강조색은 opencode 스타일 **amber/yellow**(256색 `38;5;214`, 단일 상수)로 heading·bullet 마커·inline
+  code에만 적용(본문은 기본 fg, strong은 bold만). 분석 진행 중에는 정적 메시지 대신 **amber spinner
+  상태 UI**(`redacted 스냅샷을 <provider>로 보내 분석 중…`, TTY-only, 성공/실패/timeout 모두 정리).
+  NO_COLOR/non-TTY는 색 없이 plain·spinner no-op.
+- **`/diagnose "<증상>"` — read-only SRE 진단(MVP)** — 증상을 받아 호스트가 **결정적으로** Safe probe를
+  선택(cpu/memory/disk/network/process/generic 카테고리, 키워드 ko/en)·수집한 뒤, 증거 스냅샷+증상을
+  **tool 없는 stateless 단발 LLM 호출**로 분석해 **가설→증거 인용→다음 안전 확인**을 제시한다(history
+  미push). `/diagnose memory pressure`, `/diagnose "맥이 느림"`, `/diagnose --raw 느림`(증거만), no-arg=일반
+  health. probe는 전부 고정 Safe 상수(injection 안전), prompt는 스냅샷을 데이터로만 취급·read-only 고정.
+  실패/timeout 시 raw 증거 fallback. redaction/corr/audit(kind=`diagnose`)/렌더(amber)·spinner는 `/local`
+  패턴 재사용. `AIC_LOCAL_NO_ANALYZE=1`이면 증거만.
+- **`/explain-last` / `/incident` — read-only 분석 slash(MVP)** —
+  - `/explain-last [--raw] [seq|corr]`: 최근(또는 지정) tool 기록(ring, 이미 redacted)을 증거로
+    **무슨 일이었나/원인 후보/다음 안전 확인**을 분석. 새 명령 실행이 없어 read-only 세션도 동작.
+  - `/incident [--raw] [name]`: 시스템 스냅샷(sysinfo) + git read-only 증거(repo일 때만: `git status
+    --short`/`branch --show-current`/`log -n 10 --oneline`/`diff --stat`, 전부 고정 Safe 상수) +
+    최근 tool 기록을 묶어 분석. **name은 라벨 전용으로 셸 명령에 절대 포함하지 않음**.
+  - 분석은 tool-less·stateless 단발(history 미push), prompt는 증거를 데이터로만 취급(injection 방지)·
+    read-only 고정. `--raw`/`AIC_LOCAL_NO_ANALYZE`=증거만, 실패/timeout 시 raw fallback. redaction/corr/
+    audit(kind=`explain-last`/`incident`)/markdown 렌더(amber)·spinner는 `/local`·`/diagnose` 패턴 재사용.
+- **`/doctor` · `/timeline` · `/compare` · `/bundle` — P0 운영 slash(LLM 미호출)** —
+  - `/doctor`: AIC 자체 상태(provider/model 식별자, tool-calling 지원, run_command on/off, env flag는
+    **값이 아니라 set/unset만**)를 표시. config/env 전체 dump·secret 값 노출 없음.
+  - `/timeline [N]`: 세션 in-memory tool 기록을 시간순 compact(redacted seq/corr/name/status/exit/duration).
+  - `/compare`: 고정 Safe probe로 현재 시스템 스냅샷을 수집해 직전 baseline과 **line-set diff**(추가/제거).
+    첫 호출은 baseline 저장 안내, 이후 변화 출력 + baseline 갱신. **LLM 호출 없음**.
+  - `/bundle [name]`: 인시던트 증거(시스템+git read-only+최근 기록)를 redacted markdown으로
+    `~/.aic/bundles/<name>-<ts>.md`에 저장(파일명 sanitize, dir 0700/file 0600 best-effort unix, 경로 출력).
+    **name은 파일 라벨 전용으로 셸 명령에 미포함**. provider egress·history push 없음.
+  - 보류(roadmap): `/runbook`(승인형 절차 실행), `/fix-preview`(diff 미리보기+confirm), `/config`(설정 편집),
+    watch daemon(상시 모니터링), persistent audit 조회(`/audit tail`) 등은 후속.
+- **slash 후보 선택형 패널 — reedline 이주(P2 완료)** — `aic chat` 대화형 입력기를 rustyline에서
+  **reedline**으로 이주해 Claude 스타일 후보 패널을 제공한다. **`/` 입력 즉시** `command  설명`
+  후보 패널(`ColumnarMenu`)이 열리고(Tab으로도 열기/순환), 메뉴 열림 상태에서 **↑↓**로 항목 이동(선택행 highlight), **Tab**
+  순환, **Enter** 선택, **Esc** 닫기(라인 보존). 메뉴 닫힘 상태 ↑↓는 입력 history. `/local <section>`
+  섹션 후보 포함. **삽입은 command/section 이름만**(설명은 표시용). 매칭은 prefix 우선 + subsequence
+  fuzzy 폴백. history는 `FileBackedHistory`(`~/.config/aic/chat_history`)로 영속, NO_COLOR/non-TTY면
+  메뉴 색상 비활성(선택행 reverse), 비-TTY는 기존 `read_line` 폴백. `LineReader` 공개 API 불변(호출부
+  무변경). rustyline 의존성 제거.
+
 ### Added — Centralized Command Record Store (Phase 0~3.5)
 
 세션 로컬 data plane (`RingBuffer` / `OutputProcessor` / `CommandBoundaryDetector`)

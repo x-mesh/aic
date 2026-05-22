@@ -374,6 +374,138 @@ impl LlmDispatcher {
         result
     }
 
+    /// 현재 provider가 tool-calling(`send_messages`)을 지원하는지.
+    ///
+    /// OpenAI-compat 경로(OpenAiCompatible / Groq)만 true. 호출부는 false일 때
+    /// 기존 단발 `send` 경로(ReplSession)로 폴백한다.
+    pub fn supports_tool_calling(&self) -> bool {
+        self.resolve_provider()
+            .map(|p| {
+                matches!(
+                    p.provider_type,
+                    ProviderType::OpenAiCompatible | ProviderType::Groq
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// multi-turn messages + tool-calling 요청 (OpenAI-compatible 경로 전용).
+    ///
+    /// 기존 `send`/`send_streaming`/`extract_openai_content`는 영향받지 않는다.
+    /// provider가 OpenAI-compat이 아니면 즉시 에러를 반환해 호출부가 폴백하게 한다.
+    /// redaction은 송신 직전 단일 stage로 각 메시지 content에 적용한다(`send`와 동일 정책).
+    pub async fn send_messages(
+        &self,
+        messages: &[crate::agent::types::ChatMessage],
+        tools: &[crate::agent::types::ToolSpec],
+    ) -> Result<crate::agent::types::ChatResponse, AicError> {
+        let provider = self.resolve_provider()?;
+        if !matches!(
+            provider.provider_type,
+            ProviderType::OpenAiCompatible | ProviderType::Groq
+        ) {
+            return Err(AicError::ConfigError(
+                "send_messages는 OpenAI 호환 provider에서만 지원됩니다".to_string(),
+            ));
+        }
+
+        self.circuit.check()?;
+
+        let (default_endpoint, default_model) = openai_compat_defaults(&provider.provider_type);
+        let endpoint = provider.endpoint.as_deref().unwrap_or(default_endpoint);
+        let model = provider.model.as_deref().unwrap_or(default_model);
+
+        let raw = provider
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AicError::ApiKeyMissing {
+                provider: self.config.default_provider.clone(),
+            })?;
+        let resolved = crate::keychain::resolve(raw).map_err(|e| AicError::ApiKeyMissing {
+            provider: format!("{} ({e})", self.config.default_provider),
+        })?;
+
+        // redaction: 송신 직전 각 메시지 content에 적용 (AIC_REDACT=off로 비활성).
+        let redact_enabled = std::env::var("AIC_REDACT")
+            .map(|v| v.to_lowercase() != "off")
+            .unwrap_or(true);
+        let wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                let mut j = m.to_openai_json();
+                if redact_enabled {
+                    if let Some(c) = j.get("content").and_then(|v| v.as_str()) {
+                        let (red, _report) = crate::redaction::redact(c);
+                        j["content"] = serde_json::Value::String(red);
+                    }
+                }
+                j
+            })
+            .collect();
+
+        let mut body = json!({
+            "model": model,
+            "messages": wire_messages,
+        });
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::Value::Array(tools.iter().map(|t| t.to_openai_json()).collect());
+            body["tool_choice"] = json!("auto");
+        }
+
+        let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
+
+        let resp = self
+            .http_client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {}", resolved.as_str()))
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: e.to_string(),
+            });
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                self.circuit.record_failure();
+                return Err(e);
+            }
+        };
+
+        if let Err(e) = handle_http_status(&resp) {
+            self.circuit.record_failure();
+            return Err(e);
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| AicError::LlmApiError {
+            status: 0,
+            message: format!("응답 수신 실패: {e}"),
+        })?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: format!("응답 파싱 실패: {e}"),
+            })?;
+
+        match crate::agent::types::parse_openai_response(&json) {
+            Some(r) => {
+                self.circuit.record_success();
+                Ok(r)
+            }
+            None => {
+                self.circuit.record_failure();
+                Err(AicError::LlmApiError {
+                    status: 0,
+                    message: "응답에서 메시지를 추출할 수 없습니다".to_string(),
+                })
+            }
+        }
+    }
+
     // ── 내부 헬퍼 ──────────────────────────────────────────────
 
     /// default_provider에 해당하는 ProviderConfig를 찾는다.
@@ -1002,5 +1134,52 @@ mod tests {
             Err(other) => panic!("expected ApiKeyMissing, got: {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    // ── send_messages / tool-calling capability ────────────────
+
+    #[test]
+    fn supports_tool_calling_true_for_openai_and_groq() {
+        let openai = LlmDispatcher::from_config(make_config(
+            ProviderType::OpenAiCompatible,
+            Some("sk-x"),
+            None,
+        ));
+        assert!(openai.supports_tool_calling());
+        let groq = LlmDispatcher::from_config(make_config(ProviderType::Groq, Some("gsk-x"), None));
+        assert!(groq.supports_tool_calling());
+    }
+
+    #[test]
+    fn supports_tool_calling_false_for_anthropic_and_cli() {
+        let anthropic =
+            LlmDispatcher::from_config(make_config(ProviderType::Anthropic, Some("sk-ant"), None));
+        assert!(!anthropic.supports_tool_calling());
+        let cli = LlmDispatcher::from_config(make_config(
+            ProviderType::CliBackend,
+            None,
+            Some("/bin/echo"),
+        ));
+        assert!(!cli.supports_tool_calling());
+    }
+
+    #[tokio::test]
+    async fn send_messages_unsupported_provider_errors() {
+        use crate::agent::types::ChatMessage;
+        let config = make_config(ProviderType::Anthropic, Some("sk-ant"), None);
+        let dispatcher = LlmDispatcher::from_config(config);
+        let msgs = vec![ChatMessage::User("hi".to_string())];
+        let err = dispatcher.send_messages(&msgs, &[]).await.unwrap_err();
+        assert!(matches!(err, AicError::ConfigError(_)));
+    }
+
+    #[tokio::test]
+    async fn send_messages_missing_api_key_errors() {
+        use crate::agent::types::ChatMessage;
+        let config = make_config(ProviderType::OpenAiCompatible, None, None);
+        let dispatcher = LlmDispatcher::from_config(config);
+        let msgs = vec![ChatMessage::User("hi".to_string())];
+        let err = dispatcher.send_messages(&msgs, &[]).await.unwrap_err();
+        assert!(matches!(err, AicError::ApiKeyMissing { .. }));
     }
 }

@@ -1,0 +1,258 @@
+//! `aic chat` 대화형 UI — ASCII art banner + status line + 색상/폭 처리.
+//!
+//! line-based 출력만 사용한다(ratatui 같은 fullscreen TUI 미사용).
+//! UI/provenance는 stderr로 보내고, LLM 답변은 stdout으로 둔다(스트림 분리).
+//! 색상은 `NO_COLOR` 미설정 + TTY일 때만 적용하고, non-TTY는 큰 배너 대신 plain
+//! 1줄로 fallback한다. 폭이 좁으면 compact status로 줄인다.
+
+use std::io::IsTerminal;
+
+/// status를 compact로 줄이는 폭 임계값(컬럼).
+const COMPACT_WIDTH: usize = 64;
+
+/// stderr가 TTY인지 — 배너/상태/색상 판단 기준(UI는 stderr 출력).
+pub(crate) fn is_tty() -> bool {
+    std::io::stderr().is_terminal()
+}
+
+/// 색상 사용 가능 여부 — `NO_COLOR` 미설정 && TTY.
+pub(crate) fn color_enabled() -> bool {
+    std::env::var_os("NO_COLOR").is_none() && is_tty()
+}
+
+/// 터미널 폭(컬럼). 알 수 없으면 80.
+pub(crate) fn term_width() -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(80)
+}
+
+/// markdown 렌더 wrap 폭 — 터미널 폭을 [40, 100]으로 clamp(가독성).
+pub(crate) fn render_width() -> usize {
+    term_width().clamp(40, 100)
+}
+
+/// ANSI 코드로 감싼다(`color=false`면 원문 그대로).
+fn paint_if(s: &str, code: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// 색상 정책(`color_enabled`)에 따라 ANSI로 감싸거나 plain을 반환한다.
+/// NO_COLOR/non-TTY면 escape 없이 원문 — 다른 모듈(run_command/session)에서 직접 ANSI를
+/// 쓰지 않고 이 헬퍼를 재사용한다.
+pub(crate) fn paint(s: &str, code: &str) -> String {
+    paint_if(s, code, color_enabled())
+}
+
+/// run_command 노출 상태.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunState {
+    On,
+    ReadOnly,
+}
+
+/// 상태줄에 표시할 정보.
+pub(crate) struct StatusInfo {
+    pub run_state: RunState,
+    pub cwd: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// 폭이 좁아 compact status를 써야 하는지.
+fn is_compact(width: usize) -> bool {
+    width < COMPACT_WIDTH
+}
+
+/// banner 라인들. rich면 ASCII art, 아니면 plain 1줄. 순수 함수(테스트 가능).
+pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
+    if rich {
+        vec![
+            r"   __ _ (_)  ___ ".to_string(),
+            r"  / _` || | / __|".to_string(),
+            r" | (_| || || (__ ".to_string(),
+            r"  \__,_||_| \___|   chat".to_string(),
+        ]
+    } else {
+        vec!["aic chat — agentic SRE assistant".to_string()]
+    }
+}
+
+/// 상태줄 라인들(ANSI 없음 — prefix/색상은 출력 시 부착). 순수 함수(테스트 가능).
+pub(crate) fn status_lines(info: &StatusInfo, width: usize) -> Vec<String> {
+    let (tools_full, tool_count) = match info.run_state {
+        RunState::On => ("read_file list_dir grep glob run_command", 5),
+        RunState::ReadOnly => ("read_file list_dir grep glob", 4),
+    };
+
+    if is_compact(width) {
+        let mode = match info.run_state {
+            RunState::On => "SRE · run_command on",
+            RunState::ReadOnly => "read-only · run_command off",
+        };
+        let toggle = match info.run_state {
+            RunState::On => "off: --no-run",
+            RunState::ReadOnly => "on: drop --no-run + unset AIC_AGENT_NO_RUN",
+        };
+        return vec![
+            format!("aic chat · {mode} · tools={tool_count}"),
+            toggle.to_string(),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    match info.run_state {
+        RunState::On => {
+            lines.push("aic chat · SRE mode (run_command on)".to_string());
+            lines.push(format!("tools: {tools_full}"));
+            lines.push(
+                "policy: Safe→auto · NeedsConfirm→confirm(y/N) · Dangerous/Unknown→block"
+                    .to_string(),
+            );
+        }
+        RunState::ReadOnly => {
+            lines.push("aic chat · read-only mode (run_command off)".to_string());
+            lines.push(format!("tools: {tools_full}"));
+        }
+    }
+
+    let mut meta = format!("cwd: {}", info.cwd);
+    if let Some(p) = &info.provider {
+        meta.push_str(&format!("   provider: {p}"));
+    }
+    if let Some(m) = &info.model {
+        meta.push_str(&format!("   model: {m}"));
+    }
+    lines.push(meta);
+
+    lines.push(match info.run_state {
+        RunState::On => "off: aic chat --no-run  (or AIC_AGENT_NO_RUN=1)".to_string(),
+        RunState::ReadOnly => {
+            "on: run `aic chat` without --no-run/--read-only and unset AIC_AGENT_NO_RUN".to_string()
+        }
+    });
+    lines
+}
+
+/// 대화형 입력 프롬프트 라벨.
+///
+/// 라인 에디터(reedline)가 실제로 활성화되는 조건(stdin && stdout 모두 interactive)과 **동일하게**
+/// 판정해야 한다. 그렇지 않으면 비대화형 fallback 경로(stdout으로 prompt 출력)에서
+/// Unicode 라벨이 stdout에 섞여 stdout-stderr 분리가 깨진다.
+/// interactive가 아니면 단순 ASCII(`you> `)로 fallback한다.
+pub(crate) fn prompt_label() -> &'static str {
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        "◇ you ❯ "
+    } else {
+        "you> "
+    }
+}
+
+/// banner + status를 stderr로 출력한다(TTY/색상/폭 자동 처리).
+pub(crate) fn print_banner_and_status(info: &StatusInfo) {
+    let rich = is_tty();
+    let color = color_enabled();
+    for l in banner_lines(rich) {
+        eprintln!("{}", paint_if(&l, "36;1", color)); // cyan bold
+    }
+    let bar = paint_if("▌", "2", color);
+    for l in status_lines(info, term_width()) {
+        eprintln!("{bar} {}", paint_if(&l, "2", color));
+    }
+}
+
+/// 런타임 상태 변경(예: provider degrade)을 status 줄 스타일로 stderr에 출력한다.
+pub(crate) fn print_status_note(note: &str) {
+    let color = color_enabled();
+    let bar = paint_if("▌", "33", color); // yellow bar
+    eprintln!("{bar} {}", paint_if(note, "33", color));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(run_state: RunState) -> StatusInfo {
+        StatusInfo {
+            run_state,
+            cwd: "/tmp/proj".to_string(),
+            provider: Some("ai-mesh".to_string()),
+            model: Some("claude-haiku".to_string()),
+        }
+    }
+
+    #[test]
+    fn banner_rich_is_multiline_plain_is_one_line() {
+        assert!(banner_lines(true).len() >= 3);
+        let plain = banner_lines(false);
+        assert_eq!(plain.len(), 1);
+        assert!(plain[0].contains("aic chat"));
+    }
+
+    #[test]
+    fn paint_respects_color_flag() {
+        assert_eq!(paint_if("x", "1", false), "x");
+        assert_eq!(paint_if("x", "1", true), "\x1b[1mx\x1b[0m");
+    }
+
+    #[test]
+    fn compact_threshold() {
+        assert!(is_compact(40));
+        assert!(is_compact(63));
+        assert!(!is_compact(64));
+        assert!(!is_compact(120));
+    }
+
+    #[test]
+    fn status_full_on_lists_run_command_and_policy() {
+        let lines = status_lines(&info(RunState::On), 120);
+        let joined = lines.join("\n");
+        assert!(joined.contains("run_command on"));
+        assert!(joined.contains("run_command")); // tools 목록
+        assert!(joined.contains("policy:"));
+        assert!(joined.contains("cwd: /tmp/proj"));
+        assert!(joined.contains("provider: ai-mesh"));
+        assert!(joined.contains("--no-run"));
+    }
+
+    #[test]
+    fn status_full_readonly_omits_run_command() {
+        let lines = status_lines(&info(RunState::ReadOnly), 120);
+        let joined = lines.join("\n");
+        assert!(joined.contains("read-only"));
+        assert!(joined.contains("run_command off"));
+        // tools 목록에 run_command가 없어야 한다.
+        let tools_line = lines.iter().find(|l| l.starts_with("tools:")).unwrap();
+        assert!(!tools_line.contains("run_command"));
+        // 다시 켜는 안내(env unset 포함).
+        assert!(joined.contains("AIC_AGENT_NO_RUN"));
+    }
+
+    #[test]
+    fn status_compact_is_two_lines_with_tool_count() {
+        let on = status_lines(&info(RunState::On), 40);
+        assert_eq!(on.len(), 2);
+        assert!(on[0].contains("tools=5"));
+        let ro = status_lines(&info(RunState::ReadOnly), 40);
+        assert!(ro[0].contains("tools=4"));
+    }
+
+    #[test]
+    fn prompt_label_nonempty() {
+        // TTY 여부와 무관하게 비어있지 않은 라벨.
+        assert!(!prompt_label().is_empty());
+    }
+
+    #[test]
+    fn prompt_label_is_ascii_fallback_when_not_interactive() {
+        // cargo test 환경은 stdin/stdout이 비-TTY이므로 ASCII fallback이어야 한다.
+        // (stdout으로 Unicode 프롬프트가 새는 것을 방지 — finding 1.)
+        let label = prompt_label();
+        assert_eq!(label, "you> ");
+        assert!(label.is_ascii(), "non-interactive 프롬프트는 ASCII여야 함");
+    }
+}

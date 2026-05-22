@@ -1,6 +1,6 @@
 # aic
 
-> CLI tool that analyzes shell command errors via LLM and suggests fixes
+> A Rust terminal LLM assistant: shell-error analysis + an SRE chat agent that runs bounded, sandboxed read-only diagnostics. Works with OpenAI-compatible, Groq, Anthropic, and CLI backends.
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
@@ -33,6 +33,8 @@ graph LR
 - ✅ Command boundary detection — OSC 133 markers + timing-heuristic fallback
 - ✅ Automatic error analysis — when exit code ≠ 0, the LLM explains the cause and suggests fixes
 - ✅ Interactive REPL — when exit code = 0, freeform chat with the LLM
+- ✅ `aic chat` agent mode — explicit chat entry point. With an OpenAI-compatible provider it runs a tool-calling agent over your project; gracefully degrades to plain chat when the provider doesn't support tools
+- ✅ SRE shell execution (default-on) — the interactive agent can run **bounded, sandboxed** shell commands via `run_command` (read-only diagnostics like `ps`/`df -h`/`grep` run automatically; state-changing commands need confirmation; dangerous ones are blocked). Turn it off with `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1` for a read-only session (`read_file`/`list_dir`/`grep`/`glob` only)
 - ✅ Multiple LLM providers — OpenAI-compatible, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
 - ✅ TUI compatibility — alternate-screen-buffer detection keeps vim, htop, etc. working correctly
 - ✅ Cross-platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
@@ -140,6 +142,14 @@ Or via Makefile:
 make install
 ```
 
+Develop / verify:
+
+```bash
+cargo check --workspace      # fast type-check
+cargo test --workspace       # run the test suite (run before every commit)
+make check                   # fmt + clippy + check (see Makefile)
+```
+
 ### Self-update
 
 ```bash
@@ -190,6 +200,7 @@ aic config             # interactive provider/api_key/model setup
 aic init zsh           # idempotently appends 'source ~/.aic/hooks.zsh' to ~/.zshrc
 aic migrate-keys       # move plaintext API keys into the OS keychain (optional)
 aic doctor             # 9-axis diagnosis — see PASS/WARN/FAIL at a glance
+aic doctor --probe-tools  # opt-in live probe: does the provider actually support tool-calling?
 
 # 2. (optional) Start the supervisor — central multi-session lifecycle
 aic daemon start       # spawns aicd in the background
@@ -212,12 +223,110 @@ aic
 # 7. Direct question + dry-run for cost preview
 aic --dry-run "how do I fix this error?"
 
-# 8. Operations
+# 8. Explicit chat / agent mode (independent of exit code)
+aic chat "summarize what this repo does"   # one-shot answer, then exit
+aic chat                                    # interactive SRE agent (run_command default-on)
+# → With an OpenAI-compatible provider, the agent reads your project via tools
+#   (read_file/list_dir/grep/glob), confined to the cwd sandbox and honoring
+#   .gitignore. It can also run BOUNDED shell commands (run_command):
+aic chat                                    # then type:  ps        → runs `ps aux | head -n 20`
+                                            #             disk      → runs `df -h`
+                                            #             cpu/memory/net → bounded OS-friendly command
+# → Safe read-only commands run automatically; state-changing commands ask for
+#   confirmation (TTY); dangerous/unknown commands are blocked. The shell is
+#   restricted (no $, globs, quotes, redirects, ;, &, pipes-of-danger).
+aic chat --no-run                           # read-only session (no run_command); --read-only is a synonym
+AIC_AGENT_NO_RUN=1 aic chat                 # same opt-out via env
+AIC_DEBUG=1 aic chat                        # stderr debug: tool_specs/run_command/provider_tools (banner still shown)
+NO_COLOR=1 aic chat                         # plain output (no ANSI; also auto on non-TTY)
+# → On start, a banner + status line (mode/tools/policy/cwd/provider) prints to stderr.
+#   The chat prompt is "◇ you ❯ " on a TTY, plain "you> " when piped. LLM answers go
+#   to stdout; banner/status/command-cards/debug go to stderr (clean piping).
+# → In-session slash commands (not sent to the LLM, printed on screen only):
+#     /help · /last [N] · /raw [seq|corr]
+#     /local [section] [--raw]  (alias /sys, /snapshot) — local sysinfo snapshot + LLM analysis
+#                       probes (date/host/os/uptime/disk/memory/ip/route/ports), each a bounded Safe command.
+#                       Default sends the REDACTED snapshot to the provider for a brief summary (no chat
+#                       history). --raw/-r shows the raw snapshot only (no model call); --analyze/-a forces
+#                       analysis. On any provider error/timeout it falls back to raw with a short reason.
+#                       Opt out of analysis entirely with AIC_LOCAL_NO_ANALYZE=1.
+#                       The analysis is rendered for the terminal (markdown headings/bullets/bold/code as
+#                       ANSI structure, CJK-aware wrap, amber accent); NO_COLOR keeps structure without
+#                       color, and a pipe (non-TTY) emits raw markdown unchanged. A spinner shows analysis
+#                       progress on a TTY (no-op when piped).
+#     /diagnose [--raw] <symptom>  read-only SRE diagnosis. Picks safe probes from the symptom
+#                       (cpu/memory/disk/network/process/generic), collects evidence, and analyzes it into
+#                       hypotheses → cited evidence → next safe checks (no chat history). e.g.
+#                       /diagnose "the mac is slow", /diagnose memory pressure, /diagnose --raw slow.
+#                       No-arg = general health. --raw shows evidence only; falls back to raw on LLM failure.
+#     /explain-last [--raw] [seq|corr]  analyze the last (or given) tool record (cause/evidence/next checks).
+#     /incident [--raw] [name]  bundle system snapshot + git read-only evidence (in a repo) + recent tool
+#                       records, then analyze. "name" is a label only (never placed in a shell command).
+#     /doctor              AIC self-status: provider/model, tool-calling support, run_command on/off, and env
+#                       flags as set/unset only (no secret values, no config dump).
+#     /timeline [N]        session tool records in chronological order (redacted summaries).
+#     /compare             collect a fixed-Safe system snapshot and diff vs the previous baseline (no LLM).
+#     /bundle [name]       save incident evidence (system + git read-only + recent records) as redacted
+#                       markdown under ~/.aic/bundles/ (dir 0700 / file 0600 on Unix). "name" labels the file.
+#   Deferred: /runbook, /fix-preview, /config, a watch daemon, persistent /audit browsing.
+#   On a TTY, typing "/" instantly opens a candidate panel ("command  description"); ↑↓ to move
+#   (selected row highlighted), Tab to cycle, Enter to pick, Esc to close. Only the name is inserted.
+#   Matching is prefix-first with subsequence/fuzzy fallback (e.g. /lcl → /local). /local <section>
+#   completes sections. (Powered by reedline; NO_COLOR/non-TTY policy respected.)
+#   (persistent /audit browsing is planned for P2-2)
+# (legacy flags --sre / --allow-run still parse but are now no-ops: run_command is on by default)
+# Design: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
+# → Preview cost with: aic chat --dry-run "ping"
+
+# 9. Operations
 aic status             # daemon PID / ping / last command
 aic sessions           # all active sessions (aicd registry-first)
 aic session stop <id>  # terminate a specific session (requires aicd)
 aic audit verify       # audit-log HMAC-chain integrity (exit 0/2/3)
 ```
+
+### Chat slash commands
+
+Inside `aic chat`, lines starting with `/` are intercepted locally — they are **never sent to the LLM**
+and never enter the chat history; their output goes to the screen (stderr) only. On a TTY, typing `/`
+opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to close).
+
+| Command | What it does |
+|---------|--------------|
+| `/help` | List the available slash commands |
+| `/last [N]` | Show the last tool card, or a compact list of the last N tool calls |
+| `/raw [seq\|corr]` | Full redacted output of the last (or a specific) tool call |
+| `/local [section] [--raw]` | Local sysinfo snapshot → LLM summary (`--raw` = evidence only). alias: `/sys`, `/snapshot` |
+| `/diagnose [--raw] <symptom>` | Pick Safe probes from the symptom, collect evidence, analyze → hypotheses / cited evidence / next safe checks |
+| `/explain-last [--raw] [seq\|corr]` | Analyze the last (or given) tool record: cause candidates / evidence / next checks |
+| `/incident [--raw] [name]` | Bundle system snapshot + git read-only evidence (in a repo) + recent records, then analyze. `name` is a label only |
+| `/doctor` | AIC self-status: provider/model, tool-calling support, run_command on/off, env flags as set/unset only (no secret values) |
+| `/timeline [N]` | Session tool records in chronological order (redacted) |
+| `/compare` | Diff a fixed-Safe system snapshot against the previous baseline (no LLM) |
+| `/bundle [name]` | Save incident evidence as redacted markdown under `~/.aic/bundles/` (dir 0700 / file 0600 on Unix) |
+
+Analysis commands send a **redacted** evidence snapshot to the provider in a single, tool-less,
+stateless call. `--raw` (and `AIC_LOCAL_NO_ANALYZE=1`) skip the model and show evidence only; on any
+provider error/timeout they fall back to the raw evidence. Analysis output is rendered as a CLI-friendly
+markdown subset (amber accents) on a TTY, plain when piped, with a progress spinner.
+
+Deferred (roadmap): `/runbook`, `/fix-preview`, `/config`, a watch daemon, persistent `/audit` browsing.
+
+### Safety model (run_command)
+
+`aic chat` classifies every shell command before running it and never weakens the guard:
+
+| Tier | Behavior | Examples |
+|------|----------|----------|
+| **Safe** | Runs automatically | `ps aux`, `df -h`, `cat`, `grep`, `dig name` |
+| **NeedsConfirm** | TTY confirm (rejected when non-interactive) | `systemctl restart`, `git commit`, `curl https://…` (any network egress) |
+| **Dangerous** | Blocked | `rm -rf`, `mkfs`, `dd`, `ssh`/`scp`/`nc` (remote/arbitrary network) |
+| **Unknown** | Blocked (conservative) | unparseable / subshell `$(…)` |
+
+Additional guarantees: commands run via `sh -c` confined to the cwd sandbox with a minimal env allowlist
+(no API keys passed), bounded output + process-group timeout, and **secret/PII redaction** applied before
+anything reaches the LLM, the screen, or the audit log. Disable shell execution entirely with `--no-run` /
+`--read-only` / `AIC_AGENT_NO_RUN=1` (read-only tools `read_file`/`list_dir`/`grep`/`glob` remain).
 
 ### Optional: Hook capture mode (metadata only, no PTY wrapper)
 
@@ -352,7 +461,9 @@ cli_path = "claude"
 | `AIC_SESSION_ID` | active session identifier — `aic-session` exports it into the shell. Clients (`aic`/`status`/`doctor`/`top`) use it to locate the socket. | (auto-generated) |
 | `AIC_NO_RUN` | when set, disables the inline-run prompt for LLM-suggested commands | unset |
 | `AIC_AUTO_RUN` | when `1`, auto-runs without an inline-run prompt (excluding destructive commands) | unset |
-| `AIC_DEBUG` | when `1` or `true`, emits debug logs to stderr | unset |
+| `AIC_DEBUG` | when `1` or `true`, emits `[debug +X.XXXs]` logs to stderr (agent loop adds structured `provider_tools=…` / `tool_specs=…` lines; banner still shown) | unset |
+| `AIC_AGENT_NO_RUN` | when `1` or `true`, runs `aic chat` in read-only mode (disables `run_command`; same as `--no-run`/`--read-only`) | unset |
+| `NO_COLOR` | when set, suppresses ANSI colors in `aic chat` banner/status/cards/debug (also auto-suppressed on non-TTY stderr) | unset |
 | `AIC_REDACT` | when `1`, masks secrets/PII in the prompt right before sending to the LLM | unset |
 | `AIC_NO_STREAM` | when set, disables streaming responses (received and displayed all at once) | unset |
 
@@ -470,4 +581,4 @@ make help         # full command list
 
 ## License
 
-[MIT](./LICENSE)
+MIT (no LICENSE file is bundled yet)

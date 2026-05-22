@@ -29,9 +29,22 @@ const COL_RED: &str = "\x1b[31m";
 
 /// 디버그 모드 확인 (AIC_DEBUG 환경변수)
 fn is_debug_mode() -> bool {
-    std::env::var("AIC_DEBUG")
+    env_flag("AIC_DEBUG")
+}
+
+/// 불리언 환경변수 판정 — `1` 또는 `true`(대소문자 무시)면 true.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false)
+}
+
+/// `aic chat`에서 run_command(SRE 실행) 활성 여부를 결정한다.
+///
+/// 기본 활성. `--no-run`/`--read-only`(read_only_flag) 또는 env `AIC_AGENT_NO_RUN`
+/// (env_no_run)으로 opt-out하면 비활성. 보안 게이트는 별개로 항상 적용된다.
+fn chat_run_command_enabled(read_only_flag: bool, env_no_run: bool) -> bool {
+    !(read_only_flag || env_no_run)
 }
 
 /// 첫 디버그 호출 시점을 캐시하고, 그 시점부터의 누적 경과 시간(초)을 반환한다.
@@ -43,27 +56,41 @@ fn debug_elapsed_secs() -> f64 {
         .as_secs_f64()
 }
 
-/// 단순 디버그 정보 라인 — `[debug +0.001s] <message>` (흐린 회색).
+/// debug 로그에 ANSI 색상을 쓸지 — `NO_COLOR` 미설정 && stderr TTY일 때만.
+/// (agent UI 색상 정책과 동일.)
+fn debug_color() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+}
+
+/// 단순 디버그 정보 라인 — `[debug +0.001s] <message>` (TTY+색상 시 흐린 회색).
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if is_debug_mode() {
             let t = debug_elapsed_secs();
-            eprintln!("\x1b[90m[debug +{:.3}s] {}\x1b[0m", t, format!($($arg)*));
+            let body = format!("[debug +{:.3}s] {}", t, format!($($arg)*));
+            if debug_color() {
+                eprintln!("\x1b[90m{}\x1b[0m", body);
+            } else {
+                eprintln!("{}", body);
+            }
         }
     };
 }
 
-/// 정보와 측정 시간을 한 라인으로 출력 — `[debug +0.001s] <message> (1.23ms)` (흐린 회색).
+/// 정보와 측정 시간을 한 라인으로 출력 — `[debug +0.001s] <message> (1.23ms)`.
 macro_rules! debug_step {
     ($start:expr, $($arg:tt)*) => {
         if is_debug_mode() {
             let elapsed = $start.elapsed();
             let t = debug_elapsed_secs();
             let msg = format!($($arg)*);
-            eprintln!(
-                "\x1b[90m[debug +{:.3}s] {} ({:.2}ms)\x1b[0m",
-                t, msg, elapsed.as_secs_f64() * 1000.0
-            );
+            let body = format!("[debug +{:.3}s] {} ({:.2}ms)", t, msg, elapsed.as_secs_f64() * 1000.0);
+            if debug_color() {
+                eprintln!("\x1b[90m{}\x1b[0m", body);
+            } else {
+                eprintln!("{}", body);
+            }
         }
     };
 }
@@ -174,6 +201,11 @@ enum Commands {
         /// `--fix`와 함께 사용. 실제 변경 없이 적용될 작업만 출력.
         #[arg(long)]
         dry_run: bool,
+        /// opt-in tool-calling live probe (GA Gate G1). 설정된 provider에 최소 tool spec으로
+        /// `send_messages`를 1회 보내 ok/unsupported/degraded/error를 진단한다.
+        /// credential/network 없으면 명확히 skip/fail. 세션 시작 시 자동 수행하지 않는다.
+        #[arg(long)]
+        probe_tools: bool,
     },
     /// 데몬 상태 표시 — PID, ping, 마지막 명령어 요약
     Status {
@@ -278,6 +310,38 @@ enum Commands {
         /// 실행할 명령어와 인자. `--` 뒤에 그대로 전달.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
         cmd: Vec<String>,
+    },
+    /// LLM과 대화 — 질문을 주면 1회 답변, 생략하면 대화형 REPL로 진입.
+    ///
+    /// `aic chat "질문"` → 1회성 답변 후 종료(도구 없음, 단발 답변).
+    /// `aic chat` (인자 없음) → 대화형 REPL. exit code와 무관하게 항상 대화형으로
+    /// 진입하며, 직전 명령 record가 있으면 best-effort로 첫 턴 context에 첨부한다.
+    /// **tools(read_file/list_dir/grep/glob)와 run_command는 인자 없는 대화형 모드에서만
+    /// 동작한다.**
+    Chat {
+        /// 질문 (생략 시 대화형 REPL).
+        #[arg(trailing_var_arg = true)]
+        prompt: Vec<String>,
+        /// 실제 LLM 호출 없이 추정 토큰·비용·timeout만 미리보기.
+        #[arg(long)]
+        dry_run: bool,
+        /// 1회성 질문 흐름에 project context pack을 함께 첨부 (P3).
+        #[arg(long)]
+        context: bool,
+        /// 읽기 전용 모드 — 대화형 `aic chat`에서 run_command(셸 실행)를 끄고
+        /// read_file/list_dir/grep/glob만 노출한다. 기본은 run_command 활성(SRE).
+        /// env: AIC_AGENT_NO_RUN(=1|true). 다시 켜려면 이 플래그를 빼고 env도 unset/0.
+        #[arg(long)]
+        no_run: bool,
+        /// `--no-run` 동의어(읽기 전용 도구만).
+        #[arg(long)]
+        read_only: bool,
+        /// (호환) SRE 모드 명시. run_command는 이제 기본 활성이라 사실상 no-op.
+        #[arg(long)]
+        sre: bool,
+        /// (호환) run_command 실행 허용 명시. 기본 활성이라 no-op. 끄려면 `--no-run`.
+        #[arg(long)]
+        allow_run: bool,
     },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
@@ -539,8 +603,11 @@ async fn main() {
             session,
             fix,
             dry_run,
+            probe_tools,
         }) => {
-            if fix {
+            if probe_tools {
+                handle_doctor_probe_tools(cli.provider).await;
+            } else if fix {
                 handle_doctor_fix(dry_run).await;
             } else {
                 handle_doctor(json, session).await;
@@ -574,6 +641,31 @@ async fn main() {
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
+        Some(Commands::Chat {
+            prompt,
+            dry_run,
+            context,
+            no_run,
+            read_only,
+            sre,
+            allow_run,
+        }) => {
+            // 레거시 호환 안내(1회): --sre/--allow-run은 이제 no-op(run_command 기본 활성).
+            if sre || allow_run {
+                eprintln!(
+                    "\x1b[2m[aic] 안내: run_command/tools는 인자 없는 대화형 `aic chat`에서만 \
+                     동작하며 이제 기본 활성입니다. `--sre`/`--allow-run`은 호환용 no-op이고, \
+                     끄려면 `--no-run`(또는 AIC_AGENT_NO_RUN=1). 1회성 `aic chat \"질문\"`은 \
+                     도구 없이 단발 답변만 합니다.\x1b[0m"
+                );
+            }
+            if let Err(e) =
+                handle_chat(prompt, dry_run, cli.provider, context, no_run || read_only).await
+            {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::History {
             limit,
             failed,
@@ -648,9 +740,7 @@ async fn main() {
                 Some(cli.prompt.join(" "))
             };
 
-            if let Err(e) =
-                handle_default(prompt, cli.dry_run, cli.provider, cli.context).await
-            {
+            if let Err(e) = handle_default(prompt, cli.dry_run, cli.provider, cli.context).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -751,7 +841,9 @@ async fn resolve_record(
 
     if let Some(prefix) = record_prefix.map(str::trim).filter(|s| !s.is_empty()) {
         if !aic_common::is_valid_record_id(prefix) {
-            anyhow::bail!("record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)");
+            anyhow::bail!(
+                "record id prefix가 유효하지 않음: '{prefix}' (1~16자 lowercase hex 필요)"
+            );
         }
         let matched = if let Some(ref c) = cascade {
             c.find_record_by_prefix(prefix)
@@ -1172,13 +1264,15 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
     if record.exit_code != 0 {
         match ConfigManager::load() {
             Ok(config) => {
-                let provider_name = match resolve_provider(&config, provider_override.as_deref()) {
-                    Ok(name) => name,
-                    Err(e) => {
-                        eprintln!("{COL_YELLOW}⚠{COL_RESET} 분석 건너뜀: {e}");
-                        std::process::exit(exit_code);
-                    }
-                };
+                // CLI --provider override를 config에 실제 반영 → dispatcher가 override를 사용.
+                let (config, provider_name) =
+                    match apply_provider_override(config, provider_override.as_deref()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("{COL_YELLOW}⚠{COL_RESET} 분석 건너뜀: {e}");
+                            std::process::exit(exit_code);
+                        }
+                    };
                 let model_name = config
                     .llm
                     .providers
@@ -2027,27 +2121,18 @@ async fn handle_doctor_fix(dry_run: bool) {
     let aicd_alive = matches!(aicd_client.ping().await, Ok(true));
     if aicd_alive {
         println!("  {COL_GREEN}✓{COL_RESET} aicd 응답 OK");
+    } else if dry_run {
+        println!("  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 — (dry-run) 데몬 시작 예정");
     } else {
-        if dry_run {
-            println!(
-                "  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 — (dry-run) 데몬 시작 예정"
-            );
-        } else {
-            println!(
-                "  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 → 데몬 시작"
-            );
-            handle_daemon_start(false).await;
-        }
+        println!("  {COL_YELLOW}⚠{COL_RESET} aicd 응답 없음 → 데몬 시작");
+        handle_daemon_start(false).await;
     }
 
     // 2. hook 파일 ensure (~/.aic/hooks.{zsh,bash}).
     let hook_dir = dirs::home_dir().map(|h| h.join(".aic"));
     match hook_dir {
         Some(dir) => {
-            println!(
-                "  {COL_DIM}↳{COL_RESET} hook 파일 위치: {}",
-                dir.display()
-            );
+            println!("  {COL_DIM}↳{COL_RESET} hook 파일 위치: {}", dir.display());
             if !dry_run {
                 let zsh_path = dir.join("hooks.zsh");
                 let bash_path = dir.join("hooks.bash");
@@ -2070,16 +2155,12 @@ async fn handle_doctor_fix(dry_run: bool) {
 
     // 3. stale session artifacts는 aicd가 부팅 시 정리한다.
     //    여기서는 사용자에게 안내만 — 별도 client-side cleanup은 단계 4의 prune이 커버.
-    println!(
-        "  {COL_DIM}↳ stale .sock/.pid 정리는 aicd 부팅 단계에서 자동 수행{COL_RESET}"
-    );
+    println!("  {COL_DIM}↳ stale .sock/.pid 정리는 aicd 부팅 단계에서 자동 수행{COL_RESET}");
 
     // 4. registry inactive 1시간 초과 prune. dry-run이면 항상 안내만, 아니면 ping
     //    재확인 후 실제 호출.
     if dry_run {
-        println!(
-            "  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}"
-        );
+        println!("  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}");
     } else {
         let recheck = matches!(aicd_client.ping().await, Ok(true));
         if recheck {
@@ -2094,9 +2175,93 @@ async fn handle_doctor_fix(dry_run: bool) {
         }
     }
 
-    println!(
-        "{COL_DIM}완료. 자세한 진단은 `aic doctor`로 확인.{COL_RESET}"
-    );
+    println!("{COL_DIM}완료. 자세한 진단은 `aic doctor`로 확인.{COL_RESET}");
+}
+
+/// `aic doctor --probe-tools` — opt-in tool-calling live probe (GA Gate G1-b).
+///
+/// 설정된 provider에 최소 tool spec으로 `send_messages`를 1회 보내 결과를 진단한다.
+/// ok / unsupported / degraded / error / skip(credential 없음)으로 분류해 출력한다.
+/// 세션 시작 시 자동 수행하지 않으며, 이 명령으로만 실제 네트워크 호출이 발생한다.
+async fn handle_doctor_probe_tools(provider_override: Option<String>) {
+    use aic_client::agent::{ChatMessage, ChatResponse, ToolSpec};
+
+    let config = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config 로드 실패: {e}");
+            std::process::exit(2);
+        }
+    };
+    // CLI --provider override를 config(default_provider)에 실제 반영 → probe가 override provider를 검증.
+    let (config, provider_name) =
+        match apply_provider_override(config, provider_override.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
+        };
+    let model_name = config
+        .llm
+        .providers
+        .get(&provider_name)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "(provider default)".to_string());
+    let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+
+    println!("tool-calling live probe");
+    println!("  provider: {provider_name}");
+    println!("  model: {model_name}");
+
+    if !dispatcher.supports_tool_calling() {
+        println!(
+            "  result: unsupported — provider_type가 OpenAI 호환이 아님(정적 판정). \
+             `aic chat`은 ReplSession(단발 send)으로 폴백합니다."
+        );
+        return;
+    }
+
+    // 최소 tool spec + user 메시지로 1회 호출(probe 전용 — 모델이 호출할 필요 없음).
+    let tools = vec![ToolSpec {
+        name: "noop_probe",
+        description: "probe only; do not call",
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }];
+    let msgs = vec![ChatMessage::User("reply with: ok".to_string())];
+
+    match dispatcher.send_messages(&msgs, &tools).await {
+        Ok(ChatResponse::Text(_)) => {
+            println!("  result: ok — provider가 `tools` 파라미터를 수락하고 텍스트로 응답함.");
+        }
+        Ok(ChatResponse::ToolCalls(_)) => {
+            println!("  result: ok — provider가 tool_calls를 반환함(tool-calling 동작).");
+        }
+        Err(aic_common::AicError::ApiKeyMissing { provider }) => {
+            println!(
+                "  result: skip — API key 미설정({provider}). 네트워크 호출 없이 종료. \
+                 credential 설정 후 다시 실행하세요."
+            );
+        }
+        Err(aic_common::AicError::ConfigError(m)) => {
+            println!("  result: unsupported — {m}");
+        }
+        Err(aic_common::AicError::LlmApiError { status, message }) => {
+            if matches!(status, 400 | 404 | 405 | 415 | 422 | 501) {
+                println!(
+                    "  result: degraded — provider가 `tools`를 거부(HTTP {status}). \
+                     `aic chat`은 런타임에 일반 대화로 degrade합니다."
+                );
+            } else if status == 0 {
+                println!("  result: error — 네트워크 오류: {message} (연결/endpoint 확인).");
+            } else {
+                println!("  result: error — HTTP {status}: {message} (auth/endpoint 확인).");
+            }
+        }
+        Err(e) => {
+            println!("  result: error — {e}");
+        }
+    }
 }
 
 async fn handle_doctor(json: bool, session: Option<String>) {
@@ -2104,7 +2269,8 @@ async fn handle_doctor(json: bool, session: Option<String>) {
     let results = aic_client::doctor::run_all_checks(&socket).await;
     // Central Store 섹션 (R14.6): 세션 socket 이 실제로 존재할 때만 GetMetrics 를 시도.
     // 없거나 실패하면 report 내부의 session_metrics_error 에 기록된다.
-    let session_socket: Option<&std::path::Path> = if socket.exists() { Some(&socket) } else { None };
+    let session_socket: Option<&std::path::Path> =
+        if socket.exists() { Some(&socket) } else { None };
     let central_store = aic_client::doctor::probe_central_store_default(session_socket).await;
     if json {
         #[derive(serde::Serialize)]
@@ -3736,8 +3902,7 @@ async fn handle_feedback(
                 }
             } else {
                 action_msg =
-                    "분석 결과 없음 — 먼저 `aic`로 분석을 만들어두면 자동 학습됩니다."
-                        .to_string();
+                    "분석 결과 없음 — 먼저 `aic`로 분석을 만들어두면 자동 학습됩니다.".to_string();
             }
         }
         Verdict::NotWorked => match recipes::delete_by_prefix(&fingerprint) {
@@ -4207,6 +4372,23 @@ fn resolve_provider(config: &AppConfig, override_name: Option<&str>) -> anyhow::
     }
 }
 
+/// CLI `--provider` override를 검증하고, override가 있으면 `config.llm.default_provider`를
+/// 그 provider로 실제로 바꾼 config를 돌려준다.
+///
+/// `LlmDispatcher::from_config`는 `default_provider`를 따라 동작하므로, 표시용 이름만
+/// 바꾸고 config를 그대로 두면 dispatcher가 여전히 원래 default provider를 사용/검증한다
+/// (표시≠실제 버그). 이 헬퍼로 만든 config로 dispatcher를 생성하면 표시=실제가 보장된다.
+/// model은 provider config(`providers[provider].model`)에서 파생되므로 함께 일치한다.
+/// 반환: (override 반영된 config, 사용 provider name).
+fn apply_provider_override(
+    mut config: AppConfig,
+    override_name: Option<&str>,
+) -> anyhow::Result<(AppConfig, String)> {
+    let name = resolve_provider(&config, override_name)?;
+    config.llm.default_provider = name.clone();
+    Ok((config, name))
+}
+
 /// 기본 동작: 서버 연결 → 직전 명령어 조회 → 자동 분기
 /// 또는 직접 프롬프트가 주어지면 LLM에 바로 질문
 /// `--record <prefix>` 흐름. session ring buffer에서 prefix로 record를 찾아
@@ -4231,7 +4413,8 @@ async fn handle_record_by_prefix(
     );
 
     let config = ConfigManager::load()?;
-    let provider_name = resolve_provider(&config, provider_override.as_deref())?;
+    // CLI --provider override를 config(default_provider)에 실제 반영 → dispatcher가 override를 사용.
+    let (config, provider_name) = apply_provider_override(config, provider_override.as_deref())?;
     let model_name = config
         .llm
         .providers
@@ -4255,6 +4438,148 @@ async fn handle_record_by_prefix(
     r
 }
 
+/// 직전 명령 record를 best-effort로 조회한다 (side-effect 없음).
+///
+/// `handle_default`의 record 조회와 달리 history/REPL 폴백을 트리거하지 않고,
+/// 데몬·세션 소켓 또는 hook metadata에서 의미 있는 record를 찾으면 `Some`을,
+/// 없으면 `None`을 돌려준다. `aic chat` REPL 진입 시 첫 턴 context 첨부 용도.
+async fn resolve_last_record_best_effort(config: &AppConfig) -> Option<aic_common::CommandRecord> {
+    let rec = match resolve_session_socket(config) {
+        SessionSocket::Path(socket_path) => {
+            let lookup = if let Some(cascade) = build_cascade_for_session_path(&socket_path) {
+                cascade.get_last_command().await
+            } else {
+                match UdsClient::new(socket_path).get_last_command().await {
+                    Ok(rec) => Ok(Some(rec)),
+                    Err(_) => Ok(None),
+                }
+            };
+            lookup.ok().flatten()
+        }
+        SessionSocket::HistoryFallback => None,
+    };
+
+    // 데몬이 record는 줬지만 command를 캡처하지 못한 경우 hook metadata로 보강.
+    match rec {
+        Some(r)
+            if r.command
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty) =>
+        {
+            get_hook_metadata_record(config).await
+        }
+        Some(r) => Some(r),
+        None => get_hook_metadata_record(config).await,
+    }
+}
+
+/// `aic chat` 처리. 질문 인자가 있으면 1회성 답변, 없으면 대화형 REPL.
+async fn handle_chat(
+    prompt_parts: Vec<String>,
+    dry_run: bool,
+    provider_override: Option<String>,
+    with_context: bool,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    let total_start = Instant::now();
+
+    // run_command(SRE 실행)는 기본 활성. `--no-run`/`--read-only`(또는 env
+    // AIC_AGENT_NO_RUN)로만 끈다. 보안 게이트(risk_guard/validator/confirm)는 그대로.
+    let run_command_enabled = chat_run_command_enabled(read_only, env_flag("AIC_AGENT_NO_RUN"));
+
+    let config = ConfigManager::load()?;
+    // CLI --provider override를 config(default_provider)에 실제 반영 → dispatcher가 override를 사용.
+    let (config, provider_name) = apply_provider_override(config, provider_override.as_deref())?;
+    let model_name = config
+        .llm
+        .providers
+        .get(&provider_name)
+        .and_then(|p| p.model.clone())
+        .unwrap_or_else(|| "(CLI)".to_string());
+    let lang = aic_common::resolve_lang(&config.llm.lang);
+    let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+
+    // 인자가 있으면 1회성 답변 (direct-prompt와 동일 경로).
+    if !prompt_parts.is_empty() {
+        let prompt = prompt_parts.join(" ");
+        let prompt = if with_context {
+            let ctx = aic_client::project_context::build_context_pack();
+            if let Some(c) = ctx.as_deref() {
+                debug_log!("context  project · {} chars", c.len());
+            }
+            aic_client::project_context::append_to_prompt(prompt, ctx.as_deref())
+        } else {
+            prompt
+        };
+        debug_log!("mode     chat-prompt · {} chars", prompt.len());
+        if dry_run {
+            print_dry_run(
+                "direct-prompt",
+                &prompt,
+                &provider_name,
+                &model_name,
+                &config.llm,
+            );
+            return Ok(());
+        }
+        let r = handle_direct_prompt(&dispatcher, &prompt, &model_name, &lang).await;
+        debug_step!(total_start, "total");
+        return r;
+    }
+
+    // 인자 없음 → 항상 대화형 REPL (exit code 무관).
+    debug_log!("mode     chat-repl");
+    if dry_run {
+        print_dry_run(
+            "repl",
+            "(interactive)",
+            &provider_name,
+            &model_name,
+            &config.llm,
+        );
+        return Ok(());
+    }
+
+    let record = resolve_last_record_best_effort(&config)
+        .await
+        .unwrap_or_else(|| aic_common::CommandRecord {
+            command: None,
+            exit_code: 0,
+            output_lines: vec![],
+            timestamp: chrono::Utc::now(),
+            ..Default::default()
+        });
+
+    // provider가 tool-calling을 지원하면 읽기 전용 agent 세션, 아니면 기존 REPL.
+    if dispatcher.supports_tool_calling() {
+        match aic_client::agent::Sandbox::from_cwd() {
+            Ok(sandbox) => {
+                debug_log!("mode     chat-agent (run_command={})", run_command_enabled);
+                let mut session = aic_client::agent::AgentSession::new(
+                    dispatcher,
+                    sandbox,
+                    record,
+                    lang.to_string(),
+                )
+                .allow_run_command(run_command_enabled)
+                .with_provider_model(provider_name.clone(), model_name.clone());
+                session.run().await?;
+            }
+            Err(e) => {
+                debug_log!("agent sandbox 실패 — ReplSession 폴백: {e}");
+                let mut session = ReplSession::new(dispatcher, record, lang.to_string());
+                session.run().await?;
+            }
+        }
+    } else {
+        let mut session = ReplSession::new(dispatcher, record, lang.to_string());
+        session.run().await?;
+    }
+    debug_step!(total_start, "total");
+    Ok(())
+}
+
 async fn handle_default(
     direct_prompt: Option<String>,
     dry_run: bool,
@@ -4265,7 +4590,8 @@ async fn handle_default(
 
     let config_start = Instant::now();
     let config = ConfigManager::load()?;
-    let provider_name = resolve_provider(&config, provider_override.as_deref())?;
+    // CLI --provider override를 config에 실제 반영 → dispatcher가 override를 사용.
+    let (config, provider_name) = apply_provider_override(config, provider_override.as_deref())?;
     let model_name = config
         .llm
         .providers
@@ -5199,12 +5525,31 @@ fn print_command_block(title: &str, cmd: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_destructive_command, resolve_provider};
+    use super::{
+        apply_provider_override, chat_run_command_enabled, is_destructive_command, resolve_provider,
+    };
+    use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
         AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType, ServerConfig,
         SessionConfig,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn chat_run_command_default_enabled() {
+        // 기본 chat(opt-out 없음) → run_command 활성.
+        assert!(chat_run_command_enabled(false, false));
+    }
+
+    #[test]
+    fn chat_run_command_opt_out_disables() {
+        // --no-run/--read-only 플래그 → 비활성.
+        assert!(!chat_run_command_enabled(true, false));
+        // env AIC_AGENT_NO_RUN → 비활성.
+        assert!(!chat_run_command_enabled(false, true));
+        // 둘 다 → 비활성.
+        assert!(!chat_run_command_enabled(true, true));
+    }
 
     #[test]
     fn destructive_rm_rf_root() {
@@ -5303,6 +5648,44 @@ mod tests {
     fn resolve_provider_treats_empty_override_as_no_override() {
         let cfg = config_with_providers("openai", &["openai"]);
         assert_eq!(resolve_provider(&cfg, Some("")).unwrap(), "openai");
+    }
+
+    #[test]
+    fn provider_override_is_applied_to_dispatcher_config() {
+        // default=anthropic(Anthropic, tool-calling 미지원), override=groq(OpenAI-compat 지원).
+        let mut cfg = config_with_providers("anthropic", &["anthropic", "groq"]);
+        if let Some(p) = cfg.llm.providers.get_mut("anthropic") {
+            p.provider_type = ProviderType::Anthropic;
+            p.model = Some("claude-x".to_string());
+        }
+        if let Some(p) = cfg.llm.providers.get_mut("groq") {
+            p.provider_type = ProviderType::Groq;
+            p.model = Some("llama-x".to_string());
+        }
+
+        // override 없음 → default(anthropic) 보존, dispatcher도 anthropic(미지원).
+        let (cfg_def, name_def) = apply_provider_override(cfg.clone(), None).unwrap();
+        assert_eq!(name_def, "anthropic");
+        assert_eq!(cfg_def.llm.default_provider, "anthropic");
+        assert!(!LlmDispatcher::from_config(cfg_def.llm.clone()).supports_tool_calling());
+
+        // override=groq → default_provider가 실제로 groq로 바뀌고 dispatcher가 override를 사용.
+        let (cfg_ov, name_ov) = apply_provider_override(cfg.clone(), Some("groq")).unwrap();
+        assert_eq!(name_ov, "groq");
+        assert_eq!(cfg_ov.llm.default_provider, "groq");
+        assert!(LlmDispatcher::from_config(cfg_ov.llm.clone()).supports_tool_calling());
+        // model도 override provider의 것을 따른다(표시=실제).
+        assert_eq!(
+            cfg_ov
+                .llm
+                .providers
+                .get("groq")
+                .and_then(|p| p.model.clone()),
+            Some("llama-x".to_string())
+        );
+
+        // 알 수 없는 override는 에러(기존 검증 동작 보존).
+        assert!(apply_provider_override(cfg, Some("ghost")).is_err());
     }
 
     #[test]

