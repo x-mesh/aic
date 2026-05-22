@@ -130,24 +130,36 @@ fn check_keychain_access(cfg: &AppConfig, provider: &ProviderConfig) -> CheckRes
     }
 }
 
+/// Keychain → file 기본 전환(opt-in) 후 업그레이드 안내.
+/// 기존 keychain-only chain 사용자가 file 기본에서 verify 실패/키 없음을 만났을 때의 선택지.
+const AUDIT_UPGRADE_HINT: &str =
+    "audit HMAC 키 backend가 기본 file로 바뀌었습니다(keychain은 opt-in). \
+기존 keychain 저장 chain이 있다면: (1) 계속 검증/사용하려면 `AIC_AUDIT_KEYCHAIN=1`로 실행, \
+또는 (2) 새 file 기반 chain을 시작하려면 `~/.local/state/aic/audit.log`를 백업/rotate한 뒤 재실행. \
+그 외에는 키/로그 파일 권한을 확인하세요.";
+
 fn check_audit_log() -> CheckResult {
+    let backend = crate::audit::audit_key_backend();
     match crate::audit::verify() {
         Ok(report) if report.valid => CheckResult::pass(
             "audit log",
-            format!("HMAC chain 무결성 OK ({n} 라인)", n = report.lines),
+            format!(
+                "HMAC chain 무결성 OK ({n} 라인) · key backend: {backend}",
+                n = report.lines
+            ),
         ),
         Ok(report) => CheckResult::fail(
             "audit log",
             format!(
-                "chain 변조 의심 — 라인 {at}",
+                "chain 변조 의심 또는 키 불일치 — 라인 {at} (현재 key backend: {backend})",
                 at = report.broken_at.unwrap_or(0)
             ),
-            "`~/.local/state/aic/audit.log`를 백업 후 삭제하고 새 chain 시작",
+            AUDIT_UPGRADE_HINT,
         ),
         Err(e) => CheckResult::warn(
             "audit log",
-            format!("검증 실패: {e}"),
-            "키 또는 로그 파일 권한을 확인하세요",
+            format!("검증 실패: {e} (현재 key backend: {backend})"),
+            AUDIT_UPGRADE_HINT,
         ),
     }
 }
@@ -226,8 +238,7 @@ pub async fn probe_central_store(
     config: Option<&DaemonConfig>,
     session_socket: Option<&Path>,
 ) -> CentralStoreReport {
-    let (flag_resolved, source) =
-        resolve_central_store_flag_with_source_uncached(env, config);
+    let (flag_resolved, source) = resolve_central_store_flag_with_source_uncached(env, config);
     let phase = current_phase();
     let attach_socket_path = aic_common::aicd_attach_socket_path();
     let attach_connected = probe_attach_socket(&attach_socket_path).await;
@@ -252,9 +263,7 @@ pub async fn probe_central_store(
 ///
 /// `handle_doctor` 에서 사용한다. config 파일 파싱 실패는 `None` 으로 떨어져
 /// env + Phase default 로만 평가된다 (R12.2).
-pub async fn probe_central_store_default(
-    session_socket: Option<&Path>,
-) -> CentralStoreReport {
+pub async fn probe_central_store_default(session_socket: Option<&Path>) -> CentralStoreReport {
     let env: HashMap<String, String> = std::env::vars().collect();
     let daemon = read_daemon_config_best_effort();
     probe_central_store(&env, daemon.as_ref(), session_socket).await
@@ -278,9 +287,7 @@ async fn probe_attach_socket(path: &Path) -> bool {
 /// 두 필드는 `aic-session` 측 counter 이고 aicd 에는 존재하지 않는다 (R14.4, R14.5).
 /// 세션 소켓이 없거나 `GetMetrics` 가 에러로 끝나면 placeholder 0 값을 돌려주고
 /// 원인을 `Some(String)` 으로 반환한다.
-async fn probe_session_metrics(
-    session_socket: Option<&Path>,
-) -> (u64, u64, Option<String>) {
+async fn probe_session_metrics(session_socket: Option<&Path>) -> (u64, u64, Option<String>) {
     let Some(path) = session_socket else {
         return (
             0,
@@ -351,9 +358,7 @@ pub fn print_central_store_section(report: &CentralStoreReport) {
             println!("  reconnects  : {}", report.attach_reconnect_total);
         }
         Some(reason) => {
-            println!(
-                "  dropped     : \x1b[90mN/A\x1b[0m ({reason})"
-            );
+            println!("  dropped     : \x1b[90mN/A\x1b[0m ({reason})");
             println!("  reconnects  : \x1b[90mN/A\x1b[0m");
         }
     }
@@ -656,6 +661,26 @@ mod tests {
     }
 
     #[test]
+    fn audit_upgrade_hint_covers_both_migration_options() {
+        // keychain→file 기본 전환 후 verify 실패/키 없음 시 사용자에게 두 선택지를 안내해야 한다.
+        // (1) keychain chain 계속: AIC_AUDIT_KEYCHAIN=1, (2) 새 file chain: audit.log 백업/rotate.
+        assert!(
+            AUDIT_UPGRADE_HINT.contains("AIC_AUDIT_KEYCHAIN=1"),
+            "옵션1(keychain opt-in) 안내 누락"
+        );
+        assert!(
+            AUDIT_UPGRADE_HINT.contains("audit.log"),
+            "옵션2(로그 백업/rotate) 안내 누락"
+        );
+        assert!(
+            AUDIT_UPGRADE_HINT.contains("백업") || AUDIT_UPGRADE_HINT.contains("rotate"),
+            "백업/rotate 키워드 누락"
+        );
+        // 권한 안내도 여전히 포함.
+        assert!(AUDIT_UPGRADE_HINT.contains("권한"), "권한 확인 안내 누락");
+    }
+
+    #[test]
     fn check_result_fail_includes_fix() {
         let r = CheckResult::fail("n", "d", "fix me");
         assert_eq!(r.status, Status::Fail);
@@ -916,10 +941,7 @@ mod tests {
         assert_eq!(dropped, 0);
         assert_eq!(reconnects, 0);
         let reason = err.expect("Some(String) 이어야 한다");
-        assert!(
-            reason.contains("존재하지 않습니다"),
-            "reason={reason}"
-        );
+        assert!(reason.contains("존재하지 않습니다"), "reason={reason}");
     }
 
     #[tokio::test]

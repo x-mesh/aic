@@ -530,10 +530,7 @@ impl ReadCascade {
     /// **Phase 3.5 차이 (R7.1)**: session socket fallback 제거. flag=true 에서
     /// aicd 가 에러면 `Err` 그대로 전파된다.
     #[cfg(not(feature = "phase-3_5"))]
-    pub async fn get_recent_commands(
-        &self,
-        count: usize,
-    ) -> Result<Vec<CommandRecord>, AicError> {
+    pub async fn get_recent_commands(&self, count: usize) -> Result<Vec<CommandRecord>, AicError> {
         if self.central_store_flag {
             let aicd = UdsClient::new(self.aicd_sock.clone());
             match aicd
@@ -561,10 +558,7 @@ impl ReadCascade {
     /// flag=false 이면 세션 로컬 소켓이 지원되지 않으므로 warning 을 남기고 빈 Vec 를
     /// 반환한다.
     #[cfg(feature = "phase-3_5")]
-    pub async fn get_recent_commands(
-        &self,
-        count: usize,
-    ) -> Result<Vec<CommandRecord>, AicError> {
+    pub async fn get_recent_commands(&self, count: usize) -> Result<Vec<CommandRecord>, AicError> {
         if !self.central_store_flag {
             tracing::warn!(
                 session_id = %self.session_id,
@@ -604,7 +598,10 @@ impl ReadCascade {
 
         // session socket 의 GetRecentLines 래퍼는 UdsClient 에 없으므로 raw request 를 보낸다.
         let session = UdsClient::new(self.session_sock.clone());
-        match session.send_raw(IpcRequest::GetRecentLines { count }).await? {
+        match session
+            .send_raw(IpcRequest::GetRecentLines { count })
+            .await?
+        {
             IpcResponse::Lines(lines) => Ok(lines),
             IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
             other => Err(AicError::IpcError(std::io::Error::new(
@@ -812,7 +809,11 @@ mod tests {
     /// `connections` 는 실제로 accept 된 횟수(= cascade 가 해당 소켓을 시도한 횟수).
     async fn start_multi_mock(
         responses: Vec<IpcResponse>,
-    ) -> (PathBuf, tempfile::TempDir, std::sync::Arc<tokio::sync::Mutex<usize>>) {
+    ) -> (
+        PathBuf,
+        tempfile::TempDir,
+        std::sync::Arc<tokio::sync::Mutex<usize>>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("mock.sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
@@ -884,7 +885,9 @@ mod tests {
             start_multi_mock(vec![IpcResponse::CommandData(expected.clone())]).await;
         let (session_sock, _sess_dir, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandData(sample_record(
-                "2222", "should-not-be-used", 99,
+                "2222",
+                "should-not-be-used",
+                99,
             ))])
             .await;
 
@@ -985,7 +988,10 @@ mod tests {
         let session_sock = nonexistent_sock();
         let cascade = ReadCascade::with_paths("sess06", true, aicd_sock, session_sock);
         let got = cascade.get_last_command().await.unwrap();
-        assert!(got.is_none(), "양쪽 모두 연결 실패 시 Ok(None) 으로 떨어진다");
+        assert!(
+            got.is_none(),
+            "양쪽 모두 연결 실패 시 Ok(None) 으로 떨어진다"
+        );
     }
 
     // ── get_recent_commands cascade ─────────────────────────────────
@@ -1027,11 +1033,10 @@ mod tests {
     #[cfg(not(feature = "phase-3_5"))]
     #[tokio::test]
     async fn cascade_recent_commands_flag_false_uses_only_session() {
-        let (aicd_sock, _d1, aicd_hits) =
-            start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "zzzz", "should-skip", 0,
-            )])])
-            .await;
+        let (aicd_sock, _d1, aicd_hits) = start_multi_mock(vec![IpcResponse::CommandRecords(
+            vec![sample_record("zzzz", "should-skip", 0)],
+        )])
+        .await;
         let records = vec![sample_record("dddd", "make", 2)];
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(records.clone())]).await;
@@ -1051,13 +1056,19 @@ mod tests {
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![])]).await;
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "xxxx", "session-wins", 0,
+                "xxxx",
+                "session-wins",
+                0,
             )])])
             .await;
 
         let cascade = ReadCascade::with_paths("sess13", true, aicd_sock, session_sock);
         let got = cascade.get_recent_commands(5).await.unwrap();
-        assert_eq!(got.len(), 0, "aicd 빈 Vec 는 성공이므로 cascade 하지 않는다");
+        assert_eq!(
+            got.len(),
+            0,
+            "aicd 빈 Vec 는 성공이므로 cascade 하지 않는다"
+        );
         assert_eq!(*aicd_hits.lock().await, 1);
         assert_eq!(
             *session_hits.lock().await,
@@ -1150,11 +1161,10 @@ mod tests {
     #[cfg(not(feature = "phase-3_5"))]
     #[tokio::test]
     async fn cascade_find_by_prefix_flag_false_uses_only_session() {
-        let (aicd_sock, _d1, aicd_hits) =
-            start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "aicd1111", "skip", 0,
-            )])])
-            .await;
+        let (aicd_sock, _d1, aicd_hits) = start_multi_mock(vec![IpcResponse::CommandRecords(
+            vec![sample_record("aicd1111", "skip", 0)],
+        )])
+        .await;
         let records = vec![sample_record("sess2222", "legacy-prefix-match", 0)];
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(records.clone())]).await;
@@ -1175,7 +1185,9 @@ mod tests {
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![])]).await;
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "sess3333", "should-not-reach", 0,
+                "sess3333",
+                "should-not-reach",
+                0,
             )])])
             .await;
 
@@ -1209,7 +1221,9 @@ mod tests {
         // session mock 은 호출되지 말아야 한다.
         let (session_sock, _sess_dir, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandData(sample_record(
-                "should-not", "used", 99,
+                "should-not",
+                "used",
+                99,
             ))])
             .await;
 
@@ -1235,13 +1249,18 @@ mod tests {
         .await;
         let (session_sock, _sess_dir, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandData(sample_record(
-                "should-not", "used", 99,
+                "should-not",
+                "used",
+                99,
             ))])
             .await;
 
         let cascade = ReadCascade::with_paths("sess_p35_b", true, aicd_sock, session_sock);
         let got = cascade.get_last_command().await.unwrap();
-        assert!(got.is_none(), "Phase 3.5 에서는 aicd record 없음 → Ok(None)");
+        assert!(
+            got.is_none(),
+            "Phase 3.5 에서는 aicd record 없음 → Ok(None)"
+        );
         assert_eq!(*aicd_hits.lock().await, 1);
         assert_eq!(*session_hits.lock().await, 0);
     }
@@ -1252,7 +1271,9 @@ mod tests {
         let aicd_sock = nonexistent_sock();
         let (session_sock, _sess_dir, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandData(sample_record(
-                "should-not", "used", 99,
+                "should-not",
+                "used",
+                99,
             ))])
             .await;
 
@@ -1275,7 +1296,9 @@ mod tests {
         .await;
         let (session_sock, _sess_dir, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandData(sample_record(
-                "shouldskip", "session-skip", 0,
+                "shouldskip",
+                "session-skip",
+                0,
             ))])
             .await;
 
@@ -1283,16 +1306,17 @@ mod tests {
         let got = cascade.get_last_command().await.unwrap();
         assert!(got.is_none(), "flag=false + Phase 3.5 → Ok(None)");
         assert_eq!(*aicd_hits.lock().await, 0, "aicd 는 호출되지 말아야 한다");
-        assert_eq!(*session_hits.lock().await, 0, "session 도 호출되지 말아야 한다");
+        assert_eq!(
+            *session_hits.lock().await,
+            0,
+            "session 도 호출되지 말아야 한다"
+        );
     }
 
     #[cfg(feature = "phase-3_5")]
     #[tokio::test]
     async fn phase35_recent_commands_flag_true_aicd_success() {
-        let records = vec![
-            sample_record("a1", "ls", 0),
-            sample_record("a2", "pwd", 0),
-        ];
+        let records = vec![sample_record("a1", "ls", 0), sample_record("a2", "pwd", 0)];
         let (aicd_sock, _d1, aicd_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(records.clone())]).await;
         let (session_sock, _d2, session_hits) =
@@ -1317,7 +1341,9 @@ mod tests {
         .await;
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "should-not", "used", 0,
+                "should-not",
+                "used",
+                0,
             )])])
             .await;
 
@@ -1338,11 +1364,10 @@ mod tests {
     #[cfg(feature = "phase-3_5")]
     #[tokio::test]
     async fn phase35_recent_commands_flag_false_returns_empty() {
-        let (aicd_sock, _d1, aicd_hits) =
-            start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "aa", "skip", 0,
-            )])])
-            .await;
+        let (aicd_sock, _d1, aicd_hits) = start_multi_mock(vec![IpcResponse::CommandRecords(
+            vec![sample_record("aa", "skip", 0)],
+        )])
+        .await;
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
                 "bb", "skip", 0,
@@ -1406,11 +1431,10 @@ mod tests {
     #[cfg(feature = "phase-3_5")]
     #[tokio::test]
     async fn phase35_find_by_prefix_flag_false_returns_empty() {
-        let (aicd_sock, _d1, aicd_hits) =
-            start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
-                "skip", "aicd", 0,
-            )])])
-            .await;
+        let (aicd_sock, _d1, aicd_hits) = start_multi_mock(vec![IpcResponse::CommandRecords(
+            vec![sample_record("skip", "aicd", 0)],
+        )])
+        .await;
         let (session_sock, _d2, session_hits) =
             start_multi_mock(vec![IpcResponse::CommandRecords(vec![sample_record(
                 "skip", "session", 0,

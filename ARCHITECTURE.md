@@ -109,6 +109,7 @@ ac-rust/
         │   ├── sysinfo.rs       # /local 내장 sysinfo probe 목록(개별 bounded Safe 명령)
         │   ├── markdown.rs      # CLI 친화 markdown subset → ANSI 렌더(의존성 없는 순수 fn, CJK wrap)
         │   ├── diagnose.rs      # /diagnose 증상→결정적 Safe probe 선택 + 진단 prompt(순수 fn)
+        │   ├── probes.rs        # Probe Catalog(ProbeSpec) — 읽기 전용 probe 단일 출처 + /triage plan
         │   └── session.rs       # AgentSession agent loop (SRE preface, degrade 폴백)
         ├── auto_brancher.rs     # ErrorAnalysis vs InteractiveRepl 분기
         ├── cache.rs             # 결과 캐시 (24h TTL)
@@ -201,7 +202,7 @@ sequenceDiagram
 | Secret 누출 | `redaction.rs` | 5종 prefix + Shannon entropy ≥3.0. LLM 송신 직전 단일 stage. `AIC_REDACT=off` opt-out |
 | PII | `redaction.rs` | 4종 정형 매칭 (entropy 무관) |
 | API key 평문 | `keychain.rs` | OS keychain reference (`keychain:<provider>`). `aic migrate-keys` 일괄 이동 |
-| 감사 | `audit.rs` | JSONL append-only + HMAC-SHA256 line chain. `aic audit verify` (exit 0/2/3) |
+| 감사 | `audit.rs` | JSONL append-only + HMAC-SHA256 line chain. `aic audit verify` (exit 0/2/3). HMAC 키 backend는 **기본 file**, keychain은 opt-in(`AIC_AUDIT_KEYCHAIN=1`), `AIC_NO_KEYCHAIN=1`은 강제 off. backend는 `aic doctor`/chat `/doctor`에 표시 |
 | 데이터 본문 보존 금지 | tracing/audit 양쪽 | hash + token count만, prompt/response 본문 미저장 |
 
 ### 가시성
@@ -280,6 +281,19 @@ NO_COLOR/non-TTY는 plain·no-op.
 분석. prompt(`build_diagnose_prompt`)는 가설→증거 인용→다음 안전 확인을 요구하고 증거를 데이터로만 취급
 (injection 방지)·read-only 고정. `--raw`/`AIC_LOCAL_NO_ANALYZE`=증거만, 실패 시 raw fallback. audit
 kind=`diagnose`, corr가 probe들+분석을 한 진단으로 묶음. 렌더(amber)·spinner는 `/local`과 공유.
+
+**Probe Catalog (`agent::probes`)** — 읽기 전용 SRE probe의 단일 출처. `ProbeSpec{id, category, tags,
+description, linux_command, macos_command, max_lines}`로 local 섹션 + `process` + git read-only를 모은
+고정 상수 catalog. `command()`가 OS별 명령을 해석하고, `resolve_ids`/`by_category`/`probe_by_id`로 조회.
+`sysinfo::local_probes`(=`resolve_ids(LOCAL_SECTIONS)`), `/diagnose` section_command, `/incident`·
+`/bundle` git 증거(`by_category("git")`)가 모두 catalog를 참조한다. 모든 명령은 risk_guard Safe∧validator
+통과∧egress 없음(테스트로 invariant 검증).
+
+**`/triage` (`agent::probes::triage_plan` + `session::handle_triage`)** — 토픽(mac-slow/web/disk/memory/
+cpu/network/build-fail/generic; unknown→generic+원 라벨 보존)→`TriagePlan{checklist, probe_ids}`(순수).
+기본은 체크리스트 + 후보 probe(id/tags/설명/명령/≤max_lines)를 stderr 렌더(LLM·실행 없음). `--run`이면
+run_command 활성 시에만 `collect_local_snapshot`으로 후보 probe 실행(redacted 증거, LLM/history 미사용).
+topic은 라벨 선택에만 쓰여 셸 명령에 섞이지 않는다.
 
 **`/explain-last` · `/incident`** — `/explain-last [--raw] [seq|corr]`은 ring의 최근(또는 지정) tool
 기록(`tool_record::record_evidence`)을 증거로 원인/다음확인 분석(새 명령 실행 없음 → read-only 세션도

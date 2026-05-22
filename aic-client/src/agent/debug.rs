@@ -11,11 +11,23 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// `AIC_DEBUG=1|true` 여부 (`main.rs::is_debug_mode`와 동일 규칙).
+/// env 값이 truthy(`1`/`true`, 대소문자·공백 무시)인지. **그 외(0/false/off/빈값/unset)는 모두 OFF**.
+/// AIC_DEBUG·AIC_NO_BANNER 등 on/off env flag의 전역 공통 판정.
+pub(crate) fn truthy(val: Option<&str>) -> bool {
+    matches!(
+        val.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// `AIC_DEBUG=1|true` 여부. 0/false/off/unset/empty=OFF.
 pub(crate) fn enabled() -> bool {
-    std::env::var("AIC_DEBUG")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    truthy(std::env::var("AIC_DEBUG").ok().as_deref())
+}
+
+/// env 이름으로 truthy 판정(전역 공통 헬퍼).
+pub(crate) fn env_truthy(name: &str) -> bool {
+    truthy(std::env::var(name).ok().as_deref())
 }
 
 /// 첫 호출 시점부터의 누적 경과 시간(초). `main.rs::debug_elapsed_secs`와 같은 패턴.
@@ -44,3 +56,24 @@ macro_rules! adbg {
     };
 }
 pub(crate) use adbg;
+
+#[cfg(test)]
+mod tests {
+    use super::truthy;
+
+    #[test]
+    fn truthy_only_one_and_true() {
+        // ON: 1 / true (대소문자·공백 무시).
+        assert!(truthy(Some("1")));
+        assert!(truthy(Some("true")));
+        assert!(truthy(Some("TRUE")));
+        assert!(truthy(Some(" true ")));
+        // OFF: 0/false/off/empty/unset/기타.
+        assert!(!truthy(Some("0")));
+        assert!(!truthy(Some("false")));
+        assert!(!truthy(Some("off")));
+        assert!(!truthy(Some("")));
+        assert!(!truthy(Some("yes")));
+        assert!(!truthy(None));
+    }
+}

@@ -12,47 +12,8 @@ pub(crate) const LOCAL_SECTIONS: &[&str] = &[
 
 /// OS에 맞는 (섹션, 명령) 목록. 각 명령은 하드코딩된 bounded Safe 명령.
 pub(crate) fn local_probes() -> Vec<(&'static str, String)> {
-    let linux = cfg!(target_os = "linux");
-    let s = |x: &str| x.to_string();
-    vec![
-        ("date", s("date")),
-        ("host", s("hostname")),
-        ("os", s("uname -a")),
-        ("uptime", s("uptime")),
-        ("disk", s("df -h")),
-        (
-            "memory",
-            if linux {
-                s("free -h")
-            } else {
-                s("top -l 1 | head -n 12")
-            },
-        ),
-        (
-            "ip",
-            if linux {
-                s("ip -br addr")
-            } else {
-                s("ifconfig | head -n 80")
-            },
-        ),
-        (
-            "route",
-            if linux {
-                s("ip route | head -n 20")
-            } else {
-                s("netstat -rn | head -n 30")
-            },
-        ),
-        (
-            "ports",
-            if linux {
-                s("ss -tunl | head -n 50")
-            } else {
-                s("lsof -nP -iTCP -sTCP:LISTEN | head -n 50")
-            },
-        ),
-    ]
+    // Probe Catalog(`agent::probes`)에서 LOCAL_SECTIONS 순서로 해석한다(명령은 catalog의 단일 출처).
+    super::probes::resolve_ids(LOCAL_SECTIONS)
 }
 
 /// 섹션 이름으로 필터(없으면 전체). 대소문자 무시.

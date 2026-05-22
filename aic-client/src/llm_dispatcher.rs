@@ -720,10 +720,8 @@ pub(crate) fn resolve_cli_args(cli_path: &str, override_args: Option<&[String]>)
 /// Rate limit 관련 응답 헤더를 디버그 로그로 출력한다.
 /// Groq, OpenAI 등 x-ratelimit-* 헤더를 지원한다.
 fn log_rate_limit_headers(resp: &reqwest::Response) {
-    if std::env::var("AIC_DEBUG")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
-    {
+    // 공통 truthy 판정(1|true, trim+case-insensitive) 재사용 — AIC_DEBUG=" true "도 ON.
+    if crate::agent::debug::env_truthy("AIC_DEBUG") {
         let headers = resp.headers();
         let remaining_req = headers
             .get("x-ratelimit-remaining-requests")

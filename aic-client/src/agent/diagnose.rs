@@ -89,16 +89,9 @@ fn category_sections(category: &str) -> Vec<&'static str> {
     names
 }
 
-/// 섹션 이름 → 실행할 bounded Safe 명령. sysinfo probe를 재사용하고, process는 고정 상수.
+/// 섹션 이름 → 실행할 bounded Safe 명령. Probe Catalog(`agent::probes`)에서 조회(process 포함).
 fn section_command(name: &str) -> Option<String> {
-    if name == "process" {
-        // ps는 Safe safelist. bounded(| head). 고정 상수 → injection 안전.
-        return Some("ps aux | head -n 20".to_string());
-    }
-    super::sysinfo::local_probes()
-        .into_iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, cmd)| cmd)
+    super::probes::probe_by_id(name).map(|p| p.command())
 }
 
 /// 증상에 대한 (섹션, 명령) probe 목록을 결정적으로 고른다. 순수 함수(테스트 가능).
