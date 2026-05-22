@@ -20,6 +20,20 @@ pub(crate) fn color_enabled() -> bool {
     std::env::var_os("NO_COLOR").is_none() && is_tty()
 }
 
+/// 순수 결정 로직(테스트용): 둘 중 하나라도 켜지면 배너 생략.
+fn banner_suppressed_from(no_banner: bool, quiet: bool) -> bool {
+    no_banner || quiet
+}
+
+/// chat 시작 배너/status를 끌지 — `AIC_NO_BANNER` 또는 `AIC_QUIET`가 `1|true`면 true.
+/// 배너는 debug 로그와 무관하지만, 조용한 실행을 원하는 사용자를 위한 opt-out.
+pub(crate) fn banner_suppressed() -> bool {
+    banner_suppressed_from(
+        super::debug::env_truthy("AIC_NO_BANNER"),
+        super::debug::env_truthy("AIC_QUIET"),
+    )
+}
+
 /// 터미널 폭(컬럼). 알 수 없으면 80.
 pub(crate) fn term_width() -> usize {
     terminal_size::terminal_size()
@@ -197,6 +211,14 @@ mod tests {
     fn paint_respects_color_flag() {
         assert_eq!(paint_if("x", "1", false), "x");
         assert_eq!(paint_if("x", "1", true), "\x1b[1mx\x1b[0m");
+    }
+
+    #[test]
+    fn banner_suppressed_when_either_flag_on() {
+        assert!(!banner_suppressed_from(false, false), "기본은 배너 표시");
+        assert!(banner_suppressed_from(true, false), "AIC_NO_BANNER → 생략");
+        assert!(banner_suppressed_from(false, true), "AIC_QUIET → 생략");
+        assert!(banner_suppressed_from(true, true));
     }
 
     #[test]

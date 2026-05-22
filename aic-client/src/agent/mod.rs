@@ -14,6 +14,7 @@ pub(crate) mod debug;
 pub(crate) mod diagnose;
 pub mod gitignore;
 pub(crate) mod markdown;
+pub(crate) mod probes;
 pub mod run_command;
 pub mod sandbox;
 pub mod session;

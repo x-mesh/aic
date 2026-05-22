@@ -8,9 +8,9 @@
 
 ## Overview
 
-`aic`는 터미널에서 명령어 실행 중 발생하는 에러를 LLM에 넘겨서 원인을 설명받고 수정 명령어를 제안받는 도구입니다.
+명령어가 실패하면 `aic`가 그 출력을 LLM에 넘겨 원인 설명과 수정 명령어를 받아옵니다.
 
-PTY 기반 셸 래퍼 데몬(`aic-session`)이 사용자의 셸을 감싸서 입출력을 중계하면서 출력을 캡처합니다. CLI 클라이언트(`aic`)는 직전 명령어의 exit code를 보고 에러 분석 또는 Interactive REPL 모드로 분기합니다.
+내부적으로는 PTY 기반 데몬(`aic-session`)이 셸을 감싸 입출력을 중계하면서 최근 출력을 Ring Buffer에 담아 둡니다. CLI 클라이언트(`aic`)는 직전 명령어의 exit code를 보고 에러 분석 또는 Interactive REPL로 분기합니다.
 
 사용자당 하나의 supervisor daemon(`aicd`)이 세션 lifecycle/registry/cleanup을 관리하고, 출력 캡처가 부담스러운 워크플로우를 위해 metadata만 수집하는 **hook capture mode**도 있습니다 (PRD: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
 
@@ -43,12 +43,13 @@ graph LR
 - ✅ 단일 인스턴스 보장 — `fcntl(F_SETLK)` PID lock + stale 자동 정리
 - ✅ Graceful shutdown — SIGTERM/SIGINT 핸들링, drain 후 cleanup
 - ✅ 구조화 trace 로그 — JSONL daily rotate (7일 보존), `AIC_LOG=info|debug`
-- ✅ `aic doctor` — 8축 환경 진단 (config/데몬/셸hook/LLM endpoint/keychain/audit)
+- ✅ `aic doctor` — 9축 환경 진단 (config/provider/소켓/데몬/supervisor/셸hook/LLM endpoint/keychain/audit)
 - ✅ `aic status` — 데몬 PID/ping/마지막 명령어 1회 출력
 
 ### 보안 baseline
 - ✅ Secret/PII redaction — secret 5종(AWS/GitHub/OpenAI/Anthropic/JWT) + PII 4종(email/한국 전화/주민번호/IPv4) 자동 마스킹, `AIC_REDACT=off` opt-out
-- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, `aic audit verify` 무결성 검증
+- ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, `aic audit verify` 무결성 검증. HMAC 키는 **기본 file backend**, OS keychain은 opt-in(`AIC_AUDIT_KEYCHAIN=1`), `AIC_NO_KEYCHAIN=1`은 강제 off
+  - **업그레이드 노트**: 이전 버전에서 audit 키가 OS keychain에만 있던 경우, 새 file 기본에서 verify WARN/키 없음(또는 chain 보호를 위한 append skip)이 날 수 있다. (1) keychain chain을 계속 검증/사용하려면 `AIC_AUDIT_KEYCHAIN=1`로 실행, **또는** (2) 새 file 기반 chain을 시작하려면 `~/.local/state/aic/audit.log`를 백업/rotate 후 재실행. `aic doctor`가 두 선택지를 안내한다.
 - ✅ OS keychain — macOS Keychain / Linux Secret Service / Windows Credential Manager로 API key 저장, `aic migrate-keys`로 평문 일괄 이동
 
 ### LLM UX
@@ -63,7 +64,7 @@ graph LR
 - ✅ `aic init --hook-mode` — Phase 3 metadata-only hook 추가 설치
 - ✅ `aic config` 인터랙티브 wizard
 
-### Supervisor / Capture Modes (신규)
+### Supervisor / Capture Modes
 - ✅ `aicd` supervisor daemon — 사용자당 1개. 세션 registry, control UDS,
   graceful shutdown
 - ✅ `aic daemon { status | start | stop }` — supervisor 제어
@@ -241,34 +242,9 @@ NO_COLOR=1 aic chat                           # plain 출력(ANSI 없음; non-TT
 # → 시작 시 banner + status line(mode/tools/policy/cwd/provider)이 stderr로 출력된다.
 #   채팅 프롬프트는 TTY면 "◇ you ❯ ", 파이프면 plain "you> ". LLM 답변은 stdout,
 #   banner/status/command card/debug는 stderr로 분리(파이프 안전).
-# → 세션 내 slash 명령(LLM에 전송 안 됨, 화면에만 출력):
-#     /help · /last [N] · /raw [seq|corr]
-#     /local [section] [--raw]  (alias /sys, /snapshot) — 로컬 sysinfo 스냅샷 + LLM 분석
-#                       probe(date/host/os/uptime/disk/memory/ip/route/ports), 각 probe는 bounded Safe 명령.
-#                       기본은 redacted 스냅샷을 provider로 보내 짧은 요약(대화 history 미push). --raw/-r는
-#                       모델 호출 없이 원본만, --analyze/-a는 분석 강제. provider 오류/timeout 시 raw로 fallback.
-#                       AIC_LOCAL_NO_ANALYZE=1로 분석을 완전히 끔.
-#                       분석 결과는 터미널용으로 렌더(markdown 제목/불릿/굵게/코드를 ANSI 구조로, CJK 폭 wrap);
-#                       강조색은 amber, NO_COLOR는 색 없이 구조만, 파이프(non-TTY)는 raw markdown 그대로.
-#                       분석 진행은 TTY에서 spinner로 표시(파이프는 no-op).
-#     /diagnose [--raw] <증상>  read-only SRE 진단. 증상에서 Safe probe 선택
-#                       (cpu/memory/disk/network/process/generic) → 증거 수집 → 가설/증거 인용/다음 안전 확인
-#                       분석(대화 history 미push). 예: /diagnose "맥이 느림", /diagnose memory pressure,
-#                       /diagnose --raw 느림. no-arg=일반 health. --raw=증거만, LLM 실패 시 raw fallback.
-#     /explain-last [--raw] [seq|corr]  최근(또는 지정) tool 기록 분석(원인/증거/다음확인).
-#     /incident [--raw] [name]  시스템 스냅샷 + git read-only 증거(repo) + 최근 기록을 묶어 분석.
-#                       name은 라벨 전용(셸 명령에 미포함).
-#     /doctor              AIC 자체 상태: provider/model, tool-calling 지원, run_command on/off,
-#                       env flag는 set/unset만(secret 값·config dump 없음).
-#     /timeline [N]        세션 tool 기록 시간순(redacted 요약).
-#     /compare             고정 Safe probe로 현재 스냅샷 수집 후 직전 baseline과 diff(LLM 미호출).
-#     /bundle [name]       인시던트 증거(시스템+git read-only+최근 기록)를 redacted markdown으로
-#                       ~/.aic/bundles/ 에 저장(dir 0700/file 0600, Unix). name은 파일 라벨.
-#   보류: /runbook, /fix-preview, /config, watch daemon, persistent /audit 조회.
-#   TTY에서 "/" 입력 즉시 후보 패널("command  설명")이 열리고, ↑↓로 이동(선택행 highlight),
-#   Tab 순환, Enter 선택, Esc 닫기. 삽입은 이름만. 매칭은 prefix 우선, 없으면 subsequence/fuzzy
-#   폴백(예: /lcl → /local). /local <section> 섹션 후보 지원. (reedline 기반; NO_COLOR/non-TTY 정책 준수.)
-#   (persistent /audit 조회는 P2-2 예정)
+# → 세션 내 slash 명령은 로컬에서 가로채 처리하며 LLM에 전송되지 않는다:
+#   /local /diagnose /explain-last /incident /doctor /timeline /compare /bundle /triage /watch /help.
+#   TTY에서 "/"를 입력하면 후보 패널이 열린다. 자세한 표는 아래 "Chat slash 명령" 참고.
 # (레거시 --sre / --allow-run은 파싱은 되지만 이제 no-op: run_command가 기본 활성)
 # 설계 문서: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
 # → 비용 미리보기: aic chat --dry-run "ping"
@@ -299,13 +275,19 @@ Tab 순환, Enter 선택, Esc 닫기).
 | `/timeline [N]` | 세션 tool 기록 시간순(redacted) |
 | `/compare` | 고정 Safe 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출) |
 | `/bundle [name]` | 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장(dir 0700 / file 0600, Unix) |
+| `/triage [--run] [topic]` | 토픽 체크리스트 + Probe Catalog 후보 probe; `--run`이면 실행(LLM 미호출). topics: `mac-slow web disk memory cpu network build-fail generic` |
+| `/watch [target] [--count N] [--every Ns]` | 로컬 probe를 몇 번 다시 실행해 tick마다 변화량을 요약(LLM 미호출). bounded: 기본 3회(최대 20), 간격 1s. `target`은 섹션 이름, 생략하면 compact 세트 |
+
+probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다(local
+sysinfo 섹션 + `process` + git read-only). `/local`·`/compare`·`/diagnose`·`/incident`·`/bundle`·
+`/triage`가 모두 이를 참조한다.
 
 분석 명령은 **redacted** 증거 스냅샷을 tool 없는 stateless 단발 호출로 provider에 보낸다. `--raw`(및
 `AIC_LOCAL_NO_ANALYZE=1`)는 모델 호출을 건너뛰고 증거만 보여주며, provider 오류/timeout 시 raw 증거로
 fallback한다. 분석 출력은 TTY에서 CLI 친화 markdown subset(amber 강조)으로 렌더되고, 파이프에서는 plain,
 진행 중에는 spinner를 표시한다.
 
-보류(roadmap): `/runbook`, `/fix-preview`, `/config`, watch daemon, persistent `/audit` 조회.
+보류(roadmap): `/runbook`, `/fix-preview`, `/config`, background watch daemon, persistent `/audit` 조회.
 
 ### 안전 모델 (run_command)
 
@@ -348,6 +330,11 @@ aic run -- cargo build              # stdout/stderr 보존, exit code 그대로
 | `AIC_REDACT=off` | secret/PII redaction 비활성 (audit 기록됨) |
 | `AIC_NO_STREAM=1` | streaming 비활성 (spinner + sectional 출력) |
 | `AIC_DEBUG=1` | client `[debug +X.XXXs]` prefix 출력 |
+| `AIC_AUDIT_KEYCHAIN=1` | audit HMAC 키를 OS keychain에 저장(opt-in). **기본은 file 키** |
+| `AIC_NO_KEYCHAIN=1` | keychain을 강제 off(최우선) — opt-in보다 우선, 항상 file 키 |
+| `AIC_LOCAL_NO_ANALYZE=1` | `/local`·`/diagnose` 등 분석을 끄고 raw 증거만 |
+| `AIC_NO_BANNER=1` / `AIC_QUIET=1` | `aic chat` 시작 배너·status 줄·context header 출력 안 함 (이 chrome은 debug 출력과 무관) |
+| `AIC_VERBOSE=1` | command별 상세 `run_command` 카드(preamble + `→ done` 요약) 표시. 기본은 조용(섹션 헤더 + 보안 경고만). `AIC_DEBUG=1`도 활성화 |
 | `AIC_SESSION_ID` | 활성 세션 ID. `aic-session`이 자동 export, hook도 참조 |
 
 ## Project Structure

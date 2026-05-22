@@ -114,17 +114,20 @@ impl AgentSession {
         let mut reader = repl::LineReader::new();
 
         // ASCII art banner + status line(TTY/색상/폭 자동, non-TTY는 plain fallback).
-        ui::print_banner_and_status(&ui::StatusInfo {
-            run_state: if self.allow_run_command {
-                ui::RunState::On
-            } else {
-                ui::RunState::ReadOnly
-            },
-            cwd: self.sandbox.root().display().to_string(),
-            provider: self.provider.clone(),
-            model: self.model.clone(),
-        });
-        repl::print_context_header(&self.context);
+        // AIC_NO_BANNER/AIC_QUIET면 시작 배너·status를 생략(배너는 debug와 무관, opt-out 전용).
+        if !ui::banner_suppressed() {
+            ui::print_banner_and_status(&ui::StatusInfo {
+                run_state: if self.allow_run_command {
+                    ui::RunState::On
+                } else {
+                    ui::RunState::ReadOnly
+                },
+                cwd: self.sandbox.root().display().to_string(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+            });
+            repl::print_context_header(&self.context);
+        }
 
         // system preface를 history 시드로 둔다(OpenAI system role 사용).
         // SRE 모드면 generic preface 뒤에 SRE 지침을 덧붙인다.
@@ -425,6 +428,20 @@ impl AgentSession {
             }
             SlashCommand::Compare => self.handle_compare(),
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()),
+            SlashCommand::Triage { topic, run } => self.handle_triage(topic.as_deref(), run),
+            SlashCommand::Watch {
+                target,
+                count,
+                every_ms,
+            } => self.handle_watch(target.as_deref(), count, every_ms),
+            SlashCommand::Ambiguous { input, candidates } => {
+                let cands = candidates
+                    .iter()
+                    .map(|c| format!("/{c}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!("/{input}는 여러 명령과 일치합니다: {cands}. 더 입력해 구분하세요.");
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("알 수 없는 명령: /{name}. /help 로 사용법을 확인하세요.")
             }
@@ -455,8 +472,10 @@ impl AgentSession {
 
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
 
-        eprintln!("=== local system snapshot ===");
-        // raw 모드면 본문도 즉시 출력. 분석 모드면 스냅샷으로만 모은다(요약 우선, 실패 시 fallback에서 출력).
+        // raw 모드만 snapshot 헤더/섹션/본문을 보인다. analyze 모드는 spinner만 두고 조용히 수집한다.
+        if !do_analyze {
+            eprintln!("=== local system snapshot ===");
+        }
         let snapshot = self.collect_local_snapshot(probes, !do_analyze);
 
         if !do_analyze {
@@ -538,14 +557,26 @@ impl AgentSession {
         probes: Vec<(&'static str, String)>,
         print_bodies: bool,
     ) -> String {
+        use std::io::Write;
+        let total = probes.len();
+        // analyze 모드(헤더/본문 미출력) + TTY일 때만 같은 줄을 overwrite하는 진행 표시.
+        let show_progress = !print_bodies && ui::is_tty();
         let mut snapshot = String::new();
-        for (name, cmd) in probes {
+        for (idx, (name, cmd)) in probes.into_iter().enumerate() {
             self.tool_seq += 1;
             let corr = format!("{}.{}", self.run_id, self.tool_seq);
-            eprintln!("\n[{name}]");
+            if print_bodies {
+                // raw 모드만 섹션 헤더/본문을 보인다.
+                eprintln!("\n[{name}]");
+            } else if show_progress {
+                // 현재 probe 진행 상태를 같은 줄에 갱신(ephemeral). NO_COLOR면 plain.
+                let label = collect_progress_label(name, idx + 1, total);
+                eprint!("\r\x1b[K{}", ui::paint(&label, "2"));
+                let _ = std::io::stderr().flush();
+            }
             let args = serde_json::json!({ "command": cmd });
             // Safe 명령이라 confirm은 호출되지 않지만, 비대화형 안전을 위해 거부 클로저 전달.
-            // execute_with_corr가 command card를 stderr로 출력(visibility), 결과는 redacted.
+            // execute_with_corr가 (AIC_VERBOSE/AIC_DEBUG일 때만) command card를 출력, 결과는 redacted.
             let out =
                 super::run_command::execute_with_corr(&args, &self.sandbox, &corr, |_, _, _| false)
                     .unwrap_or_else(|e| format!("[tool error] {e}"));
@@ -554,6 +585,11 @@ impl AgentSession {
             }
             snapshot.push_str(&format!("## {name}\n{out}\n\n"));
             self.record_tool(&corr, "run_command", Some(cmd), &out);
+        }
+        if show_progress {
+            // 진행 줄 정리(다음 단계의 분석 spinner와 겹치지 않게).
+            eprint!("\r\x1b[K");
+            let _ = std::io::stderr().flush();
         }
         snapshot
     }
@@ -566,14 +602,19 @@ impl AgentSession {
             kind,
             serde_json::json!({ "run_id": self.run_id, "analyzed": false, "fallback": reason }),
         );
+        // 사용자 친화 문구: provider/내부 사정 대신 "수집한 raw 증거를 보여준다"는 결과 중심.
+        // 구체 사유(provider 오류/timeout 등)는 audit + AIC_DEBUG에만 남겨 출력을 시끄럽게 하지 않는다.
         eprintln!(
             "\n{}",
             ui::paint(
-                &format!("[{kind}] LLM 분석을 못 해 raw 증거를 표시합니다 ({reason})."),
+                &format!("[{kind}] 분석을 완료하지 못해 수집한 raw 증거를 아래에 표시합니다."),
                 "33"
             )
         );
-        // 분석 모드에서는 본문을 안 찍었으므로, fallback 시 raw 증거 본문 전체를 출력한다.
+        if super::debug::enabled() {
+            eprintln!("{}", ui::paint(&format!("  (사유: {reason})"), "2"));
+        }
+        // 분석 모드에서는 본문을 안 찍었으므로, fallback 시 raw 증거(요약/cap된)를 출력한다.
         eprintln!("{}", snapshot.trim_end());
     }
 
@@ -649,31 +690,37 @@ impl AgentSession {
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
         eprintln!("=== incident: {} ===", name.unwrap_or("(unnamed)"));
 
-        let mut evidence = String::from("# system\n");
-        evidence
-            .push_str(&self.collect_local_snapshot(super::sysinfo::local_probes(), !do_analyze));
-
-        // git read-only 증거(repo일 때만). 고정 Safe 상수만 — name은 명령에 절대 포함하지 않는다.
-        if self.sandbox.root().join(".git").exists() {
-            let git_probes: Vec<(&'static str, String)> = vec![
-                ("git_status", "git status --short".to_string()),
-                ("git_branch", "git branch --show-current".to_string()),
-                ("git_log", "git log -n 10 --oneline".to_string()),
-                ("git_diff", "git diff --stat".to_string()),
-            ];
-            evidence.push_str("\n# git\n");
-            evidence.push_str(&self.collect_local_snapshot(git_probes, !do_analyze));
-        }
-
-        // 최근 tool 기록 요약(분석/raw 모두 포함).
-        let recent = tool_record::recent_records_evidence(&self.tool_records, 10);
-        evidence.push_str("\n# recent tool records\n");
-        evidence.push_str(&recent);
+        // raw 모드는 full 출력(print_bodies=true)을 보이고, analyze 모드는 조용히 수집한 뒤
+        // **bounded** evidence로 분석한다(과대 evidence로 인한 provider parsing/context 오류 방지).
+        let sys_raw = self.collect_local_snapshot(super::sysinfo::local_probes(), !do_analyze);
+        let git_raw = if self.sandbox.root().join(".git").exists() {
+            Some(self.collect_local_snapshot(super::probes::by_category("git"), !do_analyze))
+        } else {
+            None
+        };
 
         if !do_analyze {
+            // raw 모드: 본문은 collect가 이미 출력했고, 최근 기록만 추가 표시.
+            let recent = tool_record::recent_records_evidence(&self.tool_records, 10);
             eprintln!("\n# recent tool records\n{recent}");
             return;
         }
+
+        // analyze evidence: 섹션별 line cap으로 핵심(date/host/os/uptime/disk/memory/ip/route/ports)은
+        // 보존하되 각 섹션을 짧게, 최근 기록은 적게, 마지막에 전체 byte cap.
+        let mut evidence = String::from("# system\n");
+        evidence.push_str(&cap_section_lines(&sys_raw, INCIDENT_SECTION_MAX_LINES));
+        if let Some(git) = git_raw {
+            evidence.push_str("\n# git\n");
+            evidence.push_str(&cap_section_lines(&git, INCIDENT_SECTION_MAX_LINES));
+        }
+        evidence.push_str("\n# recent tool records\n");
+        evidence.push_str(&tool_record::recent_records_evidence(
+            &self.tool_records,
+            INCIDENT_RECENT_RECORDS,
+        ));
+        let evidence = cap_evidence(&evidence, INCIDENT_EVIDENCE_MAX_BYTES);
+
         let prompt = tool_record::build_incident_prompt(name, &evidence);
         self.run_analysis(
             &evidence,
@@ -688,7 +735,8 @@ impl AgentSession {
     /// `/doctor` — AIC 자체 상태를 secret 값 없이(presence-only) 표시한다. LLM/명령 실행 없음.
     fn handle_doctor(&self) {
         let flags = [
-            ("AIC_DEBUG", std::env::var_os("AIC_DEBUG").is_some()),
+            // AIC_DEBUG는 truthy(1|true)만 ON으로 통일 — 0/false/off는 OFF 표기.
+            ("AIC_DEBUG", super::debug::enabled()),
             (
                 "AIC_AGENT_NO_RUN",
                 std::env::var_os("AIC_AGENT_NO_RUN").is_some(),
@@ -705,6 +753,7 @@ impl AgentSession {
             self.model.as_deref(),
             self.dispatcher.supports_tool_calling(),
             self.allow_run_command,
+            crate::audit::audit_key_backend(),
             &flags,
         );
         let body = if ui::is_tty() {
@@ -735,11 +784,51 @@ impl AgentSession {
             Some(old) => {
                 eprintln!(
                     "\n=== compare (직전 baseline 대비) ===\n{}",
-                    tool_record::snapshot_diff(&old, &snapshot)
+                    tool_record::compare_report(&old, &snapshot)
                 );
                 self.compare_baseline = Some(snapshot);
             }
         }
+    }
+
+    /// `/watch [target] [--count N] [--every Ns]` — local probe를 bounded하게 반복 실행하고
+    /// 각 tick마다 직전 대비 변화 라인 수를 compact하게 보여준다. 무한 watch 없음(count clamp).
+    /// run_command 안전정책·local probe(Safe 카탈로그) 재사용, LLM 미호출.
+    fn handle_watch(&mut self, target: Option<&str>, count: usize, every_ms: u64) {
+        if !self.allow_run_command {
+            eprintln!("/watch는 run_command가 필요합니다 — 현재 read-only 세션이라 비활성입니다.");
+            return;
+        }
+        // unknown target은 조용히 compact로 fallback하지 않고 명확히 거부 + 사용 가능 섹션 안내.
+        if let Some(msg) = watch_target_error(target) {
+            eprintln!("{msg}");
+            return;
+        }
+        let probes = watch_probes(target);
+        if probes.is_empty() {
+            eprintln!("watch할 probe가 없습니다.");
+            return;
+        }
+        let label = target.unwrap_or("local(compact)");
+        eprintln!("=== watch: {label} ({count}회, {every_ms}ms 간격) ===");
+        let interval = std::time::Duration::from_millis(every_ms);
+        let mut prev: Option<String> = None;
+        for i in 1..=count {
+            let snap = self.collect_local_snapshot(probes.clone(), false);
+            let digest = match &prev {
+                None => "baseline".to_string(),
+                Some(p) => format!("{} 라인 변동", tool_record::changed_line_count(p, &snap)),
+            };
+            eprintln!(
+                "{}",
+                ui::paint(&format!("[watch {i}/{count}] {digest}"), "2")
+            );
+            prev = Some(snap);
+            if i < count {
+                std::thread::sleep(interval);
+            }
+        }
+        eprintln!("watch 완료({count} ticks).");
     }
 
     /// `/bundle [name]` — 인시던트 증거(시스템+git+최근 기록)를 redacted markdown으로 파일 저장.
@@ -753,12 +842,7 @@ impl AgentSession {
         let mut evidence = String::from("# system\n");
         evidence.push_str(&self.collect_local_snapshot(super::sysinfo::local_probes(), false));
         if self.sandbox.root().join(".git").exists() {
-            let git_probes: Vec<(&'static str, String)> = vec![
-                ("git_status", "git status --short".to_string()),
-                ("git_branch", "git branch --show-current".to_string()),
-                ("git_log", "git log -n 10 --oneline".to_string()),
-                ("git_diff", "git diff --stat".to_string()),
-            ];
+            let git_probes = super::probes::by_category("git");
             evidence.push_str("\n# git\n");
             evidence.push_str(&self.collect_local_snapshot(git_probes, false));
         }
@@ -772,6 +856,55 @@ impl AgentSession {
             Ok(path) => eprintln!("\nbundle 저장됨: {}", path.display()),
             Err(e) => eprintln!("\nbundle 저장 실패: {e}"),
         }
+    }
+
+    /// `/triage [--run] [topic]` — 토픽별 read-only 체크리스트 + 후보 probe를 stderr로 렌더.
+    /// `run`이면 (run_command 활성 시) 후보 probe를 실행해 redacted evidence를 보여준다. LLM 미호출.
+    /// topic은 라벨 선택에만 쓰고 셸 명령에 섞지 않는다(probe는 catalog의 고정 상수).
+    fn handle_triage(&mut self, topic: Option<&str>, run: bool) {
+        let plan = super::probes::triage_plan(topic);
+        let probes = super::probes::resolve_ids(plan.probe_ids);
+
+        eprintln!("=== triage: {} (topic: {}) ===", plan.label, plan.resolved);
+        eprintln!("\n[checklist]");
+        for item in plan.checklist {
+            eprintln!("  - {item}");
+        }
+        eprintln!("\n[candidate probes]");
+        for (id, cmd) in &probes {
+            if let Some(p) = super::probes::probe_by_id(id) {
+                let bound = match p.max_lines {
+                    Some(n) => format!(" (≤{n} lines)"),
+                    None => String::new(),
+                };
+                eprintln!(
+                    "  - {id} [{}]: {}{bound}  →  {cmd}",
+                    p.tags.join(","),
+                    p.description
+                );
+            } else {
+                eprintln!("  - {id}  →  {cmd}");
+            }
+        }
+
+        if !run {
+            eprintln!(
+                "\n(--run 으로 위 probe를 실행해 redacted 증거를 볼 수 있습니다. LLM 호출 없음. \
+                 topics: {})",
+                super::probes::TRIAGE_TOPICS.join(" ")
+            );
+            return;
+        }
+        if !self.allow_run_command {
+            eprintln!(
+                "\n--run은 run_command가 필요합니다 — 현재 read-only 세션(--no-run/--read-only/\
+                 AIC_AGENT_NO_RUN)이라 probe를 실행하지 않습니다."
+            );
+            return;
+        }
+        eprintln!("\n=== triage evidence (read-only, redacted) ===");
+        // collect_local_snapshot은 redaction/timeout/cap/corr/ring을 그대로 적용한다. LLM 미전송.
+        let _ = self.collect_local_snapshot(probes, true);
     }
 
     /// 사용자 입력에 언어 지시 + (첫 턴) 직전 명령 컨텍스트를 붙인다.
@@ -798,6 +931,81 @@ impl AgentSession {
 
 /// `/local` 분석 단발 LLM 호출의 최대 대기 시간(초). 초과 시 raw fallback.
 const LOCAL_ANALYZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `/incident` analyze evidence 바운드 — 과대 evidence로 인한 provider parsing/context 오류 방지.
+/// 섹션(=probe)별 본문 최대 줄 수(핵심 섹션은 모두 보존하되 각 섹션을 짧게).
+const INCIDENT_SECTION_MAX_LINES: usize = 12;
+/// 최근 tool 기록 포함 개수(작게).
+const INCIDENT_RECENT_RECORDS: usize = 8;
+/// 조립된 evidence 전체 byte 상한(안전망).
+const INCIDENT_EVIDENCE_MAX_BYTES: usize = 8 * 1024;
+
+/// `## section\n<body>` 블록들에서 각 섹션 본문을 최대 `max_lines`줄로 자른다(순수, 테스트 가능).
+/// 섹션 헤더(`## name`)·빈 줄 구분은 보존해 모든 핵심 섹션이 남되 각 섹션을 짧게 만든다.
+fn cap_section_lines(snapshot: &str, max_lines: usize) -> String {
+    let mut out = String::new();
+    let mut body_lines = 0usize;
+    let mut elided = false;
+    for line in snapshot.lines() {
+        if line.starts_with("## ") {
+            out.push_str(line);
+            out.push('\n');
+            body_lines = 0;
+            elided = false;
+        } else if line.trim().is_empty() {
+            out.push('\n');
+        } else if body_lines < max_lines {
+            out.push_str(line);
+            out.push('\n');
+            body_lines += 1;
+        } else if !elided {
+            out.push_str("…\n");
+            elided = true;
+        }
+    }
+    out
+}
+
+/// `/watch` 대상 probe 목록 — 단일 섹션(유효 + Safe 카탈로그) 지정 시 그 probe만, 아니면
+/// compact 기본 세트(uptime/memory/disk; 가장 변동이 잦은 자원). 모두 catalog의 고정 Safe 상수.
+/// `/watch` 대상 검증(순수) — None/유효 섹션은 OK(None), 그 외는 거부 안내 메시지(Some).
+/// parse 단계에서 `local`은 None으로 정규화되므로 Some(t)는 항상 non-`local` 토큰이다.
+fn watch_target_error(target: Option<&str>) -> Option<String> {
+    match target {
+        None => None,
+        Some(t) if super::sysinfo::LOCAL_SECTIONS.contains(&t) => None,
+        Some(t) => Some(format!(
+            "알 수 없는 watch 대상 '{t}'. 사용 가능: local(기본 compact) 또는 섹션 — {}",
+            super::sysinfo::LOCAL_SECTIONS.join(" ")
+        )),
+    }
+}
+
+fn watch_probes(target: Option<&str>) -> Vec<(&'static str, String)> {
+    if let Some(t) = target {
+        if super::sysinfo::LOCAL_SECTIONS.contains(&t) {
+            if let Some(p) = super::probes::probe_by_id(t) {
+                return vec![(p.id, p.command())];
+            }
+        }
+    }
+    ["uptime", "memory", "disk"]
+        .iter()
+        .filter_map(|n| super::probes::probe_by_id(n).map(|p| (p.id, p.command())))
+        .collect()
+}
+
+/// evidence 전체를 `max_bytes`로 UTF-8 경계 안전하게 자른다(순수, 테스트 가능).
+fn cap_evidence(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…", &text[..end])
+}
 
 /// `/bundle` — redacted 증거를 `~/.aic/bundles/<sanitized>-<ts>.md`에 저장하고 경로를 반환한다.
 /// name은 파일명 라벨(sanitize)로만 쓰고 셸 명령에 섞지 않는다. dir 0700 / file 0600(unix best-effort).
@@ -826,11 +1034,18 @@ fn write_bundle(name: Option<&str>, evidence: &str) -> anyhow::Result<std::path:
     Ok(path)
 }
 
-/// 분석 spinner 라벨 — provider 전송 투명성을 유지한다(`noun`=스냅샷/증거 등). provider명이 있으면 포함.
+/// 수집 진행 라벨(순수) — analyze 모드에서 probe별 같은 줄 갱신용. 짧은 Claude-like 톤.
+/// 예: `<thinking> 수집 중: date (1/9)`.
+fn collect_progress_label(name: &str, idx: usize, total: usize) -> String {
+    format!("<thinking> 수집 중: {name} ({idx}/{total})")
+}
+
+/// 분석 spinner 라벨 — Claude-like 짧은 `<thinking>` 톤. provider명이 있으면 전송 투명성을 위해
+/// 괄호로 덧붙인다(`noun`=스냅샷/증거/기록 등). spinner는 ephemeral(완료 시 정리).
 fn analyze_status_label(noun: &str, provider: Option<&str>) -> String {
     match provider {
-        Some(p) if !p.is_empty() => format!("redacted {noun}를 {p}로 보내 분석 중…"),
-        _ => format!("redacted {noun}를 provider로 보내 분석 중…"),
+        Some(p) if !p.is_empty() => format!("<thinking> redacted {noun} 분석 중… ({p})"),
+        _ => format!("<thinking> redacted {noun} 분석 중…"),
     }
 }
 
@@ -1146,16 +1361,72 @@ mod tests {
     }
 
     #[test]
-    fn analyze_status_label_includes_provider() {
+    fn watch_target_validation() {
+        // None(기본 compact)·유효 섹션은 통과.
+        assert!(watch_target_error(None).is_none());
+        assert!(watch_target_error(Some("memory")).is_none());
+        assert!(watch_target_error(Some("disk")).is_none());
+        // unknown target은 거부 + 사용 가능 섹션 힌트.
+        let err = watch_target_error(Some("memroy")).expect("invalid target should error");
+        assert!(err.contains("memroy") && err.contains("사용 가능"));
+        assert!(err.contains("memory"), "힌트에 실제 섹션명 포함: {err}");
+    }
+
+    #[test]
+    fn cap_section_lines_preserves_headers_and_caps_body() {
+        let snap = "## date\nl1\nl2\nl3\nl4\n\n## host\nh1\nh2\n";
+        let capped = cap_section_lines(snap, 2);
+        // 헤더는 모두 보존, 각 섹션 본문은 최대 2줄 + 생략 마커.
+        assert!(capped.contains("## date") && capped.contains("## host"));
+        assert!(capped.contains("l1") && capped.contains("l2") && !capped.contains("l3"));
+        assert!(capped.contains("…"));
+        assert!(capped.contains("h1") && capped.contains("h2"));
+    }
+
+    #[test]
+    fn cap_evidence_bounds_total_bytes() {
+        let big = "x".repeat(20_000);
+        let capped = cap_evidence(&big, 8 * 1024);
+        assert!(capped.len() <= 8 * 1024 + 8, "byte cap: {}", capped.len());
+        assert!(capped.ends_with('…'));
+        // 작은 입력은 그대로.
+        assert_eq!(cap_evidence("short", 1024), "short");
+    }
+
+    #[test]
+    fn collect_progress_label_shows_name_and_index() {
+        assert_eq!(
+            collect_progress_label("date", 1, 9),
+            "<thinking> 수집 중: date (1/9)"
+        );
+        assert_eq!(
+            collect_progress_label("ports", 9, 9),
+            "<thinking> 수집 중: ports (9/9)"
+        );
+        // 짧은 Claude-like 톤(<thinking> 프리픽스) + name/진행도 포함.
+        let l = collect_progress_label("host", 2, 9);
+        assert!(l.starts_with("<thinking>") && l.contains("host") && l.contains("(2/9)"));
+    }
+
+    #[test]
+    fn analyze_status_label_thinking_tone_and_provider() {
+        // Claude-like <thinking> 톤 + provider는 괄호로(전송 투명성).
         assert_eq!(
             analyze_status_label("스냅샷", Some("ai-mesh")),
-            "redacted 스냅샷를 ai-mesh로 보내 분석 중…"
+            "<thinking> redacted 스냅샷 분석 중… (ai-mesh)"
         );
-        // provider 없거나 빈 문자열이면 일반 라벨.
-        assert!(analyze_status_label("스냅샷", None).contains("provider로"));
-        assert!(analyze_status_label("증거", Some("")).contains("provider로"));
-        // 항상 전송 투명성(redacted) + noun 문구 유지.
-        assert!(analyze_status_label("증거", Some("x")).contains("redacted 증거"));
+        // provider 없거나 빈 문자열이면 괄호 생략.
+        assert_eq!(
+            analyze_status_label("스냅샷", None),
+            "<thinking> redacted 스냅샷 분석 중…"
+        );
+        assert_eq!(
+            analyze_status_label("증거", Some("")),
+            "<thinking> redacted 증거 분석 중…"
+        );
+        // 항상 redacted + noun 유지, <thinking> 프리픽스 포함.
+        let l = analyze_status_label("증거", Some("x"));
+        assert!(l.starts_with("<thinking>") && l.contains("redacted 증거") && l.contains("(x)"));
     }
 
     #[test]
