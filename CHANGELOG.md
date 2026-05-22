@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-22
+
 ### Added — `aic chat` Agentic Assistant (RFC-002 Phase 0~2)
 
 `aic chat` 서브커맨드 도입 — exit code와 무관한 명시적 대화 진입점. 단발성
