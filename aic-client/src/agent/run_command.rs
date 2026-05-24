@@ -659,12 +659,71 @@ fn path_policy(head: &str) -> PathArgPolicy {
 }
 
 /// 인자 토큰의 절대경로/traversal 탈출을 차단한다(옵션은 호출 전 제외).
+/// mutation/위험 명령(NeedsConfirm 등급)에만 적용한다 — read-only 진단은 전역 read를 허용한다.
 fn check_no_escape(tok: &str) -> Result<(), String> {
     if tok.starts_with('/') {
         return Err(format!("절대 경로 인자 불가: {tok}"));
     }
     if tok.split('/').any(|c| c == "..") {
         return Err(format!("경로 traversal(..) 불가: {tok}"));
+    }
+    Ok(())
+}
+
+/// read-only 진단이 호스트 전역을 읽더라도 **차단할 민감 경로**인지(secret/credential).
+/// 경로 컴포넌트·파일명 기준으로 판정한다(절대·상대 무관). egress·mutation은 risk_guard가
+/// 별도 게이트하고, 출력은 redaction을 거치지만, secret 파일은 읽기 자체를 막는다.
+fn is_sensitive_path_str(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let comps: Vec<&str> = lower.split('/').filter(|c| !c.is_empty()).collect();
+    // 민감 디렉토리(홈 하위 credential 저장소). 컴포넌트 단위라 `/var/lib/docker`(점 없음)와
+    // `~/.docker`(`.docker`)는 구분된다.
+    const SENSITIVE_DIR_COMPONENTS: &[&str] = &[
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".gpg",
+        ".kube",
+        ".docker",
+        "gcloud",
+        ".password-store",
+        ".gem",
+    ];
+    if comps
+        .iter()
+        .any(|c| SENSITIVE_DIR_COMPONENTS.contains(c))
+    {
+        return true;
+    }
+    // 시스템 secret 파일/디렉토리.
+    for prefix in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssl/private"] {
+        if lower == prefix || lower.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+    // /proc/<pid>/environ — 프로세스 환경변수(secret 가능).
+    if comps.first() == Some(&"proc") && comps.last() == Some(&"environ") {
+        return true;
+    }
+    // 파일명/확장자 기반(.env, credentials, *.pem, id_rsa ...) — tools::is_secret_file 재사용.
+    if let Some(name) = lower.rsplit('/').next() {
+        if super::tools::is_secret_file(name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// read-only 진단 명령의 path 인자가 민감 경로면 차단한다. 경로 문자열 + (존재 시)
+/// canonicalize 대상까지 검사해 symlink/traversal 우회(`/tmp/x -> ~/.ssh/id_rsa`)를 best-effort 방어한다.
+fn check_sensitive_path(tok: &str) -> Result<(), String> {
+    if is_sensitive_path_str(tok) {
+        return Err(format!("민감 경로 접근 차단: {tok}"));
+    }
+    if let Ok(canon) = std::fs::canonicalize(tok) {
+        if is_sensitive_path_str(&canon.to_string_lossy()) {
+            return Err(format!("민감 경로(symlink 대상) 접근 차단: {tok}"));
+        }
     }
     Ok(())
 }
@@ -725,13 +784,13 @@ fn consumes_next_value(cmd: &str, opt: &str) -> bool {
     }
 }
 
-/// 정책에 따라 path로 간주되는 인자를 sandbox.resolve로 검증한다.
-/// 옵션 arity(값 토큰)는 `consumes_next_value`로 건너뛴다.
-fn validate_path_args(
+/// 정책에 따라 path로 간주되는 인자에 `on_path`를 적용한다(옵션 arity·pattern 제외 처리 공유).
+/// 옵션 값 토큰은 `consumes_next_value`로 건너뛰고, PatternThenPaths의 첫 non-option(pattern)은 제외한다.
+fn for_each_path_arg(
     cmd: &str,
     policy: PathArgPolicy,
     args: &[&str],
-    sandbox: &Sandbox,
+    mut on_path: impl FnMut(&str) -> Result<(), String>,
 ) -> Result<(), String> {
     if policy == PathArgPolicy::NoPaths {
         return Ok(());
@@ -759,20 +818,32 @@ fn validate_path_args(
             i += 1;
             continue;
         }
-        resolve_in_sandbox(tok, sandbox)?;
+        on_path(tok)?;
         i += 1;
     }
     Ok(())
 }
 
+/// (mutation/위험 명령용) path 인자를 sandbox.resolve로 검증한다 — root 내 존재 + containment.
+fn validate_path_args(
+    cmd: &str,
+    policy: PathArgPolicy,
+    args: &[&str],
+    sandbox: &Sandbox,
+) -> Result<(), String> {
+    for_each_path_arg(cmd, policy, args, |tok| resolve_in_sandbox(tok, sandbox))
+}
+
 /// 단일 pipe segment(`cmd args...`)를 검증한다.
-fn validate_segment(segment: &str, sandbox: &Sandbox) -> Result<(), String> {
+/// `read_only`면(전체 명령이 risk_guard Safe) 호스트 전역 read를 허용하고 secret 경로만 차단한다.
+/// 아니면(mutation/위험) 기존대로 절대경로/traversal 차단 + sandbox(cwd) containment를 강제한다.
+fn validate_segment(segment: &str, sandbox: &Sandbox, read_only: bool) -> Result<(), String> {
     let tokens: Vec<&str> = segment.split_whitespace().collect();
     let head = tokens.first().ok_or_else(|| "빈 명령".to_string())?;
     let args = &tokens[1..];
     let name = head.rsplit('/').next().unwrap_or(head);
 
-    // find/fd: subprocess/삭제/제어/파일쓰기 옵션은 무조건 차단(Safe 우회 방지).
+    // find/fd: subprocess/삭제/제어/파일쓰기 옵션은 무조건 차단(read_only 무관, Safe 우회 방지).
     if matches!(name, "find" | "fd") {
         for tok in args {
             if FIND_DANGEROUS_OPTS.contains(tok) {
@@ -781,16 +852,26 @@ fn validate_segment(segment: &str, sandbox: &Sandbox) -> Result<(), String> {
         }
     }
 
-    // 전역: 모든 non-option 인자의 절대경로/traversal 차단.
-    for tok in args {
-        if is_option(tok) {
-            continue;
+    if read_only {
+        // read-only 진단: 호스트 전역 read 허용 — secret 경로만 차단(SRE 목적).
+        // egress(curl/ssh)·mutation(rm/prune)은 애초에 Safe가 아니라 이 경로로 오지 않는다.
+        // NoPaths 명령(sort/cut/echo 등)도 인자를 잠재 path로 보고 검사한다(secret 우회 방지).
+        // 단 grep류 pattern(첫 non-option)은 path가 아니므로 제외(false positive 방지).
+        let policy = match path_policy(head) {
+            PathArgPolicy::NoPaths => PathArgPolicy::AllPaths,
+            p => p,
+        };
+        for_each_path_arg(name, policy, args, check_sensitive_path)?;
+    } else {
+        // mutation/위험 명령: 절대경로/traversal 차단 + path 인자를 sandbox 안으로 강제.
+        for tok in args {
+            if is_option(tok) {
+                continue;
+            }
+            check_no_escape(tok)?;
         }
-        check_no_escape(tok)?;
+        validate_path_args(name, path_policy(head), args, sandbox)?;
     }
-
-    // file-reading 명령은 path 인자를 sandbox 안으로 강제(옵션 arity 고려).
-    validate_path_args(name, path_policy(head), args, sandbox)?;
     Ok(())
 }
 
@@ -856,12 +937,16 @@ pub(crate) fn validate_command(command: &str, sandbox: &Sandbox) -> Result<(), S
         return Err("`~`(홈 확장) 불가".into());
     }
 
+    // read-only(risk_guard Safe) 진단은 호스트 전역 read를 허용하고, mutation/위험 명령은
+    // sandbox(cwd) 안으로 강제한다. 판정은 전체 파이프라인 기준(혼합 시 보수적으로 non-Safe).
+    let read_only =
+        crate::risk_guard::classify(command).level == crate::risk_guard::RiskLevel::Safe;
     for segment in command.split('|') {
         let seg = segment.trim();
         if seg.is_empty() {
             return Err("빈 pipe segment".into());
         }
-        validate_segment(seg, sandbox)?;
+        validate_segment(seg, sandbox, read_only)?;
     }
     Ok(())
 }
@@ -1021,12 +1106,17 @@ mod tests {
     // ── High finding 1: 명령 검증(샌드박스 강제) ──────────────
 
     #[test]
-    fn validate_blocks_absolute_path() {
+    fn validate_readonly_allows_absolute_blocks_secret() {
         let (_d, sb) = sandbox();
-        assert!(validate_command("cat /etc/passwd", &sb).is_err());
-        assert!(validate_command("ls /etc", &sb).is_err());
-        // execute 경로로도 [blocked] 표면화(echo가 아니라 cat이라 검증 단계 도달).
-        let out = execute(&json!({ "command": "cat /etc/passwd" }), &sb, |_, _, _| {
+        // read-only 진단은 호스트 전역 read를 허용한다(SRE 목적).
+        assert!(validate_command("cat /etc/passwd", &sb).is_ok());
+        assert!(validate_command("ls /etc", &sb).is_ok());
+        assert!(validate_command("du -ah /tmp", &sb).is_ok());
+        // 단 secret 경로는 read-only라도 차단한다.
+        assert!(validate_command("cat /etc/shadow", &sb).is_err());
+        assert!(validate_command("cat /root/.ssh/id_rsa", &sb).is_err());
+        // execute 경로로도 secret은 [blocked] 표면화.
+        let out = execute(&json!({ "command": "cat /etc/shadow" }), &sb, |_, _, _| {
             true
         })
         .unwrap();
@@ -1040,10 +1130,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_blocks_traversal() {
+    fn validate_traversal_readonly_ok_mutation_blocked() {
         let (_d, sb) = sandbox();
-        assert!(validate_command("cat ../secret", &sb).is_err());
-        assert!(validate_command("cat sub/../../etc/passwd", &sb).is_err());
+        // read-only는 전역 read라 traversal도 허용(secret이 아니면).
+        assert!(validate_command("cat ../some/file", &sb).is_ok());
+        // mutation(NeedsConfirm)은 traversal/절대경로를 차단하고 sandbox 안으로 강제한다.
+        assert!(validate_command("cp ../x ../y", &sb).is_err());
+        assert!(validate_command("mv /etc/x /tmp/y", &sb).is_err());
     }
 
     #[test]
@@ -1076,36 +1169,73 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_relative_path_in_sandbox() {
+    fn validate_readonly_allows_paths_without_existence_check() {
         let (dir, sb) = sandbox();
         std::fs::write(dir.path().join("hello.txt"), "hi").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub").join("a.txt"), "x").unwrap();
         assert!(validate_command("cat hello.txt", &sb).is_ok());
         assert!(validate_command("cat sub/a.txt", &sb).is_ok());
-        // 존재하지 않는 path는 거부(file-reading 명령).
-        assert!(validate_command("cat nope.txt", &sb).is_err());
+        // read-only는 전역 read라 존재하지 않는 path도 허용한다(명령이 자체 처리; sandbox 존재검증 불요).
+        assert!(validate_command("cat nope.txt", &sb).is_ok());
     }
 
     #[test]
     fn validate_grep_pattern_not_treated_as_path() {
         let (dir, sb) = sandbox();
         std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
-        // 첫 non-option(pattern)은 path 검증에서 제외, 파일 인자는 검증.
         assert!(validate_command("grep hello f.txt", &sb).is_ok());
-        // 파일 인자가 sandbox 밖이면 거부.
-        assert!(validate_command("grep hello /etc/passwd", &sb).is_err());
+        // read-only라 절대경로 파일도 허용.
+        assert!(validate_command("grep hello /etc/passwd", &sb).is_ok());
+        // pattern이 secret처럼 보여도(첫 non-option) path로 오판하지 않는다(false positive 방지).
+        assert!(validate_command("grep id_rsa f.txt", &sb).is_ok());
+        // 단 secret 파일 인자는 차단.
+        assert!(validate_command("grep key /root/.ssh/id_rsa", &sb).is_err());
     }
 
     #[test]
     fn validate_pipe_segments_each_checked() {
         let (dir, sb) = sandbox();
         std::fs::write(dir.path().join("f.txt"), "hello").unwrap();
-        // pipe 자체는 허용하되 두 번째 segment의 절대경로는 차단.
         assert!(validate_command("cat f.txt | grep hello", &sb).is_ok());
-        assert!(validate_command("cat f.txt | cat /etc/hosts", &sb).is_err());
+        // read-only pipe는 전역 read 허용(/etc/hosts).
+        assert!(validate_command("cat f.txt | cat /etc/hosts", &sb).is_ok());
+        // 단 어느 segment든 secret 경로면 전체 차단.
+        assert!(validate_command("cat f.txt | cat /etc/shadow", &sb).is_err());
         // 빈 segment 거부.
         assert!(validate_command("cat f.txt |", &sb).is_err());
+    }
+
+    #[test]
+    fn sensitive_path_detection() {
+        // secret/credential 경로는 차단 대상.
+        assert!(is_sensitive_path_str("/home/u/.ssh/id_rsa"));
+        assert!(is_sensitive_path_str("/home/u/.aws/credentials"));
+        assert!(is_sensitive_path_str("/etc/shadow"));
+        assert!(is_sensitive_path_str("/etc/ssl/private/server.key"));
+        assert!(is_sensitive_path_str("/proc/1234/environ"));
+        assert!(is_sensitive_path_str("config/.env"));
+        assert!(is_sensitive_path_str("certs/server.pem"));
+        // 비민감 경로는 허용(진단 대상).
+        assert!(!is_sensitive_path_str("/tmp/app.log"));
+        assert!(!is_sensitive_path_str("/var/log/syslog"));
+        // `.docker`(홈 credential)와 `docker`(점 없는 일반 디렉토리)는 구분.
+        assert!(!is_sensitive_path_str("/var/lib/docker/overlay2"));
+        assert!(!is_sensitive_path_str("/etc/passwd"));
+        assert!(!is_sensitive_path_str("/proc/meminfo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_blocks_symlink_to_secret() {
+        let (dir, sb) = sandbox();
+        // 평범한 이름의 symlink가 secret 파일을 가리켜도 canonicalize 대상으로 차단한다.
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, "PRIVATE").unwrap();
+        let link = dir.path().join("innocent.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        // 절대경로로 접근 → canonicalize → id_rsa(secret) → 차단.
+        assert!(validate_command(&format!("cat {}", link.display()), &sb).is_err());
     }
 
     // ── High finding 2: bounded reader ──────────────────────

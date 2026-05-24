@@ -41,6 +41,10 @@ memory snapshot (`vm_stat` on macOS, `free -h` on Linux, else `ps aux | head -n 
 - ALWAYS keep output bounded: pipe large output through `head`/`sort`/limit (e.g. `| head -n 20`). \
 Never run unbounded streaming commands.\n\
 - Only state-changing or risky commands require confirmation; read-only diagnostics run automatically.\n\
+- Read-only diagnostics may inspect the WHOLE host — use absolute paths freely: \
+`tail -n 100 /var/log/syslog`, `du -ah /tmp | sort -rh | head -n 20`, `find /tmp -type f -mmin -10`, \
+`cat /proc/meminfo`. Secret paths (~/.ssh, ~/.aws, /etc/shadow, *.pem, *.key, .env) are blocked even \
+for reads, and mutation/egress still require confirmation or are blocked.\n\
 - The shell is restricted (no $, globs, quotes, backslashes, redirects, ;, &). If a command is \
 blocked for that reason, propose and run a simpler safe alternative instead of giving up.\n\
 - If a tool result says output was truncated, re-run with a narrower/limited command.\n";
@@ -973,9 +977,11 @@ fn cap_section_lines(snapshot: &str, max_lines: usize) -> String {
 fn watch_target_error(target: Option<&str>) -> Option<String> {
     match target {
         None => None,
-        Some(t) if super::sysinfo::LOCAL_SECTIONS.contains(&t) => None,
+        // catalog의 모든 probe를 watch 대상으로 허용한다(LOCAL 섹션 + docker_df/tmp_recent 등).
+        Some(t) if super::probes::probe_by_id(t).is_some() => None,
         Some(t) => Some(format!(
-            "알 수 없는 watch 대상 '{t}'. 사용 가능: local(기본 compact) 또는 섹션 — {}",
+            "알 수 없는 watch 대상 '{t}'. 사용 가능: local(기본 compact), LOCAL 섹션({}), \
+             또는 catalog probe(docker_df/docker_ps/tmp_big/tmp_recent 등)",
             super::sysinfo::LOCAL_SECTIONS.join(" ")
         )),
     }
@@ -983,10 +989,9 @@ fn watch_target_error(target: Option<&str>) -> Option<String> {
 
 fn watch_probes(target: Option<&str>) -> Vec<(&'static str, String)> {
     if let Some(t) = target {
-        if super::sysinfo::LOCAL_SECTIONS.contains(&t) {
-            if let Some(p) = super::probes::probe_by_id(t) {
-                return vec![(p.id, p.command())];
-            }
+        // LOCAL 섹션뿐 아니라 catalog 전체 probe를 watch할 수 있다(tmp_recent로 늘어나는 파일 추적 등).
+        if let Some(p) = super::probes::probe_by_id(t) {
+            return vec![(p.id, p.command())];
         }
     }
     ["uptime", "memory", "disk"]

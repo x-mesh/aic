@@ -317,6 +317,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "uptime" => "uptime",
         "disk" => "df -h (디스크 사용량)",
         "memory" => "메모리 스냅샷",
+        "fd" => "열린 파일 디스크립터 수(현재/최대)",
         "ip" => "네트워크 인터페이스 주소",
         "route" => "라우팅 테이블",
         "ports" => "LISTEN 중인 포트",

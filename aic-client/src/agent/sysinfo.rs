@@ -7,7 +7,7 @@
 
 /// `/local`이 보여줄 섹션 이름(자동완성·필터에도 사용).
 pub(crate) const LOCAL_SECTIONS: &[&str] = &[
-    "date", "host", "os", "uptime", "disk", "memory", "ip", "route", "ports",
+    "date", "host", "os", "uptime", "disk", "memory", "fd", "ip", "route", "ports",
 ];
 
 /// OS에 맞는 (섹션, 명령) 목록. 각 명령은 하드코딩된 bounded Safe 명령.

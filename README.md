@@ -34,7 +34,7 @@ graph LR
 - ✅ Automatic error analysis — when exit code ≠ 0, the LLM explains the cause and suggests fixes
 - ✅ Interactive REPL — when exit code = 0, freeform chat with the LLM
 - ✅ `aic chat` agent mode — explicit chat entry point. With an OpenAI-compatible provider it runs a tool-calling agent over your project; gracefully degrades to plain chat when the provider doesn't support tools
-- ✅ SRE shell execution (default-on) — the interactive agent can run **bounded, sandboxed** shell commands via `run_command` (read-only diagnostics like `ps`/`df -h`/`grep` run automatically; state-changing commands need confirmation; dangerous ones are blocked). Turn it off with `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1` for a read-only session (`read_file`/`list_dir`/`grep`/`glob` only)
+- ✅ SRE shell execution (default-on) — the interactive agent can run **bounded** shell commands via `run_command`. Read-only diagnostics run automatically and may inspect the **whole host** (e.g. `tail /var/log/...`, `du -ah /tmp | sort -rh | head`, `find /tmp -mmin -10`); state-changing commands need confirmation and dangerous ones are blocked. Secret paths (`~/.ssh`, `~/.aws`, `/etc/shadow`, `*.pem`, `.env`, …) are blocked even for reads. Turn it off with `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1` for a read-only session (`read_file`/`list_dir`/`grep`/`glob` only)
 - ✅ Multiple LLM providers — OpenAI-compatible, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
 - ✅ TUI compatibility — alternate-screen-buffer detection keeps vim, htop, etc. working correctly
 - ✅ Cross-platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
@@ -48,6 +48,7 @@ graph LR
 
 ### Security baseline
 - ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
+- ✅ Read-only host diagnostics with a secret-path denylist — `run_command` read-only commands may read host-wide (logs, `/tmp`, `/proc`), but **secret paths are denied even for reads**: `~/.ssh`/`~/.aws`/`~/.gnupg`/`~/.kube`/`~/.docker`, `/etc/shadow`, `/etc/ssl/private`, `/proc/*/environ`, and `*.pem`/`*.key`/`.env`/`id_rsa`/`credentials` (symlink targets resolved via `canonicalize`). Egress (curl/ssh/nc) and mutation (rm/mv/`docker prune`) stay gated (confirm/block), and mutations remain confined to the cwd sandbox
 - ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, integrity verification via `aic audit verify`. The HMAC key uses a **file backend by default**; the OS keychain is opt-in (`AIC_AUDIT_KEYCHAIN=1`), and `AIC_NO_KEYCHAIN=1` forces it off
   - **Upgrade note**: if you used an earlier version where the audit key lived only in the OS keychain, the new file-backend default may report a verify WARN/missing-key (or skip new appends to protect the chain). Either keep verifying/using the keychain-backed chain by running with `AIC_AUDIT_KEYCHAIN=1`, **or** start a fresh file-backed chain by backing up/rotating `~/.local/state/aic/audit.log` and re-running. `aic doctor` prints both options.
 - ✅ OS keychain — store API keys in macOS Keychain / Linux Secret Service / Windows Credential Manager; bulk migrate plaintext via `aic migrate-keys`
@@ -227,15 +228,18 @@ aic --dry-run "how do I fix this error?"
 # 8. Explicit chat / agent mode (independent of exit code)
 aic chat "summarize what this repo does"   # one-shot answer, then exit
 aic chat                                    # interactive SRE agent (run_command default-on)
-# → With an OpenAI-compatible provider, the agent reads your project via tools
+# → With an OpenAI-compatible provider, the agent reads your project via file tools
 #   (read_file/list_dir/grep/glob), confined to the cwd sandbox and honoring
 #   .gitignore. It can also run BOUNDED shell commands (run_command):
 aic chat                                    # then type:  ps        → runs `ps aux | head -n 20`
                                             #             disk      → runs `df -h`
                                             #             cpu/memory/net → bounded OS-friendly command
-# → Safe read-only commands run automatically; state-changing commands ask for
-#   confirmation (TTY); dangerous/unknown commands are blocked. The shell is
-#   restricted (no $, globs, quotes, redirects, ;, &, pipes-of-danger).
+# → Safe read-only commands run automatically and may inspect the WHOLE host
+#   (e.g. `tail /var/log/syslog`, `du -ah /tmp | sort -rh | head`, `find /tmp -mmin -10`),
+#   except secret paths (~/.ssh, ~/.aws, /etc/shadow, *.pem, .env) which are blocked.
+#   State-changing commands ask for confirmation (TTY); dangerous/unknown are blocked;
+#   mutations stay confined to the cwd sandbox. The shell is restricted
+#   (no $, globs, quotes, redirects, ;, &, pipes-of-danger).
 aic chat --no-run                           # read-only session (no run_command); --read-only is a synonym
 AIC_AGENT_NO_RUN=1 aic chat                 # same opt-out via env
 AIC_DEBUG=1 aic chat                        # stderr debug: tool_specs/run_command/provider_tools (banner still shown)
@@ -276,12 +280,15 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/timeline [N]` | Session tool records in chronological order (redacted) |
 | `/compare` | Diff a fixed-Safe system snapshot against the previous baseline (no LLM) |
 | `/bundle [name]` | Save incident evidence as redacted markdown under `~/.aic/bundles/` (dir 0700 / file 0600 on Unix) |
-| `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail generic` |
-| `/watch [target] [--count N] [--every Ns]` | Re-run local probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is a section name, or omit it for a compact set |
+| `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail docker generic` (the `disk` topic also checks docker disk usage and big `/tmp` files) |
+| `/watch [target] [--count N] [--every Ns]` | Re-run probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is any Probe Catalog id — LOCAL sections, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — e.g. `/watch tmp_recent` tracks files growing under `/tmp`; omit it for a compact set |
 
-Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands
-(local sysinfo sections + `process` + git read-only); `/local`, `/compare`, `/diagnose`, `/incident`,
-`/bundle`, and `/triage` all draw from it.
+Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
+local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +
+`docker` (`docker_df`/`docker_ps`/`docker_images`) + `filesystem` (`tmp_big`/`tmp_recent`). `/local`,
+`/compare`, `/diagnose`, `/incident`, `/bundle`, and `/triage` all draw from it. The `docker`/`filesystem`
+probes are not in the default `/local` set (they need docker / absolute-path reads) but are selected by
+`/triage`, `/diagnose`, and `/watch`.
 
 Analysis commands send a **redacted** evidence snapshot to the provider in a single, tool-less,
 stateless call. `--raw` (and `AIC_LOCAL_NO_ANALYZE=1`) skip the model and show evidence only; on any

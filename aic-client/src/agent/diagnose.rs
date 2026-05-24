@@ -12,7 +12,10 @@ pub(crate) fn diagnose_category(symptom: Option<&str>) -> &'static str {
     };
     let has = |kws: &[&str]| kws.iter().any(|k| s.contains(k));
     // 우선순위: 구체 카테고리 먼저. 다중 매칭 시 첫 카테고리(상한·결정적).
-    if has(&[
+    // docker는 명시적 신호라 최우선(예: "docker 컨테이너가 느림"은 cpu가 아니라 docker로).
+    if has(&["docker", "도커", "container", "컨테이너"]) {
+        "docker"
+    } else if has(&[
         "cpu", "load", "느림", "느려", "slow", "hang", "행", "busy", "높", "high",
     ]) {
         "cpu"
@@ -75,9 +78,11 @@ fn category_sections(category: &str) -> Vec<&'static str> {
     let extra: &[&str] = match category {
         "cpu" => &["uptime", "process", "memory"],
         "memory" => &["memory", "process", "uptime"],
-        "disk" => &["disk"],
+        // disk: 호스트 df + docker 디스크 점유까지 본다(docker가 원인인 경우를 자동 발견).
+        "disk" => &["disk", "docker_df"],
         "network" => &["ip", "route", "ports"],
         "process" => &["process", "memory", "uptime"],
+        "docker" => &["disk", "docker_df", "docker_ps", "docker_images"],
         _ => &["uptime", "memory", "disk"], // generic
     };
     let mut names: Vec<&'static str> = vec!["date", "host", "os"];
@@ -187,6 +192,29 @@ mod tests {
             .collect();
         assert!(names.contains(&"process"));
         assert!(names.contains(&"uptime"));
+    }
+
+    #[test]
+    fn docker_symptom_selects_docker_probes() {
+        // "docker 컨테이너 이상" → docker 카테고리 → df/ps/images 전부 수집.
+        let names: Vec<&str> = select_probes(Some("docker 컨테이너 tmp가 계속 커짐"))
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(names.contains(&"docker_df"));
+        assert!(names.contains(&"docker_ps"));
+        assert!(names.contains(&"docker_images"));
+    }
+
+    #[test]
+    fn disk_symptom_includes_docker_df() {
+        // "디스크 full"만 말해도 docker 점유를 함께 수집해 원인(images/cache)을 발견할 수 있다.
+        let names: Vec<&str> = select_probes(Some("디스크 공간이 부족"))
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(names.contains(&"disk"));
+        assert!(names.contains(&"docker_df"));
     }
 
     #[test]
