@@ -277,6 +277,72 @@ fn draw_viewport_popup(
     f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
 }
 
+/// slash popup ↑↓ 순환 범위 상한(표시는 1줄에 선택 항목만).
+const MAX_POPUP: usize = 16;
+
+/// chat viewport(3줄 고정)를 그린다. 위→아래: 입력/thinking · (구분선 또는 slash popup) · status.
+/// claude CLI 스타일(입력 위, status 맨 아래). popup 활성 시 가운데 줄을 "▸ /명령  설명  (n/m)"으로
+/// 토글한다(↑↓로 후보 순환). 동적 높이를 안 써 잔상이 없다(ratatui Inline 한계 회피).
+fn draw_chat(
+    f: &mut Frame,
+    status: &str,
+    textarea: &TextArea,
+    prompt: &str,
+    popup: &[&str],
+    popup_sel: usize,
+    spin: Option<&SpinState>,
+) {
+    let rows = Layout::vertical([
+        Constraint::Length(1), // 입력/thinking
+        Constraint::Length(1), // 구분선 또는 popup
+        Constraint::Length(1), // status(맨 아래)
+    ])
+    .split(f.area());
+
+    // 입력 줄 or thinking(맨 위).
+    match spin {
+        Some(sp) => {
+            let frame = SPIN_FRAMES[sp.frame % SPIN_FRAMES.len()];
+            let secs = sp.started.elapsed().as_secs_f32();
+            f.render_widget(
+                Paragraph::new(format!("{frame} {} ({secs:.1}s)", sp.label)).dim(),
+                rows[0],
+            );
+        }
+        None => {
+            let prompt_w = UnicodeWidthStr::width(prompt) as u16;
+            let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)])
+                .split(rows[0]);
+            f.render_widget(Paragraph::new(prompt.to_string()), cols[0]);
+            f.render_widget(textarea, cols[1]);
+        }
+    }
+
+    // 가운데 줄: popup 활성(입력 중)이면 선택 후보+설명, 아니면 구분선.
+    if spin.is_none() && !popup.is_empty() {
+        let sel = popup[popup_sel];
+        let desc = super::tool_record::slash_description(sel);
+        let counter = if popup.len() > 1 {
+            format!("  ({}/{} ↑↓)", popup_sel + 1, popup.len())
+        } else {
+            String::new()
+        };
+        let line = Line::from(vec![
+            Span::raw("▸ "),
+            Span::styled(format!("/{sel}"), Style::default().add_modifier(Modifier::REVERSED)),
+            Span::raw(format!("  {desc}")),
+            Span::styled(counter, Style::default().add_modifier(Modifier::DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line), rows[1]);
+    } else {
+        let sep = "─".repeat(f.area().width as usize);
+        f.render_widget(Paragraph::new(sep).dim(), rows[1]);
+    }
+
+    // status(맨 아래).
+    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[2]);
+}
+
 /// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
 /// 레이아웃은 draw_viewport와 동일하게 status를 맨 아래에 둔다(claude CLI 스타일).
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
@@ -302,10 +368,11 @@ async fn chat_loop(
     if enable_raw_mode().is_err() {
         return;
     }
+    // 기본 viewport 3줄: 입력 + 구분선 + status. slash popup 시 후보 수만큼 동적 재생성.
     let mut terminal = match Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(2),
+            viewport: Viewport::Inline(3),
         },
     ) {
         Ok(t) => t,
@@ -335,22 +402,20 @@ async fn chat_loop(
                 last_sample = Instant::now();
             }
         }
-        // slash 후보 popup 계산(입력이 `/명령` 첫 토큰일 때만). sel은 후보 수에 맞게 보정.
-        let popup = slash_candidates(&textarea.lines().join("\n"));
+        // slash 후보 popup 계산(입력이 `/명령` 첫 토큰일 때만). MAX_POPUP로 제한, sel 보정.
+        let mut popup = slash_candidates(&textarea.lines().join("\n"));
+        popup.truncate(MAX_POPUP);
         if popup.is_empty() {
             popup_sel = 0;
         } else if popup_sel >= popup.len() {
             popup_sel = popup.len() - 1;
         }
-        // draw: spinner→thinking, popup 활성→후보 줄, 아니면 입력+status. 실패 시 종료.
+        // draw: 통합 draw_chat. viewport는 3줄 고정(입력 / 구분선·popup / status). 동적 높이는
+        // ratatui Inline이 화면 하단에서 스크롤과 얽혀 잔상/깨짐을 내므로 쓰지 않고, popup은 구분선
+        // 줄을 "선택 후보 + 설명 + (n/m)"으로 토글한다(↑↓ 순환).
+        let spin_ref = spin.as_ref();
         let draw_ok = terminal
-            .draw(|f| match &spin {
-                Some(sp) => draw_thinking(f, &status, sp),
-                None if !popup.is_empty() => {
-                    draw_viewport_popup(f, &popup, popup_sel, &textarea, &prompt)
-                }
-                None => draw_viewport(f, &status, &textarea, &prompt),
-            })
+            .draw(|f| draw_chat(f, &status, &textarea, &prompt, &popup, popup_sel, spin_ref))
             .is_ok();
         if !draw_ok {
             break;
@@ -580,6 +645,37 @@ mod tests {
         assert!(row0.contains("lo"), "입력 줄(위): {row0:?}");
         assert!(row1.contains("local"), "후보 줄(아래): {row1:?}");
         assert!(row1.contains("last"), "후보 줄(아래): {row1:?}");
+    }
+
+    #[test]
+    fn draw_chat_popup_shows_selected_with_desc() {
+        // popup 활성: 입력(row0) / 선택 후보+설명+카운터(row1) / status(row2). viewport 3줄 고정.
+        let ta = super::textarea_with("/d");
+        let mut term = Terminal::new(TestBackend::new(80, 3)).unwrap();
+        term.draw(|f| {
+            super::draw_chat(f, "· load", &ta, "you ❯ ", &["diagnose", "doctor"], 0, None)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).contains("/d"), "입력(row0): {:?}", row(0));
+        assert!(row(1).contains("diagnose"), "popup 선택+설명(row1): {:?}", row(1));
+        assert!(row(1).contains("/2"), "카운터(row1): {:?}", row(1));
+        assert!(row(2).contains("load"), "status(row2): {:?}", row(2));
+    }
+
+    #[test]
+    fn draw_chat_no_popup_shows_separator() {
+        // popup 비활성: 입력(row0) / 구분선(row1) / status(row2).
+        let ta = super::textarea_with("hi");
+        let mut term = Terminal::new(TestBackend::new(40, 3)).unwrap();
+        term.draw(|f| super::draw_chat(f, "· load", &ta, "you ❯ ", &[], 0, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).contains("hi"), "입력(row0): {:?}", row(0));
+        assert!(row(1).contains("─"), "구분선(row1): {:?}", row(1));
+        assert!(row(2).contains("load"), "status(row2): {:?}", row(2));
     }
 
     #[test]
