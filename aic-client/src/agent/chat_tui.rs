@@ -1,11 +1,15 @@
-//! RFC-004 ratatui chat TUI (단계 2 골격) — Inline viewport + 하단 고정 status bar + tui-textarea 입력.
+//! RFC-004 ratatui chat TUI (단계 8) — alternate screen 전면 TUI + 대화 로그 스크롤 버퍼.
 //!
-//! reedline 라인 모드의 **TTY 대체**. 동기 `event::poll` 루프(top.rs 패턴)라 crossterm event-stream
-//! feature가 불필요하고, status bar는 poll 주기로 갱신되어 **타이핑 중에도 흐른다**(0.9.0의 입력경계/
-//! spinner-구간 갱신 한계 해소). Viewport::Inline이라 대화 로그는 `insert_before`로 scrollback에 보존된다.
+//! reedline 라인 모드의 **TTY 대체**. `chat_loop`는 EnterAlternateScreen + raw mode로 전체 화면을
+//! 단독 소유하고, 대화 로그를 자체 스크롤 버퍼(`log: Vec<String>` 원본 ANSI)로 관리한다.
+//! `EventStream` + `tokio::select!`(키 / status·spinner tick / out_rx)로 입력·지표·답변을 처리한다.
+//! status bar는 tick으로 갱신되어 타이핑 중에도 흐른다. 종료 시 alternate screen을 떠나고 로그를 stdout에
+//! dump해 터미널 scrollback에 보존한다(8e, 원본 ANSI라 색 그대로).
 //!
-//! 단계 2 범위: 입력 1줄 받기(`read_line_tui`) + status bar 렌더. LLM 호출/로그 insert_before/slash
-//! popup/history는 단계 3~6에서 session과 통합한다. non-TTY는 호출 측이 기존 `repl::LineReader`로 fallback.
+//! 단계 2~7의 Inline viewport + `insert_before` 모델(`read_line_tui`/`insert_before_ansi`/`draw_chat`/
+//! `draw_viewport`/`draw_viewport_popup`/`ansi_to_paragraph`/`draw_thinking`)은 전면 TUI 전환 후
+//! 미사용이나, height 계산·테스트 자산으로 보존한다(모듈 `#[allow(dead_code)]`). non-TTY는 호출
+//! 측(session)이 `ChatOut::Direct`(reedline/stdin)로 fallback한다.
 
 use std::io::{self};
 use std::time::{Duration, Instant};
@@ -15,11 +19,14 @@ use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Widget, Wrap};
 use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -187,14 +194,16 @@ impl ChatHandle {
     }
 }
 
-/// raw mode에서 패닉이 나도 터미널을 복원하도록 패닉 훅을 1회 설치한다(m5). 기존 훅은 보존해
-/// 호출한다(panic 메시지·backtrace 유지).
+/// 전면 TUI(alternate screen) + raw mode에서 패닉이 나도 터미널을 복원하도록 패닉 훅을 1회 설치한다
+/// (m5). LeaveAlternateScreen + disable_raw_mode로 원래 화면을 되돌린 뒤 기존 훅을 호출한다(panic
+/// 메시지·backtrace 유지).
 fn install_panic_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
             let _ = disable_raw_mode();
             prev(info);
         }));
@@ -343,6 +352,108 @@ fn draw_chat(
     f.render_widget(Paragraph::new(status.to_string()).dim(), rows[2]);
 }
 
+// ─── 단계 8: 전면 TUI(alternate screen) — 대화 로그 스크롤 버퍼 + 동적 세로 popup ───────
+
+/// 로그 Paragraph의 wrap 후 총 화면 줄 수 기준 scroll 최대값(= total - height, 음수면 0).
+/// `Paragraph::scroll`은 wrap 후 화면 줄 기준이므로 이 값으로 scroll을 clamp하면 정합한다(critic B1).
+fn log_scroll_max(log_text: &Text, width: u16, height: u16) -> u16 {
+    let total = Paragraph::new(log_text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1)) as u16;
+    total.saturating_sub(height)
+}
+
+/// 전면 TUI 한 프레임(순수 함수, TestBackend로 검증). 위→아래:
+/// 대화 로그(스크롤) · slash popup(세로, 입력 위 조건부) · 입력/thinking · 구분선 · status.
+/// 로그는 `Paragraph.wrap.scroll`로 그려 wrap/offset이 자동 정합(critic B1). popup 높이는
+/// 가용 공간으로 clamp(작은 터미널 붕괴 방지, critic M3). 로그 영역 Min은 1 이상 보장.
+#[allow(clippy::too_many_arguments)]
+fn draw_full(
+    f: &mut Frame,
+    log_text: &Text,
+    scroll: u16,
+    status: &str,
+    textarea: &TextArea,
+    prompt: &str,
+    popup: &[&str],
+    popup_sel: usize,
+    spin: Option<&SpinState>,
+) {
+    let area = f.area();
+    // popup 높이: spin 중엔 0, 아니면 후보 수를 (가용 높이 - 입력1·구분선1·status1·로그1=4)로 clamp.
+    let pop_n = if spin.is_some() {
+        0
+    } else {
+        popup.len().min(area.height.saturating_sub(4) as usize)
+    };
+    let rows = Layout::vertical([
+        Constraint::Min(1),               // 대화 로그(스크롤)
+        Constraint::Length(pop_n as u16), // slash popup(세로, 0이면 없음)
+        Constraint::Length(1),            // 입력/thinking
+        Constraint::Length(1),            // 구분선
+        Constraint::Length(1),            // status
+    ])
+    .split(area);
+
+    // 대화 로그: 내용이 영역보다 짧으면 **하단 정렬**(claude CLI식 — 입력 바로 위에 붙음), 길면 scroll.
+    let log_area = rows[0];
+    let para = Paragraph::new(log_text.clone()).wrap(Wrap { trim: false });
+    let total = para.line_count(log_area.width.max(1)) as u16;
+    if total < log_area.height {
+        let bottom = Rect {
+            x: log_area.x,
+            y: log_area.y + (log_area.height - total),
+            width: log_area.width,
+            height: total,
+        };
+        f.render_widget(para, bottom);
+    } else {
+        f.render_widget(para.scroll((scroll, 0)), log_area);
+    }
+
+    // slash popup(세로 select box, 입력 위): "/명령   설명", sel reverse.
+    if pop_n > 0 {
+        let items: Vec<ListItem> = popup
+            .iter()
+            .take(pop_n)
+            .map(|c| {
+                let desc = super::tool_record::slash_description(c);
+                ListItem::new(format!("  /{c:<13}{desc}"))
+            })
+            .collect();
+        let list = List::new(items)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .style(Style::default().add_modifier(Modifier::DIM));
+        let mut state = ListState::default();
+        state.select(Some(popup_sel.min(pop_n.saturating_sub(1))));
+        f.render_stateful_widget(list, rows[1], &mut state);
+    }
+
+    // 입력 줄 or thinking.
+    match spin {
+        Some(sp) => {
+            let frame = SPIN_FRAMES[sp.frame % SPIN_FRAMES.len()];
+            let secs = sp.started.elapsed().as_secs_f32();
+            f.render_widget(
+                Paragraph::new(format!("{frame} {} ({secs:.1}s)", sp.label)).dim(),
+                rows[2],
+            );
+        }
+        None => {
+            let prompt_w = UnicodeWidthStr::width(prompt) as u16;
+            let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)])
+                .split(rows[2]);
+            f.render_widget(Paragraph::new(prompt.to_string()), cols[0]);
+            f.render_widget(textarea, cols[1]);
+        }
+    }
+
+    // 구분선 + status.
+    let sep = "─".repeat(area.width as usize);
+    f.render_widget(Paragraph::new(sep).dim(), rows[3]);
+    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[4]);
+}
+
 /// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
 /// 레이아웃은 draw_viewport와 동일하게 status를 맨 아래에 둔다(claude CLI 스타일).
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
@@ -356,9 +467,27 @@ fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
     f.render_widget(Paragraph::new(status.to_string()).dim(), rows[1]);
 }
 
-/// ChatLoop 본체 — terminal 단독 소유. enable_raw_mode + Inline(2) viewport로 진입하고,
-/// `tokio::select!`로 (키 입력 / status·spinner tick / 출력 메시지)를 한 곳에서 처리한다.
-/// 종료(Shutdown/stream EOF/draw 실패) 시 viewport를 정리하고 raw mode를 복원한다.
+/// 대화 로그 ring 상한(줄 수). 초과 시 앞에서 폐기하고 scroll을 보정한다(critic M2). LLM 답변은
+/// 보통 수십 줄이라 수천 줄이면 긴 세션도 충분하면서 메모리 폭주는 막는다.
+const LOG_CAP: usize = 2000;
+
+/// `log`(원본 ANSI 줄 벡터)를 `Text`로 재구성한다(m3 캐시 갱신용). ANSI 파싱 실패 시 plain 폴백
+/// (escape가 보일 수 있으나 패닉/누락 없음). 빈 로그는 빈 Text.
+fn rebuild_log_text(log: &[String]) -> Text<'static> {
+    let joined = log.join("\n");
+    joined.into_text().unwrap_or_else(|_| Text::raw(joined))
+}
+
+/// draw_full 레이아웃과 동일한 공식으로 로그 영역 높이를 구한다(scroll clamp·follow를 draw와 정합
+/// 시키기 위해 단일 소스). 전체 높이 - popup_n - 입력1 - 구분선1 - status1, 최소 1.
+fn log_area_height(total_height: u16, popup_n: u16) -> u16 {
+    total_height.saturating_sub(popup_n + 3).max(1)
+}
+
+/// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
+/// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
+/// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
+/// raw mode를 복원한 뒤, 대화 버퍼를 stdout에 dump해 터미널 scrollback에 보존한다(8e).
 async fn chat_loop(
     line_tx: mpsc::Sender<ChatLine>,
     mut out_rx: mpsc::Receiver<OutMsg>,
@@ -368,15 +497,14 @@ async fn chat_loop(
     if enable_raw_mode().is_err() {
         return;
     }
-    // 기본 viewport 3줄: 입력 + 구분선 + status. slash popup 시 후보 수만큼 동적 재생성.
-    let mut terminal = match Terminal::with_options(
-        CrosstermBackend::new(io::stdout()),
-        TerminalOptions {
-            viewport: Viewport::Inline(3),
-        },
-    ) {
+    if execute!(io::stdout(), EnterAlternateScreen).is_err() {
+        let _ = disable_raw_mode();
+        return;
+    }
+    let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
         Ok(t) => t,
         Err(_) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return;
         }
@@ -387,6 +515,12 @@ async fn chat_loop(
     let mut status = String::from("· (collecting metrics…)");
     let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
+    // 대화 로그: 원본 ANSI 줄(dump용·색 보존, M1) + Text 캐시(m3, log 변경 시만 재구성).
+    let mut log: Vec<String> = Vec::new();
+    let mut log_text: Text<'static> = Text::default();
+    // scroll=화면 줄 offset(wrap 후 기준). follow=true면 새 답변 도착 시 자동 최하단(m1).
+    let mut scroll: u16 = 0;
+    let mut follow = true;
     // 입력 history(reedline과 동일 파일 공유). hist_idx=탐색 위치, draft=탐색 전 편집 내용 보존.
     let mut history = crate::repl::load_chat_history();
     let mut hist_idx: Option<usize> = None;
@@ -410,20 +544,41 @@ async fn chat_loop(
         } else if popup_sel >= popup.len() {
             popup_sel = popup.len() - 1;
         }
-        // draw: 통합 draw_chat. viewport는 3줄 고정(입력 / 구분선·popup / status). 동적 높이는
-        // ratatui Inline이 화면 하단에서 스크롤과 얽혀 잔상/깨짐을 내므로 쓰지 않고, popup은 구분선
-        // 줄을 "선택 후보 + 설명 + (n/m)"으로 토글한다(↑↓ 순환).
+
+        // draw: 전면 레이아웃(로그·popup·입력·구분선·status). scroll clamp/follow를 draw_full
+        // 내부 레이아웃과 동일 공식으로 계산해 정합시킨다(로그 높이 = 전체 - popup_n - 3).
         let spin_ref = spin.as_ref();
+        // popup 높이는 draw_full과 같은 규칙(spin 중 0, 아니면 가용으로 clamp).
+        let area = terminal.get_frame().area();
+        let pop_n = if spin.is_some() {
+            0
+        } else {
+            popup.len().min(area.height.saturating_sub(4) as usize) as u16
+        };
+        let log_h = log_area_height(area.height, pop_n);
+        let max = log_scroll_max(&log_text, area.width, log_h);
+        if follow {
+            scroll = max;
+        } else {
+            scroll = scroll.min(max);
+        }
+        let draw_scroll = scroll;
         let draw_ok = terminal
-            .draw(|f| draw_chat(f, &status, &textarea, &prompt, &popup, popup_sel, spin_ref))
+            .draw(|f| {
+                draw_full(
+                    f, &log_text, draw_scroll, &status, &textarea, &prompt, &popup, popup_sel,
+                    spin_ref,
+                )
+            })
             .is_ok();
         if !draw_ok {
             break;
         }
 
-        // tick: spinner 애니메이션 100ms, 평상시 status 흐름 200ms. width는 answer wrap과 동일 소스.
+        // tick: spinner 애니메이션 100ms, 평상시 status 흐름 200ms.
         let tick = Duration::from_millis(if spin.is_some() { 100 } else { 200 });
-        let width = super::ui::render_width() as u16;
+        // PageUp/Down 점프 폭(로그 높이의 절반, 최소 1).
+        let page = (log_h / 2).max(1);
 
         tokio::select! {
             maybe_ev = events.next() => {
@@ -432,6 +587,19 @@ async fn chat_loop(
                         match (k.code, k.modifiers) {
                             (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                                 let _ = line_tx.send(ChatLine::Eof).await;
+                            }
+                            // PageUp/Down: 로그 스크롤(popup 활성과 무관하게 동작 — ↑↓는 popup 우선,
+                            // PageUp/Down은 항상 로그). PageUp이면 follow 해제, PageDown으로 최하단
+                            // 도달 시 follow 재개(m1 불변식: scroll==max면 follow).
+                            (KeyCode::PageUp, _) => {
+                                follow = false;
+                                scroll = scroll.saturating_sub(page);
+                            }
+                            (KeyCode::PageDown, _) => {
+                                scroll = (scroll + page).min(max);
+                                if scroll >= max {
+                                    follow = true;
+                                }
                             }
                             // slash popup 활성: Tab=선택 후보 완성(공백 추가→popup 닫힘, 인자 입력),
                             // ↑↓=후보 이동(아래 history ↑↓보다 우선).
@@ -456,12 +624,10 @@ async fn chat_loop(
                                 } else {
                                     format!("/{}", popup[popup_sel])
                                 };
-                                // 입력 echo를 scrollback에 남긴다(prompt + 입력, plain).
-                                let _ = insert_before_ansi(
-                                    &mut terminal,
-                                    &format!("{prompt}{line}"),
-                                    width,
-                                );
+                                // 입력 echo를 대화 로그에 남긴다(prompt + 입력). insert_before 대체.
+                                log.push(format!("{prompt}{line}"));
+                                log_text = rebuild_log_text(&log);
+                                follow = true;
                                 textarea = TextArea::default();
                                 // history 기록(메모리 + 파일, reedline과 동일 파일) 후 탐색/popup 리셋.
                                 if crate::repl::should_record_history(&line) {
@@ -507,7 +673,7 @@ async fn chat_loop(
                         }
                     }
                     // Key 외 이벤트(Resize/Mouse/Focus/Paste)는 무시 — Resize는 다음 루프 draw가
-                    // 새 크기로 자동 반영(ratatui #2086 best-effort).
+                    // 새 크기로 자동 반영(best-effort).
                     Some(Ok(_)) => {}
                     // 일시 입력 오류는 무시(다음 tick에 재시도).
                     Some(Err(_)) => {}
@@ -525,7 +691,23 @@ async fn chat_loop(
             msg = out_rx.recv() => {
                 match msg {
                     Some(OutMsg::Answer(s)) | Some(OutMsg::Note(s)) => {
-                        let _ = insert_before_ansi(&mut terminal, &s, width);
+                        // 답변/note를 대화 로그에 추가(insert_before 대체). 여러 줄이면 줄 단위로 넣어
+                        // ring 상한·dump가 줄 단위로 동작하게 한다(원본 ANSI 보존, M1).
+                        for l in s.lines() {
+                            log.push(l.to_string());
+                        }
+                        // ring 상한 초과 시 앞에서 폐기 + scroll 보정(폐기한 만큼 위로, critic M2).
+                        if log.len() > LOG_CAP {
+                            let drop = log.len() - LOG_CAP;
+                            log.drain(0..drop);
+                            scroll = scroll.saturating_sub(drop as u16);
+                        }
+                        log_text = rebuild_log_text(&log);
+                        // follow면 새 답변 도착 시 자동 최하단(scroll은 다음 draw에서 max로 재계산됨).
+                        if follow {
+                            // 다음 draw의 clamp/follow가 max로 맞춰주지만, 의도를 명시.
+                            scroll = u16::MAX;
+                        }
                     }
                     Some(OutMsg::SpinStart(label)) => {
                         spin = Some(SpinState { label, frame: 0, started: Instant::now() });
@@ -539,8 +721,13 @@ async fn chat_loop(
         }
     }
 
-    let _ = terminal.clear();
+    // alternate screen 떠나고 raw mode 복원(원래 화면 복귀).
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
+    // 8e: 대화 버퍼를 stdout에 dump해 터미널 scrollback에 보존(원본 ANSI라 색 그대로).
+    for line in &log {
+        println!("{line}");
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +832,78 @@ mod tests {
         assert!(row0.contains("lo"), "입력 줄(위): {row0:?}");
         assert!(row1.contains("local"), "후보 줄(아래): {row1:?}");
         assert!(row1.contains("last"), "후보 줄(아래): {row1:?}");
+    }
+
+    #[test]
+    fn log_scroll_max_clamps_to_total_minus_height() {
+        // 단계 8: scroll 최대값 = wrap 후 총 화면 줄 - height(음수면 0).
+        let log = Text::from("a\nb\nc\nd\ne"); // 5줄, width 큼=wrap 없음
+        assert_eq!(super::log_scroll_max(&log, 80, 3), 2, "5-3=2");
+        assert_eq!(super::log_scroll_max(&log, 80, 10), 0, "height≥total");
+    }
+
+    #[test]
+    fn rebuild_log_text_preserves_lines_and_color() {
+        // 8e/M1: log(원본 ANSI 줄)을 Text로 재구성 — 줄 수·색 보존.
+        let log = vec![
+            "plain".to_string(),
+            "\x1b[34mblue\x1b[0m".to_string(),
+            "".to_string(),
+            "tail".to_string(),
+        ];
+        let text = super::rebuild_log_text(&log);
+        assert_eq!(text.lines.len(), 4, "줄 수 보존(빈 줄 포함)");
+        // 두 번째 줄의 첫 span이 파랑이어야 색이 보존된 것.
+        let blue_span = &text.lines[1].spans[0];
+        assert_eq!(blue_span.content, "blue");
+        assert_eq!(blue_span.style.fg, Some(ratatui::style::Color::Blue));
+        // 빈 로그는 빈 Text(패닉 없음).
+        assert_eq!(super::rebuild_log_text(&[]).lines.len(), 1);
+    }
+
+    #[test]
+    fn log_area_height_matches_draw_full_formula() {
+        // draw_full 레이아웃과 동일: 전체 - popup_n - 3(입력1·구분선1·status1), 최소 1.
+        assert_eq!(super::log_area_height(20, 0), 17, "20-0-3");
+        assert_eq!(super::log_area_height(20, 5), 12, "20-5-3");
+        assert_eq!(super::log_area_height(4, 0), 1, "최소 1(붕괴 방지)");
+        assert_eq!(super::log_area_height(3, 0), 1, "전체<3이어도 최소 1");
+    }
+
+    #[test]
+    fn draw_full_layout_log_input_sep_status() {
+        // 전면 TUI: 로그(위) / 입력 / 구분선 / status(맨 아래). popup 없음.
+        let log = Text::from("L0\nL1\nL2");
+        let ta = super::textarea_with("hi");
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &[], 0, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        // 로그(3줄)는 영역(8-3=5줄)보다 짧아 하단 정렬 → L2가 로그 영역 맨 아래(row 4).
+        assert!(row(4).contains("L2"), "로그 하단 정렬: {:?}", row(4));
+        assert!(row(5).contains("hi"), "입력: {:?}", row(5));
+        assert!(row(6).contains("─"), "구분선: {:?}", row(6));
+        assert!(row(7).contains("load"), "status(맨아래): {:?}", row(7));
+    }
+
+    #[test]
+    fn draw_full_popup_vertical_with_desc() {
+        // popup 활성: 입력 위에 세로 목록(명령+설명).
+        let log = Text::from("x");
+        let ta = super::textarea_with("/d");
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        term.draw(|f| {
+            super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &["diagnose", "doctor"], 1, None)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..10)
+            .map(|y| (0..70).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(all.contains("diagnose"), "popup 세로 후보+설명: {all:?}");
+        assert!(all.contains("doctor"), "popup 세로 후보: {all:?}");
     }
 
     #[test]

@@ -647,6 +647,27 @@ pub(crate) fn format_with_border(text: &str) -> String {
     out
 }
 
+/// 파란 border만 붙이고 **wrap은 하지 않는** 변형(RFC-004 step 8b critic B1). 전면 TUI(alternate
+/// screen)에서는 화면 폭 wrap을 ratatui `Paragraph`가 담당하므로, 여기서 사전 wrap하면 이중 wrap이
+/// 되어 scroll offset이 어긋난다. 각 줄에 파란 `▐ ` prefix(빈 줄은 prefix만)만 붙인다.
+/// `format_with_border`(term_width-3 wrap)는 Direct 경로 byte-identical 유지를 위해 그대로 둔다.
+pub(crate) fn format_with_border_raw(text: &str) -> String {
+    let prefix = "\x1b[34m▐\x1b[0m "; // 파란색
+    let empty_prefix = "\x1b[34m▐\x1b[0m";
+
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            out.push_str(empty_prefix);
+        } else {
+            out.push_str(prefix);
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// 파란색 왼쪽 선과 함께 텍스트 출력(Direct 경로). [`format_with_border`]를 stdout에 낸다.
 pub(crate) fn print_with_border(text: &str) {
     print!("{}", format_with_border(text));
@@ -969,6 +990,24 @@ mod tests {
         assert_eq!(
             format_with_border("a\n\nb"),
             "\x1b[34m▐\x1b[0m a\n\x1b[34m▐\x1b[0m\n\x1b[34m▐\x1b[0m b\n"
+        );
+    }
+
+    #[test]
+    fn format_with_border_raw_has_no_wrap() {
+        // RFC-004 step 8b: wrap 없이 border prefix만. 화면 폭 wrap은 ratatui Paragraph가 한다.
+        // 비어있지 않은 줄: "▐ " prefix + 내용 + \n.
+        assert_eq!(format_with_border_raw("hi"), "\x1b[34m▐\x1b[0m hi\n");
+        // 빈 줄: 공백 없는 empty_prefix + \n. 줄 순서·개행 보존.
+        assert_eq!(
+            format_with_border_raw("a\n\nb"),
+            "\x1b[34m▐\x1b[0m a\n\x1b[34m▐\x1b[0m\n\x1b[34m▐\x1b[0m b\n"
+        );
+        // 폭보다 긴 줄도 wrap하지 않고 한 줄 prefix만(term_width 비의존 — 핵심 차이).
+        let long = "a".repeat(500);
+        assert_eq!(
+            format_with_border_raw(&long),
+            format!("\x1b[34m▐\x1b[0m {long}\n")
         );
     }
 

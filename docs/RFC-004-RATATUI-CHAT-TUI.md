@@ -187,3 +187,117 @@ golden 스냅샷(stdout/stderr 각각) → 전환 후 byte diff=0**을 4d/4f 게
 | raw mode 잔존(에러/패닉) | `Drop` + `std::panic::set_hook`로 `disable_raw_mode` 보장(m5) |
 | run_command 카드(별도 모듈) | verbose-only라 기본 무출력 → 보류 안전. 단 `collect`의 `\r` 진행표시는 4e에서 반드시 우회(m6) |
 | non-TTY/CI 회귀 | `ChatOut::Direct` byte-identical — golden/파이프 테스트로 고정 |
+
+---
+
+## 단계 8 상세 설계 (전면 TUI 재설계 — alternate screen)
+
+> 사용자 결정(2026-05-25): slash popup을 **완전 동적 세로 select box**(claude CLI 수준)로 만들기 위해
+> Inline viewport + `insert_before` 모델을 폐기하고 **alternate screen 전체 TUI**로 전환한다.
+> 배경: Inline viewport는 동적 높이가 없어(재생성/resize/절대좌표 정리 모두 스크롤과 얽혀 잔상) 세로
+> popup이 불가. 전체 화면을 소유하면 대화 로그·입력·popup을 자유롭게 레이아웃할 수 있다.
+
+### 핵심 trade-off (사용자 확인 필요)
+
+| 항목 | inline(현재) | alternate screen(전환 후) |
+|------|------|------|
+| 종료 후 대화 | 터미널 scrollback에 **남음** | 화면 복원으로 **사라짐**(휘발) → **완화: 종료 시 대화 버퍼를 stdout에 dump** |
+| 대화 스크롤 | 터미널 native | 앱이 자체 관리(PageUp/Down·휠) |
+| popup | 1줄(현재) | **완전 동적 세로**(설명 포함) |
+
+### 아키텍처
+
+```
+┌ alternate screen (전체 화면 소유) ────────────────┐
+│ 대화 로그 (스크롤 버퍼, 화면 대부분)              │ ← Vec<Line<'static>> + scroll offset
+│   ▐ 이전 답변/카드/note …                         │   (ANSI→ansi_to_tui Line으로 저장)
+│   …                                               │
+├───────────────────────────────────────────────────┤
+│   /diagnose   증상 기반 진단        (popup, floating)│ ← 입력 위 동적 세로(Clear+List)
+│   /doctor     자체 상태 점검                       │
+│ ◇ you ❯ /d                                        │ ← 입력(tui-textarea)
+│ ─────────────────────────────────                 │ ← 구분선
+│ · load·cpu·mem·io                                 │ ← status bar
+└───────────────────────────────────────────────────┘
+```
+
+### 컴포넌트
+
+```
+ChatLoop (전면 재작성, terminal 단독 소유)
+├─ EnterAlternateScreen + enable_raw_mode (Drop/패닉훅에서 Leave+disable)
+├─ log: Vec<Line<'static>>          // 대화 로그(ANSI→Line). 상한 ring(메모리)
+├─ scroll: u16                       // 0=하단 follow, >0=위로 스크롤
+├─ textarea, status, sampler, spin, history, popup_sel  // 기존 재사용
+└─ select! { key / tick / out_rx }
+     ├─ Answer/Note(ansi) → log.extend(ansi_to_lines(ansi))   // insert_before 대체
+     ├─ PageUp/Down·휠 → scroll 조정
+     └─ 그 외 키 → textarea/popup/history (기존 로직 재사용)
+
+draw: Layout[ 로그(Min) / popup(조건부 Length n) / 입력(1) / 구분선(1) / status(1) ]
+  - 로그: Paragraph::new(Text::from(visible_lines)).scroll((offset,0)) 또는 List
+  - popup: 입력 위 Clear+List(세로, 설명, sel reverse) — 화면 안이라 동적 높이 자유
+```
+
+### 단계 분해
+
+| # | 범위 | 검증 |
+|---|------|------|
+| 8a | `ansi_to_lines(ansi)->Vec<Line>` 헬퍼(ANSI→Line, wrap은 Paragraph가) + 대화 로그 버퍼/스크롤 상태 | 단위테스트(ANSI→Line 색·줄 수) |
+| 8b | ChatLoop를 AlternateScreen + 로그 위젯(scroll) + 입력/구분선/status 레이아웃으로 재작성. OutMsg→log push | 수동 실터미널(답변 누적·스크롤) |
+| 8c | 동적 세로 popup(Clear+List, 입력 위) — 화면 안 floating | 수동(/d 세로 목록) |
+| 8d | PageUp/Down·마우스 휠 스크롤 + 자동 하단 follow | 수동 |
+| 8e | 종료 시 대화 버퍼 stdout dump(휘발 완화) + Leave/disable 복원 | 수동(종료 후 대화 보존) |
+| 8f | non-TTY=Direct 유지(byte-identical) + 통합 검증 | golden + 수동 |
+
+### 리스크
+
+| 리스크 | 완화 |
+|--------|------|
+| 대화 휘발(UX 변화) | 종료 시 dump(8e) — 필요 시 기본 on |
+| 대화 버퍼 메모리 | ring 상한(줄 수 cap), 오래된 줄 폐기 |
+| ANSI→Line 변환 비용 | 답변 1회 변환 후 캐시(log에 Line 저장) |
+| 스크롤 중 새 답변 | scroll>0이면 follow 안 함(사용자 위치 보존), 표시만 갱신 |
+| 큰 재작성 회귀 | 기존 ChatLoop를 대체하되 OutMsg/ChatHandle 인터페이스·session 통합은 유지(session 무변경) |
+
+### 단계 8 critic 반영 개정 (2026-05-25)
+
+critic이 blocker 3건을 지적해 아래로 확정한다.
+
+**B1 — 이중 wrap 해소 (log 모델 확정):**
+- `log: Vec<String>`로 **원본 ANSI 문자열을 보관**한다(M1 dump 색 보존도 동시 해결).
+- draw는 `Paragraph::new(Text)` 한 번에 + `.wrap(Wrap{trim:false}).scroll((scroll, 0))`. ratatui
+  `Paragraph::scroll`은 **wrap 후 화면 줄 기준**이라 offset 정합이 자동(논리/화면 줄 불일치 제거).
+- 총 화면 줄은 `Paragraph::line_count(width)`(§4 자산 승계)로 구해 `scroll`을 `[0, total-height]`로 clamp.
+- **TUI 답변은 wrap 없이 log에 넣는다**: `ChatOut::answer(Tui)`는 `format_with_border`(term_width-3 wrap)
+  대신 **wrap 없는 `format_with_border_raw`**(▐ prefix만, 자연 개행 보존)로 ANSI를 만들어 화면 폭 wrap을
+  Paragraph에 일임한다. (Direct 경로는 기존 `format_with_border` 그대로 — byte-identical 유지.)
+
+**M1 — dump 색 보존:** log가 원본 ANSI이므로 종료 시 `LeaveAlternateScreen` **후** 각 항목을 stdout에
+`println`하면 색 그대로 보존(역변환 불필요).
+
+**B2 — 8b 분할:**
+- 8b-1: `draw_full(f, log_text, scroll, status, textarea, prompt, popup, sel, spin)` **순수 함수**
+  (로그 Paragraph + popup floating + 입력 + 구분선 + status). **TestBackend 단위테스트**(레이아웃 row 배치,
+  작은 터미널 24×5 붕괴, scroll clamp).
+- 8b-2: ChatLoop를 AlternateScreen + `draw_full`로 교체 + `OutMsg`→`log` push. 실터미널.
+
+**기타:** M2(ring 폐기 시 `scroll -= 폐기 줄`), M3(popup 높이 `min(후보, 가용-4)`·로그 Min≥1),
+m1(`scroll==max`=하단 follow 불변식, 새 답변 시 follow면 자동 최하단), m3(긴 대화: log→Text 캐시,
+변경 시만 재구성), m4(`start_chat_loop`/`recv_line`/`ChatLine` 시그니처 불변 = 컴파일 게이트),
+m5(thinking은 로그 하단 아닌 입력 줄 자리 §4 방식 유지).
+
+**8a 산출물(개정):** `log: Vec<String>` + `log_text`(캐시 Text) + `draw_log(f, area, &Text, scroll)` 순수
+함수 + `line_count` 기반 scroll clamp. 단위테스트(TestBackend: 로그 렌더·scroll·색 보존).
+
+### 단계 8 완료 (2026-05-25)
+
+전면 TUI 전환 완료. 8a~8e 구현 + 실터미널 검증:
+- `draw_full`(로그 Paragraph.wrap.scroll / 세로 popup List / 입력·thinking / 구분선 / status) + `log_scroll_max`. 단위테스트(레이아웃·scroll·popup·색).
+- `chat_loop` 재작성: EnterAlternateScreen + `log: Vec<String>`(ANSI) + `log_text` 캐시 + scroll/follow + ring(2000) + PageUp/Down. 종료 시 LeaveAlternateScreen + log dump(색 보존).
+- `format_with_border_raw`(wrap 없음, B1) — `ChatOut::answer(Tui)`만 사용, Direct는 byte-identical 유지.
+- **대화 로그 하단 정렬**(짧은 대화는 입력 바로 위에 붙음, claude CLI식) — `draw_full`에서 total<height면 bottom Rect.
+- 실터미널 검증: 세로 popup(설명 포함)·alternate screen·답변 누적+하단정렬·종료 dump(scrollback 보존)·구분선. test 9 suite green, clippy clean.
+
+미사용(Inline 모델: read_line_tui/insert_before_ansi/draw_chat/draw_viewport/draw_viewport_popup/
+ansi_to_paragraph/draw_thinking)은 `#[allow(dead_code)]`로 보존(테스트/height 자산). 후속 정리 대상.
