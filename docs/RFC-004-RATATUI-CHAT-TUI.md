@@ -47,7 +47,7 @@ top.rs식 자체 스크롤 로그 위젯이 불필요하다.
 2. ~~`chat_tui.rs` 골격~~ ✅ (2026-05-24, 5bb16eb) — Inline viewport + **동기 `event::poll` 루프**(top.rs 패턴, EventStream 불필요) + `draw_viewport`(status bar dim / prompt+tui-textarea) TestBackend 검증. status 흐름·**하단 고정(단계 3)도 골격에 포함**. `read_line_tui`는 미연결(mod allow dead_code).
 3. ~~status bar 하단 고정~~ ✅ (단계 2 골격에 흡수 — Inline viewport 상단 1줄 dim).
 4. ~~**LLM 호출 통합 (insert_before)**~~ ✅ **완료** (4a~4f, 2026-05-24, `AIC_CHAT_TUI=1` opt-in) — 아래 [§단계 4 상세 설계](#단계-4-상세-설계-insert_before--단일-이벤트-루프) 참조. `ChatLoop` task가 terminal 단독 소유 + `mpsc` 채널(critic B1/B2 해소), 답변/spinner/slash를 `insert_before`로 일원화. 실터미널 검증 완료(viewport·status bar 하단고정·타이핑 중 흐름·한글·긴 답변 wrap·raw 복원). **기본 전환은 step 5(history)·6(slash popup) 이식 후**.
-5. history 이식(FilteredHistory 재사용).
+5. ~~history 이식~~ ✅ (2026-05-24) — `ChatLoop` ↑↓ 탐색. reedline과 **동일 `chat_history` 파일 공유**(`repl::load_chat_history`/`append_chat_history`, plain 줄단위). `should_record_history` 정책 재사용(빈줄/exit 제외), 첫 ↑에 편집 중 입력 draft 보존, ↓ 최하단서 draft 복원. 실터미널 검증(↑/doctor·↑/help·↓/doctor).
 6. slash popup(Clear+List).
 7. non-TTY fallback 유지(기존 stdin read_line) + 테스트.
 

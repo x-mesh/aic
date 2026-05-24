@@ -136,8 +136,45 @@ pub(crate) enum ReadLine {
 /// chat 입력 history 파일 경로 — config와 동일한 XDG 패턴
 /// (`~/.config/aic/chat_history` 또는 `$XDG_CONFIG_HOME/aic/chat_history`).
 /// `config.toml`과 같은 디렉터리를 쓰므로 `config_path()`에서 파일명만 바꾼다.
-fn chat_history_path() -> std::path::PathBuf {
+pub(crate) fn chat_history_path() -> std::path::PathBuf {
     crate::config::ConfigManager::config_path().with_file_name("chat_history")
+}
+
+/// chat history를 줄단위로 로드한다(reedline `FileBackedHistory`와 동일 파일·plain 포맷 공유).
+/// 빈 줄은 제외, 최근 [`HISTORY_CAPACITY`]개만. RFC-004 step 5: ratatui `ChatLoop`의 ↑↓ 탐색용.
+pub(crate) fn load_chat_history() -> Vec<String> {
+    let all: Vec<String> = std::fs::read_to_string(chat_history_path())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    // capacity 초과분은 앞에서 잘라 최근 항목만 유지(reedline 정책과 동일 상한).
+    let start = all.len().saturating_sub(HISTORY_CAPACITY);
+    all[start..].to_vec()
+}
+
+/// 제출된 입력을 chat history 파일에 append한다(reedline과 동일 파일). [`should_record_history`]를
+/// 통과한 항목만, 줄단위 포맷 보존을 위해 개행은 공백으로 치환한다. 실패는 무시(best-effort).
+pub(crate) fn append_chat_history(line: &str) {
+    if !should_record_history(line) {
+        return;
+    }
+    let entry = line.replace('\n', " ");
+    let path = chat_history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{entry}");
+    }
 }
 
 /// 대화형 입력 reader.
@@ -355,7 +392,7 @@ const HISTORY_CAPACITY: usize = 1000;
 /// 입력을 history에 기록할지 판정한다.
 /// 빈 줄·공백-only·`exit`/`quit`는 기록하지 않는다(잡음·중복 방지). reedline은 빈 buffer만
 /// 자동 제외하므로, 공백-only/exit/quit는 [`FilteredHistory`]에서 추가로 거른다.
-fn should_record_history(line: &str) -> bool {
+pub(crate) fn should_record_history(line: &str) -> bool {
     let trimmed = line.trim();
     !trimmed.is_empty() && !ReplSession::is_exit_command(trimmed)
 }

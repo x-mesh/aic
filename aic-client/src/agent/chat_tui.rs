@@ -222,6 +222,13 @@ struct SpinState {
     started: Instant,
 }
 
+/// 주어진 내용으로 새 `TextArea`를 만든다(커서는 끝). history(↑↓) 탐색 시 입력 줄 교체용.
+fn textarea_with(content: &str) -> TextArea<'static> {
+    let mut ta = TextArea::default();
+    ta.insert_str(content);
+    ta
+}
+
 /// thinking 표시: status 줄(위) + spinner 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
@@ -264,6 +271,10 @@ async fn chat_loop(
     let mut status = String::from("· (collecting metrics…)");
     let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
+    // 입력 history(reedline과 동일 파일 공유). hist_idx=탐색 위치, draft=탐색 전 편집 내용 보존.
+    let mut history = crate::repl::load_chat_history();
+    let mut hist_idx: Option<usize> = None;
+    let mut draft = String::new();
 
     loop {
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
@@ -306,9 +317,43 @@ async fn chat_loop(
                                     width,
                                 );
                                 textarea = TextArea::default();
+                                // history 기록(메모리 + 파일, reedline과 동일 파일) 후 탐색 상태 리셋.
+                                if crate::repl::should_record_history(&line) {
+                                    crate::repl::append_chat_history(&line);
+                                    history.push(line.clone());
+                                }
+                                hist_idx = None;
+                                draft.clear();
                                 let _ = line_tx.send(ChatLine::Line(line)).await;
                             }
+                            // ↑: 이전 history. 첫 ↑는 편집 중이던 입력을 draft에 보존.
+                            (KeyCode::Up, _) if spin.is_none() && !history.is_empty() => {
+                                let idx = match hist_idx {
+                                    None => {
+                                        draft = textarea.lines().join("\n");
+                                        history.len() - 1
+                                    }
+                                    Some(0) => 0,
+                                    Some(i) => i - 1,
+                                };
+                                hist_idx = Some(idx);
+                                textarea = textarea_with(&history[idx]);
+                            }
+                            // ↓: 다음 history. 최근 아래로 내려오면 draft(편집 중이던 입력) 복원.
+                            (KeyCode::Down, _) if spin.is_none() => {
+                                if let Some(i) = hist_idx {
+                                    if i + 1 < history.len() {
+                                        hist_idx = Some(i + 1);
+                                        textarea = textarea_with(&history[i + 1]);
+                                    } else {
+                                        hist_idx = None;
+                                        textarea = textarea_with(&draft);
+                                    }
+                                }
+                            }
                             _ if spin.is_none() => {
+                                // 일반 편집 — history 탐색 종료(현재 내용이 새 입력).
+                                hist_idx = None;
                                 textarea.input(k);
                             }
                             _ => {}
@@ -417,6 +462,15 @@ mod tests {
         let span = &t.lines[0].spans[0];
         assert_eq!(span.content, "blue");
         assert_eq!(span.style.fg, Some(ratatui::style::Color::Blue));
+    }
+
+    #[test]
+    fn textarea_with_sets_content() {
+        // 단계 5: history(↑↓) 탐색 시 입력 줄을 history 항목으로 교체. CJK 포함 내용 보존.
+        let ta = super::textarea_with("가나다 hello");
+        assert_eq!(ta.lines().join("\n"), "가나다 hello");
+        let empty = super::textarea_with("");
+        assert_eq!(empty.lines().join("\n"), "");
     }
 
     #[test]
