@@ -403,7 +403,7 @@ impl AgentSession {
                     });
                     // 각 도구를 실행하고 결과를 tool 메시지로 회신.
                     for call in &calls {
-                        let result = self.exec_tool(call);
+                        let result = self.exec_tool(call).await;
                         self.history.push(ChatMessage::Tool {
                             call_id: call.id.clone(),
                             content: result,
@@ -496,12 +496,15 @@ impl AgentSession {
 
     /// 단일 도구 호출을 실행하고 LLM에 회신할 문자열을 만든다(에러도 문자열로 흡수).
     /// `corr`(=`run_id.seq`)로 tool_call ↔ tool_result ↔ run_command card/audit를 묶는다.
-    fn exec_tool(&mut self, call: &ToolCall) -> String {
+    async fn exec_tool(&mut self, call: &ToolCall) -> String {
         self.tool_seq += 1;
         let corr = format!("{}.{}", self.run_id, self.tool_seq);
         // run_command는 자체 command card를 출력하므로 generic [tool] 줄은 생략.
+        // [tool] 줄은 sink(note) 경유 — TUI raw mode에서 직접 eprintln하면 화면이 깨진다(codex P1).
         if call.name != "run_command" {
-            eprintln!("\x1b[2m[tool] {} [{corr}]\x1b[0m", call.name);
+            self.out
+                .note(&format!("\x1b[2m[tool] {} [{corr}]\x1b[0m", call.name))
+                .await;
         }
         adbg!(
             "tool_call corr={corr} name={} args_len={}",
@@ -524,13 +527,26 @@ impl AgentSession {
         // run_command는 별도 정책 경로(risk_guard + confirm). 비활성 시 거부.
         let result = if call.name == "run_command" {
             if !self.allow_run_command {
-                eprintln!("\x1b[33m[run_command] [{corr}] 비활성(read-only 세션)\x1b[0m");
+                self.out
+                    .note(&format!(
+                        "\x1b[33m[run_command] [{corr}] 비활성(read-only 세션)\x1b[0m"
+                    ))
+                    .await;
                 Ok("[tool error] run_command은 현재 read-only 세션이라 비활성입니다. \
                     셸 실행이 필요하면 `--no-run`/`--read-only` 없이(또는 AIC_AGENT_NO_RUN 미설정) \
                     `aic chat`을 다시 실행하세요. 지금은 read_file/list_dir/grep/glob로 진단하세요."
                     .to_string())
             } else {
-                super::run_command::execute_with_corr(&args, &self.sandbox, &corr, tty_confirm)
+                // TUI(raw mode)는 동기 stdin 확인(tty_confirm)이 EventStream과 경쟁해 hang하므로,
+                // 확인이 필요한 명령은 거부한다(codex P1). Safe(read-only) 명령은 confirm을 거치지
+                // 않아 그대로 실행된다. NeedsConfirm/Dangerous는 reedline 모드(AIC_NO_TUI=1)에서.
+                let confirm: fn(&str, &str, &str) -> bool =
+                    if matches!(self.out, ChatOut::Tui(_)) {
+                        |_, _, _| false
+                    } else {
+                        tty_confirm
+                    };
+                super::run_command::execute_with_corr(&args, &self.sandbox, &corr, confirm)
             }
         } else {
             tools::execute(&call.name, &args, &self.sandbox)
@@ -1542,8 +1558,8 @@ mod tests {
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    #[test]
-    fn exec_tool_assigns_incrementing_correlation_seq() {
+    #[tokio::test]
+    async fn exec_tool_assigns_incrementing_correlation_seq() {
         use crate::llm_dispatcher::LlmDispatcher;
         use aic_common::{CommandRecord, LlmConfig};
         use std::collections::HashMap;
@@ -1573,10 +1589,10 @@ mod tests {
             name: "read_file".to_string(),
             arguments: "{\"path\":\"a.txt\"}".to_string(),
         };
-        let out1 = session.exec_tool(&call);
+        let out1 = session.exec_tool(&call).await;
         assert!(out1.contains('x'));
         assert_eq!(session.tool_seq, 1);
-        let _ = session.exec_tool(&call);
+        let _ = session.exec_tool(&call).await;
         assert_eq!(session.tool_seq, 2);
         // run_id는 세션 동안 고정 → corr는 run_id.{1,2}로 구분된다.
     }
