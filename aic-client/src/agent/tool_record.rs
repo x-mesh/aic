@@ -192,6 +192,8 @@ pub(crate) enum SlashCommand {
     Doctor,
     /// `/timeline [N]` — 세션 tool 기록을 시간순 compact 출력(최근 N개, 기본 전체).
     Timeline(Option<usize>),
+    /// `/trend [N]` — 최근 명령 exit code 추세(✓/✗ 시퀀스 + 실패율). ring의 exit 기록 집계, LLM 미호출.
+    Trend(Option<usize>),
     /// `/compare` — 현재 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출). 첫 호출은 baseline 저장.
     Compare,
     /// `/bundle [name]` — 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장. name은 파일 라벨.
@@ -266,6 +268,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "incident",
     "doctor",
     "timeline",
+    "trend",
     "compare",
     "bundle",
     "triage",
@@ -276,7 +279,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
 pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
         "diagnose" | "incident" | "triage" | "doctor" => "Diagnostics",
-        "last" | "raw" | "timeline" | "compare" | "bundle" | "explain-last" => "Evidence",
+        "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "explain-last" => "Evidence",
         "local" | "sys" | "snapshot" | "watch" => "System",
         _ => "Meta", // help 등
     }
@@ -306,6 +309,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "incident" => "인시던트 진단: 시스템+git+최근기록 (--raw=증거만)",
         "doctor" => "AIC 자체 상태 점검 (provider/도구/플래그 presence, secret 미노출)",
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
+        "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
@@ -398,6 +402,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         }
         "doctor" => SlashCommand::Doctor,
         "timeline" => SlashCommand::Timeline(parts.next().and_then(|n| n.parse::<usize>().ok())),
+        "trend" => SlashCommand::Trend(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "compare" => SlashCommand::Compare,
         "bundle" => {
             // [name] — 라벨/파일명 전용(따옴표 strip), 셸 명령에 미포함.
@@ -830,6 +835,58 @@ pub(crate) fn render_timeline(ring: &VecDeque<ToolRecord>, n: Option<usize>) -> 
     lines.join("\n")
 }
 
+/// `/trend [N]` — 최근 명령 exit code 추세. exit 기록이 있는(run_command 실행) 레코드만 집계해
+/// ✓(exit=0)/✗(non-zero·timeout) 시퀀스 + 실패율 + 최근 실패 명령을 보여준다. LLM 미호출, 순수 함수.
+pub(crate) fn render_trend(ring: &VecDeque<ToolRecord>, n: Option<usize>) -> String {
+    let execs: Vec<&ToolRecord> = ring.iter().filter(|r| r.exit.is_some()).collect();
+    if execs.is_empty() {
+        return "exit 기록이 있는 명령이 없습니다 (run_command 실행 후 다시 시도).".to_string();
+    }
+    let skip = match n {
+        Some(k) => execs.len().saturating_sub(k),
+        None => 0,
+    };
+    let recent: Vec<&ToolRecord> = execs.into_iter().skip(skip).collect();
+    let total = recent.len();
+    let ok = recent
+        .iter()
+        .filter(|r| r.exit.as_deref() == Some("0"))
+        .count();
+    let fail = total - ok;
+    let seq: String = recent
+        .iter()
+        .map(|r| if r.exit.as_deref() == Some("0") { '✓' } else { '✗' })
+        .collect();
+    let fail_pct = if total > 0 {
+        fail as f64 * 100.0 / total as f64
+    } else {
+        0.0
+    };
+    let mut lines = vec![
+        format!("exit 추세 (오래된 → 최신, {total}회): {seq}"),
+        format!("성공 {ok} / 실패 {fail} (실패율 {fail_pct:.0}%)"),
+    ];
+    // 최근 실패 명령 최대 3개(최신순).
+    let recent_fails: Vec<String> = recent
+        .iter()
+        .rev()
+        .filter(|r| r.exit.as_deref() != Some("0"))
+        .take(3)
+        .map(|r| {
+            format!(
+                "  ✗ exit={} · {}",
+                r.exit.as_deref().unwrap_or("?"),
+                r.command_display.as_deref().unwrap_or(&r.name)
+            )
+        })
+        .collect();
+    if !recent_fails.is_empty() {
+        lines.push("최근 실패:".to_string());
+        lines.extend(recent_fails);
+    }
+    lines.join("\n")
+}
+
 /// `/bundle` 파일명 sanitize — `[a-zA-Z0-9._-]`만 남기고 나머지는 `_`로. 빈/과길이는 보정. 경로 분리자 제거.
 pub(crate) fn sanitize_bundle_name(name: &str) -> String {
     let cleaned: String = name
@@ -1035,6 +1092,31 @@ mod tests {
 
     fn rec(corr: &str, name: &str, output: &str) -> ToolRecord {
         ToolRecord::from_result(corr, name, None, output)
+    }
+
+    #[test]
+    fn trend_aggregates_exits_and_skips_non_exec() {
+        let mut r = VecDeque::new();
+        push_record(&mut r, rec("a.1", "run_command", "exit_code=0 duration_ms=1"));
+        push_record(&mut r, rec("a.2", "run_command", "exit_code=1 duration_ms=1"));
+        push_record(&mut r, rec("a.3", "read_file", "ok")); // exit 없음 → 집계 제외
+        push_record(&mut r, rec("a.4", "run_command", "exit_code=0 duration_ms=1"));
+        let out = render_trend(&r, None);
+        assert!(out.contains("✓✗✓"), "out={out}"); // read_file 제외, 오래된→최신
+        assert!(out.contains("성공 2 / 실패 1"), "out={out}");
+        assert!(out.contains("최근 실패"), "out={out}");
+    }
+
+    #[test]
+    fn trend_empty_when_no_exec() {
+        let r = VecDeque::new();
+        assert!(render_trend(&r, None).contains("없습니다"));
+    }
+
+    #[test]
+    fn parse_slash_trend() {
+        assert_eq!(parse_slash("/trend"), Some(SlashCommand::Trend(None)));
+        assert_eq!(parse_slash("/trend 5"), Some(SlashCommand::Trend(Some(5))));
     }
 
     /// 테스트 헬퍼 — 완성 후보의 value(=삽입될 이름)만 추출.

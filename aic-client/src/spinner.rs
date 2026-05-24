@@ -23,6 +23,14 @@ impl Spinner {
     /// **빈 문자열이면 색 없이**(plain) 표시한다(NO_COLOR 정책: 호출부가 `""` 전달).
     /// stderr 비-TTY면 no-op. 성공/실패/timeout 무관 `stop()`에서 라인을 정리한다.
     pub fn start_styled(label: String, color_code: &str) -> Self {
+        Self::start_with_metrics(label, color_code, false)
+    }
+
+    /// [`start_styled`]에 시스템 지표(load/cpu/mem/disk-i/o)를 spinner 라인 뒤에 덧붙이는 변형.
+    /// `with_metrics`면 spinner 생애 동안 `SysSampler`를 재사용(disk i/o delta 정확)하며 **2초마다**
+    /// 지표를 재샘플한다(애니메이션은 100ms). LLM 호출/대기 구간은 `read_line` 밖이라 reedline과
+    /// 충돌하지 않고, spinner가 화면(한 줄)을 단독 소유하므로 status bar 갱신과도 충돌이 없다.
+    pub fn start_with_metrics(label: String, color_code: &str, with_metrics: bool) -> Self {
         if !std::io::stderr().is_terminal() {
             return Self {
                 handle: None,
@@ -41,10 +49,21 @@ impl Spinner {
             };
             let start = std::time::Instant::now();
             let mut idx = 0usize;
+            // 시스템 지표 샘플러(옵션) — disk i/o delta를 위해 spinner 생애 동안 재사용.
+            let mut sampler = with_metrics.then(crate::agent::sys_sampler::SysSampler::new);
+            let mut status = String::new();
+            let mut last_sample = std::time::Instant::now();
             loop {
+                // 지표는 2초마다(또는 최초) 갱신, 애니메이션은 매 tick.
+                if let Some(s) = sampler.as_mut() {
+                    if status.is_empty() || last_sample.elapsed().as_secs() >= 2 {
+                        status = format!(" · {}", s.sample().status_line());
+                        last_sample = std::time::Instant::now();
+                    }
+                }
                 let elapsed = start.elapsed().as_secs_f32();
                 eprint!(
-                    "\r{pre}{frame} {label} ({elapsed:.1}s){post}\x1b[K",
+                    "\r{pre}{frame} {label} ({elapsed:.1}s){status}{post}\x1b[K",
                     frame = frames[idx % frames.len()]
                 );
                 let _ = std::io::stderr().flush();

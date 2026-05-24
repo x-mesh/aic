@@ -18,6 +18,7 @@ pub(crate) mod probes;
 pub mod run_command;
 pub mod sandbox;
 pub mod session;
+pub(crate) mod sys_sampler;
 pub(crate) mod sysinfo;
 pub(crate) mod tool_record;
 pub mod tools;

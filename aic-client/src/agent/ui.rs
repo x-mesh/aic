@@ -82,6 +82,25 @@ fn is_compact(width: usize) -> bool {
     width < COMPACT_WIDTH
 }
 
+/// 실시간 status bar(시스템 지표)를 끌지 — `AIC_NO_STATUSBAR`가 `1|true`면 true.
+/// 배너 opt-out(`AIC_NO_BANNER`/`AIC_QUIET`)과 별개로, bar만 끄고 싶을 때.
+pub(crate) fn statusbar_suppressed() -> bool {
+    super::debug::env_truthy("AIC_NO_STATUSBAR")
+}
+
+/// 시스템 지표 status bar를 켤지 — TTY이고, 배너/statusbar opt-out이 모두 꺼져 있을 때만.
+/// (non-TTY/파이프/CI에서는 자동 비활성 — spinner.rs와 동일 정책.)
+pub(crate) fn statusbar_enabled() -> bool {
+    is_tty() && !statusbar_suppressed() && !banner_suppressed()
+}
+
+/// 시스템 지표 한 줄을 stderr에 dim으로 출력한다. 입력 프롬프트 **직전**에만 호출해야
+/// reedline raw mode와 충돌하지 않는다(read_line 진입 전 = 화면 소유자 없음).
+/// 활성 여부는 호출 측이 `statusbar_enabled()`로 판단(샘플링 비용 회피).
+pub(crate) fn print_status_bar(line: &str) {
+    eprintln!("{}", paint(&format!("· {line}"), "2")); // 2 = dim
+}
+
 /// banner 라인들. rich면 ASCII art, 아니면 plain 1줄. 순수 함수(테스트 가능).
 pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
     if rich {

@@ -141,7 +141,14 @@ impl AgentSession {
         }
         self.history.push(ChatMessage::System(preface));
 
+        // status bar 샘플러 — TTY이고 opt-out 미설정일 때만 생성(비-TTY/파이프/CI는 None = 비용 0).
+        let mut sampler = ui::statusbar_enabled().then(super::sys_sampler::SysSampler::new);
+
         loop {
+            // 입력 프롬프트 직전 1회 status bar 갱신 — reedline read_line 진입 전이라 충돌 0.
+            if let Some(s) = sampler.as_mut() {
+                ui::print_status_bar(&s.sample().status_line());
+            }
             // 한 줄 읽기 (TTY는 Unicode-aware 라인 에디터, 비-TTY는 read_line)
             let line = match reader.read(ui::prompt_label())? {
                 repl::ReadLine::Eof => {
@@ -198,7 +205,11 @@ impl AgentSession {
                 specs.len(),
                 if self.allow_run_command { "on" } else { "off" }
             );
-            let spinner = crate::spinner::Spinner::start("thinking...".to_string());
+            let spinner = crate::spinner::Spinner::start_with_metrics(
+                "thinking...".to_string(),
+                "90",
+                ui::statusbar_enabled(),
+            );
             let resp = self.dispatcher.send_messages(&self.history, &specs).await;
             spinner.stop().await;
 
@@ -297,7 +308,11 @@ impl AgentSession {
             "degraded turn: provider_tools=off send() prompt_len={}",
             prompt.len()
         );
-        let spinner = crate::spinner::Spinner::start("thinking...".to_string());
+        let spinner = crate::spinner::Spinner::start_with_metrics(
+                "thinking...".to_string(),
+                "90",
+                ui::statusbar_enabled(),
+            );
         let resp = self.dispatcher.send(&prompt).await;
         spinner.stop().await;
 
@@ -430,6 +445,9 @@ impl AgentSession {
             SlashCommand::Timeline(n) => {
                 eprintln!("{}", tool_record::render_timeline(&self.tool_records, n))
             }
+            SlashCommand::Trend(n) => {
+                eprintln!("{}", tool_record::render_trend(&self.tool_records, n))
+            }
             SlashCommand::Compare => self.handle_compare(),
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()),
             SlashCommand::Triage { topic, run } => self.handle_triage(topic.as_deref(), run),
@@ -519,7 +537,7 @@ impl AgentSession {
         } else {
             ""
         };
-        let spinner = crate::spinner::Spinner::start_styled(label, amber);
+        let spinner = crate::spinner::Spinner::start_with_metrics(label, amber, ui::statusbar_enabled());
         let result =
             tokio::time::timeout(LOCAL_ANALYZE_TIMEOUT, self.dispatcher.send(prompt)).await;
         spinner.stop().await;
