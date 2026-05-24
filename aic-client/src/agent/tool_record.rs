@@ -161,6 +161,8 @@ fn cap_str(s: &str, max: usize) -> (String, bool) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
     Help,
+    /// `/clear` — 대화 컨텍스트 리셋(시스템 프롬프트 유지). LLM 미호출.
+    Clear,
     /// `/last`(None) / `/last N`(Some).
     Last(Option<usize>),
     /// `/raw`(None=마지막) / `/raw <seq|corr>`(Some).
@@ -258,6 +260,7 @@ fn resolve_slash_command(typed: &str) -> Resolution {
 /// 자동완성·도움말에 쓰는 slash 메타명령 목록(primary 이름).
 pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "help",
+    "clear",
     "last",
     "raw",
     "local",
@@ -299,6 +302,7 @@ fn slash_category_order(name: &str) -> u8 {
 pub(crate) fn slash_description(name: &str) -> &'static str {
     match name {
         "help" => "이 도움말 표시",
+        "clear" => "대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
         "last" => "직전 tool 카드 / 최근 N개 요약",
         "raw" => "마지막(또는 지정) tool의 redacted 전체 출력",
         "local" => "로컬 sysinfo 스냅샷 LLM 분석 (--raw=원본만; alias: sys, snapshot)",
@@ -369,6 +373,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
     };
     Some(match cmd.as_str() {
         "help" | "?" => SlashCommand::Help,
+        "clear" => SlashCommand::Clear,
         "last" => SlashCommand::Last(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "raw" => SlashCommand::Raw(parts.next().map(|s| s.to_string())),
         "local" | "sys" | "snapshot" => {
@@ -684,6 +689,7 @@ pub(crate) fn help_text() -> String {
     [
         "slash 명령 (대화 history에 안 들어감, 출력은 화면에만):",
         "  /help                이 도움말",
+        "  /clear               대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
         "  /last [N]            직전 tool 카드 / 최근 N개 요약",
         "  /raw [seq|corr]      마지막(또는 지정) tool의 redacted 전체 출력",
         "  /local [section] [--raw]  로컬 sysinfo 스냅샷 → LLM 분석 요약 (alias: /sys, /snapshot)",
@@ -1123,6 +1129,22 @@ mod tests {
     fn slash_completion(line: &str, pos: usize) -> (usize, Vec<String>) {
         let (start, entries, _append) = slash_completion_entries(line, pos);
         (start, entries.into_iter().map(|(v, _d)| v).collect())
+    }
+
+    #[test]
+    fn parse_slash_clear() {
+        // exact + 유일 prefix(`/cl`). `/c`는 clear/compare ambiguous.
+        assert_eq!(parse_slash("/clear"), Some(SlashCommand::Clear));
+        assert_eq!(parse_slash("/cl"), Some(SlashCommand::Clear));
+        assert!(matches!(
+            parse_slash("/c"),
+            Some(SlashCommand::Ambiguous { .. })
+        ));
+        // clear 메타데이터: Meta 카테고리 + 설명 존재 + SLASH_COMMANDS 포함.
+        assert_eq!(slash_category("clear"), "Meta");
+        assert!(slash_description("clear").contains("리셋"));
+        assert!(SLASH_COMMANDS.contains(&"clear"));
+        assert!(help_text().contains("/clear"));
     }
 
     #[test]
