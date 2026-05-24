@@ -698,10 +698,12 @@ impl AgentSession {
         } else {
             ""
         };
-        let spinner = crate::spinner::Spinner::start_with_metrics(label, amber, ui::statusbar_enabled());
+        // spinner를 ChatOut sink로 — TUI는 viewport tick arm(누적 없음), Direct는 stderr spinner.
+        // (4d/4e에서 run_turn만 이전했고 이 분석 경로가 누락되어 TUI에서 spinner 프레임이 누적됐었음.)
+        self.out.spin_start(label, amber).await;
         let result =
             tokio::time::timeout(LOCAL_ANALYZE_TIMEOUT, self.dispatcher.send(prompt)).await;
-        spinner.stop().await;
+        self.out.spin_stop().await;
 
         match result {
             Ok(Ok(text)) => {

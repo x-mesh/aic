@@ -23,14 +23,16 @@
 핵심 단순화: **Inline viewport이면 대화 로그 관리가 단순**(insert_before로 밀어올림 → 터미널이 스크롤),
 top.rs식 자체 스크롤 로그 위젯이 불필요하다.
 
-### 레이아웃
+### 레이아웃 (claude CLI 스타일 — 입력 위, status bar 맨 아래)
 ```
 [scrollback ↑ : 이전 대화 — insert_before 출력]
+    [/local /diagnose ...]  ← slash popup (Clear+List overlay, 입력 위에 조건부)
+◇ you ❯ 입력...            ← 입력 (viewport 위 row)
 ─────────────────────────────────
-· load·cpu·mem·io          ← status bar (Inline viewport, 고정)
-◇ you ❯ 입력...            ← 입력
-    [/local /diagnose ...]  ← slash popup (Clear+List overlay, 조건부)
+· load·cpu·mem·io          ← status bar (Inline viewport 맨 아래 고정)
 ```
+> 2026-05-24 변경: 초안은 status(위)/입력(아래)였으나 사용자 요청으로 **입력(위)/status(아래)**로 뒤집음
+> (claude CLI 스타일 — 상태바가 화면 맨 아래). `draw_viewport`/`draw_thinking` rows[0]=입력/spinner, rows[1]=status.
 
 ## 대체 대상 — reedline 4기능 (repl.rs)
 
