@@ -44,9 +44,9 @@ top.rs식 자체 스크롤 로그 위젯이 불필요하다.
 ## 단계
 
 1. ~~**CJK PoC**~~ ✅ **통과** (`aic-client/tests/cjk_poc.rs`, 2026-05-24) — tui-textarea 0.7 한글 정확. go.
-2. `chat_tui.rs` 골격 — `Terminal::with_options(Inline)` + EventStream 루프 + panic/종료 복구(top.rs 패턴).
-3. 입력 + submit → `insert_before`(로그) + status bar 하단 고정(sys_sampler 재사용).
-4. LLM 호출 통합 — 답변/spinner를 `insert_before`로(현재 stdout `println` → insert_before; **가장 침습적**).
+2. ~~`chat_tui.rs` 골격~~ ✅ (2026-05-24, 5bb16eb) — Inline viewport + **동기 `event::poll` 루프**(top.rs 패턴, EventStream 불필요) + `draw_viewport`(status bar dim / prompt+tui-textarea) TestBackend 검증. status 흐름·**하단 고정(단계 3)도 골격에 포함**. `read_line_tui`는 미연결(mod allow dead_code).
+3. ~~status bar 하단 고정~~ ✅ (단계 2 골격에 흡수 — Inline viewport 상단 1줄 dim).
+4. **LLM 호출 통합 (다음, 대수술)** — `read_line_tui`(매번 terminal 생성)는 LLM 로그 `insert_before`와 안 맞음 → **terminal 보관 `ChatTui` struct + 전체 루프 소유**로 재설계 필요. session.run의 `reader.read` 루프를 TTY면 ChatTui로 교체, 답변/spinner/tool 카드를 stdout `println` → `insert_before`. **실제 터미널 검증 필수**(자동 테스트 불가).
 5. history 이식(FilteredHistory 재사용).
 6. slash popup(Clear+List).
 7. non-TTY fallback 유지(기존 stdin read_line) + 테스트.
