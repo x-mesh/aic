@@ -34,17 +34,19 @@ pub(crate) enum ChatLine {
     Eof,
 }
 
-/// Inline viewport(2줄)에 status bar(위) + 입력(아래)을 그린다. 순수 함수(TestBackend로 테스트).
+/// Inline viewport(2줄)에 입력(위) + status bar(아래)를 그린다. 순수 함수(TestBackend로 테스트).
+/// claude CLI 스타일: 입력창 바로 아래에 상태바를 둬 화면 맨 아래에 고정한다.
 pub(crate) fn draw_viewport(f: &mut Frame, status: &str, textarea: &TextArea, prompt: &str) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
-    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[0]);
-    // 입력 줄: prompt + textarea를 가로로. prompt 폭은 byte가 아닌 **display width**로 잡는다
+    // 입력 줄(위): prompt + textarea를 가로로. prompt 폭은 byte가 아닌 **display width**로 잡는다
     // (◇/❯는 3바이트 1~2셀 — byte로 잡으면 입력이 과도하게 밀린다).
     let prompt_w = UnicodeWidthStr::width(prompt) as u16;
     let input_cols =
-        Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)]).split(rows[1]);
+        Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)]).split(rows[0]);
     f.render_widget(Paragraph::new(prompt.to_string()), input_cols[0]);
     f.render_widget(textarea, input_cols[1]);
+    // status bar(아래, 화면 맨 아래 고정).
+    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[1]);
 }
 
 /// status bar가 흐르는 한 줄 입력. TTY 전용(호출 측이 TTY 확인 후 사용).
@@ -229,16 +231,17 @@ fn textarea_with(content: &str) -> TextArea<'static> {
     ta
 }
 
-/// thinking 표시: status 줄(위) + spinner 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
+/// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
+/// 레이아웃은 draw_viewport와 동일하게 status를 맨 아래에 둔다(claude CLI 스타일).
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
-    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[0]);
     let frame = SPIN_FRAMES[spin.frame % SPIN_FRAMES.len()];
     let secs = spin.started.elapsed().as_secs_f32();
     f.render_widget(
         Paragraph::new(format!("{frame} {} ({secs:.1}s)", spin.label)).dim(),
-        rows[1],
+        rows[0],
     );
+    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[1]);
 }
 
 /// ChatLoop 본체 — terminal 단독 소유. enable_raw_mode + Inline(2) viewport로 진입하고,
@@ -411,9 +414,10 @@ mod tests {
         let buf = term.backend().buffer();
         let row0: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
         let row1: String = (0..40).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(row0.contains("load 1.0"), "status row: {row0:?}");
-        assert!(row1.contains("you"), "input row: {row1:?}");
-        assert!(row1.contains("hello"), "input row: {row1:?}");
+        // 입력은 위(row0), status bar는 아래(row1) — claude CLI 스타일.
+        assert!(row0.contains("you"), "input row(위): {row0:?}");
+        assert!(row0.contains("hello"), "input row(위): {row0:?}");
+        assert!(row1.contains("load 1.0"), "status row(아래): {row1:?}");
     }
 
     // ─── 단계 4a: ansi_to_paragraph height 계산(insert_before 정확도) ──────────
@@ -475,7 +479,7 @@ mod tests {
 
     #[test]
     fn draw_thinking_renders_status_and_spinner_label() {
-        // 단계 4b: thinking 표시는 status 줄(위) + spinner+라벨 줄(아래).
+        // thinking 표시는 spinner+라벨 줄(위 row0) + status 줄(아래 row1, claude CLI 스타일).
         let spin = super::SpinState {
             label: "thinking".into(),
             frame: 0,
@@ -487,8 +491,8 @@ mod tests {
         let buf = term.backend().buffer();
         let row0: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
         let row1: String = (0..40).map(|x| buf[(x, 1)].symbol()).collect();
-        assert!(row0.contains("load 1.0"), "status row: {row0:?}");
-        assert!(row1.contains("thinking"), "spinner row: {row1:?}");
+        assert!(row0.contains("thinking"), "spinner row(위): {row0:?}");
+        assert!(row1.contains("load 1.0"), "status row(아래): {row1:?}");
     }
 
     #[test]
