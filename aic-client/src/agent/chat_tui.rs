@@ -24,6 +24,7 @@ use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewp
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
 use super::sys_sampler::SysSampler;
 
@@ -37,10 +38,11 @@ pub(crate) enum ChatLine {
 pub(crate) fn draw_viewport(f: &mut Frame, status: &str, textarea: &TextArea, prompt: &str) {
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
     f.render_widget(Paragraph::new(status.to_string()).dim(), rows[0]);
-    // 입력 줄: prompt + textarea를 가로로.
+    // 입력 줄: prompt + textarea를 가로로. prompt 폭은 byte가 아닌 **display width**로 잡는다
+    // (◇/❯는 3바이트 1~2셀 — byte로 잡으면 입력이 과도하게 밀린다).
+    let prompt_w = UnicodeWidthStr::width(prompt) as u16;
     let input_cols =
-        Layout::horizontal([Constraint::Length(prompt.len() as u16), Constraint::Min(0)])
-            .split(rows[1]);
+        Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)]).split(rows[1]);
     f.render_widget(Paragraph::new(prompt.to_string()), input_cols[0]);
     f.render_widget(textarea, input_cols[1]);
 }
