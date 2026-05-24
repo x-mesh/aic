@@ -81,7 +81,9 @@ impl ChatOut {
                         block.push('\n');
                     }
                 }
-                block.push_str(&repl::format_with_border(&main));
+                // 전면 TUI는 화면 폭 wrap을 ratatui Paragraph가 하므로 사전 wrap 끔(critic B1).
+                // think 요약은 한 줄이라 wrap 무관 → format_think_summary 그대로.
+                block.push_str(&repl::format_with_border_raw(&main));
                 let _ = tx.send(super::chat_tui::OutMsg::Answer(block)).await;
             }
         }
