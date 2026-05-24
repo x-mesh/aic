@@ -17,8 +17,8 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::Stylize;
-use ratatui::text::Text;
+use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
@@ -231,6 +231,52 @@ fn textarea_with(content: &str) -> TextArea<'static> {
     ta
 }
 
+/// 단계 6: 입력이 `/명령`(공백 전, 첫 토큰)이면 매칭되는 slash 후보를 돌려준다(자동완성 popup용).
+/// `/`가 아니거나 인자 입력 중(공백 포함)이면 빈 vec → popup 미표시.
+fn slash_candidates(input: &str) -> Vec<&'static str> {
+    let Some(rest) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if rest.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    super::tool_record::SLASH_COMMANDS
+        .iter()
+        .filter(|c| c.starts_with(rest))
+        .copied()
+        .collect()
+}
+
+/// popup(slash 후보) 활성 시 viewport: 입력 줄(위) + 후보 1줄(아래, status 자리). 선택은 reverse,
+/// 나머지는 dim. ratatui Inline은 동적 높이가 없어 status를 잠시 후보로 대체한다(`/` 입력 중에만).
+fn draw_viewport_popup(
+    f: &mut Frame,
+    popup: &[&str],
+    sel: usize,
+    textarea: &TextArea,
+    prompt: &str,
+) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
+    // 입력 줄(위) — draw_viewport와 동일.
+    let prompt_w = UnicodeWidthStr::width(prompt) as u16;
+    let input_cols =
+        Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)]).split(rows[0]);
+    f.render_widget(Paragraph::new(prompt.to_string()), input_cols[0]);
+    f.render_widget(textarea, input_cols[1]);
+    // 후보 줄(아래): "▸ /local /diagnose …" — sel은 reverse, 나머지 dim.
+    let mut spans = vec![Span::raw("▸ ")];
+    for (i, c) in popup.iter().enumerate() {
+        let style = if i == sel {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(format!("/{c}"), style));
+        spans.push(Span::raw("  "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+}
+
 /// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
 /// 레이아웃은 draw_viewport와 동일하게 status를 맨 아래에 둔다(claude CLI 스타일).
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
@@ -278,6 +324,8 @@ async fn chat_loop(
     let mut history = crate::repl::load_chat_history();
     let mut hist_idx: Option<usize> = None;
     let mut draft = String::new();
+    // slash 자동완성 popup 선택 인덱스(후보는 매 루프 입력에서 재계산).
+    let mut popup_sel: usize = 0;
 
     loop {
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
@@ -287,10 +335,20 @@ async fn chat_loop(
                 last_sample = Instant::now();
             }
         }
-        // draw: spinner면 thinking 줄, 아니면 입력 줄. 실패 시 종료.
+        // slash 후보 popup 계산(입력이 `/명령` 첫 토큰일 때만). sel은 후보 수에 맞게 보정.
+        let popup = slash_candidates(&textarea.lines().join("\n"));
+        if popup.is_empty() {
+            popup_sel = 0;
+        } else if popup_sel >= popup.len() {
+            popup_sel = popup.len() - 1;
+        }
+        // draw: spinner→thinking, popup 활성→후보 줄, 아니면 입력+status. 실패 시 종료.
         let draw_ok = terminal
             .draw(|f| match &spin {
                 Some(sp) => draw_thinking(f, &status, sp),
+                None if !popup.is_empty() => {
+                    draw_viewport_popup(f, &popup, popup_sel, &textarea, &prompt)
+                }
                 None => draw_viewport(f, &status, &textarea, &prompt),
             })
             .is_ok();
@@ -310,9 +368,29 @@ async fn chat_loop(
                             (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                                 let _ = line_tx.send(ChatLine::Eof).await;
                             }
+                            // slash popup 활성: Tab=선택 후보 완성(공백 추가→popup 닫힘, 인자 입력),
+                            // ↑↓=후보 이동(아래 history ↑↓보다 우선).
+                            (KeyCode::Tab, _) if spin.is_none() && !popup.is_empty() => {
+                                textarea = textarea_with(&format!("/{} ", popup[popup_sel]));
+                            }
+                            (KeyCode::Up, _) if spin.is_none() && !popup.is_empty() => {
+                                popup_sel = if popup_sel == 0 {
+                                    popup.len() - 1
+                                } else {
+                                    popup_sel - 1
+                                };
+                            }
+                            (KeyCode::Down, _) if spin.is_none() && !popup.is_empty() => {
+                                popup_sel = (popup_sel + 1) % popup.len();
+                            }
                             // 편집·제출은 thinking 중이 아닐 때만(LLM 처리 중 입력 차단).
                             (KeyCode::Enter, _) if spin.is_none() => {
-                                let line = textarea.lines().join("\n");
+                                // popup 활성이면 선택 후보를 제출, 아니면 입력 그대로.
+                                let line = if popup.is_empty() {
+                                    textarea.lines().join("\n")
+                                } else {
+                                    format!("/{}", popup[popup_sel])
+                                };
                                 // 입력 echo를 scrollback에 남긴다(prompt + 입력, plain).
                                 let _ = insert_before_ansi(
                                     &mut terminal,
@@ -320,13 +398,14 @@ async fn chat_loop(
                                     width,
                                 );
                                 textarea = TextArea::default();
-                                // history 기록(메모리 + 파일, reedline과 동일 파일) 후 탐색 상태 리셋.
+                                // history 기록(메모리 + 파일, reedline과 동일 파일) 후 탐색/popup 리셋.
                                 if crate::repl::should_record_history(&line) {
                                     crate::repl::append_chat_history(&line);
                                     history.push(line.clone());
                                 }
                                 hist_idx = None;
                                 draft.clear();
+                                popup_sel = 0;
                                 let _ = line_tx.send(ChatLine::Line(line)).await;
                             }
                             // ↑: 이전 history. 첫 ↑는 편집 중이던 입력을 draft에 보존.
@@ -475,6 +554,32 @@ mod tests {
         assert_eq!(ta.lines().join("\n"), "가나다 hello");
         let empty = super::textarea_with("");
         assert_eq!(empty.lines().join("\n"), "");
+    }
+
+    #[test]
+    fn slash_candidates_filters_by_prefix() {
+        // 단계 6: `/명령` 첫 토큰 prefix 매칭. / 아님·인자(공백) 입력 중엔 빈 vec(popup 닫힘).
+        assert!(super::slash_candidates("/lo").contains(&"local"));
+        assert!(super::slash_candidates("/d").contains(&"diagnose"));
+        assert!(super::slash_candidates("/d").contains(&"doctor"));
+        assert_eq!(super::slash_candidates("/help"), vec!["help"]);
+        assert!(super::slash_candidates("hello").is_empty(), "/ 아님");
+        assert!(super::slash_candidates("/local ").is_empty(), "공백=인자 입력→닫힘");
+        assert!(super::slash_candidates("/").len() >= 10, "/ 단독은 전체 후보");
+    }
+
+    #[test]
+    fn draw_viewport_popup_shows_input_and_candidates() {
+        let ta = super::textarea_with("/lo");
+        let mut term = Terminal::new(TestBackend::new(60, 2)).unwrap();
+        term.draw(|f| super::draw_viewport_popup(f, &["local", "last"], 0, &ta, "you ❯ "))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row0: String = (0..60).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..60).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(row0.contains("lo"), "입력 줄(위): {row0:?}");
+        assert!(row1.contains("local"), "후보 줄(아래): {row1:?}");
+        assert!(row1.contains("last"), "후보 줄(아래): {row1:?}");
     }
 
     #[test]
