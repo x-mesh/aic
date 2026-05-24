@@ -137,6 +137,14 @@ impl ChatOut {
     fn is_direct(&self) -> bool {
         matches!(self, ChatOut::Direct { .. })
     }
+
+    /// 컨텍스트 토큰 추정치를 status bar에 전달한다. Tui면 `OutMsg::Ctx`, Direct면 no-op
+    /// (Direct status bar는 시스템 지표만 표시하며 토큰 표시 자리가 없다).
+    async fn send_ctx(&self, tokens: usize) {
+        if let ChatOut::Tui(tx) = self {
+            let _ = tx.send(super::chat_tui::OutMsg::Ctx(tokens)).await;
+        }
+    }
 }
 
 pub struct AgentSession {
@@ -318,6 +326,9 @@ impl AgentSession {
             self.out.note(&banner).await;
         }
 
+        // 시작 시 1회 컨텍스트 토큰 표시(preface seed 후 — 보통 system 프롬프트만 있는 상태).
+        self.out.send_ctx(self.estimate_tokens()).await;
+
         loop {
             let line = match handle.recv_line().await {
                 super::chat_tui::ChatLine::Eof => break,
@@ -338,6 +349,8 @@ impl AgentSession {
                     .await;
                 self.handle_slash(cmd).await;
                 self.out.spin_stop().await;
+                // /clear 등으로 history가 바뀔 수 있어 매 처리 후 토큰 표시 갱신.
+                self.out.send_ctx(self.estimate_tokens()).await;
                 continue;
             }
             let user_text = self.build_user_message(input);
@@ -345,6 +358,8 @@ impl AgentSession {
             if let Err(e) = self.run_turn().await {
                 self.out.note(&format!("LLM 요청 실패: {e}")).await;
             }
+            // 턴 처리(답변/도구 호출로 history 증가) 후 토큰 표시 갱신.
+            self.out.send_ctx(self.estimate_tokens()).await;
         }
 
         // raw mode 복원 보장(Shutdown + task join).
@@ -597,6 +612,13 @@ impl AgentSession {
         use tool_record::SlashCommand;
         match cmd {
             SlashCommand::Help => self.out.note(&tool_record::help_text()).await,
+            SlashCommand::Clear => {
+                // history[0]=system preface는 유지하고 이후 대화 턴만 비운다(컨텍스트 리셋).
+                self.history.truncate(1);
+                self.out
+                    .note("대화 컨텍스트를 초기화했습니다 (시스템 프롬프트 유지).")
+                    .await;
+            }
             SlashCommand::Last(n) => {
                 self.out
                     .note(&tool_record::render_last(&self.tool_records, n))
@@ -1182,6 +1204,24 @@ impl AgentSession {
             .await;
         // collect_local_snapshot은 redaction/timeout/cap/corr/ring을 그대로 적용한다. LLM 미전송.
         let _ = self.collect_local_snapshot(probes, true).await;
+    }
+
+    /// 컨텍스트 토큰 **추정치** — provider 응답에 usage가 없어 history의 모든 메시지 content
+    /// 문자 수 합을 4로 나눈 근사값(영문 ≈4자/토큰)을 쓴다. tool_calls 자체(인자 JSON)는 제외하고
+    /// Assistant content·Tool content만 센다(표시용 근사라 정밀도보다 일관성 우선).
+    fn estimate_tokens(&self) -> usize {
+        let chars: usize = self
+            .history
+            .iter()
+            .map(|m| match m {
+                ChatMessage::System(c) | ChatMessage::User(c) => c.chars().count(),
+                ChatMessage::Assistant { content, .. } => {
+                    content.as_ref().map(|c| c.chars().count()).unwrap_or(0)
+                }
+                ChatMessage::Tool { content, .. } => content.chars().count(),
+            })
+            .sum();
+        chars / 4
     }
 
     /// 사용자 입력에 언어 지시 + (첫 턴) 직전 명령 컨텍스트를 붙인다.

@@ -160,6 +160,8 @@ pub(crate) enum OutMsg {
     SpinStart(String),
     /// thinking 표시 종료 → 입력 줄 복귀.
     SpinStop,
+    /// 컨텍스트 토큰 추정치(history 문자 수/4) → status bar 끝에 ` · ctx ~Nk` 표시.
+    Ctx(usize),
     /// 루프 종료 — raw mode 복원 후 task 종료.
     Shutdown,
 }
@@ -503,6 +505,39 @@ fn log_area_height(total_height: u16, popup_n: u16) -> u16 {
     total_height.saturating_sub(popup_n + 3).max(1)
 }
 
+/// status 문자열 끝에 컨텍스트 토큰 추정치를 ` · ctx ~Nk`로 덧붙인다(0이면 생략). 순수 함수.
+/// N = tokens/1000(1000 단위 k 절삭). `~`로 추정 표기(provider usage가 아닌 문자수/4 추정).
+fn status_with_ctx(status: &str, ctx_tokens: usize) -> String {
+    if ctx_tokens == 0 {
+        status.to_string()
+    } else {
+        format!("{status} · ctx ~{}k", ctx_tokens / 1000)
+    }
+}
+
+/// 검색 모드 search bar 텍스트(입력 줄 대체). `/{query}  (idx/total)`. hit가 없으면 `(0/0)`.
+/// idx는 1-based로 표시(hit가 있을 때만). 순수 함수.
+fn search_bar(query: &str, idx: usize, total: usize) -> String {
+    let counter = if total == 0 {
+        "(0/0)".to_string()
+    } else {
+        format!("({}/{})", idx + 1, total)
+    };
+    format!("/{query}  {counter}")
+}
+
+/// 검색 쿼리로 매칭되는 log 인덱스를 모은다(부분 문자열 포함). 빈 쿼리는 빈 vec. 순수 함수.
+fn search_hits_for(log: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    log.iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(query))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
 /// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
 /// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
@@ -546,6 +581,12 @@ async fn chat_loop(
     let mut draft = String::new();
     // slash 자동완성 popup 선택 인덱스(후보는 매 루프 입력에서 재계산).
     let mut popup_sel: usize = 0;
+    // 컨텍스트 토큰 추정치(session이 OutMsg::Ctx로 push). status bar 끝에 ` · ctx ~Nk`로 표시.
+    let mut ctx_tokens: usize = 0;
+    // 로그 검색 모드(Ctrl+F): Some=검색 중(쿼리), hits=매칭 log 인덱스, idx=현재 hit.
+    let mut search: Option<String> = None;
+    let mut search_hits: Vec<usize> = Vec::new();
+    let mut search_idx: usize = 0;
 
     loop {
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
@@ -561,7 +602,8 @@ async fn chat_loop(
         // 화면에 실제로 표시 가능한 수(pop_n)로 제한 — 작은 터미널에서 보이는 후보와 제출되는 후보가
         // 어긋나는 것을 막는다(codex P2: take(pop_n) 표시 vs popup[popup_sel] 제출 불일치).
         let area = terminal.get_frame().area();
-        let pop_n = if spin.is_some() {
+        // 검색 모드에선 slash popup을 막는다(검색 우선, 입력 줄을 search bar로 대체).
+        let pop_n = if spin.is_some() || search.is_some() {
             0
         } else {
             popup.len().min(area.height.saturating_sub(4) as usize)
@@ -585,11 +627,23 @@ async fn chat_loop(
             scroll = scroll.min(max);
         }
         let draw_scroll = scroll;
+        // status 끝에 컨텍스트 토큰 추정치를 덧붙인다(0이면 생략).
+        let status_line = status_with_ctx(&status, ctx_tokens);
+        // 검색 모드면 입력 줄 대신 search bar(`/{query}  (idx/total)`)를 그린다(prompt는 빈 문자열로
+        // 둬 textarea가 search bar 전체를 차지하게). popup은 위에서 막았고, spin도 검색 중엔 없다.
+        let search_ta;
+        let (draw_ta, draw_prompt): (&TextArea, &str) = match &search {
+            Some(q) => {
+                search_ta = textarea_with(&search_bar(q, search_idx, search_hits.len()));
+                (&search_ta, "")
+            }
+            None => (&textarea, prompt.as_str()),
+        };
         let draw_ok = terminal
             .draw(|f| {
                 draw_full(
-                    f, &log_text, draw_scroll, &status, &textarea, &prompt, &popup, popup_sel,
-                    spin_ref,
+                    f, &log_text, draw_scroll, &status_line, draw_ta, draw_prompt, &popup,
+                    popup_sel, spin_ref,
                 )
             })
             .is_ok();
@@ -607,10 +661,84 @@ async fn chat_loop(
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // 검색 모드(Ctrl+F): 입력 줄을 search bar로 대체하고 키를 검색에 전용한다.
+                    // textarea 편집·slash popup·history ↑↓는 비활성(검색 우선). Ctrl+C/D는 항상 EOF.
+                    Some(Ok(Event::Key(k))) if search.is_some() => {
+                        let query = search.take().unwrap();
+                        match (k.code, k.modifiers) {
+                            (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                                let _ = line_tx.send(ChatLine::Eof).await;
+                                search = Some(query);
+                            }
+                            // Esc: 검색 종료(follow 복귀).
+                            (KeyCode::Esc, _) => {
+                                search = None;
+                                search_hits.clear();
+                                search_idx = 0;
+                            }
+                            // Enter/n: 다음 hit, N: 이전 hit. hit로 scroll 이동(follow 해제).
+                            (KeyCode::Enter, _) | (KeyCode::Char('n'), _) => {
+                                if !search_hits.is_empty() {
+                                    search_idx = (search_idx + 1) % search_hits.len();
+                                    follow = false;
+                                    scroll = (search_hits[search_idx] as u16).min(max);
+                                }
+                                search = Some(query);
+                            }
+                            (KeyCode::Char('N'), _) => {
+                                if !search_hits.is_empty() {
+                                    search_idx = if search_idx == 0 {
+                                        search_hits.len() - 1
+                                    } else {
+                                        search_idx - 1
+                                    };
+                                    follow = false;
+                                    scroll = (search_hits[search_idx] as u16).min(max);
+                                }
+                                search = Some(query);
+                            }
+                            // Backspace: 쿼리 한 글자 삭제 → hits 재계산.
+                            (KeyCode::Backspace, _) => {
+                                let mut q = query;
+                                q.pop();
+                                search_hits = search_hits_for(&log, &q);
+                                search_idx = 0;
+                                if !search_hits.is_empty() {
+                                    follow = false;
+                                    scroll = (search_hits[0] as u16).min(max);
+                                }
+                                search = Some(q);
+                            }
+                            // 일반 문자: 쿼리에 append → hits 재계산, 첫 hit로 이동.
+                            (KeyCode::Char(c), m)
+                                if !m.contains(KeyModifiers::CONTROL)
+                                    && !m.contains(KeyModifiers::ALT) =>
+                            {
+                                let mut q = query;
+                                q.push(c);
+                                search_hits = search_hits_for(&log, &q);
+                                search_idx = 0;
+                                if !search_hits.is_empty() {
+                                    follow = false;
+                                    scroll = (search_hits[0] as u16).min(max);
+                                }
+                                search = Some(q);
+                            }
+                            _ => {
+                                search = Some(query);
+                            }
+                        }
+                    }
                     Some(Ok(Event::Key(k))) => {
                         match (k.code, k.modifiers) {
                             (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                                 let _ = line_tx.send(ChatLine::Eof).await;
+                            }
+                            // Ctrl+F: 로그 검색 모드 진입(spin 없을 때만). 빈 쿼리로 시작.
+                            (KeyCode::Char('f'), KeyModifiers::CONTROL) if spin.is_none() => {
+                                search = Some(String::new());
+                                search_hits.clear();
+                                search_idx = 0;
                             }
                             // PageUp/Down: 로그 스크롤(popup 활성과 무관하게 동작 — ↑↓는 popup 우선,
                             // PageUp/Down은 항상 로그). PageUp이면 follow 해제, PageDown으로 최하단
@@ -738,6 +866,9 @@ async fn chat_loop(
                     }
                     Some(OutMsg::SpinStop) => {
                         spin = None;
+                    }
+                    Some(OutMsg::Ctx(n)) => {
+                        ctx_tokens = n;
                     }
                     Some(OutMsg::Shutdown) | None => break,
                 }
@@ -977,6 +1108,69 @@ mod tests {
         let row1: String = (0..40).map(|x| buf[(x, 1)].symbol()).collect();
         assert!(row0.contains("thinking"), "spinner row(위): {row0:?}");
         assert!(row1.contains("load 1.0"), "status row(아래): {row1:?}");
+    }
+
+    #[test]
+    fn status_with_ctx_appends_token_estimate() {
+        // 0이면 status 그대로(표시 생략), >0이면 ` · ctx ~Nk`(1000 단위 절삭).
+        assert_eq!(super::status_with_ctx("· load 1.0", 0), "· load 1.0");
+        assert_eq!(super::status_with_ctx("· load", 12_345), "· load · ctx ~12k");
+        // 1000 미만은 ~0k(있다는 신호). 정확 1000 = ~1k.
+        assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~0k");
+        assert_eq!(super::status_with_ctx("s", 1000), "s · ctx ~1k");
+    }
+
+    #[test]
+    fn search_bar_formats_query_and_counter() {
+        // hit 없으면 (0/0), 있으면 1-based (idx+1/total).
+        assert_eq!(super::search_bar("err", 0, 0), "/err  (0/0)");
+        assert_eq!(super::search_bar("err", 0, 3), "/err  (1/3)");
+        assert_eq!(super::search_bar("err", 2, 3), "/err  (3/3)");
+        assert_eq!(super::search_bar("", 0, 0), "/  (0/0)");
+    }
+
+    #[test]
+    fn search_hits_for_filters_matching_lines() {
+        let log = vec![
+            "first error".to_string(),
+            "ok".to_string(),
+            "another error here".to_string(),
+            "done".to_string(),
+        ];
+        assert_eq!(super::search_hits_for(&log, "error"), vec![0, 2]);
+        assert_eq!(super::search_hits_for(&log, "ok"), vec![1]);
+        assert!(super::search_hits_for(&log, "zzz").is_empty(), "매칭 없음");
+        // 빈 쿼리는 hit 없음(검색 시작 직후 전체 매칭 방지).
+        assert!(super::search_hits_for(&log, "").is_empty(), "빈 쿼리");
+    }
+
+    #[test]
+    fn draw_full_renders_search_bar_as_input_line() {
+        // 검색 모드 표현 검증: search bar 텍스트를 입력 줄(prompt="")로 그리면 그대로 보인다.
+        let log = Text::from("L0\nfound it\nL2");
+        let bar = super::search_bar("found", 0, 1);
+        let ta = super::textarea_with(&bar);
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "", &[], 0, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        assert!(row(5).contains("/found"), "search bar(입력 줄): {:?}", row(5));
+        assert!(row(5).contains("(1/1)"), "카운터: {:?}", row(5));
+    }
+
+    #[test]
+    fn draw_full_status_shows_ctx_tokens() {
+        // status 끝에 ctx 토큰이 합쳐져 그려지는지(status_line 합성 후 draw_full로).
+        let log = Text::from("x");
+        let ta = super::textarea_with("hi");
+        let status = super::status_with_ctx("· load", 12_000);
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| super::draw_full(f, &log, 0, &status, &ta, "you ❯ ", &[], 0, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row5: String = (0..40).map(|x| buf[(x, 5)].symbol()).collect();
+        assert!(row5.contains("ctx ~12k"), "status에 ctx: {row5:?}");
     }
 
     #[test]
