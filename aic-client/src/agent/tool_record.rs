@@ -163,6 +163,8 @@ pub(crate) enum SlashCommand {
     Help,
     /// `/clear` — 대화 컨텍스트 리셋(시스템 프롬프트 유지). LLM 미호출.
     Clear,
+    /// `/resume` — 이전 세션 대화(`~/.aic/sessions/last.json`)를 history에 복원. LLM 미호출.
+    Resume,
     /// `/last`(None) / `/last N`(Some).
     Last(Option<usize>),
     /// `/raw`(None=마지막) / `/raw <seq|corr>`(Some).
@@ -261,6 +263,7 @@ fn resolve_slash_command(typed: &str) -> Resolution {
 pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "help",
     "clear",
+    "resume",
     "last",
     "raw",
     "local",
@@ -303,6 +306,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
     match name {
         "help" => "이 도움말 표시",
         "clear" => "대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
+        "resume" => "이전 세션 대화 복원 (~/.aic/sessions/last.json)",
         "last" => "직전 tool 카드 / 최근 N개 요약",
         "raw" => "마지막(또는 지정) tool의 redacted 전체 출력",
         "local" => "로컬 sysinfo 스냅샷 LLM 분석 (--raw=원본만; alias: sys, snapshot)",
@@ -374,6 +378,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
     Some(match cmd.as_str() {
         "help" | "?" => SlashCommand::Help,
         "clear" => SlashCommand::Clear,
+        "resume" => SlashCommand::Resume,
         "last" => SlashCommand::Last(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "raw" => SlashCommand::Raw(parts.next().map(|s| s.to_string())),
         "local" | "sys" | "snapshot" => {
@@ -690,6 +695,7 @@ pub(crate) fn help_text() -> String {
         "slash 명령 (대화 history에 안 들어감, 출력은 화면에만):",
         "  /help                이 도움말",
         "  /clear               대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
+        "  /resume              이전 세션 대화 복원 (~/.aic/sessions/last.json)",
         "  /last [N]            직전 tool 카드 / 최근 N개 요약",
         "  /raw [seq|corr]      마지막(또는 지정) tool의 redacted 전체 출력",
         "  /local [section] [--raw]  로컬 sysinfo 스냅샷 → LLM 분석 요약 (alias: /sys, /snapshot)",
