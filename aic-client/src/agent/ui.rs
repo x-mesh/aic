@@ -104,11 +104,15 @@ pub(crate) fn print_status_bar(line: &str) {
 /// banner 라인들. rich면 ASCII art, 아니면 plain 1줄. 순수 함수(테스트 가능).
 pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
     if rich {
+        // figlet 'aic' + 옆에 미니 봇 마스코트(머리/눈/턱). chat 라벨은 눈 줄에 둔다.
         vec![
-            r"   __ _ (_)  ___ ".to_string(),
-            r"  / _` || | / __|".to_string(),
-            r" | (_| || || (__ ".to_string(),
-            format!(r"  \__,_||_| \___|   chat v{}", env!("CARGO_PKG_VERSION")),
+            r"   __ _ (_)  ___      ▗▄▖".to_string(),
+            format!(
+                r"  / _` || | / __|     ▌◉ ◉▌   chat v{}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            r" | (_| || || (__      ▝▀▀▘".to_string(),
+            r"  \__,_||_| \___|".to_string(),
         ]
     } else {
         vec![format!(
