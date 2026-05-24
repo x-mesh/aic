@@ -220,7 +220,9 @@ impl AgentSession {
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        if tty && super::debug::env_truthy("AIC_CHAT_TUI") {
+        // TTY는 기본 ratatui chat TUI(입력 아래 status bar, claude CLI 스타일). reedline(slash
+        // 자동완성 메뉴·구식 history)을 원하면 `AIC_NO_TUI=1`로 opt-out. non-TTY/파이프는 항상 Direct.
+        if tty && !super::debug::env_truthy("AIC_NO_TUI") {
             self.run_loop_tui().await
         } else {
             self.run_loop_direct().await
