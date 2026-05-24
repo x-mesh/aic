@@ -558,6 +558,15 @@ async fn chat_loop(
         // slash 후보 popup 계산(입력이 `/명령` 첫 토큰일 때만). MAX_POPUP로 제한, sel 보정.
         let mut popup = slash_candidates(&textarea.lines().join("\n"));
         popup.truncate(MAX_POPUP);
+        // 화면에 실제로 표시 가능한 수(pop_n)로 제한 — 작은 터미널에서 보이는 후보와 제출되는 후보가
+        // 어긋나는 것을 막는다(codex P2: take(pop_n) 표시 vs popup[popup_sel] 제출 불일치).
+        let area = terminal.get_frame().area();
+        let pop_n = if spin.is_some() {
+            0
+        } else {
+            popup.len().min(area.height.saturating_sub(4) as usize)
+        };
+        popup.truncate(pop_n);
         if popup.is_empty() {
             popup_sel = 0;
         } else if popup_sel >= popup.len() {
@@ -567,13 +576,7 @@ async fn chat_loop(
         // draw: 전면 레이아웃(로그·popup·입력·구분선·status). scroll clamp/follow를 draw_full
         // 내부 레이아웃과 동일 공식으로 계산해 정합시킨다(로그 높이 = 전체 - popup_n - 3).
         let spin_ref = spin.as_ref();
-        // popup 높이는 draw_full과 같은 규칙(spin 중 0, 아니면 가용으로 clamp).
-        let area = terminal.get_frame().area();
-        let pop_n = if spin.is_some() {
-            0
-        } else {
-            popup.len().min(area.height.saturating_sub(4) as usize) as u16
-        };
+        let pop_n = pop_n as u16;
         let log_h = log_area_height(area.height, pop_n);
         let max = log_scroll_max(&log_text, area.width, log_h);
         if follow {
