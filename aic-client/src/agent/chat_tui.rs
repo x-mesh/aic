@@ -594,8 +594,10 @@ async fn chat_loop(
             break;
         }
 
-        // tick: spinner 애니메이션 100ms, 평상시 status 흐름 200ms.
-        let tick = Duration::from_millis(if spin.is_some() { 100 } else { 200 });
+        // tick: spinner 애니메이션 100ms(처리 중, 부드러운 회전), 평상시 status 흐름 1초.
+        // status 숫자는 어차피 2초마다 갱신(sample)이고 키 입력은 이벤트 기반(즉시)이라, 평상시
+        // redraw를 1초로 둬도 반응성·흐름에 영향 없이 아이들 wake를 줄인다.
+        let tick = Duration::from_millis(if spin.is_some() { 100 } else { 1000 });
         // PageUp/Down 점프 폭(로그 높이의 절반, 최소 1).
         let page = (log_h / 2).max(1);
 
