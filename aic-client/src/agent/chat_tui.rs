@@ -11,6 +11,8 @@ use std::io::{self};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
+use crossterm::event::EventStream;
+use futures::StreamExt;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -19,6 +21,8 @@ use ratatui::style::Stylize;
 use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 
 use super::sys_sampler::SysSampler;
@@ -129,6 +133,217 @@ pub(crate) fn insert_before_ansi<B: Backend>(
     })
 }
 
+// ─── 단계 4b: ChatLoop — terminal 단독 소유 task + EventStream select! 루프 ─────
+//
+// terminal을 만지는 주체를 이 task 하나로 한정한다(Arc/Mutex/Rc 없음 → Send 위반·데드락 구조적
+// 제거, RFC-004 critic B1/B2). session은 채널 핸들(Send)만 들고: 입력은 line_rx로 받고, 답변/카드/
+// spinner 토글은 out_tx로 보낸다. status bar tick은 이 루프가 독립적으로 돌려 LLM await 중에도 흐른다.
+
+/// session → ChatLoop 메시지.
+pub(crate) enum OutMsg {
+    /// LLM 답변 블록(ANSI 포함) → viewport 위 scrollback에 insert_before.
+    Answer(String),
+    /// UI/tool 카드/슬래시 출력(ANSI 포함) → insert_before(answer와 동일 경로, 의미 구분만).
+    Note(String),
+    /// thinking 표시 시작(라벨). viewport 입력 줄을 spinner 줄로 대체한다.
+    SpinStart(String),
+    /// thinking 표시 종료 → 입력 줄 복귀.
+    SpinStop,
+    /// 루프 종료 — raw mode 복원 후 task 종료.
+    Shutdown,
+}
+
+/// session이 ChatLoop와 통신하는 핸들. terminal은 task가 소유하므로 여기엔 채널만 있다.
+pub(crate) struct ChatHandle {
+    line_rx: mpsc::Receiver<ChatLine>,
+    out_tx: mpsc::Sender<OutMsg>,
+    join: JoinHandle<()>,
+}
+
+impl ChatHandle {
+    /// 입력 한 줄을 받는다(ChatLoop가 Enter로 보냄). 채널이 닫히면 EOF로 본다.
+    pub(crate) async fn recv_line(&mut self) -> ChatLine {
+        self.line_rx.recv().await.unwrap_or(ChatLine::Eof)
+    }
+
+    /// 출력/스핀 메시지를 보낸다(채널이 닫혔으면 무시 — 종료 중).
+    pub(crate) async fn send(&self, msg: OutMsg) {
+        let _ = self.out_tx.send(msg).await;
+    }
+
+    /// 종료: Shutdown 후 task join으로 raw mode 복원을 보장한다.
+    pub(crate) async fn shutdown(self) {
+        let _ = self.out_tx.send(OutMsg::Shutdown).await;
+        let _ = self.join.await;
+    }
+}
+
+/// raw mode에서 패닉이 나도 터미널을 복원하도록 패닉 훅을 1회 설치한다(m5). 기존 훅은 보존해
+/// 호출한다(panic 메시지·backtrace 유지).
+fn install_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            prev(info);
+        }));
+    });
+}
+
+/// ChatLoop task를 띄우고 핸들을 돌려준다. TTY 전용(호출 측이 확인). `with_statusbar`면 2초마다
+/// 시스템 지표를 status bar에 갱신한다(non-TTY/opt-out은 호출 측에서 Direct 경로로 우회).
+pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandle {
+    install_panic_hook();
+    let (line_tx, line_rx) = mpsc::channel::<ChatLine>(8);
+    let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
+    let join = tokio::spawn(chat_loop(line_tx, out_rx, prompt, with_statusbar));
+    ChatHandle {
+        line_rx,
+        out_tx,
+        join,
+    }
+}
+
+const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// thinking 표시 상태(spinner 애니메이션 프레임 + 경과).
+struct SpinState {
+    label: String,
+    frame: usize,
+    started: Instant,
+}
+
+/// thinking 표시: status 줄(위) + spinner 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
+fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(f.area());
+    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[0]);
+    let frame = SPIN_FRAMES[spin.frame % SPIN_FRAMES.len()];
+    let secs = spin.started.elapsed().as_secs_f32();
+    f.render_widget(
+        Paragraph::new(format!("{frame} {} ({secs:.1}s)", spin.label)).dim(),
+        rows[1],
+    );
+}
+
+/// ChatLoop 본체 — terminal 단독 소유. enable_raw_mode + Inline(2) viewport로 진입하고,
+/// `tokio::select!`로 (키 입력 / status·spinner tick / 출력 메시지)를 한 곳에서 처리한다.
+/// 종료(Shutdown/stream EOF/draw 실패) 시 viewport를 정리하고 raw mode를 복원한다.
+async fn chat_loop(
+    line_tx: mpsc::Sender<ChatLine>,
+    mut out_rx: mpsc::Receiver<OutMsg>,
+    prompt: String,
+    with_statusbar: bool,
+) {
+    if enable_raw_mode().is_err() {
+        return;
+    }
+    let mut terminal = match Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions {
+            viewport: Viewport::Inline(2),
+        },
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            let _ = disable_raw_mode();
+            return;
+        }
+    };
+    let mut textarea = TextArea::default();
+    let mut events = EventStream::new();
+    let mut sampler = with_statusbar.then(SysSampler::new);
+    let mut status = String::from("· (collecting metrics…)");
+    let mut last_sample = Instant::now();
+    let mut spin: Option<SpinState> = None;
+
+    loop {
+        // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
+        if let Some(s) = sampler.as_mut() {
+            if last_sample.elapsed().as_secs() >= 2 || status.starts_with("· (") {
+                status = format!("· {}", s.sample().status_line());
+                last_sample = Instant::now();
+            }
+        }
+        // draw: spinner면 thinking 줄, 아니면 입력 줄. 실패 시 종료.
+        let draw_ok = terminal
+            .draw(|f| match &spin {
+                Some(sp) => draw_thinking(f, &status, sp),
+                None => draw_viewport(f, &status, &textarea, &prompt),
+            })
+            .is_ok();
+        if !draw_ok {
+            break;
+        }
+
+        // tick: spinner 애니메이션 100ms, 평상시 status 흐름 200ms. width는 answer wrap과 동일 소스.
+        let tick = Duration::from_millis(if spin.is_some() { 100 } else { 200 });
+        let width = super::ui::render_width() as u16;
+
+        tokio::select! {
+            maybe_ev = events.next() => {
+                match maybe_ev {
+                    Some(Ok(Event::Key(k))) => {
+                        match (k.code, k.modifiers) {
+                            (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                                let _ = line_tx.send(ChatLine::Eof).await;
+                            }
+                            // 편집·제출은 thinking 중이 아닐 때만(LLM 처리 중 입력 차단).
+                            (KeyCode::Enter, _) if spin.is_none() => {
+                                let line = textarea.lines().join("\n");
+                                // 입력 echo를 scrollback에 남긴다(prompt + 입력, plain).
+                                let _ = insert_before_ansi(
+                                    &mut terminal,
+                                    &format!("{prompt}{line}"),
+                                    width,
+                                );
+                                textarea = TextArea::default();
+                                let _ = line_tx.send(ChatLine::Line(line)).await;
+                            }
+                            _ if spin.is_none() => {
+                                textarea.input(k);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Key 외 이벤트(Resize/Mouse/Focus/Paste)는 무시 — Resize는 다음 루프 draw가
+                    // 새 크기로 자동 반영(ratatui #2086 best-effort).
+                    Some(Ok(_)) => {}
+                    // 일시 입력 오류는 무시(다음 tick에 재시도).
+                    Some(Err(_)) => {}
+                    // stream 종료 = EOF.
+                    None => {
+                        let _ = line_tx.send(ChatLine::Eof).await;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(tick) => {
+                if let Some(sp) = spin.as_mut() {
+                    sp.frame = sp.frame.wrapping_add(1);
+                }
+            }
+            msg = out_rx.recv() => {
+                match msg {
+                    Some(OutMsg::Answer(s)) | Some(OutMsg::Note(s)) => {
+                        let _ = insert_before_ansi(&mut terminal, &s, width);
+                    }
+                    Some(OutMsg::SpinStart(label)) => {
+                        spin = Some(SpinState { label, frame: 0, started: Instant::now() });
+                    }
+                    Some(OutMsg::SpinStop) => {
+                        spin = None;
+                    }
+                    Some(OutMsg::Shutdown) | None => break,
+                }
+            }
+        }
+    }
+
+    let _ = terminal.clear();
+    let _ = disable_raw_mode();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +410,24 @@ mod tests {
         let span = &t.lines[0].spans[0];
         assert_eq!(span.content, "blue");
         assert_eq!(span.style.fg, Some(ratatui::style::Color::Blue));
+    }
+
+    #[test]
+    fn draw_thinking_renders_status_and_spinner_label() {
+        // 단계 4b: thinking 표시는 status 줄(위) + spinner+라벨 줄(아래).
+        let spin = super::SpinState {
+            label: "thinking".into(),
+            frame: 0,
+            started: Instant::now(),
+        };
+        let mut term = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        term.draw(|f| super::draw_thinking(f, "· load 1.0", &spin))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row0: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+        let row1: String = (0..40).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(row0.contains("load 1.0"), "status row: {row0:?}");
+        assert!(row1.contains("thinking"), "spinner row: {row1:?}");
     }
 
     #[test]

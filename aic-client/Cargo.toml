@@ -64,6 +64,9 @@ flate2 = "1"
 tar = "0.4"
 # RFC-004 step 4: ANSI escape(답변/카드 색) → ratatui Text 변환(insert_before용). 7.x=ratatui 0.29 정합(8.x는 0.30+ 금지).
 ansi-to-tui = "7"
+# RFC-004 step 4b: ChatLoop의 async 키 입력(EventStream) — ratatui 0.29와 동일한 0.28.1에 event-stream
+# feature만 더한다(feature unification, 중복 crate 없음). tokio select!로 키 vs status tick vs 출력 통합.
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 [dev-dependencies]
 proptest = "1"
