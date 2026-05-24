@@ -47,7 +47,9 @@ Never run unbounded streaming commands.\n\
 for reads, and mutation/egress still require confirmation or are blocked.\n\
 - The shell is restricted (no $, globs, quotes, backslashes, redirects, ;, &). If a command is \
 blocked for that reason, propose and run a simpler safe alternative instead of giving up.\n\
-- If a tool result says output was truncated, re-run with a narrower/limited command.\n";
+- If a tool result says output was truncated, re-run with a narrower/limited command.\n\
+- If a file change is needed, use write_file/edit_file — every write goes through a user \
+confirm and is rejected outside the sandbox or on secret files.\n";
 
 /// session 화면 출력 sink (RFC-004 step 4d). 비-TTY/배너 opt-out은 `Direct`로 기존 line-based
 /// 출력(stdout=답변/stderr=UI)을 **byte-identical** 유지하고, TTY는 `Tui`로 ChatLoop에 위임해
@@ -413,6 +415,9 @@ impl AgentSession {
         let mut specs = tools::read_only_specs();
         if self.allow_run_command {
             specs.push(super::run_command::spec());
+            // 쓰기 도구는 run_command와 동일 게이트(SRE 모드)에서만 노출. read-only 세션엔 미노출.
+            specs.push(tools::write_file_spec());
+            specs.push(tools::edit_file_spec());
         }
 
         for iter in 0..MAX_ITERATIONS {
@@ -615,6 +620,21 @@ impl AgentSession {
                     &corr,
                     move |_, _, _| approved,
                 )
+            }
+        } else if call.name == "write_file" || call.name == "edit_file" {
+            // mutation 도구: 쓰기 전 미리보기를 note로 출력하고 confirm을 받는다.
+            // (sandbox 경계·secrets 위반은 confirm 후 tools::execute가 최종 거부한다.)
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let preview = build_write_preview(&call.name, &args, &self.sandbox);
+            self.out.note(&preview).await;
+            let ok = self
+                .out
+                .confirm(&format!("⚠ {path} 쓰기? [y/N]"))
+                .await;
+            if ok {
+                tools::execute(&call.name, &args, &self.sandbox)
+            } else {
+                Ok("[denied] 파일 쓰기를 사용자가 거부했습니다.".to_string())
             }
         } else {
             tools::execute(&call.name, &args, &self.sandbox)
@@ -1612,6 +1632,71 @@ fn cap_bytes(s: &str, max: usize) -> String {
     format!("{}\n…[tool 결과 truncated: {} bytes]", &s[..end], s.len())
 }
 
+/// 미리보기에서 한 줄 길이를 자를 char 상한.
+const WRITE_PREVIEW_STR_CAP: usize = 200;
+/// write_file 미리보기에서 보여줄 본문 앞부분 라인 수.
+const WRITE_PREVIEW_HEAD_LINES: usize = 10;
+
+/// char 경계를 지키며 문자열을 최대 길이로 자른다(미리보기 전용).
+fn cap_preview_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let body: String = s.chars().take(max).collect();
+    format!("{body}…")
+}
+
+/// 쓰기 도구의 변경 미리보기를 만든다(실제 쓰기 전 note로 출력). 외부 diff crate 없이
+/// 간단 라인 표시(MVP). 파일 읽기 실패는 새 파일로 간주한다(secrets/경계는 confirm 후 거부).
+fn build_write_preview(name: &str, args: &serde_json::Value, sandbox: &Sandbox) -> String {
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match name {
+        "write_file" => {
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let new_lines = content.lines().count();
+            // 대상 파일 존재 여부는 resolve_for_write로 검증된 경로의 read로 판단(실패=새 파일).
+            let existing = sandbox
+                .resolve_for_write(path)
+                .ok()
+                .and_then(|p| std::fs::read_to_string(p).ok());
+            let header = match &existing {
+                Some(old) => {
+                    let old_lines = old.lines().count();
+                    format!("[write_file] {path} 덮어쓰기 ({old_lines}줄 → {new_lines}줄)")
+                }
+                None => format!("[write_file] 새 파일 {path} ({new_lines}줄)"),
+            };
+            let head: Vec<String> = content
+                .lines()
+                .take(WRITE_PREVIEW_HEAD_LINES)
+                .map(|l| format!("  {}", cap_preview_str(l, WRITE_PREVIEW_STR_CAP)))
+                .collect();
+            let mut out = header;
+            if !head.is_empty() {
+                out.push('\n');
+                out.push_str(&head.join("\n"));
+            }
+            if new_lines > WRITE_PREVIEW_HEAD_LINES {
+                out.push_str(&format!(
+                    "\n  …[{}줄 더]",
+                    new_lines - WRITE_PREVIEW_HEAD_LINES
+                ));
+            }
+            out
+        }
+        "edit_file" => {
+            let old_string = args.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+            let new_string = args.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            format!(
+                "[edit_file] {path}\n- {}\n+ {}",
+                cap_preview_str(old_string, WRITE_PREVIEW_STR_CAP),
+                cap_preview_str(new_string, WRITE_PREVIEW_STR_CAP)
+            )
+        }
+        other => format!("[{other}] {path}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,5 +2133,58 @@ mod tests {
             "raw stdout body 누락: {snap}"
         );
         assert!(snap.contains("exit_code="), "raw exit_code 누락");
+    }
+
+    #[test]
+    fn write_preview_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path()).unwrap();
+        let args = json!({ "path": "new.txt", "content": "line1\nline2\nline3" });
+        let preview = build_write_preview("write_file", &args, &sb);
+        assert!(preview.contains("새 파일 new.txt"));
+        assert!(preview.contains("(3줄)"));
+        assert!(preview.contains("line1"));
+    }
+
+    #[test]
+    fn write_preview_overwrite_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("exists.txt"), "a\nb").unwrap();
+        let sb = Sandbox::new(dir.path()).unwrap();
+        let args = json!({ "path": "exists.txt", "content": "x\ny\nz" });
+        let preview = build_write_preview("write_file", &args, &sb);
+        assert!(preview.contains("덮어쓰기"));
+        assert!(preview.contains("2줄 → 3줄"));
+    }
+
+    #[test]
+    fn write_preview_edit_shows_diff_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path()).unwrap();
+        let args = json!({
+            "path": "f.txt",
+            "old_string": "foo",
+            "new_string": "bar"
+        });
+        let preview = build_write_preview("edit_file", &args, &sb);
+        assert!(preview.contains("[edit_file] f.txt"));
+        assert!(preview.contains("- foo"));
+        assert!(preview.contains("+ bar"));
+    }
+
+    #[test]
+    fn write_preview_caps_long_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path()).unwrap();
+        let long = "z".repeat(500);
+        let args = json!({
+            "path": "f.txt",
+            "old_string": long.clone(),
+            "new_string": "short"
+        });
+        let preview = build_write_preview("edit_file", &args, &sb);
+        // 200자 cap + 말줄임 → 원문 500자가 그대로 들어가지 않는다.
+        assert!(!preview.contains(&long));
+        assert!(preview.contains('…'));
     }
 }
