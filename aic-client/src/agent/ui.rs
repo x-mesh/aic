@@ -108,10 +108,13 @@ pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
             r"   __ _ (_)  ___ ".to_string(),
             r"  / _` || | / __|".to_string(),
             r" | (_| || || (__ ".to_string(),
-            r"  \__,_||_| \___|   chat".to_string(),
+            format!(r"  \__,_||_| \___|   chat v{}", env!("CARGO_PKG_VERSION")),
         ]
     } else {
-        vec!["aic chat — agentic SRE assistant".to_string()]
+        vec![format!(
+            "aic chat v{} — agentic SRE assistant",
+            env!("CARGO_PKG_VERSION")
+        )]
     }
 }
 

@@ -331,7 +331,13 @@ impl AgentSession {
                 continue;
             }
             if let Some(cmd) = tool_record::parse_slash(input) {
+                // slash 처리 동안 spin으로 즉시 반응 + 입력 차단(probe 수집 등으로 무반응·중복 실행
+                // 되던 문제 해소). 분석 단계의 run_analysis가 라벨을 "분석 중…"으로 덮어쓴다.
+                self.out
+                    .spin_start(format!("{input} 처리 중…"), "90")
+                    .await;
                 self.handle_slash(cmd).await;
+                self.out.spin_stop().await;
                 continue;
             }
             let user_text = self.build_user_message(input);
