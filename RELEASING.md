@@ -5,12 +5,20 @@
 ## TL;DR
 
 ```sh
-# 1. CHANGELOG의 [Unreleased]를 정리 (선택)
-# 2. workspace Cargo.toml 버전 bump
-# 3. tag + push
-git tag v0.3.0 -m "v0.3.0"
-git push origin v0.3.0
+# 1. CHANGELOG의 [Unreleased] → [X.Y.Z] 로 정리
+# 2. Cargo.toml 버전 bump (aic-common/aic-server/aic-client) + Cargo.lock 반영
+# 3. main push (tag 없이 먼저) → CI 발화
+git commit -am "chore(release): vX.Y.Z"
+git push origin main
+# 4. CI green 확인 — 실패하면 여기서 멈춘다(tag 만들지 않음)
+gh run watch "$(gh run list --workflow=ci.yml --branch main -L1 --json databaseId --jq '.[0].databaseId')" --exit-status
+# 5. green 이면 tag push → release.yml(GoReleaser + brew) 발화
+git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
 ```
+
+> **중요 — tag 는 CI green 확인 뒤에 push 한다.** main 에 branch protection 이 없어 직접 push 의 CI 는
+> *post-merge* 로 돈다. main 과 tag 를 같이 올리면 CI 가 실패해도 릴리스(GitHub Release + brew)가 그대로
+> 나간다. tag 를 분리해 CI green 을 게이트로 쓰면 깨진 릴리스를 막는다(PR/rate-limit 무관).
 
 이 한 번이 다음을 자동으로 트리거한다:
 - `.github/workflows/release.yml`이 발화 (Rust toolchain + zig + cargo-zigbuild 설치)
@@ -44,11 +52,22 @@ GoReleaser의 `brews:` block이 첫 release에서 `Formula/aic.rb`를 직접 만
 ## 정상 흐름
 
 1. 작업 브랜치를 main에 머지.
-2. CHANGELOG 정리 — `## [Unreleased]` 아래 항목들이 release notes로 그대로 노출되지는 않는다 (GoReleaser는 git log 기반). 사람이 읽을 changelog는 따로 유지.
-3. workspace Cargo.toml 버전 bump (`aic-common`/`aic-server`/`aic-client` 모두 동일 버전).
-4. `git commit -am "release: v0.3.0"`.
-5. `git tag v0.3.0 -m "v0.3.0" && git push origin main v0.3.0`.
-6. Actions 탭에서 release workflow가 그린이면 끝.
+2. CHANGELOG 정리 — `## [Unreleased]` → `## [X.Y.Z] - YYYY-MM-DD`. (release notes는 GoReleaser git log 기반이라 별개지만, 사람이 읽을 changelog로 유지.)
+3. Cargo.toml 버전 bump (`aic-common`/`aic-server`/`aic-client` 동일 버전) + `cargo update -p aic-client -p aic-common -p aic-server --precise X.Y.Z`로 Cargo.lock 반영.
+4. **(권장) 로컬 사전 검증** — CI는 phase × OS × central_store 매트릭스를 돌므로 `--lib`만으로는 놓치는 조합이 있다(예: `central_store=1`에서만 깨지는 env-의존 테스트). 최소 CI와 동일한 형태로 한 조합은 돌린다:
+
+   ```sh
+   cargo clippy --all-targets -- -D warnings
+   cargo test --workspace --no-default-features --features phase-3_5
+   AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
+   ```
+
+5. `git commit -am "chore(release): vX.Y.Z" && git push origin main` — **tag 없이 main 먼저.**
+6. **CI green 확인** — `gh run watch "$(gh run list --workflow=ci.yml --branch main -L1 --json databaseId --jq '.[0].databaseId')" --exit-status`. 빨강이면 고치고 **5번부터 다시**. tag는 만들지 않는다.
+7. green이면 `git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` — release.yml(GoReleaser + brew) 발화.
+8. Actions 탭에서 release workflow가 그린이면 끝. `brew update && brew info x-mesh/tap/aic`로 새 버전 노출 확인.
+
+> tag(7)와 main(5)을 **분리**하는 이유는 TL;DR의 경고와 같다 — CI(6)를 릴리스 게이트로 쓰기 위함. 한 줄로 `git push origin main vX.Y.Z`를 하면 이 게이트가 사라진다.
 
 ## 수동 dry-run
 
