@@ -6,8 +6,11 @@
 > 루프로 확장하는 것이 핵심이다.
 
 - 상태: Phase 0(진입점)·Phase 1(읽기 전용 agent)·Phase 2(SRE `run_command` 실행)
-  구현 완료. `run_command`는 `aic chat`에서 **기본 활성(default-on)**이며 쓰기 도구
-  (`write_file`/`edit_file`)는 아직 미구현(후속). §7.1 선행 결정 모두 확정.
+  구현 완료. `run_command`는 `aic chat`에서 **기본 활성(default-on)**. 쓰기 도구
+  (`write_file`/`edit_file`)도 **구현 완료(2026-05-25, f56b223)** — `allow_run_command`
+  게이트에서 노출, 쓰기 전 미리보기(diff/내용) note + confirm(TUI y/n UI), sandbox
+  경계(`resolve_for_write` 새 파일 지원, `..`/symlink/절대경로/secrets/.git 거부).
+  §7.1 선행 결정 모두 확정.
 - 작성일: 2026-05-21
 - 갱신일: 2026-05-22 (Phase 2 `run_command` + default-on + UX 반영)
 - 대상 바이너리: `aic` (crate `aic-client`, lib target `aic_client`). 문서 전반의
