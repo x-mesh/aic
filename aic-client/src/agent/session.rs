@@ -232,11 +232,14 @@ impl AgentSession {
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         // TTY는 기본 ratatui chat TUI(입력 아래 status bar, claude CLI 스타일). reedline(slash
         // 자동완성 메뉴·구식 history)을 원하면 `AIC_NO_TUI=1`로 opt-out. non-TTY/파이프는 항상 Direct.
-        if tty && !super::debug::env_truthy("AIC_NO_TUI") {
+        let result = if tty && !super::debug::env_truthy("AIC_NO_TUI") {
             self.run_loop_tui().await
         } else {
             self.run_loop_direct().await
-        }
+        };
+        // 루프 종료(=세션 종료) 시점에 1회 저장 → `/resume`로 복원. best-effort(출력 없음).
+        self.save_session();
+        result
     }
 
     /// 시작 배너 + context 헤더(banner opt-out이면 생략). Direct/Tui 공용.
@@ -619,6 +622,7 @@ impl AgentSession {
                     .note("대화 컨텍스트를 초기화했습니다 (시스템 프롬프트 유지).")
                     .await;
             }
+            SlashCommand::Resume => self.handle_resume().await,
             SlashCommand::Last(n) => {
                 self.out
                     .note(&tool_record::render_last(&self.tool_records, n))
@@ -1244,6 +1248,61 @@ impl AgentSession {
         text
     }
 
+    /// 세션 종료 시 대화를 `~/.aic/sessions/last.json`에 저장한다(`/resume`로 복원).
+    /// User/Assistant(content) 메시지만 추출하며, 추출 결과가 비면(대화 없음) 파일을 만들지 않는다.
+    /// dir 0700 / file 0600(unix best-effort). 직렬화/IO 실패는 무시한다(best-effort, 출력 없음).
+    fn save_session(&self) {
+        let messages = history_to_session_values(&self.history);
+        if messages.is_empty() {
+            return; // 대화 없음 — 저장 skip(파일 안 만듦).
+        }
+        let Some(path) = session_file_path() else {
+            return; // 홈 디렉터리 미발견 — best-effort로 무시.
+        };
+        let Some(dir) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let Ok(body) = serde_json::to_string_pretty(&messages) else {
+            return;
+        };
+        if std::fs::write(&path, body).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    /// `/resume` — 이전 세션 대화(`~/.aic/sessions/last.json`)를 history에 append 복원한다.
+    /// 파일 없음/파싱 실패는 "복원할 이전 세션이 없습니다." 안내. LLM 미호출.
+    async fn handle_resume(&mut self) {
+        let restored = session_file_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+            .map(|values| session_values_to_messages(&values));
+        match restored {
+            Some(msgs) if !msgs.is_empty() => {
+                let n = msgs.len();
+                self.history.extend(msgs);
+                self.out
+                    .note(&format!("이전 세션 {n}개 메시지를 복원했습니다."))
+                    .await;
+            }
+            _ => {
+                self.out.note("복원할 이전 세션이 없습니다.").await;
+            }
+        }
+    }
 }
 
 /// `/local` 분석 단발 LLM 호출의 최대 대기 시간(초). 초과 시 raw fallback.
@@ -1323,6 +1382,48 @@ fn cap_evidence(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}\n…", &text[..end])
+}
+
+/// history에서 세션 재개용 메시지만 추출해 `[{role,content}]` JSON 배열로 만든다(순수, 테스트 가능).
+/// 대상: `User(content)`와 `Assistant{content:Some(c)}`만. System preface·Tool 결과·tool_calls-only
+/// Assistant(content=None)는 제외한다(재개 시 대화 흐름만 복원하고 도구 사이클은 버린다).
+fn history_to_session_values(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+    history
+        .iter()
+        .filter_map(|m| match m {
+            ChatMessage::User(c) => Some(serde_json::json!({ "role": "user", "content": c })),
+            ChatMessage::Assistant {
+                content: Some(c), ..
+            } => Some(serde_json::json!({ "role": "assistant", "content": c })),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 저장된 `[{role,content}]` 값을 `ChatMessage`로 복원한다(순수, 테스트 가능).
+/// role=user → `User(content)`, role=assistant → `Assistant{content:Some(content), tool_calls:[]}`.
+/// role/content가 없거나 알 수 없는 role 항목은 건너뛴다(best-effort, 손상 항목 무시).
+fn session_values_to_messages(values: &[serde_json::Value]) -> Vec<ChatMessage> {
+    values
+        .iter()
+        .filter_map(|v| {
+            let role = v.get("role").and_then(|r| r.as_str())?;
+            let content = v.get("content").and_then(|c| c.as_str())?.to_string();
+            match role {
+                "user" => Some(ChatMessage::User(content)),
+                "assistant" => Some(ChatMessage::Assistant {
+                    content: Some(content),
+                    tool_calls: vec![],
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// 세션 저장 파일 경로(`~/.aic/sessions/last.json`). 홈을 못 찾으면 None.
+fn session_file_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".aic").join("sessions").join("last.json"))
 }
 
 /// `/bundle` — redacted 증거를 `~/.aic/bundles/<sanitized>-<ts>.md`에 저장하고 경로를 반환한다.
@@ -1604,6 +1705,114 @@ mod tests {
         let id = new_run_id();
         assert_eq!(id.len(), 8);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn session_extract_filters_to_user_and_assistant_content() {
+        // System preface·Tool·tool_calls-only Assistant는 제외, User·Assistant(content)만 추출.
+        let history = vec![
+            ChatMessage::System("preface".to_string()),
+            ChatMessage::User("hi".to_string()),
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            ChatMessage::Tool {
+                call_id: "c1".to_string(),
+                content: "result".to_string(),
+            },
+            ChatMessage::Assistant {
+                content: Some("answer".to_string()),
+                tool_calls: vec![],
+            },
+        ];
+        let vals = history_to_session_values(&history);
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0]["role"], "user");
+        assert_eq!(vals[0]["content"], "hi");
+        assert_eq!(vals[1]["role"], "assistant");
+        assert_eq!(vals[1]["content"], "answer");
+    }
+
+    #[test]
+    fn session_extract_empty_when_no_conversation() {
+        // System preface만(또는 tool 사이클만) → 추출 결과 비어야 함(저장 skip 조건).
+        let history = vec![
+            ChatMessage::System("preface".to_string()),
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "x".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+        ];
+        assert!(history_to_session_values(&history).is_empty());
+    }
+
+    #[test]
+    fn session_round_trip_preserves_conversation() {
+        // history → values → JSON → values → messages 라운드트립이 대화를 보존한다.
+        let history = vec![
+            ChatMessage::System("preface".to_string()),
+            ChatMessage::User("질문1".to_string()),
+            ChatMessage::Assistant {
+                content: Some("답변1".to_string()),
+                tool_calls: vec![],
+            },
+            ChatMessage::User("질문2".to_string()),
+        ];
+        let vals = history_to_session_values(&history);
+        let json = serde_json::to_string_pretty(&vals).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let restored = session_values_to_messages(&parsed);
+        assert_eq!(
+            restored,
+            vec![
+                ChatMessage::User("질문1".to_string()),
+                ChatMessage::Assistant {
+                    content: Some("답변1".to_string()),
+                    tool_calls: vec![],
+                },
+                ChatMessage::User("질문2".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_restore_skips_malformed_and_unknown_roles() {
+        // role/content 누락·알 수 없는 role 항목은 건너뛴다(best-effort).
+        let vals = vec![
+            serde_json::json!({ "role": "user", "content": "ok" }),
+            serde_json::json!({ "role": "system", "content": "skip-unknown-role" }),
+            serde_json::json!({ "role": "assistant" }), // content 누락 → skip
+            serde_json::json!({ "content": "no-role" }), // role 누락 → skip
+            serde_json::json!({ "role": "assistant", "content": "ok2" }),
+        ];
+        let restored = session_values_to_messages(&vals);
+        assert_eq!(
+            restored,
+            vec![
+                ChatMessage::User("ok".to_string()),
+                ChatMessage::Assistant {
+                    content: Some("ok2".to_string()),
+                    tool_calls: vec![],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_file_path_under_aic_sessions() {
+        // 경로가 ~/.aic/sessions/last.json 형태인지(홈 환경이 있을 때).
+        if let Some(p) = session_file_path() {
+            assert!(p.ends_with(".aic/sessions/last.json"), "path={p:?}");
+        }
     }
 
     #[tokio::test]
