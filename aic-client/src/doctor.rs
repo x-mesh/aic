@@ -893,12 +893,17 @@ mod tests {
 
     #[tokio::test]
     async fn probe_central_store_uses_common_attach_socket_path() {
-        // attach_socket_path 는 항상 aic_common::aicd_attach_socket_path() 와 일치.
+        // doctor 는 attach_socket_path 를 자체 계산하지 않고 공용 헬퍼
+        // `aic_common::aicd_attach_socket_path()`(= session_dir/aicd-attach.sock)를 쓴다.
+        // 파일명으로 검증해 race-free 로 둔다: 헬퍼를 두 번 호출해 결과를 비교하면 그 사이
+        // `XDG_RUNTIME_DIR` 를 mutate 하는 병렬 테스트(config.rs 등)와 race 해 flaky 해진다
+        // (session_dir 이 XDG_RUNTIME_DIR 에 의존).
         let env: HashMap<String, String> = HashMap::new();
         let report = probe_central_store(&env, None, None).await;
-        assert_eq!(
-            report.attach_socket_path,
-            aic_common::aicd_attach_socket_path()
+        assert!(
+            report.attach_socket_path.ends_with("aicd-attach.sock"),
+            "attach_socket_path={:?}",
+            report.attach_socket_path
         );
     }
 
