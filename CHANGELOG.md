@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-24
+
+### Fixed — `aic update`의 GitHub API rate limit(403)
+
+- **brew 설치인데도 GitHub API를 먼저 타서 죽던 문제** — `update::run`이 source 분기(brew/manual) 전에
+  무조건 `fetch_latest_tag()`(GitHub API)를 호출해, 미인증 rate limit(IP당 60회/시간) 소진 시 403으로
+  중단되며 `brew upgrade`에 도달조차 못 했다. 이제 brew/cargo는 태그 조회를 **best-effort**로 두어
+  실패해도 `brew upgrade`로 진행한다(brew가 tap에서 최신을 가져옴).
+- **태그 조회를 `api.github.com` → `github.com/.../releases/latest` redirect로 변경** — 302 `Location`
+  (`.../releases/tag/<tag>`)에서 태그를 추출한다. 웹 redirect는 API rate limit·토큰과 무관하므로
+  미인증 60회/시간 한도를 더는 타지 않는다(토큰 설정 불필요).
+
 ## [0.8.0] - 2026-05-24
 
 ### Changed — `/diagnose` 진단 커버리지 대폭 확장
