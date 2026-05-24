@@ -1,6 +1,6 @@
 [package]
 name = "aic-client"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 
 [lib]
@@ -52,6 +52,9 @@ hmac = "0.12"
 tracing = "0.1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 ratatui = "0.29"
+# chat status bar 시스템 지표(load/cpu/mem/disk i/o) in-process 수집. disk i/o delta는
+# Disks 인스턴스 재사용으로 sysinfo가 자동 계산. system+disk feature만(network/component 제외).
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
 # `aic update`의 release archive 추출.
 flate2 = "1"
 tar = "0.4"
