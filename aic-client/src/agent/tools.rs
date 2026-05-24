@@ -368,6 +368,118 @@ fn collect_files(dir: &Path, sb: &Sandbox, depth: usize, out: &mut Vec<PathBuf>)
     }
 }
 
+// ── 쓰기 도구 (Phase 2) ────────────────────────────────────
+//
+// **mutation 도구라 안전이 최우선**. tools 계층은 실제 쓰기만 담당하고,
+// 사용자 확인(confirm)·미리보기는 호출부(`session::exec_tool`)가 책임진다.
+// 모든 쓰기 경로는 sandbox 경계를 통과해야 하며 secrets 파일 쓰기는 거부한다.
+// (gitignore는 소스 편집 목적이라 쓰기에 적용하지 않는다 — secrets denylist만.)
+
+/// 쓰기 대상 경로가 secrets면 거부, 아니면 통과시키는 공통 가드.
+fn reject_secret_write(path: &Path) -> Result<(), ToolError> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if is_secret_file(name) {
+        return Err(ToolError::new(format!("secrets 파일 쓰기 거부: {name}")));
+    }
+    if has_git_component(path) {
+        return Err(ToolError::new(".git 내부에는 쓸 수 없습니다"));
+    }
+    Ok(())
+}
+
+/// `write_file` — 파일을 통째로 쓴다(없으면 생성, 있으면 덮어쓰기).
+///
+/// 경계 검증은 [`Sandbox::resolve_for_write`](새 파일 경로 지원)로 한다. 부모 디렉터리가
+/// 없으면 sandbox 내에 `create_dir_all`로 만든다. secrets 파일은 거부한다.
+/// confirm은 호출부(`exec_tool`)가 이미 받은 뒤이므로 여기선 검증 후 즉시 쓴다.
+pub fn write_file(args: &Value, sb: &Sandbox) -> Result<String, ToolError> {
+    let path_arg = arg_str(args, "path")?;
+    let content = arg_str(args, "content")?;
+    let path = sb.resolve_for_write(path_arg)?;
+    reject_secret_write(&path)?;
+
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ToolError::new(format!("부모 디렉터리 생성 실패: {e}")))?;
+        }
+    }
+    std::fs::write(&path, content).map_err(|e| ToolError::new(format!("파일 쓰기 실패: {e}")))?;
+
+    let rel = sb
+        .relative(&path)
+        .unwrap_or_else(|| path.display().to_string());
+    Ok(format!("wrote {rel} ({} bytes)", content.len()))
+}
+
+/// `edit_file` — `old_string`을 `new_string`으로 1회 치환한다.
+///
+/// 매칭 횟수가 0이면 실패(찾지 못함), 2회 이상이면 실패(모호 — 더 구체적으로).
+/// 정확히 1회일 때만 치환 후 파일에 쓴다. secrets/경계는 write_file과 동일 가드.
+pub fn edit_file(args: &Value, sb: &Sandbox) -> Result<String, ToolError> {
+    let path_arg = arg_str(args, "path")?;
+    let old_string = arg_str(args, "old_string")?;
+    let new_string = arg_str(args, "new_string")?;
+    // 편집은 기존 파일 대상이라 resolve_for_write로 경계 검증(존재 파일도 통과).
+    let path = sb.resolve_for_write(path_arg)?;
+    reject_secret_write(&path)?;
+
+    let current = std::fs::read_to_string(&path)
+        .map_err(|e| ToolError::new(format!("파일 읽기 실패: {e}")))?;
+    let count = current.matches(old_string).count();
+    match count {
+        0 => Err(ToolError::new("old_string을 찾지 못함")),
+        n if n >= 2 => Err(ToolError::new(format!(
+            "old_string이 여러 곳({n}) 매칭 — 더 구체적으로"
+        ))),
+        _ => {
+            let updated = current.replacen(old_string, new_string, 1);
+            std::fs::write(&path, updated)
+                .map_err(|e| ToolError::new(format!("파일 쓰기 실패: {e}")))?;
+            let rel = sb
+                .relative(&path)
+                .unwrap_or_else(|| path.display().to_string());
+            Ok(format!("edited {rel}"))
+        }
+    }
+}
+
+/// LLM에 노출할 `write_file` 도구 스펙(`aic chat` SRE 모드에서만 등록).
+pub fn write_file_spec() -> ToolSpec {
+    ToolSpec {
+        name: "write_file",
+        description: "샌드박스(cwd) 내 파일을 통째로 쓴다(없으면 생성, 있으면 덮어쓰기). \
+                      변경 전 사용자 confirm을 거친다. secrets 파일은 거부된다.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "cwd 기준 상대 경로(새 파일 가능)" },
+                "content": { "type": "string", "description": "파일 전체 내용" }
+            },
+            "required": ["path", "content"]
+        }),
+    }
+}
+
+/// LLM에 노출할 `edit_file` 도구 스펙(`aic chat` SRE 모드에서만 등록).
+pub fn edit_file_spec() -> ToolSpec {
+    ToolSpec {
+        name: "edit_file",
+        description: "샌드박스(cwd) 내 파일에서 old_string을 new_string으로 1회 치환한다. \
+                      old_string은 파일에서 정확히 한 번만 매칭되어야 한다(0/다중이면 거부). \
+                      변경 전 사용자 confirm을 거친다. secrets 파일은 거부된다.",
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "cwd 기준 상대 경로" },
+                "old_string": { "type": "string", "description": "치환 대상(정확히 1회 매칭)" },
+                "new_string": { "type": "string", "description": "대체 문자열" }
+            },
+            "required": ["path", "old_string", "new_string"]
+        }),
+    }
+}
+
 // ── registry ──────────────────────────────────────────────
 
 /// 등록된 읽기 전용 도구 스펙(LLM 노출용). 쓰기/실행 도구는 의도적으로 미등록.
@@ -429,6 +541,8 @@ pub fn execute(name: &str, args: &Value, sb: &Sandbox) -> Result<String, ToolErr
         "list_dir" => list_dir(args, sb),
         "grep" => grep(args, sb),
         "glob" => glob(args, sb),
+        "write_file" => write_file(args, sb),
+        "edit_file" => edit_file(args, sb),
         other => Err(ToolError::new(format!("미지원 도구: {other}"))),
     }
 }
@@ -604,7 +718,7 @@ mod tests {
     #[test]
     fn execute_unknown_tool_errors() {
         let (_d, sb) = sandbox_with_files();
-        let err = execute("write_file", &json!({}), &sb).unwrap_err();
+        let err = execute("totally_unknown_tool", &json!({}), &sb).unwrap_err();
         assert!(err.message.contains("미지원 도구"));
     }
 
@@ -628,6 +742,19 @@ mod tests {
         assert!(!names.contains(&"run_command"));
     }
 
+    /// run_turn의 게이트 구성(allow_run_command 시 write 도구 포함)을 미러링해 검증한다.
+    /// run_turn은 `read_only_specs() + run_command + write_file + edit_file`를 노출한다.
+    #[test]
+    fn allowed_specs_include_write_tools() {
+        let mut specs = read_only_specs();
+        // run_turn의 `if self.allow_run_command { ... }` 분기와 동일한 push 순서.
+        specs.push(write_file_spec());
+        specs.push(edit_file_spec());
+        let names: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+    }
+
     #[test]
     fn is_secret_file_detects_common_secrets() {
         assert!(is_secret_file(".env"));
@@ -637,5 +764,183 @@ mod tests {
         assert!(is_secret_file("backup.key"));
         assert!(!is_secret_file("main.rs"));
         assert!(!is_secret_file("README.md"));
+    }
+
+    // ── 쓰기 도구 테스트 (Phase 2) ──────────────────────────
+
+    #[test]
+    fn write_file_creates_new_file() {
+        let (dir, sb) = sandbox_with_files();
+        let out = write_file(
+            &json!({ "path": "created.txt", "content": "new content" }),
+            &sb,
+        )
+        .unwrap();
+        assert!(out.contains("wrote"));
+        assert!(out.contains("created.txt"));
+        let written = fs::read_to_string(dir.path().join("created.txt")).unwrap();
+        assert_eq!(written, "new content");
+    }
+
+    #[test]
+    fn write_file_creates_nested_parent_dirs() {
+        let (dir, sb) = sandbox_with_files();
+        let out =
+            write_file(&json!({ "path": "a/b/c.txt", "content": "deep" }), &sb).unwrap();
+        assert!(out.contains("a/b/c.txt"));
+        let written = fs::read_to_string(dir.path().join("a").join("b").join("c.txt")).unwrap();
+        assert_eq!(written, "deep");
+    }
+
+    #[test]
+    fn write_file_overwrites_existing() {
+        let (dir, sb) = sandbox_with_files();
+        let out = write_file(
+            &json!({ "path": "hello.txt", "content": "replaced" }),
+            &sb,
+        )
+        .unwrap();
+        assert!(out.contains("wrote"));
+        let written = fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+        assert_eq!(written, "replaced");
+    }
+
+    #[test]
+    fn write_file_outside_tree_rejected() {
+        let (_d, sb) = sandbox_with_files();
+        let err = write_file(
+            &json!({ "path": "../escape.txt", "content": "x" }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("'..'") || err.message.contains("샌드박스 밖"));
+    }
+
+    #[test]
+    fn write_file_secret_rejected() {
+        let (dir, sb) = sandbox_with_files();
+        let err = write_file(
+            &json!({ "path": ".env", "content": "API_KEY=leak" }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("secrets"));
+        // 기존 .env는 변경되지 않아야 한다.
+        let kept = fs::read_to_string(dir.path().join(".env")).unwrap();
+        assert_eq!(kept, "API_KEY=secret123");
+    }
+
+    #[test]
+    fn write_file_new_secret_name_rejected() {
+        let (dir, sb) = sandbox_with_files();
+        // 존재하지 않는 secrets 파일명(새 파일)도 쓰기 거부.
+        let err = write_file(
+            &json!({ "path": "server.pem", "content": "-----KEY-----" }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("secrets"));
+        assert!(!dir.path().join("server.pem").exists());
+    }
+
+    #[test]
+    fn edit_file_single_match_replaced() {
+        let (dir, sb) = sandbox_with_files();
+        let out = edit_file(
+            &json!({
+                "path": "hello.txt",
+                "old_string": "world",
+                "new_string": "rust"
+            }),
+            &sb,
+        )
+        .unwrap();
+        assert!(out.contains("edited"));
+        let written = fs::read_to_string(dir.path().join("hello.txt")).unwrap();
+        assert_eq!(written, "hello rust\nsecond line");
+    }
+
+    #[test]
+    fn edit_file_zero_match_errors() {
+        let (_d, sb) = sandbox_with_files();
+        let err = edit_file(
+            &json!({
+                "path": "hello.txt",
+                "old_string": "NOT_PRESENT",
+                "new_string": "x"
+            }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("찾지 못함"));
+    }
+
+    #[test]
+    fn edit_file_multiple_match_errors() {
+        let (dir, sb) = sandbox_with_files();
+        fs::write(dir.path().join("dup.txt"), "foo bar foo").unwrap();
+        let err = edit_file(
+            &json!({
+                "path": "dup.txt",
+                "old_string": "foo",
+                "new_string": "baz"
+            }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("여러 곳"));
+        // 다중 매칭이면 파일은 변경되지 않아야 한다.
+        let kept = fs::read_to_string(dir.path().join("dup.txt")).unwrap();
+        assert_eq!(kept, "foo bar foo");
+    }
+
+    #[test]
+    fn edit_file_secret_rejected() {
+        let (_d, sb) = sandbox_with_files();
+        let err = edit_file(
+            &json!({
+                "path": ".env",
+                "old_string": "secret123",
+                "new_string": "x"
+            }),
+            &sb,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("secrets"));
+    }
+
+    #[test]
+    fn write_tool_specs_have_expected_shape() {
+        let w = write_file_spec();
+        assert_eq!(w.name, "write_file");
+        assert_eq!(w.parameters["required"], json!(["path", "content"]));
+        let e = edit_file_spec();
+        assert_eq!(e.name, "edit_file");
+        assert_eq!(
+            e.parameters["required"],
+            json!(["path", "old_string", "new_string"])
+        );
+    }
+
+    #[test]
+    fn execute_dispatches_write_and_edit() {
+        let (dir, sb) = sandbox_with_files();
+        let out = execute(
+            "write_file",
+            &json!({ "path": "viaexec.txt", "content": "y" }),
+            &sb,
+        )
+        .unwrap();
+        assert!(out.contains("wrote"));
+        assert_eq!(fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(), "y");
+
+        let out2 = execute(
+            "edit_file",
+            &json!({ "path": "viaexec.txt", "old_string": "y", "new_string": "z" }),
+            &sb,
+        )
+        .unwrap();
+        assert!(out2.contains("edited"));
+        assert_eq!(fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(), "z");
     }
 }

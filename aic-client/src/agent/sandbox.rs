@@ -81,6 +81,66 @@ impl Sandbox {
         Ok(canonical)
     }
 
+    /// 쓰기용 경로 해소(Phase 2). `resolve`와 달리 **존재하지 않는 새 파일 경로**도
+    /// 허용한다. 입력 경로에서 존재하는 가장 가까운 조상을 `canonicalize`해 root 하위인지
+    /// 검증한 뒤, 그 canonical 조상에 나머지(아직 없는) 컴포넌트를 합쳐 최종 절대 경로를
+    /// 만든다(symlink·`..`·절대경로 탈출은 조상 canonicalize가 실제 경로를 풀어 차단).
+    ///
+    /// 부모 디렉터리가 아직 없어도 허용한다 — 호출부(`write_file`)가 `create_dir_all`로
+    /// sandbox 내에 생성한다. 입력 경로 컴포넌트에 `..`이 포함되면 거부한다(부분 정규화로
+    /// 인한 탈출 차단). 마지막 컴포넌트가 정상 파일명이 아니면 거부한다.
+    pub fn resolve_for_write(&self, input: &str) -> Result<PathBuf, ToolError> {
+        use std::path::Component;
+        if input.contains('\0') {
+            return Err(ToolError::new("경로에 NUL 바이트가 포함되어 거부"));
+        }
+        let raw = Path::new(input);
+        let joined = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.root.join(raw)
+        };
+        // `..`은 부분(아직 미존재) 구간에서 탈출에 악용될 수 있으므로 입력에 있으면 거부한다.
+        // (존재 구간은 canonicalize가 풀지만, 미존재 구간은 풀리지 않으므로 명시 거부.)
+        if joined
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return Err(ToolError::new(format!("쓰기 경로에 '..' 사용 거부: {input}")));
+        }
+
+        // 존재하는 가장 가까운 조상을 canonicalize해 경계를 검증하고, 나머지(미존재)
+        // 컴포넌트를 그 위에 누적한다.
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut probe = joined.as_path();
+        let canonical_base = loop {
+            match probe.canonicalize() {
+                Ok(c) => break c,
+                Err(_) => {
+                    let name = probe.file_name().ok_or_else(|| {
+                        ToolError::new(format!("쓰기 대상 경로를 확인할 수 없음: {input}"))
+                    })?;
+                    tail.push(name.to_os_string());
+                    probe = probe.parent().ok_or_else(|| {
+                        ToolError::new(format!("경로 확인 실패: {input}"))
+                    })?;
+                }
+            }
+        };
+        if !canonical_base.starts_with(&self.root) {
+            return Err(ToolError::new(format!("샌드박스 밖 경로 거부: {input}")));
+        }
+        // tail은 leaf→root 순으로 쌓였으므로 역순으로 붙인다.
+        let mut target = canonical_base;
+        for comp in tail.into_iter().rev() {
+            target.push(comp);
+        }
+        if target.file_name().is_none() {
+            return Err(ToolError::new(format!("쓰기 대상 파일명을 확인할 수 없음: {input}")));
+        }
+        Ok(target)
+    }
+
     /// 이미 확보한 절대 경로가 root 하위인지 검사한다(walk 결과 필터용).
     /// 정규화에 실패하면(깨진 symlink 등) false.
     pub fn contains(&self, path: &Path) -> bool {
@@ -147,5 +207,59 @@ mod tests {
     fn resolve_nonexistent_rejected() {
         let (_dir, sb) = tmp_sandbox();
         assert!(sb.resolve("does-not-exist.txt").is_err());
+    }
+
+    #[test]
+    fn resolve_for_write_new_file_ok() {
+        let (_dir, sb) = tmp_sandbox();
+        // 존재하지 않는 새 파일도 부모(root) 검증을 통과해야 한다.
+        let p = sb.resolve_for_write("new.txt").unwrap();
+        assert!(p.starts_with(sb.root()));
+        assert!(p.ends_with("new.txt"));
+    }
+
+    #[test]
+    fn resolve_for_write_new_nested_file_ok() {
+        let (_dir, sb) = tmp_sandbox();
+        // 부모 디렉터리가 아직 없어도(중첩) 허용 — 호출부가 create_dir_all.
+        let p = sb.resolve_for_write("a/b/c.txt").unwrap();
+        assert!(p.starts_with(sb.root()));
+        assert!(p.ends_with("c.txt"));
+    }
+
+    #[test]
+    fn resolve_for_write_existing_file_ok() {
+        let (dir, sb) = tmp_sandbox();
+        let f = dir.path().join("exists.txt");
+        fs::write(&f, "x").unwrap();
+        let p = sb.resolve_for_write("exists.txt").unwrap();
+        assert!(p.starts_with(sb.root()));
+        assert!(p.ends_with("exists.txt"));
+    }
+
+    #[test]
+    fn resolve_for_write_parent_escape_rejected() {
+        let (_dir, sb) = tmp_sandbox();
+        let err = sb.resolve_for_write("../escape.txt").unwrap_err();
+        assert!(err.message.contains("'..'") || err.message.contains("샌드박스 밖"));
+    }
+
+    #[test]
+    fn resolve_for_write_absolute_outside_rejected() {
+        let (_dir, sb) = tmp_sandbox();
+        let err = sb.resolve_for_write("/tmp/evil-aic-write.txt").unwrap_err();
+        assert!(err.message.contains("샌드박스 밖") || err.message.contains("경로 확인 실패"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_for_write_symlink_escape_rejected() {
+        use std::os::unix::fs::symlink;
+        let (dir, sb) = tmp_sandbox();
+        // sandbox 안에 root 밖(/tmp)을 가리키는 symlink dir를 만들고 그 안에 쓰기 시도.
+        let link = dir.path().join("evil");
+        symlink("/tmp", &link).unwrap();
+        let err = sb.resolve_for_write("evil/pwned.txt").unwrap_err();
+        assert!(err.message.contains("샌드박스 밖") || err.message.contains("경로 확인 실패"));
     }
 }
