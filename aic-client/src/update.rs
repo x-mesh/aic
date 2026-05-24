@@ -196,29 +196,41 @@ pub fn format_plan(current: &str, next: &str) -> String {
 
 // ── GitHub 호출 ───────────────────────────────────────────────
 
-/// `releases/latest`의 `tag_name`을 가져온다. anonymous(60 req/h)로 충분.
+/// 최신 release 태그를 가져온다. `api.github.com`(미인증 60 req/h — 쉽게 소진되어 403) 대신
+/// `github.com/.../releases/latest`의 302 `Location`(`.../releases/tag/<tag>`)에서 태그를 추출한다.
+/// 웹 redirect는 API rate limit·토큰과 무관하다.
 pub async fn fetch_latest_tag() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let url = format!("https://github.com/{REPO}/releases/latest");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent(concat!("aic/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none()) // 따라가지 않고 Location 헤더만 읽는다
         .build()?;
     let resp = client
         .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
         .context("최신 release 조회 실패")?;
-    if !resp.status().is_success() {
-        bail!("GitHub API 응답 {}: {}", resp.status(), url);
-    }
-    let body: serde_json::Value = resp.json().await.context("응답 JSON 파싱 실패")?;
-    let tag = body
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("tag_name 필드 없음"))?;
-    Ok(tag.to_string())
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "최신 release redirect 없음 (status {}) — release가 없거나 네트워크 문제",
+                resp.status()
+            )
+        })?;
+    tag_from_location(location)
+        .ok_or_else(|| anyhow!("redirect Location에서 태그 추출 실패: {location}"))
+}
+
+/// `github.com/.../releases/tag/<tag>` 형태 Location에서 `<tag>`를 추출한다(순수 함수).
+/// `/tag/`가 없으면(release 없어 releases 페이지로 redirect 등) None.
+fn tag_from_location(location: &str) -> Option<String> {
+    let (_, tag) = location.rsplit_once("/tag/")?;
+    let tag = tag.trim().trim_end_matches('/');
+    (!tag.is_empty()).then(|| tag.to_string())
 }
 
 fn asset_url(tag: &str, asset: &str) -> String {
@@ -486,31 +498,59 @@ pub async fn run(opts: UpdateOptions) -> Result<()> {
     let install = detect_install()?;
     let current = current_version();
 
-    let target = match opts.pinned {
-        Some(t) => t,
-        None => fetch_latest_tag().await?,
+    // 최신 태그: Manual은 다운로드 URL 구성에 **필수**라 실패 시 중단한다.
+    // Brew/Cargo는 `brew upgrade`/cargo가 최신을 알아서 가져오므로 태그는 출력·--check 용 best-effort —
+    // 조회가 실패해도(네트워크 등) 업그레이드를 막지 않는다. 조회는 github.com redirect라 rate limit 무관.
+    let target: Option<String> = match opts.pinned.clone() {
+        Some(t) => Some(t),
+        None => match install.source {
+            Source::Manual => Some(fetch_latest_tag().await?),
+            _ => fetch_latest_tag().await.ok(),
+        },
     };
-    let cmp = compare_semver(current, &target);
-    let up_to_date = cmp >= 0 && !opts.force;
 
     if opts.check {
-        if cmp >= 0 {
-            println!(
-                "up-to-date: v{current} (latest {target}, source {})",
-                install.source.label()
-            );
-            return Ok(());
-        }
-        println!("update available: {}", format_plan(current, &target));
-        std::process::exit(1);
+        return match target.as_deref() {
+            Some(t) if compare_semver(current, t) >= 0 => {
+                println!(
+                    "up-to-date: v{current} (latest {t}, source {})",
+                    install.source.label()
+                );
+                Ok(())
+            }
+            Some(t) => {
+                println!("update available: {}", format_plan(current, t));
+                std::process::exit(1);
+            }
+            None => {
+                let hint = match install.source {
+                    Source::Brew => "brew outdated",
+                    _ => "잠시 후 재시도",
+                };
+                println!(
+                    "최신 버전 확인 실패 (네트워크) — source {}, `{hint}`로 확인하세요.",
+                    install.source.label()
+                );
+                Ok(())
+            }
+        };
     }
 
-    println!(
-        "current: v{current}\nlatest:  {target}\nsource:  {} ({})",
-        install.source.label(),
-        install.binary_path.display()
-    );
+    match target.as_deref() {
+        Some(t) => println!(
+            "current: v{current}\nlatest:  {t}\nsource:  {} ({})",
+            install.source.label(),
+            install.binary_path.display()
+        ),
+        None => println!(
+            "current: v{current}\nsource:  {} ({}) — 최신 태그 확인은 건너뜀",
+            install.source.label(),
+            install.binary_path.display()
+        ),
+    }
 
+    let up_to_date =
+        matches!(target.as_deref(), Some(t) if compare_semver(current, t) >= 0) && !opts.force;
     if up_to_date {
         println!("이미 최신입니다 — 강제 재설치는 --force.");
         return Ok(());
@@ -519,7 +559,8 @@ pub async fn run(opts: UpdateOptions) -> Result<()> {
     match install.source {
         Source::Brew => run_brew_upgrade(),
         Source::Cargo => print_cargo_hint(),
-        Source::Manual => run_manual_upgrade(&install, &target).await,
+        // Manual은 위에서 target이 Some임이 보장된다(None이면 fetch_latest_tag가 이미 중단).
+        Source::Manual => run_manual_upgrade(&install, target.as_deref().unwrap()).await,
     }
 }
 
@@ -608,6 +649,22 @@ mod tests {
         // 비-숫자 segment는 dirty로 간주 — 항상 update 가능 표시가 의도.
         assert_eq!(compare_semver("dev", "0.3.0"), -1);
         assert_eq!(compare_semver("0.3.0", "dev"), 1);
+    }
+
+    #[test]
+    fn tag_from_location_extracts_tag() {
+        assert_eq!(
+            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v0.8.0").as_deref(),
+            Some("v0.8.0")
+        );
+        // trailing slash 허용.
+        assert_eq!(
+            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v1.2.3/").as_deref(),
+            Some("v1.2.3")
+        );
+        // `/tag/`가 없으면(release 없어 releases 페이지로 redirect 등) None.
+        assert_eq!(tag_from_location("https://github.com/x-mesh/aic/releases"), None);
+        assert_eq!(tag_from_location("https://github.com/x-mesh/aic/releases/tag/"), None);
     }
 
     #[test]
