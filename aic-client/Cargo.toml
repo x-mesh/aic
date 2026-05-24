@@ -51,7 +51,9 @@ sha2 = "0.10"
 hmac = "0.12"
 tracing = "0.1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
-ratatui = "0.29"
+# unstable-rendered-line-info: Paragraph::line_count(width) — insert_before에 줄 height를 미리 줘야
+# 하므로(RFC-004 step 4), ratatui가 실제 렌더에 쓰는 wrap 줄 수를 단일 소스로 계산한다.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 # RFC-004 ratatui chat TUI 입력 위젯 평가용(CJK PoC). ratatui 0.29/crossterm 0.28과 정합하는 0.7.x.
 tui-textarea = "0.7"
 # chat status bar 시스템 지표(load/cpu/mem/disk i/o) in-process 수집. disk i/o delta는
@@ -60,6 +62,8 @@ sysinfo = { version = "0.33", default-features = false, features = ["system", "d
 # `aic update`의 release archive 추출.
 flate2 = "1"
 tar = "0.4"
+# RFC-004 step 4: ANSI escape(답변/카드 색) → ratatui Text 변환(insert_before용). 7.x=ratatui 0.29 정합(8.x는 0.30+ 금지).
+ansi-to-tui = "7"
 
 [dev-dependencies]
 proptest = "1"
