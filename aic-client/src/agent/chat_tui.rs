@@ -162,6 +162,9 @@ pub(crate) enum OutMsg {
     SpinStop,
     /// 컨텍스트 토큰 추정치(history 문자 수/4) → status bar 끝에 ` · ctx ~Nk` 표시.
     Ctx(usize),
+    /// NeedsConfirm 명령 확인 요청. prompt(예: `⚠ … 실행? [y/N]`)를 입력 줄에 띄우고,
+    /// y/Y면 true·그 외 키(n/N/Esc/Enter/…)면 false를 oneshot으로 회신한다(기본 거부).
+    Confirm(String, tokio::sync::oneshot::Sender<bool>),
     /// 루프 종료 — raw mode 복원 후 task 종료.
     Shutdown,
 }
@@ -391,10 +394,11 @@ fn draw_full(
     popup: &[&str],
     popup_sel: usize,
     spin: Option<&SpinState>,
+    confirm: Option<&str>,
 ) {
     let area = f.area();
-    // popup 높이: spin 중엔 0, 아니면 후보 수를 (가용 높이 - 입력1·구분선1·status1·로그1=4)로 clamp.
-    let pop_n = if spin.is_some() {
+    // popup 높이: spin/confirm 중엔 0, 아니면 후보 수를 (가용 높이 - 입력1·구분선1·status1·로그1=4)로 clamp.
+    let pop_n = if spin.is_some() || confirm.is_some() {
         0
     } else {
         popup.len().min(area.height.saturating_sub(4) as usize)
@@ -450,9 +454,16 @@ fn draw_full(
         f.render_stateful_widget(list, rows[1], &mut state);
     }
 
-    // 입력 줄 or thinking.
-    match spin {
-        Some(sp) => {
+    // 입력 줄: confirm(확인 프롬프트, 노랑) > thinking(spinner) > 일반 입력 순.
+    match (confirm, spin) {
+        // 확인 대기: 입력 줄 전체를 노란색 prompt로 대체(가시성↑). textarea는 그리지 않는다.
+        (Some(c), _) => {
+            f.render_widget(
+                Paragraph::new(c.to_string()).style(Style::default().fg(Color::Yellow)),
+                rows[2],
+            );
+        }
+        (None, Some(sp)) => {
             let frame = SPIN_FRAMES[sp.frame % SPIN_FRAMES.len()];
             let secs = sp.started.elapsed().as_secs_f32();
             f.render_widget(
@@ -460,7 +471,7 @@ fn draw_full(
                 rows[2],
             );
         }
-        None => {
+        (None, None) => {
             let prompt_w = UnicodeWidthStr::width(prompt) as u16;
             let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(0)])
                 .split(rows[2]);
@@ -587,6 +598,9 @@ async fn chat_loop(
     let mut search: Option<String> = None;
     let mut search_hits: Vec<usize> = Vec::new();
     let mut search_idx: usize = 0;
+    // NeedsConfirm 확인 모드: Some(tx)면 확인 대기 중(입력 줄을 confirm_prompt로 대체, 키는 y/n 전용).
+    let mut confirm_pending: Option<tokio::sync::oneshot::Sender<bool>> = None;
+    let mut confirm_prompt = String::new();
 
     loop {
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
@@ -602,8 +616,8 @@ async fn chat_loop(
         // 화면에 실제로 표시 가능한 수(pop_n)로 제한 — 작은 터미널에서 보이는 후보와 제출되는 후보가
         // 어긋나는 것을 막는다(codex P2: take(pop_n) 표시 vs popup[popup_sel] 제출 불일치).
         let area = terminal.get_frame().area();
-        // 검색 모드에선 slash popup을 막는다(검색 우선, 입력 줄을 search bar로 대체).
-        let pop_n = if spin.is_some() || search.is_some() {
+        // 검색/확인 모드에선 slash popup을 막는다(우선순위: 확인>검색>popup, 입력 줄을 대체).
+        let pop_n = if spin.is_some() || search.is_some() || confirm_pending.is_some() {
             0
         } else {
             popup.len().min(area.height.saturating_sub(4) as usize)
@@ -639,11 +653,13 @@ async fn chat_loop(
             }
             None => (&textarea, prompt.as_str()),
         };
+        // 확인 모드면 draw_full이 입력 줄을 노란 prompt로 대체한다(spin/popup/search보다 우선).
+        let confirm_ref = confirm_pending.as_ref().map(|_| confirm_prompt.as_str());
         let draw_ok = terminal
             .draw(|f| {
                 draw_full(
                     f, &log_text, draw_scroll, &status_line, draw_ta, draw_prompt, &popup,
-                    popup_sel, spin_ref,
+                    popup_sel, spin_ref, confirm_ref,
                 )
             })
             .is_ok();
@@ -661,6 +677,16 @@ async fn chat_loop(
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    // NeedsConfirm 확인 모드(최우선): y/Y면 승인(true), 그 외 모든 키(n/N/Esc/Enter/…)는
+                    // 거부(false). 입력 줄은 confirm_prompt로 대체되어 있고, textarea/slash/history/search는
+                    // 전부 비활성이다. Ctrl+C/D도 확인을 거부(false)로 닫아 안전 기본값을 유지한다.
+                    Some(Ok(Event::Key(k))) if confirm_pending.is_some() => {
+                        let approved = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+                        if let Some(tx) = confirm_pending.take() {
+                            let _ = tx.send(approved);
+                        }
+                        confirm_prompt.clear();
+                    }
                     // 검색 모드(Ctrl+F): 입력 줄을 search bar로 대체하고 키를 검색에 전용한다.
                     // textarea 편집·slash popup·history ↑↓는 비활성(검색 우선). Ctrl+C/D는 항상 EOF.
                     Some(Ok(Event::Key(k))) if search.is_some() => {
@@ -870,6 +896,11 @@ async fn chat_loop(
                     Some(OutMsg::Ctx(n)) => {
                         ctx_tokens = n;
                     }
+                    Some(OutMsg::Confirm(prompt, tx)) => {
+                        // 확인 모드 진입 — 입력 줄을 prompt로 대체하고 다음 키 입력을 y/n으로 소비한다.
+                        confirm_prompt = prompt;
+                        confirm_pending = Some(tx);
+                    }
                     Some(OutMsg::Shutdown) | None => break,
                 }
             }
@@ -1031,7 +1062,7 @@ mod tests {
         let log = Text::from("L0\nL1\nL2");
         let ta = super::textarea_with("hi");
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &[], 0, None))
+        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &[], 0, None, None))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
@@ -1043,13 +1074,50 @@ mod tests {
     }
 
     #[test]
+    fn draw_full_confirm_replaces_input_with_prompt() {
+        // 기능 A: 확인 모드면 입력 줄(prompt+textarea) 대신 confirm_prompt를 그린다.
+        // popup 후보를 줘도 confirm이 우선이라 popup은 그려지지 않는다.
+        let log = Text::from("x");
+        let ta = super::textarea_with("/d");
+        let prompt = "⚠ systemctl restart nginx 실행? [y/N]";
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        term.draw(|f| {
+            super::draw_full(
+                f,
+                &log,
+                0,
+                "· load",
+                &ta,
+                "you ❯ ",
+                &["diagnose", "doctor"],
+                0,
+                None,
+                Some(prompt),
+            )
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..8)
+            .map(|y| (0..60).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("|");
+        // 입력 줄(row 5 = height-3)에 confirm prompt가 보인다.
+        let row5: String = (0..60).map(|x| buf[(x, 5)].symbol()).collect();
+        assert!(row5.contains("[y/N]"), "confirm prompt(입력 줄): {row5:?}");
+        // confirm 우선 → popup 후보(diagnose/doctor)는 화면에 없다.
+        assert!(!all.contains("diagnose"), "confirm 중 popup 미표시: {all:?}");
+    }
+
+    #[test]
     fn draw_full_popup_vertical_with_desc() {
         // popup 활성: 입력 위에 세로 목록(명령+설명).
         let log = Text::from("x");
         let ta = super::textarea_with("/d");
         let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
         term.draw(|f| {
-            super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &["diagnose", "doctor"], 1, None)
+            super::draw_full(
+                f, &log, 0, "· load", &ta, "you ❯ ", &["diagnose", "doctor"], 1, None, None,
+            )
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -1151,7 +1219,7 @@ mod tests {
         let bar = super::search_bar("found", 0, 1);
         let ta = super::textarea_with(&bar);
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "", &[], 0, None))
+        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "", &[], 0, None, None))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
@@ -1166,7 +1234,7 @@ mod tests {
         let ta = super::textarea_with("hi");
         let status = super::status_with_ctx("· load", 12_000);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, &status, &ta, "you ❯ ", &[], 0, None))
+        term.draw(|f| super::draw_full(f, &log, 0, &status, &ta, "you ❯ ", &[], 0, None, None))
             .unwrap();
         let buf = term.backend().buffer();
         let row5: String = (0..40).map(|x| buf[(x, 5)].symbol()).collect();
