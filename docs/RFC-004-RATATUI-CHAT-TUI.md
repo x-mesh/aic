@@ -50,8 +50,10 @@ top.rs식 자체 스크롤 로그 위젯이 불필요하다.
 3. ~~status bar 하단 고정~~ ✅ (단계 2 골격에 흡수 — Inline viewport 상단 1줄 dim).
 4. ~~**LLM 호출 통합 (insert_before)**~~ ✅ **완료** (4a~4f, 2026-05-24) — 아래 [§단계 4 상세 설계](#단계-4-상세-설계-insert_before--단일-이벤트-루프) 참조. `ChatLoop` task가 terminal 단독 소유 + `mpsc` 채널(critic B1/B2 해소), 답변/spinner/slash를 `insert_before`로 일원화. 실터미널 검증 완료. **2026-05-25: TUI를 기본 전환**(TTY는 기본 ratatui, `AIC_NO_TUI=1`로 reedline opt-out). history(step 5)는 이식 완료, slash popup(step 6)은 잔여(메뉴만 없고 `/명령` 직접 입력은 동작).
 5. ~~history 이식~~ ✅ (2026-05-24) — `ChatLoop` ↑↓ 탐색. reedline과 **동일 `chat_history` 파일 공유**(`repl::load_chat_history`/`append_chat_history`, plain 줄단위). `should_record_history` 정책 재사용(빈줄/exit 제외), 첫 ↑에 편집 중 입력 draft 보존, ↓ 최하단서 draft 복원. 실터미널 검증(↑/doctor·↑/help·↓/doctor).
-6. slash popup(Clear+List).
-7. non-TTY fallback 유지(기존 stdin read_line) + 테스트.
+6. ~~slash popup~~ ✅ (2026-05-25) — `/명령` 첫 토큰 입력 시 후보 줄을 status 자리에 토글(`draw_viewport_popup`, ratatui Inline은 동적 높이가 없어 status를 잠시 대체). `slash_candidates`가 `SLASH_COMMANDS` prefix 매칭, ↑↓ 후보 이동(popup 활성 시 history보다 우선), Tab=완성(공백→닫힘), Enter=선택 후보 제출. 실터미널 검증(`/d`→diagnose·doctor, ↓+Tab→`/doctor`).
+7. ~~non-TTY fallback~~ ✅ — `ChatOut::Direct`(run_loop_direct, reedline/stdin). non-TTY/파이프·`AIC_NO_TUI=1`은 항상 Direct, byte-identical(파이프 회귀 테스트).
+
+**→ RFC-004 step 1~7 전부 완료(2026-05-25). TUI 기본, reedline은 `AIC_NO_TUI=1` fallback.**
 
 ## 리스크
 
