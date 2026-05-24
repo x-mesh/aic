@@ -10,6 +10,9 @@
 //! provider는 OpenAI-compat 경로에서만 tool-calling을 지원하며, 미지원 시
 //! 호출부가 기존 `ReplSession`(단발 send)으로 폴백한다.
 
+// RFC-004 단계 2 골격(ratatui chat TUI). 단계 4에서 session 연결 시 allow 제거.
+#[allow(dead_code)]
+pub(crate) mod chat_tui;
 pub(crate) mod debug;
 pub(crate) mod diagnose;
 pub mod gitignore;
