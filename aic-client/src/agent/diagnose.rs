@@ -78,8 +78,9 @@ fn category_sections(category: &str) -> Vec<&'static str> {
     let extra: &[&str] = match category {
         "cpu" => &["uptime", "process", "memory"],
         "memory" => &["memory", "process", "uptime"],
-        // disk: 호스트 df + docker 디스크 점유까지 본다(docker가 원인인 경우를 자동 발견).
-        "disk" => &["disk", "docker_df"],
+        // disk/cpu/... 의 docker probe는 select_probes 의 docker 가용 분기에서 붙인다
+        // (미설치 호스트 노이즈 0). "docker" 카테고리만 명시적으로 docker probe 를 포함한다.
+        "disk" => &["disk"],
         "network" => &["ip", "route", "ports"],
         "process" => &["process", "memory", "uptime"],
         "docker" => &["disk", "docker_df", "docker_ps", "docker_images"],
@@ -99,10 +100,61 @@ fn section_command(name: &str) -> Option<String> {
     super::probes::probe_by_id(name).map(|p| p.command())
 }
 
+/// PATH에 `docker` 실행 파일이 있는지(설치 여부)로 docker 가용성을 가볍게 판단한다.
+/// 데몬 기동까지는 보지 않는다 — 설치돼 있으면 probe를 후보에 넣고, 데몬이 꺼져 있으면 probe 출력의
+/// "Cannot connect to the docker daemon" 자체가 진단 정보가 된다(error_analyzer가 인식).
+pub(crate) fn docker_available() -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join("docker").is_file()))
+        .unwrap_or(false)
+}
+
 /// 증상에 대한 (섹션, 명령) probe 목록을 결정적으로 고른다. 순수 함수(테스트 가능).
-pub(crate) fn select_probes(symptom: Option<&str>) -> Vec<(&'static str, String)> {
+///
+/// `docker_available`이면 사용자가 docker를 의심하지 않은 일반 증상에도 카테고리에 맞는 docker probe를
+/// 후보에 추가한다(원인 발견 최대화). 미설치면 추가하지 않아 노이즈가 없다. "docker" 카테고리는
+/// `category_sections`가 이미 docker probe를 포함하므로 건너뛴다.
+pub(crate) fn select_probes(
+    symptom: Option<&str>,
+    docker_available: bool,
+) -> Vec<(&'static str, String)> {
+    fn push_unique(sections: &mut Vec<&'static str>, ids: &[&'static str]) {
+        for id in ids {
+            if !sections.contains(id) {
+                sections.push(id);
+            }
+        }
+    }
     let cat = diagnose_category(symptom);
-    category_sections(cat)
+    let mut sections = category_sections(cat);
+    // 카테고리별 흔한 "범인" probe — 가용성 조건 없이(unix 표준 명령) 붙인다.
+    // disk: inode 고갈(df -i) + /var/log 누적 + /tmp 비대, network: 연결 상태 폭주,
+    // process: 좀비/상태 분포. tmp_big=지금 큰 파일, tmp_recent=최근 수정(추세는 `/watch tmp_recent`).
+    push_unique(
+        &mut sections,
+        match cat {
+            "disk" => &["inodes", "log_big", "tmp_big", "tmp_recent"],
+            "generic" => &["inodes", "tmp_big"],
+            "network" => &["conn_states"],
+            "process" => &["proc_states"],
+            _ => &[],
+        },
+    );
+    // docker — 설치된 호스트면 docker를 의심 안 한 일반 증상에도 카테고리-적합 probe를 붙인다.
+    if docker_available && cat != "docker" {
+        push_unique(
+            &mut sections,
+            match cat {
+                // 디스크 압박이면 docker 디스크 점유(images/volumes/cache).
+                "disk" => &["docker_df"],
+                // 리소스/장애 계열이면 컨테이너 상태·writable layer(폭주/재시작 컨테이너).
+                "cpu" | "memory" | "process" | "network" => &["docker_ps"],
+                // 원인 미상(generic)이면 디스크 + 컨테이너 둘 다.
+                _ => &["docker_df", "docker_ps"],
+            },
+        );
+    }
+    sections
         .into_iter()
         .filter_map(|n| section_command(n).map(|c| (n, c)))
         .collect()
@@ -163,7 +215,7 @@ mod tests {
             Some("프로세스"),
             None,
         ] {
-            let probes = select_probes(sym);
+            let probes = select_probes(sym, true);
             assert!(!probes.is_empty(), "empty probes for {sym:?}");
             for (name, cmd) in &probes {
                 // 전부 Safe(자동 실행 가능) + 메타문자 없음(파이프만).
@@ -186,7 +238,7 @@ mod tests {
 
     #[test]
     fn cpu_symptom_includes_process_probe() {
-        let names: Vec<&str> = select_probes(Some("느림"))
+        let names: Vec<&str> = select_probes(Some("느림"), false)
             .iter()
             .map(|(n, _)| *n)
             .collect();
@@ -196,8 +248,8 @@ mod tests {
 
     #[test]
     fn docker_symptom_selects_docker_probes() {
-        // "docker 컨테이너 이상" → docker 카테고리 → df/ps/images 전부 수집.
-        let names: Vec<&str> = select_probes(Some("docker 컨테이너 tmp가 계속 커짐"))
+        // "docker 컨테이너 이상" → docker 카테고리 → df/ps/images 전부 수집(docker_available 무관).
+        let names: Vec<&str> = select_probes(Some("docker 컨테이너 tmp가 계속 커짐"), false)
             .iter()
             .map(|(n, _)| *n)
             .collect();
@@ -207,14 +259,92 @@ mod tests {
     }
 
     #[test]
-    fn disk_symptom_includes_docker_df() {
-        // "디스크 full"만 말해도 docker 점유를 함께 수집해 원인(images/cache)을 발견할 수 있다.
-        let names: Vec<&str> = select_probes(Some("디스크 공간이 부족"))
+    fn disk_symptom_includes_docker_df_when_docker_available() {
+        // docker 설치 호스트면 "디스크 full"만 말해도 docker 점유를 함께 수집해 원인(images/cache)을 발견.
+        let names: Vec<&str> = select_probes(Some("디스크 공간이 부족"), true)
             .iter()
             .map(|(n, _)| *n)
             .collect();
         assert!(names.contains(&"disk"));
         assert!(names.contains(&"docker_df"));
+    }
+
+    #[test]
+    fn disk_and_generic_include_tmp_probes() {
+        // /diagnose 가 /tmp 비대를 보려면 tmp probe 가 카테고리에 붙어야 한다(docker_available 무관).
+        let disk: Vec<&str> = select_probes(Some("디스크 공간이 부족"), false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(disk.contains(&"tmp_big"), "disk: {disk:?}");
+        assert!(disk.contains(&"tmp_recent"), "disk: {disk:?}");
+        let generic: Vec<&str> = select_probes(Some("원인 모름 그냥 이상"), false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(generic.contains(&"tmp_big"), "generic: {generic:?}");
+    }
+
+    #[test]
+    fn disk_includes_inode_and_log_probes() {
+        // 용량 무관 disk full(inode) + 로그 누적(/var/log)을 disk 진단이 함께 본다.
+        let n: Vec<&str> = select_probes(Some("디스크 공간이 부족"), false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(n.contains(&"inodes"), "disk: {n:?}");
+        assert!(n.contains(&"log_big"), "disk: {n:?}");
+    }
+
+    #[test]
+    fn network_includes_conn_states() {
+        let n: Vec<&str> = select_probes(Some("포트 연결이 안 됨"), false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(n.contains(&"conn_states"), "network: {n:?}");
+    }
+
+    #[test]
+    fn process_includes_proc_states() {
+        let n: Vec<&str> = select_probes(Some("프로세스가 안 죽음"), false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(n.contains(&"proc_states"), "process: {n:?}");
+    }
+
+    #[test]
+    fn docker_unavailable_adds_no_docker_probes() {
+        // docker 미설치 호스트: 명시적 docker 카테고리가 아니면 docker probe 를 붙이지 않는다(노이즈 0).
+        for sym in ["서버가 느려", "메모리 누수", "앱이 죽어", "디스크 full", "원인 모름 그냥 이상"] {
+            let names: Vec<&str> = select_probes(Some(sym), false)
+                .iter()
+                .map(|(n, _)| *n)
+                .collect();
+            assert!(
+                !names.iter().any(|n| n.starts_with("docker")),
+                "sym={sym} 에 docker probe 가 붙음: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_available_adds_probes_across_categories() {
+        // docker 설치 호스트: docker 를 언급하지 않은 일반 증상에도 카테고리-적합 docker probe 가 붙는다.
+        let cpu: Vec<&str> = select_probes(Some("서버가 느려"), true)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(cpu.contains(&"docker_ps"), "cpu: {cpu:?}");
+        let generic: Vec<&str> = select_probes(Some("원인 모름 그냥 이상"), true)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(
+            generic.contains(&"docker_df") && generic.contains(&"docker_ps"),
+            "generic: {generic:?}"
+        );
     }
 
     #[test]

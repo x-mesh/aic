@@ -230,6 +230,44 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "find /tmp -type f -mmin -10 | head -n 30",
         max_lines: Some(30),
     },
+    // inode/log/connection/process-state — 용량과 무관한 disk full·로그 누적·연결 폭주·좀비 등
+    // 흔한 장애의 "범인"을 짚는 probe. select_probes가 카테고리별로 붙인다.
+    ProbeSpec {
+        id: "inodes",
+        category: "system",
+        tags: &["disk", "inode"],
+        description: "inode 사용량(df -i) — 용량 남아도 'No space left'면 inode 고갈 의심",
+        linux_command: "df -i",
+        macos_command: "df -i",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "log_big",
+        category: "filesystem",
+        tags: &["disk", "log"],
+        description: "/var/log의 큰 파일·디렉토리 top 20(du)",
+        linux_command: "du -ah /var/log | sort -rh | head -n 20",
+        macos_command: "du -ah /var/log | sort -rh | head -n 20",
+        max_lines: Some(20),
+    },
+    ProbeSpec {
+        id: "conn_states",
+        category: "system",
+        tags: &["network", "conn"],
+        description: "TCP 연결 상태 요약(established/time_wait 등)",
+        linux_command: "ss -s",
+        macos_command: "netstat -an | head -n 60",
+        max_lines: Some(60),
+    },
+    ProbeSpec {
+        id: "proc_states",
+        category: "process",
+        tags: &["process", "zombie"],
+        description: "프로세스 상태 분포(좀비 Z/대기 등 카운트)",
+        linux_command: "ps -eo stat | sort | uniq -c | sort -rn | head -n 15",
+        macos_command: "ps -axo stat | sort | uniq -c | sort -rn | head -n 15",
+        max_lines: Some(15),
+    },
 ];
 
 /// 전체 catalog 슬라이스.

@@ -633,7 +633,8 @@ impl AgentSession {
             return;
         }
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
-        let probes = super::diagnose::select_probes(symptom);
+        let probes =
+            super::diagnose::select_probes(symptom, super::diagnose::docker_available());
         eprintln!(
             "=== diagnose: {} ===",
             symptom.unwrap_or("(generic health)")
