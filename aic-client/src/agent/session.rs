@@ -49,6 +49,88 @@ for reads, and mutation/egress still require confirmation or are blocked.\n\
 blocked for that reason, propose and run a simpler safe alternative instead of giving up.\n\
 - If a tool result says output was truncated, re-run with a narrower/limited command.\n";
 
+/// session 화면 출력 sink (RFC-004 step 4d). 비-TTY/배너 opt-out은 `Direct`로 기존 line-based
+/// 출력(stdout=답변/stderr=UI)을 **byte-identical** 유지하고, TTY는 `Tui`로 ChatLoop에 위임해
+/// 답변을 viewport 위 scrollback에 insert_before하고 spinner를 tick arm으로 흐르게 한다.
+enum ChatOut {
+    /// non-TTY/파이프/배너 opt-out — 기존 동작 보존. thinking은 stderr spinner.
+    Direct {
+        spinner: Option<crate::spinner::Spinner>,
+    },
+    /// TTY — ChatLoop에 메시지로 위임(answer=insert_before, spin=tick arm).
+    Tui(tokio::sync::mpsc::Sender<super::chat_tui::OutMsg>),
+}
+
+impl ChatOut {
+    /// LLM 답변(<think> 요약 + 파란 border)을 출력한다. 두 경로가 같은 `repl::format_*`를
+    /// 통과해 Direct는 stdout, Tui는 insert_before로 내되 내용이 일치한다(critic M3).
+    async fn answer(&self, text: &str) {
+        let (think, main) = repl::split_think_block(text);
+        match self {
+            ChatOut::Direct { .. } => {
+                if let Some(t) = &think {
+                    repl::print_think_summary(t);
+                }
+                repl::print_with_border(&main);
+            }
+            ChatOut::Tui(tx) => {
+                let mut block = String::new();
+                if let Some(t) = &think {
+                    if let Some(s) = repl::format_think_summary(t) {
+                        block.push_str(&s);
+                        block.push('\n');
+                    }
+                }
+                block.push_str(&repl::format_with_border(&main));
+                let _ = tx.send(super::chat_tui::OutMsg::Answer(block)).await;
+            }
+        }
+    }
+
+    /// thinking spinner 시작. Direct=stderr spinner(색/지표 포함), Tui=ChatLoop tick(SpinStart).
+    async fn spin_start(&mut self, label: String, color: &str) {
+        match self {
+            ChatOut::Direct { spinner } => {
+                *spinner = Some(crate::spinner::Spinner::start_with_metrics(
+                    label,
+                    color,
+                    ui::statusbar_enabled(),
+                ));
+            }
+            ChatOut::Tui(tx) => {
+                let _ = tx.send(super::chat_tui::OutMsg::SpinStart(label)).await;
+            }
+        }
+    }
+
+    /// thinking spinner 종료(Direct는 라인 정리, Tui는 입력 줄 복귀).
+    async fn spin_stop(&mut self) {
+        match self {
+            ChatOut::Direct { spinner } => {
+                if let Some(s) = spinner.take() {
+                    s.stop().await;
+                }
+            }
+            ChatOut::Tui(tx) => {
+                let _ = tx.send(super::chat_tui::OutMsg::SpinStop).await;
+            }
+        }
+    }
+
+    /// UI/에러 한 줄. Direct=stderr(기존 byte-identical), Tui=insert_before(Note).
+    /// slash 핸들러의 다른 stderr 출력 이전은 4e에서 진행(현재 TUI에서 slash는 화면 깨질 수 있음).
+    async fn note(&self, line: &str) {
+        match self {
+            ChatOut::Direct { .. } => eprintln!("{line}"),
+            ChatOut::Tui(tx) => {
+                let _ = tx
+                    .send(super::chat_tui::OutMsg::Note(line.to_string()))
+                    .await;
+            }
+        }
+    }
+}
+
 pub struct AgentSession {
     dispatcher: LlmDispatcher,
     sandbox: Sandbox,
@@ -73,6 +155,8 @@ pub struct AgentSession {
     tool_records: VecDeque<ToolRecord>,
     /// `/compare` 직전 시스템 스냅샷(baseline). 첫 호출 시 저장, 이후 diff 후 갱신.
     compare_baseline: Option<String>,
+    /// 화면 출력 sink. 기본 `Direct`(기존 동작), TTY chat은 `run()`에서 `Tui`로 교체(RFC-004 step 4).
+    out: ChatOut,
 }
 
 impl AgentSession {
@@ -97,6 +181,7 @@ impl AgentSession {
             tool_seq: 0,
             tool_records: VecDeque::new(),
             compare_baseline: None,
+            out: ChatOut::Direct { spinner: None },
         }
     }
 
@@ -114,11 +199,30 @@ impl AgentSession {
     }
 
     /// REPL 루프 실행. exit/quit/Ctrl+D로 종료.
+    ///
+    /// system preface를 시드한 뒤, 입출력 TTY + `AIC_CHAT_TUI` opt-in이면 ratatui chat TUI
+    /// ([`run_loop_tui`])로, 아니면 기존 line-based 루프([`run_loop_direct`])로 분기한다.
+    /// (RFC-004 step 4: TUI는 slash popup/history 이식 전까지 opt-in — reedline 회귀 방지.)
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut reader = repl::LineReader::new();
+        // system preface를 history 시드로 둔다(OpenAI system role 사용).
+        // SRE 모드면 generic preface 뒤에 SRE 지침을 덧붙인다.
+        let mut preface = repl::system_preface().to_string();
+        if self.allow_run_command {
+            preface.push_str(SRE_PREFACE);
+        }
+        self.history.push(ChatMessage::System(preface));
 
-        // ASCII art banner + status line(TTY/색상/폭 자동, non-TTY는 plain fallback).
-        // AIC_NO_BANNER/AIC_QUIET면 시작 배너·status를 생략(배너는 debug와 무관, opt-out 전용).
+        use std::io::IsTerminal;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        if tty && super::debug::env_truthy("AIC_CHAT_TUI") {
+            self.run_loop_tui().await
+        } else {
+            self.run_loop_direct().await
+        }
+    }
+
+    /// 시작 배너 + context 헤더(banner opt-out이면 생략). Direct/Tui 공용.
+    fn print_banner(&self) {
         if !ui::banner_suppressed() {
             ui::print_banner_and_status(&ui::StatusInfo {
                 run_state: if self.allow_run_command {
@@ -132,14 +236,12 @@ impl AgentSession {
             });
             repl::print_context_header(&self.context);
         }
+    }
 
-        // system preface를 history 시드로 둔다(OpenAI system role 사용).
-        // SRE 모드면 generic preface 뒤에 SRE 지침을 덧붙인다.
-        let mut preface = repl::system_preface().to_string();
-        if self.allow_run_command {
-            preface.push_str(SRE_PREFACE);
-        }
-        self.history.push(ChatMessage::System(preface));
+    /// 기존 line-based REPL 루프(reedline/stdin). non-TTY·기본 경로. 출력은 stdout=답변/stderr=UI.
+    async fn run_loop_direct(&mut self) -> anyhow::Result<()> {
+        let mut reader = repl::LineReader::new();
+        self.print_banner();
 
         // status bar 샘플러 — TTY이고 opt-out 미설정일 때만 생성(비-TTY/파이프/CI는 None = 비용 0).
         let mut sampler = ui::statusbar_enabled().then(super::sys_sampler::SysSampler::new);
@@ -183,6 +285,48 @@ impl AgentSession {
         Ok(())
     }
 
+    /// RFC-004 step 4: ratatui chat TUI 루프(`AIC_CHAT_TUI` opt-in). `ChatLoop`가 terminal을 단독
+    /// 소유하고, 여기선 채널로 입력을 받고(`recv_line`) 답변/spinner를 `ChatOut::Tui`로 보낸다.
+    /// 배너는 raw mode 진입(spawn) 전에 일반 출력해 scrollback에 남긴다. slash 출력 이전은 4e.
+    async fn run_loop_tui(&mut self) -> anyhow::Result<()> {
+        use std::io::Write;
+        // 배너는 ChatLoop의 raw mode 진입 전에 출력(scrollback 보존). flush로 순서 보장.
+        self.print_banner();
+        let _ = std::io::stderr().flush();
+        let _ = std::io::stdout().flush();
+
+        let prompt = ui::prompt_label().to_string();
+        let mut handle = super::chat_tui::start_chat_loop(prompt, ui::statusbar_enabled());
+        self.out = ChatOut::Tui(handle.out_sender());
+
+        loop {
+            let line = match handle.recv_line().await {
+                super::chat_tui::ChatLine::Eof => break,
+                super::chat_tui::ChatLine::Line(l) => l,
+            };
+            if repl::ReplSession::is_exit_command(&line) {
+                break;
+            }
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
+            if let Some(cmd) = tool_record::parse_slash(input) {
+                self.handle_slash(cmd).await;
+                continue;
+            }
+            let user_text = self.build_user_message(input);
+            self.history.push(ChatMessage::User(user_text));
+            if let Err(e) = self.run_turn().await {
+                self.out.note(&format!("LLM 요청 실패: {e}")).await;
+            }
+        }
+
+        // raw mode 복원 보장(Shutdown + task join).
+        handle.shutdown().await;
+        Ok(())
+    }
+
     /// 한 번의 사용자 입력에 대해 tool-calling loop를 돈다.
     /// degrade 상태이면 도구 없이 단발 send()로 처리한다.
     async fn run_turn(&mut self) -> anyhow::Result<()> {
@@ -205,13 +349,9 @@ impl AgentSession {
                 specs.len(),
                 if self.allow_run_command { "on" } else { "off" }
             );
-            let spinner = crate::spinner::Spinner::start_with_metrics(
-                "thinking...".to_string(),
-                "90",
-                ui::statusbar_enabled(),
-            );
+            self.out.spin_start("thinking...".to_string(), "90").await;
             let resp = self.dispatcher.send_messages(&self.history, &specs).await;
-            spinner.stop().await;
+            self.out.spin_stop().await;
 
             match resp {
                 Ok(ChatResponse::Text(text)) => {
@@ -220,7 +360,7 @@ impl AgentSession {
                         content: Some(text.clone()),
                         tool_calls: vec![],
                     });
-                    self.render(&text);
+                    self.out.answer(&text).await;
                     return Ok(());
                 }
                 Ok(ChatResponse::ToolCalls(calls)) => {
@@ -308,13 +448,9 @@ impl AgentSession {
             "degraded turn: provider_tools=off send() prompt_len={}",
             prompt.len()
         );
-        let spinner = crate::spinner::Spinner::start_with_metrics(
-                "thinking...".to_string(),
-                "90",
-                ui::statusbar_enabled(),
-            );
+        self.out.spin_start("thinking...".to_string(), "90").await;
         let resp = self.dispatcher.send(&prompt).await;
-        spinner.stop().await;
+        self.out.spin_stop().await;
 
         match resp {
             Ok(text) => {
@@ -323,7 +459,7 @@ impl AgentSession {
                     content: Some(text.clone()),
                     tool_calls: vec![],
                 });
-                self.render(&text);
+                self.out.answer(&text).await;
                 Ok(())
             }
             Err(e) => {
@@ -942,14 +1078,6 @@ impl AgentSession {
         text
     }
 
-    /// 최종 텍스트 응답을 <think> 분리 후 렌더링한다(repl 렌더러 재사용).
-    fn render(&self, text: &str) {
-        let (think, main) = repl::split_think_block(text);
-        if let Some(ref t) = think {
-            repl::print_think_summary(t);
-        }
-        repl::print_with_border(&main);
-    }
 }
 
 /// `/local` 분석 단발 LLM 호출의 최대 대기 시간(초). 초과 시 raw fallback.
