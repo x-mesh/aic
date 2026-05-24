@@ -145,6 +145,39 @@ impl ChatOut {
             let _ = tx.send(super::chat_tui::OutMsg::Ctx(tokens)).await;
         }
     }
+
+    /// NeedsConfirm 명령 확인. y면 true, 그 외(거부/Esc/비-TTY)는 false(기본 거부).
+    /// - Direct: stdin y/N(비-TTY는 출력 없이 즉시 false — 기존 비대화형 거부와 byte-identical).
+    /// - Tui: `OutMsg::Confirm`으로 ChatLoop에 위임하고 oneshot으로 결과를 받는다(EventStream과
+    ///   경쟁하던 동기 stdin hang을 해소 — investigate F2). 채널이 닫히면 false(안전 거부).
+    async fn confirm(&self, prompt: &str) -> bool {
+        match self {
+            ChatOut::Direct { .. } => {
+                use std::io::{IsTerminal, Write};
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    return false;
+                }
+                eprint!("{prompt} ");
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    return false;
+                }
+                matches!(line.trim(), "y" | "Y" | "yes" | "YES")
+            }
+            ChatOut::Tui(tx) => {
+                let (rtx, rrx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(super::chat_tui::OutMsg::Confirm(prompt.to_string(), rtx))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+                rrx.await.unwrap_or(false)
+            }
+        }
+    }
 }
 
 pub struct AgentSession {
@@ -555,16 +588,33 @@ impl AgentSession {
                     `aic chat`을 다시 실행하세요. 지금은 read_file/list_dir/grep/glob로 진단하세요."
                     .to_string())
             } else {
-                // TUI(raw mode)는 동기 stdin 확인(tty_confirm)이 EventStream과 경쟁해 hang하므로,
-                // 확인이 필요한 명령은 거부한다(codex P1). Safe(read-only) 명령은 confirm을 거치지
-                // 않아 그대로 실행된다. NeedsConfirm/Dangerous는 reedline 모드(AIC_NO_TUI=1)에서.
-                let confirm: fn(&str, &str, &str) -> bool =
-                    if matches!(self.out, ChatOut::Tui(_)) {
-                        |_, _, _| false
-                    } else {
-                        tty_confirm
-                    };
-                super::run_command::execute_with_corr(&args, &self.sandbox, &corr, confirm)
+                // risk 선평가 — NeedsConfirm일 때만 sink(Direct stdin / Tui y·n UI)로 확인을 받는다.
+                // Safe는 confirm을 호출하지 않고 자동 실행, Dangerous/Unknown은 execute_with_corr가
+                // 클로저와 무관하게 차단한다. 이로써 TUI에서도 동기 stdin hang 없이 확인이 동작한다
+                // (investigate F2 해소). execute_with_corr 내부의 risk 재평가·정책은 그대로 둔다.
+                use crate::risk_guard::RiskLevel;
+                let command = args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let assessment = crate::risk_guard::classify(&command);
+                let approved = if assessment.level == RiskLevel::NeedsConfirm {
+                    // 위험 이유(reason)를 confirm 프롬프트에 함께 보여 사용자가 근거로 판단하게 한다.
+                    let reason = assessment.reason.as_deref().unwrap_or("상태 변경 가능");
+                    self.out
+                        .confirm(&format!("⚠ {command} — {reason} [y/N]"))
+                        .await
+                } else {
+                    // Safe는 confirm 미호출(아래 클로저는 호출되지 않음), Dangerous/Unknown은 차단됨.
+                    false
+                };
+                super::run_command::execute_with_corr(
+                    &args,
+                    &self.sandbox,
+                    &corr,
+                    move |_, _, _| approved,
+                )
             }
         } else {
             tools::execute(&call.name, &args, &self.sandbox)
@@ -646,6 +696,7 @@ impl AgentSession {
                 self.handle_incident(name.as_deref(), analyze).await
             }
             SlashCommand::Doctor => self.handle_doctor().await,
+            SlashCommand::Fix => self.handle_fix().await,
             SlashCommand::Timeline(n) => {
                 self.out
                     .note(&tool_record::render_timeline(&self.tool_records, n))
@@ -1045,6 +1096,27 @@ impl AgentSession {
             report
         };
         self.out.note(&format!("\n=== aic doctor ===\n{body}")).await;
+    }
+
+    /// `/fix` — 직전 대화·진단 맥락에서 지금 실행하면 좋을 **안전한 명령 하나**를 run_command로
+    /// 제안·실행하도록 LLM에 턴을 위임한다. run_command가 비활성(read-only)이면 안내만 하고 종료한다.
+    /// 활성이면 사용자 메시지를 history에 push한 뒤 `run_turn`을 돌린다 — LLM이 run_command tool_call을
+    /// 내면 `exec_tool`이 risk 선평가 + confirm UI(기능 A)를 거쳐 실행/거부한다(상태 변경은 확인 후).
+    async fn handle_fix(&mut self) {
+        if !self.allow_run_command {
+            self.out
+                .note("`/fix`는 run_command가 필요합니다 — read-only 세션에서는 비활성입니다.")
+                .await;
+            return;
+        }
+        self.history.push(ChatMessage::User(
+            "직전 대화·진단 맥락에서 지금 실행하면 좋을 안전한 명령 하나를 run_command 도구로 \
+             실행해줘. 상태 변경이 위험하면 실행하지 말고 이유를 설명해줘."
+                .to_string(),
+        ));
+        if let Err(e) = self.run_turn().await {
+            self.out.note(&format!("LLM 요청 실패: {e}")).await;
+        }
     }
 
     /// `/compare` — 고정 Safe probe로 현재 시스템 스냅샷을 만들고 직전 baseline과 diff(LLM 미호출).
@@ -1509,26 +1581,6 @@ fn is_tools_unsupported(e: &AicError) -> bool {
         }
         _ => false,
     }
-}
-
-/// run_command NeedsConfirm용 TTY 확인. 비-TTY는 무조건 거부(false).
-/// command/cwd/risk를 보여주고 y/N을 받는다(기본 N).
-fn tty_confirm(command: &str, cwd: &str, reason: &str) -> bool {
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return false;
-    }
-    eprintln!("\x1b[33m[run_command] ⚠ 확인 필요 (risk: NeedsConfirm — 상태 변경 가능)\x1b[0m");
-    eprintln!("  command: {command}");
-    eprintln!("  cwd:     {cwd}");
-    eprintln!("  reason:  {reason}");
-    eprint!("\x1b[33m실행할까요? [y/N] (Enter=No)\x1b[0m ");
-    let _ = std::io::stderr().flush();
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 /// 에러의 종류/상태만 반환한다(메시지 본문은 제외 — debug 로그에 내용 누출 방지).

@@ -194,6 +194,9 @@ pub(crate) enum SlashCommand {
     },
     /// `/doctor` — AIC 자체 상태(provider/model/tool-calling/run_command/env flag presence). secret 미출력.
     Doctor,
+    /// `/fix` — 직전 진단·대화 맥락에서 실행하면 좋을 안전한 명령을 run_command로 제안·실행(확인 후).
+    /// run_command가 비활성(read-only)이면 안내만 한다. LLM에 turn을 위임하고 confirm UI를 거친다.
+    Fix,
     /// `/timeline [N]` — 세션 tool 기록을 시간순 compact 출력(최근 N개, 기본 전체).
     Timeline(Option<usize>),
     /// `/trend [N]` — 최근 명령 exit code 추세(✓/✗ 시퀀스 + 실패율). ring의 exit 기록 집계, LLM 미호출.
@@ -273,6 +276,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "explain-last",
     "incident",
     "doctor",
+    "fix",
     "timeline",
     "trend",
     "compare",
@@ -284,7 +288,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
 /// slash 명령의 palette 카테고리(빈 `/` discovery 메뉴 그룹핑용). 표시 순서는 `slash_category_order`.
 pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
-        "diagnose" | "incident" | "triage" | "doctor" => "Diagnostics",
+        "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "explain-last" => "Evidence",
         "local" | "sys" | "snapshot" | "watch" => "System",
         _ => "Meta", // help 등
@@ -316,6 +320,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "explain-last" => "최근(또는 지정) tool 기록 분석 (원인/증거/다음확인; --raw=증거만)",
         "incident" => "인시던트 진단: 시스템+git+최근기록 (--raw=증거만)",
         "doctor" => "AIC 자체 상태 점검 (provider/도구/플래그 presence, secret 미노출)",
+        "fix" => "직전 진단·대화 맥락에서 실행할 명령을 제안·실행 (확인 후)",
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
         "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
@@ -411,6 +416,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
             SlashCommand::Incident { name, analyze }
         }
         "doctor" => SlashCommand::Doctor,
+        "fix" => SlashCommand::Fix,
         "timeline" => SlashCommand::Timeline(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "trend" => SlashCommand::Trend(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "compare" => SlashCommand::Compare,
@@ -707,6 +713,7 @@ pub(crate) fn help_text() -> String {
         "  /explain-last [--raw] [seq|corr]  최근(또는 지정) tool 기록을 증거로 원인/다음확인 분석",
         "  /incident [--raw] [name]  시스템 스냅샷+git(repo)+최근 기록을 묶어 인시던트 분석",
         "  /doctor              AIC 자체 상태(provider/도구/플래그 presence; secret 미노출)",
+        "  /fix                 직전 진단·대화 맥락에서 실행할 안전한 명령을 제안·실행(확인 후; run_command 필요)",
         "  /timeline [N]        세션 tool 기록 시간순(최근 N개)",
         "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(변경 섹션/±라인 요약; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
@@ -1414,6 +1421,19 @@ mod tests {
             parse_slash("/bundle db-outage"),
             Some(SlashCommand::Bundle(Some("db-outage".to_string())))
         );
+    }
+
+    #[test]
+    fn parse_slash_fix() {
+        // exact + 유일 prefix(`f`로 시작하는 명령은 fix뿐).
+        assert_eq!(parse_slash("/fix"), Some(SlashCommand::Fix));
+        assert_eq!(parse_slash("/f"), Some(SlashCommand::Fix));
+        assert_eq!(parse_slash("/fi"), Some(SlashCommand::Fix));
+        // 메타데이터: Diagnostics 카테고리 + 설명 존재 + SLASH_COMMANDS 포함 + help 노출.
+        assert_eq!(slash_category("fix"), "Diagnostics");
+        assert!(!slash_description("fix").is_empty());
+        assert!(SLASH_COMMANDS.contains(&"fix"));
+        assert!(help_text().contains("/fix"));
     }
 
     #[test]
