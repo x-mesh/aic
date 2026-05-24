@@ -156,12 +156,13 @@ pub(crate) fn status_lines(info: &StatusInfo, width: usize) -> Vec<String> {
         }
     }
 
-    let mut meta = format!("cwd: {}", info.cwd);
-    if let Some(p) = &info.provider {
-        meta.push_str(&format!("   provider: {p}"));
-    }
-    if let Some(m) = &info.model {
-        meta.push_str(&format!("   model: {m}"));
+    // cwd는 단축(~/…/마지막2), provider/model은 한 줄로 합쳐 dim 메타 한 줄에 담는다.
+    let mut meta = shorten_path(&info.cwd);
+    match (&info.provider, &info.model) {
+        (Some(p), Some(m)) => meta.push_str(&format!(" · {p}/{m}")),
+        (Some(p), None) => meta.push_str(&format!(" · {p}")),
+        (None, Some(m)) => meta.push_str(&format!(" · {m}")),
+        (None, None) => {}
     }
     lines.push(meta);
 
@@ -172,6 +173,31 @@ pub(crate) fn status_lines(info: &StatusInfo, width: usize) -> Vec<String> {
         }
     });
     lines
+}
+
+/// cwd를 status 메타용으로 짧게: home은 `~`로, 4단계보다 깊으면 `~/…/마지막2`로 줄인다.
+/// 순수 함수(테스트 가능). home 판정 실패 시 원문 유지.
+fn shorten_path(path: &str) -> String {
+    let p = match dirs::home_dir() {
+        Some(h) => {
+            let h = h.display().to_string();
+            path.strip_prefix(&h)
+                .map(|r| format!("~{r}"))
+                .unwrap_or_else(|| path.to_string())
+        }
+        None => path.to_string(),
+    };
+    let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() > 3 {
+        let lead = if p.starts_with('~') { "~" } else { "" };
+        format!(
+            "{lead}/…/{}/{}",
+            parts[parts.len() - 2],
+            parts[parts.len() - 1]
+        )
+    } else {
+        p
+    }
 }
 
 /// 대화형 입력 프롬프트 라벨.
@@ -203,9 +229,16 @@ pub(crate) fn format_banner_and_status(info: &StatusInfo) -> String {
         out.push_str(&paint_if(&l, "36;1", color)); // cyan bold
         out.push('\n');
     }
+    // rich 배너에는 tagline 한 줄(dim). plain 배너는 한 줄 안에 이미 tagline을 포함한다.
+    if rich {
+        out.push_str(&paint_if("  agentic SRE assistant", "2", color));
+        out.push('\n');
+    }
+    // status: 첫 줄(mode)은 cyan으로 강조해 위계를 주고, 나머지(tools/meta/toggle)는 dim.
     let bar = paint_if("▌", "2", color);
-    for l in status_lines(info, term_width()) {
-        out.push_str(&format!("{bar} {}\n", paint_if(&l, "2", color)));
+    for (i, l) in status_lines(info, term_width()).into_iter().enumerate() {
+        let code = if i == 0 { "36" } else { "2" };
+        out.push_str(&format!("{bar} {}\n", paint_if(&l, code, color)));
     }
     out
 }
@@ -267,8 +300,9 @@ mod tests {
         assert!(joined.contains("run_command on"));
         assert!(joined.contains("run_command")); // tools 목록
         assert!(joined.contains("policy:"));
-        assert!(joined.contains("cwd: /tmp/proj"));
-        assert!(joined.contains("provider: ai-mesh"));
+        // meta: cwd 단축(여기선 짧아 원문) + provider/model 합침("ai-mesh/claude-haiku").
+        assert!(joined.contains("/tmp/proj"));
+        assert!(joined.contains("ai-mesh/claude-haiku"));
         assert!(joined.contains("--no-run"));
     }
 
