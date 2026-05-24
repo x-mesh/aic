@@ -168,7 +168,7 @@ golden 스냅샷(stdout/stderr 각각) → 전환 후 byte diff=0**을 4d/4f 게
 | ~~**4a**~~ ✅ | `ansi-to-tui 7` + ratatui `unstable-rendered-line-info` feature + `ansi_to_paragraph`(=height 단일 계산, `Paragraph::line_count` 사용)/`insert_before_ansi` 헬퍼 (`chat_tui.rs`, 2026-05-24) | ✅ 단위테스트 7개 통과: tab·빈줄·**trailing nl=off-by-one 고정("a\n"=1줄)**·CJK cell-width wrap 경계·색(Blue) 보존·insert_before TestBackend. crossterm `event-stream`은 실사용하는 4b로 이연 |
 | ~~**4b**~~ ✅(코드) | `ChatLoop` task(terminal 단독 소유) + `EventStream`+`tokio::select!`(키/tick/out_rx) + `ChatHandle`(line_rx/out_tx/shutdown) + 입력 echo + 패닉훅(raw 복원) (`chat_tui.rs`, 2026-05-24). crossterm `event-stream` feature 추가. **Send 충족(spawn OK)** | ✅ 컴파일+단위테스트(`draw_thinking`) green. **실동작(EventStream/raw mode)은 4d 통합 후 `aic chat`로 검증**(단독 진입점 없음) |
 | ~~**4c**~~ ✅ | `OutMsg::Spin*`을 별도 task 아닌 **4b 루프 tick arm**으로 흡수(critic M2 해소) | 4b에 포함 |
-| **4d** | `ChatOut` sink + `session.run`을 채널 모델로(`line_rx`/`out_tx`) + `render()`→`answer`. non-TTY=Direct fallback | **golden byte-diff=0** + 수동 |
+| ~~**4d**~~ ✅(코드) | `ChatOut` sink(Direct/Tui) + `repl::format_with_border`/`format_think_summary` 분리(byte-identical) + `session.run`→`run_loop_direct`/`run_loop_tui` 분기 + `render()`→`out.answer`, spinner→`out.spin_*`. **TUI는 `AIC_CHAT_TUI=1` opt-in**(slash popup/history 이식 전까지 reedline 기본 유지) (2026-05-24) | ✅ byte-identical 단위테스트(`format_*`) + 전체 484+ green. **실터미널(`AIC_CHAT_TUI=1 aic chat`) 검증 대기** |
 | **4e** | slash 출력(`note`) + `collect_local_snapshot` 진행표시(`\r`, 기본활성·우선) 이전. run_command 카드는 verbose-only라 보류 가능 | 수동(/local·/diagnose) |
 | **4f** | 통합 검증 체크리스트 | 한글·긴 답변 wrap·resize(#2086)·Ctrl+C·패닉 복원·파이프 fallback byte-diff=0 |
 

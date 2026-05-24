@@ -541,11 +541,12 @@ pub(crate) fn split_think_block(text: &str) -> (Option<String>, String) {
     (None, trimmed.to_string())
 }
 
-/// <think> 블록을 처음과 끝을 보여주는 요약 한 줄로 출력
-pub(crate) fn print_think_summary(think: &str) {
+/// <think> 블록을 처음과 끝을 보여주는 요약 한 줄로 만든다(없으면 None). RFC-004 step 4d:
+/// Direct는 println, Tui sink는 이 문자열을 `OutMsg::Answer`에 담는다(byte-identical 보장).
+pub(crate) fn format_think_summary(think: &str) -> Option<String> {
     let lines: Vec<&str> = think.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.is_empty() {
-        return;
+        return None;
     }
     let first: String = lines
         .first()
@@ -565,15 +566,23 @@ pub(crate) fn print_think_summary(think: &str) {
         .into_iter()
         .rev()
         .collect();
-    if lines.len() <= 1 {
-        println!("\x1b[90m[Thinking] {first}\x1b[0m");
+    Some(if lines.len() <= 1 {
+        format!("\x1b[90m[Thinking] {first}\x1b[0m")
     } else {
-        println!("\x1b[90m[Thinking] {first} ... {last}\x1b[0m");
+        format!("\x1b[90m[Thinking] {first} ... {last}\x1b[0m")
+    })
+}
+
+/// <think> 블록 요약 한 줄을 stdout에 출력(Direct 경로).
+pub(crate) fn print_think_summary(think: &str) {
+    if let Some(s) = format_think_summary(think) {
+        println!("{s}");
     }
 }
 
-/// 파란색 왼쪽 선과 함께 텍스트 출력
-pub(crate) fn print_with_border(text: &str) {
+/// 파란색 왼쪽 선과 함께 텍스트를 렌더한 문자열을 만든다(각 줄 끝에 `\n` 포함). RFC-004 step 4d:
+/// Direct는 그대로 print, Tui sink는 `OutMsg::Answer`에 담는다(동일 함수 → byte-identical).
+pub(crate) fn format_with_border(text: &str) -> String {
     let prefix = "\x1b[34m▐\x1b[0m "; // 파란색
     let empty_prefix = "\x1b[34m▐\x1b[0m";
 
@@ -582,18 +591,28 @@ pub(crate) fn print_with_border(text: &str) {
         .unwrap_or(80);
     let content_width = term_width.saturating_sub(3);
 
+    let mut out = String::new();
     for line in text.lines() {
         if line.is_empty() {
-            println!("{}", empty_prefix);
+            out.push_str(empty_prefix);
+            out.push('\n');
         } else {
             let mut remaining = line;
             while !remaining.is_empty() {
                 let (chunk, rest) = split_at_width(remaining, content_width);
-                println!("{}{}", prefix, chunk);
+                out.push_str(prefix);
+                out.push_str(chunk);
+                out.push('\n');
                 remaining = rest;
             }
         }
     }
+    out
+}
+
+/// 파란색 왼쪽 선과 함께 텍스트 출력(Direct 경로). [`format_with_border`]를 stdout에 낸다.
+pub(crate) fn print_with_border(text: &str) {
+    print!("{}", format_with_border(text));
 }
 
 #[cfg(test)]
@@ -899,5 +918,30 @@ mod tests {
             ..Default::default()
         };
         assert!(build_prefix_for(&r).is_none());
+    }
+
+    // ── RFC-004 step 4d: format_* byte-identical 게이트(critic M3) ──────────────
+    // Direct는 print_*(=format_* + print), Tui는 format_*를 OutMsg에 담으므로, format_* 출력이
+    // 기존 println 레이아웃과 byte 동일해야 한다. 짧은 입력은 wrap 무관(term_width 비의존).
+
+    #[test]
+    fn format_with_border_layout_is_byte_stable() {
+        // 비어있지 않은 줄: "▐ " prefix + 내용 + \n.
+        assert_eq!(format_with_border("hi"), "\x1b[34m▐\x1b[0m hi\n");
+        // 빈 줄: 공백 없는 empty_prefix + \n. 줄 순서·개행 보존.
+        assert_eq!(
+            format_with_border("a\n\nb"),
+            "\x1b[34m▐\x1b[0m a\n\x1b[34m▐\x1b[0m\n\x1b[34m▐\x1b[0m b\n"
+        );
+    }
+
+    #[test]
+    fn format_think_summary_single_line_and_blank() {
+        assert_eq!(
+            format_think_summary("hello"),
+            Some("\x1b[90m[Thinking] hello\x1b[0m".to_string())
+        );
+        // 공백-only think는 출력 없음(None) — 기존 print_think_summary의 early return과 동일.
+        assert_eq!(format_think_summary("   "), None);
     }
 }

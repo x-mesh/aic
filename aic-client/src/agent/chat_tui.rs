@@ -171,6 +171,11 @@ impl ChatHandle {
         let _ = self.out_tx.send(msg).await;
     }
 
+    /// 출력 송신단을 복제한다 — session의 `ChatOut::Tui`가 답변/spin을 직접 보내게 한다.
+    pub(crate) fn out_sender(&self) -> mpsc::Sender<OutMsg> {
+        self.out_tx.clone()
+    }
+
     /// 종료: Shutdown 후 task join으로 raw mode 복원을 보장한다.
     pub(crate) async fn shutdown(self) {
         let _ = self.out_tx.send(OutMsg::Shutdown).await;
