@@ -780,6 +780,14 @@ impl AgentSession {
                     text.trim().to_string()
                 };
                 self.out.note(&format!("\n=== {heading} ===\n{body}")).await;
+                // 분석을 history에 push해 후속 질문(왜/어떻게)을 같은 대화로 이을 수 있게 한다
+                // (investigate F1 해소). 토큰 증가는 status의 ctx 표시 + /clear로 관리.
+                self.history
+                    .push(ChatMessage::User(format!("[{kind}] 진단 분석 요청")));
+                self.history.push(ChatMessage::Assistant {
+                    content: Some(text.clone()),
+                    tool_calls: vec![],
+                });
             }
             Ok(Err(e)) => {
                 self.analysis_fallback(kind, &format!("provider 오류: {}", err_kind(&e)), snapshot)
