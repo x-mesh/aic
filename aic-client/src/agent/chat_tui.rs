@@ -520,10 +520,15 @@ fn log_area_height(total_height: u16, popup_n: u16) -> u16 {
 /// N = tokens/1000(1000 단위 k 절삭). `~`로 추정 표기(provider usage가 아닌 문자수/4 추정).
 fn status_with_ctx(status: &str, ctx_tokens: usize) -> String {
     if ctx_tokens == 0 {
-        status.to_string()
-    } else {
-        format!("{status} · ctx ~{}k", ctx_tokens / 1000)
+        return status.to_string();
     }
+    // 1000 미만은 `~512`처럼 정확한 수로(과거 `~0k`로 떠 '값 없음'처럼 보이던 문제), 이상은 `~12k`.
+    let ctx = if ctx_tokens >= 1000 {
+        format!("~{}k", ctx_tokens / 1000)
+    } else {
+        format!("~{ctx_tokens}")
+    };
+    format!("{status} · ctx {ctx}")
 }
 
 /// 검색 모드 search bar 텍스트(입력 줄 대체). `/{query}  (idx/total)`. hit가 없으면 `(0/0)`.
@@ -1183,8 +1188,8 @@ mod tests {
         // 0이면 status 그대로(표시 생략), >0이면 ` · ctx ~Nk`(1000 단위 절삭).
         assert_eq!(super::status_with_ctx("· load 1.0", 0), "· load 1.0");
         assert_eq!(super::status_with_ctx("· load", 12_345), "· load · ctx ~12k");
-        // 1000 미만은 ~0k(있다는 신호). 정확 1000 = ~1k.
-        assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~0k");
+        // 1000 미만은 정확한 수(~512), 1000 이상은 ~Nk.
+        assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~999");
         assert_eq!(super::status_with_ctx("s", 1000), "s · ctx ~1k");
     }
 
