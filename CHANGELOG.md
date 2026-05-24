@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-25
+
+### Added — ratatui 전면 chat TUI + agentic 쓰기 도구
+
+- **전면 TUI (alternate screen)** — `aic chat`이 전체 화면을 소유한다. 대화 로그를 자체 스크롤
+  버퍼로 관리(`PageUp`/`PageDown`), 입력창 **아래에 하단 고정 status bar**(타이핑 중에도 흐름),
+  종료 시 대화를 터미널 scrollback에 색 그대로 dump. `AIC_NO_TUI=1`로 기존 reedline 라인 모드.
+- **slash 자동완성 popup** — `/` 입력 시 세로 목록(카테고리 색 + 설명)을 띄운다. ↑↓로 선택,
+  Tab 완성, Enter 제출.
+- **history ↑↓** — 이전 입력 탐색(reedline과 동일 `chat_history` 파일 공유).
+- **`/clear`** — 대화 컨텍스트 리셋(시스템 프롬프트 유지).
+- **`/resume`** — 종료한 세션의 대화 복원(`~/.aic/sessions/last.json`).
+- **`/fix`** — 직전 진단·대화 맥락에서 실행할 명령을 제안·실행(확인 후).
+- **컨텍스트 토큰 표시** — status bar에 대화 토큰 추정치 `ctx ~Nk`.
+- **로그 내 검색** — `Ctrl+F`로 대화 로그를 검색(`n`/`N` 이동, `Esc` 종료).
+- **분석↔대화 통합** — `/diagnose`·`/local`·`/incident` 등 분석 후 "왜?/어떻게?" 후속 질문을
+  같은 대화로 이어갈 수 있다.
+- **`write_file`/`edit_file` 도구** — agentic 파일 작성·수정. sandbox 경계 + 쓰기 전 미리보기·확인.
+  `run_command` 활성(mutation) 세션에서만 노출, read-only 세션엔 없음.
+- **TUI confirm UI** — `NeedsConfirm` 명령을 `⚠ {명령} — {이유} [y/N]`로 확인.
+- **시작 배너** — 버전 + 미니 봇 마스코트 + tagline.
+
+### Changed
+
+- **TUI 기본 전환** — TTY는 기본 ratatui chat TUI(`AIC_NO_TUI=1`로 reedline opt-out). 레이아웃은
+  입력 위 / status bar 아래(claude CLI 스타일).
+- status bar redraw 주기를 1초로(입력 대기 중 불필요한 깨어남 감소).
+
+### Fixed
+
+- TUI에서 slash 출력·tool 출력·확인 입력이 화면을 깨거나 멈추던 문제(출력 sink 일원화 + confirm UI).
+- 작은 터미널에서 slash popup 표시 항목과 제출 항목이 어긋나던 문제.
+- 입력 prompt 폭(`◇`/`❯` 밀림), 분석 spinner 프레임 누적.
+
 ## [0.9.0] - 2026-05-24
 
 ### Added — chat status bar (실시간 시스템 지표) + `/trend`
