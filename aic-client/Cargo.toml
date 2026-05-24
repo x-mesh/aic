@@ -52,6 +52,8 @@ hmac = "0.12"
 tracing = "0.1"
 keyring = { version = "3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 ratatui = "0.29"
+# RFC-004 ratatui chat TUI 입력 위젯 평가용(CJK PoC). ratatui 0.29/crossterm 0.28과 정합하는 0.7.x.
+tui-textarea = "0.7"
 # chat status bar 시스템 지표(load/cpu/mem/disk i/o) in-process 수집. disk i/o delta는
 # Disks 인스턴스 재사용으로 sysinfo가 자동 계산. system+disk feature만(network/component 제외).
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
