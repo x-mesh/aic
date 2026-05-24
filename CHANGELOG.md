@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-24
+
+### Changed — `/diagnose` 진단 커버리지 대폭 확장
+
+- **docker를 의심하지 않아도 발견** — `/diagnose`가 docker 설치 호스트면 카테고리에 맞는 docker probe를
+  자동 포함한다(cpu/memory/process/network → `docker_ps`, disk → `docker_df`, 원인 미상 → 둘 다).
+  이전엔 증상에 "docker"를 직접 써야만 봤다. **docker 미설치 호스트면 docker probe를 전혀 안 붙여 노이즈 0.**
+- **`/tmp` 비대를 disk/원인미상 진단에서 자동 수집** — `tmp_big`(du), `tmp_recent`(최근 10분 수정).
+  이전엔 `/triage`·`/watch`로만 접근 가능했다. 증가 추세 추적은 여전히 `/watch tmp_recent`.
+
+### Added — 흔한 장애 probe 4종 (inode · 로그 · 연결 · 프로세스 상태)
+
+- **`inodes`** (`df -i`) — 용량이 남아도 `No space left on device`면 inode 고갈. disk·원인미상 진단에 포함.
+- **`log_big`** (`du -ah /var/log | sort -rh | head`) — `/var/log` 누적(디스크 full의 흔한 원인). disk 진단에 포함.
+- **`conn_states`** (linux `ss -s` / macOS `netstat`) — TCP 연결 상태 폭주(established/time_wait). network 진단에 포함.
+- **`proc_states`** (`ps -eo stat | sort | uniq -c | sort -rn`) — 프로세스 상태 분포(좀비 Z 등). process 진단에 포함.
+
+### Fixed
+
+- **`/release` 커맨드 clippy를 CI와 일치** — Step 2 로컬 검증의 clippy를 `--all-targets`에서 CI(`ci.yml`)와
+  동일한 `--workspace -- -D warnings`로 변경. `--all-targets`는 CI가 검사하지 않는 test 타겟 경고까지 잡아
+  "CI는 통과할 릴리스"를 로컬에서 잘못 막았다(게이트가 CI보다 엄격하면 안 됨).
+
 ## [0.7.0] - 2026-05-24
 
 ### Added — host-wide SRE 진단 (docker · filesystem · fd)
