@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-24
+
+### Added — chat status bar (실시간 시스템 지표) + `/trend`
+
+- **status bar** — `aic chat`에서 load average·cpu%·memory·disk i/o를 보여준다. **입력 프롬프트 직전**(매
+  입력마다 최신)과 **LLM 응답 대기 중 spinner 라인**(2초마다 갱신)에 표시한다. reedline이 `read_line()`
+  중 raw mode를 독점하므로, 충돌이 없는 이 두 구간에만 갱신한다(타이핑 중 갱신은 ratatui 전환이 필요해
+  현재는 정적). 수집은 `sysinfo` crate(in-process), disk i/o는 `Disks` 인스턴스 재사용으로 delta 자동 계산.
+  - non-TTY/파이프/CI에서는 자동 비활성(spinner와 동일 정책). `AIC_NO_STATUSBAR=1`로 끄기.
+- **`/trend [N]`** — 최근 명령 exit code 추세를 `✓`/`✗` 시퀀스 + 성공/실패율 + 최근 실패 명령으로 보여준다.
+  ring buffer의 exit 기록만 집계(LLM 미호출). Evidence 카테고리(`/last`·`/timeline`과 함께).
+
 ## [0.8.1] - 2026-05-24
 
 ### Fixed — `aic update`의 GitHub API rate limit(403)
