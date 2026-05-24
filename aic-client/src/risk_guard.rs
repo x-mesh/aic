@@ -469,6 +469,11 @@ fn first_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
     args.iter().find(|a| !a.starts_with('-')).copied()
 }
 
+/// 두 번째 non-flag 토큰(예: `docker system df`의 `df`). flag/옵션은 건너뛴다.
+fn second_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    args.iter().filter(|a| !a.starts_with('-')).nth(1).copied()
+}
+
 fn match_dangerous(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     match head {
         // 원격 접속/임의 네트워크 도구는 명시적으로 Dangerous(차단) — Unknown 의존 금지.
@@ -561,12 +566,31 @@ fn match_dangerous(head: &str, args: &[&str]) -> Option<RiskAssessment> {
             )),
             _ => None,
         },
-        "docker" => match first_subcommand(args) {
-            Some("rm") | Some("rmi") | Some("system") if has_flag(args, "-f") => Some(
-                RiskAssessment::dangerous("docker.force_remove", "docker 강제 제거는 복구 불가"),
-            ),
-            _ => None,
-        },
+        "docker" => {
+            // 강제 제거(`-f`): docker rm/rmi/system -f — 복구 불가.
+            if has_flag(args, "-f")
+                && matches!(first_subcommand(args), Some("rm" | "rmi" | "system"))
+            {
+                return Some(RiskAssessment::dangerous(
+                    "docker.force_remove",
+                    "docker 강제 제거는 복구 불가",
+                ));
+            }
+            // prune: `docker prune` 또는 `docker <area> prune` — 미사용 리소스 삭제(복구 불가).
+            // `-f` 없이도 삭제하므로 Dangerous로 분류해 자동 실행을 막는다.
+            let is_prune = first_subcommand(args) == Some("prune")
+                || (matches!(
+                    first_subcommand(args),
+                    Some("system" | "image" | "container" | "volume" | "network" | "builder")
+                ) && second_subcommand(args) == Some("prune"));
+            if is_prune {
+                return Some(RiskAssessment::dangerous(
+                    "docker.prune",
+                    "docker prune은 미사용 리소스를 삭제(복구 불가)",
+                ));
+            }
+            None
+        }
         "npm" | "pnpm" | "yarn" => match first_subcommand(args) {
             Some("publish") => Some(RiskAssessment::dangerous(
                 "npm.publish",
@@ -619,6 +643,12 @@ fn dns_uses_custom_resolver(head: &str, args: &[&str]) -> bool {
         }
         _ => false,
     }
+}
+
+/// `sysctl`이 커널 파라미터를 변경하는 write 형태인지(`-w` 또는 `key=value`). 읽기 전용 조회는 false.
+fn sysctl_is_write(args: &[&str]) -> bool {
+    args.iter()
+        .any(|a| *a == "-w" || (!a.starts_with('-') && a.contains('=')))
 }
 
 /// curl/wget args에 write/upload/output(=네트워크 쓰기 또는 파일 출력) 플래그가 있는지.
@@ -774,6 +804,7 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         "df",
         "du",
         "free",
+        "sysctl",
         "ps",
         "top",
         "htop",
@@ -792,13 +823,36 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         "yq",
         "xxd",
         "base64",
+        // 순수 텍스트 필터(stdin→stdout, 부작용 없음). awk/sed는 코드 실행(system()/e)
+        // 가능성 때문에 의도적으로 제외한다.
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "column",
+        "comm",
+        // macOS 메모리 read-only 조회(SRE_PREFACE가 mem 진단에 사용).
+        "vm_stat",
     ]
     .iter()
     .copied()
     .collect();
+    // sort/uniq의 `-o`/`--output`은 파일 쓰기 → Safe(자동 실행)에서 제외(파이프 stdin 필터만 Safe).
+    if matches!(head, "sort" | "uniq")
+        && args.iter().any(|a| {
+            *a == "-o" || a.starts_with("--output") || (a.starts_with("-o") && a.len() > 2)
+        })
+    {
+        return None;
+    }
     // DNS 도구가 custom resolver/explicit server를 쓰면 Safe 자동실행에서 제외한다
     // (DNS exfil 축소 — match_needs_confirm의 dns.custom_resolver가 받는다).
     if matches!(head, "dig" | "nslookup" | "host") && dns_uses_custom_resolver(head, args) {
+        return None;
+    }
+    // sysctl이 write 형태(`-w` 또는 `key=value`)면 Safe 자동실행에서 제외(커널 파라미터 변경 방지).
+    // 읽기 전용 조회(`sysctl kern.num_files` 등)만 Safe로 유지한다.
+    if head == "sysctl" && sysctl_is_write(args) {
         return None;
     }
     if safe_set.contains(head) {
@@ -846,6 +900,10 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         {
             return Some(RiskAssessment::safe("docker.read"));
         }
+        // `docker system df`(디스크 사용량 읽기)만 Safe. system prune/events 등은 제외(위 prune은 Dangerous).
+        if first_subcommand(args) == Some("system") && second_subcommand(args) == Some("df") {
+            return Some(RiskAssessment::safe("docker.read"));
+        }
     }
     None
 }
@@ -880,6 +938,34 @@ mod tests {
         ] {
             assert_eq!(lvl(cmd), RiskLevel::Safe, "expected Safe for '{cmd}'");
         }
+    }
+
+    #[test]
+    fn sysctl_read_safe_write_not() {
+        // 읽기 전용 조회는 Safe(자동 실행 가능) — `/local` fd probe가 의존.
+        assert_eq!(
+            lvl("sysctl kern.num_files kern.maxfiles"),
+            RiskLevel::Safe
+        );
+        assert_eq!(lvl("sysctl -a"), RiskLevel::Safe);
+        // write 형태(`-w` 또는 key=value)는 Safe가 아니다(커널 파라미터 변경 → 자동 실행 금지).
+        assert_ne!(lvl("sysctl -w kern.maxfiles=400000"), RiskLevel::Safe);
+        assert_ne!(lvl("sysctl kern.maxfiles=400000"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn docker_read_safe_prune_dangerous() {
+        // 읽기 전용은 Safe(자동 실행 — catalog docker probe가 의존).
+        assert_eq!(lvl("docker system df"), RiskLevel::Safe);
+        assert_eq!(lvl("docker ps -s"), RiskLevel::Safe);
+        assert_eq!(lvl("docker images"), RiskLevel::Safe);
+        // prune/force-remove는 삭제(복구 불가) → Dangerous, 자동 실행 금지.
+        assert_eq!(lvl("docker system prune"), RiskLevel::Dangerous);
+        assert_eq!(lvl("docker image prune -f"), RiskLevel::Dangerous);
+        assert_eq!(lvl("docker volume prune"), RiskLevel::Dangerous);
+        assert_eq!(lvl("docker rmi -f img"), RiskLevel::Dangerous);
+        // system의 df가 아닌 하위(events 등)는 Safe가 아니다(자동 실행 금지).
+        assert_ne!(lvl("docker system events"), RiskLevel::Safe);
     }
 
     #[test]

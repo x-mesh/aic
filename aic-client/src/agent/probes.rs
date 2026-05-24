@@ -98,6 +98,18 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(12),
     },
     ProbeSpec {
+        id: "fd",
+        category: "system",
+        tags: &["fd", "files", "limits"],
+        description: "열린 파일 디스크립터 수(현재/최대)",
+        // 양 OS 모두 sysctl 사용(절대 경로 인자는 sandbox validator가 거부).
+        // Linux: fs.file-nr = "allocated unused max", fs.file-max = 상한.
+        // macOS: kern.num_files = 현재, kern.maxfiles = 상한.
+        linux_command: "sysctl fs.file-nr fs.file-max",
+        macos_command: "sysctl kern.num_files kern.maxfiles",
+        max_lines: Some(2),
+    },
+    ProbeSpec {
         id: "ip",
         category: "system",
         tags: &["network", "ip"],
@@ -169,6 +181,55 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "git diff --stat",
         max_lines: None,
     },
+    // docker: 데몬/설치 의존이라 `/local` 기본 섹션엔 없고(미설치 호스트 노이즈 방지),
+    // docker·disk triage/diagnose에서만 선택된다. 모두 읽기 전용(risk_guard docker.read=Safe).
+    ProbeSpec {
+        id: "docker_df",
+        category: "docker",
+        tags: &["docker", "disk", "storage"],
+        description: "docker 디스크 사용량 요약(images/containers/volumes/build cache)",
+        linux_command: "docker system df",
+        macos_command: "docker system df",
+        max_lines: None,
+    },
+    ProbeSpec {
+        id: "docker_ps",
+        category: "docker",
+        tags: &["docker", "process", "disk"],
+        description: "컨테이너 상태 + writable layer 크기(ps -s)",
+        linux_command: "docker ps -s | head -n 30",
+        macos_command: "docker ps -s | head -n 30",
+        max_lines: Some(30),
+    },
+    ProbeSpec {
+        id: "docker_images",
+        category: "docker",
+        tags: &["docker", "disk", "images"],
+        description: "이미지별 크기(images)",
+        linux_command: "docker images | head -n 40",
+        macos_command: "docker images | head -n 40",
+        max_lines: Some(40),
+    },
+    // filesystem: 호스트 read-only 진단(절대경로 허용). /tmp 같은 디렉토리의 비대 파일 추적.
+    // `/watch tmp_recent`로 시계열 변화(늘어나는 파일)를 관찰할 수 있다.
+    ProbeSpec {
+        id: "tmp_big",
+        category: "filesystem",
+        tags: &["disk", "tmp", "files"],
+        description: "/tmp의 큰 파일·디렉토리 top 20(du)",
+        linux_command: "du -ah /tmp | sort -rh | head -n 20",
+        macos_command: "du -ah /tmp | sort -rh | head -n 20",
+        max_lines: Some(20),
+    },
+    ProbeSpec {
+        id: "tmp_recent",
+        category: "filesystem",
+        tags: &["disk", "tmp", "files"],
+        description: "/tmp에서 최근 10분 내 수정된 파일(find -mmin)",
+        linux_command: "find /tmp -type f -mmin -10 | head -n 30",
+        macos_command: "find /tmp -type f -mmin -10 | head -n 30",
+        max_lines: Some(30),
+    },
 ];
 
 /// 전체 catalog 슬라이스.
@@ -219,6 +280,7 @@ pub(crate) const TRIAGE_TOPICS: &[&str] = &[
     "cpu",
     "network",
     "build-fail",
+    "docker",
     "generic",
 ];
 
@@ -234,6 +296,7 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
         Some("cpu") | Some("load") => "cpu",
         Some("network") | Some("net") => "network",
         Some("build-fail") | Some("build") => "build-fail",
+        Some("docker") | Some("container") | Some("containers") => "docker",
         _ => "generic",
     };
     let (checklist, probe_ids): (&'static [&str], &'static [&str]) = match resolved {
@@ -261,8 +324,20 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
             &[
                 "파티션별 사용률/여유 공간 (disk)",
                 "디스크를 점유하는 프로세스 (process)",
+                "docker가 디스크를 점유하는가 — images/containers/volumes (docker_df)",
+                "/tmp에 큰 파일이 쌓였는가 (tmp_big)",
             ],
-            &["disk", "process"],
+            &["disk", "process", "docker_df", "tmp_big"],
+        ),
+        "docker" => (
+            &[
+                "docker 전체 디스크 사용량 — images/containers/volumes/build cache (docker_df)",
+                "컨테이너별 writable layer 크기 — 비정상 증가 컨테이너 식별 (docker_ps)",
+                "이미지별 크기/중복 누적 (docker_images)",
+                "(수동) 비대 컨테이너 내부 경로 확인: docker exec <id> du -xh /tmp | sort -rh | head",
+                "(수동) 정리: docker image prune / docker system df 확인 후 prune (삭제는 복구 불가)",
+            ],
+            &["docker_df", "docker_ps", "docker_images"],
         ),
         "network" | "web" => (
             &[
