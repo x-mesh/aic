@@ -23,10 +23,13 @@ branch protection이 없어 직접 push의 CI는 post-merge로 돌기 때문에,
 `--lib`만으로는 CI의 phase × central_store 조합을 놓친다(과거 `central_store=1`에서만 깨진 env-race
 사례 있음). 최소 아래를 돌리고, 실패하면 **중단**한다.
 ```sh
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace -- -D warnings   # CI(ci.yml)와 동일 명령 — 게이트는 CI와 일치시킨다
 cargo test --workspace --no-default-features --features phase-3_5
 AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
 ```
+> clippy는 CI(`ci.yml`)와 **똑같은** `--workspace -- -D warnings`를 쓴다. `--all-targets`를 붙이면 CI가
+> 검사하지 않는 test 타겟 경고까지 잡아, "CI는 통과할 릴리스"를 로컬에서 잘못 막는다(게이트가 CI보다
+> 엄격하면 안 된다). test 타겟 lint는 별도 백로그로 다룬다.
 
 ## 3. bump + CHANGELOG
 - `aic-common`/`aic-server`/`aic-client`의 `Cargo.toml` `version`을 동일하게 bump.
