@@ -4,6 +4,41 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-24
+
+### Added — host-wide SRE 진단 (docker · filesystem · fd)
+
+- **docker 진단 probe** — `docker_df`(`docker system df` — images/containers/volumes/build cache 디스크
+  사용량), `docker_ps`(`docker ps -s` — 컨테이너 writable layer 크기), `docker_images`(이미지별 크기).
+  `/triage docker` 토픽 신설, `/diagnose`의 docker/disk 카테고리에서 자동 선택된다. **"디스크 full"만
+  말해도** docker가 원인이면 `docker_df`가 함께 수집돼 발견된다.
+- **`/local fd` 섹션** — 열린 파일 디스크립터 수(현재/최대). Linux `sysctl fs.file-nr fs.file-max`,
+  macOS `sysctl kern.num_files kern.maxfiles`.
+- **filesystem probe** — `tmp_big`(`du -ah /tmp | sort -rh | head` — 큰 파일/디렉토리),
+  `tmp_recent`(`find /tmp -type f -mmin -10` — 최근 수정 파일). `/triage disk`가 `tmp_big`을 포함한다.
+- **`/watch`가 모든 Probe Catalog probe를 대상으로** — 기존 LOCAL 섹션 제한을 풀어 `docker_df`·
+  `tmp_recent` 등도 watch 가능. `/watch tmp_recent`로 `/tmp`에서 **늘어나는 파일을 시계열로 추적**한다.
+
+### Changed — SRE sandbox 경계 재정의 (read-only는 호스트 전역)
+
+- **read-only 진단의 host-wide read 허용** — `run_command`의 읽기 전용(Safe) 명령은 이제 cwd sandbox에
+  갇히지 않고 호스트 전역을 읽을 수 있다(`tail -n 100 /var/log/...`, `du -ah /tmp`, `cat /proc/meminfo`
+  등). 이전엔 절대경로·`..`가 일률 차단돼 SRE 지침이 권하던 로그 tail조차 막혔다. mutation/위험 명령은
+  기존대로 cwd sandbox에 격리된다.
+- **risk_guard safe_set 보강** — 순수 텍스트 필터 `sort`/`uniq`/`cut`/`tr`/`column`/`comm`과 `vm_stat`를
+  Safe 자동 실행에 추가(`awk`/`sed`는 코드 실행 위험이라 제외, `sort`/`uniq -o`는 파일 쓰기라 가드).
+  `du /tmp | sort -rh | head` 같은 진단이 막힘 없이 실행된다.
+- **docker prune Dangerous화** — `docker system prune`/`<area> prune`/`prune`을 복구 불가 삭제로 분류해
+  자동 실행을 차단한다(이전엔 미분류). `docker system df`(읽기)만 Safe로 구분.
+
+### Security
+
+- **secret 경로 denylist** — host-wide read가 열린 대신, 읽기 전용 명령이라도 secret 경로는 차단한다:
+  `~/.ssh`·`~/.aws`·`~/.gnupg`·`~/.kube`·`~/.docker`, `/etc/shadow`, `/etc/ssl/private`,
+  `/proc/*/environ`, `*.pem`/`*.key`/`.env`/`id_rsa`/`credentials`. symlink 대상은 `canonicalize`로
+  해소해 우회를 막는다. egress(curl/ssh)·mutation 게이트와 출력 redaction은 그대로 유지된다.
+- **`sysctl` write 차단** — `sysctl` 읽기 조회만 Safe, `-w`/`key=value`(커널 파라미터 변경)는 Safe에서 제외.
+
 ## [0.6.0] - 2026-05-22
 
 `aic chat`을 SRE 진단 어시스턴트로 굳히는 릴리즈 — slash 명령 팔레트/안전성 개선, 새 진단 명령
