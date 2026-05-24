@@ -46,7 +46,7 @@ top.rs식 자체 스크롤 로그 위젯이 불필요하다.
 1. ~~**CJK PoC**~~ ✅ **통과** (`aic-client/tests/cjk_poc.rs`, 2026-05-24) — tui-textarea 0.7 한글 정확. go.
 2. ~~`chat_tui.rs` 골격~~ ✅ (2026-05-24, 5bb16eb) — Inline viewport + **동기 `event::poll` 루프**(top.rs 패턴, EventStream 불필요) + `draw_viewport`(status bar dim / prompt+tui-textarea) TestBackend 검증. status 흐름·**하단 고정(단계 3)도 골격에 포함**. `read_line_tui`는 미연결(mod allow dead_code).
 3. ~~status bar 하단 고정~~ ✅ (단계 2 골격에 흡수 — Inline viewport 상단 1줄 dim).
-4. **LLM 호출 통합 (현재 진행 — insert_before 채택 확정 2026-05-24)** — 아래 [§단계 4 상세 설계](#단계-4-상세-설계-insert_before-채택) 참조. `read_line_tui`(매번 terminal 생성)를 폐기하고 **terminal 보관 `ChatTui` + 전체 루프 소유**로 재설계, 답변/spinner/tool 카드를 `insert_before`로 일원화. **실제 터미널 검증 필수**(자동 테스트는 ANSI→Text·height 변환만 커버).
+4. ~~**LLM 호출 통합 (insert_before)**~~ ✅ **완료** (4a~4f, 2026-05-24, `AIC_CHAT_TUI=1` opt-in) — 아래 [§단계 4 상세 설계](#단계-4-상세-설계-insert_before--단일-이벤트-루프) 참조. `ChatLoop` task가 terminal 단독 소유 + `mpsc` 채널(critic B1/B2 해소), 답변/spinner/slash를 `insert_before`로 일원화. 실터미널 검증 완료(viewport·status bar 하단고정·타이핑 중 흐름·한글·긴 답변 wrap·raw 복원). **기본 전환은 step 5(history)·6(slash popup) 이식 후**.
 5. history 이식(FilteredHistory 재사용).
 6. slash popup(Clear+List).
 7. non-TTY fallback 유지(기존 stdin read_line) + 테스트.
@@ -170,7 +170,7 @@ golden 스냅샷(stdout/stderr 각각) → 전환 후 byte diff=0**을 4d/4f 게
 | ~~**4c**~~ ✅ | `OutMsg::Spin*`을 별도 task 아닌 **4b 루프 tick arm**으로 흡수(critic M2 해소) | 4b에 포함 |
 | ~~**4d**~~ ✅ | `ChatOut` sink(Direct/Tui) + `repl::format_with_border`/`format_think_summary` 분리(byte-identical) + `session.run`→`run_loop_direct`/`run_loop_tui` 분기 + `render()`→`out.answer`, spinner→`out.spin_*`. **TUI는 `AIC_CHAT_TUI=1` opt-in**(slash popup/history 이식 전까지 reedline 기본 유지) (2026-05-24) | ✅ byte-identical 단위테스트(`format_*`) + 전체 484+ green. ✅ **실터미널(tmux) 검증**: banner→viewport·**status bar 하단고정**·**타이핑 중 지표 흐름**·한글 입력/echo·**답변 insert_before**·Ctrl+D raw 복원 모두 확인. prompt 폭 byte→display width fix(`◇`/`❯` 밀림 해소) |
 | ~~**4e**~~ ✅ | slash 출력 57곳 → `self.out.note(..).await`. sync 7개 함수(`collect_local_snapshot`/`analysis_fallback`/`handle_doctor`/`compare`/`watch`/`bundle`/`triage`) async화 + 호출부 `.await`. `collect`의 `\r` ephemeral 진행표시는 `ChatOut::is_direct()`로 **Direct만**(Tui 생략). `watch` thread→tokio sleep. byte-identical 유지(2026-05-24) | ✅ build/clippy/test green(487 lib) + non-TTY 회귀. ✅ **실터미널**: `/doctor`·`/local` insert_before 출력, **viewport 무결**·status bar 하단고정 확인. run_command 카드(verbose-only)는 보류 |
-| **4f** | 통합 검증 체크리스트 | 한글·긴 답변 wrap·resize(#2086)·Ctrl+C·패닉 복원·파이프 fallback byte-diff=0 |
+| ~~**4f**~~ ✅ | 통합 검증 체크리스트(2026-05-24) | ✅ **실터미널**: 한글 입력/답변·**긴 답변 wrap(4줄, height 정확·status bar 안밀림)**·Ctrl+D raw 복원·파이프 byte-identical. 패닉훅 코드 설치(`install_panic_hook`), resize는 best-effort(다음 draw) |
 
 ### 추가 리스크 (단계 4 한정)
 
