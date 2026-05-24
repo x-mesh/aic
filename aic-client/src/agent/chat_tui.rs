@@ -24,7 +24,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Widget, Wrap};
 use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
@@ -256,6 +256,17 @@ fn slash_candidates(input: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// slash 명령 카테고리별 표시 색(popup 가시성, 과하지 않게 4색).
+/// Diagnostics=노랑 · System=cyan · Evidence=초록 · Meta=회색.
+fn slash_category_color(name: &str) -> Color {
+    match super::tool_record::slash_category(name) {
+        "Diagnostics" => Color::Yellow,
+        "System" => Color::Cyan,
+        "Evidence" => Color::Green,
+        _ => Color::Gray, // Meta(help 등)
+    }
+}
+
 /// popup(slash 후보) 활성 시 viewport: 입력 줄(위) + 후보 1줄(아래, status 자리). 선택은 reverse,
 /// 나머지는 dim. ratatui Inline은 동적 높이가 없어 status를 잠시 후보로 대체한다(`/` 입력 중에만).
 fn draw_viewport_popup(
@@ -411,19 +422,27 @@ fn draw_full(
         f.render_widget(para.scroll((scroll, 0)), log_area);
     }
 
-    // slash popup(세로 select box, 입력 위): "/명령   설명", sel reverse.
+    // slash popup(세로 select box, 입력 위): "/명령(카테고리 색 bold)  설명(회색)", sel은 reverse.
     if pop_n > 0 {
         let items: Vec<ListItem> = popup
             .iter()
             .take(pop_n)
             .map(|c| {
                 let desc = super::tool_record::slash_description(c);
-                ListItem::new(format!("  /{c:<13}{desc}"))
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("/{c:<13}"),
+                        Style::default()
+                            .fg(slash_category_color(c))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
+                ]))
             })
             .collect();
         let list = List::new(items)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .style(Style::default().add_modifier(Modifier::DIM));
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
         let mut state = ListState::default();
         state.select(Some(popup_sel.min(pop_n.saturating_sub(1))));
         f.render_stateful_widget(list, rows[1], &mut state);

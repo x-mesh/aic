@@ -187,15 +187,24 @@ pub(crate) fn prompt_label() -> &'static str {
 
 /// banner + status를 stderr로 출력한다(TTY/색상/폭 자동 처리).
 pub(crate) fn print_banner_and_status(info: &StatusInfo) {
+    eprint!("{}", format_banner_and_status(info));
+}
+
+/// banner + status를 ANSI 문자열로 만든다(각 줄 끝 `\n`). 전면 TUI(alternate screen)는 시작 배너가
+/// 화면에 안 보이므로, 이 문자열을 대화 로그에 넣어 표시한다(RFC-004 step 8 후속). 색은 동일 정책.
+pub(crate) fn format_banner_and_status(info: &StatusInfo) -> String {
     let rich = is_tty();
     let color = color_enabled();
+    let mut out = String::new();
     for l in banner_lines(rich) {
-        eprintln!("{}", paint_if(&l, "36;1", color)); // cyan bold
+        out.push_str(&paint_if(&l, "36;1", color)); // cyan bold
+        out.push('\n');
     }
     let bar = paint_if("▌", "2", color);
     for l in status_lines(info, term_width()) {
-        eprintln!("{bar} {}", paint_if(&l, "2", color));
+        out.push_str(&format!("{bar} {}\n", paint_if(&l, "2", color)));
     }
+    out
 }
 
 /// 런타임 상태 변경(예: provider degrade)을 status 줄 스타일로 stderr에 출력한다.

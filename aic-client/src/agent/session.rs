@@ -299,15 +299,24 @@ impl AgentSession {
     /// 소유하고, 여기선 채널로 입력을 받고(`recv_line`) 답변/spinner를 `ChatOut::Tui`로 보낸다.
     /// 배너는 raw mode 진입(spawn) 전에 일반 출력해 scrollback에 남긴다. slash 출력 이전은 4e.
     async fn run_loop_tui(&mut self) -> anyhow::Result<()> {
-        use std::io::Write;
-        // 배너는 ChatLoop의 raw mode 진입 전에 출력(scrollback 보존). flush로 순서 보장.
-        self.print_banner();
-        let _ = std::io::stderr().flush();
-        let _ = std::io::stdout().flush();
-
         let prompt = ui::prompt_label().to_string();
         let mut handle = super::chat_tui::start_chat_loop(prompt, ui::statusbar_enabled());
         self.out = ChatOut::Tui(handle.out_sender());
+
+        // 시작 배너 — alternate screen이라 stderr 배너는 안 보이므로 대화 로그에 넣는다(step 8 후속).
+        if !ui::banner_suppressed() {
+            let banner = ui::format_banner_and_status(&ui::StatusInfo {
+                run_state: if self.allow_run_command {
+                    ui::RunState::On
+                } else {
+                    ui::RunState::ReadOnly
+                },
+                cwd: self.sandbox.root().display().to_string(),
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+            });
+            self.out.note(&banner).await;
+        }
 
         loop {
             let line = match handle.recv_line().await {
