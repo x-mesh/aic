@@ -2530,7 +2530,7 @@ fn handle_whitelist_status() {
     if let Some(p) = &wl.user_path {
         println!(
             "{COL_BOLD}user{COL_RESET} ({}) [{}]:",
-            user_count.max(0),
+            user_count,
             p.display()
         );
         for (name, rules) in &wl.programs {
