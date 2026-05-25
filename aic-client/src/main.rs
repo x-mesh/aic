@@ -265,6 +265,12 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         interactive: bool,
     },
+    /// SSH 멀티호스트 인벤토리 조회 (RFC-005 Phase 1) — `~/.aic/hosts.toml`과
+    /// `~/.ssh/config` import + overlay 결과를 표시. 실제 SSH 호출은 Phase 2 이후.
+    Hosts {
+        #[command(subcommand)]
+        op: HostsOp,
+    },
     /// 첫 사용 통합 가이드 — config + init + migrate-keys + doctor 순으로 안내
     Setup {
         /// 셸 종류 (자동 감지: $SHELL)
@@ -576,6 +582,20 @@ enum AuditOp {
 }
 
 #[derive(Subcommand)]
+enum HostsOp {
+    /// 인벤토리 표시 — `~/.aic/hosts.toml` + `~/.ssh/config` import + overlay 적용 결과.
+    /// 이름 인자가 없으면 전체 호스트·그룹 목록, 있으면 단일 호스트의 최종 해석값
+    /// (어느 필드가 어느 source에서 왔는지) + ssh_config 위임 경고를 표시한다.
+    Show {
+        /// 단일 호스트 이름. 생략 시 전체 인벤토리.
+        name: Option<String>,
+        /// JSON 출력(머신 파싱 친화). 디버깅 surface.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigOp {
     /// 현재 설정을 비-인터랙티브로 출력 (기본 TOML, `--json`도 가능). API key는 마스킹된다.
     Show {
@@ -625,6 +645,9 @@ async fn main() {
             json,
             all,
         }) => handle_status(watch, interval, session, json, all).await,
+        Some(Commands::Hosts { op }) => match op {
+            HostsOp::Show { name, json } => handle_hosts_show(name, json),
+        },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
         },
@@ -1861,6 +1884,161 @@ fn handle_audit_verify() {
         Err(e) => {
             println!("{COL_YELLOW}⚠{COL_RESET} audit verify error: {e}");
             std::process::exit(3);
+        }
+    }
+}
+
+/// `aic hosts show [name] [--json]` — RFC-005 Phase 1 디버깅 surface.
+///
+/// `~/.aic/hosts.toml` + `~/.ssh/config` import + overlay 결과를 노출한다. 이 단계에서
+/// 실제 SSH 호출은 없다(Phase 2 RemoteExecutor). 사용자가 "왜 호스트가 비어있나" /
+/// "어느 필드가 어디서 왔나"를 즉시 검사할 수 있게 하는 것이 목적(red-team O1 해소).
+fn handle_hosts_show(name: Option<String>, json: bool) {
+    use aic_client::agent::hosts::Inventory;
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    if json {
+        // 전체(name=None) 또는 단일(name=Some)을 JSON으로.
+        let v = match &name {
+            Some(n) => match inv.host(n) {
+                Some(e) => serde_json::to_value(e).unwrap_or_default(),
+                None => {
+                    eprintln!("{COL_RED}✗{COL_RESET} host not found: {n}");
+                    std::process::exit(1);
+                }
+            },
+            None => serde_json::to_value(&inv).unwrap_or_default(),
+        };
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return;
+    }
+
+    match name {
+        None => print_hosts_summary(&inv),
+        Some(n) => print_host_detail(&inv, &n),
+    }
+}
+
+fn print_hosts_summary(inv: &aic_client::agent::hosts::Inventory) {
+    use aic_client::agent::hosts::HostSource;
+
+    let n_hosts = inv.hosts.len();
+    let n_groups = inv.groups.len();
+    println!(
+        "inventory: {n_hosts} hosts · {n_groups} groups · ssh_config_import={}",
+        inv.options.ssh_config_import
+    );
+    println!(
+        "concurrency: max_parallel={} · per_host_timeout={}s · wall_clock={}s",
+        inv.concurrency.max_parallel,
+        inv.concurrency.per_host_timeout_secs,
+        inv.concurrency.wall_clock_timeout_secs,
+    );
+
+    if !inv.groups.is_empty() {
+        println!("\n{COL_BOLD}groups{COL_RESET}");
+        for (name, g) in &inv.groups {
+            let tags = if g.tags.is_empty() {
+                String::new()
+            } else {
+                format!("  tags: {}", g.tags.join(", "))
+            };
+            println!("  @{name}  ({} hosts){tags}", g.hosts.len());
+        }
+    }
+
+    if !inv.hosts.is_empty() {
+        println!("\n{COL_BOLD}hosts{COL_RESET}");
+        // 가독성: 가장 긴 name 폭 기준으로 정렬.
+        let name_w = inv.hosts.keys().map(|k| k.len()).max().unwrap_or(0).max(8);
+        for (name, e) in &inv.hosts {
+            let src = match e.source {
+                HostSource::HostsToml => "hosts.toml",
+                HostSource::SshConfig => "ssh_config",
+                HostSource::Overlay => "ssh_config + hosts.toml",
+            };
+            let target = format!("{}@{}:{}", e.user, e.hostname, e.port);
+            println!(
+                "  {name:<name_w$}  {target:<32}  [source: {src}]",
+                name_w = name_w
+            );
+        }
+    }
+
+    if !inv.ssh_config_warnings.is_empty() {
+        println!("\n{COL_YELLOW}ssh_config_warnings{COL_RESET} (위임 directive, ssh가 직접 처리)");
+        for w in &inv.ssh_config_warnings {
+            println!("  · {w}");
+        }
+    }
+}
+
+fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
+    use aic_client::agent::hosts::{HostKeyCheck, HostSource};
+
+    let Some(e) = inv.host(name) else {
+        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+        // 유사 이름 제안(Levenshtein 미사용, 간단한 substring 매칭).
+        let candidates: Vec<&String> = inv
+            .hosts
+            .keys()
+            .filter(|k| k.contains(name) || name.contains(k.as_str()))
+            .collect();
+        if !candidates.is_empty() {
+            eprintln!("    did you mean: {:?}", candidates);
+        }
+        std::process::exit(1);
+    };
+
+    let src = match e.source {
+        HostSource::HostsToml => "hosts.toml",
+        HostSource::SshConfig => "ssh_config",
+        HostSource::Overlay => "ssh_config + hosts.toml overlay",
+    };
+    let hkc = match e.host_key_check {
+        HostKeyCheck::Strict => "strict",
+        HostKeyCheck::AcceptNew => "accept-new",
+    };
+
+    println!("{COL_BOLD}{}{COL_RESET}", e.name);
+    println!("  source:                {src}");
+    println!("  hostname:              {}", e.hostname);
+    println!("  user:                  {}", e.user);
+    println!("  port:                  {}", e.port);
+    println!(
+        "  identity_file:         {}",
+        e.identity_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "—".into())
+    );
+    println!(
+        "  proxy_jump:            {}",
+        e.proxy_jump.as_deref().unwrap_or("—")
+    );
+    println!("  forward_agent:         {}", e.forward_agent);
+    println!("  host_key_check:        {hkc}");
+    println!("  connect_timeout_secs:  {}", e.connect_timeout_secs);
+    println!(
+        "  tags:                  {}",
+        if e.tags.is_empty() {
+            "—".into()
+        } else {
+            e.tags.join(", ")
+        }
+    );
+
+    if !inv.ssh_config_warnings.is_empty() {
+        println!("\n{COL_YELLOW}ssh_config_warnings{COL_RESET} (전역 — 이 호스트만의 경고는 아님)");
+        for w in &inv.ssh_config_warnings {
+            println!("  · {w}");
         }
     }
 }
