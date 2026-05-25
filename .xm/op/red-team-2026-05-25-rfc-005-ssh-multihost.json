@@ -1,0 +1,91 @@
+{
+  "strategy": "red-team",
+  "topic": "RFC-005 SSH 멀티호스트 적대적 검증",
+  "target": "docs/RFC-005-SSH-MULTIHOST.md",
+  "date": "2026-05-25",
+  "session_id": "b150e097-7899-4713-97fd-6f366d36b3b8",
+  "config": {
+    "agents": 4,
+    "model": "sonnet",
+    "tone": "critic (가차없음)",
+    "dimensions": {
+      "A1": "Security",
+      "A2": "Reliability",
+      "A3": "Usability",
+      "A4": "Ops/Maintainability"
+    }
+  },
+  "rounds_summary": [
+    {"round": 1, "name": "TARGET", "result": "docs/RFC-005-SSH-MULTIHOST.md (9 섹션, council CONSENSUS WITH RESERVATIONS 반영본)"},
+    {
+      "round": 2,
+      "name": "ATTACK",
+      "vulns_per_dimension": {"Security": 12, "Reliability": 13, "Usability": 15, "Ops": 14},
+      "vulns_total": 54,
+      "by_severity": {"Critical": 12, "High": 18, "Medium": 24},
+      "multi-finding consensus": [
+        "BatchMode=yes + StrictHostKeyChecking=strict ↔ TOFU TUI confirm 구조적 모순 (A2·A4)",
+        "/proc/self/environ 등 procfs 미차단 (A1·A2)",
+        "경로 접두사 best-effort 면피 (A1·A2·A3·A4 4인 합의)",
+        "diff/MVP 단순화(R3)가 RFC §2.1 핵심 가치를 MVP에서 불가능하게 함 (A3 결정타)",
+        "ForwardAgent=no 미명시 (A1 단독, Critical급 누락)",
+        "디버깅 surface 부재 (A4 총평)"
+      ]
+    },
+    {
+      "round": 3,
+      "name": "DEFEND",
+      "scope": "Critical 12개만 (High/Medium은 Phase 4에서 leader 직접 분류 또는 후속)",
+      "results": [
+        {"id": "S1", "dim": "Security", "attack": "shell_escape 미정의 + 비-sh 셸 + remote_shell_wrap=false 기본", "verdict": "PARTIAL", "fix": "POSIX sh-safe shell_escape pseudo-code 명시 + 원격 $SHELL 감지로 remote_shell_wrap 자동 강제", "mvp_days": 0.5},
+        {"id": "S2", "dim": "Security", "attack": "경로 동등 경로 우회(/etc/./shadow, symlink)", "verdict": "FIX", "fix": "lexical canonicalization + procfs/devfs/sysfs allowlist 반전(기본 차단 + probe 사용 path만 명시 허용)", "mvp_days": 0.5},
+        {"id": "S3", "dim": "Security", "attack": "/proc/self/environ 환경변수 노출", "verdict": "FIX", "fix": "S2의 procfs allowlist로 자동 해결 + post-collect regex 2중 방어(AWS_[A-Z_]+=, DATABASE_URL= 등)", "mvp_days": 0.5},
+        {"id": "R1", "dim": "Reliability", "attack": "Semaphore permit 누수", "verdict": "PARTIAL", "fix": "Arc::clone(&sem).acquire_owned() + task move-capture 명시. OwnedSemaphorePermit이 task drop 시 자동 반환", "mvp_days": 0},
+        {"id": "R2", "dim": "Reliability", "attack": "collect-then-render 버퍼 상한 부재 → OOM", "verdict": "FIX", "fix": "단일 호스트 정책 전이 (64KiB 저장 / 8MiB 드레인), cap 8 동시 최악 RSS ~128MiB. [truncated] 태그", "mvp_days": 1},
+        {"id": "R3", "dim": "Reliability", "attack": "Ctrl+C SIGKILL PID 재사용 race", "verdict": "COUNTER", "fix": "tokio::process::Child 핸들이 PID 좀비로 보존 → 재사용 race 구조적 해소. try_wait()+wait().await 명시", "mvp_days": 0},
+        {"id": "U1", "dim": "Usability", "attack": "100+ 호스트 카드 stack 스크롤 고문", "verdict": "PARTIAL", "fix": "severity-sort + [ok] normal collapsed 기본 + 헤더 실패 호스트명 inline + anomaly ⚠ 플래그. '1200줄' 수치는 과장 반박(실제 ~480줄)", "mvp_days": 3},
+        {"id": "U2", "dim": "Usability", "attack": "5종 상태 태그 long-tail 압축", "verdict": "FIX", "fix": "HostStatus 5종→8종 ([ok_warn], [proxy_fail], [remote_err], [host_key_mismatch]) + stderr 패턴 분류기 + proxy_fail 공통 원인 집계", "mvp_days": 3},
+        {"id": "U3", "dim": "Usability", "attack": "[auth_fail] 행동 경로 부재", "verdict": "FIX", "fix": "stderr 패턴별 hint block + 로컬 ssh-add -l 자동 점검 + identity_file/forward_agent 스키마 + --retry-failed", "mvp_days": 3.5},
+        {"id": "O1", "dim": "Ops", "attack": "ssh_config 파싱 범위 미명시 + 디버깅 부재", "verdict": "PARTIAL", "fix": "파싱 위임 경계 표(HostName/User/Port/ProxyJump만 흡수, Match/ProxyCommand/%h는 ssh 위임) + aic hosts show [name] [--json] CLI", "mvp_days": 1.25},
+        {"id": "O2", "dim": "Ops", "attack": "audit JSONL 로테이션/TTL 부재", "verdict": "FIX", "fix": "daily segment + cross-segment chain 경계 + [audit] rotation/compress_after/retain/max_total_size/verify_on_start + aic audit verify --date", "mvp_days": 3.5},
+        {"id": "O3", "dim": "Ops", "attack": "tokenizer 화이트리스트 확장 PR 사이클", "verdict": "FIX", "fix": "~/.aic/whitelist.toml append-merge + aic whitelist status/check CLI + ps -eo 허용 컬럼 구체화", "mvp_days": 4.5}
+      ]
+    }
+  ],
+  "outcome": {
+    "verdict": "54 vulns (12 Critical defended, 0 open) — FIX 7 / COUNTER 1 / PARTIAL 4",
+    "summary": [
+      "RFC-005 Critical 12개 모두 응답 — Open 0",
+      "강력한 응답: R3 COUNTER(tokio Child 좀비 보존), S2/S3 통합 FIX(procfs allowlist 반전), U2 FIX(태그 5→8종), U3 FIX(auth_fail hint+ssh-agent 자동 점검)",
+      "RFC v2 패치 항목: §1.2 Non-Goals + §4.1~§4.6 모두 보강",
+      "MVP 추가 공수: ~14일(O2·O3 분리 시), ~21~25일(전체 포함)",
+      "잔존 trade-off: MFA 호스트 미지원, ProxyJump 다단 어느 hop 실패 불명, fish/csh rc 파일 alias, sed/패턴 매칭의 locale 의존"
+    ],
+    "rfc_v2_patches": {
+      "§1.2 Non-Goals": ["MFA(keyboard-interactive) 호스트 멀티호스트 미지원 명시 (U3 잔존)"],
+      "§4.1 hosts": ["identity_file/forward_agent 필드 추가 + bastion 신뢰 경고 (U3)", "ssh_config 파싱 위임 경계 표 (O1)", "aic hosts show [name] [--json] CLI (O1)"],
+      "§4.2 execution": ["shell_escape POSIX sh-safe pseudo-code 명시 (S1)", "원격 $SHELL 감지로 remote_shell_wrap 자동 강제 (S1)"],
+      "§4.3 scope": ["lexical canonicalization + procfs/devfs/sysfs allowlist 반전 (S2, S3)", "~/.aic/whitelist.toml append-merge + aic whitelist status/check (O3)", "ps -eo 허용 컬럼 구체화 (O3)"],
+      "§4.4 output": ["severity-sort + [ok] normal collapsed + 헤더 실패 호스트 inline (U1)", "HostStatus 5→8종 + stderr 패턴 분류기 + proxy_fail 공통 원인 (U2)", "[auth_fail] hint block + 로컬 ssh-agent 점검 + --retry-failed (U3)"],
+      "§4.5 safety": ["acquire_owned + move-capture 명시 (R1)", "stdout 64KiB/8MiB 정책 + [truncated] (R2)", "try_wait + wait.await 명시 reap (R3)"],
+      "§4.6 audit": ["daily segment + chain 경계 + [audit] 정책 + aic audit verify --date (O2)", "post-collect 환경변수 regex 2중 방어 (S3)"]
+    }
+  },
+  "self_score": {
+    "coverage": {"score": 9, "note": "4 dimension × Critical 3 + 추가 High/Medium 24개 식별. dimension 직교성 유지"},
+    "convergence": {"score": 9, "note": "Open 0, FIX 7+COUNTER 1, Partial 4 RESIDUAL 솔직"},
+    "actionability": {"score": 9, "note": "각 fix가 코드 fragment·CLI·필드 단위. MVP 일정 정량"},
+    "calibration": {"score": 8, "note": "R3 COUNTER가 tokio Child 동작 근거. U1 '1200줄' 과장 반박 등 PARTIAL trade-off 정직"},
+    "hallucination_check": {
+      "feasible": true,
+      "specific_to_project": true,
+      "measurable_unit": true,
+      "post_release_validation_required": true
+    }
+  },
+  "follow_up_recommended": [
+    "RFC-005를 v2로 직접 업데이트 (council reservation R1~R4 + Critical 12 fix 반영)",
+    "High 18개는 v2 작성 시 점진 흡수 (특히 BatchMode↔TOFU 구조 모순, ForwardAgent=no 명시, ControlMaster 도입)",
+    "Medium 24개는 후속 RFC 또는 0.10.x 패치로 분리"
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "strategy": "council",
+  "topic": "aic SSH 멀티호스트 진단(T1.1) 설계 — brainstorm follow-up",
+  "date": "2026-05-25",
+  "session_id": "b150e097-7899-4713-97fd-6f366d36b3b8",
+  "config": {
+    "agents": 4,
+    "model": "sonnet",
+    "rounds_executed": ["R1 OPENING", "R2 CROSS-EXAMINE", "Final CONVERGE"],
+    "dimensions": {
+      "A1": "실행 메커니즘 (Execution Mechanism)",
+      "A2": "호스트 정의 + 인증 (Hosts & Auth)",
+      "A3": "결과 표시 + 진단 범위 (Output & Scope)",
+      "A4": "안전 · 동시성 · 운영 (Safety/Concurrency/Ops)"
+    }
+  },
+  "rounds_summary": [
+    {
+      "round": 1,
+      "name": "OPENING",
+      "positions": {
+        "A1": "외부 ssh + RemoteExecutor trait 추상화, 2단계 ssh2/russh 전환 가능. BatchMode + collect-then-render",
+        "A2": "~/.ssh/config 1순위 + ~/.aic/hosts.toml 보강(그룹/태그). ssh-agent + TOFU TUI confirm",
+        "A3": "카드 + Tab diff(majority-diff or reference). read-only probe + run_command 화이트리스트. mutation·write 하드 차단",
+        "A4": "cap 8, continue-and-report, per-host 30s + wall 5min. mutation 별도 서브커맨드. audit batch_id + 호스트 서브레코드. SIGTERM 전파"
+      }
+    },
+    {
+      "round": 2,
+      "name": "CROSS-EXAMINE",
+      "agreements_emerged": [
+        "collect-then-render (A1·A3 합의)",
+        "continue-and-report + audit batch (A1·A2·A4 합의)",
+        "timeout 의미 분리: connect 10s · cmd 30s · wall 5min (A1·A3·A4 명시)"
+      ],
+      "position_changes": {
+        "A1": "trait 유지 + MVP 단일 구현(2단계 RFC 보존)",
+        "A2": "hosts.toml을 보강 → ssh_config_import 지원하는 통합 인벤토리로 조정",
+        "A3": "임의 run_command 화이트리스트 → catalog 확장 우선 + tokenizer 화이트리스트 통합 수용. run --hosts 별도 서브커맨드는 chat UX 끊김으로 반대 유지",
+        "A4": "read-only run_command tokenizer 화이트리스트 + 원격 `--` 셸해석 배제 조건부 수용. Dangerous 별도 서브커맨드 유지"
+      },
+      "unresolved_after_r2": ["majority-diff vs reference UX", "catalog 확장 vs tokenizer 화이트리스트 우선순위"]
+    },
+    {
+      "round": "Final",
+      "name": "CONVERGE",
+      "votes": {
+        "A1": "AGREE WITH RESERVATIONS",
+        "A2": "AGREE WITH RESERVATIONS",
+        "A3": "AGREE WITH RESERVATIONS",
+        "A4": "AGREE WITH RESERVATIONS"
+      },
+      "reservations": [
+        {"id": "R1", "from": "A1", "section": "§2 실행", "ask": "ssh -- 단독 불충분; sh -c 래핑 또는 args 배열 분리를 명시"},
+        {"id": "R2", "from": "A2", "section": "§6 audit", "ask": "TOFU 거부도 audit 기록; secret 필터는 collect 직후·render 이전 pre-render 강제"},
+        {"id": "R3", "from": "A3", "section": "§4 결과", "ask": "MVP는 단순 per-host 카드만; majority-diff/diff 모드는 1.1로 분리"},
+        {"id": "R4", "from": "A4", "section": "§3 범위", "ask": "tokenizer 화이트리스트가 'read-only=safe-read' 미보장; 경로 접두사 제한 MVP 포함 또는 한계 audit 경고"}
+      ]
+    }
+  ],
+  "outcome": {
+    "verdict": "CONSENSUS WITH RESERVATIONS",
+    "summary": "aic SSH 멀티호스트 진단 설계 합의 — hosts.toml 통합 인벤토리(ssh_config_import) · 외부 ssh + RemoteExecutor trait MVP 단일 구현 · probe catalog 1차 + tokenizer 화이트리스트 read-only run_command 통합(mutation·write 차단) · 카드 stack 기본(MVP는 per-host만, diff/majority는 1.1) · cap 8 + 3-layer timeout(10/30/300s) + continue-and-report · batch_id audit + pre-render secret 필터. 4개 reservation은 초안 v2에 반영.",
+    "consensus_statement": "aic SSH 멀티호스트 진단(T1.1)을 다음과 같이 설계한다. ~/.aic/hosts.toml이 [options] ssh_config_import = true로 ~/.ssh/config를 자동 import하는 통합 인벤토리 역할을 하고, [[hosts]]/[groups.X]로 overlay·그룹/태그를 정의한다. 실행은 외부 ssh 프로세스(tokio::process::Command, BatchMode=yes + StrictHostKeyChecking + ConnectTimeout=10)에 RemoteExecutor trait 추상화(MVP 단일 구현)를 두고 collect-then-render 원칙을 지킨다. 진단 범위는 probe catalog 1차 + read-only run_command는 tokenizer 화이트리스트(`;&|$()<>` 차단 + 원격 args 분리 또는 sh -c 래핑 명시)로 같은 chat 흐름에 통합하고 mutation·write는 멀티호스트에서 하드 차단한다. 동시성 cap 8(설정 가능), timeout 3-layer(connect 10s/cmd 30s/wall 5min), continue-and-report, Ctrl+C → SSH child SIGTERM + 200ms grace + close. Audit은 batch_id + 호스트 서브레코드(HMAC chain은 batch 단위)로 기록하고 TOFU 확인/거부·취소 이벤트도 포함하며, 원격 secret은 collect 직후·render 이전 pre-render 필터 + 한계 audit 경고로 명시한다.",
+    "draft_v2_required": "4개 reservation을 합의 초안에 반영한 v2를 RFC로 작성해야 한다",
+    "follow_up_rfcs": [
+      "majority-diff / reference 호스트 선택 UX (1.1)",
+      "catalog 확장 vs tokenizer 화이트리스트 단계 결정",
+      "aic run --hosts mutation 서브커맨드"
+    ]
+  },
+  "self_score": {
+    "coverage": {"score": 9, "note": "6개 섹션 + 후속 분리, 4 차원 분리 효과적"},
+    "convergence": {"score": 8, "note": "4/4 AGREE WITH RESERVATIONS, 4개 reservation 모두 구체·반영 가능"},
+    "actionability": {"score": 9, "note": "cap 8 / timeout 10·30·300s / ssh -o BatchMode 등 값까지 구체. MVP vs 1.1 분리"},
+    "calibration": {"score": 8, "note": "0.10.0 구조 정합. A4의 화이트리스트 한계 지적이 환각 방지로 작동"},
+    "hallucination_check": {
+      "feasible": true,
+      "specific_to_project": true,
+      "measurable_unit": true,
+      "post_release_validation_required": true
+    }
+  },
+  "stance_evolution": [
+    {"agent": "A1", "r1": "외부 ssh + trait + 2단계 전환 계획", "final": "trait 유지 + MVP 단일 구현 + sh -c 래핑 명시 요구", "changed": true},
+    {"agent": "A2", "r1": "ssh_config 1순위 + hosts.toml 보강", "final": "hosts.toml 통합 인벤토리 + ssh_config_import + TOFU/secret audit 시점 강화", "changed": true},
+    {"agent": "A3", "r1": "카드+Tab diff, run_command 화이트리스트", "final": "catalog 확장 우선 + tokenizer 화이트리스트 + majority-diff는 1.1로 + pre-render secret 필터", "changed": true},
+    {"agent": "A4", "r1": "cap 8, mutation 별도 서브커맨드, audit batch", "final": "+ read-only run_command 조건부 수용 + 경로 접두사 제한 권고", "changed": true}
+  ]
+}

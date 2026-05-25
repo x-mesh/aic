@@ -1,0 +1,20 @@
+{
+  "strategy": "debate",
+  "date": "2026-05-24",
+  "composed_from": "investigate-2026-05-24-statusbar-metrics",
+  "question": "aic chat status bar를 ratatui 전환(타이핑-중 진짜 실시간)할 것인가, 입력경계 갱신(reedline 유지)에 머물 것인가",
+  "positions": {
+    "PRO_전환": "갱신 공백(LLM 실행/대기)=증거 구간이라 단기안은 장식. reedline raw mode 독점은 ratatui만 구조적 해결. ratatui 이미 의존성+top.rs 레퍼런스, 재구현은 split_at_width/slash_completion 재사용으로 범위 축소",
+    "CON_유지": "reedline CJK/history/slash 재구현 회귀 리스크. 타이핑 중 갱신은 인지 소비 안 됨. ROI 10배 비대칭. aic top/watch 중복"
+  },
+  "verdict": "CON 방향(reedline 유지·ratatui 보류) + PRO 핵심 우려 반영",
+  "key_insight": "reedline 충돌은 read_line() 중에만 발생. LLM 실행/대기(spinner 구간)는 read_line 밖이라 background ticker로 충돌 0 갱신 가능(spinner.rs가 이미 그 구간 stderr 사용). PRO가 우려한 '멈춤 구간'은 ratatui 없이 해소, 진짜 충돌하는 '타이핑 중 수초'는 가치 낮음 → ratatui 전환 현재 불필요(YAGNI)",
+  "recommendation": {
+    "input_boundary": "read_line() 직전 1회 갱신 — 충돌 0",
+    "exec_wait": "LLM 실행/대기(spinner) 구간 background ticker 2초 — 충돌 0(read_line 밖), PRO 우려 해소",
+    "typing": "타이핑 중 수초는 정적(수용, 가치 낮음)",
+    "ratatui": "타이핑-중 실시간 필요가 실측될 때 재평가. top.rs 레퍼런스로 그때 비용 낮음"
+  },
+  "implementation": "sys_sampler.rs(sysinfo crate) + ui.rs StatusInfo 확장 + session.rs: (1)read_line 전 1회 (2)spinner start~stop 사이 ticker task(mpsc stop, spinner 패턴 복사) + non-TTY/AIC_NO_STATUSBAR/AIC_STATUSBAR_INTERVAL guard",
+  "next_strategy": "scaffold (sys_sampler + 2-구간 갱신 모듈 설계·구현)"
+}

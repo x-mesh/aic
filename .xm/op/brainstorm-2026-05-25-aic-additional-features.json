@@ -1,0 +1,73 @@
+{
+  "strategy": "brainstorm",
+  "topic": "aic 추가 기능 제안 (0.10.0 이후)",
+  "date": "2026-05-25",
+  "session_id": "b150e097-7899-4713-97fd-6f366d36b3b8",
+  "config": {
+    "agents": 4,
+    "model": "sonnet",
+    "vote": true,
+    "context_injected": "aic 0.10.0 현황(chat TUI, status bar, probe 진단, run_command 게이트, write/edit_file, /resume, /fix, aicd, brew, multi-provider)"
+  },
+  "rounds_summary": [
+    {
+      "phase": 1,
+      "name": "GENERATE",
+      "agents": 4,
+      "axes": ["관측성/SSH/협업/안전", "터미널UX/LLM비용", "인시던트워크플로우/협업", "확장성/시각화"],
+      "raw_ideas": 85
+    },
+    {
+      "phase": 2,
+      "name": "CLUSTER",
+      "themes": 11,
+      "merged_ideas": 45,
+      "theme_keys": ["T1 멀티호스트", "T2 인시던트", "T3 관측성", "T4 자율/자동화", "T5 시각화", "T6 TUI UX", "T7 LLM 비용/품질", "T8 협업/공유", "T9 확장성/플러그인", "T10 안전/감사", "T11 진단 심화"]
+    },
+    {
+      "phase": 3,
+      "name": "VOTE",
+      "method": "Borda count (1위=3pt, 2위=2pt, 3위=1pt)",
+      "votes": [
+        {"agent": 1, "top3": ["T3.2", "T11.6", "T10.2"]},
+        {"agent": 2, "top3": ["T7.1", "T4.2", "T3.2"]},
+        {"agent": 3, "top3": ["T9.3", "T6.3", "T10.3"]},
+        {"agent": 4, "top3": ["T9.3", "T6.3", "T10.3"]}
+      ],
+      "independence_caveat": "agent-3과 agent-4가 완전 동일 투표 → 실효 독립표본 3개로 해석"
+    }
+  ],
+  "outcome": {
+    "verdict": "45 ideas, 11 themes — top 3: T9.3 MCP 서버(6pt), T3.2 /log-tail(4pt), T6.3 Ctrl+R fzf(4pt)",
+    "top5": [
+      {"rank": 1, "id": "T9.3", "name": "aic가 MCP 서버", "votes": 6, "rationale": "외부 Claude/AI 에이전트가 aic의 probe/run_command/sysinfo를 MCP 도구로 호출 → SRE 에코시스템 허브 포지셔닝"},
+      {"rank": 2, "id": "T3.2", "name": "/log-tail (로그 스트림 + 이상 패턴)", "votes": 4, "rationale": "journald/docker/k8s/파일 tail TUI 통합 + 이상 패턴 시 LLM 자동 요약 — 현재 가장 큰 공백"},
+      {"rank": 3, "id": "T6.3", "name": "Ctrl+R fzf 히스토리 퍼지 검색", "votes": 4, "rationale": "낮은 구현 비용 + 즉각 체감"},
+      {"rank": 4, "id": "T7.1", "name": "토큰/비용 추적 + 예산 경보 + aic cost", "votes": 3, "rationale": "ctx 표시 위 자연 확장, multi-provider 비용 가시화"},
+      {"rank": "5-tie", "id": "T11.6/T4.2/T10.3", "name": "지식DB / aicd watch rule / audit JSONL+서명", "votes": 2, "rationale": "각각 반복 장애 자동 힌트 / 상시 모니터링 도약 / 엔터프라이즈 감사"}
+    ],
+    "summary": [
+      "1위: T9.3 MCP 서버 — 외부 에이전트가 aic 도구를 호출하는 허브 포지셔닝, 실제 구현 scope 가장 큼",
+      "2위: T3.2 /log-tail — 로그 스트림 통합, 현 probe catalog의 가장 큰 공백 보완",
+      "3위: T6.3 Ctrl+R fzf 히스토리 — 가장 빠르게 출시 가능한 UX 체감 개선",
+      "후속 결정 필요: top 3 중 어느 것부터 RFC 작성·구현할지"
+    ]
+  },
+  "self_score": {
+    "coverage": {"score": 9, "note": "11 테마 × 45 아이디어, 다축 분산"},
+    "convergence": {"score": 7, "note": "top1 6pt vs top2 4pt 명확. agent-3·4 동일 투표 caveat"},
+    "actionability": {"score": 8, "note": "top 3 모두 0.10.0 구조와 정합, 단독 출시 가능"},
+    "calibration": {"score": 7, "note": "환각 위험 낮음. MCP 서버는 implementation scope 가장 큼"},
+    "hallucination_check": {
+      "feasible": true,
+      "specific_to_project": true,
+      "measurable_unit": true,
+      "post_release_validation_required": true
+    }
+  },
+  "follow_up_strategies_suggested": [
+    "scaffold T9.3 MCP 서버 — 모듈/인터페이스 설계 (큰 작업이라 설계 우선)",
+    "chain T3.2 /log-tail — 단순 파일 tail → journalctl → docker/k8s 순으로 단계 구현",
+    "T6.3 즉시 구현 — 단일 PR 규모, RFC 불필요 가능"
+  ]
+}
