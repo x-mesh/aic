@@ -173,6 +173,10 @@ pub(crate) enum OutMsg {
 pub(crate) struct ChatHandle {
     line_rx: mpsc::Receiver<ChatLine>,
     out_tx: mpsc::Sender<OutMsg>,
+    /// 작업(turn/slash 처리) 중 Ctrl+C 취소 신호. ChatLoop가 보내고 run_loop_tui가 select!로
+    /// `run_turn` future와 race한다 — cancel arm이 이기면 future가 drop되어 reqwest/도구 await가
+    /// 취소된다(앱은 유지, 입력 프롬프트로 복귀).
+    cancel_rx: mpsc::Receiver<()>,
     join: JoinHandle<()>,
 }
 
@@ -190,6 +194,21 @@ impl ChatHandle {
     /// 출력 송신단을 복제한다 — session의 `ChatOut::Tui`가 답변/spin을 직접 보내게 한다.
     pub(crate) fn out_sender(&self) -> mpsc::Sender<OutMsg> {
         self.out_tx.clone()
+    }
+
+    /// 작업 중 Ctrl+C 취소 신호를 기다린다(`run_turn`/`handle_slash`와 select!). 채널이 닫히면
+    /// (ChatLoop 종료 = 앱 종료 중) 다시는 신호가 안 오므로 영원히 pending되어, select!의 다른 arm
+    /// (정상 완료)이 처리하도록 둔다 — 닫힌 채널의 즉시-None이 거짓 취소로 잡히는 것을 막는다.
+    pub(crate) async fn recv_cancel(&mut self) {
+        if self.cancel_rx.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// 새 작업 시작 직전 잔여 취소 신호를 비운다 — 직전 turn 종료와 거의 동시에 눌린 Ctrl+C가
+    /// 채널에 남아 다음 turn을 즉시 취소하는 race를 막는다.
+    pub(crate) fn drain_cancel(&mut self) {
+        while self.cancel_rx.try_recv().is_ok() {}
     }
 
     /// 종료: Shutdown 후 task join으로 raw mode 복원을 보장한다.
@@ -221,10 +240,13 @@ pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandl
     install_panic_hook();
     let (line_tx, line_rx) = mpsc::channel::<ChatLine>(8);
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
-    let join = tokio::spawn(chat_loop(line_tx, out_rx, prompt, with_statusbar));
+    // 취소 채널: 용량 1이면 충분(중복 Ctrl+C는 try_send 실패로 자연 병합). turn마다 drain_cancel로 비운다.
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let join = tokio::spawn(chat_loop(line_tx, out_rx, cancel_tx, prompt, with_statusbar));
     ChatHandle {
         line_rx,
         out_tx,
+        cancel_rx,
         join,
     }
 }
@@ -466,8 +488,13 @@ fn draw_full(
         (None, Some(sp)) => {
             let frame = SPIN_FRAMES[sp.frame % SPIN_FRAMES.len()];
             let secs = sp.started.elapsed().as_secs_f32();
+            // 작업 중임을 알리는 spinner + 경과 시간. 끝에 Ctrl+C 중단 힌트를 붙여 기능을 노출한다.
             f.render_widget(
-                Paragraph::new(format!("{frame} {} ({secs:.1}s)", sp.label)).dim(),
+                Paragraph::new(format!(
+                    "{frame} {} ({secs:.1}s)  · Ctrl+C 중단",
+                    sp.label
+                ))
+                .dim(),
                 rows[2],
             );
         }
@@ -561,6 +588,7 @@ fn search_hits_for(log: &[String], query: &str) -> Vec<usize> {
 async fn chat_loop(
     line_tx: mpsc::Sender<ChatLine>,
     mut out_rx: mpsc::Receiver<OutMsg>,
+    cancel_tx: mpsc::Sender<()>,
     prompt: String,
     with_statusbar: bool,
 ) {
@@ -762,7 +790,24 @@ async fn chat_loop(
                     }
                     Some(Ok(Event::Key(k))) => {
                         match (k.code, k.modifiers) {
-                            (KeyCode::Char('c') | KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            // Ctrl+C: 상황별로 동작이 갈린다(claude CLI 스타일).
+                            //   작업 중(spin)      → 현재 turn만 취소(cancel 신호), 앱은 유지.
+                            //   idle + 입력 있음   → 입력 줄 비우기(오타 입력 취소).
+                            //   idle + 빈 입력     → EOF(세션 종료).
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                if spin.is_some() {
+                                    // 용량 1 채널이 차 있으면(이미 보냄) 무시 — 중복 Ctrl+C 자연 병합.
+                                    let _ = cancel_tx.try_send(());
+                                } else if !textarea.lines().join("\n").is_empty() {
+                                    textarea = TextArea::default();
+                                    hist_idx = None;
+                                    draft.clear();
+                                } else {
+                                    let _ = line_tx.send(ChatLine::Eof).await;
+                                }
+                            }
+                            // Ctrl+D: 전통적 EOF(항상 세션 종료).
+                            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                                 let _ = line_tx.send(ChatLine::Eof).await;
                             }
                             // Ctrl+F: 로그 검색 모드 진입(spin 없을 때만). 빈 쿼리로 시작.
