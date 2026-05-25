@@ -593,12 +593,12 @@ enum HostsOp {
         #[arg(long)]
         json: bool,
     },
-    /// 단일 호스트에 ssh로 가벼운 명령을 실행해 연결을 검증한다(RFC-005 Phase 2).
-    /// BatchMode=yes + ForwardAgent=no + ControlMaster=auto로 호출하며 결과는 8종 상태
-    /// 태그 + stdout/stderr + duration을 표시한다. 멀티호스트 fan-out은 Phase 3.
+    /// 단일 호스트 또는 그룹(`@group`)에 ssh로 read-only 명령을 실행한다.
+    /// Phase 2: 단일 호스트. Phase 3: `@group` fan-out (cap + 3-layer timeout + 카드 stack).
+    /// BatchMode=yes + ForwardAgent=no + ControlMaster=auto.
     Ping {
-        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host).
-        name: String,
+        /// 호스트 이름 또는 `@group` 패턴. hosts.toml `name`/`groups.X` 또는 ssh_config Host.
+        target: String,
         /// 실행할 read-only 명령(공백 분리 인자). 기본 `uptime`.
         #[arg(long, default_value = "uptime")]
         cmd: String,
@@ -657,7 +657,7 @@ async fn main() {
         }) => handle_status(watch, interval, session, json, all).await,
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
-            HostsOp::Ping { name, cmd } => handle_hosts_ping(name, cmd).await,
+            HostsOp::Ping { target, cmd } => handle_hosts_ping(target, cmd).await,
         },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
@@ -2054,13 +2054,18 @@ fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
     }
 }
 
-/// `aic hosts ping <name> [--cmd "uptime"]` — RFC-005 Phase 2 검증용.
+/// `aic hosts ping <target> [--cmd "uptime"]` — RFC-005 Phase 2(단일) + Phase 3(`@group` fan-out).
 ///
-/// 외부 `ssh`로 가벼운 read-only 명령을 실행해 8종 상태 태그 + stdout/stderr + duration을
-/// 표시한다. 화이트리스트 게이트(Phase 3) 적용 전이므로 cmd는 사용자 책임 — read-only를 권장.
-async fn handle_hosts_ping(name: String, cmd: String) {
+/// 단일 호스트면 카드 1장, 그룹이면 cap + 3-layer timeout으로 병렬 실행 후 호스트별 카드 stack
+/// + 진단 헤더 통계(8종 상태별 카운트) + 미완료 호스트 목록(wall timeout 시).
+///
+/// exit code: 단일 — ok/ok_warn=0, 그 외=1. 그룹 — 모든 호스트 ok/ok_warn이면 0, 하나라도
+/// 실패/timeout이면 1, wall timeout이면 2.
+async fn handle_hosts_ping(target: String, cmd: String) {
     use aic_client::agent::hosts::Inventory;
-    use aic_client::agent::remote::{RemoteCommand, RemoteExecutor, SshProcessExecutor};
+    use aic_client::agent::remote::{
+        run_fanout, HostStatus, RemoteCommand, RemoteExecutor, SshProcessExecutor,
+    };
 
     let inv = match Inventory::load() {
         Ok(i) => i,
@@ -2069,12 +2074,15 @@ async fn handle_hosts_ping(name: String, cmd: String) {
             std::process::exit(2);
         }
     };
-    let Some(host) = inv.host(&name) else {
-        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
-        std::process::exit(1);
+
+    let hosts: Vec<aic_client::agent::hosts::HostEntry> = match inv.resolve_pattern(&target) {
+        Ok(refs) => refs.into_iter().cloned().collect(),
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
+            std::process::exit(1);
+        }
     };
 
-    // 공백 분리: 첫 토큰 = program, 나머지 = args. 셸 메타문자는 shell_escape가 리터럴화.
     let mut parts = cmd.split_whitespace();
     let Some(program) = parts.next() else {
         eprintln!("{COL_RED}✗{COL_RESET} --cmd is empty");
@@ -2082,7 +2090,6 @@ async fn handle_hosts_ping(name: String, cmd: String) {
     };
     let rcmd = RemoteCommand::new(program).args(parts.map(|s| s.to_string()));
 
-    // batch_id: 단발 ping이므로 timestamp 기반(ControlPath namespacing).
     let batch_id = format!(
         "ping-{}",
         std::time::SystemTime::now()
@@ -2092,36 +2099,99 @@ async fn handle_hosts_ping(name: String, cmd: String) {
     );
     let exec = SshProcessExecutor::new(batch_id);
 
+    // 단일 호스트: 기존 카드 1장 (Phase 2 동작 유지).
+    if hosts.len() == 1 {
+        let host = &hosts[0];
+        println!(
+            "{COL_BOLD}{}{COL_RESET}  →  {}@{}:{}  cmd={cmd:?}",
+            host.name, host.user, host.hostname, host.port
+        );
+        let r = exec.exec(host, &rcmd).await;
+        print_host_card(&r);
+        let code = match r.status {
+            HostStatus::Ok | HostStatus::OkWithWarn => 0,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    // 그룹: fan-out + 카드 stack + 헤더 통계.
+    let total = hosts.len();
     println!(
-        "{COL_BOLD}{}{COL_RESET}  →  {}@{}:{}  cmd={cmd:?}",
-        host.name, host.user, host.hostname, host.port
+        "{COL_BOLD}{target}{COL_RESET}  →  {total} hosts  cap={}  wall={}s  cmd={cmd:?}",
+        inv.concurrency.max_parallel, inv.concurrency.wall_clock_timeout_secs,
     );
-    let r = exec.exec(host, &rcmd).await;
+    let start = std::time::Instant::now();
+    let r = run_fanout(&exec, &hosts, &rcmd, &inv.concurrency).await;
+    let elapsed = start.elapsed();
+
+    // 진단 헤더 통계.
+    let c = r.counts();
+    let mut parts_buf: Vec<String> = Vec::new();
+    if c.ok > 0 { parts_buf.push(format!("{COL_GREEN}{} ok{COL_RESET}", c.ok)); }
+    if c.ok_warn > 0 { parts_buf.push(format!("{COL_YELLOW}{} ok_warn{COL_RESET}", c.ok_warn)); }
+    if c.unreachable > 0 { parts_buf.push(format!("{COL_YELLOW}{} unreachable{COL_RESET}", c.unreachable)); }
+    if c.timeout > 0 { parts_buf.push(format!("{COL_RED}{} timeout{COL_RESET}", c.timeout)); }
+    if c.auth_fail > 0 { parts_buf.push(format!("{COL_RED}{} auth_fail{COL_RESET}", c.auth_fail)); }
+    if c.proxy_fail > 0 { parts_buf.push(format!("{COL_RED}{} proxy_fail{COL_RESET}", c.proxy_fail)); }
+    if c.remote_err > 0 { parts_buf.push(format!("{COL_RED}{} remote_err{COL_RESET}", c.remote_err)); }
+    if c.host_key_mismatch > 0 { parts_buf.push(format!("{COL_RED}{} host_key_mismatch{COL_RESET}", c.host_key_mismatch)); }
+    if c.cancelled > 0 { parts_buf.push(format!("{COL_RED}{} cancelled{COL_RESET}", c.cancelled)); }
+    println!("  {} · {:.1}s elapsed", parts_buf.join(" · "), elapsed.as_secs_f32());
+
+    // 카드 stack (MVP: 입력 순서 유지 — severity-sort는 Phase 4).
+    for result in &r.results {
+        println!();
+        println!("─ {COL_BOLD}{}{COL_RESET}", result.host);
+        print_host_card(result);
+    }
+
+    // 미완료 호스트(wall timeout 시).
+    if r.wall_timed_out {
+        println!();
+        println!(
+            "{COL_RED}⚠ wall_clock_timeout {}s 도달{COL_RESET} — 미완료 {} 호스트:",
+            inv.concurrency.wall_clock_timeout_secs,
+            r.incomplete.len()
+        );
+        for name in &r.incomplete {
+            println!("  · {name}  [cancelled]");
+        }
+        std::process::exit(2);
+    }
+
+    // exit code: 모든 호스트가 ok/ok_warn이면 0, 하나라도 실패면 1.
+    let all_ok = r.results.iter().all(|res| {
+        matches!(res.status, HostStatus::Ok | HostStatus::OkWithWarn)
+    });
+    std::process::exit(if all_ok { 0 } else { 1 });
+}
+
+/// 단일 호스트 결과를 카드 본문으로 출력(severity 색상 태그 + 본문 + stdout/stderr).
+fn print_host_card(r: &aic_client::agent::remote::RemoteResult) {
     let color = match r.status.severity() {
         0..=10 => COL_GREEN,
         11..=40 => COL_YELLOW,
         _ => COL_RED,
     };
     println!(
-        "{color}[{}]{COL_RESET}  exit={}  {}ms{}",
+        "  {color}[{}]{COL_RESET}  {}  exit={}  {}ms{}",
         r.status.label(),
+        r.host,
         r.exit_code,
         r.duration_ms,
         if r.truncated { "  [truncated]" } else { "" },
     );
     if !r.stdout.is_empty() {
-        println!("\n{COL_BOLD}stdout{COL_RESET}\n{}", r.stdout.trim_end());
+        for line in r.stdout.trim_end().lines() {
+            println!("    {line}");
+        }
     }
     if !r.stderr.is_empty() {
-        println!("\n{COL_BOLD}stderr{COL_RESET}\n{}", r.stderr.trim_end());
+        for line in r.stderr.trim_end().lines() {
+            println!("    {COL_YELLOW}stderr:{COL_RESET} {line}");
+        }
     }
-    // exit code: ok=0, ok_warn=0, 나머지는 비-zero(스크립트 친화).
-    let code = match r.status {
-        aic_client::agent::remote::HostStatus::Ok
-        | aic_client::agent::remote::HostStatus::OkWithWarn => 0,
-        _ => 1,
-    };
-    std::process::exit(code);
 }
 
 /// `aic status --json`: 단일 세션 status를 JSON으로 출력.
