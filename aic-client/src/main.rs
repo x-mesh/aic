@@ -603,6 +603,21 @@ enum HostsOp {
         #[arg(long, default_value = "uptime")]
         cmd: String,
     },
+    /// 신규 호스트의 host key를 ssh-keyscan으로 수집해 SHA256 fingerprint를 노출하고,
+    /// 승인 시 `~/.ssh/known_hosts`에 append한다 (RFC-005 §4.1 TOFU 4-step의 step 2~4).
+    /// BatchMode=yes로 인해 ssh 자체 prompt가 차단되어 신규 호스트는 `[auth_fail]`로
+    /// 떨어지는데, 이 명령으로 명시 trust 후 `aic hosts ping`을 재시도한다. chat TUI의
+    /// 자동 confirm flow는 후속(1.1).
+    Trust {
+        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host).
+        name: String,
+        /// ssh-keyscan timeout 초. 기본 5.
+        #[arg(long, default_value = "5")]
+        timeout_secs: u32,
+        /// 비-TTY/스크립트 환경에서 prompt 없이 자동 승인. 보안 주의 — MITM 위험.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -658,6 +673,11 @@ async fn main() {
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
             HostsOp::Ping { target, cmd } => handle_hosts_ping(target, cmd).await,
+            HostsOp::Trust {
+                name,
+                timeout_secs,
+                yes,
+            } => handle_hosts_trust(name, timeout_secs, yes).await,
         },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
@@ -2320,7 +2340,100 @@ async fn print_auth_fail_hint(stderr: &str) {
         println!("    · ssh-add -l 로 ssh-agent 상태 확인");
         println!("    · ssh -v {{host}} -- echo ok 로 verbose 디버깅(BatchMode 외부)");
     }
+    println!("    → 신규 호스트(known_hosts 미등록)는 `aic hosts trust <name>` 후 재시도");
     println!("    → 수정 후 `aic hosts ping <target> --retry-failed`로 실패 호스트만 재시도(1.1)");
+}
+
+/// `aic hosts trust <name>` — RFC-005 §4.1 TOFU step 2~4 (scan + confirm + append).
+///
+/// 1. inventory에서 호스트 해석(hostname/port 추출)
+/// 2. `ssh-keyscan -T {n} -p {port} {hostname}` 호출
+/// 3. SHA256 fingerprint를 사용자에게 노출 + stdin prompt(또는 `--yes`)
+/// 4. 승인 시 `~/.ssh/known_hosts`에 append
+///
+/// 보안 주의: ssh-keyscan 자체가 MITM 노출 위험 — 사용자에게 fingerprint를 외부 채널로
+/// 검증할 것을 안내한다. `--yes`는 비대화 환경(CI) 용이지만 신뢰 가능한 네트워크에서만.
+async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
+    use aic_client::agent::hosts::Inventory;
+    use aic_client::agent::remote::tofu;
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let Some(host) = inv.host(&name) else {
+        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+        std::process::exit(1);
+    };
+
+    println!(
+        "{COL_BOLD}{}{COL_RESET}  →  {}:{}  (ssh-keyscan -T {timeout_secs}s)",
+        host.name, host.hostname, host.port
+    );
+    let scan = match tofu::scan_host(&host.hostname, host.port, timeout_secs).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} ssh-keyscan 실패: {e:#}");
+            eprintln!("    네트워크/DNS 점검 또는 ssh-keyscan 설치 확인.");
+            std::process::exit(1);
+        }
+    };
+
+    println!("\n{COL_BOLD}수집한 host key{COL_RESET} ({} 종)", scan.host_keys.len());
+    for key in &scan.host_keys {
+        let fp = match tofu::fingerprint_sha256(&key.known_hosts_line).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("    {COL_YELLOW}fingerprint 계산 실패:{COL_RESET} {e}");
+                continue;
+            }
+        };
+        println!("    {COL_BOLD}{}{COL_RESET}  {COL_GREEN}{fp}{COL_RESET}", key.key_type);
+    }
+    println!(
+        "\n{COL_YELLOW}⚠ 보안:{COL_RESET} ssh-keyscan은 MITM 공격에 노출될 수 있다. fingerprint를"
+    );
+    println!("  외부 채널(서버 관리자 / 사내 wiki / 다른 호스트의 known_hosts)로 검증한 뒤 승인.");
+
+    let accept = if yes {
+        eprintln!("\n{COL_YELLOW}--yes 자동 승인 (보안 주의){COL_RESET}");
+        true
+    } else {
+        use std::io::Write;
+        eprint!("\nAccept and append to ~/.ssh/known_hosts? [y/N]: ");
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            eprintln!("{COL_RED}✗{COL_RESET} stdin read failed (non-TTY?). use --yes for CI.");
+            std::process::exit(1);
+        }
+        let trimmed = input.trim().to_lowercase();
+        trimmed == "y" || trimmed == "yes"
+    };
+
+    if !accept {
+        eprintln!("{COL_YELLOW}✗ rejected — known_hosts not modified{COL_RESET}");
+        std::process::exit(1);
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("{COL_RED}✗{COL_RESET} $HOME not set");
+        std::process::exit(2);
+    };
+    let known_hosts = home.join(".ssh").join("known_hosts");
+    if let Err(e) = tofu::append_known_hosts(&known_hosts, &scan.host_keys) {
+        eprintln!("{COL_RED}✗{COL_RESET} known_hosts append 실패: {e:#}");
+        std::process::exit(2);
+    }
+    println!(
+        "{COL_GREEN}✔{COL_RESET} added {} host key(s) to {}",
+        scan.host_keys.len(),
+        known_hosts.display()
+    );
+    println!("  이제 `aic hosts ping {}` 재시도 가능.", host.name);
 }
 
 enum SshAgentStatus {
