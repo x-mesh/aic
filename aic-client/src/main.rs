@@ -2099,7 +2099,7 @@ async fn handle_hosts_ping(target: String, cmd: String) {
     );
     let exec = SshProcessExecutor::new(batch_id);
 
-    // 단일 호스트: 기존 카드 1장 (Phase 2 동작 유지).
+    // 단일 호스트: 기존 카드 1장 (Phase 2 동작 유지) — 본문 항상 펼침.
     if hosts.len() == 1 {
         let host = &hosts[0];
         println!(
@@ -2107,7 +2107,10 @@ async fn handle_hosts_ping(target: String, cmd: String) {
             host.name, host.user, host.hostname, host.port
         );
         let r = exec.exec(host, &rcmd).await;
-        print_host_card(&r);
+        print_host_card(&r, true);
+        if matches!(r.status, HostStatus::AuthFail) {
+            print_auth_fail_hint(&r.stderr).await;
+        }
         let code = match r.status {
             HostStatus::Ok | HostStatus::OkWithWarn => 0,
             _ => 1,
@@ -2125,25 +2128,69 @@ async fn handle_hosts_ping(target: String, cmd: String) {
     let r = run_fanout(&exec, &hosts, &rcmd, &inv.concurrency).await;
     let elapsed = start.elapsed();
 
-    // 진단 헤더 통계.
+    // 진단 헤더: 카운트 + 실패 호스트명 inline (5개 초과면 +N more).
     let c = r.counts();
     let mut parts_buf: Vec<String> = Vec::new();
     if c.ok > 0 { parts_buf.push(format!("{COL_GREEN}{} ok{COL_RESET}", c.ok)); }
     if c.ok_warn > 0 { parts_buf.push(format!("{COL_YELLOW}{} ok_warn{COL_RESET}", c.ok_warn)); }
-    if c.unreachable > 0 { parts_buf.push(format!("{COL_YELLOW}{} unreachable{COL_RESET}", c.unreachable)); }
-    if c.timeout > 0 { parts_buf.push(format!("{COL_RED}{} timeout{COL_RESET}", c.timeout)); }
-    if c.auth_fail > 0 { parts_buf.push(format!("{COL_RED}{} auth_fail{COL_RESET}", c.auth_fail)); }
-    if c.proxy_fail > 0 { parts_buf.push(format!("{COL_RED}{} proxy_fail{COL_RESET}", c.proxy_fail)); }
-    if c.remote_err > 0 { parts_buf.push(format!("{COL_RED}{} remote_err{COL_RESET}", c.remote_err)); }
-    if c.host_key_mismatch > 0 { parts_buf.push(format!("{COL_RED}{} host_key_mismatch{COL_RESET}", c.host_key_mismatch)); }
+    // 실패 카테고리는 호스트명 inline.
+    add_named(&mut parts_buf, "unreachable", c.unreachable, COL_YELLOW, &r.results, HostStatus::Unreachable);
+    add_named(&mut parts_buf, "timeout", c.timeout, COL_RED, &r.results, HostStatus::Timeout);
+    add_named(&mut parts_buf, "auth_fail", c.auth_fail, COL_RED, &r.results, HostStatus::AuthFail);
+    add_named(&mut parts_buf, "proxy_fail", c.proxy_fail, COL_RED, &r.results, HostStatus::ProxyFail);
+    add_named(&mut parts_buf, "remote_err", c.remote_err, COL_RED, &r.results, HostStatus::RemoteErr);
+    add_named(&mut parts_buf, "host_key_mismatch", c.host_key_mismatch, COL_RED, &r.results, HostStatus::HostKeyMismatch);
     if c.cancelled > 0 { parts_buf.push(format!("{COL_RED}{} cancelled{COL_RESET}", c.cancelled)); }
     println!("  {} · {:.1}s elapsed", parts_buf.join(" · "), elapsed.as_secs_f32());
 
-    // 카드 stack (MVP: 입력 순서 유지 — severity-sort는 Phase 4).
-    for result in &r.results {
+    // severity-sort: 가장 심각한 카드가 위로(host_key_mismatch > auth_fail > ... > ok).
+    let mut sorted: Vec<&aic_client::agent::remote::RemoteResult> = r.results.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.status
+            .severity()
+            .cmp(&a.status.severity())
+            .then_with(|| a.host.cmp(&b.host))
+    });
+
+    // 카드 stack: ok(no-anomaly)는 collapsed(헤더 1줄만), 그 외는 펼침.
+    let mut collapsed_ok: Vec<&str> = Vec::new();
+    let mut has_auth_fail_in_group = false;
+    for result in &sorted {
+        if matches!(result.status, HostStatus::Ok) {
+            collapsed_ok.push(result.host.as_str());
+            continue;
+        }
         println!();
         println!("─ {COL_BOLD}{}{COL_RESET}", result.host);
-        print_host_card(result);
+        print_host_card(result, true);
+        if matches!(result.status, HostStatus::AuthFail) {
+            has_auth_fail_in_group = true;
+        }
+    }
+    if !collapsed_ok.is_empty() {
+        println!();
+        let suffix = if collapsed_ok.len() > 5 {
+            format!(" +{} more", collapsed_ok.len() - 5)
+        } else {
+            String::new()
+        };
+        let names: Vec<&str> = collapsed_ok.iter().take(5).copied().collect();
+        println!(
+            "─ {COL_GREEN}[ok, no anomaly] {} hosts{COL_RESET}: {}{suffix}  (collapsed)",
+            collapsed_ok.len(),
+            names.join(", ")
+        );
+    }
+
+    // auth_fail hint block: 그룹 중 하나라도 있으면 ssh-agent 점검 + 패턴별 hint 1회 표시.
+    if has_auth_fail_in_group {
+        let first_auth_stderr = sorted
+            .iter()
+            .find(|r| matches!(r.status, HostStatus::AuthFail))
+            .map(|r| r.stderr.as_str())
+            .unwrap_or_default();
+        println!();
+        print_auth_fail_hint(first_auth_stderr).await;
     }
 
     // 미완료 호스트(wall timeout 시).
@@ -2167,8 +2214,9 @@ async fn handle_hosts_ping(target: String, cmd: String) {
     std::process::exit(if all_ok { 0 } else { 1 });
 }
 
-/// 단일 호스트 결과를 카드 본문으로 출력(severity 색상 태그 + 본문 + stdout/stderr).
-fn print_host_card(r: &aic_client::agent::remote::RemoteResult) {
+/// 카드 헤더(상태 태그 + duration) + 선택적 본문(stdout/stderr).
+/// `verbose=false`이면 헤더만 출력(그룹의 collapsed ok에는 미사용 — 별도 경로).
+fn print_host_card(r: &aic_client::agent::remote::RemoteResult, verbose: bool) {
     let color = match r.status.severity() {
         0..=10 => COL_GREEN,
         11..=40 => COL_YELLOW,
@@ -2182,6 +2230,9 @@ fn print_host_card(r: &aic_client::agent::remote::RemoteResult) {
         r.duration_ms,
         if r.truncated { "  [truncated]" } else { "" },
     );
+    if !verbose {
+        return;
+    }
     if !r.stdout.is_empty() {
         for line in r.stdout.trim_end().lines() {
             println!("    {line}");
@@ -2191,6 +2242,116 @@ fn print_host_card(r: &aic_client::agent::remote::RemoteResult) {
         for line in r.stderr.trim_end().lines() {
             println!("    {COL_YELLOW}stderr:{COL_RESET} {line}");
         }
+    }
+}
+
+/// 상태별 카운트를 헤더에 inline으로 추가하면서 실패 호스트명을 5개까지 노출(+N more).
+fn add_named(
+    parts: &mut Vec<String>,
+    label: &str,
+    count: usize,
+    color: &str,
+    results: &[aic_client::agent::remote::RemoteResult],
+    status: aic_client::agent::remote::HostStatus,
+) {
+    if count == 0 {
+        return;
+    }
+    let names: Vec<&str> = results
+        .iter()
+        .filter(|r| r.status == status)
+        .map(|r| r.host.as_str())
+        .take(5)
+        .collect();
+    let suffix = if count > names.len() {
+        format!(" +{} more", count - names.len())
+    } else {
+        String::new()
+    };
+    parts.push(format!(
+        "{color}{count} {label}({}){suffix}{COL_RESET}",
+        names.join(", ")
+    ));
+}
+
+/// `[auth_fail]` 호스트에 대한 hint block — 로컬 ssh-agent 자동 점검(`ssh-add -l`) +
+/// stderr 패턴별 단계적 해결 안내(RFC-005 §4.4 U3).
+async fn print_auth_fail_hint(stderr: &str) {
+    let agent = probe_local_ssh_agent().await;
+    println!(
+        "  {COL_BOLD}local ssh-agent{COL_RESET}  (auto-probed)"
+    );
+    match agent {
+        SshAgentStatus::NoSocket => println!("    SSH_AUTH_SOCK: {COL_YELLOW}unset{COL_RESET}  → ssh-agent를 시작하거나 `eval $(ssh-agent)`"),
+        SshAgentStatus::NoKeys(sock) => {
+            println!("    SSH_AUTH_SOCK: {sock}");
+            println!("    loaded keys:   {COL_YELLOW}0{COL_RESET}  ← 키 미등록");
+            println!("    → ssh-add ~/.ssh/id_ed25519 (또는 사용 중인 키) 실행");
+        }
+        SshAgentStatus::Loaded { sock, keys } => {
+            println!("    SSH_AUTH_SOCK: {sock}");
+            println!("    loaded keys:   {COL_GREEN}{keys}{COL_RESET}");
+            println!("    → hosts.toml에 identity_file 지정 또는 서버 authorized_keys 확인");
+        }
+        SshAgentStatus::ProbeFailed(reason) => {
+            println!("    {COL_YELLOW}probe 실패{COL_RESET}: {reason}");
+        }
+    }
+    println!();
+    println!("  {COL_BOLD}hint{COL_RESET}");
+    let lower = stderr.to_lowercase();
+    if lower.contains("publickey") {
+        println!("    1. ssh-add -l 로 등록 키 확인");
+        println!("    2. hosts.toml `[[hosts]] identity_file = \"~/.ssh/...\"`로 명시 지정");
+        println!("    3. 서버 authorized_keys에 공개키 등록 여부 확인");
+    } else if lower.contains("gssapi") || lower.contains("kerberos") {
+        println!("    · Kerberos TGT 만료 가능 — `klist`로 확인 후 `kinit`으로 갱신");
+    } else if lower.contains("keyboard-interactive") {
+        println!("    · MFA(keyboard-interactive) 호스트 — RFC-005 §1.2 멀티호스트 미지원");
+        println!("    · 단일 호스트로 직접 ssh 접속(BatchMode=no) 후 재시도");
+    } else if lower.contains("too many authentication failures") {
+        println!("    · ssh-add -D 로 모든 키 제거 후 필요한 키만 ssh-add -t 60");
+    } else {
+        println!("    · ssh-add -l 로 ssh-agent 상태 확인");
+        println!("    · ssh -v {{host}} -- echo ok 로 verbose 디버깅(BatchMode 외부)");
+    }
+    println!("    → 수정 후 `aic hosts ping <target> --retry-failed`로 실패 호스트만 재시도(1.1)");
+}
+
+enum SshAgentStatus {
+    NoSocket,
+    NoKeys(String),
+    Loaded { sock: String, keys: usize },
+    ProbeFailed(String),
+}
+
+async fn probe_local_ssh_agent() -> SshAgentStatus {
+    let Ok(sock) = std::env::var("SSH_AUTH_SOCK") else {
+        return SshAgentStatus::NoSocket;
+    };
+    match tokio::process::Command::new("ssh-add")
+        .arg("-l")
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = if stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                stdout.to_string()
+            };
+            if combined.contains("no identities") || combined.contains("agent has no") {
+                SshAgentStatus::NoKeys(sock)
+            } else {
+                let keys = combined
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                SshAgentStatus::Loaded { sock, keys }
+            }
+        }
+        Err(e) => SshAgentStatus::ProbeFailed(format!("ssh-add not available: {e}")),
     }
 }
 
