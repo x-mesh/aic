@@ -1,0 +1,22 @@
+{
+  "strategy": "investigate",
+  "date": "2026-05-25",
+  "topic": "aic chat 기능 추가",
+  "depth": "deep",
+  "angles": ["current-features", "workflow-gaps", "comparison", "extensibility"],
+  "outcome": {
+    "verdict": "10 findings, 4 gaps",
+    "summary": "진단 기능 자체는 풍부(slash 16/진단 9/tool 4+run_command/전면 TUI). 추가 가치는 '진단 후 흐름'과 'TUI 사용성'에 집중. Quick win 3종(로그검색 Ctrl+F·컨텍스트 토큰표시·/clear)은 TUI 인프라로 즉시 구현 가능. confirmed HIGH 3종(분석↔대화 통합·세션 영속성/재개·/fix 자동화)은 2각도 독립 확인이며 PRD 목표(진단→해석→후속)와 정렬. 대형: write_file/edit_file(agentic Phase 3), 멀티호스트(구조적 한계).",
+    "tier1_quickwin": ["log in-buffer search (Ctrl+F)", "context token display in status bar", "/clear history reset"],
+    "tier2_core": ["analysis-to-chat integration (/diagnose followup)", "session persistence/resume", "TUI confirm UI for NeedsConfirm"],
+    "tier3_large": ["/fix automation", "write_file/edit_file", "multi-host SSH"]
+  },
+  "gaps": [
+    {"id": "G1", "gap": "risk_guard can classify ssh host cmd safely", "importance": "CRITICAL", "action": "hypothesis + review run_command.rs"},
+    {"id": "G2", "gap": "LLM provider response includes usage tokens vs estimate-only", "importance": "IMPORTANT", "action": "read llm_dispatcher.rs/types.rs"},
+    {"id": "G3", "gap": "error_analyzer.rs/project_context.rs vs P0 spec match", "importance": "IMPORTANT", "action": "review --target"},
+    {"id": "G4", "gap": "/bundle resume via --context partial impl", "importance": "NICE", "action": "read project_context.rs"}
+  ],
+  "self_score": {"score": 8, "confidence": "CONFIDENT", "note": "4 angles code/doc/web cited; confirmed HIGH x3 via cross-signal; Phase 2.5 skipped (leader cross-check)"},
+  "rounds_summary": "Phase1 SCOPE(4 angles) → Phase2 EXPLORE deep fan-out(4/4) → Phase2.5 skipped → Phase3 SYNTHESIZE(theme + impact/effort matrix) → Phase4 GAP(4 gaps)"
+}

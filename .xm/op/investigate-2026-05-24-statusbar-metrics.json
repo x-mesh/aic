@@ -1,0 +1,31 @@
+{
+  "strategy": "investigate",
+  "date": "2026-05-24",
+  "topic": "aic chat status bar에 cpu load/usage·disk i/o·memory 실시간 갱신 + 증거 수집 확장 feasibility",
+  "depth": "deep",
+  "angles": ["코드베이스 통합지점", "실시간 렌더링 기술", "지표 수집·샘플링", "UX·제약+증거수집 확장"],
+  "verdict": "FEASIBLE — '실시간'의 정의에 따라 3단계 비용",
+  "key_findings": [
+    "REPL 루프(session.rs:144)는 blocking reader.read()지만 run()은 async tokio라 spinner.rs의 tokio::spawn+mpsc 패턴이 blueprint",
+    "reedline 0.39(crossterm 0.28)이 read_line() 중 raw mode를 독점 → 입력 중 외부 stderr write는 입력 라인 파괴. ANSI s/u·scroll region·별도 스레드 모두 충돌 심각~치명",
+    "ratatui 0.29+crossterm 0.28이 이미 의존성(aic top/top.rs가 TUI 사용). 진짜 타이핑-중 실시간은 ratatui 전환만 충돌 0이나 reedline 기능(CJK/history/slash) 재구현 필요(고비용)",
+    "수집은 sysinfo crate(0.33) 채택 — cpu%/disk i/o는 probe catalog에 없고(disk=df -h 용량만) fork 비용 큼(macOS top -l 1=300ms). sysinfo는 in-process, 2s overhead ~0.025%",
+    "disk i/o는 누적 카운터 delta 필요 — sysinfo::DiskUsage.read_bytes/written_bytes가 refresh 간 delta 자동 계산. Disks 인스턴스 세션 재사용 필수(매번 new=0)",
+    "기존 억제 패턴: stderr.is_terminal()(spinner.rs:26), banner_suppressed()/AIC_NO_BANNER/AIC_QUIET(ui.rs:30), NO_COLOR. status bar도 동일 적용 + AIC_NO_STATUSBAR/AIC_STATUSBAR_INTERVAL"
+  ],
+  "recommendation": {
+    "short_term": "입력 경계 갱신 — reader.read() 진입 직전 status 1줄(sysinfo 수집). 충돌 0, ~반나절. sys_sampler.rs + ui.rs StatusInfo 확장 + session.rs 루프 hook + non-TTY/AIC_NO_STATUSBAR guard",
+    "mid_term": "idle-aware background ticker — tokio::select! 입력 vs 타이머, idle만 갱신, 입력 시 pause. 중위험·실험적",
+    "long_term": "ratatui 전환 — 타이핑 중 포함 진짜 실시간. reedline 재구현 고비용"
+  },
+  "evidence_extensions": [
+    {"id": "exit_trend", "cmd": "/trend", "value": "high", "difficulty": "low", "note": "ring buffer exit code 집계, 새 probe 0"},
+    {"id": "threshold_alarm", "value": "high", "difficulty": "mid", "note": "load>코어/mem>90%/disk>85% probe 후처리"},
+    {"id": "diff_run", "cmd": "/diff-run <cmd>", "value": "high", "difficulty": "mid", "note": "전후 스냅샷 자동 diff, compare_report 재사용"}
+  ],
+  "gaps": [
+    "ratatui+reedline 공존(tui-textarea) 실제 실험 미수행",
+    "idle-aware ticker의 reedline pause 협조 프로토콜 실동작 미검증"
+  ],
+  "next_strategy": "단기 구현=scaffold; ratatui 전환 결정=debate(실시간 vs 입력경계 트레이드오프)"
+}
