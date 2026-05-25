@@ -579,6 +579,14 @@ enum DebugOp {
 enum AuditOp {
     /// HMAC chain 무결성 검증 (exit 0=pass, 2=tampered, 3=key/IO error)
     Verify,
+    /// 멀티호스트 batch audit segment 무결성 검증 (RFC-005 §4.6, O2).
+    /// `~/.aic/audit/YYYY-MM-DD.jsonl` 파일의 SHA256 chain을 재계산해 검증한다.
+    /// 인자 없으면 모든 segment 검증, `--date`로 특정 일자만.
+    BatchVerify {
+        /// 특정 일자(YYYY-MM-DD)만 검증. 생략 시 모든 segment.
+        #[arg(long)]
+        date: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -681,6 +689,7 @@ async fn main() {
         },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
+            AuditOp::BatchVerify { date } => handle_audit_batch_verify(date),
         },
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
         Some(Commands::Init { shell, hook_mode }) => handle_init(shell, hook_mode),
@@ -1919,6 +1928,67 @@ fn handle_audit_verify() {
     }
 }
 
+/// `aic audit batch-verify [--date YYYY-MM-DD]` — 멀티호스트 batch audit segment 검증.
+/// `~/.aic/audit/YYYY-MM-DD.jsonl`의 SHA256 chain을 재계산해 무결성을 보고한다.
+/// exit 0=all pass, 2=하나라도 tampered, 3=IO/parse error.
+fn handle_audit_batch_verify(date: Option<String>) {
+    use aic_client::agent::audit_batch::{list_segments, verify_segment};
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("{COL_RED}✗{COL_RESET} $HOME not set");
+        std::process::exit(3);
+    };
+    let audit_dir = home.join(".aic").join("audit");
+
+    let segments: Vec<std::path::PathBuf> = if let Some(d) = &date {
+        let p = audit_dir.join(format!("{d}.jsonl"));
+        if !p.exists() {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} segment not found: {}", p.display());
+            std::process::exit(3);
+        }
+        vec![p]
+    } else {
+        match list_segments(&audit_dir) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                println!("{COL_YELLOW}⚠{COL_RESET} no audit segments in {}", audit_dir.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} list segments: {e:#}");
+                std::process::exit(3);
+            }
+        }
+    };
+
+    let mut any_broken = false;
+    for path in &segments {
+        match verify_segment(path) {
+            Ok(report) if report.valid => {
+                println!(
+                    "{COL_GREEN}✔{COL_RESET} {} — {} entries, chain OK",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    report.entries
+                );
+            }
+            Ok(report) => {
+                any_broken = true;
+                println!(
+                    "{COL_RED}✗{COL_RESET} {} — {} entries, broken at line {}",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    report.entries,
+                    report.broken_at.unwrap_or(0)
+                );
+            }
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} {}: {e:#}", path.display());
+                std::process::exit(3);
+            }
+        }
+    }
+    std::process::exit(if any_broken { 2 } else { 0 });
+}
+
 /// `aic hosts show [name] [--json]` — RFC-005 Phase 1 디버깅 surface.
 ///
 /// `~/.aic/hosts.toml` + `~/.ssh/config` import + overlay 결과를 노출한다. 이 단계에서
@@ -2117,7 +2187,8 @@ async fn handle_hosts_ping(target: String, cmd: String) {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     );
-    let exec = SshProcessExecutor::new(batch_id);
+    // batch_id는 executor(ControlPath namespace)와 audit_batch(BatchAppender) 모두 사용.
+    let exec = SshProcessExecutor::new(batch_id.clone());
 
     // 단일 호스트: 기존 카드 1장 (Phase 2 동작 유지) — 본문 항상 펼침.
     if hosts.len() == 1 {
@@ -2144,9 +2215,41 @@ async fn handle_hosts_ping(target: String, cmd: String) {
         "{COL_BOLD}{target}{COL_RESET}  →  {total} hosts  cap={}  wall={}s  cmd={cmd:?}",
         inv.concurrency.max_parallel, inv.concurrency.wall_clock_timeout_secs,
     );
+
+    // Audit batch — best-effort. 실패해도 진단은 계속 진행하되 stderr에 경고.
+    let mut appender = match dirs::home_dir().map(|h| h.join(".aic").join("audit")) {
+        Some(dir) => match aic_client::agent::audit_batch::BatchAppender::open(dir, batch_id.clone()) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠ audit batch open 실패(계속):{COL_RESET} {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(a) = appender.as_mut() {
+        let host_names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+        let _ = a.batch_start("diagnose", &target, &host_names);
+    }
+
     let start = std::time::Instant::now();
     let r = run_fanout(&exec, &hosts, &rcmd, &inv.concurrency).await;
     let elapsed = start.elapsed();
+
+    // 각 host_result audit 기록 (redact·truncate·status 정합).
+    if let Some(a) = appender.as_mut() {
+        for result in &r.results {
+            let _ = a.host_result(
+                &result.host,
+                result.status.label(),
+                &cmd,
+                result.duration_ms,
+                result.exit_code,
+                result.truncated,
+                result.redacted,
+            );
+        }
+    }
 
     // 진단 헤더: 카운트 + 실패 호스트명 inline (5개 초과면 +N more).
     let c = r.counts();
@@ -2215,6 +2318,9 @@ async fn handle_hosts_ping(target: String, cmd: String) {
 
     // 미완료 호스트(wall timeout 시).
     if r.wall_timed_out {
+        if let Some(a) = appender.as_mut() {
+            let _ = a.batch_cancelled(r.results.len(), r.incomplete.clone());
+        }
         println!();
         println!(
             "{COL_RED}⚠ wall_clock_timeout {}s 도달{COL_RESET} — 미완료 {} 호스트:",
@@ -2225,6 +2331,22 @@ async fn handle_hosts_ping(target: String, cmd: String) {
             println!("  · {name}  [cancelled]");
         }
         std::process::exit(2);
+    }
+
+    // batch_end audit (정상 완료).
+    if let Some(a) = appender.as_mut() {
+        let stats = aic_client::agent::audit_batch::BatchStats {
+            ok: c.ok,
+            ok_warn: c.ok_warn,
+            unreachable: c.unreachable,
+            timeout: c.timeout,
+            auth_fail: c.auth_fail,
+            proxy_fail: c.proxy_fail,
+            remote_err: c.remote_err,
+            host_key_mismatch: c.host_key_mismatch,
+            cancelled: c.cancelled,
+        };
+        let _ = a.batch_end(stats);
     }
 
     // exit code: 모든 호스트가 ok/ok_warn이면 0, 하나라도 실패면 1.
