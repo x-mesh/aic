@@ -21,6 +21,14 @@ pub(crate) struct SysMetrics {
     pub cpu_pct: f32,
     pub mem_used: u64,
     pub mem_total: u64,
+    /// swap 사용량/총량(메모리 압박·OOM 조기 신호). total==0이면 swap 비활성.
+    pub swap_used: u64,
+    pub swap_total: u64,
+    /// root fs("/") 여유 용량(디스크 full 감지). total==0이면 읽기 실패(n/a).
+    /// macOS APFS는 컨테이너 공유라 `total - avail` 기반 사용률 %가 무의미(df 21% vs 계산 93%).
+    /// `available_space()`만 플랫폼 무관하게 신뢰 가능하므로 여유 용량(free)을 1차 지표로 쓴다.
+    pub disk_avail: u64,
+    pub disk_total: u64,
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
 }
@@ -48,12 +56,27 @@ impl SysSampler {
             let u = d.usage();
             (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
         });
+        // 용량은 root fs("/") 기준 — 디스크 full을 가장 직접적으로 드러낸다. macOS APFS는 볼륨
+        // 그룹이 "/"에 공유 표시되고, Linux는 "/"가 명확하다. 못 찾으면(컨테이너 등) 첫 디스크로 폴백.
+        let root = self
+            .disks
+            .list()
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"))
+            .or_else(|| self.disks.list().first());
+        let (disk_total, disk_avail) = root
+            .map(|d| (d.total_space(), d.available_space()))
+            .unwrap_or((0, 0));
         self.last = Instant::now();
         SysMetrics {
             load1: System::load_average().one,
             cpu_pct: self.sys.global_cpu_usage(),
             mem_used: self.sys.used_memory(),
             mem_total: self.sys.total_memory(),
+            swap_used: self.sys.used_swap(),
+            swap_total: self.sys.total_swap(),
+            disk_avail,
+            disk_total,
             disk_read_bps: (read as f64 / elapsed) as u64,
             disk_write_bps: (write as f64 / elapsed) as u64,
         }
@@ -68,13 +91,28 @@ impl SysMetrics {
         } else {
             0.0
         };
+        // swap: 활성(total>0)이면 사용률 %, 아니면 off.
+        let swap = if self.swap_total > 0 {
+            format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+        } else {
+            "swap off".to_string()
+        };
+        // disk: root fs 여유 용량(SRE는 "얼마 남았나"가 핵심). 사용률 %는 macOS APFS 컨테이너
+        // 공유로 부정확해(df 21% vs total-avail 93%) 신뢰 가능한 free만 쓴다. 못 읽으면 n/a.
+        let disk = if self.disk_total > 0 {
+            format!("disk {} free", human_bytes(self.disk_avail))
+        } else {
+            "disk n/a".to_string()
+        };
         format!(
-            "load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · io r{}/s w{}/s",
+            "load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s",
             self.load1,
             self.cpu_pct,
             mem_pct,
             human_bytes(self.mem_used),
             human_bytes(self.mem_total),
+            swap,
+            disk,
             human_bytes(self.disk_read_bps),
             human_bytes(self.disk_write_bps),
         )
@@ -117,6 +155,10 @@ mod tests {
             cpu_pct: 45.6,
             mem_used: 8 * 1024 * 1024 * 1024,
             mem_total: 16 * 1024 * 1024 * 1024,
+            swap_used: 1024 * 1024 * 1024,
+            swap_total: 4 * 1024 * 1024 * 1024,
+            disk_avail: 70 * 1024 * 1024 * 1024,
+            disk_total: 280 * 1024 * 1024 * 1024,
             disk_read_bps: 2 * 1024 * 1024,
             disk_write_bps: 512 * 1024,
         };
@@ -124,7 +166,29 @@ mod tests {
         assert!(line.contains("load 1.23"), "{line}");
         assert!(line.contains("cpu 46%"), "{line}");
         assert!(line.contains("mem 50%"), "{line}");
+        assert!(line.contains("swap 25%"), "{line}");
+        // disk는 신뢰 가능한 free만(사용률 %는 macOS APFS에서 부정확).
+        assert!(line.contains("disk 70.0G free"), "{line}");
         assert!(line.contains("io r2.0M/s w512.0K/s"), "{line}");
+    }
+
+    #[test]
+    fn status_line_handles_no_swap_and_no_disk() {
+        let m = SysMetrics {
+            load1: 0.0,
+            cpu_pct: 0.0,
+            mem_used: 1024,
+            mem_total: 2048,
+            swap_used: 0,
+            swap_total: 0,
+            disk_avail: 0,
+            disk_total: 0,
+            disk_read_bps: 0,
+            disk_write_bps: 0,
+        };
+        let line = m.status_line();
+        assert!(line.contains("swap off"), "{line}");
+        assert!(line.contains("disk n/a"), "{line}");
     }
 
     #[test]
