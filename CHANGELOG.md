@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-26
+
 ### Added
 - **status bar에 swap·디스크 free 표시** — `mem` 옆에 `swap {pct}%`(메모리 압박/OOM 조기 신호),
   `io` 앞에 `disk {N}G free`(root fs 여유 용량 — SRE의 "얼마 남았나" 핵심 지표). macOS APFS
