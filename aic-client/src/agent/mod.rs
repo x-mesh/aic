@@ -17,8 +17,9 @@ pub(crate) mod debug;
 pub(crate) mod diagnose;
 pub mod gitignore;
 // RFC-005 Phase 1: SSH 멀티호스트 인벤토리(hosts.toml + ssh_config import + overlay).
-// 실행 레이어(remote::ssh_process)는 Phase 2, fan-out은 Phase 3에서 연결.
 pub mod hosts;
+// RFC-005 Phase 2: RemoteExecutor trait + 외부 ssh 프로세스 구현. fan-out은 Phase 3.
+pub mod remote;
 pub(crate) mod markdown;
 pub(crate) mod probes;
 pub mod run_command;
