@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Added
+- **status bar에 swap·디스크 free 표시** — `mem` 옆에 `swap {pct}%`(메모리 압박/OOM 조기 신호),
+  `io` 앞에 `disk {N}G free`(root fs 여유 용량 — SRE의 "얼마 남았나" 핵심 지표). macOS APFS
+  컨테이너 공유로 `total-avail` 기반 사용률 %가 부정확한 점을 피하기 위해 `available_space()`만
+  쓴다(플랫폼 무관 신뢰).
+
 ## [0.10.0] - 2026-05-25
 
 ### Added — ratatui 전면 chat TUI + agentic 쓰기 도구
