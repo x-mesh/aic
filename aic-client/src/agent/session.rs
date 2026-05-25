@@ -385,16 +385,40 @@ impl AgentSession {
                 self.out
                     .spin_start(format!("{input} 처리 중…"), "90")
                     .await;
-                self.handle_slash(cmd).await;
+                // Ctrl+C 취소: probe 수집/분석이 길어질 때 중단(future drop). 직전 잔여 신호는 drain.
+                handle.drain_cancel();
+                let cancelled = tokio::select! {
+                    _ = self.handle_slash(cmd) => false,
+                    _ = handle.recv_cancel() => true,
+                };
                 self.out.spin_stop().await;
+                if cancelled {
+                    self.out.note("⨯ 중단됨 (Ctrl+C)").await;
+                }
                 // /clear 등으로 history가 바뀔 수 있어 매 처리 후 토큰 표시 갱신.
                 self.out.send_ctx(self.estimate_tokens()).await;
                 continue;
             }
             let user_text = self.build_user_message(input);
             self.history.push(ChatMessage::User(user_text));
-            if let Err(e) = self.run_turn().await {
-                self.out.note(&format!("LLM 요청 실패: {e}")).await;
+            // Ctrl+C 취소: run_turn future를 cancel과 race한다 — 취소되면 future가 drop되며 진행 중인
+            // reqwest/도구 await가 중단된다. 직전 turn 종료와 동시에 눌린 잔여 신호는 drain으로 제거.
+            handle.drain_cancel();
+            let mark = self.history.len();
+            let outcome = tokio::select! {
+                r = self.run_turn() => Some(r),
+                _ = handle.recv_cancel() => None,
+            };
+            match outcome {
+                Some(Ok(())) => {}
+                Some(Err(e)) => self.out.note(&format!("LLM 요청 실패: {e}")).await,
+                None => {
+                    // 취소: 미완성 응답(Assistant/Tool, dangling tool_call 포함)을 history에서 제거해
+                    // 다음 turn의 OpenAI 정합성을 지킨다. User 메시지는 유지(무엇을 물었는지 보존).
+                    self.history.truncate(mark);
+                    self.out.spin_stop().await;
+                    self.out.note("⨯ 중단됨 (Ctrl+C)").await;
+                }
             }
             // 턴 처리(답변/도구 호출로 history 증가) 후 토큰 표시 갱신.
             self.out.send_ctx(self.estimate_tokens()).await;
