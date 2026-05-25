@@ -688,3 +688,63 @@ $ aic audit verify --date 2026-05-24
 🔴 **Open (0)**
 
 PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team artifact 참고.
+
+---
+
+## 10. Implementation Status (2026-05-25)
+
+`feat/ssh-multihost` 브랜치 6 커밋. 전체 lib 테스트 **589 passed** · clippy clean.
+
+### 10.1 Phase별 커밋 + 모듈
+
+| Phase | 커밋 | 모듈 | LOC(신규) | 테스트 |
+|:-----:|------|------|:---------:|:------:|
+| **1 인벤토리** | `2141409` | `agent/hosts.rs` | ~550 | 12 |
+| **2 RemoteExecutor** | `3b38342` | `agent/remote/{mod,ssh_process}.rs` | ~540 | 20 |
+| **3 fan-out** | `b50d06e` | `agent/remote/fanout.rs` | ~250 | 4 |
+| **4 UX 보강** | `0976167` | `main.rs` 핸들러(severity-sort, collapsed ok, auth_fail hint, ssh-agent 자동 점검) | ~150 | — |
+| **5 전반 (S2/S3)** | `ab4f7bd` | `agent/remote/path_guard.rs` + `secret_filter.rs` + `ssh_process` redact 통합 + `RemoteResult.redacted` | ~360 | 15 |
+| **5 후반 (TOFU 모듈)** | `951a089` | `agent/remote/tofu.rs` (scan_host / parse_keyscan_lines / append_known_hosts / fingerprint_sha256) | ~210 | 3 (+1 ignored) |
+| **합계** | — | — | **~2,060** | **54** |
+
+### 10.2 CLI 노출 (사용자 직접 사용 가능)
+
+| 명령 | 동작 |
+|------|------|
+| `aic hosts show` | 인벤토리 전체 표시 — 그룹·호스트·source·`ssh_config_warnings` |
+| `aic hosts show <name> [--json]` | 단일 호스트 최종 해석값 (overlay 결과 + 어느 directive를 ssh에 위임했는지) |
+| `aic hosts ping <name> [--cmd "..."]` | 단일 호스트 ssh ping — 8종 상태 태그 + stdout/stderr + duration |
+| `aic hosts ping @group [--cmd "..."]` | 그룹 fan-out — cap 8 + 3-layer timeout + severity-sort 카드 stack + 헤더 inline 실패명 + ok collapsed + `[auth_fail]` hint + ssh-agent 자동 점검 |
+
+### 10.3 red-team Critical 12 → 구현 매핑
+
+| ID | 결함 | Phase | 반영 위치 |
+|----|------|:----:|-----------|
+| 🟢 S1 | shell_escape + 비-sh | 2 | `agent/remote/mod.rs::shell_escape` (POSIX `'...'` + `'\''` 이스케이프) |
+| 🟢 S2 | 경로 동등 우회 | 5 | `path_guard::lexical_canonicalize` + `check_path` |
+| 🟢 S3 | `/proc/self/environ` | 5 | `path_guard` procfs allowlist 반전 + `secret_filter::redact` env 패턴 |
+| 🟢 R1 | Semaphore permit 누수 | 3 | `fanout::run_fanout`의 `acquire` + move-capture |
+| 🟢 R2 | OOM 버퍼 상한 | 2 | `ssh_process::bounded_read` (64KiB 저장 / 8MiB 드레인) + `RemoteResult.truncated` |
+| 🟢 R3 | SIGKILL PID 재사용 | 2 | `ssh_process` `kill_on_drop(true)` + `tokio::process::Child` 좀비 보존 |
+| 🟢 U1 | 100+ 호스트 스크롤 | 4 | severity-sort + `[ok] collapsed` + 헤더 inline 실패명 |
+| 🟢 U2 | 5종 → 8종 태그 | 2 | `HostStatus` 8 variants + `classify_ssh_result` stderr 패턴 우선 |
+| 🟢 U3 | `[auth_fail]` 행동 부재 | 4 | `print_auth_fail_hint` + `probe_local_ssh_agent` 자동 호출 |
+| 🟢 O1 | ssh_config 디버깅 부재 | 1 | `aic hosts show <name>` source/overlay 표시 + `ssh_config_warnings` |
+| 🟡 O2 | audit 로테이션 | — | **미반영** — 다음 작업 (batch_id + daily segment + `aic audit verify --date`) |
+| 🟡 O3 | whitelist 확장 | — | **미반영** — 다음 작업 (Phase 6: `~/.aic/whitelist.toml` + `aic whitelist check`) |
+| 🟢 TOFU (High) | BatchMode↔TOFU 양립 | 5 | `tofu` 모듈 (함수 단위) — **wiring 보류**(ssh_process 자동 재시도 + confirm callback) |
+
+### 10.4 미반영 / 다음 작업
+
+| 작업 | 효과 | 의존성 |
+|------|------|--------|
+| **TOFU wiring** | `ssh_process`가 `Host key verification failed` 감지 → `scan_host` → confirm callback → `append_known_hosts` → ssh 재시도 | callback 패턴 추상화 (단발 CLI = stdin prompt, chat TUI = mpsc 직렬화) |
+| **Audit batch + daily segment (O2)** | `batch_id` UUID + per-host `host_result` + `segment_end` 경계 + `aic audit verify --date` + retain/compress 정책 | 기존 `audit.rs` 확장 또는 신규 `audit/batch.rs` |
+| **Phase 6 — whitelist (O3)** | `~/.aic/whitelist.toml` append-merge + tokenizer + `aic whitelist status/check` + `run_command` 멀티호스트 게이트에 `path_guard`/whitelist wiring | path_guard·tokenizer 통합 |
+| **chat TUI 통합** | `/diagnose @group` 슬래시 명령으로 fan-out 호출 + 카드 stack을 chat TUI에 inline 렌더 + TOFU confirm을 ratatui modal로 | RFC-004 chat TUI + 본 RFC fan-out |
+
+### 10.5 운영 메모
+
+- 브랜치는 아직 push되지 않음 → 다음 단계는 (a) 남은 작업 진행 후 일괄 PR, 또는 (b) 현재 6 커밋을 먼저 push해 CI 검증 + PR 생성 후 후속 PR.
+- `RemoteResult.redacted` 카운트 > 0이어도 패턴 미일치 secret이 있을 수 있다 — audit batch 구현 시 "원격 결과는 secret 포함 가능" 경고를 항상 첨부할 것(§4.6).
+- `aic hosts ping`은 read-only run_command 임시 wiring 없이 사용자가 임의 `--cmd`를 보낼 수 있다 → Phase 6 whitelist 게이트 적용 전까지 운영자 책임.

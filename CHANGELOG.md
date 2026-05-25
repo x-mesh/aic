@@ -9,6 +9,13 @@
   `io` 앞에 `disk {N}G free`(root fs 여유 용량 — SRE의 "얼마 남았나" 핵심 지표). macOS APFS
   컨테이너 공유로 `total-avail` 기반 사용률 %가 부정확한 점을 피하기 위해 `available_space()`만
   쓴다(플랫폼 무관 신뢰).
+- **`aic hosts show / ping`** — RFC-005 SSH 멀티호스트 진단 Phase 1~5 (`feat/ssh-multihost`).
+  `~/.aic/hosts.toml`(+ `~/.ssh/config` 자동 import + overlay) 기반 `aic hosts ping @group`이
+  cap 8 + 3-layer timeout(connect 10s / cmd 30s / wall 300s)으로 병렬 진단, 8종 상태 태그
+  (`ok`/`ok_warn`/`unreachable`/`timeout`/`auth_fail`/`proxy_fail`/`remote_err`/`host_key_mismatch`)
+  + severity-sort + `[ok] collapsed` + 헤더 inline 실패명 + `[auth_fail]` hint(ssh-agent 자동 점검)
+  를 카드 stack으로 표시. red-team Critical 12 중 10개 반영(S1/S2/S3/R1/R2/R3/U1/U2/U3/O1),
+  O2/O3 + TOFU wiring은 후속. 구현 상태는 `docs/RFC-005-SSH-MULTIHOST.md §10`.
 
 ## [0.10.0] - 2026-05-25
 
