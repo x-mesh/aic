@@ -15,6 +15,7 @@ pub mod fanout;
 pub mod path_guard;
 pub mod secret_filter;
 pub mod ssh_process;
+pub mod tofu;
 
 use serde::Serialize;
 
