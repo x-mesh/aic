@@ -271,6 +271,12 @@ enum Commands {
         #[command(subcommand)]
         op: HostsOp,
     },
+    /// `run_command` tokenizer 화이트리스트 조회·검사 (RFC-005 Phase 6, O3).
+    /// builtin(8) + `~/.aic/whitelist.toml` user 확장 + path_guard 연결.
+    Whitelist {
+        #[command(subcommand)]
+        op: WhitelistOp,
+    },
     /// 첫 사용 통합 가이드 — config + init + migrate-keys + doctor 순으로 안내
     Setup {
         /// 셸 종류 (자동 감지: $SHELL)
@@ -629,6 +635,18 @@ enum HostsOp {
 }
 
 #[derive(Subcommand)]
+enum WhitelistOp {
+    /// builtin + user(`~/.aic/whitelist.toml`) 화이트리스트 program 목록 표시.
+    Status,
+    /// 단일 명령(공백 분리)을 4단 게이트(shell metachar / program allowlist /
+    /// path_guard / allowed_args 규칙)로 검사하고 Allowed/Blocked + 이유를 출력.
+    Check {
+        /// 예: `"ps aux"`, `"cat /etc/shadow"`. 따옴표로 감싸 단일 인자로.
+        cmd: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigOp {
     /// 현재 설정을 비-인터랙티브로 출력 (기본 TOML, `--json`도 가능). API key는 마스킹된다.
     Show {
@@ -686,6 +704,10 @@ async fn main() {
                 timeout_secs,
                 yes,
             } => handle_hosts_trust(name, timeout_secs, yes).await,
+        },
+        Some(Commands::Whitelist { op }) => match op {
+            WhitelistOp::Status => handle_whitelist_status(),
+            WhitelistOp::Check { cmd } => handle_whitelist_check(cmd),
         },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
@@ -2178,7 +2200,30 @@ async fn handle_hosts_ping(target: String, cmd: String) {
         eprintln!("{COL_RED}✗{COL_RESET} --cmd is empty");
         std::process::exit(2);
     };
-    let rcmd = RemoteCommand::new(program).args(parts.map(|s| s.to_string()));
+    let arg_vec: Vec<String> = parts.map(String::from).collect();
+
+    // 화이트리스트 게이트(Phase 6, O3): 멀티호스트로 실행 가능한 명령은 builtin 또는
+    // user(`~/.aic/whitelist.toml`)에 있어야 한다. metachar·경로 denylist도 함께 검사.
+    {
+        use aic_client::agent::whitelist::{CheckResult, Whitelist};
+        let wl = match Whitelist::load() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+                std::process::exit(2);
+            }
+        };
+        if let CheckResult::Blocked { reason } = wl.check(program, &arg_vec) {
+            eprintln!(
+                "{COL_RED}✗ whitelist 차단:{COL_RESET} {reason}\n\
+                 → 허용된 명령은 `aic whitelist status`로 확인. 추가하려면 \
+                 `~/.aic/whitelist.toml`에 program 항목 작성.\n\
+                 → 단일 명령 검사: `aic whitelist check \"{cmd}\"`"
+            );
+            std::process::exit(1);
+        }
+    }
+    let rcmd = RemoteCommand::new(program).args(arg_vec.iter().cloned());
 
     let batch_id = format!(
         "ping-{}",
@@ -2464,6 +2509,82 @@ async fn print_auth_fail_hint(stderr: &str) {
     }
     println!("    → 신규 호스트(known_hosts 미등록)는 `aic hosts trust <name>` 후 재시도");
     println!("    → 수정 후 `aic hosts ping <target> --retry-failed`로 실패 호스트만 재시도(1.1)");
+}
+
+/// `aic whitelist status` — builtin + user 화이트리스트 program 목록 출력.
+fn handle_whitelist_status() {
+    use aic_client::agent::whitelist::{Whitelist, BUILTIN_PROGRAMS};
+    let wl = match Whitelist::load() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let user_count = wl.programs.len() - BUILTIN_PROGRAMS.len();
+    println!(
+        "{COL_BOLD}builtin{COL_RESET} ({}): {}",
+        BUILTIN_PROGRAMS.len(),
+        BUILTIN_PROGRAMS.join(", ")
+    );
+    if let Some(p) = &wl.user_path {
+        println!(
+            "{COL_BOLD}user{COL_RESET} ({}) [{}]:",
+            user_count.max(0),
+            p.display()
+        );
+        for (name, rules) in &wl.programs {
+            if BUILTIN_PROGRAMS.contains(&name.as_str()) {
+                continue;
+            }
+            let rules_count = rules.as_ref().map(|r| r.len()).unwrap_or(0);
+            let suffix = if rules_count > 0 {
+                format!("  ({rules_count} allowed_args rules)")
+            } else {
+                String::new()
+            };
+            println!("  · {name}{suffix}");
+        }
+    } else {
+        println!(
+            "{COL_BOLD}user{COL_RESET}: ~/.aic/whitelist.toml 없음 (선택 사항 — builtin만 사용 가능)"
+        );
+    }
+    println!(
+        "\n{COL_BOLD}total{COL_RESET}: {} programs",
+        wl.programs.len()
+    );
+}
+
+/// `aic whitelist check "<cmd>"` — 단일 명령 4단 게이트 검사.
+fn handle_whitelist_check(cmd: String) {
+    use aic_client::agent::whitelist::{CheckResult, Whitelist};
+    let wl = match Whitelist::load() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        eprintln!("{COL_RED}✗{COL_RESET} cmd is empty");
+        std::process::exit(2);
+    };
+    let args: Vec<String> = parts.map(String::from).collect();
+    println!("program: {COL_BOLD}{program}{COL_RESET}");
+    println!("args:    {args:?}");
+    match wl.check(program, &args) {
+        CheckResult::Allowed => {
+            println!("result:  {COL_GREEN}ALLOW{COL_RESET}");
+            std::process::exit(0);
+        }
+        CheckResult::Blocked { reason } => {
+            println!("result:  {COL_RED}BLOCK{COL_RESET}");
+            println!("reason:  {reason}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `aic hosts trust <name>` — RFC-005 §4.1 TOFU step 2~4 (scan + confirm + append).
