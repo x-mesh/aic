@@ -56,16 +56,20 @@ jobs:
             cargo install --locked cargo-zigbuild
 
       # Validate config first — fast feedback on .goreleaser.yaml syntax errors.
+      # version 고정: `brews`가 GoReleaser v2.16에서 hard-removal 됐다(v2.10 soft-deprecate).
+      # `version: latest`가 v2.16.0을 받으면서 `check`가 deprecated 속성으로 exit 2 →
+      # release.yml 전체 실패(0.10.0 사례). cask 마이그레이션(brews→homebrew_casks) 전까지
+      # brews를 지원하는 마지막 라인인 v2.15에 고정한다.
       - name: GoReleaser check
         uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          version: '~> v2.15'
           args: check
 
       - name: GoReleaser release
         uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          version: '~> v2.15'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
