@@ -12,11 +12,14 @@
 //! - 분기 명확: 8종 [`HostStatus`] + [`classify_ssh_result`] (U2).
 
 pub mod fanout;
+pub mod path_guard;
+pub mod secret_filter;
 pub mod ssh_process;
 
 use serde::Serialize;
 
 pub use fanout::{run_fanout, FanoutResult, StatusCounts};
+pub use path_guard::{check_path, lexical_canonicalize, PathCheck};
 pub use ssh_process::SshProcessExecutor;
 
 /// 원격 호스트에서 실행할 명령. 셸 해석 배제를 위해 program/args를 분리한다.
@@ -60,6 +63,10 @@ pub struct RemoteResult {
     pub status: HostStatus,
     /// stdout 또는 stderr가 64KiB 저장 한계를 넘었는지(나머지는 드레인 후 버림).
     pub truncated: bool,
+    /// pre-render secret 필터가 redact한 매치 수(stdout+stderr 합산). 0이어도 미일치
+    /// secret이 있을 수 있음 → audit 측에서 "원격 결과는 secret 포함 가능" 경고 첨부.
+    #[serde(default)]
+    pub redacted: usize,
 }
 
 /// 8종 상태 태그(RFC-005 §4.4 U2). Phase 3의 카드 헤더에 표시.

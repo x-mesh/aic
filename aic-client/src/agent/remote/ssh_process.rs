@@ -17,7 +17,8 @@ use std::time::Instant;
 use tokio::io::AsyncReadExt;
 
 use super::{
-    classify_ssh_result, shell_escape, HostStatus, RemoteCommand, RemoteExecutor, RemoteResult,
+    classify_ssh_result, secret_filter, shell_escape, HostStatus, RemoteCommand, RemoteExecutor,
+    RemoteResult,
 };
 use crate::agent::hosts::{HostEntry, HostKeyCheck};
 
@@ -116,6 +117,7 @@ impl RemoteExecutor for SshProcessExecutor {
                     duration_ms: start.elapsed().as_millis() as u64,
                     status: HostStatus::RemoteErr,
                     truncated: false,
+                    redacted: 0,
                 };
             }
         };
@@ -138,10 +140,15 @@ impl RemoteExecutor for SshProcessExecutor {
 
         match res {
             Ok((out_res, err_res, wait_res)) => {
-                let (stdout, stdout_truncated) = out_res.unwrap_or((String::new(), false));
-                let (stderr, stderr_truncated) = err_res.unwrap_or((String::new(), false));
+                let (stdout_raw, stdout_truncated) = out_res.unwrap_or((String::new(), false));
+                let (stderr_raw, stderr_truncated) = err_res.unwrap_or((String::new(), false));
                 let exit_code = wait_res.ok().and_then(|s| s.code()).unwrap_or(-1);
-                let status = classify_ssh_result(exit_code, &stderr, duration_ms, connect_timeout_ms);
+                // 분류는 raw stderr 패턴(예: "Permission denied")으로 — redact 후 패턴이 사라지면
+                // 분류 정확도가 떨어진다. 따라서 classify를 먼저, redact를 그 다음.
+                let status = classify_ssh_result(exit_code, &stderr_raw, duration_ms, connect_timeout_ms);
+                // Pre-render secret 필터(R2/S3): stdout/stderr는 redact 후 저장·렌더·audit.
+                let (stdout, redact_out) = secret_filter::redact(&stdout_raw);
+                let (stderr, redact_err) = secret_filter::redact(&stderr_raw);
                 RemoteResult {
                     host: host.name.clone(),
                     stdout,
@@ -150,6 +157,7 @@ impl RemoteExecutor for SshProcessExecutor {
                     duration_ms,
                     status,
                     truncated: stdout_truncated || stderr_truncated,
+                    redacted: redact_out + redact_err,
                 }
             }
             Err(_elapsed) => {
@@ -167,6 +175,7 @@ impl RemoteExecutor for SshProcessExecutor {
                     duration_ms,
                     status: HostStatus::Timeout,
                     truncated: false,
+                    redacted: 0,
                 }
             }
         }
