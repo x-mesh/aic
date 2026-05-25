@@ -11,10 +11,12 @@
 //! - stdout/stderr 상한 64 KiB 저장 / 8 MiB 드레인 (R2).
 //! - 분기 명확: 8종 [`HostStatus`] + [`classify_ssh_result`] (U2).
 
+pub mod fanout;
 pub mod ssh_process;
 
 use serde::Serialize;
 
+pub use fanout::{run_fanout, FanoutResult, StatusCounts};
 pub use ssh_process::SshProcessExecutor;
 
 /// 원격 호스트에서 실행할 명령. 셸 해석 배제를 위해 program/args를 분리한다.
