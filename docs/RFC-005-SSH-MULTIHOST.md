@@ -691,9 +691,9 @@ PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team
 
 ---
 
-## 10. Implementation Status (2026-05-25)
+## 10. Implementation Status (2026-05-26, Critical 12/12 반영 완료)
 
-`feat/ssh-multihost` 브랜치 6 커밋. 전체 lib 테스트 **589 passed** · clippy clean.
+`feat/ssh-multihost` 브랜치 11 커밋. 전체 lib 테스트 **605 passed** · clippy clean.
 
 ### 10.1 Phase별 커밋 + 모듈
 
@@ -703,9 +703,13 @@ PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team
 | **2 RemoteExecutor** | `3b38342` | `agent/remote/{mod,ssh_process}.rs` | ~540 | 20 |
 | **3 fan-out** | `b50d06e` | `agent/remote/fanout.rs` | ~250 | 4 |
 | **4 UX 보강** | `0976167` | `main.rs` 핸들러(severity-sort, collapsed ok, auth_fail hint, ssh-agent 자동 점검) | ~150 | — |
-| **5 전반 (S2/S3)** | `ab4f7bd` | `agent/remote/path_guard.rs` + `secret_filter.rs` + `ssh_process` redact 통합 + `RemoteResult.redacted` | ~360 | 15 |
+| **5 전반 (S2/S3)** | `ab4f7bd` | `agent/remote/path_guard.rs` + `secret_filter.rs` + `ssh_process` redact + `RemoteResult.redacted` | ~360 | 15 |
 | **5 후반 (TOFU 모듈)** | `951a089` | `agent/remote/tofu.rs` (scan_host / parse_keyscan_lines / append_known_hosts / fingerprint_sha256) | ~210 | 3 (+1 ignored) |
-| **합계** | — | — | **~2,060** | **54** |
+| **5 TOFU CLI** | `5256b47` | `aic hosts trust <name>` 명시 TOFU 4-step (단발 CLI, 자동 retry는 1.1) | ~110 | — |
+| **5 audit batch (O2)** | `63dc7d6` | `agent/audit_batch.rs` + `aic audit batch-verify` (SHA256 chain, daily segment) | ~430 | 7 |
+| **6 whitelist 모듈 (O3)** | `8486981` | `agent/whitelist.rs` (builtin 8 + user toml + 4단 게이트 + path_guard 연결) | ~210 | 9 |
+| **6 whitelist wiring** | `e13eecc` | `aic whitelist status/check` + `hosts ping` cmd 게이트 적용 | ~90 | — |
+| **합계** | — | — | **~2,900** | **70** |
 
 ### 10.2 CLI 노출 (사용자 직접 사용 가능)
 
@@ -713,8 +717,12 @@ PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team
 |------|------|
 | `aic hosts show` | 인벤토리 전체 표시 — 그룹·호스트·source·`ssh_config_warnings` |
 | `aic hosts show <name> [--json]` | 단일 호스트 최종 해석값 (overlay 결과 + 어느 directive를 ssh에 위임했는지) |
-| `aic hosts ping <name> [--cmd "..."]` | 단일 호스트 ssh ping — 8종 상태 태그 + stdout/stderr + duration |
-| `aic hosts ping @group [--cmd "..."]` | 그룹 fan-out — cap 8 + 3-layer timeout + severity-sort 카드 stack + 헤더 inline 실패명 + ok collapsed + `[auth_fail]` hint + ssh-agent 자동 점검 |
+| `aic hosts ping <name> [--cmd "..."]` | 단일 호스트 ssh ping — 8종 상태 태그 + stdout/stderr + duration + redacted 카운트 |
+| `aic hosts ping @group [--cmd "..."]` | 그룹 fan-out — cap 8 + 3-layer timeout + severity-sort 카드 stack + 헤더 inline 실패명 + ok collapsed + `[auth_fail]` hint + ssh-agent 자동 점검 + audit batch 자동 기록 |
+| `aic hosts trust <name> [--yes]` | TOFU step 2~4 — `ssh-keyscan` → SHA256 fingerprint 노출 → stdin confirm → `~/.ssh/known_hosts` append |
+| `aic whitelist status` | builtin 8 + user(`~/.aic/whitelist.toml`) 화이트리스트 목록 |
+| `aic whitelist check "<cmd>"` | 단일 명령 4단 게이트 검사 — ALLOW/BLOCK + 이유 |
+| `aic audit batch-verify [--date YYYY-MM-DD]` | 멀티호스트 batch audit segment SHA256 chain 무결성 검증 |
 
 ### 10.3 red-team Critical 12 → 구현 매핑
 
@@ -730,21 +738,27 @@ PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team
 | 🟢 U2 | 5종 → 8종 태그 | 2 | `HostStatus` 8 variants + `classify_ssh_result` stderr 패턴 우선 |
 | 🟢 U3 | `[auth_fail]` 행동 부재 | 4 | `print_auth_fail_hint` + `probe_local_ssh_agent` 자동 호출 |
 | 🟢 O1 | ssh_config 디버깅 부재 | 1 | `aic hosts show <name>` source/overlay 표시 + `ssh_config_warnings` |
-| 🟡 O2 | audit 로테이션 | — | **미반영** — 다음 작업 (batch_id + daily segment + `aic audit verify --date`) |
-| 🟡 O3 | whitelist 확장 | — | **미반영** — 다음 작업 (Phase 6: `~/.aic/whitelist.toml` + `aic whitelist check`) |
-| 🟢 TOFU (High) | BatchMode↔TOFU 양립 | 5 | `tofu` 모듈 (함수 단위) — **wiring 보류**(ssh_process 자동 재시도 + confirm callback) |
+| 🟢 O2 | audit 로테이션 | 5 후반 | `agent/audit_batch.rs` (BatchAppender + SHA256 chain + daily segment) + `aic audit batch-verify --date` |
+| 🟢 O3 | whitelist 확장 | 6 | `agent/whitelist.rs` (builtin 8 + `~/.aic/whitelist.toml` user) + 4단 게이트(metachar/program/path_guard/allowed_args) + `aic whitelist status/check` + `hosts ping` cmd 게이트 적용 |
+| 🟢 TOFU (High) | BatchMode↔TOFU 양립 | 5 | `tofu` 모듈 + **`aic hosts trust <name>` CLI** (단발 명시 4-step). chat TUI 자동 retry는 1.1 |
 
-### 10.4 미반영 / 다음 작업
+### 10.4 1.1 후속 (Critical 외)
 
-| 작업 | 효과 | 의존성 |
-|------|------|--------|
-| **TOFU wiring** | `ssh_process`가 `Host key verification failed` 감지 → `scan_host` → confirm callback → `append_known_hosts` → ssh 재시도 | callback 패턴 추상화 (단발 CLI = stdin prompt, chat TUI = mpsc 직렬화) |
-| **Audit batch + daily segment (O2)** | `batch_id` UUID + per-host `host_result` + `segment_end` 경계 + `aic audit verify --date` + retain/compress 정책 | 기존 `audit.rs` 확장 또는 신규 `audit/batch.rs` |
-| **Phase 6 — whitelist (O3)** | `~/.aic/whitelist.toml` append-merge + tokenizer + `aic whitelist status/check` + `run_command` 멀티호스트 게이트에 `path_guard`/whitelist wiring | path_guard·tokenizer 통합 |
-| **chat TUI 통합** | `/diagnose @group` 슬래시 명령으로 fan-out 호출 + 카드 stack을 chat TUI에 inline 렌더 + TOFU confirm을 ratatui modal로 | RFC-004 chat TUI + 본 RFC fan-out |
+red-team Critical 12는 모두 반영. 다음은 RFC §5.2 1.1 분리 항목.
+
+| 작업 | 효과 | 비고 |
+|------|------|------|
+| **chat TUI 통합** | `/diagnose @group` 슬래시 명령으로 fan-out 호출 + 카드 stack inline 렌더 + TOFU confirm을 ratatui modal로 | RFC-004 chat TUI + 본 RFC fan-out |
+| **TOFU 자동 retry** | `ssh_process`가 `Host key verification failed` 감지 → `scan_host` → confirm callback → `append_known_hosts` → ssh 재시도 | 현재는 명시 `aic hosts trust` 2-step. callback 패턴 추상화(stdin / mpsc) |
+| **diff 모드 토글** | `Tab`으로 카드↔diff. majority-diff 또는 `r` 키 reference 선택 | 임계 결정 후 |
+| **mutation 멀티호스트** | `aic run --hosts <group> -- <command>` 별도 서브커맨드 | risk_guard 호스트별 확인 정책 |
+| **`russh`/`ssh2` 전환** | latency 또는 OpenSSH 미설치 환경 | 측정 트리거 필요 |
+| **Ansible inventory / k8s import** | `[options] inventory_imports = [...]` | 별도 RFC |
+| **`--retry-failed` 옵션 실제 구현** | 직전 batch의 [auth_fail] 등 실패 호스트만 재실행 | 메모리 또는 batch_id 파일 보존 |
 
 ### 10.5 운영 메모
 
-- 브랜치는 아직 push되지 않음 → 다음 단계는 (a) 남은 작업 진행 후 일괄 PR, 또는 (b) 현재 6 커밋을 먼저 push해 CI 검증 + PR 생성 후 후속 PR.
-- `RemoteResult.redacted` 카운트 > 0이어도 패턴 미일치 secret이 있을 수 있다 — audit batch 구현 시 "원격 결과는 secret 포함 가능" 경고를 항상 첨부할 것(§4.6).
-- `aic hosts ping`은 read-only run_command 임시 wiring 없이 사용자가 임의 `--cmd`를 보낼 수 있다 → Phase 6 whitelist 게이트 적용 전까지 운영자 책임.
+- 본 브랜치(`feat/ssh-multihost`) 11 커밋 후 0.11.0 minor 릴리스 예정 (사용자 가치: `aic hosts {show,ping,trust} / whitelist {status,check} / audit batch-verify`).
+- `RemoteResult.redacted` 카운트 > 0이어도 패턴 미일치 secret이 있을 수 있다 — audit batch는 "원격 결과는 secret 포함 가능" 경고를 항상 함께 기록(§4.6).
+- `aic hosts ping`은 cmd 게이트가 strict 적용됨(builtin 8개 외 명령은 거부). 추가는 `~/.aic/whitelist.toml`.
+- TOFU는 단발 CLI에서 명시 `aic hosts trust` 단계. chat TUI 자동 retry는 1.1.
