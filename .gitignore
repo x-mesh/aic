@@ -22,7 +22,12 @@ Thumbs.db
 # IDE/Editor
 .cursor/
 .kiro/
-.xm/
+# .xm/ 안 내용은 대부분 ephemeral(state, plans 등) → ignore. 단 op skill 결과
+# artifact(RFC가 결정 근거로 참조)는 추적한다. 디렉토리 자체를 ignore하면
+# negative pattern이 안 먹으므로 `.xm/*`로 안 내용만 ignore + op는 예외.
+.xm/*
+!.xm/op/
+!.xm/op/**
 .omc/
 .claude/settings.local.json
 # AI-suggested
