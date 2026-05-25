@@ -593,6 +593,16 @@ enum HostsOp {
         #[arg(long)]
         json: bool,
     },
+    /// 단일 호스트에 ssh로 가벼운 명령을 실행해 연결을 검증한다(RFC-005 Phase 2).
+    /// BatchMode=yes + ForwardAgent=no + ControlMaster=auto로 호출하며 결과는 8종 상태
+    /// 태그 + stdout/stderr + duration을 표시한다. 멀티호스트 fan-out은 Phase 3.
+    Ping {
+        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host).
+        name: String,
+        /// 실행할 read-only 명령(공백 분리 인자). 기본 `uptime`.
+        #[arg(long, default_value = "uptime")]
+        cmd: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -647,6 +657,7 @@ async fn main() {
         }) => handle_status(watch, interval, session, json, all).await,
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
+            HostsOp::Ping { name, cmd } => handle_hosts_ping(name, cmd).await,
         },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
@@ -2041,6 +2052,76 @@ fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
             println!("  · {w}");
         }
     }
+}
+
+/// `aic hosts ping <name> [--cmd "uptime"]` — RFC-005 Phase 2 검증용.
+///
+/// 외부 `ssh`로 가벼운 read-only 명령을 실행해 8종 상태 태그 + stdout/stderr + duration을
+/// 표시한다. 화이트리스트 게이트(Phase 3) 적용 전이므로 cmd는 사용자 책임 — read-only를 권장.
+async fn handle_hosts_ping(name: String, cmd: String) {
+    use aic_client::agent::hosts::Inventory;
+    use aic_client::agent::remote::{RemoteCommand, RemoteExecutor, SshProcessExecutor};
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let Some(host) = inv.host(&name) else {
+        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+        std::process::exit(1);
+    };
+
+    // 공백 분리: 첫 토큰 = program, 나머지 = args. 셸 메타문자는 shell_escape가 리터럴화.
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        eprintln!("{COL_RED}✗{COL_RESET} --cmd is empty");
+        std::process::exit(2);
+    };
+    let rcmd = RemoteCommand::new(program).args(parts.map(|s| s.to_string()));
+
+    // batch_id: 단발 ping이므로 timestamp 기반(ControlPath namespacing).
+    let batch_id = format!(
+        "ping-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let exec = SshProcessExecutor::new(batch_id);
+
+    println!(
+        "{COL_BOLD}{}{COL_RESET}  →  {}@{}:{}  cmd={cmd:?}",
+        host.name, host.user, host.hostname, host.port
+    );
+    let r = exec.exec(host, &rcmd).await;
+    let color = match r.status.severity() {
+        0..=10 => COL_GREEN,
+        11..=40 => COL_YELLOW,
+        _ => COL_RED,
+    };
+    println!(
+        "{color}[{}]{COL_RESET}  exit={}  {}ms{}",
+        r.status.label(),
+        r.exit_code,
+        r.duration_ms,
+        if r.truncated { "  [truncated]" } else { "" },
+    );
+    if !r.stdout.is_empty() {
+        println!("\n{COL_BOLD}stdout{COL_RESET}\n{}", r.stdout.trim_end());
+    }
+    if !r.stderr.is_empty() {
+        println!("\n{COL_BOLD}stderr{COL_RESET}\n{}", r.stderr.trim_end());
+    }
+    // exit code: ok=0, ok_warn=0, 나머지는 비-zero(스크립트 친화).
+    let code = match r.status {
+        aic_client::agent::remote::HostStatus::Ok
+        | aic_client::agent::remote::HostStatus::OkWithWarn => 0,
+        _ => 1,
+    };
+    std::process::exit(code);
 }
 
 /// `aic status --json`: 단일 세션 status를 JSON으로 출력.
