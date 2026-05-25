@@ -201,6 +201,7 @@ mod tests {
                 duration_ms: self.delay_ms,
                 status: HostStatus::Ok,
                 truncated: false,
+                redacted: 0,
             }
         }
     }

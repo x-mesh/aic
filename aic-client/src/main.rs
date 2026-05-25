@@ -2222,13 +2222,18 @@ fn print_host_card(r: &aic_client::agent::remote::RemoteResult, verbose: bool) {
         11..=40 => COL_YELLOW,
         _ => COL_RED,
     };
+    let truncated_tag = if r.truncated { "  [truncated]" } else { "" };
+    let redacted_tag = if r.redacted > 0 {
+        format!("  {COL_YELLOW}[redacted: {}]{COL_RESET}", r.redacted)
+    } else {
+        String::new()
+    };
     println!(
-        "  {color}[{}]{COL_RESET}  {}  exit={}  {}ms{}",
+        "  {color}[{}]{COL_RESET}  {}  exit={}  {}ms{truncated_tag}{redacted_tag}",
         r.status.label(),
         r.host,
         r.exit_code,
         r.duration_ms,
-        if r.truncated { "  [truncated]" } else { "" },
     );
     if !verbose {
         return;
