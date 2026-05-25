@@ -265,6 +265,18 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         interactive: bool,
     },
+    /// SSH 멀티호스트 인벤토리 조회 (RFC-005 Phase 1) — `~/.aic/hosts.toml`과
+    /// `~/.ssh/config` import + overlay 결과를 표시. 실제 SSH 호출은 Phase 2 이후.
+    Hosts {
+        #[command(subcommand)]
+        op: HostsOp,
+    },
+    /// `run_command` tokenizer 화이트리스트 조회·검사 (RFC-005 Phase 6, O3).
+    /// builtin(8) + `~/.aic/whitelist.toml` user 확장 + path_guard 연결.
+    Whitelist {
+        #[command(subcommand)]
+        op: WhitelistOp,
+    },
     /// 첫 사용 통합 가이드 — config + init + migrate-keys + doctor 순으로 안내
     Setup {
         /// 셸 종류 (자동 감지: $SHELL)
@@ -573,6 +585,65 @@ enum DebugOp {
 enum AuditOp {
     /// HMAC chain 무결성 검증 (exit 0=pass, 2=tampered, 3=key/IO error)
     Verify,
+    /// 멀티호스트 batch audit segment 무결성 검증 (RFC-005 §4.6, O2).
+    /// `~/.aic/audit/YYYY-MM-DD.jsonl` 파일의 SHA256 chain을 재계산해 검증한다.
+    /// 인자 없으면 모든 segment 검증, `--date`로 특정 일자만.
+    BatchVerify {
+        /// 특정 일자(YYYY-MM-DD)만 검증. 생략 시 모든 segment.
+        #[arg(long)]
+        date: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostsOp {
+    /// 인벤토리 표시 — `~/.aic/hosts.toml` + `~/.ssh/config` import + overlay 적용 결과.
+    /// 이름 인자가 없으면 전체 호스트·그룹 목록, 있으면 단일 호스트의 최종 해석값
+    /// (어느 필드가 어느 source에서 왔는지) + ssh_config 위임 경고를 표시한다.
+    Show {
+        /// 단일 호스트 이름. 생략 시 전체 인벤토리.
+        name: Option<String>,
+        /// JSON 출력(머신 파싱 친화). 디버깅 surface.
+        #[arg(long)]
+        json: bool,
+    },
+    /// 단일 호스트 또는 그룹(`@group`)에 ssh로 read-only 명령을 실행한다.
+    /// Phase 2: 단일 호스트. Phase 3: `@group` fan-out (cap + 3-layer timeout + 카드 stack).
+    /// BatchMode=yes + ForwardAgent=no + ControlMaster=auto.
+    Ping {
+        /// 호스트 이름 또는 `@group` 패턴. hosts.toml `name`/`groups.X` 또는 ssh_config Host.
+        target: String,
+        /// 실행할 read-only 명령(공백 분리 인자). 기본 `uptime`.
+        #[arg(long, default_value = "uptime")]
+        cmd: String,
+    },
+    /// 신규 호스트의 host key를 ssh-keyscan으로 수집해 SHA256 fingerprint를 노출하고,
+    /// 승인 시 `~/.ssh/known_hosts`에 append한다 (RFC-005 §4.1 TOFU 4-step의 step 2~4).
+    /// BatchMode=yes로 인해 ssh 자체 prompt가 차단되어 신규 호스트는 `[auth_fail]`로
+    /// 떨어지는데, 이 명령으로 명시 trust 후 `aic hosts ping`을 재시도한다. chat TUI의
+    /// 자동 confirm flow는 후속(1.1).
+    Trust {
+        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host).
+        name: String,
+        /// ssh-keyscan timeout 초. 기본 5.
+        #[arg(long, default_value = "5")]
+        timeout_secs: u32,
+        /// 비-TTY/스크립트 환경에서 prompt 없이 자동 승인. 보안 주의 — MITM 위험.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WhitelistOp {
+    /// builtin + user(`~/.aic/whitelist.toml`) 화이트리스트 program 목록 표시.
+    Status,
+    /// 단일 명령(공백 분리)을 4단 게이트(shell metachar / program allowlist /
+    /// path_guard / allowed_args 규칙)로 검사하고 Allowed/Blocked + 이유를 출력.
+    Check {
+        /// 예: `"ps aux"`, `"cat /etc/shadow"`. 따옴표로 감싸 단일 인자로.
+        cmd: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -625,8 +696,22 @@ async fn main() {
             json,
             all,
         }) => handle_status(watch, interval, session, json, all).await,
+        Some(Commands::Hosts { op }) => match op {
+            HostsOp::Show { name, json } => handle_hosts_show(name, json),
+            HostsOp::Ping { target, cmd } => handle_hosts_ping(target, cmd).await,
+            HostsOp::Trust {
+                name,
+                timeout_secs,
+                yes,
+            } => handle_hosts_trust(name, timeout_secs, yes).await,
+        },
+        Some(Commands::Whitelist { op }) => match op {
+            WhitelistOp::Status => handle_whitelist_status(),
+            WhitelistOp::Check { cmd } => handle_whitelist_check(cmd),
+        },
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
+            AuditOp::BatchVerify { date } => handle_audit_batch_verify(date),
         },
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
         Some(Commands::Init { shell, hook_mode }) => handle_init(shell, hook_mode),
@@ -1862,6 +1947,772 @@ fn handle_audit_verify() {
             println!("{COL_YELLOW}⚠{COL_RESET} audit verify error: {e}");
             std::process::exit(3);
         }
+    }
+}
+
+/// `aic audit batch-verify [--date YYYY-MM-DD]` — 멀티호스트 batch audit segment 검증.
+/// `~/.aic/audit/YYYY-MM-DD.jsonl`의 SHA256 chain을 재계산해 무결성을 보고한다.
+/// exit 0=all pass, 2=하나라도 tampered, 3=IO/parse error.
+fn handle_audit_batch_verify(date: Option<String>) {
+    use aic_client::agent::audit_batch::{list_segments, verify_segment};
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("{COL_RED}✗{COL_RESET} $HOME not set");
+        std::process::exit(3);
+    };
+    let audit_dir = home.join(".aic").join("audit");
+
+    let segments: Vec<std::path::PathBuf> = if let Some(d) = &date {
+        let p = audit_dir.join(format!("{d}.jsonl"));
+        if !p.exists() {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} segment not found: {}", p.display());
+            std::process::exit(3);
+        }
+        vec![p]
+    } else {
+        match list_segments(&audit_dir) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                println!("{COL_YELLOW}⚠{COL_RESET} no audit segments in {}", audit_dir.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} list segments: {e:#}");
+                std::process::exit(3);
+            }
+        }
+    };
+
+    let mut any_broken = false;
+    for path in &segments {
+        match verify_segment(path) {
+            Ok(report) if report.valid => {
+                println!(
+                    "{COL_GREEN}✔{COL_RESET} {} — {} entries, chain OK",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    report.entries
+                );
+            }
+            Ok(report) => {
+                any_broken = true;
+                println!(
+                    "{COL_RED}✗{COL_RESET} {} — {} entries, broken at line {}",
+                    path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                    report.entries,
+                    report.broken_at.unwrap_or(0)
+                );
+            }
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} {}: {e:#}", path.display());
+                std::process::exit(3);
+            }
+        }
+    }
+    std::process::exit(if any_broken { 2 } else { 0 });
+}
+
+/// `aic hosts show [name] [--json]` — RFC-005 Phase 1 디버깅 surface.
+///
+/// `~/.aic/hosts.toml` + `~/.ssh/config` import + overlay 결과를 노출한다. 이 단계에서
+/// 실제 SSH 호출은 없다(Phase 2 RemoteExecutor). 사용자가 "왜 호스트가 비어있나" /
+/// "어느 필드가 어디서 왔나"를 즉시 검사할 수 있게 하는 것이 목적(red-team O1 해소).
+fn handle_hosts_show(name: Option<String>, json: bool) {
+    use aic_client::agent::hosts::Inventory;
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    if json {
+        // 전체(name=None) 또는 단일(name=Some)을 JSON으로.
+        let v = match &name {
+            Some(n) => match inv.host(n) {
+                Some(e) => serde_json::to_value(e).unwrap_or_default(),
+                None => {
+                    eprintln!("{COL_RED}✗{COL_RESET} host not found: {n}");
+                    std::process::exit(1);
+                }
+            },
+            None => serde_json::to_value(&inv).unwrap_or_default(),
+        };
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return;
+    }
+
+    match name {
+        None => print_hosts_summary(&inv),
+        Some(n) => print_host_detail(&inv, &n),
+    }
+}
+
+fn print_hosts_summary(inv: &aic_client::agent::hosts::Inventory) {
+    use aic_client::agent::hosts::HostSource;
+
+    let n_hosts = inv.hosts.len();
+    let n_groups = inv.groups.len();
+    println!(
+        "inventory: {n_hosts} hosts · {n_groups} groups · ssh_config_import={}",
+        inv.options.ssh_config_import
+    );
+    println!(
+        "concurrency: max_parallel={} · per_host_timeout={}s · wall_clock={}s",
+        inv.concurrency.max_parallel,
+        inv.concurrency.per_host_timeout_secs,
+        inv.concurrency.wall_clock_timeout_secs,
+    );
+
+    if !inv.groups.is_empty() {
+        println!("\n{COL_BOLD}groups{COL_RESET}");
+        for (name, g) in &inv.groups {
+            let tags = if g.tags.is_empty() {
+                String::new()
+            } else {
+                format!("  tags: {}", g.tags.join(", "))
+            };
+            println!("  @{name}  ({} hosts){tags}", g.hosts.len());
+        }
+    }
+
+    if !inv.hosts.is_empty() {
+        println!("\n{COL_BOLD}hosts{COL_RESET}");
+        // 가독성: 가장 긴 name 폭 기준으로 정렬.
+        let name_w = inv.hosts.keys().map(|k| k.len()).max().unwrap_or(0).max(8);
+        for (name, e) in &inv.hosts {
+            let src = match e.source {
+                HostSource::HostsToml => "hosts.toml",
+                HostSource::SshConfig => "ssh_config",
+                HostSource::Overlay => "ssh_config + hosts.toml",
+            };
+            let target = format!("{}@{}:{}", e.user, e.hostname, e.port);
+            println!(
+                "  {name:<name_w$}  {target:<32}  [source: {src}]",
+                name_w = name_w
+            );
+        }
+    }
+
+    if !inv.ssh_config_warnings.is_empty() {
+        println!("\n{COL_YELLOW}ssh_config_warnings{COL_RESET} (위임 directive, ssh가 직접 처리)");
+        for w in &inv.ssh_config_warnings {
+            println!("  · {w}");
+        }
+    }
+}
+
+fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
+    use aic_client::agent::hosts::{HostKeyCheck, HostSource};
+
+    let Some(e) = inv.host(name) else {
+        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+        // 유사 이름 제안(Levenshtein 미사용, 간단한 substring 매칭).
+        let candidates: Vec<&String> = inv
+            .hosts
+            .keys()
+            .filter(|k| k.contains(name) || name.contains(k.as_str()))
+            .collect();
+        if !candidates.is_empty() {
+            eprintln!("    did you mean: {:?}", candidates);
+        }
+        std::process::exit(1);
+    };
+
+    let src = match e.source {
+        HostSource::HostsToml => "hosts.toml",
+        HostSource::SshConfig => "ssh_config",
+        HostSource::Overlay => "ssh_config + hosts.toml overlay",
+    };
+    let hkc = match e.host_key_check {
+        HostKeyCheck::Strict => "strict",
+        HostKeyCheck::AcceptNew => "accept-new",
+    };
+
+    println!("{COL_BOLD}{}{COL_RESET}", e.name);
+    println!("  source:                {src}");
+    println!("  hostname:              {}", e.hostname);
+    println!("  user:                  {}", e.user);
+    println!("  port:                  {}", e.port);
+    println!(
+        "  identity_file:         {}",
+        e.identity_file
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "—".into())
+    );
+    println!(
+        "  proxy_jump:            {}",
+        e.proxy_jump.as_deref().unwrap_or("—")
+    );
+    println!("  forward_agent:         {}", e.forward_agent);
+    println!("  host_key_check:        {hkc}");
+    println!("  connect_timeout_secs:  {}", e.connect_timeout_secs);
+    println!(
+        "  tags:                  {}",
+        if e.tags.is_empty() {
+            "—".into()
+        } else {
+            e.tags.join(", ")
+        }
+    );
+
+    if !inv.ssh_config_warnings.is_empty() {
+        println!("\n{COL_YELLOW}ssh_config_warnings{COL_RESET} (전역 — 이 호스트만의 경고는 아님)");
+        for w in &inv.ssh_config_warnings {
+            println!("  · {w}");
+        }
+    }
+}
+
+/// `aic hosts ping <target> [--cmd "uptime"]` — RFC-005 Phase 2(단일) + Phase 3(`@group` fan-out).
+///
+/// 단일 호스트면 카드 1장, 그룹이면 cap + 3-layer timeout으로 병렬 실행 후 호스트별 카드 stack
+/// + 진단 헤더 통계(8종 상태별 카운트) + 미완료 호스트 목록(wall timeout 시).
+///
+/// exit code: 단일 — ok/ok_warn=0, 그 외=1. 그룹 — 모든 호스트 ok/ok_warn이면 0, 하나라도
+/// 실패/timeout이면 1, wall timeout이면 2.
+async fn handle_hosts_ping(target: String, cmd: String) {
+    use aic_client::agent::hosts::Inventory;
+    use aic_client::agent::remote::{
+        run_fanout, HostStatus, RemoteCommand, RemoteExecutor, SshProcessExecutor,
+    };
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    let hosts: Vec<aic_client::agent::hosts::HostEntry> = match inv.resolve_pattern(&target) {
+        Ok(refs) => refs.into_iter().cloned().collect(),
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        eprintln!("{COL_RED}✗{COL_RESET} --cmd is empty");
+        std::process::exit(2);
+    };
+    let arg_vec: Vec<String> = parts.map(String::from).collect();
+
+    // 화이트리스트 게이트(Phase 6, O3): 멀티호스트로 실행 가능한 명령은 builtin 또는
+    // user(`~/.aic/whitelist.toml`)에 있어야 한다. metachar·경로 denylist도 함께 검사.
+    {
+        use aic_client::agent::whitelist::{CheckResult, Whitelist};
+        let wl = match Whitelist::load() {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+                std::process::exit(2);
+            }
+        };
+        if let CheckResult::Blocked { reason } = wl.check(program, &arg_vec) {
+            eprintln!(
+                "{COL_RED}✗ whitelist 차단:{COL_RESET} {reason}\n\
+                 → 허용된 명령은 `aic whitelist status`로 확인. 추가하려면 \
+                 `~/.aic/whitelist.toml`에 program 항목 작성.\n\
+                 → 단일 명령 검사: `aic whitelist check \"{cmd}\"`"
+            );
+            std::process::exit(1);
+        }
+    }
+    let rcmd = RemoteCommand::new(program).args(arg_vec.iter().cloned());
+
+    let batch_id = format!(
+        "ping-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    // batch_id는 executor(ControlPath namespace)와 audit_batch(BatchAppender) 모두 사용.
+    let exec = SshProcessExecutor::new(batch_id.clone());
+
+    // 단일 호스트: 기존 카드 1장 (Phase 2 동작 유지) — 본문 항상 펼침.
+    if hosts.len() == 1 {
+        let host = &hosts[0];
+        println!(
+            "{COL_BOLD}{}{COL_RESET}  →  {}@{}:{}  cmd={cmd:?}",
+            host.name, host.user, host.hostname, host.port
+        );
+        let r = exec.exec(host, &rcmd).await;
+        print_host_card(&r, true);
+        if matches!(r.status, HostStatus::AuthFail) {
+            print_auth_fail_hint(&r.stderr).await;
+        }
+        let code = match r.status {
+            HostStatus::Ok | HostStatus::OkWithWarn => 0,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
+    // 그룹: fan-out + 카드 stack + 헤더 통계.
+    let total = hosts.len();
+    println!(
+        "{COL_BOLD}{target}{COL_RESET}  →  {total} hosts  cap={}  wall={}s  cmd={cmd:?}",
+        inv.concurrency.max_parallel, inv.concurrency.wall_clock_timeout_secs,
+    );
+
+    // Audit batch — best-effort. 실패해도 진단은 계속 진행하되 stderr에 경고.
+    let mut appender = match dirs::home_dir().map(|h| h.join(".aic").join("audit")) {
+        Some(dir) => match aic_client::agent::audit_batch::BatchAppender::open(dir, batch_id.clone()) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("{COL_YELLOW}⚠ audit batch open 실패(계속):{COL_RESET} {e:#}");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(a) = appender.as_mut() {
+        let host_names: Vec<String> = hosts.iter().map(|h| h.name.clone()).collect();
+        let _ = a.batch_start("diagnose", &target, &host_names);
+    }
+
+    let start = std::time::Instant::now();
+    let r = run_fanout(&exec, &hosts, &rcmd, &inv.concurrency).await;
+    let elapsed = start.elapsed();
+
+    // 각 host_result audit 기록 (redact·truncate·status 정합).
+    if let Some(a) = appender.as_mut() {
+        for result in &r.results {
+            let _ = a.host_result(
+                &result.host,
+                result.status.label(),
+                &cmd,
+                result.duration_ms,
+                result.exit_code,
+                result.truncated,
+                result.redacted,
+            );
+        }
+    }
+
+    // 진단 헤더: 카운트 + 실패 호스트명 inline (5개 초과면 +N more).
+    let c = r.counts();
+    let mut parts_buf: Vec<String> = Vec::new();
+    if c.ok > 0 { parts_buf.push(format!("{COL_GREEN}{} ok{COL_RESET}", c.ok)); }
+    if c.ok_warn > 0 { parts_buf.push(format!("{COL_YELLOW}{} ok_warn{COL_RESET}", c.ok_warn)); }
+    // 실패 카테고리는 호스트명 inline.
+    add_named(&mut parts_buf, "unreachable", c.unreachable, COL_YELLOW, &r.results, HostStatus::Unreachable);
+    add_named(&mut parts_buf, "timeout", c.timeout, COL_RED, &r.results, HostStatus::Timeout);
+    add_named(&mut parts_buf, "auth_fail", c.auth_fail, COL_RED, &r.results, HostStatus::AuthFail);
+    add_named(&mut parts_buf, "proxy_fail", c.proxy_fail, COL_RED, &r.results, HostStatus::ProxyFail);
+    add_named(&mut parts_buf, "remote_err", c.remote_err, COL_RED, &r.results, HostStatus::RemoteErr);
+    add_named(&mut parts_buf, "host_key_mismatch", c.host_key_mismatch, COL_RED, &r.results, HostStatus::HostKeyMismatch);
+    if c.cancelled > 0 { parts_buf.push(format!("{COL_RED}{} cancelled{COL_RESET}", c.cancelled)); }
+    println!("  {} · {:.1}s elapsed", parts_buf.join(" · "), elapsed.as_secs_f32());
+
+    // severity-sort: 가장 심각한 카드가 위로(host_key_mismatch > auth_fail > ... > ok).
+    let mut sorted: Vec<&aic_client::agent::remote::RemoteResult> = r.results.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.status
+            .severity()
+            .cmp(&a.status.severity())
+            .then_with(|| a.host.cmp(&b.host))
+    });
+
+    // 카드 stack: ok(no-anomaly)는 collapsed(헤더 1줄만), 그 외는 펼침.
+    let mut collapsed_ok: Vec<&str> = Vec::new();
+    let mut has_auth_fail_in_group = false;
+    for result in &sorted {
+        if matches!(result.status, HostStatus::Ok) {
+            collapsed_ok.push(result.host.as_str());
+            continue;
+        }
+        println!();
+        println!("─ {COL_BOLD}{}{COL_RESET}", result.host);
+        print_host_card(result, true);
+        if matches!(result.status, HostStatus::AuthFail) {
+            has_auth_fail_in_group = true;
+        }
+    }
+    if !collapsed_ok.is_empty() {
+        println!();
+        let suffix = if collapsed_ok.len() > 5 {
+            format!(" +{} more", collapsed_ok.len() - 5)
+        } else {
+            String::new()
+        };
+        let names: Vec<&str> = collapsed_ok.iter().take(5).copied().collect();
+        println!(
+            "─ {COL_GREEN}[ok, no anomaly] {} hosts{COL_RESET}: {}{suffix}  (collapsed)",
+            collapsed_ok.len(),
+            names.join(", ")
+        );
+    }
+
+    // auth_fail hint block: 그룹 중 하나라도 있으면 ssh-agent 점검 + 패턴별 hint 1회 표시.
+    if has_auth_fail_in_group {
+        let first_auth_stderr = sorted
+            .iter()
+            .find(|r| matches!(r.status, HostStatus::AuthFail))
+            .map(|r| r.stderr.as_str())
+            .unwrap_or_default();
+        println!();
+        print_auth_fail_hint(first_auth_stderr).await;
+    }
+
+    // 미완료 호스트(wall timeout 시).
+    if r.wall_timed_out {
+        if let Some(a) = appender.as_mut() {
+            let _ = a.batch_cancelled(r.results.len(), r.incomplete.clone());
+        }
+        println!();
+        println!(
+            "{COL_RED}⚠ wall_clock_timeout {}s 도달{COL_RESET} — 미완료 {} 호스트:",
+            inv.concurrency.wall_clock_timeout_secs,
+            r.incomplete.len()
+        );
+        for name in &r.incomplete {
+            println!("  · {name}  [cancelled]");
+        }
+        std::process::exit(2);
+    }
+
+    // batch_end audit (정상 완료).
+    if let Some(a) = appender.as_mut() {
+        let stats = aic_client::agent::audit_batch::BatchStats {
+            ok: c.ok,
+            ok_warn: c.ok_warn,
+            unreachable: c.unreachable,
+            timeout: c.timeout,
+            auth_fail: c.auth_fail,
+            proxy_fail: c.proxy_fail,
+            remote_err: c.remote_err,
+            host_key_mismatch: c.host_key_mismatch,
+            cancelled: c.cancelled,
+        };
+        let _ = a.batch_end(stats);
+    }
+
+    // exit code: 모든 호스트가 ok/ok_warn이면 0, 하나라도 실패면 1.
+    let all_ok = r.results.iter().all(|res| {
+        matches!(res.status, HostStatus::Ok | HostStatus::OkWithWarn)
+    });
+    std::process::exit(if all_ok { 0 } else { 1 });
+}
+
+/// 카드 헤더(상태 태그 + duration) + 선택적 본문(stdout/stderr).
+/// `verbose=false`이면 헤더만 출력(그룹의 collapsed ok에는 미사용 — 별도 경로).
+fn print_host_card(r: &aic_client::agent::remote::RemoteResult, verbose: bool) {
+    let color = match r.status.severity() {
+        0..=10 => COL_GREEN,
+        11..=40 => COL_YELLOW,
+        _ => COL_RED,
+    };
+    let truncated_tag = if r.truncated { "  [truncated]" } else { "" };
+    let redacted_tag = if r.redacted > 0 {
+        format!("  {COL_YELLOW}[redacted: {}]{COL_RESET}", r.redacted)
+    } else {
+        String::new()
+    };
+    println!(
+        "  {color}[{}]{COL_RESET}  {}  exit={}  {}ms{truncated_tag}{redacted_tag}",
+        r.status.label(),
+        r.host,
+        r.exit_code,
+        r.duration_ms,
+    );
+    if !verbose {
+        return;
+    }
+    if !r.stdout.is_empty() {
+        for line in r.stdout.trim_end().lines() {
+            println!("    {line}");
+        }
+    }
+    if !r.stderr.is_empty() {
+        for line in r.stderr.trim_end().lines() {
+            println!("    {COL_YELLOW}stderr:{COL_RESET} {line}");
+        }
+    }
+}
+
+/// 상태별 카운트를 헤더에 inline으로 추가하면서 실패 호스트명을 5개까지 노출(+N more).
+fn add_named(
+    parts: &mut Vec<String>,
+    label: &str,
+    count: usize,
+    color: &str,
+    results: &[aic_client::agent::remote::RemoteResult],
+    status: aic_client::agent::remote::HostStatus,
+) {
+    if count == 0 {
+        return;
+    }
+    let names: Vec<&str> = results
+        .iter()
+        .filter(|r| r.status == status)
+        .map(|r| r.host.as_str())
+        .take(5)
+        .collect();
+    let suffix = if count > names.len() {
+        format!(" +{} more", count - names.len())
+    } else {
+        String::new()
+    };
+    parts.push(format!(
+        "{color}{count} {label}({}){suffix}{COL_RESET}",
+        names.join(", ")
+    ));
+}
+
+/// `[auth_fail]` 호스트에 대한 hint block — 로컬 ssh-agent 자동 점검(`ssh-add -l`) +
+/// stderr 패턴별 단계적 해결 안내(RFC-005 §4.4 U3).
+async fn print_auth_fail_hint(stderr: &str) {
+    let agent = probe_local_ssh_agent().await;
+    println!(
+        "  {COL_BOLD}local ssh-agent{COL_RESET}  (auto-probed)"
+    );
+    match agent {
+        SshAgentStatus::NoSocket => println!("    SSH_AUTH_SOCK: {COL_YELLOW}unset{COL_RESET}  → ssh-agent를 시작하거나 `eval $(ssh-agent)`"),
+        SshAgentStatus::NoKeys(sock) => {
+            println!("    SSH_AUTH_SOCK: {sock}");
+            println!("    loaded keys:   {COL_YELLOW}0{COL_RESET}  ← 키 미등록");
+            println!("    → ssh-add ~/.ssh/id_ed25519 (또는 사용 중인 키) 실행");
+        }
+        SshAgentStatus::Loaded { sock, keys } => {
+            println!("    SSH_AUTH_SOCK: {sock}");
+            println!("    loaded keys:   {COL_GREEN}{keys}{COL_RESET}");
+            println!("    → hosts.toml에 identity_file 지정 또는 서버 authorized_keys 확인");
+        }
+        SshAgentStatus::ProbeFailed(reason) => {
+            println!("    {COL_YELLOW}probe 실패{COL_RESET}: {reason}");
+        }
+    }
+    println!();
+    println!("  {COL_BOLD}hint{COL_RESET}");
+    let lower = stderr.to_lowercase();
+    if lower.contains("publickey") {
+        println!("    1. ssh-add -l 로 등록 키 확인");
+        println!("    2. hosts.toml `[[hosts]] identity_file = \"~/.ssh/...\"`로 명시 지정");
+        println!("    3. 서버 authorized_keys에 공개키 등록 여부 확인");
+    } else if lower.contains("gssapi") || lower.contains("kerberos") {
+        println!("    · Kerberos TGT 만료 가능 — `klist`로 확인 후 `kinit`으로 갱신");
+    } else if lower.contains("keyboard-interactive") {
+        println!("    · MFA(keyboard-interactive) 호스트 — RFC-005 §1.2 멀티호스트 미지원");
+        println!("    · 단일 호스트로 직접 ssh 접속(BatchMode=no) 후 재시도");
+    } else if lower.contains("too many authentication failures") {
+        println!("    · ssh-add -D 로 모든 키 제거 후 필요한 키만 ssh-add -t 60");
+    } else {
+        println!("    · ssh-add -l 로 ssh-agent 상태 확인");
+        println!("    · ssh -v {{host}} -- echo ok 로 verbose 디버깅(BatchMode 외부)");
+    }
+    println!("    → 신규 호스트(known_hosts 미등록)는 `aic hosts trust <name>` 후 재시도");
+    println!("    → 수정 후 `aic hosts ping <target> --retry-failed`로 실패 호스트만 재시도(1.1)");
+}
+
+/// `aic whitelist status` — builtin + user 화이트리스트 program 목록 출력.
+fn handle_whitelist_status() {
+    use aic_client::agent::whitelist::{Whitelist, BUILTIN_PROGRAMS};
+    let wl = match Whitelist::load() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let user_count = wl.programs.len() - BUILTIN_PROGRAMS.len();
+    println!(
+        "{COL_BOLD}builtin{COL_RESET} ({}): {}",
+        BUILTIN_PROGRAMS.len(),
+        BUILTIN_PROGRAMS.join(", ")
+    );
+    if let Some(p) = &wl.user_path {
+        println!(
+            "{COL_BOLD}user{COL_RESET} ({}) [{}]:",
+            user_count.max(0),
+            p.display()
+        );
+        for (name, rules) in &wl.programs {
+            if BUILTIN_PROGRAMS.contains(&name.as_str()) {
+                continue;
+            }
+            let rules_count = rules.as_ref().map(|r| r.len()).unwrap_or(0);
+            let suffix = if rules_count > 0 {
+                format!("  ({rules_count} allowed_args rules)")
+            } else {
+                String::new()
+            };
+            println!("  · {name}{suffix}");
+        }
+    } else {
+        println!(
+            "{COL_BOLD}user{COL_RESET}: ~/.aic/whitelist.toml 없음 (선택 사항 — builtin만 사용 가능)"
+        );
+    }
+    println!(
+        "\n{COL_BOLD}total{COL_RESET}: {} programs",
+        wl.programs.len()
+    );
+}
+
+/// `aic whitelist check "<cmd>"` — 단일 명령 4단 게이트 검사.
+fn handle_whitelist_check(cmd: String) {
+    use aic_client::agent::whitelist::{CheckResult, Whitelist};
+    let wl = match Whitelist::load() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} whitelist 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let mut parts = cmd.split_whitespace();
+    let Some(program) = parts.next() else {
+        eprintln!("{COL_RED}✗{COL_RESET} cmd is empty");
+        std::process::exit(2);
+    };
+    let args: Vec<String> = parts.map(String::from).collect();
+    println!("program: {COL_BOLD}{program}{COL_RESET}");
+    println!("args:    {args:?}");
+    match wl.check(program, &args) {
+        CheckResult::Allowed => {
+            println!("result:  {COL_GREEN}ALLOW{COL_RESET}");
+            std::process::exit(0);
+        }
+        CheckResult::Blocked { reason } => {
+            println!("result:  {COL_RED}BLOCK{COL_RESET}");
+            println!("reason:  {reason}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `aic hosts trust <name>` — RFC-005 §4.1 TOFU step 2~4 (scan + confirm + append).
+///
+/// 1. inventory에서 호스트 해석(hostname/port 추출)
+/// 2. `ssh-keyscan -T {n} -p {port} {hostname}` 호출
+/// 3. SHA256 fingerprint를 사용자에게 노출 + stdin prompt(또는 `--yes`)
+/// 4. 승인 시 `~/.ssh/known_hosts`에 append
+///
+/// 보안 주의: ssh-keyscan 자체가 MITM 노출 위험 — 사용자에게 fingerprint를 외부 채널로
+/// 검증할 것을 안내한다. `--yes`는 비대화 환경(CI) 용이지만 신뢰 가능한 네트워크에서만.
+async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
+    use aic_client::agent::hosts::Inventory;
+    use aic_client::agent::remote::tofu;
+
+    let inv = match Inventory::load() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} 인벤토리 로드 실패: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let Some(host) = inv.host(&name) else {
+        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+        std::process::exit(1);
+    };
+
+    println!(
+        "{COL_BOLD}{}{COL_RESET}  →  {}:{}  (ssh-keyscan -T {timeout_secs}s)",
+        host.name, host.hostname, host.port
+    );
+    let scan = match tofu::scan_host(&host.hostname, host.port, timeout_secs).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} ssh-keyscan 실패: {e:#}");
+            eprintln!("    네트워크/DNS 점검 또는 ssh-keyscan 설치 확인.");
+            std::process::exit(1);
+        }
+    };
+
+    println!("\n{COL_BOLD}수집한 host key{COL_RESET} ({} 종)", scan.host_keys.len());
+    for key in &scan.host_keys {
+        let fp = match tofu::fingerprint_sha256(&key.known_hosts_line).await {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("    {COL_YELLOW}fingerprint 계산 실패:{COL_RESET} {e}");
+                continue;
+            }
+        };
+        println!("    {COL_BOLD}{}{COL_RESET}  {COL_GREEN}{fp}{COL_RESET}", key.key_type);
+    }
+    println!(
+        "\n{COL_YELLOW}⚠ 보안:{COL_RESET} ssh-keyscan은 MITM 공격에 노출될 수 있다. fingerprint를"
+    );
+    println!("  외부 채널(서버 관리자 / 사내 wiki / 다른 호스트의 known_hosts)로 검증한 뒤 승인.");
+
+    let accept = if yes {
+        eprintln!("\n{COL_YELLOW}--yes 자동 승인 (보안 주의){COL_RESET}");
+        true
+    } else {
+        use std::io::Write;
+        eprint!("\nAccept and append to ~/.ssh/known_hosts? [y/N]: ");
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            eprintln!("{COL_RED}✗{COL_RESET} stdin read failed (non-TTY?). use --yes for CI.");
+            std::process::exit(1);
+        }
+        let trimmed = input.trim().to_lowercase();
+        trimmed == "y" || trimmed == "yes"
+    };
+
+    if !accept {
+        eprintln!("{COL_YELLOW}✗ rejected — known_hosts not modified{COL_RESET}");
+        std::process::exit(1);
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("{COL_RED}✗{COL_RESET} $HOME not set");
+        std::process::exit(2);
+    };
+    let known_hosts = home.join(".ssh").join("known_hosts");
+    if let Err(e) = tofu::append_known_hosts(&known_hosts, &scan.host_keys) {
+        eprintln!("{COL_RED}✗{COL_RESET} known_hosts append 실패: {e:#}");
+        std::process::exit(2);
+    }
+    println!(
+        "{COL_GREEN}✔{COL_RESET} added {} host key(s) to {}",
+        scan.host_keys.len(),
+        known_hosts.display()
+    );
+    println!("  이제 `aic hosts ping {}` 재시도 가능.", host.name);
+}
+
+enum SshAgentStatus {
+    NoSocket,
+    NoKeys(String),
+    Loaded { sock: String, keys: usize },
+    ProbeFailed(String),
+}
+
+async fn probe_local_ssh_agent() -> SshAgentStatus {
+    let Ok(sock) = std::env::var("SSH_AUTH_SOCK") else {
+        return SshAgentStatus::NoSocket;
+    };
+    match tokio::process::Command::new("ssh-add")
+        .arg("-l")
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = if stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                stdout.to_string()
+            };
+            if combined.contains("no identities") || combined.contains("agent has no") {
+                SshAgentStatus::NoKeys(sock)
+            } else {
+                let keys = combined
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                SshAgentStatus::Loaded { sock, keys }
+            }
+        }
+        Err(e) => SshAgentStatus::ProbeFailed(format!("ssh-add not available: {e}")),
     }
 }
 

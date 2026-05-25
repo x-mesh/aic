@@ -9,6 +9,21 @@
   `io` 앞에 `disk {N}G free`(root fs 여유 용량 — SRE의 "얼마 남았나" 핵심 지표). macOS APFS
   컨테이너 공유로 `total-avail` 기반 사용률 %가 부정확한 점을 피하기 위해 `available_space()`만
   쓴다(플랫폼 무관 신뢰).
+- **SSH 멀티호스트 진단(RFC-005)** — `aic hosts {show,ping,trust}` + `aic whitelist {status,check}` +
+  `aic audit batch-verify` 신규 (`feat/ssh-multihost` 11 커밋, ~2,900 LOC, 70 tests).
+  - `~/.aic/hosts.toml`(+ `~/.ssh/config` 자동 import + overlay) 기반 `aic hosts ping @group`이
+    cap 8 + 3-layer timeout(connect 10s / cmd 30s / wall 300s)으로 병렬 진단, 8종 상태 태그 +
+    severity-sort + `[ok] collapsed` + 헤더 inline 실패명 + `[auth_fail]` hint(ssh-agent 자동 점검)를
+    카드 stack으로 표시. 결과는 `~/.aic/audit/YYYY-MM-DD.jsonl`에 SHA256 chain으로 자동 기록.
+  - `aic hosts trust <name>` — TOFU 4-step(ssh-keyscan + SHA256 fingerprint + stdin confirm +
+    known_hosts append)을 명시 단계로 실행. BatchMode↔TOFU 양립 해소.
+  - `aic whitelist` — builtin 8개(`ps/df/free/uptime/cat/journalctl/ls/find`) + `~/.aic/whitelist.toml`
+    user 확장 + 4단 게이트(shell metachar / program / `path_guard`(procfs allowlist 반전 + secret
+    파일명 차단) / allowed_args 규칙). `hosts ping --cmd`도 동일 게이트 통과해야 실행.
+  - `aic audit batch-verify [--date YYYY-MM-DD]` — 멀티호스트 batch audit segment SHA256 chain
+    무결성 검증. 변조 감지 시 broken_at line 보고.
+  - red-team Critical **12/12 반영 완료**(S1·S2·S3·R1·R2·R3·U1·U2·U3·O1·O2·O3).
+  - 자세한 Implementation Status는 `docs/RFC-005-SSH-MULTIHOST.md §10`.
 
 ## [0.10.0] - 2026-05-25
 

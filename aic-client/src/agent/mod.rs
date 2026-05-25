@@ -16,6 +16,14 @@ pub(crate) mod chat_tui;
 pub(crate) mod debug;
 pub(crate) mod diagnose;
 pub mod gitignore;
+// RFC-005 Phase 1: SSH 멀티호스트 인벤토리(hosts.toml + ssh_config import + overlay).
+pub mod hosts;
+// RFC-005 Phase 2: RemoteExecutor trait + 외부 ssh 프로세스 구현. fan-out은 Phase 3.
+pub mod remote;
+// RFC-005 Phase 5 후반: 멀티호스트 batch audit + daily segment + SHA256 chain (O2).
+pub mod audit_batch;
+// RFC-005 Phase 6: 사용자 확장 가능한 tokenizer 화이트리스트(builtin + ~/.aic/whitelist.toml) (O3).
+pub mod whitelist;
 pub(crate) mod markdown;
 pub(crate) mod probes;
 pub mod run_command;
