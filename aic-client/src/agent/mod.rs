@@ -22,6 +22,8 @@ pub mod hosts;
 pub mod remote;
 // RFC-005 Phase 5 후반: 멀티호스트 batch audit + daily segment + SHA256 chain (O2).
 pub mod audit_batch;
+// RFC-005 Phase 6: 사용자 확장 가능한 tokenizer 화이트리스트(builtin + ~/.aic/whitelist.toml) (O3).
+pub mod whitelist;
 pub(crate) mod markdown;
 pub(crate) mod probes;
 pub mod run_command;
