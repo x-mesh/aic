@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-05-28
+
 ### Added
 - **`aic hosts ping/trust` ad-hoc 호스트 + `-i` identity_file 옵션** — 인벤토리
   (`~/.aic/hosts.toml`)나 `~/.ssh/config`에 등록되지 않은 호스트도 `aic hosts ping
