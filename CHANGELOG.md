@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Added
+- **`aic hosts ping/trust` ad-hoc 호스트 + `-i` identity_file 옵션** — 인벤토리
+  (`~/.aic/hosts.toml`)나 `~/.ssh/config`에 등록되지 않은 호스트도 `aic hosts ping
+  root@jw-server[:port]`처럼 즉석 지정 가능. `-i, --identity-file <PATH>`로 SSH 키 파일을
+  명시 지정(또는 인벤토리 등록 호스트의 키를 일회성 override). 신규 ad-hoc 호스트는
+  `aic hosts trust root@jw-server`로 동일하게 TOFU 등록. 화이트리스트 게이트는 그대로
+  적용된다. RFC-005 §4.1 ad-hoc(`HostSource::AdHoc`) 1.1 후속 항목 선반영.
+
 ## [0.11.0] - 2026-05-26
 
 ### Added
