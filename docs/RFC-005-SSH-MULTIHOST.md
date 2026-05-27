@@ -717,9 +717,10 @@ PARTIAL 잔존은 §7 Risks에 모두 등록. 자세한 fix/RESIDUAL은 red-team
 |------|------|
 | `aic hosts show` | 인벤토리 전체 표시 — 그룹·호스트·source·`ssh_config_warnings` |
 | `aic hosts show <name> [--json]` | 단일 호스트 최종 해석값 (overlay 결과 + 어느 directive를 ssh에 위임했는지) |
-| `aic hosts ping <name> [--cmd "..."]` | 단일 호스트 ssh ping — 8종 상태 태그 + stdout/stderr + duration + redacted 카운트 |
-| `aic hosts ping @group [--cmd "..."]` | 그룹 fan-out — cap 8 + 3-layer timeout + severity-sort 카드 stack + 헤더 inline 실패명 + ok collapsed + `[auth_fail]` hint + ssh-agent 자동 점검 + audit batch 자동 기록 |
-| `aic hosts trust <name> [--yes]` | TOFU step 2~4 — `ssh-keyscan` → SHA256 fingerprint 노출 → stdin confirm → `~/.ssh/known_hosts` append |
+| `aic hosts ping <name> [--cmd "..."] [-i PATH]` | 단일 호스트 ssh ping — 8종 상태 태그 + stdout/stderr + duration + redacted 카운트. `-i`로 identity_file 일회성 override |
+| `aic hosts ping user@host[:port] [--cmd "..."] [-i PATH]` | ad-hoc(`HostSource::AdHoc`) — 인벤토리 미등록 호스트 즉석 점검. `~/.aic/hosts.toml`/`~/.ssh/config` 변경 없이 일회용 |
+| `aic hosts ping @group [--cmd "..."] [-i PATH]` | 그룹 fan-out — cap 8 + 3-layer timeout + severity-sort 카드 stack + 헤더 inline 실패명 + ok collapsed + `[auth_fail]` hint + ssh-agent 자동 점검 + audit batch 자동 기록. `-i`는 그룹 전체에 일괄 override |
+| `aic hosts trust <name>\|user@host[:port] [--yes]` | TOFU step 2~4 — `ssh-keyscan` → SHA256 fingerprint 노출 → stdin confirm → `~/.ssh/known_hosts` append. ad-hoc 문자열도 허용 |
 | `aic whitelist status` | builtin 8 + user(`~/.aic/whitelist.toml`) 화이트리스트 목록 |
 | `aic whitelist check "<cmd>"` | 단일 명령 4단 게이트 검사 — ALLOW/BLOCK + 이유 |
 | `aic audit batch-verify [--date YYYY-MM-DD]` | 멀티호스트 batch audit segment SHA256 chain 무결성 검증 |

@@ -13,6 +13,7 @@ use aic_common::{
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
@@ -610,20 +611,30 @@ enum HostsOp {
     /// 단일 호스트 또는 그룹(`@group`)에 ssh로 read-only 명령을 실행한다.
     /// Phase 2: 단일 호스트. Phase 3: `@group` fan-out (cap + 3-layer timeout + 카드 stack).
     /// BatchMode=yes + ForwardAgent=no + ControlMaster=auto.
+    ///
+    /// target이 `user@host[:port]` 형식이면 인벤토리 미등록이어도 즉석 임시 호스트로 처리한다
+    /// (RFC-005 §4.1 ad-hoc). `-i <path>`로 identity_file을 override할 수 있다.
     Ping {
-        /// 호스트 이름 또는 `@group` 패턴. hosts.toml `name`/`groups.X` 또는 ssh_config Host.
+        /// 호스트 이름, `@group` 패턴, 또는 `user@host[:port]` 임시 호스트.
+        /// hosts.toml `name`/`groups.X`, ssh_config Host, 또는 ad-hoc 문자열.
         target: String,
         /// 실행할 read-only 명령(공백 분리 인자). 기본 `uptime`.
         #[arg(long, default_value = "uptime")]
         cmd: String,
+        /// ssh `-i` identity_file 경로 (override). ad-hoc 호스트에 특히 유용하며,
+        /// 인벤토리 등록 호스트에도 일회성 키 지정이 가능하다.
+        #[arg(short = 'i', long = "identity-file", value_name = "PATH")]
+        identity_file: Option<PathBuf>,
     },
     /// 신규 호스트의 host key를 ssh-keyscan으로 수집해 SHA256 fingerprint를 노출하고,
     /// 승인 시 `~/.ssh/known_hosts`에 append한다 (RFC-005 §4.1 TOFU 4-step의 step 2~4).
     /// BatchMode=yes로 인해 ssh 자체 prompt가 차단되어 신규 호스트는 `[auth_fail]`로
     /// 떨어지는데, 이 명령으로 명시 trust 후 `aic hosts ping`을 재시도한다. chat TUI의
     /// 자동 confirm flow는 후속(1.1).
+    ///
+    /// name이 `user@host[:port]` 형식이면 인벤토리 등록 없이 즉석 trust 가능.
     Trust {
-        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host).
+        /// 호스트 이름(hosts.toml `name` 또는 ssh_config Host), 또는 `user@host[:port]` 임시.
         name: String,
         /// ssh-keyscan timeout 초. 기본 5.
         #[arg(long, default_value = "5")]
@@ -698,7 +709,11 @@ async fn main() {
         }) => handle_status(watch, interval, session, json, all).await,
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
-            HostsOp::Ping { target, cmd } => handle_hosts_ping(target, cmd).await,
+            HostsOp::Ping {
+                target,
+                cmd,
+                identity_file,
+            } => handle_hosts_ping(target, cmd, identity_file).await,
             HostsOp::Trust {
                 name,
                 timeout_secs,
@@ -2086,6 +2101,7 @@ fn print_hosts_summary(inv: &aic_client::agent::hosts::Inventory) {
                 HostSource::HostsToml => "hosts.toml",
                 HostSource::SshConfig => "ssh_config",
                 HostSource::Overlay => "ssh_config + hosts.toml",
+                HostSource::AdHoc => "ad-hoc",
             };
             let target = format!("{}@{}:{}", e.user, e.hostname, e.port);
             println!(
@@ -2124,6 +2140,7 @@ fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
         HostSource::HostsToml => "hosts.toml",
         HostSource::SshConfig => "ssh_config",
         HostSource::Overlay => "ssh_config + hosts.toml overlay",
+        HostSource::AdHoc => "ad-hoc (user@host[:port])",
     };
     let hkc = match e.host_key_check {
         HostKeyCheck::Strict => "strict",
@@ -2173,8 +2190,8 @@ fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
 ///
 /// exit code: 단일 — ok/ok_warn=0, 그 외=1. 그룹 — 모든 호스트 ok/ok_warn이면 0, 하나라도
 /// 실패/timeout이면 1, wall timeout이면 2.
-async fn handle_hosts_ping(target: String, cmd: String) {
-    use aic_client::agent::hosts::Inventory;
+async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<PathBuf>) {
+    use aic_client::agent::hosts::{parse_ad_hoc, Inventory};
     use aic_client::agent::remote::{
         run_fanout, HostStatus, RemoteCommand, RemoteExecutor, SshProcessExecutor,
     };
@@ -2187,13 +2204,35 @@ async fn handle_hosts_ping(target: String, cmd: String) {
         }
     };
 
-    let hosts: Vec<aic_client::agent::hosts::HostEntry> = match inv.resolve_pattern(&target) {
-        Ok(refs) => refs.into_iter().cloned().collect(),
-        Err(e) => {
-            eprintln!("{COL_RED}✗{COL_RESET} {e}");
-            std::process::exit(1);
+    // target 해석 우선순위: `@group`/등록명 → resolve_pattern.
+    // 그 외에 `user@host[:port]` 패턴이면 ad-hoc 임시 호스트(인벤토리 미저장).
+    let mut hosts: Vec<aic_client::agent::hosts::HostEntry> = if target.starts_with('@')
+        || inv.host(&target).is_some()
+    {
+        match inv.resolve_pattern(&target) {
+            Ok(refs) => refs.into_iter().cloned().collect(),
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} {e}");
+                std::process::exit(1);
+            }
         }
+    } else if let Some(ad_hoc) = parse_ad_hoc(&target) {
+        vec![ad_hoc]
+    } else {
+        eprintln!(
+            "{COL_RED}✗{COL_RESET} host not found: {target}\n\
+             → 인벤토리 등록명, `@group`, 또는 `user@host[:port]` 형식만 허용.\n\
+             → `aic hosts show`로 인벤토리 확인."
+        );
+        std::process::exit(1);
     };
+
+    // -i 옵션이 주어지면 모든 대상 호스트의 identity_file을 일회성으로 override.
+    if let Some(idf) = identity_file.as_ref() {
+        for h in hosts.iter_mut() {
+            h.identity_file = Some(idf.clone());
+        }
+    }
 
     let mut parts = cmd.split_whitespace();
     let Some(program) = parts.next() else {
@@ -2597,7 +2636,7 @@ fn handle_whitelist_check(cmd: String) {
 /// 보안 주의: ssh-keyscan 자체가 MITM 노출 위험 — 사용자에게 fingerprint를 외부 채널로
 /// 검증할 것을 안내한다. `--yes`는 비대화 환경(CI) 용이지만 신뢰 가능한 네트워크에서만.
 async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
-    use aic_client::agent::hosts::Inventory;
+    use aic_client::agent::hosts::{parse_ad_hoc, Inventory};
     use aic_client::agent::remote::tofu;
 
     let inv = match Inventory::load() {
@@ -2607,8 +2646,18 @@ async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
             std::process::exit(2);
         }
     };
-    let Some(host) = inv.host(&name) else {
-        eprintln!("{COL_RED}✗{COL_RESET} host not found: {name}");
+    // 등록명 우선 조회, 미존재 시 `user@host[:port]` ad-hoc 파싱.
+    let host_owned;
+    let host = if let Some(h) = inv.host(&name) {
+        h
+    } else if let Some(ad_hoc) = parse_ad_hoc(&name) {
+        host_owned = ad_hoc;
+        &host_owned
+    } else {
+        eprintln!(
+            "{COL_RED}✗{COL_RESET} host not found: {name}\n\
+             → 인벤토리 등록명 또는 `user@host[:port]` 형식만 허용."
+        );
         std::process::exit(1);
     };
 

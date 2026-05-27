@@ -51,6 +51,8 @@ pub enum HostSource {
     SshConfig,
     /// ssh_config에서 흡수된 뒤 hosts.toml로 일부 필드 overlay된 호스트.
     Overlay,
+    /// `--host user@host[:port]`로 즉석 지정된 임시 호스트(인벤토리 미저장).
+    AdHoc,
 }
 
 /// `@web-tier` 그룹 정의.
@@ -239,6 +241,57 @@ impl Inventory {
     pub fn host(&self, name: &str) -> Option<&HostEntry> {
         self.hosts.get(name)
     }
+}
+
+/// `user@host[:port]` 임시 호스트 문자열을 즉석 `HostEntry`로 파싱한다.
+///
+/// 인벤토리(`~/.aic/hosts.toml`)나 `~/.ssh/config`에 등록되지 않은 호스트를
+/// `aic hosts ping`/`trust`에서 일회용으로 지정할 때 사용한다. `--host root@jw-server`,
+/// `--host deploy@10.0.0.5:2222` 등.
+///
+/// 형식이 맞지 않거나 `@`가 없으면 `None`. IPv6 리터럴(`root@[::1]:22`)은 현재 미지원
+/// — 그쪽은 `~/.ssh/config` Host 블록 또는 `hosts.toml`에 등록해서 쓰자.
+pub fn parse_ad_hoc(s: &str) -> Option<HostEntry> {
+    // `@group` prefix는 그룹 패턴이지 ad-hoc이 아님.
+    if s.starts_with('@') {
+        return None;
+    }
+    // `user@host[:port]` — `@`는 정확히 1개여야 한다.
+    let (user, rest) = s.split_once('@')?;
+    if user.is_empty() || rest.is_empty() {
+        return None;
+    }
+    if rest.contains('@') {
+        return None;
+    }
+    // IPv6 리터럴 차단(첫 라운드 미지원).
+    if rest.starts_with('[') {
+        return None;
+    }
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => {
+            let parsed: u16 = p.parse().ok()?;
+            (h, parsed)
+        }
+        None => (rest, 22),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let name = format!("{user}@{host}:{port}");
+    Some(HostEntry {
+        name,
+        hostname: host.to_string(),
+        user: user.to_string(),
+        port,
+        identity_file: None,
+        forward_agent: false,
+        proxy_jump: None,
+        host_key_check: HostKeyCheck::Strict,
+        connect_timeout_secs: 10,
+        tags: Vec::new(),
+        source: HostSource::AdHoc,
+    })
 }
 
 // ── 헬퍼 ────────────────────────────────────────────────────────────
@@ -756,5 +809,45 @@ host_key_check = "strict"
             inv.host("web-02").unwrap().host_key_check,
             HostKeyCheck::Strict
         ));
+    }
+
+    #[test]
+    fn parse_ad_hoc_basic() {
+        let e = parse_ad_hoc("root@jw-server").unwrap();
+        assert_eq!(e.user, "root");
+        assert_eq!(e.hostname, "jw-server");
+        assert_eq!(e.port, 22);
+        assert_eq!(e.name, "root@jw-server:22");
+        assert!(matches!(e.source, HostSource::AdHoc));
+        assert!(matches!(e.host_key_check, HostKeyCheck::Strict));
+        assert!(e.identity_file.is_none());
+    }
+
+    #[test]
+    fn parse_ad_hoc_with_port() {
+        let e = parse_ad_hoc("deploy@10.0.0.5:2222").unwrap();
+        assert_eq!(e.user, "deploy");
+        assert_eq!(e.hostname, "10.0.0.5");
+        assert_eq!(e.port, 2222);
+    }
+
+    #[test]
+    fn parse_ad_hoc_rejects_invalid() {
+        // user 없음
+        assert!(parse_ad_hoc("jw-server").is_none());
+        // @group
+        assert!(parse_ad_hoc("@web-tier").is_none());
+        // 빈 user
+        assert!(parse_ad_hoc("@host").is_none());
+        // 빈 host
+        assert!(parse_ad_hoc("root@").is_none());
+        // 잘못된 port
+        assert!(parse_ad_hoc("root@host:abc").is_none());
+        // port 범위 초과
+        assert!(parse_ad_hoc("root@host:99999").is_none());
+        // @ 2개 (잘못된 형식)
+        assert!(parse_ad_hoc("a@b@c").is_none());
+        // IPv6 리터럴(현재 미지원)
+        assert!(parse_ad_hoc("root@[::1]:22").is_none());
     }
 }
