@@ -29,6 +29,7 @@ Thumbs.db
 !.xm/op/
 !.xm/op/**
 .omc/
+.omo/
 .claude/settings.local.json
 # AI-suggested
 coverage/
