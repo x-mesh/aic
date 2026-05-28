@@ -252,37 +252,57 @@ impl Inventory {
 /// 형식이 맞지 않거나 `@`가 없으면 `None`. IPv6 리터럴(`root@[::1]:22`)은 현재 미지원
 /// — 그쪽은 `~/.ssh/config` Host 블록 또는 `hosts.toml`에 등록해서 쓰자.
 pub fn parse_ad_hoc(s: &str) -> Option<HostEntry> {
-    // `@group` prefix는 그룹 패턴이지 ad-hoc이 아님.
     if s.starts_with('@') {
         return None;
     }
-    // `user@host[:port]` — `@`는 정확히 1개여야 한다.
-    let (user, rest) = s.split_once('@')?;
-    if user.is_empty() || rest.is_empty() {
-        return None;
-    }
-    if rest.contains('@') {
-        return None;
-    }
-    // IPv6 리터럴 차단(첫 라운드 미지원).
-    if rest.starts_with('[') {
-        return None;
-    }
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((h, p)) => {
-            let parsed: u16 = p.parse().ok()?;
-            (h, parsed)
+    if s.contains('@') {
+        let (user, rest) = s.split_once('@')?;
+        if user.is_empty() || rest.is_empty() || rest.contains('@') || rest.starts_with('[') {
+            return None;
         }
-        None => (rest, 22),
+        let (host, port) = match rest.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().ok()?),
+            None => (rest, 22),
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let name = format!("{user}@{host}:{port}");
+        return Some(HostEntry {
+            name,
+            hostname: host.to_string(),
+            user: user.to_string(),
+            port,
+            identity_file: None,
+            forward_agent: false,
+            proxy_jump: None,
+            host_key_check: HostKeyCheck::Strict,
+            connect_timeout_secs: 10,
+            tags: Vec::new(),
+            source: HostSource::AdHoc,
+        });
+    }
+    // hostname-only → $USER@host:22
+    let s = s.trim();
+    if s.is_empty() || s.contains(' ') || s.contains('/') {
+        return None;
+    }
+    let (host, port) = match s.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(parsed) => (h, parsed),
+            Err(_) => (s, 22),
+        },
+        None => (s, 22),
     };
     if host.is_empty() {
         return None;
     }
+    let user = whoami();
     let name = format!("{user}@{host}:{port}");
     Some(HostEntry {
         name,
         hostname: host.to_string(),
-        user: user.to_string(),
+        user,
         port,
         identity_file: None,
         forward_agent: false,
