@@ -266,6 +266,14 @@ enum Commands {
         #[arg(long, conflicts_with = "json")]
         interactive: bool,
     },
+    /// `aic ssh <host> [cmd]` — 간결한 SSH 실행. hostname만으로도 $USER@host:22 자동 해석.
+    Ssh {
+        target: String,
+        #[arg(default_value = "uptime")]
+        cmd: String,
+        #[arg(short = 'i', long = "identity-file", value_name = "PATH")]
+        identity_file: Option<PathBuf>,
+    },
     /// SSH 멀티호스트 인벤토리 조회 (RFC-005 Phase 1) — `~/.aic/hosts.toml`과
     /// `~/.ssh/config` import + overlay 결과를 표시. 실제 SSH 호출은 Phase 2 이후.
     Hosts {
@@ -707,6 +715,7 @@ async fn main() {
             json,
             all,
         }) => handle_status(watch, interval, session, json, all).await,
+        Some(Commands::Ssh { target, cmd, identity_file }) => handle_hosts_ping(target, cmd, identity_file).await,
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
             HostsOp::Ping {
@@ -2281,10 +2290,18 @@ async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<Pa
             "{COL_BOLD}{}{COL_RESET}  →  {}@{}:{}  cmd={cmd:?}",
             host.name, host.user, host.hostname, host.port
         );
-        let r = exec.exec(host, &rcmd).await;
+        let mut r = exec.exec(host, &rcmd).await;
         print_host_card(&r, true);
         if matches!(r.status, HostStatus::AuthFail) {
-            print_auth_fail_hint(&r.stderr).await;
+            if try_auto_trust(host, &r.stderr).await {
+                // trust 성공 — 1회 retry.
+                println!("\n{COL_BOLD}↻ retry{COL_RESET}");
+                r = exec.exec(host, &rcmd).await;
+                print_host_card(&r, true);
+            }
+            if matches!(r.status, HostStatus::AuthFail) {
+                print_auth_fail_hint(&r.stderr).await;
+            }
         }
         let code = match r.status {
             HostStatus::Ok | HostStatus::OkWithWarn => 0,
@@ -2503,6 +2520,58 @@ fn add_named(
         "{color}{count} {label}({}){suffix}{COL_RESET}",
         names.join(", ")
     ));
+}
+
+/// TOFU auto-trust: stderr에 "Host key verification failed" 감지 시
+/// TTY confirm → ssh-keyscan → known_hosts append. 성공하면 true(retry 필요).
+async fn try_auto_trust(host: &aic_client::agent::hosts::HostEntry, stderr: &str) -> bool {
+    use aic_client::agent::remote::tofu;
+    use std::io::{IsTerminal, Write};
+
+    if !stderr.to_lowercase().contains("host key verification failed") {
+        return false;
+    }
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+
+    eprint!(
+        "\n  {COL_YELLOW}⚠ known_hosts 미등록{COL_RESET} — auto-trust {}? [y/N]: ",
+        host.hostname
+    );
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let trimmed = input.trim().to_lowercase();
+    if trimmed != "y" && trimmed != "yes" {
+        return false;
+    }
+
+    let scan = match tofu::scan_host(&host.hostname, host.port, 5).await {
+        Ok(s) if !s.host_keys.is_empty() => s,
+        Ok(_) => {
+            eprintln!("  {COL_RED}✗{COL_RESET} ssh-keyscan 결과 없음");
+            return false;
+        }
+        Err(e) => {
+            eprintln!("  {COL_RED}✗{COL_RESET} ssh-keyscan 실패: {e:#}");
+            return false;
+        }
+    };
+
+    let Some(home) = dirs::home_dir() else { return false };
+    let known_hosts = home.join(".ssh").join("known_hosts");
+    if let Err(e) = tofu::append_known_hosts(&known_hosts, &scan.host_keys) {
+        eprintln!("  {COL_RED}✗{COL_RESET} known_hosts append 실패: {e:#}");
+        return false;
+    }
+    println!(
+        "  {COL_GREEN}✔{COL_RESET} {} host key(s) added",
+        scan.host_keys.len()
+    );
+    true
 }
 
 /// `[auth_fail]` 호스트에 대한 hint block — 로컬 ssh-agent 자동 점검(`ssh-add -l`) +
