@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-29
+
+### Added
+- **`aic ssh <host> [cmd]` 서브커맨드** — 인벤토리/`~/.ssh/config` 등록 호스트는 물론
+  ad-hoc 지정(`aic ssh root@jw-server` 또는 hostname만)도 받아 ping/명령 실행.
+  `-i, --identity-file <PATH>`로 SSH 키 파일 지정. 내부적으로 `hosts ping` 경로를
+  재사용하므로 화이트리스트 게이트가 동일하게 적용된다.
+- **hostname-only ad-hoc 해석** — `user@host[:port]` 외에 단순 `host`(예: `jw-server`)도
+  `$USER@host:22` ad-hoc 호스트로 자동 해석. `aic ssh`/`hosts ping`에서 즉석 호스트
+  지정이 한층 간결해진다.
+
+### Changed
+- **TOFU auto-trust 1회 재시도** — SSH 인증 실패 stderr에 `host key verification failed`
+  패턴이 보이면 TTY 환경에서 confirm을 받아 `ssh-keyscan` + `known_hosts` append 후
+  1회 자동 retry. non-TTY(CI 등)에서는 자동 차단되어 가드레일을 유지한다.
+
+### Fixed
+- **chat TUI 한글 IME 하드웨어 커서 위치 보정** + alternate screen 진입 시 터미널 clear로
+  잔상 제거.
+
 ## [0.11.1] - 2026-05-28
 
 ### Added
