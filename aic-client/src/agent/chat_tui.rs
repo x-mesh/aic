@@ -627,6 +627,10 @@ async fn chat_loop(
             return;
         }
     };
+    // alternate screen은 진입 직후 셀이 미정의(터미널마다 검정/잔상)다. 물리적으로 `clear`해 화면 전체를
+    // 터미널 기본 배경으로 칠한다. 안 하면 draw가 안 그리는 빈 상단 영역만 검정으로 남아, 로그·입력 줄이
+    // 그려지는 영역(기본 배경)과 배경색이 달라 보인다(사용자 보고: "배경색이 다름").
+    let _ = terminal.clear();
     let mut textarea = TextArea::default();
     let mut events = EventStream::new();
     let mut sampler = with_statusbar.then(SysSampler::new);
