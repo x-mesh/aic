@@ -401,6 +401,25 @@ fn log_scroll_max(log_text: &Text, width: u16, height: u16) -> u16 {
     total.saturating_sub(height)
 }
 
+/// textarea 입력 위치로 **하드웨어 커서**를 옮긴다. ratatui는 `set_cursor_position`을 부르지 않으면
+/// 커서를 마지막 렌더 셀(여기선 status bar 끝)에 둔 채 두고, tui-textarea는 커서를 셀 스타일로만
+/// 표시한다 → 한글 IME 조합 글자(preedit)가 터미널의 하드웨어 커서 위치(status bar 끝)에 새는 버그가
+/// 생긴다. cursor(row,col)를 display width로 화면 좌표 변환해 하드웨어 커서를 입력 줄에 정렬한다.
+fn place_textarea_cursor(f: &mut Frame, textarea: &TextArea, area: Rect) {
+    let (row, col) = textarea.cursor();
+    let line = textarea.lines().get(row).map(String::as_str).unwrap_or("");
+    let before: String = line.chars().take(col).collect();
+    let x = area
+        .x
+        .saturating_add(UnicodeWidthStr::width(before.as_str()) as u16)
+        .min(area.x + area.width.saturating_sub(1));
+    let y = area
+        .y
+        .saturating_add(row as u16)
+        .min(area.y + area.height.saturating_sub(1));
+    f.set_cursor_position((x, y));
+}
+
 /// 전면 TUI 한 프레임(순수 함수, TestBackend로 검증). 위→아래:
 /// 대화 로그(스크롤) · slash popup(세로, 입력 위 조건부) · 입력/thinking · 구분선 · status.
 /// 로그는 `Paragraph.wrap.scroll`로 그려 wrap/offset이 자동 정합(critic B1). popup 높이는
@@ -504,6 +523,7 @@ fn draw_full(
                 .split(rows[2]);
             f.render_widget(Paragraph::new(prompt.to_string()), cols[0]);
             f.render_widget(textarea, cols[1]);
+            place_textarea_cursor(f, textarea, cols[1]);
         }
     }
 
