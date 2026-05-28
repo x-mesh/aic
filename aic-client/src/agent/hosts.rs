@@ -852,9 +852,17 @@ host_key_check = "strict"
     }
 
     #[test]
+    fn parse_ad_hoc_hostname_only() {
+        // hostname-only → $USER@host:22 (RFC-005 ad-hoc 후속)
+        let e = parse_ad_hoc("jw-server").unwrap();
+        assert_eq!(e.hostname, "jw-server");
+        assert_eq!(e.user, whoami());
+        assert_eq!(e.port, 22);
+        assert!(matches!(e.source, HostSource::AdHoc));
+    }
+
+    #[test]
     fn parse_ad_hoc_rejects_invalid() {
-        // user 없음
-        assert!(parse_ad_hoc("jw-server").is_none());
         // @group
         assert!(parse_ad_hoc("@web-tier").is_none());
         // 빈 user
