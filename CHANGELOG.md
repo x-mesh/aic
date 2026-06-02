@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-03
+
+### Added
+- **`aic config`에 Custom (OpenAI 호환 endpoint) 등록** — LLM Provider 설정 메뉴에서
+  ai-mesh·vLLM·LiteLLM·LM Studio 등 임의의 OpenAI Chat Completions 호환 endpoint를
+  대화형으로 추가할 수 있다. provider 이름·endpoint URL·API Key·모델을 직접 입력하며,
+  지정한 이름이 그대로 `default_provider`가 되어 `aic --provider <name>`으로도 선택 가능.
+  같은 이름으로 다시 들어가면 기존 값이 prefill되어 수정도 된다. 설정 예제(`설정 파일
+  직접 편집`)에도 custom endpoint 주석 블록을 추가.
+
 ## [0.12.0] - 2026-05-29
 
 ### Added
