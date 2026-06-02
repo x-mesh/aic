@@ -3330,6 +3330,7 @@ fn configure_llm_provider() {
         "NVIDIA NIM (qwen, nemotron, llama)",
         "Kiro CLI (로컬)",
         "Claude CLI (로컬)",
+        "Custom (OpenAI 호환 endpoint — ai-mesh, vLLM, LiteLLM 등)",
         "뒤로",
     ];
 
@@ -3338,7 +3339,7 @@ fn configure_llm_provider() {
         .items(providers)
         .default(0)
         .interact()
-        .unwrap_or(6);
+        .unwrap_or(7);
 
     let (provider_name, provider_config) = match selection {
         0 => configure_openai(&theme, &existing_config),
@@ -3347,6 +3348,7 @@ fn configure_llm_provider() {
         3 => configure_nvidia(&theme, &existing_config),
         4 => configure_kiro_cli(&theme, &existing_config),
         5 => configure_claude_cli(&theme, &existing_config),
+        6 => configure_custom(&theme, &existing_config),
         _ => return,
     };
 
@@ -3827,6 +3829,116 @@ fn configure_claude_cli(
     )
 }
 
+/// 임의 OpenAI 호환 endpoint(ai-mesh, vLLM, LiteLLM, LM Studio 등)를 등록한다.
+/// provider 이름을 사용자가 직접 지정하므로 동일 메뉴에서 여러 custom endpoint를
+/// 각각 추가/수정할 수 있다. `provider_type`은 항상 `OpenAiCompatible`.
+fn configure_custom(
+    theme: &ColorfulTheme,
+    existing_config: &Option<AppConfig>,
+) -> (String, ProviderConfig) {
+    println!("\nCustom (OpenAI 호환 endpoint) 설정");
+    println!("OpenAI Chat Completions 호환 API를 제공하는 임의 endpoint를 등록합니다.");
+    println!("예: ai-mesh, vLLM, LiteLLM, LM Studio 등\n");
+
+    // 실패 시 반환할 빈 결과(provider_name이 빈 문자열이면 호출부가 저장을 건너뛴다).
+    let empty = || {
+        (
+            String::new(),
+            ProviderConfig {
+                provider_type: ProviderType::OpenAiCompatible,
+                endpoint: None,
+                api_key: None,
+                model: None,
+                cli_path: None,
+                cli_args: None,
+            },
+        )
+    };
+
+    // 1) provider 이름 = config의 [llm.providers.<name>] 키이자 default_provider 값
+    let provider_name: String = Input::with_theme(theme)
+        .with_prompt("Provider 이름 (예: ai-mesh)")
+        .interact_text()
+        .unwrap_or_default();
+    let provider_name = provider_name.trim().to_string();
+    if provider_name.is_empty() {
+        println!("Provider 이름이 필요합니다.");
+        return empty();
+    }
+
+    // 같은 이름의 기존 custom provider가 있으면 값을 prefill 한다.
+    let existing = get_existing_provider(existing_config, &provider_name);
+    let existing_endpoint = existing.as_ref().and_then(|p| p.endpoint.as_ref());
+    let existing_key = existing.as_ref().and_then(|p| p.api_key.as_ref());
+    let existing_model = existing.as_ref().and_then(|p| p.model.as_ref());
+
+    if let Some(ep) = existing_endpoint {
+        println!("현재 endpoint: {}", ep);
+    }
+    if let Some(key) = existing_key {
+        println!("현재 API Key: {}", mask_api_key(key));
+    }
+    if let Some(model) = existing_model {
+        println!("현재 모델: {}", model);
+    }
+    if existing.is_some() {
+        println!();
+    }
+
+    // 2) endpoint URL — Chat Completions 전체 경로(/v1/chat/completions 포함)
+    let mut endpoint_input = Input::with_theme(theme)
+        .with_prompt("Endpoint URL (예: https://ai-mesh.example.com/v1/chat/completions)");
+    if let Some(ep) = existing_endpoint {
+        endpoint_input = endpoint_input.default(ep.clone());
+    }
+    let endpoint: String = endpoint_input.interact_text().unwrap_or_default();
+    let endpoint = endpoint.trim().to_string();
+    if endpoint.is_empty() {
+        println!("Endpoint URL이 필요합니다.");
+        return empty();
+    }
+
+    // 3) API Key — OpenAI 호환 경로는 Bearer 토큰을 전송한다.
+    let api_key: String = Input::with_theme(theme)
+        .with_prompt("API Key (유지하려면 Enter)")
+        .allow_empty(true)
+        .interact_text()
+        .unwrap_or_default();
+    let final_key = if api_key.is_empty() {
+        existing_key.cloned()
+    } else {
+        Some(api_key)
+    };
+    if final_key.is_none() {
+        println!("API Key가 필요합니다.");
+        return empty();
+    }
+
+    // 4) 모델 이름 — endpoint가 받는 모델 식별자(자유 입력)
+    let mut model_input = Input::with_theme(theme).with_prompt("모델 이름");
+    if let Some(m) = existing_model {
+        model_input = model_input.default(m.clone());
+    }
+    let model: String = model_input.interact_text().unwrap_or_default();
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        println!("모델 이름이 필요합니다.");
+        return empty();
+    }
+
+    (
+        provider_name,
+        ProviderConfig {
+            provider_type: ProviderType::OpenAiCompatible,
+            endpoint: Some(endpoint),
+            api_key: final_key,
+            model: Some(model),
+            cli_path: None,
+            cli_args: None,
+        },
+    )
+}
+
 fn show_config_example() {
     let path = ConfigManager::config_path();
 
@@ -3882,6 +3994,15 @@ model = "meta/llama-3.1-8b-instruct"
 # - meta/llama-3.1-70b-instruct
 # - nvidia/nemotron-3-super-120b-a12b
 # - meta/llama-3.1-405b-instruct
+
+# Custom (OpenAI 호환 endpoint) 설정 (선택)
+# ai-mesh, vLLM, LiteLLM, LM Studio 등 OpenAI Chat Completions 호환 API.
+# provider 이름은 자유롭게 지정 — default_provider에 그 이름을 쓰면 된다.
+# [llm.providers.ai-mesh]
+# provider_type = "OpenAiCompatible"
+# endpoint = "https://ai-mesh.example.com/v1/chat/completions"
+# api_key = "your-api-key-here"
+# model = "your-model-id"
 
 # Kiro CLI 설정 (선택)
 [llm.providers.kiro-cli]
