@@ -7,6 +7,7 @@ pub mod error;
 pub mod ipc;
 pub mod paths;
 pub mod session;
+pub mod shell_hooks;
 
 pub use error::AicError;
 pub use ipc::{decode_frame, encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
@@ -20,6 +21,7 @@ pub use session::{
     generate_record_id, generate_session_id, generate_unused_session_id, is_valid_record_id,
     is_valid_session_id,
 };
+pub use shell_hooks::generate_shell_hooks;
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
 

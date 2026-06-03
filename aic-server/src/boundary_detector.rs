@@ -220,68 +220,10 @@ fn decode_hex_command(hex: &str) -> Option<String> {
 
 // ── 셸 훅 주입 유틸리티 ────────────────────────────────────────
 
-/// 지정된 셸에 대한 OSC 133 마커 출력 훅 스크립트를 생성한다.
-///
-/// zsh: precmd/preexec 함수 정의
-/// bash: PROMPT_COMMAND 설정
-pub fn generate_shell_hooks(shell: &str) -> String {
-    match shell {
-        "zsh" => ZSH_HOOKS.to_string(),
-        "bash" => BASH_HOOKS.to_string(),
-        _ => String::new(),
-    }
-}
-
-const ZSH_HOOKS: &str = r#"
-# AIC OSC 133 shell integration (zsh)
-# precmd 훅 목록의 맨 앞에 등록하여 $?가 다른 훅에 의해 덮어쓰이기 전에 캡처
-_aic_save_exit_code() {
-    _aic_last_exit=$?
-}
-_aic_hex() {
-    printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n'
-}
-_aic_preexec() {
-    local _aic_cmd_hex
-    _aic_cmd_hex="$(_aic_hex "$1")"
-    printf '\x1b]133;C;cmd=%s\x07' "${_aic_cmd_hex[1,8192]}"
-}
-_aic_precmd() {
-    printf '\x1b]133;D;%d\x07' "$_aic_last_exit"
-    printf '\x1b]133;A\x07'
-    printf '\x1b]133;B\x07'
-}
-autoload -Uz add-zsh-hook
-# save_exit_code를 맨 먼저 실행하여 $? 보존
-add-zsh-hook precmd _aic_save_exit_code
-add-zsh-hook precmd _aic_precmd
-add-zsh-hook preexec _aic_preexec
-"#;
-
-const BASH_HOOKS: &str = r#"
-# AIC OSC 133 shell integration (bash)
-_aic_hex() {
-    printf '%s' "$1" | od -An -tx1 -v | tr -d ' \n'
-}
-_aic_debug_trap() {
-    _aic_last_exit=$?
-    case "$BASH_COMMAND" in
-        _aic_prompt_command*|_aic_debug_trap*|trap\ *) return ;;
-    esac
-    local _aic_cmd_hex
-    _aic_cmd_hex="$(_aic_hex "$BASH_COMMAND")"
-    printf '\x1b]133;C;cmd=%s\x07' "${_aic_cmd_hex:0:8192}"
-}
-_aic_prompt_command() {
-    local exit_code=${_aic_last_exit:-$?}
-    printf '\x1b]133;D;%d\x07' "$exit_code"
-    printf '\x1b]133;A\x07'
-    printf '\x1b]133;B\x07'
-}
-# trap DEBUG로 명령어 실행 직후 exit code를 즉시 캡처
-trap '_aic_debug_trap' DEBUG
-PROMPT_COMMAND="_aic_prompt_command${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-"#;
+// OSC 133 boundary hook generator는 client(`aic init`)와 공유하기 위해
+// `aic-common`으로 이전했다. 기존 `crate::boundary_detector::generate_shell_hooks`
+// 참조(pty_manager 등)가 깨지지 않도록 여기서 re-export한다.
+pub use aic_common::generate_shell_hooks;
 
 // ── 테스트 ─────────────────────────────────────────────────────
 

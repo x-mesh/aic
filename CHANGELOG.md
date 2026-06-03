@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-06-03
+
+### Fixed
+- **`aic init`이 셸 hook 파일을 직접 생성** — 이전에는 `.bashrc`/`.zshrc`에
+  `source ~/.aic/hooks.{shell}` 라인만 추가하고 정작 `~/.aic/hooks.{shell}` 파일은
+  서버(PTY 세션)가 lazy 생성하는 구조라, init만 하고 세션을 안 띄운 호스트에서
+  새 셸을 열 때마다 `source: No such file or directory` 에러가 났다. 이제 `aic init`이
+  source 라인과 함께 hook 파일을 즉시 생성하며, rc에 마커가 이미 있어도 파일이 없으면
+  self-heal 한다. OSC 133 boundary hook generator를 `aic-common`으로 이전해 client에서도
+  생성 가능하게 했고, `aic doctor --fix`도 `hooks.{zsh,bash}`에 올바른 boundary 내용을
+  쓰도록 수정했다(기존엔 metadata hook 내용이 잘못 들어갔다).
+
 ## [0.13.0] - 2026-06-03
 
 ### Added
