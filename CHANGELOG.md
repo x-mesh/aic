@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-06-03
+
 ### Added
 - **`aic daemon restart` 서브커맨드** — stop → socket 해제 대기 → start를 한 번에
   수행한다. 새 바이너리로 업그레이드한 뒤 실행 중인 aicd에 적용할 때 쓴다(업그레이드
