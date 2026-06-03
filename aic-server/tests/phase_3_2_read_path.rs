@@ -46,7 +46,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
 // ─────────────────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ impl AicdHarness {
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let ctx = ControlContext {
-            shutdown: Arc::new(Notify::new()),
+            shutdown: watch::channel(false).0,
             registry: SessionRegistry::new(),
             record_store: CommandRecordStore::new(),
             registry_path: None,

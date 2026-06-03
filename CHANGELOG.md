@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+### Added
+- **`aic daemon restart` 서브커맨드** — stop → socket 해제 대기 → start를 한 번에
+  수행한다. 새 바이너리로 업그레이드한 뒤 실행 중인 aicd에 적용할 때 쓴다(업그레이드
+  안내가 이미 이 명령을 가리키고 있었으나 실제로는 없던 것을 추가). 미실행 상태면
+  곧장 start만 한다.
+
+### Fixed
+- **aicd가 Shutdown 요청에 실제로 종료되지 않던 버그** — `aic daemon stop`/`restart`가
+  Shutdown을 보내고 서버가 Pong을 응답해도 데몬 프로세스가 종료되지 않고 socket이
+  남아 있었다. 원인은 control·attach 두 serve 루프가 같은 `Notify`를 공유하는데
+  `notify_one()`이 단일 waiter만 깨워, 요청을 처리 중이라 park 상태가 아니던 control
+  루프가 신호를 놓치고 영원히 hang 한 것(`server.serve()`가 리턴하지 않음). shutdown
+  신호를 level-triggered인 `tokio::sync::watch`로 바꿔 한 번의 `send_replace(true)`로
+  모든 serve 루프가 신호를 놓치지 않고 깨어나도록 수정했다. 이제 stop/restart가 즉시
+  데몬을 종료한다.
+
 ## [0.13.1] - 2026-06-03
 
 ### Fixed
