@@ -21,7 +21,7 @@ use aic_common::attach::{
 };
 use anyhow::Context;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 use crate::command_record_store::CommandRecordStore;
 use crate::metrics::AicdMetrics;
@@ -108,7 +108,8 @@ impl AttachServer {
 
     /// `shutdown` 이 notify 될 때까지 accept 루프를 돈다. 각 연결은 별도 task 로 분리되어
     /// 처리되므로 shutdown 이 떨어져도 in-flight 연결은 detach 된 상태로 각자 종료된다.
-    pub async fn serve(&self, shutdown: Arc<Notify>) {
+    pub async fn serve(&self, shutdown: watch::Sender<bool>) {
+        let mut shutdown_rx = shutdown.subscribe();
         loop {
             tokio::select! {
                 accept = self.listener.accept() => {
@@ -126,7 +127,7 @@ impl AttachServer {
                         }
                     }
                 }
-                _ = shutdown.notified() => {
+                _ = shutdown_rx.changed() => {
                     tracing::info!("AttachServer shutdown 신호 수신");
                     break;
                 }
@@ -368,7 +369,7 @@ mod tests {
         metrics: Arc<AicdMetrics>,
         pool: Arc<SessionProcessorPool>,
         store: CommandRecordStore,
-        shutdown: Arc<Notify>,
+        shutdown: watch::Sender<bool>,
         serve_handle: tokio::task::JoinHandle<()>,
     }
 
@@ -387,8 +388,8 @@ mod tests {
             )
             .await
             .expect("bind");
-            let shutdown = Arc::new(Notify::new());
-            let shutdown_clone = Arc::clone(&shutdown);
+            let (shutdown, _) = watch::channel(false);
+            let shutdown_clone = shutdown.clone();
             let serve_handle = tokio::spawn(async move {
                 server.serve(shutdown_clone).await;
             });
@@ -416,7 +417,7 @@ mod tests {
         }
 
         async fn shutdown(self) {
-            self.shutdown.notify_one();
+            self.shutdown.send_replace(true);
             let _ = tokio::time::timeout(Duration::from_millis(500), self.serve_handle).await;
         }
     }

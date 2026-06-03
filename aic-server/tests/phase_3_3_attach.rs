@@ -40,7 +40,7 @@ use bytes::Bytes;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 // ─────────────────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ struct Harness {
     metrics: Arc<AicdMetrics>,
     pool: Arc<SessionProcessorPool>,
     store: CommandRecordStore,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Sender<bool>,
     serve_handle: JoinHandle<()>,
 }
 
@@ -77,8 +77,8 @@ impl Harness {
         .await
         .expect("AttachServer::bind");
 
-        let shutdown = Arc::new(Notify::new());
-        let shutdown_clone = Arc::clone(&shutdown);
+        let (shutdown, _) = watch::channel(false);
+        let shutdown_clone = shutdown.clone();
         let serve_handle = tokio::spawn(async move {
             server.serve(shutdown_clone).await;
         });
@@ -106,7 +106,7 @@ impl Harness {
     }
 
     async fn shutdown(self) {
-        self.shutdown.notify_one();
+        self.shutdown.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_millis(500), self.serve_handle).await;
     }
 }

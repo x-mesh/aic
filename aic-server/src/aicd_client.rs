@@ -198,14 +198,14 @@ mod tests {
         use crate::control_server::{ControlContext, ControlServer};
         use crate::session_registry::SessionRegistry;
         use std::sync::Arc;
-        use tokio::sync::Notify;
+        use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let registry = SessionRegistry::new();
         let ctx = ControlContext {
-            shutdown: Arc::new(Notify::new()),
+            shutdown: watch::channel(false).0,
             registry: registry.clone(),
             record_store: crate::command_record_store::CommandRecordStore::new(),
             registry_path: None,

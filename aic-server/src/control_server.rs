@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 const STALE_ACTIVE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 
@@ -27,7 +27,10 @@ const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3
 /// shutdown trigger, session registry, hook event buffer, aicd metric 카운터를 보유한다.
 #[derive(Clone)]
 pub struct ControlContext {
-    pub shutdown: Arc<Notify>,
+    /// daemon 종료 신호. `watch`는 level-triggered라 한 번 `send(true)`하면
+    /// control/attach serve 루프의 모든 구독자가 신호를 놓치지 않고 깨어난다.
+    /// (`Notify::notify_one`은 단일 waiter만 깨워 다중 루프에서 한쪽이 hang 됐다.)
+    pub shutdown: watch::Sender<bool>,
     pub registry: SessionRegistry,
     pub record_store: CommandRecordStore,
     pub registry_path: Option<PathBuf>,
@@ -59,7 +62,7 @@ impl ControlServer {
     /// `ctx.shutdown`이 신호를 받을 때까지 accept 루프를 돈다.
     /// 신호를 받으면 즉시 루프를 빠져나오며, in-flight 핸들러는 detach된 채 종료된다.
     pub async fn serve(&self, ctx: ControlContext) {
-        let shutdown = Arc::clone(&ctx.shutdown);
+        let mut shutdown_rx = ctx.shutdown.subscribe();
         loop {
             tokio::select! {
                 accept_result = self.listener.accept() => {
@@ -82,7 +85,7 @@ impl ControlServer {
                         }
                     }
                 }
-                _ = shutdown.notified() => {
+                _ = shutdown_rx.changed() => {
                     tracing::info!("control server shutdown 신호 수신");
                     break;
                 }
@@ -177,10 +180,10 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         }
         IpcRequest::Shutdown => {
             tracing::info!("control Shutdown 요청 수신");
-            // 응답을 보낸 뒤 serve 루프가 빠져나가도록 notify.
-            // notify_one()은 수신자가 없으면 next notified()까지 latch되므로
-            // 응답 write 이후 select가 즉시 종료된다.
-            ctx.shutdown.notify_one();
+            // watch=level-triggered: send_replace로 값을 true로 latch하고 control/
+            // attach serve 루프의 모든 구독자를 동시에 깨운다. send()와 달리 구독자가
+            // 아직 없어도 값이 설정되므로, 이후 subscribe하는 루프도 신호를 본다.
+            ctx.shutdown.send_replace(true);
             IpcResponse::Pong
         }
         IpcRequest::StopSession { id } => stop_session(ctx, &id).await,
@@ -460,7 +463,7 @@ mod tests {
 
     fn ctx() -> ControlContext {
         ControlContext {
-            shutdown: Arc::new(Notify::new()),
+            shutdown: watch::channel(false).0,
             registry: SessionRegistry::new(),
             record_store: CommandRecordStore::new(),
             registry_path: None,
@@ -755,9 +758,8 @@ mod tests {
         let c = ctx();
         let resp = process_control_request(IpcRequest::Shutdown, &c).await;
         assert_eq!(resp, IpcResponse::Pong);
-        // Shutdown 처리 후 notified()가 즉시 떨어져야 한다.
-        let waited = tokio::time::timeout(Duration::from_millis(100), c.shutdown.notified()).await;
-        assert!(waited.is_ok(), "shutdown notify가 발화되지 않음");
+        // Shutdown 처리 후 watch 값이 true로 설정돼야 한다.
+        assert!(*c.shutdown.borrow(), "shutdown 신호가 설정되지 않음");
     }
 
     #[tokio::test]
@@ -1346,7 +1348,7 @@ mod tests {
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let c = ctx();
-        let shutdown = Arc::clone(&c.shutdown);
+        let shutdown = c.shutdown.clone();
         let serve_handle = tokio::spawn(async move { server.serve(c).await });
 
         let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -1370,7 +1372,7 @@ mod tests {
             other => panic!("Error 기대 — {other:?}"),
         }
 
-        shutdown.notify_one();
+        shutdown.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), serve_handle).await;
     }
 
@@ -1397,12 +1399,12 @@ mod tests {
         assert!(sock_path.exists());
 
         let c = ctx();
-        let shutdown = Arc::clone(&c.shutdown);
+        let shutdown = c.shutdown.clone();
         let serve_handle = tokio::spawn(async move { server.serve(c).await });
 
         assert_eq!(ping_through_socket(&sock_path).await, IpcResponse::Pong);
 
-        shutdown.notify_one();
+        shutdown.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), serve_handle).await;
     }
 

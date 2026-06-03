@@ -21,7 +21,7 @@ use aic_server::session_registry::SessionRegistry;
 use clap::Parser;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// aicd CLI.
 #[derive(Debug, Parser)]
@@ -61,11 +61,13 @@ async fn main() -> anyhow::Result<()> {
     let server = ControlServer::bind(&sock_path).await?;
     tracing::info!(path = %server.socket_path().display(), "aicd control 소켓 바인드");
 
-    // shutdown notify — control Shutdown(추후) 또는 signal에서 사용.
-    let shutdown = Arc::new(Notify::new());
+    // shutdown 신호 — control Shutdown 요청 또는 signal에서 사용. watch는
+    // level-triggered라 control/attach serve 루프가 모두 같은 채널을 구독해도
+    // 한 번의 send(true)로 둘 다 깨어난다 (Notify::notify_one은 한쪽만 깨워 hang).
+    let (shutdown, _shutdown_rx) = watch::channel(false);
 
-    // SIGINT/SIGTERM → shutdown notify
-    let signal_shutdown = Arc::clone(&shutdown);
+    // SIGINT/SIGTERM → shutdown 신호
+    let signal_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler 등록 실패");
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler 등록 실패");
@@ -73,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
             _ = sigint.recv() => tracing::info!("SIGINT 수신"),
             _ = sigterm.recv() => tracing::info!("SIGTERM 수신"),
         }
-        signal_shutdown.notify_one();
+        signal_shutdown.send_replace(true);
     });
 
     let registry_path = aicd_registry_path();
@@ -108,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %attach_sock_path.display(), "aicd attach 소켓 바인드");
 
     let control_ctx = ControlContext {
-        shutdown: Arc::clone(&shutdown),
+        shutdown: shutdown.clone(),
         registry: registry.clone(),
         record_store,
         registry_path: Some(registry_path.clone()),
@@ -120,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     // AttachServer 는 별도 task 로 spawn 하여 Control_UDS serve 루프와 나란히 동작한다.
     // 같은 `shutdown` Notify 를 공유하므로 SIGTERM/Shutdown 요청 시 둘 다 깨어난다.
-    let attach_shutdown = Arc::clone(&shutdown);
+    let attach_shutdown = shutdown.clone();
     let attach_handle = tokio::spawn(async move {
         attach_server.serve(attach_shutdown).await;
     });
