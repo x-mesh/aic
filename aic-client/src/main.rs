@@ -574,6 +574,8 @@ enum DaemonOp {
     },
     /// aicd에 graceful Shutdown을 요청한다.
     Stop,
+    /// aicd를 재시작한다 (stop → socket 해제 대기 → start). 미실행이면 그냥 start.
+    Restart,
     /// 부팅 시 자동 시작용 OS unit을 설치한다 (macOS launchd / Linux systemd --user).
     Install {
         /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
@@ -744,6 +746,7 @@ async fn main() {
             DaemonOp::Status => handle_daemon_status().await,
             DaemonOp::Start { foreground } => handle_daemon_start(foreground).await,
             DaemonOp::Stop => handle_daemon_stop().await,
+            DaemonOp::Restart => handle_daemon_restart().await,
             DaemonOp::Install { no_load } => handle_daemon_install(no_load),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
@@ -1569,6 +1572,52 @@ async fn handle_daemon_stop() {
             std::process::exit(1);
         }
     }
+}
+
+/// `aic daemon restart`: stop → socket 해제 대기 → start.
+///
+/// 새 바이너리로 업그레이드한 뒤 실행 중인 aicd에 적용할 때 쓴다. shutdown 요청 후
+/// old aicd가 socket을 완전히 놓을 때까지 기다리지 않으면 `handle_daemon_start`가
+/// 아직 응답하는 old daemon을 보고 "이미 실행 중"으로 no-op 하므로, ping이 죽을
+/// 때까지 폴링한 뒤 start 한다. 미실행이면 stop을 건너뛰고 곧장 start.
+async fn handle_daemon_restart() {
+    let sock = aic_common::aicd_socket_path();
+    let client = UdsClient::new(sock.clone());
+
+    let was_running = matches!(client.ping().await, Ok(true));
+    if was_running {
+        match client.shutdown().await {
+            Ok(()) => println!("{COL_GREEN}✓{COL_RESET} aicd Shutdown 요청 전송"),
+            Err(AicError::ServerNotRunning) => {}
+            Err(e) => {
+                eprintln!("{COL_RED}✗{COL_RESET} aicd Shutdown 실패: {e}");
+                std::process::exit(1);
+            }
+        }
+
+        // old aicd가 socket을 놓을 때까지 ping이 죽길 기다린다 (최대 ~3s).
+        const MAX_WAIT_MS: u64 = 3000;
+        const POLL_MS: u64 = 100;
+        let mut waited = 0u64;
+        loop {
+            if !matches!(client.ping().await, Ok(true)) {
+                break;
+            }
+            if waited >= MAX_WAIT_MS {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} aicd가 {MAX_WAIT_MS}ms 내에 종료되지 않았습니다 — \
+                     그래도 start를 시도합니다."
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+            waited += POLL_MS;
+        }
+    } else {
+        println!("{COL_DIM}aicd가 실행 중이 아닙니다 — start만 수행{COL_RESET}");
+    }
+
+    handle_daemon_start(false).await;
 }
 
 /// `aic top [--interval N]`: ratatui 라이브 TUI. 비-TTY는 status --watch로 fallback.
