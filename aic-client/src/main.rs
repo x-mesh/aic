@@ -1768,6 +1768,29 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
 
     let rc_path = home.join(rc_filename);
     let hook_path = home.join(".aic").join(hook_filename);
+
+    // source 라인이 가리킬 hook 파일을 먼저 생성한다. 이게 없으면 셸이 뜰 때마다
+    // `source ...: No such file or directory` 에러가 난다. 항상 최신 내용으로
+    // 덮어쓴다 (생성 파일이라 사용자가 수정할 일이 없다). marker가 이미 있어
+    // 아래에서 early-return 하더라도 파일은 self-heal 된다.
+    let hook_body = aic_common::generate_shell_hooks(&shell_name);
+    if let Some(aic_dir) = hook_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(aic_dir) {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} {} 생성 실패: {e}",
+                aic_dir.display()
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Err(e) = std::fs::write(&hook_path, &hook_body) {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} {} 쓰기 실패: {e}",
+            hook_path.display()
+        );
+        std::process::exit(2);
+    }
+
     let snippet = format!(
         "{MARKER_BEGIN}\nsource {hook}\n{MARKER_END}\n",
         hook = hook_path.display()
@@ -1776,7 +1799,11 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
     let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
     if existing.contains(MARKER_BEGIN) {
         println!(
-            "{COL_DIM}↪ {rc} 에 이미 aic hook 마커가 있어 skip{COL_RESET}",
+            "{COL_GREEN}✔{COL_RESET} {hook} 생성/갱신",
+            hook = hook_path.display()
+        );
+        println!(
+            "{COL_DIM}↪ {rc} 에 이미 aic hook 마커가 있어 source 라인은 skip{COL_RESET}",
             rc = rc_path.display()
         );
         std::process::exit(0);
@@ -1798,6 +1825,10 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
         std::process::exit(2);
     }
 
+    println!(
+        "{COL_GREEN}✔{COL_RESET} {hook} 생성/갱신",
+        hook = hook_path.display()
+    );
     println!(
         "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨\n  새 셸을 띄우거나 `source {rc}`로 활성화하세요",
         rc = rc_path.display()
@@ -3110,10 +3141,13 @@ async fn handle_doctor_fix(dry_run: bool) {
             if !dry_run {
                 let zsh_path = dir.join("hooks.zsh");
                 let bash_path = dir.join("hooks.bash");
+                // hooks.{zsh,bash}는 `# >>> aic hooks >>>` source 라인이 가리키는
+                // OSC 133 boundary hook이다. metadata hook(hook-events.*)이 아니라
+                // boundary generator를 써야 내용이 일치한다.
                 let result = (|| -> std::io::Result<()> {
                     std::fs::create_dir_all(&dir)?;
-                    std::fs::write(&zsh_path, aic_client::hook_install::zsh_hook_script())?;
-                    std::fs::write(&bash_path, aic_client::hook_install::bash_hook_script())?;
+                    std::fs::write(&zsh_path, aic_common::generate_shell_hooks("zsh"))?;
+                    std::fs::write(&bash_path, aic_common::generate_shell_hooks("bash"))?;
                     Ok(())
                 })();
                 match result {
