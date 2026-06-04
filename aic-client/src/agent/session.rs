@@ -265,9 +265,15 @@ impl AgentSession {
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        // TTY는 기본 ratatui chat TUI(입력 아래 status bar, claude CLI 스타일). reedline(slash
-        // 자동완성 메뉴·구식 history)을 원하면 `AIC_NO_TUI=1`로 opt-out. non-TTY/파이프는 항상 Direct.
-        let result = if tty && !super::debug::env_truthy("AIC_NO_TUI") {
+        // macOS raw-mode TUI는 한글 IME 조합(preedit)과 충돌해 자모가 분리되거나 커서 옆으로
+        // 밀릴 수 있다. macOS는 기본 Direct(reedline)로 두고, TUI는 `AIC_CHAT_TUI=1`일 때만 강제한다.
+        // non-TTY/파이프와 `AIC_NO_TUI=1`은 항상 Direct.
+        let force_tui = super::debug::env_truthy("AIC_CHAT_TUI");
+        let default_tui = !cfg!(target_os = "macos");
+        let result = if tty
+            && !super::debug::env_truthy("AIC_NO_TUI")
+            && (force_tui || default_tui)
+        {
             self.run_loop_tui().await
         } else {
             self.run_loop_direct().await
