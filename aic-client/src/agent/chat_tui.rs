@@ -18,7 +18,10 @@ use ansi_to_tui::IntoText;
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -70,6 +73,7 @@ pub(crate) fn read_line_tui(
         },
     )?;
     let mut textarea = TextArea::default();
+    let mut hangul = HangulComposer::default();
     let mut status = String::from("· (collecting metrics…)");
     let mut last = Instant::now();
 
@@ -89,13 +93,18 @@ pub(crate) fn read_line_tui(
         // 입력 없으면 200ms 후 다시 그려 status가 흐르게 한다.
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
+                if !is_key_press(k) {
+                    continue;
+                }
                 match (k.code, k.modifiers) {
                     (KeyCode::Char('d') | KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         break ChatLine::Eof
                     }
                     (KeyCode::Enter, _) => break ChatLine::Line(textarea.lines().join("\n")),
                     _ => {
-                        textarea.input(k);
+                        if !hangul.input(&mut textarea, k) {
+                            textarea.input(k);
+                        }
                     }
                 }
             }
@@ -227,7 +236,7 @@ fn install_panic_hook() {
     HOOK.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             prev(info);
         }));
@@ -242,7 +251,13 @@ pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandl
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
     // 취소 채널: 용량 1이면 충분(중복 Ctrl+C는 try_send 실패로 자연 병합). turn마다 drain_cancel로 비운다.
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    let join = tokio::spawn(chat_loop(line_tx, out_rx, cancel_tx, prompt, with_statusbar));
+    let join = tokio::spawn(chat_loop(
+        line_tx,
+        out_rx,
+        cancel_tx,
+        prompt,
+        with_statusbar,
+    ));
     ChatHandle {
         line_rx,
         out_tx,
@@ -252,6 +267,10 @@ pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandl
 }
 
 const SPIN_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn is_key_press(k: KeyEvent) -> bool {
+    matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
 
 /// thinking 표시 상태(spinner 애니메이션 프레임 + 경과).
 struct SpinState {
@@ -265,6 +284,327 @@ fn textarea_with(content: &str) -> TextArea<'static> {
     let mut ta = TextArea::default();
     ta.insert_str(content);
     ta
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HangulState {
+    L { l: u8 },
+    Lv { l: u8, v: u8 },
+    Lvt { l: u8, v: u8, t: u8 },
+}
+
+#[derive(Default)]
+struct HangulComposer {
+    state: Option<HangulState>,
+    cursor_after: Option<(usize, usize)>,
+}
+
+impl HangulComposer {
+    fn reset(&mut self) {
+        self.state = None;
+        self.cursor_after = None;
+    }
+
+    fn input(&mut self, textarea: &mut TextArea<'static>, k: KeyEvent) -> bool {
+        let KeyCode::Char(c) = k.code else {
+            self.reset();
+            return false;
+        };
+        if k.modifiers.contains(KeyModifiers::CONTROL) || k.modifiers.contains(KeyModifiers::ALT) {
+            self.reset();
+            return false;
+        }
+        let Some(jamo) = Jamo::from_char(c) else {
+            self.reset();
+            return false;
+        };
+        if self.state.is_some() && self.cursor_after != Some(textarea.cursor()) {
+            self.reset();
+        }
+        self.apply_jamo(textarea, c, jamo);
+        true
+    }
+
+    fn apply_jamo(&mut self, textarea: &mut TextArea<'static>, raw: char, jamo: Jamo) {
+        match (self.state, jamo) {
+            (None, Jamo::Consonant { l: Some(l), .. }) => {
+                self.insert_fresh(textarea, &raw.to_string(), Some(HangulState::L { l }));
+            }
+            (None, _) => {
+                self.insert_fresh(textarea, &raw.to_string(), None);
+            }
+            (Some(HangulState::L { l }), Jamo::Vowel(v)) => {
+                let s = compose_hangul(l, v, 0).to_string();
+                self.replace_active(textarea, &s, Some(HangulState::Lv { l, v }));
+            }
+            (Some(HangulState::L { .. }), Jamo::Consonant { l: Some(next), .. }) => {
+                self.insert_fresh(textarea, &raw.to_string(), Some(HangulState::L { l: next }));
+            }
+            (Some(HangulState::L { .. }), _) => {
+                self.insert_fresh(textarea, &raw.to_string(), None);
+            }
+            (Some(HangulState::Lv { l, v }), Jamo::Vowel(next_v)) => {
+                if let Some(v) = combine_vowel(v, next_v) {
+                    let s = compose_hangul(l, v, 0).to_string();
+                    self.replace_active(textarea, &s, Some(HangulState::Lv { l, v }));
+                } else {
+                    self.insert_fresh(textarea, &raw.to_string(), None);
+                }
+            }
+            (Some(HangulState::Lv { l, v }), Jamo::Consonant { t: Some(t), .. }) => {
+                let s = compose_hangul(l, v, t).to_string();
+                self.replace_active(textarea, &s, Some(HangulState::Lvt { l, v, t }));
+            }
+            (Some(HangulState::Lv { .. }), Jamo::Consonant { l: Some(next), .. }) => {
+                self.insert_fresh(textarea, &raw.to_string(), Some(HangulState::L { l: next }));
+            }
+            (Some(HangulState::Lv { .. }), _) => {
+                self.insert_fresh(textarea, &raw.to_string(), None);
+            }
+            (Some(HangulState::Lvt { l, v, t }), Jamo::Vowel(next_v)) => {
+                if let Some((keep_t, next_l)) = split_final(t) {
+                    let prev = compose_hangul(l, v, keep_t.unwrap_or(0));
+                    let next = compose_hangul(next_l, next_v, 0);
+                    let s = format!("{prev}{next}");
+                    self.replace_active(
+                        textarea,
+                        &s,
+                        Some(HangulState::Lv {
+                            l: next_l,
+                            v: next_v,
+                        }),
+                    );
+                } else {
+                    self.insert_fresh(textarea, &raw.to_string(), None);
+                }
+            }
+            (
+                Some(HangulState::Lvt { l, v, t }),
+                Jamo::Consonant {
+                    t: Some(next_t), ..
+                },
+            ) => {
+                if let Some(t) = combine_final(t, next_t) {
+                    let s = compose_hangul(l, v, t).to_string();
+                    self.replace_active(textarea, &s, Some(HangulState::Lvt { l, v, t }));
+                } else if let Jamo::Consonant { l: Some(next), .. } = jamo {
+                    self.insert_fresh(textarea, &raw.to_string(), Some(HangulState::L { l: next }));
+                } else {
+                    self.insert_fresh(textarea, &raw.to_string(), None);
+                }
+            }
+            (Some(HangulState::Lvt { .. }), Jamo::Consonant { l: Some(next), .. }) => {
+                self.insert_fresh(textarea, &raw.to_string(), Some(HangulState::L { l: next }));
+            }
+            (Some(HangulState::Lvt { .. }), _) => {
+                self.insert_fresh(textarea, &raw.to_string(), None);
+            }
+        }
+    }
+
+    fn insert_fresh(
+        &mut self,
+        textarea: &mut TextArea<'static>,
+        s: &str,
+        state: Option<HangulState>,
+    ) {
+        textarea.insert_str(s);
+        self.state = state;
+        self.cursor_after = state.map(|_| textarea.cursor());
+    }
+
+    fn replace_active(
+        &mut self,
+        textarea: &mut TextArea<'static>,
+        s: &str,
+        state: Option<HangulState>,
+    ) {
+        if self.cursor_after == Some(textarea.cursor()) {
+            textarea.delete_char();
+        }
+        textarea.insert_str(s);
+        self.state = state;
+        self.cursor_after = state.map(|_| textarea.cursor());
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Jamo {
+    Consonant { l: Option<u8>, t: Option<u8> },
+    Vowel(u8),
+}
+
+impl Jamo {
+    fn from_char(c: char) -> Option<Self> {
+        let j = match c {
+            'ㄱ' => Self::Consonant {
+                l: Some(0),
+                t: Some(1),
+            },
+            'ㄲ' => Self::Consonant {
+                l: Some(1),
+                t: Some(2),
+            },
+            'ㄴ' => Self::Consonant {
+                l: Some(2),
+                t: Some(4),
+            },
+            'ㄷ' => Self::Consonant {
+                l: Some(3),
+                t: Some(7),
+            },
+            'ㄸ' => Self::Consonant {
+                l: Some(4),
+                t: None,
+            },
+            'ㄹ' => Self::Consonant {
+                l: Some(5),
+                t: Some(8),
+            },
+            'ㅁ' => Self::Consonant {
+                l: Some(6),
+                t: Some(16),
+            },
+            'ㅂ' => Self::Consonant {
+                l: Some(7),
+                t: Some(17),
+            },
+            'ㅃ' => Self::Consonant {
+                l: Some(8),
+                t: None,
+            },
+            'ㅅ' => Self::Consonant {
+                l: Some(9),
+                t: Some(19),
+            },
+            'ㅆ' => Self::Consonant {
+                l: Some(10),
+                t: Some(20),
+            },
+            'ㅇ' => Self::Consonant {
+                l: Some(11),
+                t: Some(21),
+            },
+            'ㅈ' => Self::Consonant {
+                l: Some(12),
+                t: Some(22),
+            },
+            'ㅉ' => Self::Consonant {
+                l: Some(13),
+                t: None,
+            },
+            'ㅊ' => Self::Consonant {
+                l: Some(14),
+                t: Some(23),
+            },
+            'ㅋ' => Self::Consonant {
+                l: Some(15),
+                t: Some(24),
+            },
+            'ㅌ' => Self::Consonant {
+                l: Some(16),
+                t: Some(25),
+            },
+            'ㅍ' => Self::Consonant {
+                l: Some(17),
+                t: Some(26),
+            },
+            'ㅎ' => Self::Consonant {
+                l: Some(18),
+                t: Some(27),
+            },
+            'ㅏ' => Self::Vowel(0),
+            'ㅐ' => Self::Vowel(1),
+            'ㅑ' => Self::Vowel(2),
+            'ㅒ' => Self::Vowel(3),
+            'ㅓ' => Self::Vowel(4),
+            'ㅔ' => Self::Vowel(5),
+            'ㅕ' => Self::Vowel(6),
+            'ㅖ' => Self::Vowel(7),
+            'ㅗ' => Self::Vowel(8),
+            'ㅘ' => Self::Vowel(9),
+            'ㅙ' => Self::Vowel(10),
+            'ㅚ' => Self::Vowel(11),
+            'ㅛ' => Self::Vowel(12),
+            'ㅜ' => Self::Vowel(13),
+            'ㅝ' => Self::Vowel(14),
+            'ㅞ' => Self::Vowel(15),
+            'ㅟ' => Self::Vowel(16),
+            'ㅠ' => Self::Vowel(17),
+            'ㅡ' => Self::Vowel(18),
+            'ㅢ' => Self::Vowel(19),
+            'ㅣ' => Self::Vowel(20),
+            _ => return None,
+        };
+        Some(j)
+    }
+}
+
+fn compose_hangul(l: u8, v: u8, t: u8) -> char {
+    char::from_u32(0xAC00 + (((l as u32 * 21) + v as u32) * 28) + t as u32).unwrap_or('\u{FFFD}')
+}
+
+fn combine_vowel(v: u8, next: u8) -> Option<u8> {
+    match (v, next) {
+        (8, 0) => Some(9),    // ㅗ + ㅏ = ㅘ
+        (8, 1) => Some(10),   // ㅗ + ㅐ = ㅙ
+        (8, 20) => Some(11),  // ㅗ + ㅣ = ㅚ
+        (13, 4) => Some(14),  // ㅜ + ㅓ = ㅝ
+        (13, 5) => Some(15),  // ㅜ + ㅔ = ㅞ
+        (13, 20) => Some(16), // ㅜ + ㅣ = ㅟ
+        (18, 20) => Some(19), // ㅡ + ㅣ = ㅢ
+        _ => None,
+    }
+}
+
+fn combine_final(t: u8, next: u8) -> Option<u8> {
+    match (t, next) {
+        (1, 19) => Some(3),   // ㄱ + ㅅ = ㄳ
+        (4, 22) => Some(5),   // ㄴ + ㅈ = ㄵ
+        (4, 27) => Some(6),   // ㄴ + ㅎ = ㄶ
+        (8, 1) => Some(9),    // ㄹ + ㄱ = ㄺ
+        (8, 16) => Some(10),  // ㄹ + ㅁ = ㄻ
+        (8, 17) => Some(11),  // ㄹ + ㅂ = ㄼ
+        (8, 19) => Some(12),  // ㄹ + ㅅ = ㄽ
+        (8, 25) => Some(13),  // ㄹ + ㅌ = ㄾ
+        (8, 26) => Some(14),  // ㄹ + ㅍ = ㄿ
+        (8, 27) => Some(15),  // ㄹ + ㅎ = ㅀ
+        (17, 19) => Some(18), // ㅂ + ㅅ = ㅄ
+        _ => None,
+    }
+}
+
+fn split_final(t: u8) -> Option<(Option<u8>, u8)> {
+    match t {
+        1 => Some((None, 0)),
+        2 => Some((None, 1)),
+        3 => Some((Some(1), 9)),
+        4 => Some((None, 2)),
+        5 => Some((Some(4), 12)),
+        6 => Some((Some(4), 18)),
+        7 => Some((None, 3)),
+        8 => Some((None, 5)),
+        9 => Some((Some(8), 0)),
+        10 => Some((Some(8), 6)),
+        11 => Some((Some(8), 7)),
+        12 => Some((Some(8), 9)),
+        13 => Some((Some(8), 16)),
+        14 => Some((Some(8), 17)),
+        15 => Some((Some(8), 18)),
+        16 => Some((None, 6)),
+        17 => Some((None, 7)),
+        18 => Some((Some(17), 9)),
+        19 => Some((None, 9)),
+        20 => Some((None, 10)),
+        21 => Some((None, 11)),
+        22 => Some((None, 12)),
+        23 => Some((None, 14)),
+        24 => Some((None, 15)),
+        25 => Some((None, 16)),
+        26 => Some((None, 17)),
+        27 => Some((None, 18)),
+        _ => None,
+    }
 }
 
 /// 단계 6: 입력이 `/명령`(공백 전, 첫 토큰)이면 매칭되는 slash 후보를 돌려준다(자동완성 popup용).
@@ -376,7 +716,10 @@ fn draw_chat(
         };
         let line = Line::from(vec![
             Span::raw("▸ "),
-            Span::styled(format!("/{sel}"), Style::default().add_modifier(Modifier::REVERSED)),
+            Span::styled(
+                format!("/{sel}"),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
             Span::raw(format!("  {desc}")),
             Span::styled(counter, Style::default().add_modifier(Modifier::DIM)),
         ]);
@@ -509,11 +852,7 @@ fn draw_full(
             let secs = sp.started.elapsed().as_secs_f32();
             // 작업 중임을 알리는 spinner + 경과 시간. 끝에 Ctrl+C 중단 힌트를 붙여 기능을 노출한다.
             f.render_widget(
-                Paragraph::new(format!(
-                    "{frame} {} ({secs:.1}s)  · Ctrl+C 중단",
-                    sp.label
-                ))
-                .dim(),
+                Paragraph::new(format!("{frame} {} ({secs:.1}s)  · Ctrl+C 중단", sp.label)).dim(),
                 rows[2],
             );
         }
@@ -549,6 +888,9 @@ fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
 /// 대화 로그 ring 상한(줄 수). 초과 시 앞에서 폐기하고 scroll을 보정한다(critic M2). LLM 답변은
 /// 보통 수십 줄이라 수천 줄이면 긴 세션도 충분하면서 메모리 폭주는 막는다.
 const LOG_CAP: usize = 2000;
+
+/// 마우스 휠 한 틱당 스크롤할 로그 줄 수.
+const WHEEL_STEP: u16 = 3;
 
 /// `log`(원본 ANSI 줄 벡터)를 `Text`로 재구성한다(m3 캐시 갱신용). ANSI 파싱 실패 시 plain 폴백
 /// (escape가 보일 수 있으나 패닉/누락 없음). 빈 로그는 빈 Text.
@@ -619,10 +961,14 @@ async fn chat_loop(
         let _ = disable_raw_mode();
         return;
     }
+    // 마우스 휠을 캡처해 로그 viewport 스크롤로 라우팅한다. 캡처하지 않으면 alternate screen에서
+    // 터미널이 휠을 ↑↓ 키로 변환해 보내, 사용자가 스크롤하려다 입력 history가 바뀌는 문제가 생긴다.
+    // best-effort — 미지원 터미널이어도 TUI 자체는 진입한다.
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
         Ok(t) => t,
         Err(_) => {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return;
         }
@@ -632,6 +978,7 @@ async fn chat_loop(
     // 그려지는 영역(기본 배경)과 배경색이 달라 보인다(사용자 보고: "배경색이 다름").
     let _ = terminal.clear();
     let mut textarea = TextArea::default();
+    let mut hangul = HangulComposer::default();
     let mut events = EventStream::new();
     let mut sampler = with_statusbar.then(SysSampler::new);
     let mut status = String::from("· (collecting metrics…)");
@@ -715,8 +1062,16 @@ async fn chat_loop(
         let draw_ok = terminal
             .draw(|f| {
                 draw_full(
-                    f, &log_text, draw_scroll, &status_line, draw_ta, draw_prompt, &popup,
-                    popup_sel, spin_ref, confirm_ref,
+                    f,
+                    &log_text,
+                    draw_scroll,
+                    &status_line,
+                    draw_ta,
+                    draw_prompt,
+                    &popup,
+                    popup_sel,
+                    spin_ref,
+                    confirm_ref,
                 )
             })
             .is_ok();
@@ -724,16 +1079,17 @@ async fn chat_loop(
             break;
         }
 
-        // tick: spinner 애니메이션 100ms(처리 중, 부드러운 회전), 평상시 status 흐름 1초.
-        // status 숫자는 어차피 2초마다 갱신(sample)이고 키 입력은 이벤트 기반(즉시)이라, 평상시
-        // redraw를 1초로 둬도 반응성·흐름에 영향 없이 아이들 wake를 줄인다.
-        let tick = Duration::from_millis(if spin.is_some() { 100 } else { 1000 });
+        // 입력 대기 중에는 자발적인 redraw를 하지 않는다. macOS/iTerm/Terminal의 한글 IME
+        // 조합창은 앱이 커서 줄을 다시 그리면 자모가 분리되거나 옆으로 밀릴 수 있다. spinner처럼
+        // 입력을 막는 상태에서만 100ms tick으로 애니메이션을 갱신한다.
+        let tick = Duration::from_millis(100);
         // PageUp/Down 점프 폭(로그 높이의 절반, 최소 1).
         let page = (log_h / 2).max(1);
 
         tokio::select! {
             maybe_ev = events.next() => {
                 match maybe_ev {
+                    Some(Ok(Event::Key(k))) if !is_key_press(k) => {}
                     // NeedsConfirm 확인 모드(최우선): y/Y면 승인(true), 그 외 모든 키(n/N/Esc/Enter/…)는
                     // 거부(false). 입력 줄은 confirm_prompt로 대체되어 있고, textarea/slash/history/search는
                     // 전부 비활성이다. Ctrl+C/D도 확인을 거부(false)로 닫아 안전 기본값을 유지한다.
@@ -824,6 +1180,7 @@ async fn chat_loop(
                                     let _ = cancel_tx.try_send(());
                                 } else if !textarea.lines().join("\n").is_empty() {
                                     textarea = TextArea::default();
+                                    hangul.reset();
                                     hist_idx = None;
                                     draft.clear();
                                 } else {
@@ -857,6 +1214,7 @@ async fn chat_loop(
                             // ↑↓=후보 이동(아래 history ↑↓보다 우선).
                             (KeyCode::Tab, _) if spin.is_none() && !popup.is_empty() => {
                                 textarea = textarea_with(&format!("/{} ", popup[popup_sel]));
+                                hangul.reset();
                             }
                             (KeyCode::Up, _) if spin.is_none() && !popup.is_empty() => {
                                 popup_sel = if popup_sel == 0 {
@@ -881,6 +1239,7 @@ async fn chat_loop(
                                 log_text = rebuild_log_text(&log);
                                 follow = true;
                                 textarea = TextArea::default();
+                                hangul.reset();
                                 // history 기록(메모리 + 파일, reedline과 동일 파일) 후 탐색/popup 리셋.
                                 if crate::repl::should_record_history(&line) {
                                     crate::repl::append_chat_history(&line);
@@ -903,6 +1262,7 @@ async fn chat_loop(
                                 };
                                 hist_idx = Some(idx);
                                 textarea = textarea_with(&history[idx]);
+                                hangul.reset();
                             }
                             // ↓: 다음 history. 최근 아래로 내려오면 draft(편집 중이던 입력) 복원.
                             (KeyCode::Down, _) if spin.is_none() => {
@@ -914,17 +1274,36 @@ async fn chat_loop(
                                         hist_idx = None;
                                         textarea = textarea_with(&draft);
                                     }
+                                    hangul.reset();
                                 }
                             }
                             _ if spin.is_none() => {
                                 // 일반 편집 — history 탐색 종료(현재 내용이 새 입력).
                                 hist_idx = None;
-                                textarea.input(k);
+                                if !hangul.input(&mut textarea, k) {
+                                    textarea.input(k);
+                                }
                             }
                             _ => {}
                         }
                     }
-                    // Key 외 이벤트(Resize/Mouse/Focus/Paste)는 무시 — Resize는 다음 루프 draw가
+                    // 마우스 휠: 로그 viewport 스크롤(↑↓ 입력 history 대신). PageUp/Down과 동일한
+                    // follow 규칙 — 위로 굴리면 follow 해제, 아래로 굴려 최하단 도달 시 follow 재개.
+                    // 검색/확인 모드와 무관하게 스크롤만 한다(입력 상태는 건드리지 않음).
+                    Some(Ok(Event::Mouse(m))) => match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            follow = false;
+                            scroll = scroll.saturating_sub(WHEEL_STEP);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            scroll = (scroll + WHEEL_STEP).min(max);
+                            if scroll >= max {
+                                follow = true;
+                            }
+                        }
+                        _ => {}
+                    },
+                    // 그 외 이벤트(Resize/Focus/Paste)는 무시 — Resize는 다음 루프 draw가
                     // 새 크기로 자동 반영(best-effort).
                     Some(Ok(_)) => {}
                     // 일시 입력 오류는 무시(다음 tick에 재시도).
@@ -935,7 +1314,7 @@ async fn chat_loop(
                     }
                 }
             }
-            _ = tokio::time::sleep(tick) => {
+            _ = tokio::time::sleep(tick), if spin.is_some() => {
                 if let Some(sp) = spin.as_mut() {
                     sp.frame = sp.frame.wrapping_add(1);
                 }
@@ -981,8 +1360,8 @@ async fn chat_loop(
         }
     }
 
-    // alternate screen 떠나고 raw mode 복원(원래 화면 복귀).
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    // 마우스 캡처 해제 + alternate screen 떠나고 raw mode 복원(원래 화면 복귀).
+    let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     // 8e: 대화 버퍼를 stdout에 dump해 터미널 scrollback에 보존(원본 ANSI라 색 그대로).
     for line in &log {
@@ -994,6 +1373,44 @@ async fn chat_loop(
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    fn type_chars(chars: &[char]) -> String {
+        let mut ta = TextArea::default();
+        let mut hangul = HangulComposer::default();
+        for &c in chars {
+            let k = key(c);
+            if !hangul.input(&mut ta, k) {
+                ta.input(k);
+            }
+        }
+        ta.lines().join("\n")
+    }
+
+    #[test]
+    fn hangul_composer_combines_compat_jamo() {
+        assert_eq!(type_chars(&['ㅎ', 'ㅏ', 'ㄴ', 'ㄱ', 'ㅡ', 'ㄹ']), "한글");
+    }
+
+    #[test]
+    fn hangul_composer_splits_final_before_vowel() {
+        assert_eq!(type_chars(&['ㄴ', 'ㅏ', 'ㄴ', 'ㅏ']), "나나");
+    }
+
+    #[test]
+    fn hangul_composer_combines_vowels_and_final_clusters() {
+        assert_eq!(type_chars(&['ㄱ', 'ㅗ', 'ㅏ']), "과");
+        assert_eq!(type_chars(&['ㅇ', 'ㅓ', 'ㅂ', 'ㅅ']), "없");
+    }
+
+    #[test]
+    fn hangul_composer_leaves_native_syllables_alone() {
+        assert_eq!(type_chars(&['한', '글']), "한글");
+        assert_eq!(type_chars(&['ㄱ', 'a']), "ㄱa");
+    }
 
     #[test]
     fn draw_viewport_renders_status_and_prompt() {
@@ -1076,8 +1493,14 @@ mod tests {
         assert!(super::slash_candidates("/d").contains(&"doctor"));
         assert_eq!(super::slash_candidates("/help"), vec!["help"]);
         assert!(super::slash_candidates("hello").is_empty(), "/ 아님");
-        assert!(super::slash_candidates("/local ").is_empty(), "공백=인자 입력→닫힘");
-        assert!(super::slash_candidates("/").len() >= 10, "/ 단독은 전체 후보");
+        assert!(
+            super::slash_candidates("/local ").is_empty(),
+            "공백=인자 입력→닫힘"
+        );
+        assert!(
+            super::slash_candidates("/").len() >= 10,
+            "/ 단독은 전체 후보"
+        );
     }
 
     #[test]
@@ -1179,7 +1602,10 @@ mod tests {
         let row5: String = (0..60).map(|x| buf[(x, 5)].symbol()).collect();
         assert!(row5.contains("[y/N]"), "confirm prompt(입력 줄): {row5:?}");
         // confirm 우선 → popup 후보(diagnose/doctor)는 화면에 없다.
-        assert!(!all.contains("diagnose"), "confirm 중 popup 미표시: {all:?}");
+        assert!(
+            !all.contains("diagnose"),
+            "confirm 중 popup 미표시: {all:?}"
+        );
     }
 
     #[test]
@@ -1190,7 +1616,16 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
         term.draw(|f| {
             super::draw_full(
-                f, &log, 0, "· load", &ta, "you ❯ ", &["diagnose", "doctor"], 1, None, None,
+                f,
+                &log,
+                0,
+                "· load",
+                &ta,
+                "you ❯ ",
+                &["diagnose", "doctor"],
+                1,
+                None,
+                None,
             )
         })
         .unwrap();
@@ -1215,7 +1650,11 @@ mod tests {
         let buf = term.backend().buffer();
         let row = |y: u16| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>();
         assert!(row(0).contains("/d"), "입력(row0): {:?}", row(0));
-        assert!(row(1).contains("diagnose"), "popup 선택+설명(row1): {:?}", row(1));
+        assert!(
+            row(1).contains("diagnose"),
+            "popup 선택+설명(row1): {:?}",
+            row(1)
+        );
         assert!(row(1).contains("/2"), "카운터(row1): {:?}", row(1));
         assert!(row(2).contains("load"), "status(row2): {:?}", row(2));
     }
@@ -1256,7 +1695,10 @@ mod tests {
     fn status_with_ctx_appends_token_estimate() {
         // 0이면 status 그대로(표시 생략), >0이면 ` · ctx ~Nk`(1000 단위 절삭).
         assert_eq!(super::status_with_ctx("· load 1.0", 0), "· load 1.0");
-        assert_eq!(super::status_with_ctx("· load", 12_345), "· load · ctx ~12k");
+        assert_eq!(
+            super::status_with_ctx("· load", 12_345),
+            "· load · ctx ~12k"
+        );
         // 1000 미만은 정확한 수(~512), 1000 이상은 ~Nk.
         assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~999");
         assert_eq!(super::status_with_ctx("s", 1000), "s · ctx ~1k");
@@ -1297,7 +1739,11 @@ mod tests {
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
-        assert!(row(5).contains("/found"), "search bar(입력 줄): {:?}", row(5));
+        assert!(
+            row(5).contains("/found"),
+            "search bar(입력 줄): {:?}",
+            row(5)
+        );
         assert!(row(5).contains("(1/1)"), "카운터: {:?}", row(5));
     }
 
