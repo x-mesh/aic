@@ -180,16 +180,28 @@ mod tests {
         assert!(path.ends_with("session.sock"));
     }
 
+    // XDG_RUNTIME_DIR은 프로세스 전역이라, 이를 set/remove하는 테스트들이 병렬 실행되면
+    // 한 테스트가 assert 하기 전에 다른 테스트가 값을 바꿔 간헐적으로 깨진다(env-race).
+    // 아래 락으로 직렬화하고, 각 테스트는 원래 값을 저장했다가 복원한다.
+    static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_linux_with_xdg_runtime() {
+        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = resolve_socket_path("linux");
         assert_eq!(path, PathBuf::from("/run/user/1000/aic/session.sock"));
-        std::env::remove_var("XDG_RUNTIME_DIR");
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
     }
 
     #[test]
     fn resolve_linux_without_xdg_runtime() {
+        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let path = resolve_socket_path("linux");
         let uid = unsafe { libc::getuid() };
@@ -197,6 +209,9 @@ mod tests {
             path,
             PathBuf::from(format!("/tmp/aic-{}/session.sock", uid))
         );
+        if let Some(v) = prev {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
     }
 
     #[test]
