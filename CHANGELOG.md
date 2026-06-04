@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-04
+
+### Changed
+- **macOS `aic chat`는 기본 line 모드(reedline)** — raw-mode ratatui TUI가 macOS의
+  한글 IME 조합(preedit)과 충돌해 입력 중 자모가 분리되거나 커서가 옆으로 밀리는
+  문제가 있었다. macOS는 reedline 기본으로 되돌리고, ratatui TUI는 `AIC_CHAT_TUI=1`로
+  opt-in하도록 바꿨다. Linux는 그대로 TUI 기본(`AIC_NO_TUI=1`로 opt-out).
+
+### Added
+- **chat TUI 마우스 휠 스크롤** — 휠을 위/아래로 굴려 대화 로그를 스크롤한다. 이전에는
+  alternate screen에서 휠이 `↑/↓` 키로 변환돼 들어와, 스크롤하려다 입력 history가
+  바뀌었다. 진입 시 마우스 캡처를 켜 휠을 로그 viewport 스크롤로 라우팅한다(종료 시
+  캡처 해제).
+- **chat TUI 한글 조합 입력기** — TUI 입력 줄에서 한글 자모를 직접 조합한다(초성·중성·
+  종성 결합, 받침 분리/재조합 포함). raw-mode에서 IME 없이도 한글을 입력할 수 있다.
+
 ## [0.13.2] - 2026-06-03
 
 ### Added
