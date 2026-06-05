@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-06-05
+
+### Fixed
+- **auto-attach가 AI 코딩 에이전트 셸을 교체하지 않도록 가드 추가** — claude
+  (`CLAUDECODE`), codex(`CODEX_SANDBOX`), kiro-cli(`KIRO_SESSION_ID`) 환경에서 셸을
+  인터랙티브 PTY로 띄울 때 `exec aic-session`이 발동해 에이전트 세션을 깨뜨릴 수 있던
+  문제를 막는다. 세 마커 중 하나라도 설정돼 있으면 auto-attach를 건너뛴다. (대부분의
+  에이전트는 명령을 비대화형으로 실행해 기존 대화형 가드에 이미 걸리지만, PTY로 띄우는
+  엣지 케이스를 위한 방어 심층화.)
+
 ## [0.15.0] - 2026-06-05
 
 ### Added
