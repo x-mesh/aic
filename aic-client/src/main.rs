@@ -1791,18 +1791,21 @@ async fn handle_debug_bundle() {
 
 /// 대화형 셸을 `aic-session`(PTY 래퍼)으로 1회 교체하는 auto-attach 스니펫.
 ///
-/// 5중 가드로 무한 재진입과 SSH 로그인 락아웃을 막는다 (bash/zsh 공통 문법):
-/// 1. `$- == *i*`     — 대화형 셸만 (scp·비대화형 SSH 명령은 제외)
+/// 6중 가드로 무한 재진입·SSH 락아웃·AI 에이전트 셸 오진입을 막는다 (bash/zsh 공통 문법):
+/// 1. `$- == *i*`     — 대화형 셸만 (scp·비대화형 SSH 명령, 에이전트의 `bash -c`는 제외)
 /// 2. `-z AIC_SESSION` — 이미 PTY 안이면 재진입 금지 (무한루프 차단; pty_manager가 `AIC_SESSION=1` set)
 /// 3. `-z AIC_NO_ATTACH` — 수동 탈출구. 락아웃 복구 시 `AIC_NO_ATTACH=1 ssh host`
-/// 4. `-t 0 && -t 1`  — stdin/stdout 둘 다 tty일 때만
-/// 5. `command -v`    — 바이너리가 PATH에 있을 때만 (미설치 시 셸 안 깨짐)
+/// 4. `-z CLAUDECODE…` — AI 코딩 에이전트가 띄운 셸에선 교체 금지. claude=`CLAUDECODE`,
+///    codex=`CODEX_SANDBOX`(seatbelt/landlock), kiro-cli=`KIRO_SESSION_ID`. 마커 OR을 한 `-z`로 검사.
+/// 5. `-t 0 && -t 1`  — stdin/stdout 둘 다 tty일 때만
+/// 6. `command -v`    — 바이너리가 PATH에 있을 때만 (미설치 시 셸 안 깨짐)
 ///
 /// source 라인보다 **앞**에 둔다: 첫 진입은 여기서 exec로 교체되고, aic-session이
 /// 띄운 PTY 셸은 `AIC_SESSION=1` 때문에 가드 2에 걸려 통과 → 그제서야 source 실행.
 const ATTACH_SNIPPET: &str = r#"# aic PTY auto-attach — 대화형 셸을 aic-session(PTY 래퍼)으로 1회 교체.
 # 끄기: aic init <shell> --no-attach  |  일시 우회: AIC_NO_ATTACH=1 (SSH 락아웃 복구용)
-if [[ $- == *i* ]] && [[ -z "${AIC_SESSION:-}" ]] && [[ -z "${AIC_NO_ATTACH:-}" ]] && [[ -t 0 && -t 1 ]] && command -v aic-session >/dev/null 2>&1; then
+# AI 코딩 에이전트(claude/codex 등)가 띄운 셸에서는 교체하지 않는다.
+if [[ $- == *i* ]] && [[ -z "${AIC_SESSION:-}" ]] && [[ -z "${AIC_NO_ATTACH:-}" ]] && [[ -z "${CLAUDECODE:-}${CODEX_SANDBOX:-}${KIRO_SESSION_ID:-}" ]] && [[ -t 0 && -t 1 ]] && command -v aic-session >/dev/null 2>&1; then
     exec aic-session
 fi
 "#;
@@ -6774,6 +6777,19 @@ mod tests {
         assert!(
             ATTACH_SNIPPET.contains("command -v aic-session"),
             "바이너리 존재 가드 누락"
+        );
+        // AI 에이전트 셸 오진입 차단 — claude/codex 마커.
+        assert!(
+            ATTACH_SNIPPET.contains("${CLAUDECODE:-}"),
+            "claude(CLAUDECODE) 에이전트 가드 누락"
+        );
+        assert!(
+            ATTACH_SNIPPET.contains("${CODEX_SANDBOX:-}"),
+            "codex(CODEX_SANDBOX) 에이전트 가드 누락"
+        );
+        assert!(
+            ATTACH_SNIPPET.contains("${KIRO_SESSION_ID:-}"),
+            "kiro-cli(KIRO_SESSION_ID) 에이전트 가드 누락"
         );
         // 모든 가드를 통과해야만 도달하는 단일 exec.
         assert!(ATTACH_SNIPPET.contains("exec aic-session"));
