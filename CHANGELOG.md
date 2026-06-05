@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-05
+
+### Added
+- **`aic init`이 PTY auto-attach를 기본 주입** — 이제 `aic init <shell>`이 rc에
+  `exec aic-session` 진입 스니펫을 함께 넣어, 새 셸을 열면 자동으로 aic-session(PTY
+  래퍼)에 진입한다. 이전에는 init이 OSC 133 hook만 깔고 PTY 진입은 매번 수동으로
+  `aic-session`을 실행해야 했다. 끄려면 `aic init <shell> --no-attach`, 일시 우회는
+  `AIC_NO_ATTACH=1`(SSH 락아웃 복구용). 5중 가드(대화형·`AIC_SESSION` 재진입 차단·
+  `AIC_NO_ATTACH`·stdin/stdout tty·바이너리 존재)로 무한 재진입과 로그인 락아웃을 막는다.
+- **`aic init --no-attach` 플래그** — auto-attach 없이 hook source 라인만 설치한다
+  (기존 동작). 이미 aic hook 마커가 있는 rc는 그대로 두므로, auto-attach를 토글하려면
+  마커 블록을 지우고 재실행한다.
+
 ## [0.14.0] - 2026-06-04
 
 ### Changed
