@@ -247,6 +247,10 @@ enum Commands {
         /// PTY hook과 충돌하지 않으며, aicd가 떠 있을 때만 실제로 동작한다.
         #[arg(long)]
         hook_mode: bool,
+        /// PTY auto-attach(`exec aic-session`)를 rc에 넣지 않는다. 기본은 주입.
+        /// 대화형 셸이 자동으로 aic-session(PTY 래퍼)으로 교체되는 동작을 끈다.
+        #[arg(long)]
+        no_attach: bool,
     },
     /// 데몬 라이브 모니터링 — `aic status --watch` alias (interval 1s)
     Top {
@@ -740,7 +744,11 @@ async fn main() {
             AuditOp::BatchVerify { date } => handle_audit_batch_verify(date),
         },
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
-        Some(Commands::Init { shell, hook_mode }) => handle_init(shell, hook_mode),
+        Some(Commands::Init {
+            shell,
+            hook_mode,
+            no_attach,
+        }) => handle_init(shell, hook_mode, no_attach),
         Some(Commands::Top { interval, session }) => handle_top(interval, session).await,
         Some(Commands::Daemon { op }) => match op {
             DaemonOp::Status => handle_daemon_status().await,
@@ -1658,9 +1666,9 @@ async fn handle_setup(shell: Option<String>) {
         println!("    수정하려면 나중에 `aic config`를 실행하세요.\n");
     }
 
-    // 2) shell hook 설치
+    // 2) shell hook 설치 (auto-attach 기본 on)
     println!("{COL_CYAN}2/4{COL_RESET} 셸 hook 설치 (idempotent)...");
-    handle_init(shell, false);
+    handle_init(shell, false, false);
     println!();
 
     // 3) migrate-keys (config 로드 후 평문 key 있는지 확인 후만)
@@ -1687,8 +1695,10 @@ async fn handle_setup(shell: Option<String>) {
 
     println!("\n{COL_GREEN}{COL_BOLD}✔ setup 완료{COL_RESET}");
     println!("\n다음 단계:");
-    println!("  1. {COL_BOLD}새 터미널을 열거나 `source ~/.zshrc`{COL_RESET} (또는 .bashrc)");
-    println!("  2. {COL_BOLD}aic-session{COL_RESET} 으로 PTY 셸 진입");
+    println!("  1. {COL_BOLD}새 터미널을 열기{COL_RESET} — auto-attach가 aic-session(PTY 셸)으로 자동 진입합니다");
+    println!(
+        "     {COL_DIM}자동 진입을 끄려면 `aic init <shell> --no-attach`, 일시 우회는 `AIC_NO_ATTACH=1`{COL_RESET}"
+    );
     println!("  3. 명령 실행 → 실패하면 {COL_BOLD}aic{COL_RESET} 으로 분석");
 }
 
@@ -1779,9 +1789,28 @@ async fn handle_debug_bundle() {
     );
 }
 
+/// 대화형 셸을 `aic-session`(PTY 래퍼)으로 1회 교체하는 auto-attach 스니펫.
+///
+/// 5중 가드로 무한 재진입과 SSH 로그인 락아웃을 막는다 (bash/zsh 공통 문법):
+/// 1. `$- == *i*`     — 대화형 셸만 (scp·비대화형 SSH 명령은 제외)
+/// 2. `-z AIC_SESSION` — 이미 PTY 안이면 재진입 금지 (무한루프 차단; pty_manager가 `AIC_SESSION=1` set)
+/// 3. `-z AIC_NO_ATTACH` — 수동 탈출구. 락아웃 복구 시 `AIC_NO_ATTACH=1 ssh host`
+/// 4. `-t 0 && -t 1`  — stdin/stdout 둘 다 tty일 때만
+/// 5. `command -v`    — 바이너리가 PATH에 있을 때만 (미설치 시 셸 안 깨짐)
+///
+/// source 라인보다 **앞**에 둔다: 첫 진입은 여기서 exec로 교체되고, aic-session이
+/// 띄운 PTY 셸은 `AIC_SESSION=1` 때문에 가드 2에 걸려 통과 → 그제서야 source 실행.
+const ATTACH_SNIPPET: &str = r#"# aic PTY auto-attach — 대화형 셸을 aic-session(PTY 래퍼)으로 1회 교체.
+# 끄기: aic init <shell> --no-attach  |  일시 우회: AIC_NO_ATTACH=1 (SSH 락아웃 복구용)
+if [[ $- == *i* ]] && [[ -z "${AIC_SESSION:-}" ]] && [[ -z "${AIC_NO_ATTACH:-}" ]] && [[ -t 0 && -t 1 ]] && command -v aic-session >/dev/null 2>&1; then
+    exec aic-session
+fi
+"#;
+
 /// `aic init <shell>`: 셸 rc 파일에 `source ~/.aic/hooks.{shell}` 라인을 멱등 추가.
 /// 마커 `# >>> aic hooks >>>` ~ `# <<< aic hooks <<<` 로 감싸서 안전하게 롤백 가능.
-fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
+/// `no_attach`가 false(기본)면 source 앞에 PTY auto-attach 스니펫도 함께 넣는다.
+fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
     const MARKER_BEGIN: &str = "# >>> aic hooks >>>";
     const MARKER_END: &str = "# <<< aic hooks <<<";
 
@@ -1840,8 +1869,10 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
         std::process::exit(2);
     }
 
+    // auto-attach 스니펫은 source보다 앞 (위 ATTACH_SNIPPET 주석의 진입 순서 참조).
+    let attach = if no_attach { "" } else { ATTACH_SNIPPET };
     let snippet = format!(
-        "{MARKER_BEGIN}\nsource {hook}\n{MARKER_END}\n",
+        "{MARKER_BEGIN}\n{attach}source {hook}\n{MARKER_END}\n",
         hook = hook_path.display()
     );
 
@@ -1852,7 +1883,7 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
             hook = hook_path.display()
         );
         println!(
-            "{COL_DIM}↪ {rc} 에 이미 aic hook 마커가 있어 source 라인은 skip{COL_RESET}",
+            "{COL_DIM}↪ {rc} 에 이미 aic hook 마커가 있어 rc는 그대로 둠 (auto-attach 토글하려면 마커 블록 삭제 후 재실행){COL_RESET}",
             rc = rc_path.display()
         );
         std::process::exit(0);
@@ -1878,10 +1909,17 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool) {
         "{COL_GREEN}✔{COL_RESET} {hook} 생성/갱신",
         hook = hook_path.display()
     );
-    println!(
-        "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨\n  새 셸을 띄우거나 `source {rc}`로 활성화하세요",
-        rc = rc_path.display()
-    );
+    if no_attach {
+        println!(
+            "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨 {COL_DIM}(auto-attach 없음){COL_RESET}\n  새 셸을 띄우거나 `source {rc}`로 활성화한 뒤 `aic-session`으로 PTY 셸 진입",
+            rc = rc_path.display()
+        );
+    } else {
+        println!(
+            "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook + PTY auto-attach 추가됨\n  새 셸을 띄우면 자동으로 aic-session(PTY 셸)에 진입합니다\n  {COL_DIM}끄기: `aic init <shell> --no-attach` · 일시 우회: `AIC_NO_ATTACH=1`{COL_RESET}",
+            rc = rc_path.display()
+        );
+    }
 }
 
 /// `aic init --hook-mode`: Phase 3 metadata-only hook 설치.
@@ -6705,6 +6743,7 @@ fn print_command_block(title: &str, cmd: &str) {
 mod tests {
     use super::{
         apply_provider_override, chat_run_command_enabled, is_destructive_command, resolve_provider,
+        ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -6717,6 +6756,32 @@ mod tests {
     fn chat_run_command_default_enabled() {
         // 기본 chat(opt-out 없음) → run_command 활성.
         assert!(chat_run_command_enabled(false, false));
+    }
+
+    #[test]
+    fn attach_snippet_has_all_guards() {
+        // 가드가 하나라도 빠지면 무한 재진입 또는 SSH 락아웃 위험 → 회귀 방지.
+        assert!(ATTACH_SNIPPET.contains("$- == *i*"), "대화형 가드 누락");
+        assert!(
+            ATTACH_SNIPPET.contains(r#"-z "${AIC_SESSION:-}""#),
+            "재진입(무한루프) 가드 누락"
+        );
+        assert!(
+            ATTACH_SNIPPET.contains(r#"-z "${AIC_NO_ATTACH:-}""#),
+            "수동 탈출구 가드 누락"
+        );
+        assert!(ATTACH_SNIPPET.contains("-t 0 && -t 1"), "tty 가드 누락");
+        assert!(
+            ATTACH_SNIPPET.contains("command -v aic-session"),
+            "바이너리 존재 가드 누락"
+        );
+        // 모든 가드를 통과해야만 도달하는 단일 exec.
+        assert!(ATTACH_SNIPPET.contains("exec aic-session"));
+        assert_eq!(
+            ATTACH_SNIPPET.matches("exec aic-session").count(),
+            1,
+            "exec는 정확히 한 번"
+        );
     }
 
     #[test]
