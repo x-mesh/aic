@@ -57,8 +57,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // telemetry 초기화 (stderr + ~/.local/state/aic/server.log JSONL daily rotate, max 7일)
-    let _telemetry_guard = telemetry::init().ok();
+    let telemetry_guard = telemetry::init().ok();
     aic_server::metrics::init();
 
-    session_runtime::run(SessionRuntimeConfig { hook_policy }).await
+    let result = session_runtime::run(SessionRuntimeConfig { hook_policy }).await;
+
+    // run() 의 graceful 정리는 끝났지만 `wait_handle`(child.wait)·`stdin_handle`(stdin.read)
+    // 같은 spawn_blocking task 는 PTY EOF 시점에 셸이 아직 살아있으면 abort 로 멈추지 않고
+    // OS 스레드가 syscall 에 묶여 있다. 이 상태로 main 을 반환하면 `#[tokio::main]` 의
+    // Runtime::drop 이 blocking 풀 스레드 완료를 무한 대기하여 프로세스가 hang 한다
+    // (소켓은 삭제됐는데 종료가 안 됨). telemetry 를 flush 한 뒤 명시적으로 exit 하여
+    // runtime drop 의 blocking-thread join 을 우회한다.
+    drop(telemetry_guard);
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("aic-session 종료 오류: {e:#}");
+            std::process::exit(1);
+        }
+    }
 }
