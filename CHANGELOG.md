@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-06-08
+
+### Fixed
+- **세션 종료 시 셸을 빠져나오지 못하던 hang 수정** — PTY master가 EOF를 먼저
+  받는 경우(`trigger=pty-eof`, 셸은 아직 살아있음) `wait_handle`(`child.wait()`)·
+  `stdin_handle`(`stdin.read()`) 같은 `spawn_blocking` task가 syscall에 묶인 채
+  `abort()`로 멈추지 않아, `#[tokio::main]` 런타임 drop이 blocking 스레드 완료를
+  무한 대기하면서 프로세스가 종료되지 않던 문제(세션 소켓은 삭제됐는데 프로세스가
+  남고 `^C`도 먹지 않음)를 막는다. graceful 정리 후 명시적으로 프로세스를 종료해
+  런타임 drop의 blocking-thread join을 우회한다.
+
 ## [0.15.1] - 2026-06-05
 
 ### Fixed
