@@ -32,6 +32,19 @@ struct Cli {
     print_session_id: bool,
 }
 
+/// PTY 래퍼(aic-session)와 충돌하는 터미널을 감지한다. Warp 는 자체적으로 PTY 를 관리하고
+/// 출력을 block 단위로 렌더링하기 때문에, 그 안에서 중첩 PTY 래퍼를 띄우면 셸 통합(OSC 133)이
+/// 이중으로 들어가 화면이 깨지고 스크롤이 어긋난다. 해당 터미널이면 표시용 이름을 돌려준다.
+///
+/// `term_program` 은 `$TERM_PROGRAM` 값(SSH 로 원격 접속해도 전파된다). 순수 함수로 두어
+/// env 전역 상태 없이 테스트한다.
+fn pty_hostile_terminal(term_program: Option<&str>) -> Option<&'static str> {
+    match term_program {
+        Some("WarpTerminal") => Some("Warp"),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -48,6 +61,26 @@ async fn main() -> anyhow::Result<()> {
         unsafe {
             std::env::set_var("SHELL", shell);
         }
+    }
+
+    // Warp 등 자체 PTY 를 관리하는 터미널에서는 중첩 PTY 래퍼가 화면을 깨뜨린다. PTY 를
+    // 인수하지 않고 사용자의 셸로 즉시 degrade 하되, `AIC_NO_ATTACH=1` 을 설정해 Warp 가드가
+    // 없는 구버전 rc 스니펫이 다시 `exec aic-session` 하는 무한 루프를 차단한다. rc 의 hook
+    // source 는 auto-attach 가드 밖이라 그대로 실행되어 metadata(hook) 캡처는 유지된다.
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    if let Some(term) = pty_hostile_terminal(term_program.as_deref()) {
+        use std::os::unix::process::CommandExt;
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        eprintln!(
+            "aic-session: {term} 터미널은 PTY 래퍼와 충돌하여 셸({shell})로 전환합니다. \
+             metadata 캡처는 hook/hybrid 모드를 쓰세요 — aic config set session.capture_mode hybrid"
+        );
+        // exec 는 성공 시 돌아오지 않는다(프로세스 이미지 교체). 반환됐다면 실패다.
+        let err = std::process::Command::new(&shell)
+            .env("AIC_NO_ATTACH", "1")
+            .exec();
+        eprintln!("aic-session: 셸 exec 실패: {err}");
+        std::process::exit(1);
     }
 
     let hook_policy = if cli.no_hook {
@@ -78,6 +111,31 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => {
             eprintln!("aic-session 종료 오류: {e:#}");
             std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pty_hostile_terminal;
+
+    #[test]
+    fn warp_is_pty_hostile() {
+        assert_eq!(pty_hostile_terminal(Some("WarpTerminal")), Some("Warp"));
+    }
+
+    #[test]
+    fn normal_terminals_are_not_pty_hostile() {
+        for tp in [
+            Some("iTerm.app"),
+            Some("Apple_Terminal"),
+            Some("vscode"),
+            Some("ghostty"),
+            Some("tmux"),
+            Some(""),
+            None,
+        ] {
+            assert_eq!(pty_hostile_terminal(tp), None, "{tp:?} 은 PTY 호환이어야 한다");
         }
     }
 }

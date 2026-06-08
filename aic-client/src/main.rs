@@ -1897,7 +1897,8 @@ async fn handle_debug_bundle() {
 const ATTACH_SNIPPET: &str = r#"# aic PTY auto-attach — 대화형 셸을 aic-session(PTY 래퍼)으로 1회 교체.
 # 끄기: aic init <shell> --no-attach  |  일시 우회: AIC_NO_ATTACH=1 (SSH 락아웃 복구용)
 # AI 코딩 에이전트(claude/codex 등)가 띄운 셸에서는 교체하지 않는다.
-if [[ $- == *i* ]] && [[ -z "${AIC_SESSION:-}" ]] && [[ -z "${AIC_NO_ATTACH:-}" ]] && [[ -z "${CLAUDECODE:-}${CODEX_SANDBOX:-}${KIRO_SESSION_ID:-}" ]] && [[ -t 0 && -t 1 ]] && command -v aic-session >/dev/null 2>&1; then
+# Warp 는 자체 PTY+block 렌더링을 해서 중첩 PTY 래퍼와 충돌하므로 제외한다(hook/hybrid 모드 사용).
+if [[ $- == *i* ]] && [[ -z "${AIC_SESSION:-}" ]] && [[ -z "${AIC_NO_ATTACH:-}" ]] && [[ -z "${CLAUDECODE:-}${CODEX_SANDBOX:-}${KIRO_SESSION_ID:-}" ]] && [[ "${TERM_PROGRAM:-}" != "WarpTerminal" ]] && [[ -t 0 && -t 1 ]] && command -v aic-session >/dev/null 2>&1; then
     exec aic-session
 fi
 "#;
@@ -6962,6 +6963,11 @@ mod tests {
         assert!(
             ATTACH_SNIPPET.contains("${KIRO_SESSION_ID:-}"),
             "kiro-cli(KIRO_SESSION_ID) 에이전트 가드 누락"
+        );
+        // Warp 는 자체 PTY+block 렌더링이라 중첩 PTY 래퍼와 충돌 → auto-attach 제외.
+        assert!(
+            ATTACH_SNIPPET.contains(r#""${TERM_PROGRAM:-}" != "WarpTerminal""#),
+            "Warp 터미널 가드 누락"
         );
         // 모든 가드를 통과해야만 도달하는 단일 exec.
         assert!(ATTACH_SNIPPET.contains("exec aic-session"));
