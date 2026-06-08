@@ -31,6 +31,7 @@ use aic_common::aicd_attach_socket_path;
 #[cfg(not(feature = "phase-3_5"))]
 use aic_common::{generate_record_id, CommandRecord};
 use bytes::Bytes;
+use portable_pty::ChildKiller;
 use std::io::{Read, Write};
 use std::sync::Arc;
 #[cfg(not(feature = "phase-3_5"))]
@@ -60,6 +61,53 @@ pub(crate) struct SessionRuntimeState {
     /// 보장한다. dead_code lint 는 그래서 의도적으로 허용.
     #[allow(dead_code)]
     pub attach_metrics: Arc<AttachMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownTrigger {
+    ShellExit,
+    PtyEof,
+    Signal(&'static str),
+}
+
+impl ShutdownTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            ShutdownTrigger::ShellExit => "shell-exit",
+            ShutdownTrigger::PtyEof => "pty-eof",
+            ShutdownTrigger::Signal(sig) => sig,
+        }
+    }
+
+    fn should_kill_child(self) -> bool {
+        !matches!(self, ShutdownTrigger::ShellExit)
+    }
+}
+
+type SharedChildKiller = Arc<std::sync::Mutex<Box<dyn ChildKiller + Send + Sync>>>;
+
+fn request_child_shutdown(killer: Option<&SharedChildKiller>, trigger: ShutdownTrigger) {
+    let Some(killer) = killer else {
+        return;
+    };
+    match killer.lock() {
+        Ok(mut killer) => {
+            if let Err(e) = killer.kill() {
+                tracing::debug!(
+                    trigger = trigger.as_str(),
+                    error = %e,
+                    "PTY child 종료 신호 전송 실패 또는 이미 종료됨"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                trigger = trigger.as_str(),
+                error = %e,
+                "PTY child killer lock 획득 실패"
+            );
+        }
+    }
 }
 
 /// 현재 터미널 크기(rows, cols)를 반환한다.
@@ -106,6 +154,40 @@ fn set_raw_mode() -> anyhow::Result<libc::termios> {
 fn restore_terminal(orig: &libc::termios) {
     unsafe {
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, orig);
+    }
+}
+
+/// raw mode 진입 시 원본 termios 를 보관했다가 Drop 에서 복원하는 RAII 가드.
+///
+/// `set_raw_mode()` 이후 `run()` 이 어느 경로(정상 종료 / `?` 조기 반환 / `bail!`)로
+/// 빠져나가든 스코프 종료 시 터미널을 원래 모드로 되돌린다. 과거에는 종료 경로마다
+/// `restore_terminal` 을 수동 호출해야 했고, UDS bind 실패 같은 `?` 경로가 이를
+/// 누락해 터미널이 raw 인 채로 상위 `process::exit(1)` 까지 흘러가 사용자 터미널이
+/// 깨지는 버그가 있었다. 가드로 모든 경로를 일괄 커버한다. (raw mode 진입 *이전* 의
+/// `process::exit` 는 가드 생성 전이라 무관하다.)
+struct RawModeGuard {
+    orig: libc::termios,
+}
+
+impl RawModeGuard {
+    fn enter() -> anyhow::Result<Self> {
+        Ok(Self {
+            orig: set_raw_mode()?,
+        })
+    }
+
+    /// 정상 종료 경로에서 즉시 터미널을 복원한다. `Drop` 도 동일 복원을 수행하지만
+    /// `tcsetattr` 은 idempotent 하므로 이중 호출이 무해하다. cleanup(child-kill,
+    /// unregister, task abort/timeout) 동안 raw-mode 가 노출되는 창을 없애기 위해
+    /// 쓴다 — 조기 반환(`?`/`bail!`) 경로는 이 호출을 거치지 않고 `Drop` 이 복원한다.
+    fn restore_now(&self) {
+        restore_terminal(&self.orig);
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        restore_terminal(&self.orig);
     }
 }
 
@@ -499,8 +581,9 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
         crate::pty_manager::HookStatus::Disabled => {}
     }
 
-    // 2. 터미널 raw mode 설정
-    let orig_termios = set_raw_mode()?;
+    // 2. 터미널 raw mode 설정 — RAII 가드로 모든 종료 경로에서 복원을 보장한다. 조기 반환
+    //    (`?`/`bail!`) 은 가드 Drop 이, 정상 종료는 cleanup 초입의 `restore_now()` 가 복원한다.
+    let raw_mode_guard = RawModeGuard::enter()?;
 
     // 3. UDS 서버 바인딩 — ring_buffer 보다 먼저 binding 을 해 두어도 serve 는
     //    뒤에서 spawn 한다. Local data plane 생성 분기를 정한 뒤에 buffer 참조를
@@ -628,8 +711,7 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
             }
             Err(e) => {
                 // R7.1, R20.1: Phase 3.5 에서는 Local_Fallback 이 제거되어 attach 가 필수.
-                // raw mode 를 복원한 뒤 bail 하여 사용자 터미널을 깨끗한 상태로 돌려준다.
-                restore_terminal(&orig_termios);
+                // raw mode 는 `_raw_mode_guard` Drop 으로 bail 반환 시 자동 복원된다.
                 let _ = std::fs::remove_file(&sock);
                 anyhow::bail!(
                     "Phase 3.5: Attach_UDS 연결 실패 — aicd 가 기동되지 않았거나 응답하지 않습니다 ({}): {e}",
@@ -835,7 +917,10 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
         .lock()
         .ok()
         .and_then(|mut pty| pty.take_child());
-    let wait_handle = tokio::task::spawn_blocking(move || {
+    let child_killer: Option<SharedChildKiller> = child_for_wait
+        .as_ref()
+        .map(|child| Arc::new(std::sync::Mutex::new(child.clone_killer())));
+    let mut wait_handle = tokio::task::spawn_blocking(move || {
         if let Some(child) = child_for_wait.as_mut() {
             let _ = child.wait();
         }
@@ -865,14 +950,21 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
         }
     };
 
+    let mut output_handle = output_handle;
     let trigger = tokio::select! {
-        _ = wait_handle => "shell-exit",
-        _ = output_handle => "pty-eof",
-        sig = shutdown_signal => sig,
+        _ = &mut wait_handle => ShutdownTrigger::ShellExit,
+        _ = &mut output_handle => ShutdownTrigger::PtyEof,
+        sig = shutdown_signal => ShutdownTrigger::Signal(sig),
     };
 
-    // 10. Graceful 정리
-    restore_terminal(&orig_termios);
+    // 10. Graceful 정리 — 정상 경로에서는 즉시 터미널을 복원해 cleanup(child-kill,
+    //     unregister, task abort/timeout) 동안 raw-mode 노출 창을 없앤다. 조기 반환
+    //     (`?`/`bail!`) 경로는 `_raw_mode_guard` Drop 이 복원을 보장한다.
+    raw_mode_guard.restore_now();
+    if trigger.should_kill_child() {
+        request_child_shutdown(child_killer.as_ref(), trigger);
+    }
+
     // AttachClient 를 먼저 drop 하여 writer task 가 AttachClose 를 flush 한 뒤 자연
     // 종료하도록 한다. `attach_for_output` 이 `Arc` 를 들고 있다면 여기서 drop 해도
     // reference count 가 0 이 아닐 수 있어 원본 `attach_client` 와 spawn_blocking 쪽
@@ -880,14 +972,46 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
     // blocking task 가 종료된 상태이므로 `attach_for_output` 은 이미 소멸했다.
     drop(attach_client);
     crate::aicd_client::unregister_session(&session_id).await;
+    // uds/heartbeat/sigwinch 는 async `spawn` 이라 abort 가 실제로 task 를 취소한다.
+    // 반면 stdin/wait/output 은 `spawn_blocking` 이라 abort 가 실행 중인 OS 스레드를
+    // 멈추지 못한다(JoinHandle 만 cancelled 로 표시할 뿐 syscall 은 그대로 묶임).
+    // 특히 stdin_handle 의 `stdin.read()` 는 fd 0 가 EOF 를 받지 않는 한 모든 trigger 에서
+    // 영구 블록되며, 이 때문에 런타임 drop 의 blocking-pool join 이 hang 한다 —
+    // 최종 종료는 main.rs 의 명시적 `std::process::exit` 가 책임진다.
     uds_handle.abort();
     stdin_handle.abort();
     heartbeat_handle.abort();
     sigwinch_handle.abort();
+
+    if !wait_handle.is_finished()
+        && tokio::time::timeout(std::time::Duration::from_millis(750), &mut wait_handle)
+            .await
+            .is_err()
+    {
+        wait_handle.abort();
+        tracing::warn!(
+            trigger = trigger.as_str(),
+            session_id = %session_id,
+            "PTY child wait 가 timeout 되어 wait task 를 abort 합니다"
+        );
+    }
+    if !output_handle.is_finished()
+        && tokio::time::timeout(std::time::Duration::from_millis(750), &mut output_handle)
+            .await
+            .is_err()
+    {
+        output_handle.abort();
+        tracing::warn!(
+            trigger = trigger.as_str(),
+            session_id = %session_id,
+            "PTY output relay 가 timeout 되어 output task 를 abort 합니다"
+        );
+    }
+
     let _ = std::fs::remove_file(&sock);
 
     tracing::info!(
-        trigger = trigger,
+        trigger = trigger.as_str(),
         session_id = %session_id,
         socket = %sock.display(),
         "aic-session shutdown — 세션 소켓 삭제 완료"
