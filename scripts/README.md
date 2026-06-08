@@ -3,6 +3,27 @@
 본 디렉토리는 `aic-rust` 운영 및 성능 계측에 쓰이는 bash helper 스크립트를
 모아 둔다.
 
+## 원격 배포 — 릴리스 전 검증 (`deploy-remote.sh`)
+
+현재 작업 트리를 linux 타깃으로 cross-build(`cargo-zigbuild`, 릴리스와 동일한
+`--no-default-features --features phase-3_4`)해서 원격 서버에 `aic`/`aic-session`/
+`aicd` 를 설치하고 `aicd` 를 재시작한다. GitHub 릴리스를 내기 전에 패치를 실서버에서
+검증하는 용도다.
+
+```bash
+# 원격 arch·설치 경로 자동 감지 → 빌드 → 업로드 → 설치 → aicd 재시작
+scripts/deploy-remote.sh ubuntu@okrd-lib-mesh-ingester
+
+# 수행할 작업만 미리 보기
+scripts/deploy-remote.sh ubuntu@okrd-lib-mesh-ingester --dry-run
+
+# 옵션: --install-dir DIR | --no-restart | --skip-build
+```
+
+전제: 로컬 `rustup` + `zig`. `cargo-zigbuild` 와 linux rust 타깃은 스크립트가 없으면
+자동 설치한다. 원격은 SSH 키 접속 가능해야 한다. 빌드 조건(features/target)은
+`.goreleaser.yaml` 와 일치시켜 릴리스 아티팩트와 동일한 바이너리를 만든다.
+
 ## RSS 측정 — Phase 3.4 목표치 검증
 
 centralized-record-store spec ([tasks.md](../.kiro/specs/centralized-record-store/tasks.md),
