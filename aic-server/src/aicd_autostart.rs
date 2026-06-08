@@ -257,11 +257,28 @@ mod tests {
         let picked = adjacent_aicd(Some(&fake_exe)).expect("tempdir 에 aicd 가 있으므로 Some");
         assert_eq!(picked, aicd_path);
 
-        let result = std::process::Command::new(&picked)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        // Linux 멀티스레드 테스트 러너에서, 방금 write 한 실행 파일을 exec 할 때 다른
+        // 테스트 스레드의 fork 와 겹치면 그 자식이 이 파일의 write-fd 를 상속받아 execve 가
+        // ETXTBSY("Text file busy") 로 실패할 수 있다(커널 동작, parallelism 의존 flake).
+        // 짧게 재시도해 레이스를 흡수한다 — 겹친 자식이 곧 exec/exit 하면 write-fd 가 닫힌다.
+        let mut spawned = None;
+        for _ in 0..50 {
+            match std::process::Command::new(&picked)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => {
+                    spawned = Some(other);
+                    break;
+                }
+            }
+        }
+        let result = spawned.expect("ETXTBSY 재시도 한도를 넘어 spawn 을 시도하지 못함");
         assert!(result.is_ok(), "adjacent aicd spawn 실패: {result:?}");
         // zombie 방지: wait 로 reap.
         let _ = result.unwrap().wait();
