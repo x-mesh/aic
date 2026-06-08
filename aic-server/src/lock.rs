@@ -173,12 +173,25 @@ fn is_pid_alive(pid: u32, expected_path: Option<&str>) -> bool {
     // PID 살아있음 — exe path 비교 (PID recycling 방어)
     if let Some(expected) = expected_path {
         if let Some(actual) = process_exe_path(pid) {
-            if actual != expected {
+            if !exe_path_matches(expected, &actual) {
                 return false; // PID recycling — stale
             }
         }
     }
     true
+}
+
+/// 기록된 exe 경로(`expected`)와 실제 `/proc/<pid>/exe` 경로(`actual`)가 같은 바이너리를
+/// 가리키는지 판정한다.
+///
+/// Linux 에서 데몬 실행 중에 바이너리를 in-place 로 교체(업그레이드)하면 `/proc/<pid>/exe`
+/// 의 readlink 결과가 `"<path> (deleted)"` 가 된다. 같은 데몬이 그대로 살아있는 것이므로
+/// 이 suffix 를 떼고 비교한다 — 안 그러면 살아있는 aicd 를 stale(PID recycling)로 오판해
+/// 단일 인스턴스 보장이 깨지고, 업그레이드할 때마다 중복 aicd 가 떠 버린다. (PID 가 정말로
+/// 재활용돼 다른 바이너리가 들어선 경우는 경로 자체가 달라 여전히 mismatch 로 걸린다.)
+fn exe_path_matches(expected: &str, actual: &str) -> bool {
+    let actual = actual.strip_suffix(" (deleted)").unwrap_or(actual);
+    actual == expected
 }
 
 fn current_exe_path() -> Option<String> {
@@ -402,6 +415,24 @@ mod tests {
         // PID는 살아있지만 exe path가 다르면 PID recycling으로 간주 → stale
         let pid = std::process::id();
         assert!(!is_pid_alive(pid, Some("/totally/wrong/path/binary")));
+    }
+
+    #[test]
+    fn exe_path_matches_handles_in_place_upgrade() {
+        // 동일 경로 → 일치
+        assert!(exe_path_matches("/usr/local/bin/aicd", "/usr/local/bin/aicd"));
+        // Linux in-place 업그레이드: /proc/<pid>/exe 가 "(deleted)" suffix 를 단다.
+        // 같은 데몬이므로 일치로 봐야 한다 (이게 핵심 — 중복 aicd 방지).
+        assert!(exe_path_matches(
+            "/usr/local/bin/aicd",
+            "/usr/local/bin/aicd (deleted)"
+        ));
+        // 진짜 PID recycling: 다른 바이너리는 suffix 유무와 무관하게 mismatch.
+        assert!(!exe_path_matches("/usr/local/bin/aicd", "/usr/bin/python3"));
+        assert!(!exe_path_matches(
+            "/usr/local/bin/aicd",
+            "/usr/bin/python3 (deleted)"
+        ));
     }
 
     #[test]
