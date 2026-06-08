@@ -1286,12 +1286,22 @@ async fn handle_daemon_start(foreground: bool) {
         }
     }
 
-    match std::process::Command::new(&aicd_bin)
-        .stdin(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(&aicd_bin);
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    // aicd 를 자체 세션으로 분리한다(setsid) — `aic daemon start` 를 실행한 터미널이
+    // 닫혀도 데몬이 SIGHUP 으로 죽지 않게 한다. fork 직후·exec 직전이라 호출자는 process
+    // group leader 가 아니므로 setsid 가 성공한다.
+    // SAFETY: 클로저는 async-signal-safe 한 setsid 만 호출하고 힙 할당을 하지 않는다.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
         Ok(child) => {
             println!(
                 "{COL_GREEN}✓{COL_RESET} aicd 시작 — pid {pid} ({bin})",
