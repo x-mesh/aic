@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-06-08
+
+### Fixed
+- **Warp 터미널에서 화면이 깨지던 문제 수정** — Warp는 자체 PTY와 block 렌더링을
+  쓰기 때문에 그 안에서 aic-session(PTY 래퍼)으로 auto-attach하면 셸 통합(OSC 133)이
+  이중으로 들어가 화면이 깨지고 스크롤이 어긋났다. 이제 `aic init`이 만드는 auto-attach
+  스니펫이 Warp(`TERM_PROGRAM=WarpTerminal`)를 건너뛰고, aic-session도 Warp에서 실행되면
+  PTY를 인수하지 않고 셸로 전환한다. Warp에서 캡처가 필요하면 hook/hybrid 모드를 쓴다
+  (`aic config set session.capture_mode hybrid`). 기존 rc에 박힌 스니펫은 `aic init <shell>`
+  을 다시 실행하면 Warp 가드가 반영된다.
+
 ## [0.16.0] - 2026-06-08
 
 ### Added
