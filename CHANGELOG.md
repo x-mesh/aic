@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-08
+
+### Added
+- **capture-mode 설정(`pty`/`hook`/`hybrid`)** — `aic config set session.capture_mode <mode>`
+  또는 `aic init` 대화형 설정으로 세션 캡처 방식을 고른다. `hybrid`(신규 기본)·`hook`는
+  metadata-only로 동작하며 PTY auto-attach(`exec aic-session`)를 rc에 주입하지 않는다.
+  출력이 필요하면 `aic run -- <cmd>` 또는 `aic capture-last`를 사용한다.
+
+### Changed
+- **기본 capture-mode가 `pty` → `hybrid`로 변경** — ⚠️ `[session]` 섹션이 없는 기존
+  설정은 이제 hybrid(metadata-only)로 동작해, 새 셸에서 PTY auto-attach가 더 이상 자동
+  주입되지 않는다. **기존 PTY 캡처 동작을 유지하려면** `aic config set session.capture_mode pty`
+  실행 후 `aic init <shell>`을 다시 돌려 auto-attach 스니펫을 재주입한다.
+- 세션 종료 시 trigger(PtyEof/Signal)에 따라 자식 셸에 종료 신호(SIGHUP)를 보내고,
+  wait/output relay를 timeout 후 정리한다.
+
+### Fixed
+- **세션 종료 시 터미널이 raw mode로 남던 문제 수정** — `set_raw_mode` 이후 UDS bind
+  실패 같은 조기 종료 경로가 터미널을 복원하지 않고 종료해 셸 입력이 깨지던 버그를, RAII
+  가드로 모든 종료 경로(정상/오류)에서 복원하도록 일원화했다.
+
 ## [0.15.2] - 2026-06-08
 
 ### Fixed
