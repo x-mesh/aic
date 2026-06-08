@@ -62,12 +62,16 @@ async fn main() -> anyhow::Result<()> {
 
     let result = session_runtime::run(SessionRuntimeConfig { hook_policy }).await;
 
-    // run() 의 graceful 정리는 끝났지만 `wait_handle`(child.wait)·`stdin_handle`(stdin.read)
-    // 같은 spawn_blocking task 는 PTY EOF 시점에 셸이 아직 살아있으면 abort 로 멈추지 않고
-    // OS 스레드가 syscall 에 묶여 있다. 이 상태로 main 을 반환하면 `#[tokio::main]` 의
-    // Runtime::drop 이 blocking 풀 스레드 완료를 무한 대기하여 프로세스가 hang 한다
-    // (소켓은 삭제됐는데 종료가 안 됨). telemetry 를 flush 한 뒤 명시적으로 exit 하여
-    // runtime drop 의 blocking-thread join 을 우회한다.
+    // run() 의 graceful 정리는 끝났지만 일부 `spawn_blocking` task 의 OS 스레드가 syscall 에
+    // 묶인 채 남는다. abort 는 실행 중인 blocking task 를 멈추지 못하기 때문이다.
+    //   - stdin_handle(`stdin.read()`): fd 0 가 EOF 를 받지 않아 **모든 trigger 에서** 영구
+    //     블록되는 공통 주범.
+    //   - wait_handle(`child.wait()`)·output_handle(`reader.read()`): trigger 의존적이다.
+    //     pty-eof/shell-exit 에서는 셸이 이미 pty 를 닫아 곧 종료되지만, SIGTERM/SIGINT 로
+    //     `request_child_shutdown` 의 SIGHUP 을 셸이 무시하면 함께 블록될 수 있다.
+    // 이 상태로 main 을 반환하면 `#[tokio::main]` 의 Runtime::drop 이 blocking 풀 스레드
+    // 완료를 무한 대기하여 프로세스가 hang 한다(소켓은 삭제됐는데 종료가 안 됨). telemetry 를
+    // flush 한 뒤 명시적으로 exit 하여 runtime drop 의 blocking-thread join 을 우회한다.
     drop(telemetry_guard);
     match result {
         Ok(()) => std::process::exit(0),
