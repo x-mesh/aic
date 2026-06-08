@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-06-08
+
+### Fixed
+- **autostart한 aicd가 zombie(defunct) 프로세스로 남던 문제 수정** — aicd를 자동
+  기동할 때 자식 프로세스를 reap하지 않아, 중복 인스턴스가 단일-인스턴스 락에 막혀
+  즉시 종료하거나 제어 터미널이 닫혀 죽으면 `[aicd] <defunct>` zombie가 남았다. 이제
+  aicd를 별도 세션으로 분리(setsid)해 터미널 종료 신호에 휘둘리지 않게 하고, 종료 시
+  자식을 reap하는 reaper로 zombie를 막는다. `aic daemon start`로 띄운 aicd도 세션
+  분리되어 터미널을 닫아도 살아남는다.
+
 ## [0.16.1] - 2026-06-08
 
 ### Fixed
