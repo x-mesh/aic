@@ -943,6 +943,84 @@ fn search_hits_for(log: &[String], query: &str) -> Vec<usize> {
         .collect()
 }
 
+/// 텍스트를 OSC 52 escape 로 터미널 클립보드에 복사한다. SSH 로 원격 접속해도 터미널
+/// 에뮬레이터가 로컬 클립보드에 써 주므로 시스템 클립보드 crate 없이 동작한다. 터미널이
+/// OSC 52 를 지원하지 않으면(또는 클립보드 쓰기를 막아두면) 조용히 무시된다(best-effort).
+fn osc52_copy(text: &str) {
+    use std::io::Write;
+    let b64 = base64_encode(text.as_bytes());
+    // `\x1b]52;c;<base64>\x07` — c = CLIPBOARD selection, BEL 종료.
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b]52;c;{b64}\x07");
+    let _ = out.flush();
+}
+
+/// 최소 base64 인코더(표준 알파벳). OSC 52 payload 전용 — 외부 crate 의존을 피한다.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// ANSI escape(주로 SGR 색상 `\x1b[…m`, OSC 등)를 제거해 clipboard 용 평문을 만든다.
+/// CSI(`\x1b[` … 최종 바이트 0x40–0x7E)와 OSC(`\x1b]` … BEL/ST)를 건너뛴다.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for c2 in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                while let Some(c2) = chars.next() {
+                    if c2 == '\x07' {
+                        break;
+                    }
+                    if c2 == '\x1b' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
 /// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
 /// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
 /// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
@@ -965,6 +1043,9 @@ async fn chat_loop(
     // 터미널이 휠을 ↑↓ 키로 변환해 보내, 사용자가 스크롤하려다 입력 history가 바뀌는 문제가 생긴다.
     // best-effort — 미지원 터미널이어도 TUI 자체는 진입한다.
     let _ = execute!(io::stdout(), EnableMouseCapture);
+    // 마우스 캡처 상태 — Ctrl+T 로 토글한다. OFF 면 터미널 네이티브 드래그 선택(복사)이
+    // 살아나고, ON 이면 휠이 로그 스크롤로 동작한다.
+    let mut mouse_captured = true;
     let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
         Ok(t) => t,
         Err(_) => {
@@ -981,7 +1062,7 @@ async fn chat_loop(
     let mut hangul = HangulComposer::default();
     let mut events = EventStream::new();
     let mut sampler = with_statusbar.then(SysSampler::new);
-    let mut status = String::from("· (collecting metrics…)");
+    let mut status = String::from("· Ctrl+Y 복사 · Ctrl+T 마우스 · (metrics…)");
     let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
     // 대화 로그: 원본 ANSI 줄(dump용·색 보존, M1) + Text 캐시(m3, log 변경 시만 재구성).
@@ -1197,6 +1278,33 @@ async fn chat_loop(
                                 search_hits.clear();
                                 search_idx = 0;
                             }
+                            // Ctrl+Y: 대화 전체를 OSC 52 로 클립보드에 복사(ANSI 제거).
+                            // 마우스 캡처로 드래그 선택이 막혀 있어도 키 하나로 복사되며,
+                            // SSH 원격에서도 터미널이 로컬 클립보드에 써 준다.
+                            (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
+                                let text = log
+                                    .iter()
+                                    .map(|l| strip_ansi(l))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                osc52_copy(&text);
+                                status =
+                                    format!("· 대화 {}줄을 클립보드에 복사했습니다 (Ctrl+Y)", log.len());
+                            }
+                            // Ctrl+T: 마우스 캡처 토글. OFF 면 터미널 네이티브 드래그 선택/복사가
+                            // 가능해지고, ON 이면 휠 스크롤이 로그 viewport 로 동작한다.
+                            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                                mouse_captured = !mouse_captured;
+                                if mouse_captured {
+                                    let _ = execute!(io::stdout(), EnableMouseCapture);
+                                    status = String::from("· 마우스 캡처 ON — 휠 스크롤");
+                                } else {
+                                    let _ = execute!(io::stdout(), DisableMouseCapture);
+                                    status = String::from(
+                                        "· 마우스 캡처 OFF — 드래그 선택/복사 가능 (Ctrl+T 복귀)",
+                                    );
+                                }
+                            }
                             // PageUp/Down: 로그 스크롤(popup 활성과 무관하게 동작 — ↑↓는 popup 우선,
                             // PageUp/Down은 항상 로그). PageUp이면 follow 해제, PageDown으로 최하단
                             // 도달 시 follow 재개(m1 불변식: scroll==max면 follow).
@@ -1373,6 +1481,32 @@ async fn chat_loop(
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        // RFC 4648 테스트 벡터 + padding 경계.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // 멀티바이트(UTF-8) — 한글.
+        assert_eq!(base64_encode("안녕".as_bytes()), "7JWI64WV");
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_and_keeps_text() {
+        // SGR 색상.
+        assert_eq!(strip_ansi("\x1b[31m빨강\x1b[0m"), "빨강");
+        // 복합 CSI.
+        assert_eq!(strip_ansi("\x1b[1;38;5;204mbold\x1b[0m text"), "bold text");
+        // OSC(BEL 종료).
+        assert_eq!(strip_ansi("a\x1b]0;title\x07b"), "ab");
+        // escape 없는 평문은 그대로.
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
