@@ -71,26 +71,43 @@ pub fn try_start() -> Result<(), AutostartError> {
     let aicd_bin = discover_aicd_binary();
     let attempted = aicd_bin.display().to_string();
 
-    match std::process::Command::new(&aicd_bin)
-        .stdin(Stdio::null())
+    let mut cmd = std::process::Command::new(&aicd_bin);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+
+    // aicd 를 자체 세션으로 분리한다(setsid). 부모(aic-session)의 제어 터미널이 닫혀
+    // SIGHUP 이 전파돼도 aicd 가 함께 죽지 않게 한다 — aicd 는 세션을 가로질러 공유되는
+    // 데몬이므로 어느 한 세션의 종료에 휘둘리면 안 된다. `pre_exec` 는 fork 직후·exec 직전에
+    // 자식에서 실행되며, 이 시점엔 호출자가 process group leader 가 아니라 setsid 가 성공한다.
+    // 멀티스레드 fork 안전을 위해 클로저는 async-signal-safe 한 `setsid` 만 호출하고 힙
+    // 할당을 하지 않는다.
+    //
+    // SAFETY: 위 제약(async-signal-safe only, no alloc)을 지킨다.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+
+    match cmd.spawn() {
         Ok(child) => {
             tracing::info!(
                 pid = child.id(),
                 bin = %attempted,
                 "aicd autostart 성공 — Attach_UDS 재연결을 시도합니다"
             );
-            // 자식 pid 는 호출자에게 노출하지 않는다. detach 후 부모와 독립.
-            //
-            // 주의: `Child` 를 즉시 drop 해도 detached 는 아니며, `waitpid` 대상이
-            // 남아 zombie 가 될 수 있다. 하지만 Task 4.3 의 목표는 "aicd 를 띄우고
-            // 재시도" 이고, 재시도가 성공하면 `aic-session` 은 장시간 실행되며 종료 시
-            // 같이 reap 되므로 여기서는 추가 처리를 하지 않는다. 필요 시 향후 별도의
-            // reaper task 로 분리할 수 있다.
-            std::mem::drop(child);
+            // `Child` 를 detached reaper 스레드로 넘겨 종료 시 `wait` 한다. 이게 없으면
+            // aicd 가 (중복 인스턴스의 DaemonLock 실패 등으로) 먼저 종료할 때 부모가 reap
+            // 하지 않아 zombie 로 남는다. aicd 가 장기 실행이면 스레드는 그때까지 parked
+            // 되고, aic-session 이 먼저 종료되면 스레드도 사라지며 aicd 는 init 으로
+            // reparent 되어 init 이 reap 한다.
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AutostartError::BinaryNotFound {
