@@ -219,18 +219,18 @@ pub struct SessionInfo {
 #[serde(rename_all = "lowercase")]
 pub enum SessionCaptureMode {
     /// 기존 PTY wrapper. 출력 정확도 높음.
-    #[default]
     Pty,
     /// shell hook 기반 metadata-only.
     Hook,
     /// 평소 metadata-only, 분석 시 capture suggestion 자동 노출.
+    #[default]
     Hybrid,
 }
 
 /// 세션 동작 관련 사용자 설정.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// 어느 capture mode를 쓸지. 기본 "pty".
+    /// 어느 capture mode를 쓸지. 기본 "hybrid".
     #[serde(default)]
     pub capture_mode: SessionCaptureMode,
 }
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn legacy_app_config_without_session_section_deserializes() {
-        // Phase 4: 기존 config.toml에 [session] 섹션이 없어도 default(Pty)로 채워져야 한다.
+        // Phase 4: 기존 config.toml에 [session] 섹션이 없어도 default(Hybrid)로 채워져야 한다.
         let toml_str = r#"
 [llm]
 default_provider = "openai"
@@ -506,7 +506,7 @@ max_buffer_lines = 500
 method = "prompt_marker"
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Pty);
+        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Hybrid);
     }
 
     #[test]

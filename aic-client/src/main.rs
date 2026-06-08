@@ -8,7 +8,7 @@ use aic_client::repl::ReplSession;
 use aic_client::uds_client::{ReadCascade, UdsClient};
 use aic_common::{
     AicError, AnalysisResult, AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig,
-    ProviderType, ServerConfig,
+    ProviderType, ServerConfig, SessionCaptureMode,
 };
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
@@ -244,10 +244,11 @@ enum Commands {
         #[arg(value_parser = ["zsh", "bash"])]
         shell: Option<String>,
         /// Phase 3 metadata-only hook(`~/.aic/hook-events.{zsh,bash}`)을 함께 설치한다.
-        /// PTY hook과 충돌하지 않으며, aicd가 떠 있을 때만 실제로 동작한다.
+        /// 기본 capture_mode가 hook/hybrid이면 자동 적용된다.
         #[arg(long)]
         hook_mode: bool,
-        /// PTY auto-attach(`exec aic-session`)를 rc에 넣지 않는다. 기본은 주입.
+        /// PTY auto-attach(`exec aic-session`)를 rc에 넣지 않는다.
+        /// capture_mode가 hook/hybrid이면 기본적으로 주입하지 않는다.
         /// 대화형 셸이 자동으로 aic-session(PTY 래퍼)으로 교체되는 동작을 끈다.
         #[arg(long)]
         no_attach: bool,
@@ -687,6 +688,13 @@ enum ConfigOp {
         /// dot으로 구분된 path (예: `llm.default_provider`, `server.max_buffer_lines`)
         path: String,
     },
+    /// dotted path 값을 설정 (예: `aic config set session.capture_mode hybrid`)
+    Set {
+        /// dot으로 구분된 path. 현재는 `session.capture_mode`를 지원한다.
+        path: String,
+        /// 설정할 값
+        value: String,
+    },
 }
 
 #[tokio::main]
@@ -698,6 +706,7 @@ async fn main() {
             None => handle_config(),
             Some(ConfigOp::Show { json, show_secrets }) => handle_config_show(json, show_secrets),
             Some(ConfigOp::Get { path }) => handle_config_get(&path),
+            Some(ConfigOp::Set { path, value }) => handle_config_set(&path, &value),
         },
         Some(Commands::Doctor {
             json,
@@ -914,6 +923,89 @@ fn handle_config_get(path: &str) {
             }
         },
     }
+}
+
+fn handle_config_set(path: &str, value: &str) {
+    let mut config = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} 설정 로드 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = apply_config_set(&mut config, path, value) {
+        eprintln!("{COL_RED}✗{COL_RESET} {e}");
+        std::process::exit(2);
+    }
+
+    if let Err(e) = save_config(&config) {
+        eprintln!("{COL_RED}✗{COL_RESET} 설정 저장 실패: {e}");
+        std::process::exit(1);
+    }
+
+    println!("{COL_GREEN}✔{COL_RESET} {path} = {}", value.trim());
+    if matches!(
+        config.session.capture_mode,
+        SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
+    ) {
+        print_hook_capture_setup_hint(config.session.capture_mode);
+    }
+}
+
+fn apply_config_set(config: &mut AppConfig, path: &str, value: &str) -> anyhow::Result<()> {
+    match path.trim() {
+        "session.capture_mode" | "session.capture-mode" => {
+            config.session.capture_mode = parse_session_capture_mode(value)?;
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("지원하지 않는 config path: {other}. 현재 지원: session.capture_mode")
+        }
+    }
+}
+
+fn parse_session_capture_mode(value: &str) -> anyhow::Result<SessionCaptureMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "pty" => Ok(SessionCaptureMode::Pty),
+        "hook" => Ok(SessionCaptureMode::Hook),
+        "hybrid" => Ok(SessionCaptureMode::Hybrid),
+        other => anyhow::bail!("알 수 없는 capture mode: {other}. 허용값: pty, hook, hybrid"),
+    }
+}
+
+fn session_capture_mode_value(mode: SessionCaptureMode) -> &'static str {
+    match mode {
+        SessionCaptureMode::Pty => "pty",
+        SessionCaptureMode::Hook => "hook",
+        SessionCaptureMode::Hybrid => "hybrid",
+    }
+}
+
+fn resolve_init_modes(
+    configured_capture_mode: SessionCaptureMode,
+    hook_mode: bool,
+    no_attach: bool,
+) -> (bool, bool) {
+    let config_prefers_hook = matches!(
+        configured_capture_mode,
+        SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
+    );
+    let effective_hook_mode = hook_mode || config_prefers_hook;
+    let effective_no_attach = no_attach || hook_mode || config_prefers_hook;
+    (effective_hook_mode, effective_no_attach)
+}
+
+fn print_hook_capture_setup_hint(mode: SessionCaptureMode) {
+    let mode = session_capture_mode_value(mode);
+    println!();
+    println!("{COL_BOLD}다음 단계{COL_RESET}");
+    println!("  aic daemon start");
+    println!("  aic init <zsh|bash>");
+    println!("  exec <zsh|bash>");
+    println!(
+        "{COL_DIM}capture_mode={mode}: 일반 셸은 aic-session 없이 metadata를 기록하고, 출력이 필요하면 `aic run -- <cmd>` 또는 `aic capture-last`를 사용합니다. 기존 PTY auto-attach 마커가 있으면 마커 블록 삭제 후 init을 다시 실행하세요.{COL_RESET}"
+    );
 }
 
 /// `aic config show [--json] [--show-secrets]`: 현재 설정을 비-인터랙티브로 출력.
@@ -1825,6 +1917,11 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
             .unwrap_or("")
             .to_string()
     });
+    let configured_capture_mode = ConfigManager::load()
+        .map(|c| c.session.capture_mode)
+        .unwrap_or_default();
+    let (effective_hook_mode, effective_no_attach) =
+        resolve_init_modes(configured_capture_mode, hook_mode, no_attach);
 
     let (rc_filename, hook_filename) = match shell_name.as_str() {
         "zsh" => (".zshrc", "hooks.zsh"),
@@ -1835,7 +1932,7 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
         }
     };
 
-    if hook_mode {
+    if effective_hook_mode {
         install_hook_mode(&shell_name);
     }
 
@@ -1873,7 +1970,7 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
     }
 
     // auto-attach 스니펫은 source보다 앞 (위 ATTACH_SNIPPET 주석의 진입 순서 참조).
-    let attach = if no_attach { "" } else { ATTACH_SNIPPET };
+    let attach = if effective_no_attach { "" } else { ATTACH_SNIPPET };
     let snippet = format!(
         "{MARKER_BEGIN}\n{attach}source {hook}\n{MARKER_END}\n",
         hook = hook_path.display()
@@ -1912,11 +2009,18 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
         "{COL_GREEN}✔{COL_RESET} {hook} 생성/갱신",
         hook = hook_path.display()
     );
-    if no_attach {
-        println!(
-            "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨 {COL_DIM}(auto-attach 없음){COL_RESET}\n  새 셸을 띄우거나 `source {rc}`로 활성화한 뒤 `aic-session`으로 PTY 셸 진입",
-            rc = rc_path.display()
-        );
+    if effective_no_attach {
+        if effective_hook_mode {
+            println!(
+                "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨 {COL_DIM}(metadata-only, auto-attach 없음){COL_RESET}\n  `aic daemon start` 후 새 셸에서 command metadata가 기록됩니다. 출력이 필요하면 `aic run -- <cmd>` 또는 `aic capture-last`를 사용하세요.",
+                rc = rc_path.display()
+            );
+        } else {
+            println!(
+                "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook 추가됨 {COL_DIM}(auto-attach 없음){COL_RESET}\n  새 셸을 띄우거나 `source {rc}`로 활성화한 뒤 `aic-session`으로 PTY 셸 진입",
+                rc = rc_path.display()
+            );
+        }
     } else {
         println!(
             "{COL_GREEN}✔{COL_RESET} {rc}에 aic hook + PTY auto-attach 추가됨\n  새 셸을 띄우면 자동으로 aic-session(PTY 셸)에 진입합니다\n  {COL_DIM}끄기: `aic init <shell> --no-attach` · 일시 우회: `AIC_NO_ATTACH=1`{COL_RESET}",
@@ -3410,6 +3514,7 @@ fn handle_config() {
         "현재 설정 보기",
         "LLM Provider 설정",
         "응답 언어 설정",
+        "세션 캡처 모드 설정",
         "설정 파일 직접 편집 (예제 포함)",
         "종료",
     ];
@@ -3420,13 +3525,14 @@ fn handle_config() {
             .items(options)
             .default(0)
             .interact()
-            .unwrap_or(4);
+            .unwrap_or(5);
 
         match selection {
             0 => show_current_config(),
             1 => configure_llm_provider(),
             2 => configure_lang(),
-            3 => show_config_example(),
+            3 => configure_session_capture_mode(),
+            4 => show_config_example(),
             _ => break,
         }
         println!();
@@ -3522,6 +3628,65 @@ fn configure_lang() {
         eprintln!("설정 저장 실패: {e}");
     } else {
         println!("응답 언어가 '{}'로 설정되었습니다.", langs[selection]);
+    }
+}
+
+fn configure_session_capture_mode() {
+    let theme = ColorfulTheme::default();
+    let existing_config = ConfigManager::load().ok();
+    let current = existing_config
+        .as_ref()
+        .map(|c| c.session.capture_mode)
+        .unwrap_or_default();
+
+    let modes = [
+        (
+            SessionCaptureMode::Hybrid,
+            "hybrid — 기본, hook 우선 + 필요 시 explicit capture",
+        ),
+        (
+            SessionCaptureMode::Hook,
+            "hook — metadata-only, aic-session 없이 사용",
+        ),
+        (
+            SessionCaptureMode::Pty,
+            "pty — PTY output capture (정확도 높음)",
+        ),
+    ];
+    let labels: Vec<&str> = modes.iter().map(|(_, label)| *label).collect();
+    let default_idx = modes
+        .iter()
+        .position(|(mode, _)| *mode == current)
+        .unwrap_or(0);
+
+    println!(
+        "\n현재 세션 캡처 모드: {}\n",
+        session_capture_mode_value(current)
+    );
+    let selection = Select::with_theme(&theme)
+        .with_prompt("세션 캡처 모드 선택")
+        .items(&labels)
+        .default(default_idx)
+        .interact()
+        .unwrap_or(default_idx);
+
+    let mut config = existing_config.unwrap_or_else(default_config);
+    config.session.capture_mode = modes[selection].0;
+
+    if let Err(e) = save_config(&config) {
+        eprintln!("설정 저장 실패: {e}");
+        return;
+    }
+
+    println!(
+        "세션 캡처 모드가 '{}'로 설정되었습니다.",
+        session_capture_mode_value(config.session.capture_mode)
+    );
+    if matches!(
+        config.session.capture_mode,
+        SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
+    ) {
+        print_hook_capture_setup_hint(config.session.capture_mode);
     }
 }
 
@@ -4145,6 +4310,12 @@ max_buffer_lines = 500
 [server.boundary_strategy]
 method = "prompt_marker"
 # idle_threshold_ms = 500  # timing_heuristic 사용 시
+
+[session]
+# hybrid: 기본값. aic-session 없이 hook metadata 기록, 필요 시 explicit capture
+# hook: metadata-only 기록
+# pty: aic-session 기반 정확한 출력 캡처
+capture_mode = "hybrid"
 
 # 환경변수:
 # AIC_DEBUG=1  디버그 모드 활성화 (로그 출력)
@@ -6745,13 +6916,14 @@ fn print_command_block(title: &str, cmd: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_provider_override, chat_run_command_enabled, is_destructive_command, resolve_provider,
+        apply_config_set, apply_provider_override, chat_run_command_enabled,
+        is_destructive_command, parse_session_capture_mode, resolve_init_modes, resolve_provider,
         ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
         AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType, ServerConfig,
-        SessionConfig,
+        SessionCaptureMode, SessionConfig,
     };
     use std::collections::HashMap;
 
@@ -6839,6 +7011,62 @@ mod tests {
         assert!(!is_destructive_command("git status"));
         assert!(!is_destructive_command("cat /etc/hosts"));
         assert!(!is_destructive_command("rm foo.txt")); // no -rf
+    }
+
+    #[test]
+    fn parse_session_capture_mode_accepts_supported_values() {
+        assert_eq!(
+            parse_session_capture_mode("pty").unwrap(),
+            SessionCaptureMode::Pty
+        );
+        assert_eq!(
+            parse_session_capture_mode("HOOK").unwrap(),
+            SessionCaptureMode::Hook
+        );
+        assert_eq!(
+            parse_session_capture_mode(" hybrid ").unwrap(),
+            SessionCaptureMode::Hybrid
+        );
+        assert!(parse_session_capture_mode("screen").is_err());
+    }
+
+    #[test]
+    fn config_set_updates_session_capture_mode() {
+        let mut cfg = config_with_providers("openai", &["openai"]);
+        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Hybrid);
+
+        apply_config_set(&mut cfg, "session.capture_mode", "pty").unwrap();
+        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Pty);
+
+        apply_config_set(&mut cfg, "session.capture-mode", "hook").unwrap();
+        assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Hook);
+
+        let err = apply_config_set(&mut cfg, "server.max_buffer_lines", "1000").unwrap_err();
+        assert!(err.to_string().contains("지원하지 않는 config path"));
+    }
+
+    #[test]
+    fn init_modes_follow_capture_mode_default() {
+        assert_eq!(
+            resolve_init_modes(SessionCaptureMode::Hybrid, false, false),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_init_modes(SessionCaptureMode::Hook, false, false),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_init_modes(SessionCaptureMode::Pty, false, false),
+            (false, false)
+        );
+        assert_eq!(
+            resolve_init_modes(SessionCaptureMode::Pty, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            resolve_init_modes(SessionCaptureMode::Pty, false, true),
+            (false, true)
+        );
     }
 
     fn config_with_providers(default: &str, names: &[&str]) -> AppConfig {
