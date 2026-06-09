@@ -867,11 +867,16 @@ async fn main() {
                 return;
             }
 
-            // 인자가 있으면 프롬프트로 사용, 없으면 기본 동작
-            let prompt = if cli.prompt.is_empty() {
-                None
-            } else {
-                Some(cli.prompt.join(" "))
+            // 인자가 있으면 프롬프트로 사용, 없으면 기본 동작.
+            // 공백만 있는 인자(`aic "  "`)는 무인자와 동일하게 직전 명령 분석으로 흘려보낸다
+            // — 빈 prompt를 LLM에 보내 토큰을 낭비하지 않도록.
+            let prompt = {
+                let joined = cli.prompt.join(" ");
+                if joined.trim().is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
             };
 
             if let Err(e) = handle_default(prompt, cli.dry_run, cli.provider, cli.context).await {
@@ -5902,8 +5907,11 @@ async fn handle_chat(
     let dispatcher = LlmDispatcher::from_config(config.llm.clone());
 
     // 인자가 있으면 1회성 답변 (direct-prompt와 동일 경로).
-    if !prompt_parts.is_empty() {
-        let prompt = prompt_parts.join(" ");
+    // 공백만 있는 인자(`aic chat "  "`)는 무인자와 동일하게 아래 대화형 REPL로 흘려보낸다
+    // — 빈 prompt를 LLM에 보내 토큰을 낭비하지 않도록.
+    let joined_prompt = prompt_parts.join(" ");
+    if !joined_prompt.trim().is_empty() {
+        let prompt = joined_prompt;
         let prompt = if with_context {
             let ctx = aic_client::project_context::build_context_pack();
             if let Some(c) = ctx.as_deref() {

@@ -78,7 +78,20 @@ impl ErrorAnalyzer {
     /// 오해해 임의의 재실행 명령을 제안할 수 있으므로 로컬에서 막는다.
     pub fn deterministic_result(record: &CommandRecord, lang: &str) -> Option<AnalysisResult> {
         if record.exit_code != 130 {
-            return deterministic_known_error(record, lang);
+            if let Some(known) = deterministic_known_error(record, lang) {
+                return Some(known);
+            }
+            // 출력 내용이 없어 exit_code만 신뢰 가능한 실패는 LLM에 보내봐야 동어반복뿐이라
+            // 토큰만 낭비된다. 종료 코드 자체를 결정론적으로 설명하고 재실행을 권한다.
+            // 성공(exit 0)·히스토리 폴백(exit -1/placeholder)·실질 출력 있음은 제외 — 각각 다른 경로가 처리.
+            if record.exit_code != 0
+                && record.exit_code != -1
+                && !is_history_fallback(record)
+                && output_is_empty_or_noise(&record.output_lines, record.command.as_deref())
+            {
+                return Some(deterministic_exit_only(record, lang));
+            }
+            return None;
         }
 
         let command_known = record
@@ -722,6 +735,98 @@ fn deterministic_known_error(record: &CommandRecord, lang: &str) -> Option<Analy
     None
 }
 
+/// 출력이 히스토리 폴백 placeholder인지 — exit_code=-1 또는 "히스토리에서 가져옴" 마커.
+/// 이 경우 exit_code 자체가 불명(또는 출력이 합성)이라 결정론적 exit 설명 대상에서 제외한다.
+fn is_history_fallback(record: &CommandRecord) -> bool {
+    record.exit_code == -1
+        || (record.output_lines.len() == 1
+            && record.output_lines[0].contains("히스토리에서 가져옴"))
+}
+
+/// 출력 라인이 전부 빈 줄/노이즈(셸 프롬프트·2자 이하·명령어 에코)라서
+/// 분석할 실질 내용이 없는지 판정한다. 빈 Vec도 true(=내용 없음).
+/// 노이즈 기준은 `clean_output_lines`와 동일하게 유지한다.
+fn output_is_empty_or_noise(lines: &[String], command: Option<&str>) -> bool {
+    let cmd_trim = command.map(str::trim).filter(|s| !s.is_empty());
+    lines.iter().all(|s| {
+        let t = s.trim();
+        t.is_empty()
+            || matches!(t, "%" | "$" | ">" | "#")
+            || t.chars().count() <= 2
+            || cmd_trim == Some(t)
+    })
+}
+
+/// 128+N 종료 코드의 시그널 이름. 흔한 POSIX 시그널만 매핑한다.
+fn signal_name(sig: i32) -> Option<&'static str> {
+    Some(match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        _ => return None,
+    })
+}
+
+/// 출력 없이 exit_code만 신뢰 가능한 실패를 LLM 없이 설명한다.
+/// 128+N은 시그널 종료로, 그 외는 일반 종료 코드로 안내하고 재실행(실제 출력 확보)을 권한다.
+/// SIGINT(130)는 상위 `deterministic_result`에서 별도 처리되어 여기 도달하지 않는다.
+fn deterministic_exit_only(record: &CommandRecord, lang: &str) -> AnalysisResult {
+    let code = record.exit_code;
+    let sig_label = match code {
+        129..=159 => {
+            let n = code - 128;
+            Some(match signal_name(n) {
+                Some(name) => format!("{n} ({name})"),
+                None => n.to_string(),
+            })
+        }
+        _ => None,
+    };
+
+    let explanation = match lang {
+        "english" => match &sig_label {
+            Some(s) => format!("The process was terminated by signal {s}. No output was captured, so this signal is the only reliable cause."),
+            None => format!("The command exited with code {code}, but no output was captured, so the concrete cause cannot be determined."),
+        },
+        "japanese" => match &sig_label {
+            Some(s) => format!("プロセスはシグナル {s} で終了しました。出力が取得されていないため、確実な原因はこのシグナルだけです。"),
+            None => format!("コマンドは終了コード {code} で失敗しましたが、出力が取得されていないため具体的な原因は特定できません。"),
+        },
+        "chinese" => match &sig_label {
+            Some(s) => format!("进程被信号 {s} 终止。未捕获到输出，因此该信号是唯一可靠的原因。"),
+            None => format!("命令以退出码 {code} 失败，但未捕获到输出，无法确定具体原因。"),
+        },
+        _ => match &sig_label {
+            Some(s) => format!("프로세스가 시그널 {s}로 종료됐습니다. 캡처된 출력이 없어 신뢰할 수 있는 원인은 이 시그널뿐입니다."),
+            None => format!("명령이 종료 코드 {code}로 실패했습니다. 캡처된 출력이 없어 구체적인 원인은 확인할 수 없습니다."),
+        },
+    };
+
+    let info = match lang {
+        "english" => "Rerun the same command so its real error output is visible, then run aic again. (LLM analysis was skipped because there was no output.)",
+        "japanese" => "同じコマンドを再実行して実際のエラー出力を表示してから、再度 aic を実行してください。（出力がないため LLM 分析を省略しました。）",
+        "chinese" => "重新运行同一命令以显示真实的错误输出，然后再次运行 aic。（因无输出已跳过 LLM 分析。）",
+        _ => "같은 명령을 다시 실행해 실제 오류 출력이 보이면 그때 aic로 분석하세요. (출력이 없어 LLM 호출을 생략했습니다.)",
+    };
+
+    AnalysisResult {
+        explanation,
+        suggested_command: None,
+        additional_info: Some(info.to_string()),
+    }
+}
+
 fn rule_result(
     lang: &str,
     rule_id: &str,
@@ -1145,6 +1250,62 @@ mod tests {
             .additional_info
             .unwrap()
             .contains("git.non_fast_forward"));
+    }
+
+    // ── deterministic_result: 출력 없는 exit-only (LLM 스킵) ──────
+
+    #[test]
+    fn deterministic_result_empty_output_signal_is_exit_only() {
+        // SIGKILL(137) + 출력 없음 → 시그널 설명, LLM 스킵
+        let record = make_record(Some("python train.py"), 137, vec![]);
+        let result = ErrorAnalyzer::deterministic_result(&record, "korean").unwrap();
+        assert!(result.explanation.contains("SIGKILL"));
+        assert!(result.explanation.contains("9")); // 137 - 128 = signal 9
+        assert!(result.suggested_command.is_none());
+        assert!(result.additional_info.is_some());
+    }
+
+    #[test]
+    fn deterministic_result_empty_output_generic_exit_is_exit_only() {
+        // exit 1 + 출력 없음 → 종료 코드 설명, LLM 스킵
+        let record = make_record(Some("false"), 1, vec![]);
+        let result = ErrorAnalyzer::deterministic_result(&record, "korean").unwrap();
+        assert!(result.explanation.contains("종료 코드 1"));
+        assert!(result.suggested_command.is_none());
+    }
+
+    #[test]
+    fn deterministic_result_noise_only_output_is_exit_only() {
+        // 셸 프롬프트만 캡처된 노이즈 → 실질 출력 없음 취급
+        let record = make_record(Some("make"), 2, vec!["%", "$"]);
+        let result = ErrorAnalyzer::deterministic_result(&record, "korean").unwrap();
+        assert!(result.explanation.contains("종료 코드 2"));
+        assert!(result.suggested_command.is_none());
+    }
+
+    #[test]
+    fn deterministic_result_with_real_output_falls_through_to_llm() {
+        // 출력에 실질 내용이 있으면 None → LLM 경로 유지
+        let record = make_record(
+            Some("cargo build"),
+            101,
+            vec!["error[E0433]: failed to resolve import"],
+        );
+        assert!(ErrorAnalyzer::deterministic_result(&record, "korean").is_none());
+    }
+
+    #[test]
+    fn deterministic_result_history_fallback_not_exit_only() {
+        // exit -1 (히스토리 폴백) → exit-only 아님 (LLM hypothesis 경로 유지)
+        let record = make_record(Some("chmod 755 x"), -1, vec![]);
+        assert!(ErrorAnalyzer::deterministic_result(&record, "korean").is_none());
+    }
+
+    #[test]
+    fn deterministic_result_success_is_none() {
+        // exit 0 은 실패가 아니므로 결정론 분류 대상 아님
+        let record = make_record(Some("ls"), 0, vec![]);
+        assert!(ErrorAnalyzer::deterministic_result(&record, "korean").is_none());
     }
 
     // ── parse_response: 영어 라벨 ──────────────────────────────

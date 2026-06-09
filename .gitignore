@@ -48,3 +48,4 @@ aic-server/.git/
 aic-client/.gitignore
 aic-common/.gitignore
 aic-server/.gitignore
+.xm/
