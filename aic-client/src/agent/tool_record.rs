@@ -169,10 +169,11 @@ pub(crate) enum SlashCommand {
     Last(Option<usize>),
     /// `/raw`(None=마지막) / `/raw <seq|corr>`(Some).
     Raw(Option<String>),
-    /// `/local [section] [--raw|-r|--analyze|-a]` — 로컬 sysinfo 스냅샷.
+    /// `/local [section ...] [--raw|-r|--analyze|-a]` — 로컬 sysinfo 스냅샷.
     /// 기본 `analyze=true`(LLM 분석 요약), `--raw`/`-r`이면 false(raw만). alias: `/sys`, `/snapshot`.
+    /// 섹션은 다중 지정 가능(빈 목록=전체). docker 섹션은 설치 호스트에서만 유효.
     Local {
-        section: Option<String>,
+        sections: Vec<String>,
         analyze: bool,
     },
     /// `/diagnose [--raw|-r|--analyze|-a] [<증상 rest-of-line>]` — read-only SRE 진단.
@@ -354,7 +355,10 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "ip" => "네트워크 인터페이스 주소",
         "route" => "라우팅 테이블",
         "ports" => "LISTEN 중인 포트",
-        _ => "",
+        // docker 섹션 등 나머지는 Probe Catalog의 설명을 그대로 쓴다(단일 출처).
+        _ => super::probes::probe_by_id(name)
+            .map(|p| p.description)
+            .unwrap_or(""),
     }
 }
 
@@ -403,18 +407,18 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         "last" => SlashCommand::Last(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "raw" => SlashCommand::Raw(parts.next().map(|s| s.to_string())),
         "local" | "sys" | "snapshot" => {
-            // 인자: 플래그(--raw/-r=analyze off, --analyze/-a=on) + 첫 비-플래그 토큰=section.
+            // 인자: 플래그(--raw/-r=analyze off, --analyze/-a=on) + 비-플래그 토큰들=섹션 목록.
             let mut analyze = true;
-            let mut section = None;
+            let mut sections = Vec::new();
             for p in parts {
                 match p {
                     "--raw" | "-r" => analyze = false,
                     "--analyze" | "-a" => analyze = true,
-                    s if !s.starts_with('-') && section.is_none() => section = Some(s.to_string()),
+                    s if !s.starts_with('-') => sections.push(s.to_string()),
                     _ => {}
                 }
             }
-            SlashCommand::Local { section, analyze }
+            SlashCommand::Local { sections, analyze }
         }
         "diagnose" => {
             // 선행 플래그(--raw/-r/--analyze/-a)만 소비하고, 나머지 rest-of-line을 증상으로(quote strip).
@@ -682,9 +686,11 @@ fn slash_context(line: &str, pos: usize) -> Option<SlashContext> {
         Some((cmd, _rest)) => {
             let last = before.rsplit(char::is_whitespace).next().unwrap_or("");
             // 플래그(`--run` 등)를 타이핑 중이면 인자 후보를 내지 않는다.
-            let pool: Option<&[&'static str]> = match cmd {
-                "local" | "sys" | "snapshot" | "watch" => Some(super::sysinfo::LOCAL_SECTIONS),
-                "triage" => Some(super::probes::TRIAGE_TOPICS),
+            let pool: Option<Vec<&'static str>> = match cmd {
+                // local 계열은 호스트 가용 섹션(docker 설치 시 docker_* 포함).
+                "local" | "sys" | "snapshot" => Some(super::sysinfo::available_sections()),
+                "watch" => Some(super::sysinfo::LOCAL_SECTIONS.to_vec()),
+                "triage" => Some(super::probes::TRIAGE_TOPICS.to_vec()),
                 _ => None,
             };
             pool.map(|pool| SlashContext {
@@ -692,7 +698,7 @@ fn slash_context(line: &str, pos: usize) -> Option<SlashContext> {
                 cands: if last.starts_with('-') {
                     Vec::new()
                 } else {
-                    match_candidates(last, pool)
+                    match_candidates(last, &pool)
                 },
                 is_command: false,
                 full_palette: false,
@@ -749,7 +755,7 @@ pub(crate) fn help_text() -> String {
         "  /resume              이전 세션 대화 복원 (~/.aic/sessions/last.json)",
         "  /last [N]            직전 tool 카드 / 최근 N개 요약",
         "  /raw [seq|corr]      마지막(또는 지정) tool의 redacted 전체 출력",
-        "  /local [section] [--raw]  로컬 sysinfo 스냅샷 → LLM 분석 요약 (alias: /sys, /snapshot)",
+        "  /local [section ...] [--raw]  로컬 sysinfo 스냅샷 → LLM 분석 요약 (alias: /sys, /snapshot)",
         "                       --raw/-r: 모델 호출 없이 원본만. --analyze/-a: 분석(기본).",
         "                       section: date host os uptime disk memory ip route ports",
         "                       (분석 시 redacted 스냅샷이 provider로 전송됨. AIC_LOCAL_NO_ANALYZE=1로 끔.)",
@@ -1263,28 +1269,40 @@ mod tests {
         assert_eq!(
             parse_slash("/local"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: true
             })
         );
         assert_eq!(
             parse_slash("/sys"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: true
             })
         );
         assert_eq!(
             parse_slash("/snapshot"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: true
             })
         );
         assert_eq!(
             parse_slash("/local disk"),
             Some(SlashCommand::Local {
-                section: Some("disk".to_string()),
+                sections: vec!["disk".to_string()],
+                analyze: true
+            })
+        );
+        // 다중 섹션 — 입력 순서 보존.
+        assert_eq!(
+            parse_slash("/local disk memory ports"),
+            Some(SlashCommand::Local {
+                sections: vec![
+                    "disk".to_string(),
+                    "memory".to_string(),
+                    "ports".to_string()
+                ],
                 analyze: true
             })
         );
@@ -1292,39 +1310,47 @@ mod tests {
 
     #[test]
     fn parse_slash_local_flags() {
-        // --raw/-r → analyze=false. --analyze/-a → true. section은 첫 비-플래그.
+        // --raw/-r → analyze=false. --analyze/-a → true. 비-플래그 토큰들은 섹션 목록.
         assert_eq!(
             parse_slash("/local --raw"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: false
             })
         );
         assert_eq!(
             parse_slash("/local -r"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: false
             })
         );
         assert_eq!(
             parse_slash("/local disk --raw"),
             Some(SlashCommand::Local {
-                section: Some("disk".to_string()),
+                sections: vec!["disk".to_string()],
                 analyze: false
             })
         );
         assert_eq!(
             parse_slash("/local -r disk"),
             Some(SlashCommand::Local {
-                section: Some("disk".to_string()),
+                sections: vec!["disk".to_string()],
+                analyze: false
+            })
+        );
+        // 플래그가 섹션 사이에 끼어도 섹션 순서는 보존.
+        assert_eq!(
+            parse_slash("/local disk -r memory"),
+            Some(SlashCommand::Local {
+                sections: vec!["disk".to_string(), "memory".to_string()],
                 analyze: false
             })
         );
         assert_eq!(
             parse_slash("/sys -a"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: true
             })
         );
@@ -1420,7 +1446,7 @@ mod tests {
         assert_eq!(
             parse_slash("/loc"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: true
             })
         );
@@ -1434,7 +1460,7 @@ mod tests {
         assert_eq!(
             parse_slash("/loc --raw"),
             Some(SlashCommand::Local {
-                section: None,
+                sections: vec![],
                 analyze: false
             })
         );
@@ -1891,6 +1917,13 @@ mod tests {
             assert!(
                 !slash_description(sec).is_empty(),
                 "no desc for section {sec}"
+            );
+        }
+        // docker 섹션은 Probe Catalog 설명 fallback으로 커버된다.
+        for sec in super::super::sysinfo::LOCAL_DOCKER_SECTIONS {
+            assert!(
+                !slash_description(sec).is_empty(),
+                "no desc for docker section {sec}"
             );
         }
     }
