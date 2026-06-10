@@ -44,6 +44,8 @@ pub struct WebhookConfig {
     pub rate_limit_per_min: u32,
     pub dedup_ttl: Duration,
     pub auto_diagnose: bool,
+    /// 자동 진단에 `--follow-up`을 붙일지(헤드리스 기본 false, config opt-in).
+    pub follow_up: bool,
     /// spawn할 `aic` 실행 파일 경로.
     pub aic_bin: PathBuf,
 }
@@ -71,6 +73,7 @@ impl IncomingAlert {
 struct WebhookState {
     secret: Option<String>,
     auto_diagnose: bool,
+    follow_up: bool,
     aic_bin: PathBuf,
     dedup_ttl: Duration,
     limiter: Mutex<TokenBucket>,
@@ -124,6 +127,7 @@ pub async fn serve(cfg: WebhookConfig, mut shutdown: watch::Receiver<bool>) -> a
     let state = Arc::new(WebhookState {
         secret: cfg.secret,
         auto_diagnose: cfg.auto_diagnose,
+        follow_up: cfg.follow_up,
         aic_bin: cfg.aic_bin,
         dedup_ttl: cfg.dedup_ttl,
         limiter: Mutex::new(TokenBucket::new(cfg.rate_limit_per_min, now)),
@@ -233,6 +237,7 @@ fn spawn_diagnose(state: &WebhookState, alert: &IncomingAlert) {
     let symptom = sanitize_symptom(&alert.symptom_text());
     let label = sanitize_label(&alert.fingerprint);
     let aic_bin = state.aic_bin.clone();
+    let follow_up = state.follow_up;
     // child를 await해 좀비를 reap. rate limiter가 spawn 빈도를 bound하므로 task 누적은 없음.
     tokio::spawn(async move {
         let mut cmd = tokio::process::Command::new(&aic_bin);
@@ -240,7 +245,11 @@ fn spawn_diagnose(state: &WebhookState, alert: &IncomingAlert) {
             .arg(&symptom)
             .arg("--bundle")
             .arg("--name")
-            .arg(&label)
+            .arg(&label);
+        if follow_up {
+            cmd.arg("--follow-up");
+        }
+        cmd
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
