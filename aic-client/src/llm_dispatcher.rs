@@ -376,14 +376,14 @@ impl LlmDispatcher {
 
     /// 현재 provider가 tool-calling(`send_messages`)을 지원하는지.
     ///
-    /// OpenAI-compat 경로(OpenAiCompatible / Groq)만 true. 호출부는 false일 때
-    /// 기존 단발 `send` 경로(ReplSession)로 폴백한다.
+    /// OpenAI-compat(OpenAiCompatible / Groq)과 Anthropic(SRE R4) 경로가 true.
+    /// 호출부는 false일 때 기존 단발 `send` 경로(ReplSession)로 폴백한다.
     pub fn supports_tool_calling(&self) -> bool {
         self.resolve_provider()
             .map(|p| {
                 matches!(
                     p.provider_type,
-                    ProviderType::OpenAiCompatible | ProviderType::Groq
+                    ProviderType::OpenAiCompatible | ProviderType::Groq | ProviderType::Anthropic
                 )
             })
             .unwrap_or(false)
@@ -400,12 +400,16 @@ impl LlmDispatcher {
         tools: &[crate::agent::types::ToolSpec],
     ) -> Result<crate::agent::types::ChatResponse, AicError> {
         let provider = self.resolve_provider()?;
+        // Anthropic은 wire format이 달라 전용 경로로 분기(SRE R4).
+        if matches!(provider.provider_type, ProviderType::Anthropic) {
+            return self.send_messages_anthropic(provider, messages, tools).await;
+        }
         if !matches!(
             provider.provider_type,
             ProviderType::OpenAiCompatible | ProviderType::Groq
         ) {
             return Err(AicError::ConfigError(
-                "send_messages는 OpenAI 호환 provider에서만 지원됩니다".to_string(),
+                "send_messages는 OpenAI 호환 또는 Anthropic provider에서만 지원됩니다".to_string(),
             ));
         }
 
@@ -501,6 +505,116 @@ impl LlmDispatcher {
                 Err(AicError::LlmApiError {
                     status: 0,
                     message: "응답에서 메시지를 추출할 수 없습니다".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Anthropic Messages API tool-calling 경로 (SRE R4). `send_messages`에서 분기 호출된다.
+    ///
+    /// OpenAI와의 차이: system은 top-level 필드, tools는 `input_schema`, tool 결과는 user
+    /// content의 `tool_result` 블록, 응답은 `content[].tool_use` 블록. 변환은
+    /// `agent::types::{to_anthropic_request, parse_anthropic_response}`가 단일 출처로 담당한다.
+    async fn send_messages_anthropic(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[crate::agent::types::ChatMessage],
+        tools: &[crate::agent::types::ToolSpec],
+    ) -> Result<crate::agent::types::ChatResponse, AicError> {
+        self.circuit.check()?;
+
+        let endpoint = provider
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://api.anthropic.com/v1/messages");
+        let raw = provider
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AicError::ApiKeyMissing {
+                provider: self.config.default_provider.clone(),
+            })?;
+        let resolved = crate::keychain::resolve(raw).map_err(|e| AicError::ApiKeyMissing {
+            provider: format!("{} ({e})", self.config.default_provider),
+        })?;
+        let model = provider.model.as_deref().unwrap_or("claude-sonnet-4-6");
+
+        let redact_enabled = std::env::var("AIC_REDACT")
+            .map(|v| v.to_lowercase() != "off")
+            .unwrap_or(true);
+
+        let (system, mut wire_messages) = crate::agent::types::to_anthropic_request(messages);
+        if redact_enabled {
+            for m in &mut wire_messages {
+                redact_anthropic_content(m);
+            }
+        }
+
+        let mut body = json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": wire_messages,
+        });
+        if let Some(sys) = system {
+            let sys = if redact_enabled {
+                crate::redaction::redact(&sys).0
+            } else {
+                sys
+            };
+            body["system"] = json!(sys);
+        }
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::Value::Array(tools.iter().map(|t| t.to_anthropic_json()).collect());
+        }
+
+        let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
+        let resp = self
+            .http_client
+            .post(endpoint)
+            .header("x-api-key", resolved.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: e.to_string(),
+            });
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                self.circuit.record_failure();
+                return Err(e);
+            }
+        };
+        if let Err(e) = handle_http_status(&resp) {
+            self.circuit.record_failure();
+            return Err(e);
+        }
+
+        let bytes = resp.bytes().await.map_err(|e| AicError::LlmApiError {
+            status: 0,
+            message: format!("응답 수신 실패: {e}"),
+        })?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: format!("응답 파싱 실패: {e}"),
+            })?;
+
+        match crate::agent::types::parse_anthropic_response(&json) {
+            Some(r) => {
+                self.circuit.record_success();
+                Ok(r)
+            }
+            None => {
+                self.circuit.record_failure();
+                Err(AicError::LlmApiError {
+                    status: 0,
+                    message: "Anthropic 응답에서 메시지를 추출할 수 없습니다".to_string(),
                 })
             }
         }
@@ -790,6 +904,22 @@ fn extract_anthropic_content(json: &serde_json::Value) -> Result<String, AicErro
             status: 0,
             message: "Anthropic 응답에서 content를 추출할 수 없습니다".to_string(),
         })
+}
+
+/// Anthropic wire 메시지의 content 블록 내 텍스트(`text`/tool_result `content`)에 redaction을
+/// 적용한다(송신 직전 단일 stage — OpenAI 경로의 string content redaction과 동일 정책). SRE R4.
+fn redact_anthropic_content(message: &mut serde_json::Value) {
+    let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    for block in blocks {
+        for key in ["text", "content"] {
+            if let Some(s) = block.get(key).and_then(|v| v.as_str()) {
+                let (red, _r) = crate::redaction::redact(s);
+                block[key] = serde_json::Value::String(red);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1137,7 +1267,7 @@ mod tests {
     // ── send_messages / tool-calling capability ────────────────
 
     #[test]
-    fn supports_tool_calling_true_for_openai_and_groq() {
+    fn supports_tool_calling_true_for_openai_groq_anthropic() {
         let openai = LlmDispatcher::from_config(make_config(
             ProviderType::OpenAiCompatible,
             Some("sk-x"),
@@ -1146,13 +1276,14 @@ mod tests {
         assert!(openai.supports_tool_calling());
         let groq = LlmDispatcher::from_config(make_config(ProviderType::Groq, Some("gsk-x"), None));
         assert!(groq.supports_tool_calling());
+        // SRE R4: Anthropic도 네이티브 tool-calling 지원(read-only 강등 제거).
+        let anthropic =
+            LlmDispatcher::from_config(make_config(ProviderType::Anthropic, Some("sk-ant"), None));
+        assert!(anthropic.supports_tool_calling());
     }
 
     #[test]
-    fn supports_tool_calling_false_for_anthropic_and_cli() {
-        let anthropic =
-            LlmDispatcher::from_config(make_config(ProviderType::Anthropic, Some("sk-ant"), None));
-        assert!(!anthropic.supports_tool_calling());
+    fn supports_tool_calling_false_for_cli() {
         let cli = LlmDispatcher::from_config(make_config(
             ProviderType::CliBackend,
             None,
@@ -1161,10 +1292,28 @@ mod tests {
         assert!(!cli.supports_tool_calling());
     }
 
+    #[test]
+    fn redact_anthropic_content_masks_text_and_tool_result() {
+        let mut msg = json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "key sk-ant-abcdefghijklmnopqrstuvwxyz0123456789ABCD" },
+                { "type": "tool_result", "tool_use_id": "t1", "content": "token ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ" }
+            ]
+        });
+        redact_anthropic_content(&mut msg);
+        let text = msg["content"][0]["text"].as_str().unwrap();
+        let tr = msg["content"][1]["content"].as_str().unwrap();
+        assert!(text.contains("[REDACTED:"), "text not redacted: {text}");
+        assert!(tr.contains("[REDACTED:"), "tool_result not redacted: {tr}");
+    }
+
     #[tokio::test]
     async fn send_messages_unsupported_provider_errors() {
         use crate::agent::types::ChatMessage;
-        let config = make_config(ProviderType::Anthropic, Some("sk-ant"), None);
+        // CliBackend는 tool-calling 미지원 — send_messages가 ConfigError로 폴백 유도.
+        // (Anthropic은 R4부터 전용 경로로 지원되므로 더 이상 unsupported가 아니다.)
+        let config = make_config(ProviderType::CliBackend, None, Some("/bin/echo"));
         let dispatcher = LlmDispatcher::from_config(config);
         let msgs = vec![ChatMessage::User("hi".to_string())];
         let err = dispatcher.send_messages(&msgs, &[]).await.unwrap_err();
