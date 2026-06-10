@@ -291,6 +291,11 @@ enum Commands {
         #[command(subcommand)]
         op: WhitelistOp,
     },
+    /// aicd webhook alert ingestion 수신·진단 이력 조회 (SRE R2).
+    Webhook {
+        #[command(subcommand)]
+        op: WebhookOp,
+    },
     /// 첫 사용 통합 가이드 — config + init + migrate-keys + doctor 순으로 안내
     Setup {
         /// 셸 종류 (자동 감지: $SHELL)
@@ -692,6 +697,19 @@ enum WhitelistOp {
 }
 
 #[derive(Subcommand)]
+enum WebhookOp {
+    /// aicd가 수신한 alert 처리 이력을 최근순으로 출력 (수신/진단/dedup/rate-limit/인증실패).
+    List {
+        /// 최근 N개만 표시 (기본 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// JSON 출력(스크립팅용).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigOp {
     /// 현재 설정을 비-인터랙티브로 출력 (기본 TOML, `--json`도 가능). API key는 마스킹된다.
     Show {
@@ -762,6 +780,9 @@ async fn main() {
                 timeout_secs,
                 yes,
             } => handle_hosts_trust(name, timeout_secs, yes).await,
+        },
+        Some(Commands::Webhook { op }) => match op {
+            WebhookOp::List { limit, json } => handle_webhook_list(limit, json),
         },
         Some(Commands::Whitelist { op }) => match op {
             WhitelistOp::Status => handle_whitelist_status(),
@@ -4419,6 +4440,7 @@ fn default_config() -> AppConfig {
         },
         session: aic_common::SessionConfig::default(),
         observability: aic_common::ObservabilityConfig::default(),
+        aicd: aic_common::AicdConfig::default(),
     }
 }
 
@@ -6079,6 +6101,61 @@ async fn handle_diagnose_cli(
     Ok(())
 }
 
+/// `aic webhook list [--limit N] [--json]` — aicd webhook-events.jsonl을 최근순으로 출력 (SRE R2 t11).
+fn handle_webhook_list(limit: usize, json: bool) {
+    let path = aic_common::paths::webhook_events_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => {
+            if json {
+                println!("[]");
+            } else {
+                println!(
+                    "수신된 webhook 이벤트가 없습니다 ({}).\n  aicd webhook 활성화: config [aicd.webhook] enabled=true",
+                    path.display()
+                );
+            }
+            return;
+        }
+    };
+    // JSONL 라인을 파싱(깨진 라인은 skip), 최근 limit개만.
+    let mut events: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let total = events.len();
+    if events.len() > limit {
+        events = events.split_off(total - limit);
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&events).unwrap_or_else(|_| "[]".to_string())
+        );
+        return;
+    }
+    if events.is_empty() {
+        println!("수신된 webhook 이벤트가 없습니다.");
+        return;
+    }
+    println!("최근 webhook 이벤트 {}개 (전체 {total}):", events.len());
+    for ev in &events {
+        let ts = ev.get("ts").and_then(|v| v.as_str()).unwrap_or("?");
+        let action = ev.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+        let source = ev.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+        let alert = ev.get("alert").and_then(|v| v.as_str()).unwrap_or("-");
+        let sev = ev.get("severity").and_then(|v| v.as_str()).unwrap_or("");
+        let sev = if sev.is_empty() {
+            String::new()
+        } else {
+            format!(" [{sev}]")
+        };
+        println!("  {ts}  {action:<12} {source:<12} {alert}{sev}");
+    }
+}
+
 async fn handle_default(
     direct_prompt: Option<String>,
     dry_run: bool,
@@ -7216,6 +7293,7 @@ mod tests {
             },
             session: SessionConfig::default(),
             observability: aic_common::ObservabilityConfig::default(),
+            aicd: aic_common::AicdConfig::default(),
         }
     }
 

@@ -470,6 +470,38 @@ url = "http://elasticsearch:9200"
 # 또는 자연어로 물으면 에이전트가 prometheus_query/loki_query/es_search 도구를 호출한다.
 ```
 
+### aicd webhook alert ingestion (SRE R2)
+
+aicd가 Alertmanager/Grafana/PagerDuty/generic webhook을 수신해, firing alert마다
+`aic diagnose --bundle`(읽기 전용 진단 + 증거 번들)을 자동 spawn한다. 온콜이 터미널을
+열기 전에 증거가 준비된다. **기본 비활성 + 127.0.0.1 바인드**다.
+
+```toml
+[aicd.webhook]
+enabled = true                    # opt-in (기본 false)
+listen_addr = "127.0.0.1:9099"    # 기본 localhost. 외부 노출은 리버스 프록시 경유 권장
+secret = "shared-secret"          # 인증용. env AIC_WEBHOOK_SECRET가 우선
+rate_limit_per_min = 10           # alert storm 비용 폭주 차단(token-bucket)
+dedup_ttl_secs = 300              # 동일 fingerprint 재진단 차단(루프 방지)
+auto_diagnose = true              # alert 수신 시 aic diagnose 자동 spawn
+```
+
+인증(secret 설정 시 둘 중 하나 필요):
+- `Authorization: Bearer <secret>` (Alertmanager/Grafana 헤더)
+- `X-AIC-Signature: <hex HMAC-SHA256(secret, body)>` (PagerDuty류/generic)
+
+엔드포인트: `POST /webhook/alertmanager` · `/webhook/grafana` · `/webhook/pagerduty` · `/webhook`(generic) · `GET /health`.
+
+```sh
+# Alertmanager receiver 예시
+#   webhook_configs:
+#     - url: http://127.0.0.1:9099/webhook/alertmanager
+#       http_config: { authorization: { credentials: "shared-secret" } }
+
+aic webhook list            # 수신·진단·dedup·rate-limit 이력 조회
+aic webhook list --json     # 스크립팅용
+```
+
 ## Environment Variables
 
 | Variable | Description | Default |

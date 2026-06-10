@@ -86,6 +86,38 @@ pub fn local_command_record_path() -> PathBuf {
     session_dir().join("last-command.json")
 }
 
+/// 영속 상태 디렉터리 (XDG State). `$XDG_STATE_HOME/aic` 또는 `~/.local/state/aic`.
+/// session_dir(runtime, ephemeral)과 달리 재부팅을 넘어 보존되는 로그/이벤트용.
+pub fn state_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        PathBuf::from(xdg).join("aic")
+    } else {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        home.join(".local").join("state").join("aic")
+    }
+}
+
+/// aicd webhook 수신·처리 이벤트 로그(JSONL) 경로 (SRE R2). `aic webhook list`가 읽는다.
+pub fn webhook_events_path() -> PathBuf {
+    state_dir().join("webhook-events.jsonl")
+}
+
+/// `config.toml` 경로 (XDG Base Directory). aic-client(ConfigManager)와 aicd(aic-server)가
+/// 동일 경로를 읽도록 단일 출처로 둔다. `$XDG_CONFIG_HOME/aic/config.toml` 또는 `~/.config/aic/config.toml`.
+pub fn config_file_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(xdg).join("aic").join("config.toml")
+    } else {
+        // aic-common은 lean하게 유지(dirs 미사용) — HOME에서 직접 결정.
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~"));
+        home.join(".config").join("aic").join("config.toml")
+    }
+}
+
 /// shell hook start/end 사이의 임시 metadata 경로.
 pub fn local_hook_pending_path(session_id: &str, command_id: &str) -> PathBuf {
     let safe_session = sanitize_path_token(session_id);

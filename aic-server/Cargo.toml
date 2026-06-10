@@ -39,11 +39,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 clap = { version = "4", features = ["derive"] }
+# SRE R2: aicd webhook alert ingestion. axum HTTP 리스너 + HMAC 인증.
+# rustls 미사용(평문 localhost 바인드 전용) — TLS는 리버스 프록시에 위임.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+hmac = "0.12"
+sha2 = "0.10"
+toml = "0.8"
 
 [dev-dependencies]
 proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
+# webhook_server 통합 테스트에서 실제 HTTP POST를 보낸다.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # attach_server 테스트에서 AttachClientFrame::PtyBytes 를 만들 때 `Bytes` 타입을 직접 쓴다.
 # aic-common 이 이미 bytes = "1" 을 선언하고 있어 wire format 은 공유되지만, 여기선
 # test-only 편의를 위해 명시적으로 dev-dependency 로 가져온다.

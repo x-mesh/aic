@@ -16,3 +16,5 @@ pub mod session_registry;
 pub mod session_runtime;
 pub mod telemetry;
 pub mod uds_server;
+// SRE R2: webhook alert ingestion → aic diagnose 자동 spawn.
+pub mod webhook_server;
