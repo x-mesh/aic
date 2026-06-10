@@ -502,6 +502,9 @@ aic webhook list            # 수신·진단·dedup·rate-limit 이력 조회
 aic webhook list --json     # 스크립팅용
 ```
 
+> 기능별 실전 온콜 워크플로는 [docs/SRE-USE-CASES.md](docs/SRE-USE-CASES.md), 설계 경계는
+> [docs/SRE-SCOPE-BOUNDARY.md](docs/SRE-SCOPE-BOUNDARY.md) 참조.
+
 ### Headless / air-gapped 서버 (SRE)
 
 aic는 TTY·GUI·인터넷이 없는 서버에서 1급으로 동작한다. CI의 `headless` job이 이 경로를
