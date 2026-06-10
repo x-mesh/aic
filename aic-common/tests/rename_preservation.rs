@@ -79,6 +79,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                     },
                     session: SessionConfig::default(),
                     observability: ObservabilityConfig::default(),
+                    aicd: AicdConfig::default(),
                 }
             },
         )

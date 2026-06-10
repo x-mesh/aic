@@ -127,11 +127,29 @@ async fn main() -> anyhow::Result<()> {
         attach_server.serve(attach_shutdown).await;
     });
 
+    // SRE R2: webhook alert ingestion (opt-in). config [aicd.webhook]에서 활성화 시
+    // 별도 task로 HTTP 리스너를 띄우고 동일 shutdown watch를 공유한다(graceful 종료).
+    let webhook_handle = match load_webhook_config() {
+        Some(cfg) => {
+            let wh_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::webhook_server::serve(cfg, wh_shutdown).await {
+                    tracing::warn!(error = %e, "webhook 리스너 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
     server.serve(control_ctx).await;
 
     // Control 루프가 빠져나오면 attach 루프도 동일 notify 로 이미 깨어난 상태.
     // join 하여 in-flight 연결 정리 시간을 준다.
     let _ = attach_handle.await;
+    // webhook 리스너도 동일 shutdown watch를 구독하므로 graceful 종료된다.
+    if let Some(h) = webhook_handle {
+        let _ = h.await;
+    }
 
     reconcile_handle.abort();
     // 소켓 파일 정리 — AttachServer 는 Drop 구현이 없으므로 명시 remove.
@@ -141,4 +159,33 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("aicd 종료");
     Ok(())
+}
+
+/// config.toml `[aicd.webhook]`을 읽어 webhook 설정을 만든다(활성+유효할 때만 Some).
+/// secret은 환경변수 `AIC_WEBHOOK_SECRET`가 config 평문보다 우선한다(aicd는 keychain 미resolve).
+fn load_webhook_config() -> Option<aic_server::webhook_server::WebhookConfig> {
+    let path = aic_common::paths::config_file_path();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let app: aic_common::AppConfig = toml::from_str(&content)
+        .map_err(|e| tracing::warn!(error = %e, "config 파싱 실패 — webhook 비활성"))
+        .ok()?;
+    let w = app.aicd.webhook;
+    if !w.enabled {
+        return None;
+    }
+    // aicd 옆에 있는 aic 바이너리를 우선, 없으면 PATH.
+    let aic_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("aic")))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("aic"));
+    let secret = std::env::var("AIC_WEBHOOK_SECRET").ok().or(w.secret);
+    Some(aic_server::webhook_server::WebhookConfig {
+        listen_addr: w.listen_addr,
+        secret,
+        rate_limit_per_min: w.rate_limit_per_min,
+        dedup_ttl: std::time::Duration::from_secs(w.dedup_ttl_secs),
+        auto_diagnose: w.auto_diagnose,
+        aic_bin,
+    })
 }

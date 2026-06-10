@@ -249,6 +249,9 @@ pub struct AppConfig {
     /// 레거시 config 호환을 위해 default — 미설정 시 등록 백엔드 없음.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// aicd 데몬 설정 (SRE R2: webhook alert ingestion). 레거시 호환 default.
+    #[serde(default)]
+    pub aicd: AicdConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -400,6 +403,74 @@ pub enum BackendType {
     Elasticsearch,
 }
 
+// ── AicdConfig / AicdWebhookConfig (SRE R2) ────────────────
+
+/// aicd 데몬 설정.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AicdConfig {
+    /// webhook alert ingestion 설정.
+    #[serde(default)]
+    pub webhook: AicdWebhookConfig,
+}
+
+/// aicd webhook 리스너 설정 (Alertmanager/Grafana/PagerDuty/generic JSON 수신).
+///
+/// 기본 **비활성**이며, 활성화해도 **127.0.0.1 바인드**가 기본이다(외부 노출 방지).
+/// 인증 secret은 HMAC-SHA256(secret, body) 검증에 쓰인다 — 평문 또는 환경변수
+/// `AIC_WEBHOOK_SECRET`로 주입(aicd는 keychain을 resolve하지 않는다).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AicdWebhookConfig {
+    /// webhook 리스너 활성화 여부. 기본 false(opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// 바인드 주소. 기본 `127.0.0.1:9099`(localhost 전용).
+    #[serde(default = "default_webhook_listen")]
+    pub listen_addr: String,
+    /// HMAC 공유 secret(평문). 환경변수 `AIC_WEBHOOK_SECRET`가 우선한다.
+    /// 미설정 시 인증 없음(localhost 바인드 + opt-in이라 허용하되 경고).
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// 분당 최대 LLM 진단 횟수(token-bucket). alert storm 비용 폭주 방지. 기본 10.
+    #[serde(default = "default_webhook_rate_limit")]
+    pub rate_limit_per_min: u32,
+    /// 동일 fingerprint(alertname+labels) 재진단 차단 TTL(초). 기본 300(5분).
+    #[serde(default = "default_webhook_dedup_ttl")]
+    pub dedup_ttl_secs: u64,
+    /// alert 수신 시 `aic diagnose`를 자동 spawn할지. 기본 true.
+    /// false면 수신·기록만 하고 자동 진단은 하지 않는다.
+    #[serde(default = "default_true")]
+    pub auto_diagnose: bool,
+}
+
+impl Default for AicdWebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_addr: default_webhook_listen(),
+            secret: None,
+            rate_limit_per_min: default_webhook_rate_limit(),
+            dedup_ttl_secs: default_webhook_dedup_ttl(),
+            auto_diagnose: true,
+        }
+    }
+}
+
+fn default_webhook_listen() -> String {
+    "127.0.0.1:9099".to_string()
+}
+
+fn default_webhook_rate_limit() -> u32 {
+    10
+}
+
+fn default_webhook_dedup_ttl() -> u64 {
+    300
+}
+
+fn default_true() -> bool {
+    true
+}
+
 // ── AnalysisResult ─────────────────────────────────────────────
 
 /// LLM 에러 분석 결과.
@@ -528,6 +599,7 @@ mod tests {
             },
             session: SessionConfig::default(),
             observability: ObservabilityConfig::default(),
+            aicd: AicdConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
@@ -549,6 +621,63 @@ method = "prompt_marker"
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Hybrid);
+    }
+
+    #[test]
+    fn aicd_webhook_config_defaults_are_safe() {
+        // SRE R2: webhook은 기본 비활성 + localhost 바인드 + 보수적 한도.
+        let w = AicdWebhookConfig::default();
+        assert!(!w.enabled, "webhook은 기본 비활성(opt-in)");
+        assert_eq!(w.listen_addr, "127.0.0.1:9099", "기본 바인드는 localhost");
+        assert!(w.secret.is_none());
+        assert_eq!(w.rate_limit_per_min, 10);
+        assert_eq!(w.dedup_ttl_secs, 300);
+        assert!(w.auto_diagnose);
+    }
+
+    #[test]
+    fn legacy_config_without_aicd_section_defaults_disabled() {
+        // [aicd] 섹션이 없는 레거시 config도 default(비활성)로 채워져야 한다.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.aicd.webhook.enabled);
+        assert_eq!(cfg.aicd.webhook.listen_addr, "127.0.0.1:9099");
+    }
+
+    #[test]
+    fn aicd_webhook_section_parses() {
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.webhook]
+enabled = true
+listen_addr = "127.0.0.1:9200"
+secret = "s3cr3t"
+rate_limit_per_min = 30
+dedup_ttl_secs = 600
+auto_diagnose = false
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.aicd.webhook.enabled);
+        assert_eq!(cfg.aicd.webhook.listen_addr, "127.0.0.1:9200");
+        assert_eq!(cfg.aicd.webhook.secret.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.aicd.webhook.rate_limit_per_min, 30);
+        assert_eq!(cfg.aicd.webhook.dedup_ttl_secs, 600);
+        assert!(!cfg.aicd.webhook.auto_diagnose);
     }
 
     #[test]
