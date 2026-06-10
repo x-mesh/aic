@@ -75,3 +75,5 @@ tempfile = "3"
 http = "1"
 aic-server = { path = "../aic-server", default-features = false }
 strip-ansi-escapes = "0.2"
+# SRE R1: 관측 백엔드 도구(obs_tools) 통합 테스트용 in-process HTTP mock 서버.
+wiremock = "0.6"

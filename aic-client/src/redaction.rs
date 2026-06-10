@@ -1,6 +1,7 @@
 //! LLM 송신 직전 prompt redaction — secret/PII를 마스킹.
 //!
-//! Secret 5종: AWS access key, GitHub token, Anthropic key, OpenAI key, JWT
+//! Secret 7종: AWS access key, GitHub token, Anthropic key, OpenAI key, JWT,
+//! DB connection string(user:pass@host), HTTP Bearer token (관측 백엔드 R1)
 //! PII 4종: email, 한국 전화번호, 주민등록번호, IPv4 주소
 //!
 //! 단일 stage. LLM 송신 전 1회 적용. 응답에는 적용 X.
@@ -102,6 +103,18 @@ fn patterns() -> &'static Vec<(&'static str, Regex, bool)> {
                 Regex::new(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").unwrap(),
                 true,
             ),
+            // 관측 백엔드(R1) 응답·헤더에 섞이는 자격증명 — 정형 매칭(entropy 무관, 항상 마스킹).
+            // conn_string은 email/ipv4보다 먼저 매칭돼야 user:pass@host 전체를 가린다.
+            (
+                "conn_string",
+                Regex::new(r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:[^\s:/@]+@[^\s/]+").unwrap(),
+                false,
+            ),
+            (
+                "bearer_token",
+                Regex::new(r"(?i)bearer\s+[A-Za-z0-9._~+/=\-]{16,}").unwrap(),
+                false,
+            ),
             // PII (영향 큰 것부터) — 정형 매칭만, entropy 무관
             (
                 "kr_rrn",
@@ -144,6 +157,37 @@ mod tests {
     fn redacts_github_token() {
         let (out, _) = redact("token: ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ");
         assert!(out.contains("[REDACTED:github_token]"));
+    }
+
+    // ── 관측 백엔드(R1) 자격증명 패턴 ─────────────────────────
+
+    #[test]
+    fn redacts_postgres_connection_string() {
+        // 메트릭/로그 응답에 섞인 DB conn string은 user:pass@host 전체가 가려져야 한다.
+        let (out, _) = redact("DATABASE_URL=postgres://app:s3cr3tPass@db-primary:5432/orders");
+        assert!(out.contains("[REDACTED:conn_string]"), "out={out}");
+        assert!(!out.contains("s3cr3tPass"));
+    }
+
+    #[test]
+    fn redacts_redis_connection_string() {
+        let (out, _) = redact("redis://default:hunter2hunter2@cache.internal:6379");
+        assert!(out.contains("[REDACTED:conn_string]"), "out={out}");
+        assert!(!out.contains("hunter2"));
+    }
+
+    #[test]
+    fn redacts_bearer_token() {
+        let (out, _) = redact("Authorization: Bearer abcDEF123ghiJKL456mnoPQR789");
+        assert!(out.contains("[REDACTED:bearer_token]"), "out={out}");
+        assert!(!out.contains("abcDEF123"));
+    }
+
+    #[test]
+    fn bearer_prose_is_not_redacted() {
+        // 짧은 단어는 16자 미만이라 매칭되지 않는다(false positive 방지).
+        let (out, r) = redact("the bearer of bad news");
+        assert_eq!(r.total(), 0, "out={out}");
     }
 
     #[test]

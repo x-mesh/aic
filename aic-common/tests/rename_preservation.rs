@@ -78,6 +78,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                         boundary_strategy,
                     },
                     session: SessionConfig::default(),
+                    observability: ObservabilityConfig::default(),
                 }
             },
         )
