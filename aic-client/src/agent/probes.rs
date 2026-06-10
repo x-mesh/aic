@@ -10,7 +10,7 @@
 pub(crate) struct ProbeSpec {
     /// 안정적 식별자(섹션 이름·triage 후보에서 참조).
     pub id: &'static str,
-    /// 분류: `system` | `process` | `git`.
+    /// 분류: `system` | `process` | `git` | `docker` | `filesystem` | `k8s`.
     pub category: &'static str,
     /// 자유 태그(triage 매핑·검색 보조).
     pub tags: &'static [&'static str],
@@ -210,6 +210,46 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "docker images | head -n 40",
         max_lines: Some(40),
     },
+    // k8s: kubectl 설치 + cluster context 의존이라 `/local` 기본 섹션엔 없고(미설치 노이즈 방지),
+    // k8s triage/diagnose에서만 선택된다. 모두 읽기 전용(risk_guard kubectl.read=Safe).
+    // STATUS가 Running이 아닌 pod(Pending/CrashLoopBackOff/OOMKilled/Error/ImagePullBackOff)를
+    // grep -v Running으로 한 번에 잡는다(따옴표/alternation은 validator가 막으므로 단일 패턴).
+    ProbeSpec {
+        id: "k8s_pods_notready",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "pods", "process"],
+        description: "Running이 아닌 pod(Pending/CrashLoop/OOMKilled/Error 등) + RESTARTS 컬럼",
+        linux_command: "kubectl get pods -A | grep -v Running | head -n 40",
+        macos_command: "kubectl get pods -A | grep -v Running | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "k8s_events_warning",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "events"],
+        description: "Warning 타입 cluster 이벤트(OOMKilling/FailedScheduling/BackOff 등)",
+        linux_command: "kubectl get events -A --field-selector=type=Warning | head -n 40",
+        macos_command: "kubectl get events -A --field-selector=type=Warning | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "k8s_nodes",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "nodes"],
+        description: "노드 상태(Ready/NotReady) + 버전/age",
+        linux_command: "kubectl get nodes | head -n 40",
+        macos_command: "kubectl get nodes | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "k8s_node_pressure",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "nodes", "cpu", "memory"],
+        description: "노드별 CPU/메모리 사용량(kubectl top, metrics-server 필요)",
+        linux_command: "kubectl top nodes | head -n 20",
+        macos_command: "kubectl top nodes | head -n 20",
+        max_lines: Some(20),
+    },
     // filesystem: 호스트 read-only 진단(절대경로 허용). /tmp 같은 디렉토리의 비대 파일 추적.
     // `/watch tmp_recent`로 시계열 변화(늘어나는 파일)를 관찰할 수 있다.
     ProbeSpec {
@@ -319,6 +359,7 @@ pub(crate) const TRIAGE_TOPICS: &[&str] = &[
     "network",
     "build-fail",
     "docker",
+    "k8s",
     "generic",
 ];
 
@@ -335,6 +376,7 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
         Some("network") | Some("net") => "network",
         Some("build-fail") | Some("build") => "build-fail",
         Some("docker") | Some("container") | Some("containers") => "docker",
+        Some("k8s") | Some("kubernetes") | Some("kube") | Some("pods") => "k8s",
         _ => "generic",
     };
     let (checklist, probe_ids): (&'static [&str], &'static [&str]) = match resolved {
@@ -376,6 +418,22 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
                 "(수동) 정리: docker image prune / docker system df 확인 후 prune (삭제는 복구 불가)",
             ],
             &["docker_df", "docker_ps", "docker_images"],
+        ),
+        "k8s" => (
+            &[
+                "Running이 아닌 pod이 있는가 — Pending/CrashLoop/OOMKilled/Error (k8s_pods_notready)",
+                "Warning 이벤트 — FailedScheduling/OOMKilling/BackOff (k8s_events_warning)",
+                "NotReady 노드가 있는가 (k8s_nodes)",
+                "노드 CPU/메모리 압박 — metrics-server 필요 (k8s_node_pressure)",
+                "(수동) 특정 pod 상세: kubectl describe pod <name> -n <ns>",
+                "(수동) 로그: kubectl logs <pod> -n <ns> --tail 100",
+            ],
+            &[
+                "k8s_pods_notready",
+                "k8s_events_warning",
+                "k8s_nodes",
+                "k8s_node_pressure",
+            ],
         ),
         "network" | "web" => (
             &[

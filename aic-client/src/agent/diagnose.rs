@@ -94,8 +94,21 @@ pub(crate) fn diagnose_category(symptom: Option<&str>) -> &'static str {
     };
     let has = |kws: &[&str]| kws.iter().any(|k| s.contains(k));
     // 우선순위: 구체 카테고리 먼저. 다중 매칭 시 첫 카테고리(상한·결정적).
-    // docker는 명시적 신호라 최우선(예: "docker 컨테이너가 느림"은 cpu가 아니라 docker로).
-    if has(&["docker", "도커", "container", "컨테이너"]) {
+    // k8s/docker는 명시적 신호라 최우선(예: "pod이 죽음"은 process가 아니라 k8s로).
+    if has(&[
+        "k8s",
+        "kubernetes",
+        "kubectl",
+        "kube",
+        "쿠버",
+        "pod",
+        "파드",
+        "namespace",
+        "crashloop",
+        "oomkilled",
+    ]) {
+        "k8s"
+    } else if has(&["docker", "도커", "container", "컨테이너"]) {
         "docker"
     } else if has(&[
         "cpu", "load", "느림", "느려", "slow", "hang", "행", "busy", "높", "high",
@@ -166,6 +179,13 @@ fn category_sections(category: &str) -> Vec<&'static str> {
         "network" => &["ip", "route", "ports"],
         "process" => &["process", "memory", "uptime"],
         "docker" => &["disk", "docker_df", "docker_ps", "docker_images"],
+        // k8s: kubectl 미설치/connection 실패 시 probe 출력 자체가 진단 정보(docker와 동일 철학).
+        "k8s" => &[
+            "k8s_pods_notready",
+            "k8s_events_warning",
+            "k8s_nodes",
+            "k8s_node_pressure",
+        ],
         _ => &["uptime", "memory", "disk"], // generic
     };
     let mut names: Vec<&'static str> = vec!["date", "host", "os"];
@@ -312,6 +332,25 @@ mod tests {
         assert_eq!(diagnose_category(Some("something weird")), "generic");
         assert_eq!(diagnose_category(None), "generic");
         assert_eq!(diagnose_category(Some("   ")), "generic");
+    }
+
+    #[test]
+    fn k8s_category_and_probes() {
+        // k8s 신호는 최우선(명시적). "pod oom killed"는 memory가 아니라 k8s로.
+        assert_eq!(diagnose_category(Some("pod이 CrashLoopBackOff")), "k8s");
+        assert_eq!(diagnose_category(Some("kubernetes 노드 문제")), "k8s");
+        assert_eq!(diagnose_category(Some("kubectl get pods 이상")), "k8s");
+        assert_eq!(diagnose_category(Some("쿠버네티스 클러스터")), "k8s");
+
+        // k8s 카테고리는 k8s probe를 포함하고, 전부 Safe·bounded.
+        use crate::risk_guard::{classify, RiskLevel};
+        let probes = select_probes(Some("pod이 죽음"), false);
+        let names: Vec<&str> = probes.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"k8s_pods_notready"), "names={names:?}");
+        assert!(names.contains(&"k8s_node_pressure"));
+        for (name, cmd) in &probes {
+            assert_eq!(classify(cmd).level, RiskLevel::Safe, "{name} not Safe: {cmd}");
+        }
     }
 
     #[test]

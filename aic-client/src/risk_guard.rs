@@ -887,7 +887,8 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         }
     }
     if head == "kubectl" {
-        if let Some("get" | "describe" | "logs" | "config" | "version" | "explain") =
+        // top = 리소스 사용량 읽기(metrics-server). get/describe/logs 등과 같은 read-only (SRE R3).
+        if let Some("get" | "describe" | "logs" | "config" | "version" | "explain" | "top") =
             first_subcommand(args)
         {
             return Some(RiskAssessment::safe("kubectl.read"));
@@ -933,6 +934,8 @@ mod tests {
             "cargo build",
             "cargo check",
             "kubectl get pods",
+            "kubectl top nodes",
+            "kubectl top pods -A",
             "docker ps",
             "/usr/bin/ls /tmp",
         ] {
