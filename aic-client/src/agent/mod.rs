@@ -7,8 +7,8 @@
 //! - [`session`] — tool-calling agent loop(`AgentSession`).
 //!
 //! 안전 원칙: 읽기 전용. 쓰기/실행 도구는 registry에 등록하지 않는다(Phase 2).
-//! provider는 OpenAI-compat 경로에서만 tool-calling을 지원하며, 미지원 시
-//! 호출부가 기존 `ReplSession`(단발 send)으로 폴백한다.
+//! provider는 OpenAI-compat과 Anthropic(SRE R4) 경로에서 tool-calling을 지원하며,
+//! 미지원(CLI backend 등) 시 호출부가 기존 `ReplSession`(단발 send)으로 폴백한다.
 
 // RFC-004 단계 2 골격(ratatui chat TUI). 단계 4에서 session 연결 시 allow 제거.
 #[allow(dead_code)]
