@@ -440,6 +440,10 @@ pub struct AicdWebhookConfig {
     /// false면 수신·기록만 하고 자동 진단은 하지 않는다.
     #[serde(default = "default_true")]
     pub auto_diagnose: bool,
+    /// 자동 진단에 `--follow-up`(LLM 제안 probe 1라운드 자동 실행+재분석)을 붙일지.
+    /// 헤드리스(사람 부재) 경로라 기본 false(opt-in) — 진단당 LLM 2회 호출 비용도 고려.
+    #[serde(default)]
+    pub follow_up: bool,
 }
 
 impl Default for AicdWebhookConfig {
@@ -451,6 +455,7 @@ impl Default for AicdWebhookConfig {
             rate_limit_per_min: default_webhook_rate_limit(),
             dedup_ttl_secs: default_webhook_dedup_ttl(),
             auto_diagnose: true,
+            follow_up: false,
         }
     }
 }
