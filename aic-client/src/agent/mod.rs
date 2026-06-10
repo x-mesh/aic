@@ -14,7 +14,8 @@
 #[allow(dead_code)]
 pub(crate) mod chat_tui;
 pub(crate) mod debug;
-pub(crate) mod diagnose;
+// SRE R2: headless 진단(run_headless_diagnose)을 바이너리(diagnose CLI/webhook spawn)에서 쓰므로 pub.
+pub mod diagnose;
 pub mod gitignore;
 // RFC-005 Phase 1: SSH 멀티호스트 인벤토리(hosts.toml + ssh_config import + overlay).
 pub mod hosts;
@@ -24,6 +25,8 @@ pub mod remote;
 pub mod audit_batch;
 // RFC-005 Phase 6: 사용자 확장 가능한 tokenizer 화이트리스트(builtin + ~/.aic/whitelist.toml) (O3).
 pub mod whitelist;
+// SRE R0/R2: 인시던트 증거 번들 작성(대화형 /bundle + 비대화 webhook/CLI 공유).
+pub mod bundle;
 pub(crate) mod markdown;
 // SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
 pub mod obs_tools;

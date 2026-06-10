@@ -4,6 +4,88 @@
 //! probe), 분석은 **tool-less·stateless 단발 LLM 호출**(자동 실행 없음, "다음 확인"은 텍스트 제안).
 //! 모든 probe는 sysinfo와 같은 불변식(Safe∧bounded∧고정 상수)이라 prompt injection에 안전하다.
 
+use super::sandbox::Sandbox;
+use crate::llm_dispatcher::LlmDispatcher;
+
+/// headless 진단 결과 — AgentSession(대화형 UI) 없이 webhook/CLI에서 재사용 가능(SRE R2).
+#[derive(Debug, Clone)]
+pub struct HeadlessDiagnosis {
+    pub symptom: Option<String>,
+    /// probe 실행 결과를 묶은 redacted 증거 스냅샷(`## section\n<out>`).
+    pub evidence: String,
+    /// LLM 분석 결과(dispatcher 제공 + 성공 시). 없으면 evidence-only.
+    pub analysis: Option<String>,
+}
+
+impl HeadlessDiagnosis {
+    /// 번들 파일에 쓸 redacted markdown으로 직렬화.
+    pub fn to_markdown(&self) -> String {
+        let sym = self.symptom.as_deref().unwrap_or("(generic health)");
+        let mut md = format!("# diagnose: {sym}\n\n## evidence\n\n{}\n", self.evidence);
+        if let Some(a) = &self.analysis {
+            md.push_str(&format!("\n## analysis\n\n{a}\n"));
+        }
+        md
+    }
+}
+
+/// 대화형 세션 없이 read-only 진단을 수행한다(SRE R2: webhook 자동 초동 진단의 코어).
+///
+/// 흐름: 증상→`select_probes`(고정 Safe probe)→각 probe를 `execute_with_corr`로 실행(confirm
+/// 클로저는 항상 거부 → NeedsConfirm/Dangerous는 자동 실행 안 됨)→redacted 스냅샷. `dispatcher`가
+/// Some이면 `build_diagnose_prompt`로 일회성 분석을 덧붙인다(read-only, history 없음).
+///
+/// `corr_prefix`는 audit/tool 상관관계용 접두사(예: webhook run id).
+pub async fn run_headless_diagnose(
+    symptom: Option<&str>,
+    sandbox: &Sandbox,
+    dispatcher: Option<&LlmDispatcher>,
+    corr_prefix: &str,
+) -> HeadlessDiagnosis {
+    let probes = select_probes(symptom, docker_available());
+    let mut evidence = String::new();
+    for (idx, (name, cmd)) in probes.into_iter().enumerate() {
+        let corr = format!("{corr_prefix}.{idx}");
+        let args = serde_json::json!({ "command": cmd });
+        // Safe 명령이라 confirm 미호출이지만, 비대화 안전을 위해 거부 클로저 전달
+        // (NeedsConfirm/Dangerous가 섞여도 자동 실행되지 않음 — A4 읽기전용 보장).
+        let out = super::run_command::execute_with_corr(&args, sandbox, &corr, |_, _, _| false)
+            .unwrap_or_else(|e| format!("[tool error] {e}"));
+        evidence.push_str(&format!("## {name}\n{out}\n\n"));
+    }
+
+    let analysis = match dispatcher {
+        Some(d) => {
+            let prompt = build_diagnose_prompt(symptom, &evidence);
+            match d.send(&prompt).await {
+                Ok(text) => Some(text.trim().to_string()),
+                Err(e) => {
+                    let _ = crate::audit::append(
+                        "headless_diagnose",
+                        serde_json::json!({ "corr": corr_prefix, "analyzed": false, "error": e.to_string() }),
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let _ = crate::audit::append(
+        "headless_diagnose",
+        serde_json::json!({
+            "corr": corr_prefix,
+            "symptom": symptom,
+            "analyzed": analysis.is_some(),
+        }),
+    );
+
+    HeadlessDiagnosis {
+        symptom: symptom.map(|s| s.to_string()),
+        evidence,
+        analysis,
+    }
+}
+
 /// 증상 키워드 → 진단 카테고리(결정적, 순수 함수). 무매칭/None은 "generic".
 pub(crate) fn diagnose_category(symptom: Option<&str>) -> &'static str {
     let s = match symptom {
@@ -184,6 +266,34 @@ pub(crate) fn build_diagnose_prompt(symptom: Option<&str>, evidence: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headless_diagnosis_markdown_includes_evidence_and_analysis() {
+        let d = HeadlessDiagnosis {
+            symptom: Some("disk full".to_string()),
+            evidence: "## df\nFilesystem 90%\n".to_string(),
+            analysis: Some("디스크 90% — log_big 확인 권장".to_string()),
+        };
+        let md = d.to_markdown();
+        assert!(md.contains("# diagnose: disk full"));
+        assert!(md.contains("## evidence"));
+        assert!(md.contains("Filesystem 90%"));
+        assert!(md.contains("## analysis"));
+        assert!(md.contains("log_big"));
+    }
+
+    #[test]
+    fn headless_diagnosis_markdown_evidence_only() {
+        let d = HeadlessDiagnosis {
+            symptom: None,
+            evidence: "## ps\nproc\n".to_string(),
+            analysis: None,
+        };
+        let md = d.to_markdown();
+        assert!(md.contains("# diagnose: (generic health)"));
+        assert!(md.contains("## evidence"));
+        assert!(!md.contains("## analysis"));
+    }
 
     #[test]
     fn category_keyword_mapping() {

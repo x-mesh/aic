@@ -1377,7 +1377,7 @@ impl AgentSession {
             20,
         ));
 
-        match write_bundle(name, &evidence) {
+        match super::bundle::write_bundle(name, &evidence) {
             Ok(path) => self.out.note(&format!("\nbundle 저장됨: {}", path.display())).await,
             Err(e) => self.out.note(&format!("\nbundle 저장 실패: {e}")).await,
         }
@@ -1655,31 +1655,6 @@ fn session_file_path() -> Option<std::path::PathBuf> {
 
 /// `/bundle` — redacted 증거를 `~/.aic/bundles/<sanitized>-<ts>.md`에 저장하고 경로를 반환한다.
 /// name은 파일명 라벨(sanitize)로만 쓰고 셸 명령에 섞지 않는다. dir 0700 / file 0600(unix best-effort).
-fn write_bundle(name: Option<&str>, evidence: &str) -> anyhow::Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("홈 디렉터리를 찾을 수 없습니다"))?;
-    let dir = home.join(".aic").join("bundles");
-    std::fs::create_dir_all(&dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let label = tool_record::sanitize_bundle_name(name.unwrap_or(""));
-    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let path = dir.join(format!("{label}-{ts}.md"));
-    let body = format!(
-        "# aic incident bundle: {label}\n생성: {ts}\n\n{evidence}\n",
-        label = name.unwrap_or("(unnamed)"),
-    );
-    std::fs::write(&path, body)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(path)
-}
-
 /// 수집 진행 라벨(순수) — analyze 모드에서 probe별 같은 줄 갱신용. 짧은 Claude-like 톤.
 /// 예: `<thinking> 수집 중: date (1/9)`.
 fn collect_progress_label(name: &str, idx: usize, total: usize) -> String {

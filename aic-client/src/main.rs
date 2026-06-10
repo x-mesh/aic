@@ -374,6 +374,25 @@ enum Commands {
         #[arg(long)]
         allow_run: bool,
     },
+    /// 비대화 read-only 진단 (SRE) — 증상 기반 Safe probe 수집 + (옵션) LLM 분석을
+    /// stdout에 markdown으로 출력한다. headless(서버/cron/webhook)에서 쓰며 TTY가 필요 없다.
+    Diagnose {
+        /// 증상(자유 텍스트, 여러 단어 가능). 생략 시 generic health 점검.
+        #[arg(trailing_var_arg = true)]
+        symptom: Vec<String>,
+        /// LLM 분석을 끄고 redacted 증거만 수집한다.
+        #[arg(long)]
+        no_analyze: bool,
+        /// 결과를 `~/.aic/bundles/`에 번들 파일로도 저장한다.
+        #[arg(long)]
+        bundle: bool,
+        /// 번들 라벨(파일명에 포함). `--bundle`과 함께 사용.
+        #[arg(long)]
+        name: Option<String>,
+        /// 사용할 provider 이름(config default 대신).
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
     /// 우선 source는 PTY 세션의 ring buffer. hook-only metadata record는
@@ -795,6 +814,26 @@ async fn main() {
             }
             if let Err(e) =
                 handle_chat(prompt, dry_run, cli.provider, context, no_run || read_only).await
+            {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Diagnose {
+            symptom,
+            no_analyze,
+            bundle,
+            name,
+            provider,
+        }) => {
+            if let Err(e) = handle_diagnose_cli(
+                symptom,
+                no_analyze,
+                bundle,
+                name,
+                provider.or(cli.provider),
+            )
+            .await
             {
                 eprintln!("{e}");
                 std::process::exit(1);
@@ -5988,6 +6027,55 @@ async fn handle_chat(
         session.run().await?;
     }
     debug_step!(total_start, "total");
+    Ok(())
+}
+
+/// `aic diagnose [증상] [--no-analyze] [--bundle [--name N]] [--provider P]` — 비대화 read-only 진단.
+///
+/// AgentSession(대화형 UI) 없이 `diagnose::run_headless_diagnose`를 호출해 증거+분석을 stdout에
+/// markdown으로 출력한다. webhook 자동 초동 진단(R2)의 spawn 타깃이자, cron/스크립트용 독립 기능.
+async fn handle_diagnose_cli(
+    symptom_parts: Vec<String>,
+    no_analyze: bool,
+    bundle: bool,
+    name: Option<String>,
+    provider_override: Option<String>,
+) -> anyhow::Result<()> {
+    let config = ConfigManager::load()?;
+    let (config, provider_name) = apply_provider_override(config, provider_override.as_deref())?;
+    let symptom = {
+        let s = symptom_parts.join(" ");
+        let s = s.trim().to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    };
+
+    let sandbox = aic_client::agent::Sandbox::from_cwd()?;
+    let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+    // 분석은 일회성 send라 tool-calling 미지원 provider에서도 동작한다. --no-analyze면 증거만.
+    let dispatcher_ref = if no_analyze { None } else { Some(&dispatcher) };
+    let corr = format!("diagnose-cli-{provider_name}");
+
+    let result = aic_client::agent::diagnose::run_headless_diagnose(
+        symptom.as_deref(),
+        &sandbox,
+        dispatcher_ref,
+        &corr,
+    )
+    .await;
+
+    let md = result.to_markdown();
+    println!("{md}");
+
+    if bundle {
+        match aic_client::agent::bundle::write_bundle(name.as_deref(), &md) {
+            Ok(path) => eprintln!("{COL_GREEN}✔{COL_RESET} 번들 저장: {}", path.display()),
+            Err(e) => eprintln!("{COL_YELLOW}⚠{COL_RESET} 번들 저장 실패: {e}"),
+        }
+    }
     Ok(())
 }
 
