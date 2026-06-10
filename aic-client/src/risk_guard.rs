@@ -896,7 +896,8 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     }
     if head == "docker" {
         if let Some(
-            "ps" | "images" | "logs" | "inspect" | "version" | "info" | "diff" | "history",
+            "ps" | "stats" | "images" | "logs" | "inspect" | "version" | "info" | "diff"
+            | "history",
         ) = first_subcommand(args)
         {
             return Some(RiskAssessment::safe("docker.read"));
@@ -961,6 +962,7 @@ mod tests {
         // 읽기 전용은 Safe(자동 실행 — catalog docker probe가 의존).
         assert_eq!(lvl("docker system df"), RiskLevel::Safe);
         assert_eq!(lvl("docker ps -s"), RiskLevel::Safe);
+        assert_eq!(lvl("docker stats --no-stream"), RiskLevel::Safe);
         assert_eq!(lvl("docker images"), RiskLevel::Safe);
         // prune/force-remove는 삭제(복구 불가) → Dangerous, 자동 실행 금지.
         assert_eq!(lvl("docker system prune"), RiskLevel::Dangerous);

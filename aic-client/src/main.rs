@@ -388,6 +388,10 @@ enum Commands {
         /// LLM 분석을 끄고 redacted 증거만 수집한다.
         #[arg(long)]
         no_analyze: bool,
+        /// LLM이 제안한 follow-up probe를 1라운드 자동 실행해 재분석한다.
+        /// 게이트: probe catalog/템플릿 전용 + 인자 증거-실존 + risk_guard Safe + validator.
+        #[arg(long)]
+        follow_up: bool,
         /// 결과를 `~/.aic/bundles/`에 번들 파일로도 저장한다.
         #[arg(long)]
         bundle: bool,
@@ -886,6 +890,7 @@ async fn main() {
         Some(Commands::Diagnose {
             symptom,
             no_analyze,
+            follow_up,
             bundle,
             name,
             provider,
@@ -893,6 +898,7 @@ async fn main() {
             if let Err(e) = handle_diagnose_cli(
                 symptom,
                 no_analyze,
+                follow_up,
                 bundle,
                 name,
                 provider.or(cli.provider),
@@ -6186,13 +6192,14 @@ async fn handle_chat(
     Ok(())
 }
 
-/// `aic diagnose [증상] [--no-analyze] [--bundle [--name N]] [--provider P]` — 비대화 read-only 진단.
+/// `aic diagnose [증상] [--no-analyze] [--follow-up] [--bundle [--name N]] [--provider P]` — 비대화 read-only 진단.
 ///
 /// AgentSession(대화형 UI) 없이 `diagnose::run_headless_diagnose`를 호출해 증거+분석을 stdout에
 /// markdown으로 출력한다. webhook 자동 초동 진단(R2)의 spawn 타깃이자, cron/스크립트용 독립 기능.
 async fn handle_diagnose_cli(
     symptom_parts: Vec<String>,
     no_analyze: bool,
+    follow_up: bool,
     bundle: bool,
     name: Option<String>,
     provider_override: Option<String>,
@@ -6215,11 +6222,12 @@ async fn handle_diagnose_cli(
     let dispatcher_ref = if no_analyze { None } else { Some(&dispatcher) };
     let corr = format!("diagnose-cli-{provider_name}");
 
-    let result = aic_client::agent::diagnose::run_headless_diagnose(
+    let result = aic_client::agent::diagnose::run_headless_diagnose_opts(
         symptom.as_deref(),
         &sandbox,
         dispatcher_ref,
         &corr,
+        aic_client::agent::diagnose::DiagnoseOptions { follow_up },
     )
     .await;
 
