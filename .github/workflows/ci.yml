@@ -112,3 +112,40 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --no-default-features --features phase-3_5
+
+  # SRE R6: headless(비대화·TTY 없음) 안전성 게이트. aic는 서버(cron/systemd/webhook
+  # spawn)에서 TTY·키체인 없이 돈다. ubuntu-latest 러너 자체가 headless이며, 여기에
+  # AIC_NO_KEYCHAIN=1(keychain fallback)을 더해 다음을 고정한다:
+  #   - 헤드리스 diagnose/audit/webhook/config가 hang 없이 동작
+  #   - NeedsConfirm 명령이 비대화에서 자동 실행되지 않음(보안 속성)
+  #   - 관측 백엔드/webhook 통합이 mock 서버로 headless 동작
+  # matrix 폭발을 피하려 단일 OS(ubuntu)에서만 돈다. PTY 테스트(#[ignore], make
+  # test-pty)는 실제 터미널이 필요하므로 여기에 절대 포함하지 않는다.
+  headless:
+    name: headless e2e (ubuntu)
+    runs-on: ubuntu-latest
+    env:
+      AIC_NO_KEYCHAIN: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-headless-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-headless-
+            ${{ runner.os }}-cargo-
+
+      - name: Headless e2e + integration (no TTY, no keychain)
+        run: |
+          cargo test -p aic-client --test e2e_headless
+          cargo test -p aic-client --test obs_tools_integration
+          cargo test -p aic-server --test webhook_integration

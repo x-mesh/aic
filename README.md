@@ -502,6 +502,28 @@ aic webhook list            # 수신·진단·dedup·rate-limit 이력 조회
 aic webhook list --json     # 스크립팅용
 ```
 
+### Headless / air-gapped 서버 (SRE)
+
+aic는 TTY·GUI·인터넷이 없는 서버에서 1급으로 동작한다. CI의 `headless` job이 이 경로를
+매 PR마다 검증한다(비대화 diagnose/audit/webhook + NeedsConfirm 비대화 거부).
+
+- **TTY 없음**: cron/systemd/webhook spawn에서 `aic diagnose`·`aic audit`·`aic webhook list`가
+  hang 없이 동작한다. NeedsConfirm(상태 변경) 명령은 비대화 환경에서 **자동 거부**된다.
+- **키체인 없음**: 헤드리스 Linux엔 Secret Service가 없을 수 있다. `AIC_NO_KEYCHAIN=1`로
+  keychain을 건너뛰고 API key를 config 평문/환경변수로 쓴다.
+- **air-gapped(인터넷 차단)**: 외부 LLM 대신 사내 OpenAI-compat 엔드포인트(vLLM/LiteLLM 등)를
+  `[llm.providers.*]`에 등록한다. 관측 백엔드·webhook도 전부 사내망 주소로 동작하므로
+  외부 송신 0으로 운영 가능하다.
+
+```toml
+# air-gapped: 사내 LLM + 사내 관측 백엔드만 사용
+[llm.providers.internal]
+provider_type = "OpenAiCompatible"
+endpoint = "http://llm.internal:8000/v1/chat/completions"
+api_key = "keychain:internal"   # 또는 평문(headless면 env)
+model = "qwen2.5-coder"
+```
+
 ## Environment Variables
 
 | Variable | Description | Default |
