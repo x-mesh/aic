@@ -218,6 +218,18 @@ pub(crate) enum SlashCommand {
         count: usize,
         every_ms: u64,
     },
+    /// `/metrics [-b backend] <promql>` — 등록된 Prometheus 백엔드에 PromQL instant 질의(SRE R1).
+    /// 결과를 redacted raw로 출력(LLM 미호출). backend 미지정 시 등록 Prometheus가 1개면 자동 선택.
+    Metrics {
+        backend: Option<String>,
+        query: String,
+    },
+    /// `/logs [-b backend] <logql>` — 등록된 Loki 백엔드에 LogQL query_range 질의(SRE R1).
+    /// 결과를 redacted raw로 출력(LLM 미호출). backend 미지정 시 등록 Loki가 1개면 자동 선택.
+    Logs {
+        backend: Option<String>,
+        query: String,
+    },
     /// prefix가 2개 이상 명령과 일치(예: `/d` → diagnose/doctor). 후보를 안내만 한다.
     Ambiguous {
         input: String,
@@ -283,6 +295,8 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "bundle",
     "triage",
     "watch",
+    "metrics",
+    "logs",
 ];
 
 /// slash 명령의 palette 카테고리(빈 `/` discovery 메뉴 그룹핑용). 표시 순서는 `slash_category_order`.
@@ -290,7 +304,7 @@ pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
         "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "explain-last" => "Evidence",
-        "local" | "sys" | "snapshot" | "watch" => "System",
+        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" => "System",
         _ => "Meta", // help 등
     }
 }
@@ -327,6 +341,8 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
         "watch" => "local probe를 짧게 반복 실행 (--count N --every Ns; 변화 요약, LLM 미호출)",
+        "metrics" => "등록 Prometheus에 PromQL 질의 (-b backend; redacted raw, LLM 미호출)",
+        "logs" => "등록 Loki에 LogQL 질의 (-b backend; redacted raw, LLM 미호출)",
         // /local sections
         "date" => "현재 날짜/시간",
         "host" => "hostname",
@@ -452,8 +468,37 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
             }
         }
         "watch" => parse_watch_args(rest),
+        "metrics" => {
+            let (backend, query) = parse_obs_args(rest);
+            SlashCommand::Metrics { backend, query }
+        }
+        "logs" => {
+            let (backend, query) = parse_obs_args(rest);
+            SlashCommand::Logs { backend, query }
+        }
         other => SlashCommand::Unknown(other.to_string()),
     })
+}
+
+/// `/metrics`·`/logs` 인자 파서: 선행 `-b NAME`/`--backend NAME`만 소비하고 나머지
+/// rest-of-line을 query로 보존(PromQL/LogQL은 공백·특수문자를 포함하므로 split하지 않는다).
+/// 순수 함수(테스트 가능).
+fn parse_obs_args(rest: &str) -> (Option<String>, String) {
+    let mut s = rest.trim_start();
+    let mut backend = None;
+    if let Some(tok) = s.split_whitespace().next() {
+        if tok == "-b" || tok == "--backend" {
+            let after = s[tok.len()..].trim_start();
+            let mut it = after.splitn(2, char::is_whitespace);
+            if let Some(name) = it.next() {
+                if !name.is_empty() {
+                    backend = Some(name.to_string());
+                }
+            }
+            s = it.next().unwrap_or("").trim_start();
+        }
+    }
+    (backend, s.trim().to_string())
 }
 
 /// `/watch` 기본/한계값. 무한 watch 금지 — count·interval을 bounded하게 clamp한다.
@@ -1109,6 +1154,42 @@ mod tests {
         records.into_iter().collect()
     }
 
+    #[test]
+    fn parse_metrics_without_backend_keeps_full_query() {
+        let cmd = parse_slash("/metrics rate(http_requests_total[5m])").unwrap();
+        assert_eq!(
+            cmd,
+            SlashCommand::Metrics {
+                backend: None,
+                query: "rate(http_requests_total[5m])".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_metrics_with_backend_flag() {
+        let cmd = parse_slash("/metrics -b prod up").unwrap();
+        assert_eq!(
+            cmd,
+            SlashCommand::Metrics {
+                backend: Some("prod".to_string()),
+                query: "up".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_logs_preserves_logql_spaces() {
+        let cmd = parse_slash("/logs --backend loki {app=\"api\"} |= \"error\"").unwrap();
+        assert_eq!(
+            cmd,
+            SlashCommand::Logs {
+                backend: Some("loki".to_string()),
+                query: "{app=\"api\"} |= \"error\"".to_string()
+            }
+        );
+    }
+
     fn rec(corr: &str, name: &str, output: &str) -> ToolRecord {
         ToolRecord::from_result(corr, name, None, output)
     }
@@ -1596,10 +1677,11 @@ mod tests {
         assert!(c.contains(&"local".to_string()));
         assert!(c.contains(&"help".to_string()));
 
-        // '/lo' → local만(유일 prefix).
-        let (start, c) = slash_completion("/lo", 3);
+        // '/loc' → local만(유일 prefix). ('/lo'는 R1 logs 추가로 ambiguous → 빈 후보)
+        let (start, c) = slash_completion("/loc", 4);
         assert_eq!(start, 1);
         assert_eq!(c, vec!["local".to_string()]);
+        assert!(slash_completion("/lo", 3).1.is_empty(), "lo→local/logs ambiguous");
 
         // '/s' → sys/snapshot ambiguous → 빈 후보(메뉴 오실행 방지, 원문 submit→parser 안내).
         let (_s, c) = slash_completion("/s", 2);
@@ -1632,7 +1714,7 @@ mod tests {
             entries[0]
         );
         // prefix completion(유일/ambiguous)에는 카테고리 prefix를 붙이지 않음(안전 로직 유지).
-        let (_s, entries, _a) = slash_completion_entries("/lo", 3);
+        let (_s, entries, _a) = slash_completion_entries("/loc", 4);
         assert_eq!(entries.len(), 1);
         assert!(
             !entries[0].1.contains("[System]"),
@@ -1728,12 +1810,15 @@ mod tests {
     #[test]
     fn command_token_completion_unique_only() {
         // 유일 prefix만 commit 가능한 후보. ambiguous/unknown은 빈 후보 → 원문 submit + parser 처리.
-        assert_eq!(slash_completion("/lo", 3).1, vec!["local".to_string()]);
+        assert_eq!(slash_completion("/loc", 4).1, vec!["local".to_string()]);
+        assert_eq!(slash_completion("/log", 4).1, vec!["logs".to_string()]);
+        assert_eq!(slash_completion("/m", 2).1, vec!["metrics".to_string()]);
         assert_eq!(slash_completion("/di", 3).1, vec!["diagnose".to_string()]);
         assert_eq!(slash_completion("/do", 3).1, vec!["doctor".to_string()]);
         // ambiguous → 빈 후보(첫 후보 오실행 방지).
         assert!(slash_completion("/d", 2).1.is_empty()); // diagnose/doctor
-        assert!(slash_completion("/l", 2).1.is_empty()); // last/local
+        assert!(slash_completion("/l", 2).1.is_empty()); // last/local/logs
+        assert!(slash_completion("/lo", 3).1.is_empty()); // local/logs (R1 logs 추가로 ambiguous)
         assert!(slash_completion("/t", 2).1.is_empty()); // timeline/triage
                                                          // unknown(0 매칭) → 빈 후보(fuzzy commit 안 함).
         assert!(slash_completion("/lcl", 4).1.is_empty());
@@ -1747,7 +1832,7 @@ mod tests {
     #[test]
     fn completion_entries_have_value_description_and_append_flag() {
         // 명령 컨텍스트: value="local", description에 설명, append_whitespace=true.
-        let (start, entries, append) = slash_completion_entries("/lo", 3);
+        let (start, entries, append) = slash_completion_entries("/loc", 4);
         assert_eq!(start, 1);
         assert!(append, "command 완성은 append_whitespace=true");
         let (value, desc) = entries.iter().find(|(v, _)| v == "local").unwrap();

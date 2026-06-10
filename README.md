@@ -440,6 +440,34 @@ cli_path = "kiro"
 [llm.providers.claude-cli]
 provider_type = "CliBackend"
 cli_path = "claude"
+
+# ── Observability backends (SRE) ──
+# 등록된 백엔드만 질의 가능(endpoint allowlist) — LLM은 backend 이름만 고르고 URL은
+# 직접 줄 수 없다. reqwest redirect 비활성 + link-local(169.254) 차단으로 SSRF를 막는다.
+# aic chat의 tool-calling(prometheus_query/loki_query/es_search) + slash(/metrics, /logs)에서 사용.
+[observability.backends.prom]
+backend_type = "Prometheus"          # VictoriaMetrics도 PromQL 호환이라 "Prometheus"로 등록
+url = "http://prometheus:9090"
+# auth = "keychain:obs_prom"         # 선택: Bearer 토큰(평문 또는 keychain:<account> 참조)
+
+[observability.backends.logs]
+backend_type = "Loki"
+url = "http://loki:3100"
+
+[observability.backends.es]
+backend_type = "Elasticsearch"       # OpenSearch 포함
+url = "http://elasticsearch:9200"
+```
+
+관측 백엔드를 등록하면 `aic chat`에서 다음을 쓸 수 있다:
+
+```sh
+# slash 명령(LLM 미호출, redacted raw 출력) — backend가 타입별 1개면 -b 생략 가능
+/metrics up
+/metrics -b prom rate(http_requests_total[5m])
+/logs {app="api"} |= "error"
+
+# 또는 자연어로 물으면 에이전트가 prometheus_query/loki_query/es_search 도구를 호출한다.
 ```
 
 ## Environment Variables

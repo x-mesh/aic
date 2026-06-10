@@ -245,6 +245,10 @@ pub struct AppConfig {
     /// 세션 capture 모드 설정 (Phase 4). 레거시 config 호환을 위해 default.
     #[serde(default)]
     pub session: SessionConfig,
+    /// 관측 백엔드(Prometheus/Loki/Elasticsearch) 설정 (SRE R1).
+    /// 레거시 config 호환을 위해 default — 미설정 시 등록 백엔드 없음.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,6 +361,43 @@ pub enum ProviderType {
     Anthropic,
     /// 로컬 CLI 실행 (kiro-cli, claude-cli)
     CliBackend,
+}
+
+// ── ObservabilityConfig / BackendConfig / BackendType (SRE R1) ──
+
+/// 관측 백엔드 통합 설정. config.toml `[observability]` 섹션.
+///
+/// 등록된 백엔드만 obs 질의 도구(prometheus_query/loki_query/es_query)의
+/// endpoint allowlist에 들어간다. 미등록 URL 질의는 도구 레벨에서 거부되어
+/// SSRF / 내부망 탐색을 차단한다 (R1.6).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    /// 백엔드 이름 → 설정. config.toml `[observability.backends.<name>]`.
+    #[serde(default)]
+    pub backends: HashMap<String, BackendConfig>,
+}
+
+/// 단일 관측 백엔드 설정.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendConfig {
+    /// 백엔드 유형. (VictoriaMetrics는 PromQL 호환이므로 `Prometheus`로 등록)
+    pub backend_type: BackendType,
+    /// base URL (예: `http://prometheus:9090`). 질의 시 allowlist의 단일 출처.
+    pub url: String,
+    /// 인증 토큰. 평문 또는 `keychain:<account>` 참조. 미지정 시 무인증.
+    #[serde(default)]
+    pub auth: Option<String>,
+}
+
+/// 관측 백엔드 유형.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BackendType {
+    /// Prometheus PromQL (VictoriaMetrics 포함 — PromQL/HTTP API 호환)
+    Prometheus,
+    /// Loki LogQL
+    Loki,
+    /// Elasticsearch / OpenSearch 검색 API
+    Elasticsearch,
 }
 
 // ── AnalysisResult ─────────────────────────────────────────────
@@ -486,6 +527,7 @@ mod tests {
                 },
             },
             session: SessionConfig::default(),
+            observability: ObservabilityConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();

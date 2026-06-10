@@ -719,6 +719,7 @@ mod tests {
                 },
             },
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         };
 
         let result = check_provider(&cfg);
@@ -746,6 +747,7 @@ mod tests {
                 },
             },
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         };
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Fail);
@@ -802,6 +804,7 @@ mod tests {
                 },
             },
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         };
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Warn);
@@ -829,6 +832,7 @@ mod tests {
                 },
             },
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         };
         let path = cfg
             .server

@@ -79,6 +79,7 @@ impl ConfigManager {
                 },
             },
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         }
     }
 }
@@ -108,6 +109,68 @@ mod tests {
         assert!(config.server.socket_path.is_none());
         assert_eq!(config.server.boundary_strategy.method, "prompt_marker");
         assert!(config.server.boundary_strategy.idle_threshold_ms.is_none());
+    }
+
+    #[test]
+    fn default_config_has_no_observability_backends() {
+        let config = ConfigManager::default_config();
+        assert!(config.observability.backends.is_empty());
+    }
+
+    #[test]
+    fn parses_observability_backends_section() {
+        use aic_common::BackendType;
+
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+boundary_strategy = { method = "prompt_marker" }
+
+[observability.backends.prom]
+backend_type = "Prometheus"
+url = "http://prometheus:9090"
+
+[observability.backends.logs]
+backend_type = "Loki"
+url = "http://loki:3100"
+auth = "keychain:obs_loki"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("config should parse");
+
+        let prom = config
+            .observability
+            .backends
+            .get("prom")
+            .expect("prom backend present");
+        assert_eq!(prom.backend_type, BackendType::Prometheus);
+        assert_eq!(prom.url, "http://prometheus:9090");
+        assert!(prom.auth.is_none());
+
+        let logs = config
+            .observability
+            .backends
+            .get("logs")
+            .expect("logs backend present");
+        assert_eq!(logs.backend_type, BackendType::Loki);
+        assert_eq!(logs.auth.as_deref(), Some("keychain:obs_loki"));
+    }
+
+    #[test]
+    fn legacy_config_without_observability_defaults_empty() {
+        // observability 섹션이 없는 레거시 config도 #[serde(default)]로 파싱돼야 한다.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+boundary_strategy = { method = "prompt_marker" }
+"#;
+        let config: AppConfig = toml::from_str(toml_str).expect("legacy config should parse");
+        assert!(config.observability.backends.is_empty());
     }
 
     #[test]
@@ -331,6 +394,7 @@ mod tests {
             llm,
             server,
             session: aic_common::SessionConfig::default(),
+            observability: aic_common::ObservabilityConfig::default(),
         })
     }
 

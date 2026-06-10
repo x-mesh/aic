@@ -17,6 +17,7 @@ use crate::repl;
 use std::collections::VecDeque;
 
 use super::debug::adbg;
+use super::obs_tools::ObsClient;
 use super::sandbox::Sandbox;
 use super::tool_record::{self, ToolRecord};
 use super::tools;
@@ -208,6 +209,9 @@ pub struct AgentSession {
     compare_baseline: Option<String>,
     /// 화면 출력 sink. 기본 `Direct`(기존 동작), TTY chat은 `run()`에서 `Tui`로 교체(RFC-004 step 4).
     out: ChatOut,
+    /// 관측 백엔드(Prometheus/Loki/ES) 질의 클라이언트(SRE R1). config에 등록 백엔드가
+    /// 있을 때만 Some. 등록된 백엔드만 질의 가능 — endpoint allowlist.
+    obs: Option<ObsClient>,
 }
 
 impl AgentSession {
@@ -233,12 +237,25 @@ impl AgentSession {
             tool_records: VecDeque::new(),
             compare_baseline: None,
             out: ChatOut::Direct { spinner: None },
+            obs: None,
         }
     }
 
     /// run_command 도구 노출 여부를 설정한다(`aic chat` 기본 활성, `--no-run`로 끔).
     pub fn allow_run_command(mut self, enabled: bool) -> Self {
         self.allow_run_command = enabled;
+        self
+    }
+
+    /// 관측 백엔드(Prometheus/Loki/ES) 질의 도구를 설정한다(SRE R1).
+    /// config `[observability.backends.*]`에 등록 백엔드가 있을 때만 활성화된다.
+    pub fn with_observability(mut self, cfg: &aic_common::ObservabilityConfig) -> Self {
+        if !cfg.backends.is_empty() {
+            match ObsClient::new(cfg) {
+                Ok(client) => self.obs = Some(client),
+                Err(e) => adbg!("obs client 생성 실패 — 관측 도구 비활성: {}", e),
+            }
+        }
         self
     }
 
@@ -448,6 +465,11 @@ impl AgentSession {
             // 쓰기 도구는 run_command와 동일 게이트(SRE 모드)에서만 노출. read-only 세션엔 미노출.
             specs.push(tools::write_file_spec());
             specs.push(tools::edit_file_spec());
+        }
+        // 관측 백엔드 도구(R1)는 read-only라 run_command 게이트와 무관하게, 등록 백엔드가
+        // 있으면 항상 노출한다.
+        if let Some(obs) = &self.obs {
+            specs.extend(obs.specs());
         }
 
         for iter in 0..MAX_ITERATIONS {
@@ -666,6 +688,17 @@ impl AgentSession {
             } else {
                 Ok("[denied] 파일 쓰기를 사용자가 거부했습니다.".to_string())
             }
+        } else if matches!(
+            call.name.as_str(),
+            "prometheus_query" | "loki_query" | "es_search"
+        ) {
+            // 관측 백엔드 도구(R1): 등록된 backend allowlist 안에서만 HTTP read 질의.
+            match &self.obs {
+                Some(obs) => obs.run(&call.name, &args).await,
+                None => Ok("[tool error] 관측 백엔드가 설정되지 않았습니다. \
+                    config [observability.backends.<name>]에 추가하세요."
+                    .to_string()),
+            }
         } else {
             tools::execute(&call.name, &args, &self.sandbox)
         };
@@ -767,6 +800,24 @@ impl AgentSession {
                 count,
                 every_ms,
             } => self.handle_watch(target.as_deref(), count, every_ms).await,
+            SlashCommand::Metrics { backend, query } => {
+                self.handle_obs_query(
+                    aic_common::BackendType::Prometheus,
+                    "prometheus_query",
+                    backend.as_deref(),
+                    &query,
+                )
+                .await
+            }
+            SlashCommand::Logs { backend, query } => {
+                self.handle_obs_query(
+                    aic_common::BackendType::Loki,
+                    "loki_query",
+                    backend.as_deref(),
+                    &query,
+                )
+                .await
+            }
             SlashCommand::Ambiguous { input, candidates } => {
                 let cands = candidates
                     .iter()
@@ -786,6 +837,60 @@ impl AgentSession {
                     ))
                     .await
             }
+        }
+    }
+
+    /// `/metrics`·`/logs` — 등록된 관측 백엔드에 직접 질의해 redacted raw 결과를 출력한다(LLM 미호출).
+    /// backend 미지정 시 해당 타입 백엔드가 정확히 1개면 자동 선택, 여러 개면 목록을 안내한다.
+    async fn handle_obs_query(
+        &mut self,
+        backend_type: aic_common::BackendType,
+        tool: &str,
+        backend: Option<&str>,
+        query: &str,
+    ) {
+        let Some(obs) = &self.obs else {
+            self.out
+                .note(
+                    "관측 백엔드가 설정되지 않았습니다. config [observability.backends.<name>]에 \
+                     url/backend_type을 등록하세요.",
+                )
+                .await;
+            return;
+        };
+        if query.trim().is_empty() {
+            self.out
+                .note("질의가 비었습니다. 예) /metrics up  ·  /logs {app=\"api\"}")
+                .await;
+            return;
+        }
+        // backend 결정: 명시값 우선, 없으면 해당 타입 백엔드가 1개일 때만 자동 선택.
+        let names = obs.backend_names_of(backend_type);
+        let chosen = match backend {
+            Some(b) => b.to_string(),
+            None => match names.as_slice() {
+                [only] => only.clone(),
+                [] => {
+                    self.out
+                        .note(&format!("등록된 {backend_type:?} 백엔드가 없습니다."))
+                        .await;
+                    return;
+                }
+                many => {
+                    self.out
+                        .note(&format!(
+                            "{backend_type:?} 백엔드가 여러 개입니다: {}. -b <name>으로 지정하세요.",
+                            many.join(", ")
+                        ))
+                        .await;
+                    return;
+                }
+            },
+        };
+        let args = serde_json::json!({ "backend": chosen, "query": query });
+        match obs.run(tool, &args).await {
+            Ok(out) => self.out.note(&out).await,
+            Err(e) => self.out.note(&format!("[obs error] {e}")).await,
         }
     }
 

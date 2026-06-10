@@ -25,6 +25,8 @@ pub mod audit_batch;
 // RFC-005 Phase 6: 사용자 확장 가능한 tokenizer 화이트리스트(builtin + ~/.aic/whitelist.toml) (O3).
 pub mod whitelist;
 pub(crate) mod markdown;
+// SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
+pub mod obs_tools;
 pub(crate) mod probes;
 pub mod run_command;
 pub mod sandbox;
