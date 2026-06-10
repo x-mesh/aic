@@ -186,6 +186,7 @@ fn load_webhook_config() -> Option<aic_server::webhook_server::WebhookConfig> {
         rate_limit_per_min: w.rate_limit_per_min,
         dedup_ttl: std::time::Duration::from_secs(w.dedup_ttl_secs),
         auto_diagnose: w.auto_diagnose,
+        follow_up: w.follow_up,
         aic_bin,
     })
 }

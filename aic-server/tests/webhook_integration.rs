@@ -43,6 +43,7 @@ async fn start_server_full(
         rate_limit_per_min: rate,
         dedup_ttl: Duration::from_secs(300),
         auto_diagnose,
+        follow_up: false,
         aic_bin,
     };
     tokio::spawn(async move {
