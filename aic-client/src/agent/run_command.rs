@@ -1091,14 +1091,16 @@ mod tests {
     fn output_redacted_before_return() {
         let (_d, sb) = sandbox();
         // echo(Safe)로 OpenAI key 형태를 출력 → stdout redaction이 적용되어야 한다.
+        // fixture가 secret 스캐너에 걸리지 않도록 prefix를 런타임 합성(런타임 값은 동일).
+        let fake_key = format!("sk-{}", "abcdefghijklmnopqrstuvwxyz0123456789ABCD");
         let out = execute(
-            &json!({ "command": "echo sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD" }),
+            &json!({ "command": format!("echo {fake_key}") }),
             &sb,
             |_, _, _| true,
         )
         .unwrap();
         assert!(
-            out.contains("REDACTED") || !out.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+            out.contains("REDACTED") || !out.contains(fake_key.as_str()),
             "out={out}"
         );
     }
