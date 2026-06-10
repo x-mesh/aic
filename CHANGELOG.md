@@ -4,6 +4,40 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-10
+
+SRE 로드맵 R0–R5 — `aic`를 단일 머신 진단 도구에서 관측 백엔드·k8s·webhook까지
+다루는 SRE 보조 도구로 확장한다.
+
+### Added
+- **관측 백엔드 read-only 질의 (R1)** — `[observability.backends.<name>]`에 등록한
+  Prometheus/Loki/Elasticsearch(VictoriaMetrics는 Prometheus 호환)에 질의해 진단 근거를
+  로컬 sysinfo 너머로 확장한다. `/metrics`·`/logs` slash 명령(LLM 미호출 redacted raw) +
+  LLM tool-calling 노출. SSRF 방어(redirect 차단·link-local 차단·backend allowlist),
+  응답 bounded(512KB/64KB), Bearer·conn-string redaction.
+- **headless 진단 + `aic diagnose` CLI (R0)** — TTY 없이 증상→읽기전용 Safe probe 수집→
+  redacted 증거(+옵션 LLM 분석)를 stdout markdown으로 출력. cron/스크립트/webhook spawn용.
+  `aic diagnose [증상] [--no-analyze] [--bundle --name N] [--provider P]`.
+- **webhook 알림 → 자동 초동 진단 (R2)** — aicd가 Alertmanager/Grafana/PagerDuty/generic
+  webhook을 수신해 firing alert마다 `aic diagnose --bundle`(읽기전용+증거 번들)을 자동
+  spawn. 온콜이 터미널을 열기 전에 증거가 준비된다. `[aicd.webhook]`(기본 off, 127.0.0.1:9099),
+  HMAC-SHA256/Bearer 인증·rate limit·5분 dedup. `aic webhook list [--json]`.
+- **k8s 네이티브 probe + `/triage k8s` (R3)** — kubectl 기반 read-only 진단 4종
+  (notready pods/warning events/node ready/node pressure)을 probe catalog에 추가. docker
+  probe와 동일 철학(미설치/context 부재 시 출력 자체가 진단 정보). `aic diagnose`가 k8s
+  키워드를 최우선 매핑.
+- **Anthropic 네이티브 tool-calling (R4)** — Anthropic provider에서도 agent loop
+  (run_command/obs/read 도구)가 완전 동작한다. 기존엔 Claude 사용자의 tool-calling이
+  read-only로 강등됐었다. content 블록 텍스트도 송신 전 redaction.
+- **`aic audit tail`/`search` (R5)** — HMAC 감사 로그를 CLI로 조회.
+  `aic audit tail [-n N]`, `aic audit search [--kind] [--host] [--since] [--until] [--grep]
+  [--multihost]` (+`--json`). 멀티호스트 segment도 함께 스캔.
+
+### Changed
+- **출력 없는 exit-code-only 실패는 LLM 호출을 건너뛴다** — 종료 시그널·일반 exit code만
+  있고 캡처된 출력이 없으면 결정론적으로 설명해 토큰을 아낀다. 공백뿐인 프롬프트는 None으로
+  정규화해 불필요한 호출을 막는다.
+
 ## [0.17.0] - 2026-06-08
 
 ### Added
