@@ -766,8 +766,8 @@ impl AgentSession {
                     .note(&tool_record::render_raw(&self.tool_records, t.as_deref()))
                     .await
             }
-            SlashCommand::Local { section, analyze } => {
-                self.handle_local(section.as_deref(), analyze).await
+            SlashCommand::Local { sections, analyze } => {
+                self.handle_local(&sections, analyze).await
             }
             SlashCommand::Diagnose { symptom, analyze } => {
                 self.handle_diagnose(symptom.as_deref(), analyze).await
@@ -895,10 +895,12 @@ impl AgentSession {
     }
 
     /// `/local` — 내장 sysinfo probe(개별 Safe 명령)를 실행해 로컬 스냅샷을 만든다.
+    /// 섹션 다중 지정 가능(`/local disk memory`, 빈 목록=전체). docker 설치 호스트면 docker 섹션
+    /// (`docker_ps`/`docker_stats`/`docker_df`)이 기본 스냅샷에 덧붙는다.
     /// 기본은 redacted 스냅샷을 **tool-less·stateless 단발 LLM 호출**로 분석 요약(history 미push).
     /// `--raw`이거나 `AIC_LOCAL_NO_ANALYZE`이거나 분석 실패(설정 없음/오류/timeout)면 raw 스냅샷으로
     /// fallback하고 짧은 사유만 표시한다. 출력은 stderr 전용, read-only 세션에서는 비활성.
-    async fn handle_local(&mut self, section: Option<&str>, analyze: bool) {
+    async fn handle_local(&mut self, sections: &[String], analyze: bool) {
         if !self.allow_run_command {
             self.out
                 .note(
@@ -908,17 +910,19 @@ impl AgentSession {
                 .await;
             return;
         }
-        let probes = super::sysinfo::probes_for(section);
-        if probes.is_empty() {
-            self.out
-                .note(&format!(
-                    "알 수 없는 섹션: {}. 사용 가능: {}",
-                    section.unwrap_or(""),
-                    super::sysinfo::LOCAL_SECTIONS.join(" ")
-                ))
-                .await;
-            return;
-        }
+        let probes = match super::sysinfo::probes_for(sections) {
+            Ok(p) => p,
+            Err(unknown) => {
+                self.out
+                    .note(&format!(
+                        "알 수 없는 섹션: {}. 사용 가능: {}",
+                        unknown.join(" "),
+                        super::sysinfo::available_sections().join(" ")
+                    ))
+                    .await;
+                return;
+            }
+        };
 
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
 
@@ -2127,7 +2131,7 @@ mod tests {
 
         let before = session.history.len();
         // raw 모드(analyze=false) → 네트워크 호출 없음, 결정적. 단일 섹션으로 빠르게.
-        session.handle_local(Some("date"), false).await;
+        session.handle_local(&["date".to_string()], false).await;
         // slash/local 경로는 대화 history에 push하지 않는다(no-history 원칙).
         assert_eq!(session.history.len(), before);
         // probe는 ring에 기록되어 /last·/raw로 재조회 가능.
@@ -2228,7 +2232,7 @@ mod tests {
         .allow_run_command(true);
 
         // fallback이 출력하는 것과 동일한 스냅샷. 분석 실패 시 이 본문이 그대로 표시된다.
-        let probes = super::super::sysinfo::probes_for(None);
+        let probes = super::super::sysinfo::probes_for(&[]).unwrap();
         let snap = session.collect_local_snapshot(probes, false).await;
         // 섹션 헤더 + 실제 raw 본문(redacted run_command 결과)이 포함되어야 한다.
         for section in ["date", "disk", "memory"] {
