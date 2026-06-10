@@ -57,6 +57,171 @@ pub fn verify() -> std::io::Result<VerifyReport> {
     verify_at(&audit_path(), &key_path())
 }
 
+// ── 조회 API (tail / search) — SRE R5 ──────────────────────────
+
+/// tail/search가 반환하는 통합 audit view. 로컬 HMAC chain(`AuditEvent`)과 멀티호스트
+/// batch audit(`~/.aic/audit/*.jsonl`, 다른 스키마)을 같은 형태로 다루기 위한 경량 레코드.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditRecord {
+    pub ts: Option<DateTime<Utc>>,
+    pub kind: String,
+    pub host: Option<String>,
+    /// 출처: "local"(audit.log) 또는 멀티호스트 segment 파일명.
+    pub source: String,
+    pub raw: serde_json::Value,
+}
+
+/// `search_events` 필터. 모든 필드는 AND 결합, None이면 무시.
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter {
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub kind: Option<String>,
+    /// raw JSON 문자열에 대한 부분 문자열 매칭(대소문자 무시).
+    pub grep: Option<String>,
+    pub host: Option<String>,
+    /// 멀티호스트 segment(`~/.aic/audit/*.jsonl`)도 포함할지.
+    pub include_multihost: bool,
+}
+
+/// 로컬 audit.log의 마지막 `n`개 레코드를 시간순(오래된→최근)으로 반환한다(순차 스캔).
+pub fn tail_events(n: usize) -> std::io::Result<Vec<AuditRecord>> {
+    let mut all = read_local_records(&audit_path())?;
+    if all.len() > n {
+        all = all.split_off(all.len() - n);
+    }
+    Ok(all)
+}
+
+/// 필터에 맞는 audit 레코드를 순차 스캔으로 반환한다(로컬 + 선택적 멀티호스트).
+/// 연 ~10MB 규모라 인덱스 없이 전체 스캔으로 충분하다(설계 결정 D4).
+pub fn search_events(filter: &SearchFilter) -> std::io::Result<Vec<AuditRecord>> {
+    let mut records = read_local_records(&audit_path())?;
+    if filter.include_multihost || filter.host.is_some() {
+        records.extend(read_multihost_records()?);
+    }
+    records.retain(|r| record_matches(r, filter));
+    // ts 있는 것 우선 시간순, 없는 것은 뒤로.
+    records.sort_by(|a, b| match (a.ts, b.ts) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    Ok(records)
+}
+
+fn record_matches(r: &AuditRecord, f: &SearchFilter) -> bool {
+    if let Some(since) = f.since {
+        if r.ts.map(|t| t < since).unwrap_or(true) {
+            return false;
+        }
+    }
+    if let Some(until) = f.until {
+        if r.ts.map(|t| t > until).unwrap_or(true) {
+            return false;
+        }
+    }
+    if let Some(kind) = &f.kind {
+        if &r.kind != kind {
+            return false;
+        }
+    }
+    if let Some(host) = &f.host {
+        if r.host.as_deref() != Some(host.as_str()) {
+            return false;
+        }
+    }
+    if let Some(g) = &f.grep {
+        let hay = r.raw.to_string().to_lowercase();
+        if !hay.contains(&g.to_lowercase()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 로컬 audit.log를 AuditEvent로 파싱해 AuditRecord로 매핑(파싱 실패 라인은 skip).
+fn read_local_records(path: &Path) -> std::io::Result<Vec<AuditRecord>> {
+    let mut out = Vec::new();
+    if !path.exists() {
+        return Ok(out);
+    }
+    let reader = BufReader::new(File::open(path)?);
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<AuditEvent>(&line) {
+            let host = ev
+                .data
+                .get("host")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            out.push(AuditRecord {
+                ts: Some(ev.ts),
+                kind: ev.kind,
+                host,
+                source: "local".to_string(),
+                raw: ev.data,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 멀티호스트 segment(`~/.aic/audit/*.jsonl`)를 lenient하게 파싱(스키마가 달라 generic JSON).
+fn read_multihost_records() -> std::io::Result<Vec<AuditRecord>> {
+    let dir = home().join(".aic").join("audit");
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(out),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let fname = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("?")
+            .to_string();
+        let reader = BufReader::new(File::open(&path)?);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                let ts = v
+                    .get("ts")
+                    .or_else(|| v.get("timestamp"))
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&Utc));
+                let kind = v
+                    .get("kind")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let host = v
+                    .get("host")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                out.push(AuditRecord {
+                    ts,
+                    kind,
+                    host,
+                    source: fname.clone(),
+                    raw: v,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ── 내부 (path inject 가능) ────────────────────────────────────
 
 fn append_to(
@@ -504,6 +669,92 @@ mod tests {
         let report = verify_at(&log, &key).unwrap();
         assert_eq!(report.lines, 0);
         assert!(report.valid);
+    }
+
+    // ── R5 조회 API ───────────────────────────────────────────
+
+    #[test]
+    fn read_local_records_parses_and_extracts_host() {
+        let (_dir, log, key) = setup();
+        append_to(&log, &key, "run_command_auto", serde_json::json!({"cmd": "df -h"})).unwrap();
+        append_to(
+            &log,
+            &key,
+            "host_result",
+            serde_json::json!({"host": "web1", "exit": 0}),
+        )
+        .unwrap();
+        let recs = read_local_records(&log).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].kind, "run_command_auto");
+        assert_eq!(recs[0].host, None);
+        assert_eq!(recs[1].host.as_deref(), Some("web1"));
+        assert!(recs[0].ts.is_some());
+    }
+
+    #[test]
+    fn search_filter_matches_kind_host_grep_and_time() {
+        let base = chrono::Utc::now();
+        let rec = AuditRecord {
+            ts: Some(base),
+            kind: "run_command_blocked".to_string(),
+            host: Some("db1".to_string()),
+            source: "local".to_string(),
+            raw: serde_json::json!({"command": "rm -rf /", "reason": "dangerous"}),
+        };
+        // kind 일치/불일치
+        assert!(record_matches(
+            &rec,
+            &SearchFilter { kind: Some("run_command_blocked".into()), ..Default::default() }
+        ));
+        assert!(!record_matches(
+            &rec,
+            &SearchFilter { kind: Some("other".into()), ..Default::default() }
+        ));
+        // host
+        assert!(record_matches(
+            &rec,
+            &SearchFilter { host: Some("db1".into()), ..Default::default() }
+        ));
+        assert!(!record_matches(
+            &rec,
+            &SearchFilter { host: Some("web1".into()), ..Default::default() }
+        ));
+        // grep(대소문자 무시, raw JSON 대상)
+        assert!(record_matches(
+            &rec,
+            &SearchFilter { grep: Some("DANGEROUS".into()), ..Default::default() }
+        ));
+        assert!(!record_matches(
+            &rec,
+            &SearchFilter { grep: Some("nomatch".into()), ..Default::default() }
+        ));
+        // since/until 경계
+        assert!(record_matches(
+            &rec,
+            &SearchFilter { since: Some(base - chrono::Duration::seconds(1)), ..Default::default() }
+        ));
+        assert!(!record_matches(
+            &rec,
+            &SearchFilter { since: Some(base + chrono::Duration::seconds(1)), ..Default::default() }
+        ));
+    }
+
+    #[test]
+    fn tail_via_split_off_keeps_last_n() {
+        // tail_events의 split_off 로직을 read_local_records 결과로 직접 검증.
+        let (_dir, log, key) = setup();
+        for i in 0..5 {
+            append_to(&log, &key, "evt", serde_json::json!({"i": i})).unwrap();
+        }
+        let mut all = read_local_records(&log).unwrap();
+        let n = 2;
+        if all.len() > n {
+            all = all.split_off(all.len() - n);
+        }
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].raw["i"], 3);
+        assert_eq!(all[1].raw["i"], 4);
     }
 
     #[test]
