@@ -140,9 +140,10 @@ static CATALOG: &[ProbeSpec] = &[
         id: "process",
         category: "process",
         tags: &["cpu", "memory", "process"],
-        description: "상위 프로세스(ps)",
-        linux_command: "ps aux | head -n 20",
-        macos_command: "ps aux | head -n 20",
+        description: "상위 프로세스(CPU 내림차순)",
+        // 정렬 없으면 PID 순 상위 20줄이 전부 커널 스레드(0%)라 폭주 프로세스를 놓친다.
+        linux_command: "ps aux --sort=-%cpu | head -n 20",
+        macos_command: "ps aux -r | head -n 20",
         max_lines: Some(20),
     },
     ProbeSpec {
@@ -202,12 +203,31 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(30),
     },
     ProbeSpec {
+        id: "docker_stats",
+        category: "docker",
+        tags: &["docker", "cpu", "memory", "process"],
+        description: "컨테이너별 실시간 CPU/메모리/IO 사용률(stats --no-stream)",
+        // --no-stream: 1회 스냅샷 후 종료(없으면 무한 스트림 → timeout까지 hang).
+        linux_command: "docker stats --no-stream | head -n 30",
+        macos_command: "docker stats --no-stream | head -n 30",
+        max_lines: Some(30),
+    },
+    ProbeSpec {
         id: "docker_images",
         category: "docker",
         tags: &["docker", "disk", "images"],
         description: "이미지별 크기(images)",
         linux_command: "docker images | head -n 40",
         macos_command: "docker images | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "docker_volumes",
+        category: "docker",
+        tags: &["docker", "disk", "volumes"],
+        description: "볼륨별 크기·사용 컨테이너(system df -v) — disk full 범인 볼륨 특정",
+        linux_command: "docker system df -v | head -n 40",
+        macos_command: "docker system df -v | head -n 40",
         max_lines: Some(40),
     },
     // k8s: kubectl 설치 + cluster context 의존이라 `/local` 기본 섹션엔 없고(미설치 노이즈 방지),
@@ -249,6 +269,33 @@ static CATALOG: &[ProbeSpec] = &[
         linux_command: "kubectl top nodes | head -n 20",
         macos_command: "kubectl top nodes | head -n 20",
         max_lines: Some(20),
+    },
+    ProbeSpec {
+        id: "k8s_crashloop_pods",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "pods", "crashloop"],
+        description: "재시작 루프 pod만(Completed 정상 종료 노이즈 제거)",
+        linux_command: "kubectl get pods -A | grep -v Running | grep -v Completed | head -n 30",
+        macos_command: "kubectl get pods -A | grep -v Running | grep -v Completed | head -n 30",
+        max_lines: Some(30),
+    },
+    ProbeSpec {
+        id: "k8s_resource_quota",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "quota", "capacity"],
+        description: "namespace별 resource quota used/hard — Pending 지속 원인 판별",
+        linux_command: "kubectl get resourcequota -A | head -n 30",
+        macos_command: "kubectl get resourcequota -A | head -n 30",
+        max_lines: Some(30),
+    },
+    ProbeSpec {
+        id: "k8s_hpa_status",
+        category: "k8s",
+        tags: &["k8s", "kubernetes", "hpa", "autoscaling"],
+        description: "HPA replicas vs min/max — 스케일 아웃 실패·상한 도달 식별",
+        linux_command: "kubectl get hpa -A | head -n 30",
+        macos_command: "kubectl get hpa -A | head -n 30",
+        max_lines: Some(30),
     },
     // filesystem: 호스트 read-only 진단(절대경로 허용). /tmp 같은 디렉토리의 비대 파일 추적.
     // `/watch tmp_recent`로 시계열 변화(늘어나는 파일)를 관찰할 수 있다.
@@ -308,7 +355,162 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "ps -axo stat | sort | uniq -c | sort -rn | head -n 15",
         max_lines: Some(15),
     },
+    ProbeSpec {
+        id: "mem_top_proc",
+        category: "process",
+        tags: &["memory", "process", "oom"],
+        description: "RSS 기준 메모리 상위 프로세스 — OOM 직전 범인 특정",
+        linux_command: "ps -eo pid,comm,rss --sort=-rss | head -n 15",
+        macos_command: "ps -eo pid,comm,rss -m | head -n 15",
+        max_lines: Some(15),
+    },
+    ProbeSpec {
+        id: "mem_pressure",
+        category: "system",
+        tags: &["memory", "oom"],
+        description: "메모리 압박 신호(MemAvailable/페이지 상태) — OOM 전조",
+        linux_command: "grep Mem /proc/meminfo | head -n 6",
+        macos_command: "vm_stat | head -n 15",
+        max_lines: Some(15),
+    },
+    ProbeSpec {
+        id: "swap_usage",
+        category: "system",
+        tags: &["memory", "swap"],
+        description: "swap 사용량(total/used/free) — macOS free 부재 보완",
+        linux_command: "free -h | grep Swap",
+        macos_command: "sysctl -n vm.swapusage",
+        max_lines: Some(2),
+    },
+    ProbeSpec {
+        id: "cpu_throttle",
+        category: "system",
+        tags: &["cpu", "thermal"],
+        description: "코어별 현재 클럭(MHz) — thermal throttling 신호(macOS는 명목 최대치)",
+        linux_command: "grep MHz /proc/cpuinfo | head -n 8",
+        macos_command: "sysctl -n hw.cpufrequency_max",
+        max_lines: Some(8),
+    },
+    ProbeSpec {
+        id: "tcp_retrans",
+        category: "system",
+        tags: &["network", "retrans"],
+        description: "TCP 재전송 카운터 — 패킷 로스/네트워크 품질 1차 체크",
+        linux_command: "netstat -s | grep -i retrans | head -n 10",
+        macos_command: "netstat -s | grep -i retrans | head -n 10",
+        max_lines: Some(10),
+    },
 ];
+
+/// follow-up 전용 templated probe — 인자 1개를 받는 read-only 명령 템플릿.
+///
+/// LLM 자유 명령은 금지(council 합의)이고, 타깃 인자가 필요한 진단(특정 컨테이너 로그 등)은
+/// 이 템플릿으로만 허용한다. 인자는 (1) `arg_valid` charset(쉘 메타문자 원천 배제) AND
+/// (2) 1차 증거에 실존하는 값 — 두 검증을 모두 통과해야 render된다.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FollowupTemplate {
+    /// 안정적 식별자(LLM이 fenced block에서 참조).
+    pub id: &'static str,
+    /// 한 줄 설명(프롬프트 메뉴에 노출, 인자 의미 포함).
+    pub description: &'static str,
+    /// Linux 명령 템플릿 — `{arg}` 자리에 검증된 인자가 들어간다(bounded).
+    pub linux_template: &'static str,
+    /// macOS(및 기타) 명령 템플릿. OS 무관이면 linux와 동일.
+    pub macos_template: &'static str,
+}
+
+impl FollowupTemplate {
+    /// 인자 charset 검증 — 첫 글자 영숫자, 이후 영숫자/`_`/`.`/`-`, 길이 1..=64.
+    /// 쉘 메타문자·공백·경로 구분자를 원천 배제해 조작된 이름(`$(rm -rf /)` 등)을 거부한다.
+    pub fn arg_valid(arg: &str) -> bool {
+        let mut chars = arg.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+        arg.len() <= 64
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    }
+
+    /// 현재 OS의 템플릿 문자열.
+    fn template(&self) -> &'static str {
+        if cfg!(target_os = "linux") {
+            self.linux_template
+        } else {
+            self.macos_template
+        }
+    }
+
+    /// 검증된 인자로 명령을 만든다. 인자 검증은 호출자 책임(resolve_followup_line).
+    pub fn render(&self, arg: &str) -> String {
+        self.template().replace("{arg}", arg)
+    }
+}
+
+/// follow-up 템플릿 catalog(고정 상수). 전부 read-only·risk_guard Safe·인자 1개.
+/// describe류는 핵심 정보(Events)가 출력 끝에 있어 head를 걸지 않는다 —
+/// 출력은 run_command 64KB cap + follow-up 합산 16KB 예산이 bound한다.
+pub(crate) static FOLLOWUP_TEMPLATES: &[FollowupTemplate] = &[
+    FollowupTemplate {
+        id: "docker_logs",
+        description: "특정 컨테이너의 최근 로그 100줄 — 인자: 컨테이너 이름",
+        linux_template: "docker logs --tail 100 {arg}",
+        macos_template: "docker logs --tail 100 {arg}",
+    },
+    FollowupTemplate {
+        id: "docker_logs_since",
+        description: "특정 컨테이너의 최근 5분 로그(시간 기준 슬라이스) — 인자: 컨테이너 이름",
+        linux_template: "docker logs --since 5m {arg} | head -n 120",
+        macos_template: "docker logs --since 5m {arg} | head -n 120",
+    },
+    FollowupTemplate {
+        id: "docker_inspect_container",
+        description: "컨테이너 상세(RestartPolicy/OOMKilled/HealthCheck/마운트) — 인자: 컨테이너 이름",
+        linux_template: "docker inspect {arg} | head -n 120",
+        macos_template: "docker inspect {arg} | head -n 120",
+    },
+    FollowupTemplate {
+        id: "docker_health",
+        description: "컨테이너 헬스체크 상태/연속 실패 횟수만 추출 — 인자: 컨테이너 이름",
+        linux_template: "docker inspect {arg} | grep -A 5 Health",
+        macos_template: "docker inspect {arg} | grep -A 5 Health",
+    },
+    FollowupTemplate {
+        id: "k8s_pod_describe",
+        description: "pod 상세(Events/exit code/limits) — 인자: pod 이름",
+        linux_template: "kubectl describe pod {arg}",
+        macos_template: "kubectl describe pod {arg}",
+    },
+    FollowupTemplate {
+        id: "k8s_pod_logs",
+        description: "pod 최근 로그 50줄 — 인자: pod 이름",
+        linux_template: "kubectl logs {arg} --tail=50",
+        macos_template: "kubectl logs {arg} --tail=50",
+    },
+    FollowupTemplate {
+        id: "k8s_node_describe",
+        description: "노드 상세(Conditions/Taints/Allocatable) — 인자: 노드 이름",
+        linux_template: "kubectl describe node {arg}",
+        macos_template: "kubectl describe node {arg}",
+    },
+    FollowupTemplate {
+        id: "proc_fd",
+        description: "특정 프로세스의 열린 FD 수(fd leak 범인 특정) — 인자: PID",
+        linux_template: "lsof -p {arg} | wc -l",
+        macos_template: "lsof -p {arg} | wc -l",
+    },
+    FollowupTemplate {
+        id: "proc_net",
+        description: "특정 프로세스/포트의 활성 TCP 연결(상대 IP 포함) — 인자: 프로세스명 또는 포트",
+        linux_template: "ss -tnp | grep {arg} | head -n 30",
+        macos_template: "lsof -nP -iTCP -sTCP:ESTABLISHED | grep {arg} | head -n 30",
+    },
+];
+
+/// id로 follow-up 템플릿을 찾는다.
+pub(crate) fn template_by_id(id: &str) -> Option<&'static FollowupTemplate> {
+    FOLLOWUP_TEMPLATES.iter().find(|t| t.id == id)
+}
 
 /// 전체 catalog 슬라이스.
 pub(crate) fn catalog() -> &'static [ProbeSpec] {
@@ -390,15 +592,20 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
             &["uptime", "process", "memory", "disk"],
         ),
         "cpu" => (
-            &["상위 CPU 프로세스 (process)", "load average 추세 (uptime)"],
-            &["uptime", "process"],
+            &[
+                "상위 CPU 프로세스 (process)",
+                "load average 추세 (uptime)",
+                "thermal throttling — 코어별 클럭 저하 (cpu_throttle)",
+            ],
+            &["uptime", "process", "cpu_throttle"],
         ),
         "memory" => (
             &[
-                "메모리/스왑 사용량 (memory)",
-                "메모리를 많이 쓰는 프로세스 (process)",
+                "메모리/스왑 사용량 (memory, swap_usage)",
+                "RSS 상위 프로세스 — OOM 범인 (mem_top_proc)",
+                "메모리 압박 전조 (mem_pressure)",
             ],
-            &["memory", "process", "uptime"],
+            &["memory", "mem_top_proc", "mem_pressure", "swap_usage", "uptime"],
         ),
         "disk" => (
             &[
@@ -411,28 +618,36 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
         ),
         "docker" => (
             &[
+                "컨테이너별 실시간 CPU/메모리/IO — 폭주 컨테이너 식별 (docker_stats)",
                 "docker 전체 디스크 사용량 — images/containers/volumes/build cache (docker_df)",
+                "볼륨별 크기·사용 컨테이너 — 범인 볼륨 (docker_volumes)",
                 "컨테이너별 writable layer 크기 — 비정상 증가 컨테이너 식별 (docker_ps)",
                 "이미지별 크기/중복 누적 (docker_images)",
                 "(수동) 비대 컨테이너 내부 경로 확인: docker exec <id> du -xh /tmp | sort -rh | head",
                 "(수동) 정리: docker image prune / docker system df 확인 후 prune (삭제는 복구 불가)",
             ],
-            &["docker_df", "docker_ps", "docker_images"],
+            &["docker_stats", "docker_df", "docker_volumes", "docker_ps", "docker_images"],
         ),
         "k8s" => (
             &[
                 "Running이 아닌 pod이 있는가 — Pending/CrashLoop/OOMKilled/Error (k8s_pods_notready)",
+                "재시작 루프 pod — Completed 노이즈 제거 (k8s_crashloop_pods)",
                 "Warning 이벤트 — FailedScheduling/OOMKilling/BackOff (k8s_events_warning)",
                 "NotReady 노드가 있는가 (k8s_nodes)",
                 "노드 CPU/메모리 압박 — metrics-server 필요 (k8s_node_pressure)",
+                "quota 한도 초과 — Pending 원인 (k8s_resource_quota)",
+                "HPA 스케일 상한 도달 (k8s_hpa_status)",
                 "(수동) 특정 pod 상세: kubectl describe pod <name> -n <ns>",
                 "(수동) 로그: kubectl logs <pod> -n <ns> --tail 100",
             ],
             &[
                 "k8s_pods_notready",
+                "k8s_crashloop_pods",
                 "k8s_events_warning",
                 "k8s_nodes",
                 "k8s_node_pressure",
+                "k8s_resource_quota",
+                "k8s_hpa_status",
             ],
         ),
         "network" | "web" => (
@@ -440,8 +655,9 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
                 "인터페이스 주소/링크 상태 (ip)",
                 "라우팅 테이블 (route)",
                 "LISTEN 포트/충돌 (ports)",
+                "TCP 재전송 — 패킷 로스 신호 (tcp_retrans)",
             ],
-            &["ip", "route", "ports"],
+            &["ip", "route", "ports", "tcp_retrans"],
         ),
         "build-fail" => (
             &[
@@ -574,6 +790,38 @@ mod tests {
             }
             assert!(!triage_plan(Some(t)).checklist.is_empty());
         }
+    }
+
+    #[test]
+    fn followup_templates_render_safe_and_reject_malicious_args() {
+        // 유효 인자로 render한 명령은 catalog probe와 동일한 불변식(Safe + validator 통과)을 지켜야 한다.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = crate::agent::sandbox::Sandbox::new(dir.path()).unwrap();
+        for t in FOLLOWUP_TEMPLATES {
+            let cmd = t.render("lib-mesh-acl-sync");
+            assert_eq!(classify(&cmd).level, RiskLevel::Safe, "{}: {cmd}", t.id);
+            crate::agent::run_command::validate_command(&cmd, &sb)
+                .unwrap_or_else(|e| panic!("{}: validator 거부 {cmd} ({e})", t.id));
+        }
+        // 조작된 인자는 charset에서 원천 거부(쉘 메타문자·공백·경로·과길이).
+        for bad in [
+            "$(rm -rf /)",
+            "a;b",
+            "a b",
+            "../etc",
+            "/etc/shadow",
+            "-rf",
+            "",
+            "name`id`",
+            &"x".repeat(65),
+        ] {
+            assert!(!FollowupTemplate::arg_valid(bad), "통과되면 안 됨: {bad:?}");
+        }
+        for good in ["web1", "lib-mesh-acl-sync", "app_2.prod"] {
+            assert!(FollowupTemplate::arg_valid(good), "거부되면 안 됨: {good}");
+        }
+        assert!(template_by_id("docker_logs").is_some());
+        assert!(template_by_id("nope").is_none());
     }
 
     #[test]
