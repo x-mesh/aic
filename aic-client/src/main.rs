@@ -633,6 +633,39 @@ enum AuditOp {
         #[arg(long)]
         date: Option<String>,
     },
+    /// audit log의 최근 N개 이벤트를 시간순으로 출력 (SRE R5).
+    Tail {
+        /// 표시할 최근 이벤트 수 (기본 20).
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+        /// JSON 출력(스크립팅용).
+        #[arg(long)]
+        json: bool,
+    },
+    /// audit log를 필터로 검색 (kind/host/시간/패턴). 로컬 + (--host 시) 멀티호스트 (SRE R5).
+    Search {
+        /// 이벤트 kind 정확 일치(예: run_command_blocked).
+        #[arg(long)]
+        kind: Option<String>,
+        /// 호스트 일치(멀티호스트 segment 포함 검색).
+        #[arg(long)]
+        host: Option<String>,
+        /// 이 시각 이후(RFC3339, 예: 2026-06-01T00:00:00Z).
+        #[arg(long)]
+        since: Option<String>,
+        /// 이 시각 이전(RFC3339).
+        #[arg(long)]
+        until: Option<String>,
+        /// raw JSON 부분 문자열 매칭(대소문자 무시).
+        #[arg(long)]
+        grep: Option<String>,
+        /// 멀티호스트 segment(~/.aic/audit/*.jsonl)도 포함.
+        #[arg(long)]
+        multihost: bool,
+        /// JSON 출력(스크립팅용).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -791,6 +824,16 @@ async fn main() {
         Some(Commands::Audit { op }) => match op {
             AuditOp::Verify => handle_audit_verify(),
             AuditOp::BatchVerify { date } => handle_audit_batch_verify(date),
+            AuditOp::Tail { limit, json } => handle_audit_tail(limit, json),
+            AuditOp::Search {
+                kind,
+                host,
+                since,
+                until,
+                grep,
+                multihost,
+                json,
+            } => handle_audit_search(kind, host, since, until, grep, multihost, json),
         },
         Some(Commands::MigrateKeys) => handle_migrate_keys(),
         Some(Commands::Init {
@@ -2272,6 +2315,97 @@ fn handle_audit_verify() {
             println!("{COL_YELLOW}⚠{COL_RESET} audit verify error: {e}");
             std::process::exit(3);
         }
+    }
+}
+
+/// `aic audit tail [-n N] [--json]` — 최근 N개 audit 이벤트를 시간순 출력 (SRE R5).
+fn handle_audit_tail(limit: usize, json: bool) {
+    let records = match aic_client::audit::tail_events(limit) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} audit tail 실패: {e}");
+            std::process::exit(3);
+        }
+    };
+    print_audit_records(&records, json);
+}
+
+/// `aic audit search [--kind] [--host] [--since] [--until] [--grep] [--multihost] [--json]` (SRE R5).
+#[allow(clippy::too_many_arguments)]
+fn handle_audit_search(
+    kind: Option<String>,
+    host: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    grep: Option<String>,
+    multihost: bool,
+    json: bool,
+) {
+    let parse_ts = |s: Option<String>, label: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        s.and_then(|v| match chrono::DateTime::parse_from_rfc3339(&v) {
+            Ok(d) => Some(d.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                eprintln!("{COL_YELLOW}⚠{COL_RESET} --{label} RFC3339 파싱 실패: {v} (무시)");
+                None
+            }
+        })
+    };
+    let filter = aic_client::audit::SearchFilter {
+        since: parse_ts(since, "since"),
+        until: parse_ts(until, "until"),
+        kind,
+        grep,
+        host,
+        include_multihost: multihost,
+    };
+    let records = match aic_client::audit::search_events(&filter) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} audit search 실패: {e}");
+            std::process::exit(3);
+        }
+    };
+    print_audit_records(&records, json);
+}
+
+/// audit 레코드를 사람용 테이블 또는 JSON으로 출력.
+fn print_audit_records(records: &[aic_client::audit::AuditRecord], json: bool) {
+    if json {
+        let arr: Vec<serde_json::Value> = records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "ts": r.ts.map(|t| t.to_rfc3339()),
+                    "kind": r.kind,
+                    "host": r.host,
+                    "source": r.source,
+                    "data": r.raw,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
+        );
+        return;
+    }
+    if records.is_empty() {
+        println!("일치하는 audit 이벤트가 없습니다.");
+        return;
+    }
+    println!("audit 이벤트 {}개:", records.len());
+    for r in records {
+        let ts = r
+            .ts
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let host = r.host.as_deref().unwrap_or("-");
+        // raw data 한 줄 요약(길면 cap).
+        let mut summary = r.raw.to_string();
+        if summary.chars().count() > 100 {
+            summary = summary.chars().take(100).collect::<String>() + "…";
+        }
+        println!("  {ts}  {kind:<22} {host:<10} {summary}", kind = r.kind);
     }
 }
 
@@ -7332,21 +7466,23 @@ mod tests {
 
     #[test]
     fn provider_override_is_applied_to_dispatcher_config() {
-        // default=anthropic(Anthropic, tool-calling 미지원), override=groq(OpenAI-compat 지원).
-        let mut cfg = config_with_providers("anthropic", &["anthropic", "groq"]);
-        if let Some(p) = cfg.llm.providers.get_mut("anthropic") {
-            p.provider_type = ProviderType::Anthropic;
-            p.model = Some("claude-x".to_string());
+        // default=cli(CliBackend, tool-calling 미지원), override=groq(OpenAI-compat 지원).
+        // (R4부터 Anthropic도 tool-calling을 지원하므로 미지원 예시는 CliBackend로 바꿈.)
+        let mut cfg = config_with_providers("cli", &["cli", "groq"]);
+        if let Some(p) = cfg.llm.providers.get_mut("cli") {
+            p.provider_type = ProviderType::CliBackend;
+            p.cli_path = Some("/bin/echo".to_string());
+            p.model = Some("cli-x".to_string());
         }
         if let Some(p) = cfg.llm.providers.get_mut("groq") {
             p.provider_type = ProviderType::Groq;
             p.model = Some("llama-x".to_string());
         }
 
-        // override 없음 → default(anthropic) 보존, dispatcher도 anthropic(미지원).
+        // override 없음 → default(cli) 보존, dispatcher도 cli(미지원).
         let (cfg_def, name_def) = apply_provider_override(cfg.clone(), None).unwrap();
-        assert_eq!(name_def, "anthropic");
-        assert_eq!(cfg_def.llm.default_provider, "anthropic");
+        assert_eq!(name_def, "cli");
+        assert_eq!(cfg_def.llm.default_provider, "cli");
         assert!(!LlmDispatcher::from_config(cfg_def.llm.clone()).supports_tool_calling());
 
         // override=groq → default_provider가 실제로 groq로 바뀌고 dispatcher가 override를 사용.
