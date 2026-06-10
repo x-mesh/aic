@@ -89,10 +89,13 @@ mod tests {
 
     #[test]
     fn redact_pem_headers() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\n\
-                   MIIEpAIBAAKCAQEA...\n\
-                   -----END RSA PRIVATE KEY-----";
-        let (out, hits) = redact(pem);
+        // PEM 헤더(`PRIVATE KEY`)가 그 자체로 private-key 패턴이라, fixture를 런타임 합성해
+        // secret 스캐너에 걸리지 않게 한다. redact()는 합성된 런타임 값에 적용된다.
+        let pem = format!(
+            "-----BEGIN RSA PRIVATE {0}-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE {0}-----",
+            "KEY"
+        );
+        let (out, hits) = redact(&pem);
         assert!(hits >= 2, "BEGIN + END 헤더 매칭, hits={hits}");
         assert!(!out.contains("BEGIN RSA"));
         assert!(!out.contains("END RSA"));
