@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-11
+
+### Added
+- **diagnose follow-up probe 자동 실행** — 1차 분석에서 LLM이 ```` ```aic-followup ```` 블록으로
+  제안한 추가 probe를 4층 직렬 게이트(catalog/템플릿 id 한정 → 인자는 1차 증거에 실존하는 값만 →
+  risk_guard Safe → validator) 통과분만 1라운드 자동 실행하고 합산 증거로 재분석한다.
+  상한: 명령 3개·출력 16KB. 거부된 제안은 사유와 함께 번들에 기록(투명성).
+  `[aicd.webhook] follow_up`(기본 off) 또는 `aic diagnose --follow-up`으로 opt-in.
+- **`/local` 다중 섹션 + docker 섹션** — `/local disk memory`처럼 섹션을 여러 개 지정할 수
+  있다(알 수 없는 섹션이 섞이면 이름을 들어 전체 거부). docker 설치 호스트에서는
+  `docker_ps`/`docker_stats`/`docker_df`가 기본 스냅샷에 자동 포함된다(미설치면 노이즈 0).
+- **`--version` 빌드 메타데이터** — `aic`/`aic-session`/`aicd`가
+  `0.19.0 (b652397* develop, 2026-06-11T00:17:09Z)` 형식으로 commit/브랜치/dirty(`*`)/빌드
+  시각을 표시한다. chat 배너에도 `v0.19.0+<hash> (<branch>)`로 노출. git 밖 빌드는 버전+시각만.
+- **chat TUI 드래그 복사** — 로그 영역을 좌클릭 드래그하면 줄 단위로 선택(반전 강조 +
+  "N줄 선택 중" status)되고, 놓으면 클립보드에 복사된다. 복사는 OSC 52 +
+  pbcopy/wl-copy/xclip fallback 병행. Ctrl+Y(전체 복사)·Ctrl+T(네이티브 선택)는 유지.
+
+### Changed
+- **macOS도 chat TUI 기본** — 한글 IME 조합 충돌(자모 분리/커서 밀림)이 하드웨어 커서 정렬과
+  입력 대기 중 redraw 금지로 해소되어, macOS 기본을 Direct(reedline)에서 TUI로 전환했다.
+  `AIC_NO_TUI=1`로 이전 동작 복귀(`AIC_CHAT_TUI`는 no-op).
+
 ## [0.18.1] - 2026-06-10
 
 ### Changed
