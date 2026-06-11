@@ -948,12 +948,18 @@ fn mouse_log_row(my: u16, log_top: u16, log_h: u16, total: u16, scroll: u16) -> 
 }
 
 /// 선택 구간 [a,b](로그 줄 인덱스, 순서 무관)를 REVERSED로 강조한 Text 사본. 드래그 선택의
-/// 시각 피드백 — span 스타일은 보존되고 줄 스타일에 modifier만 더한다. 순수 함수.
+/// 시각 피드백. 줄 스타일만으로는 부족하다 — ANSI reset(`\x1b[0m`)에서 온 span이
+/// `sub_modifier`로 REVERSED를 지워버리므로(셀 적용 순서: add → sub), 각 span 스타일에
+/// 직접 add를 넣고 sub에서 빼서 어떤 색/reset이 섞여 있어도 강조가 살아남게 한다. 순수 함수.
 fn highlight_log_lines(text: &Text<'static>, a: usize, b: usize) -> Text<'static> {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     let mut t = text.clone();
     for line in t.lines.iter_mut().skip(lo).take(hi - lo + 1) {
         line.style = line.style.add_modifier(Modifier::REVERSED);
+        for span in line.spans.iter_mut() {
+            span.style.add_modifier.insert(Modifier::REVERSED);
+            span.style.sub_modifier.remove(Modifier::REVERSED);
+        }
     }
     t
 }
@@ -1526,7 +1532,7 @@ async fn chat_loop(
                             }
                         }
                         MouseEventKind::Drag(MouseButton::Left) => {
-                            if let Some((_, cur, moved)) = select.as_mut() {
+                            if let Some((anchor, cur, moved)) = select.as_mut() {
                                 *moved = true;
                                 let heights = wrapped_line_heights(&log_text, area.width);
                                 let total = heights.iter().map(|h| u32::from(*h)).sum::<u32>()
@@ -1536,6 +1542,10 @@ async fn chat_loop(
                                 {
                                     *cur = display_row_to_line(&heights, row);
                                 }
+                                // 선택 범위를 status로 실시간 안내(강조와 함께 영역을 알 수 있게).
+                                let n = anchor.abs_diff(*cur) + 1;
+                                status = format!("· {n}줄 선택 중 — 놓으면 복사");
+                                last_sample = Instant::now();
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
@@ -1839,6 +1849,29 @@ mod tests {
         // log_top 오프셋 반영.
         assert_eq!(super::mouse_log_row(1, 2, 10, 20, 0), None);
         assert_eq!(super::mouse_log_row(2, 2, 10, 20, 0), Some(0));
+    }
+
+    #[test]
+    fn highlight_survives_ansi_spans_repro() {
+        // ANSI 색+reset이 섞인 줄(실제 로그와 동일 경로: rebuild_log_text)에 highlight를 적용해
+        // 렌더된 buffer 셀에 REVERSED가 남는지 확인한다.
+        let log = vec!["\x1b[34mblue\x1b[0m tail".to_string(), "plain".to_string()];
+        let text = super::rebuild_log_text(&log);
+        let t = super::highlight_log_lines(&text, 0, 1);
+        let backend = ratatui::backend::TestBackend::new(20, 2);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            f.render_widget(Paragraph::new(t.clone()).wrap(Wrap { trim: false }), f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        for (x, y, what) in [(0u16, 0u16, "blue 첫 글자"), (5, 0, "tail"), (0, 1, "plain")] {
+            assert!(
+                buf[(x, y)].modifier.contains(Modifier::REVERSED),
+                "{what} 셀에 REVERSED 없음: {:?}",
+                buf[(x, y)]
+            );
+        }
     }
 
     #[test]
