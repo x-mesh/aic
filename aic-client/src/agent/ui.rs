@@ -101,6 +101,20 @@ pub(crate) fn print_status_bar(line: &str) {
     eprintln!("{}", paint(&format!("· {line}"), "2")); // 2 = dim
 }
 
+/// 배너에 붙일 빌드 식별 suffix — git 빌드면 `+b652397* (develop)`(`*`=dirty), 아니면 빈 문자열.
+fn build_suffix() -> String {
+    let commit = env!("AIC_BUILD_COMMIT");
+    if commit.is_empty() {
+        return String::new();
+    }
+    let branch = env!("AIC_BUILD_BRANCH");
+    if branch.is_empty() {
+        format!("+{commit}")
+    } else {
+        format!("+{commit} ({branch})")
+    }
+}
+
 /// banner 라인들. rich면 ASCII art, 아니면 plain 1줄. 순수 함수(테스트 가능).
 pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
     if rich {
@@ -108,16 +122,18 @@ pub(crate) fn banner_lines(rich: bool) -> Vec<String> {
         vec![
             r"   __ _ (_)  ___      ▗▄▖".to_string(),
             format!(
-                r"  / _` || | / __|     ▌◉ ◉▌   chat v{}",
-                env!("CARGO_PKG_VERSION")
+                r"  / _` || | / __|     ▌◉ ◉▌   chat v{}{}",
+                env!("CARGO_PKG_VERSION"),
+                build_suffix()
             ),
             r" | (_| || || (__      ▝▀▀▘".to_string(),
             r"  \__,_||_| \___|".to_string(),
         ]
     } else {
         vec![format!(
-            "aic chat v{} — agentic SRE assistant",
-            env!("CARGO_PKG_VERSION")
+            "aic chat v{}{} — agentic SRE assistant",
+            env!("CARGO_PKG_VERSION"),
+            build_suffix()
         )]
     }
 }

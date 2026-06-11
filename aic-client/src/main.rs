@@ -148,7 +148,7 @@ fn split_at_width(s: &str, max_width: usize) -> (&str, &str) {
 }
 
 #[derive(Parser)]
-#[command(name = "aic", version, about = "지능형 CLI 도우미")]
+#[command(name = "aic", version = env!("AIC_BUILD_INFO"), about = "지능형 CLI 도우미")]
 struct Cli {
     /// 직접 질문하기 (예: aic "이 에러 어떻게 해결해?")
     #[arg(trailing_var_arg = true)]
@@ -1986,6 +1986,7 @@ async fn handle_debug_bundle() {
 
     let bundle = json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "build": env!("AIC_BUILD_INFO"),
         "platform": std::env::consts::OS,
         "config": config_value,
         "doctor": doctor_value,
