@@ -268,9 +268,8 @@ impl AgentSession {
 
     /// REPL 루프 실행. exit/quit/Ctrl+D로 종료.
     ///
-    /// system preface를 시드한 뒤, 입출력 TTY + `AIC_CHAT_TUI` opt-in이면 ratatui chat TUI
-    /// ([`run_loop_tui`])로, 아니면 기존 line-based 루프([`run_loop_direct`])로 분기한다.
-    /// (RFC-004 step 4: TUI는 slash popup/history 이식 전까지 opt-in — reedline 회귀 방지.)
+    /// system preface를 시드한 뒤, 입출력이 TTY면 ratatui chat TUI([`run_loop_tui`])로,
+    /// non-TTY/파이프 또는 `AIC_NO_TUI=1`이면 line-based 루프([`run_loop_direct`])로 분기한다.
     pub async fn run(&mut self) -> anyhow::Result<()> {
         // system preface를 history 시드로 둔다(OpenAI system role 사용).
         // SRE 모드면 generic preface 뒤에 SRE 지침을 덧붙인다.
@@ -282,15 +281,11 @@ impl AgentSession {
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        // macOS raw-mode TUI는 한글 IME 조합(preedit)과 충돌해 자모가 분리되거나 커서 옆으로
-        // 밀릴 수 있다. macOS는 기본 Direct(reedline)로 두고, TUI는 `AIC_CHAT_TUI=1`일 때만 강제한다.
-        // non-TTY/파이프와 `AIC_NO_TUI=1`은 항상 Direct.
-        let force_tui = super::debug::env_truthy("AIC_CHAT_TUI");
-        let default_tui = !cfg!(target_os = "macos");
-        let result = if tty
-            && !super::debug::env_truthy("AIC_NO_TUI")
-            && (force_tui || default_tui)
-        {
+        // macOS 한글 IME 조합 충돌(자모 분리/커서 밀림)은 하드웨어 커서 정렬(place_textarea_cursor)
+        // + 입력 대기 중 자발적 redraw 금지로 해소되어, macOS도 TUI 기본이다(2026-06 실사용 검증).
+        // 재발 시 `AIC_NO_TUI=1`로 Direct(reedline) fallback. non-TTY/파이프는 항상 Direct.
+        // (`AIC_CHAT_TUI`는 과거 macOS opt-in 플래그 — 이제 기본이 TUI라 no-op, 설정돼 있어도 무해.)
+        let result = if tty && !super::debug::env_truthy("AIC_NO_TUI") {
             self.run_loop_tui().await
         } else {
             self.run_loop_direct().await
@@ -364,7 +359,7 @@ impl AgentSession {
         Ok(())
     }
 
-    /// RFC-004 step 4: ratatui chat TUI 루프(`AIC_CHAT_TUI` opt-in). `ChatLoop`가 terminal을 단독
+    /// RFC-004 step 4: ratatui chat TUI 루프(TTY 기본 경로). `ChatLoop`가 terminal을 단독
     /// 소유하고, 여기선 채널로 입력을 받고(`recv_line`) 답변/spinner를 `ChatOut::Tui`로 보낸다.
     /// 배너는 raw mode 진입(spawn) 전에 일반 출력해 scrollback에 남긴다. slash 출력 이전은 4e.
     async fn run_loop_tui(&mut self) -> anyhow::Result<()> {
