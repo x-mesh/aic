@@ -30,7 +30,7 @@ use tokio::sync::watch;
     about = "aic supervisor daemon",
     long_about = "aicd: 사용자당 하나만 실행되는 supervisor daemon. \
                   control UDS를 통해 aic CLI와 aic-session에 lifecycle/registry를 제공한다.",
-    version
+    version = env!("AIC_BUILD_INFO")
 )]
 struct Cli {
     /// 로그를 stderr로 출력 (default는 tracing의 기본 layer 사용).

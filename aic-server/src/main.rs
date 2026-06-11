@@ -16,7 +16,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(
     name = "aic-session",
-    version,
+    version = env!("AIC_BUILD_INFO"),
     about = "PTY 셸 래퍼 데몬",
     long_about = None,
 )]
