@@ -20,7 +20,7 @@ use futures::StreamExt;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -905,6 +905,59 @@ fn log_area_height(total_height: u16, popup_n: u16) -> u16 {
     total_height.saturating_sub(popup_n + 3).max(1)
 }
 
+/// 로그 각 줄의 wrap 후 표시 높이(줄 수). draw_full과 동일한 `Wrap{trim:false}` 공식. 순수 함수.
+fn wrapped_line_heights(text: &Text, width: u16) -> Vec<u16> {
+    text.lines
+        .iter()
+        .map(|l| {
+            Paragraph::new(l.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width.max(1)) as u16
+        })
+        .collect()
+}
+
+/// wrap 후 절대 표시 행 → 로그 줄 인덱스(누적 높이 워크). 범위 밖이면 마지막 줄로 clamp. 순수 함수.
+fn display_row_to_line(heights: &[u16], row: u16) -> usize {
+    let mut acc = 0u32;
+    for (i, h) in heights.iter().enumerate() {
+        acc += u32::from(*h);
+        if u32::from(row) < acc {
+            return i;
+        }
+    }
+    heights.len().saturating_sub(1)
+}
+
+/// 마우스 y(화면 좌표) → 로그의 절대 표시 행. draw_full의 하단 정렬(내용 < 영역이면 아래 붙음)과
+/// scroll 오프셋을 동일하게 반영한다. 로그 영역 밖/하단 정렬 패딩 위면 None. 순수 함수.
+fn mouse_log_row(my: u16, log_top: u16, log_h: u16, total: u16, scroll: u16) -> Option<u16> {
+    if my < log_top || my >= log_top.saturating_add(log_h) {
+        return None;
+    }
+    let rel = my - log_top;
+    if total < log_h {
+        let pad = log_h - total;
+        if rel < pad {
+            return None;
+        }
+        Some(rel - pad)
+    } else {
+        Some(scroll.saturating_add(rel))
+    }
+}
+
+/// 선택 구간 [a,b](로그 줄 인덱스, 순서 무관)를 REVERSED로 강조한 Text 사본. 드래그 선택의
+/// 시각 피드백 — span 스타일은 보존되고 줄 스타일에 modifier만 더한다. 순수 함수.
+fn highlight_log_lines(text: &Text<'static>, a: usize, b: usize) -> Text<'static> {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    let mut t = text.clone();
+    for line in t.lines.iter_mut().skip(lo).take(hi - lo + 1) {
+        line.style = line.style.add_modifier(Modifier::REVERSED);
+    }
+    t
+}
+
 /// status 문자열 끝에 컨텍스트 토큰 추정치를 ` · ctx ~Nk`로 덧붙인다(0이면 생략). 순수 함수.
 /// N = tokens/1000(1000 단위 k 절삭). `~`로 추정 표기(provider usage가 아닌 문자수/4 추정).
 fn status_with_ctx(status: &str, ctx_tokens: usize) -> String {
@@ -941,6 +994,40 @@ fn search_hits_for(log: &[String], query: &str) -> Vec<usize> {
         .filter(|(_, l)| l.contains(query))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// 클립보드 복사 — OSC 52(원격 ssh 포함 1차 경로)와 시스템 도구(pbcopy 등, 로컬 fallback)를
+/// 병행한다. 터미널이 OSC 52 를 막아도 로컬 도구가 있으면 복사된다(둘 다 best-effort).
+fn copy_to_clipboard(text: &str) {
+    osc52_copy(text);
+    system_clipboard_copy(text);
+}
+
+/// 시스템 클립보드 CLI(macOS `pbcopy` → wayland `wl-copy` → X11 `xclip` 순)로 복사한다.
+/// 미설치/실패는 조용히 무시 — OSC 52 가 1차 경로고 이건 로컬 보강이다.
+fn system_clipboard_copy(text: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    for (cmd, args) in [
+        ("pbcopy", &[][..]),
+        ("wl-copy", &[][..]),
+        ("xclip", &["-selection", "clipboard"][..]),
+    ] {
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            continue;
+        };
+        if let Some(mut si) = child.stdin.take() {
+            let _ = si.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+        return; // spawn 에 성공한 첫 도구만 사용.
+    }
 }
 
 /// 텍스트를 OSC 52 escape 로 터미널 클립보드에 복사한다. SSH 로 원격 접속해도 터미널
@@ -1062,7 +1149,7 @@ async fn chat_loop(
     let mut hangul = HangulComposer::default();
     let mut events = EventStream::new();
     let mut sampler = with_statusbar.then(SysSampler::new);
-    let mut status = String::from("· Ctrl+Y 복사 · Ctrl+T 마우스 · (metrics…)");
+    let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
     // 대화 로그: 원본 ANSI 줄(dump용·색 보존, M1) + Text 캐시(m3, log 변경 시만 재구성).
@@ -1086,6 +1173,10 @@ async fn chat_loop(
     // NeedsConfirm 확인 모드: Some(tx)면 확인 대기 중(입력 줄을 confirm_prompt로 대체, 키는 y/n 전용).
     let mut confirm_pending: Option<tokio::sync::oneshot::Sender<bool>> = None;
     let mut confirm_prompt = String::new();
+    // 드래그 선택(로그 줄 단위 복사): Some((anchor 줄, 현재 줄, drag 발생 여부)). 마우스 캡처 중에도
+    // 터미널 네이티브 선택 없이 드래그→복사가 되도록 TUI가 직접 선택을 구현한다(라인 단위).
+    // MouseUp에서 drag가 있었으면 선택 줄들을 클립보드에 복사하고 해제한다. 클릭만은 no-op.
+    let mut select: Option<(usize, usize, bool)> = None;
 
     loop {
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
@@ -1140,11 +1231,21 @@ async fn chat_loop(
         };
         // 확인 모드면 draw_full이 입력 줄을 노란 prompt로 대체한다(spin/popup/search보다 우선).
         let confirm_ref = confirm_pending.as_ref().map(|_| confirm_prompt.as_str());
+        // 드래그 선택 중이면 선택 줄을 REVERSED로 강조한 사본을 그린다(log_text 원본 불변,
+        // wrap 높이는 스타일과 무관해 scroll 계산은 그대로 정합).
+        let highlighted;
+        let draw_text: &Text = match select {
+            Some((a, b, _)) => {
+                highlighted = highlight_log_lines(&log_text, a, b);
+                &highlighted
+            }
+            None => &log_text,
+        };
         let draw_ok = terminal
             .draw(|f| {
                 draw_full(
                     f,
-                    &log_text,
+                    draw_text,
                     draw_scroll,
                     &status_line,
                     draw_ta,
@@ -1278,18 +1379,18 @@ async fn chat_loop(
                                 search_hits.clear();
                                 search_idx = 0;
                             }
-                            // Ctrl+Y: 대화 전체를 OSC 52 로 클립보드에 복사(ANSI 제거).
-                            // 마우스 캡처로 드래그 선택이 막혀 있어도 키 하나로 복사되며,
-                            // SSH 원격에서도 터미널이 로컬 클립보드에 써 준다.
+                            // Ctrl+Y: 대화 전체를 클립보드에 복사(ANSI 제거). 부분 복사는 드래그
+                            // 선택으로, 전체는 키 하나로. SSH 원격은 OSC 52 경로가 담당한다.
                             (KeyCode::Char('y'), KeyModifiers::CONTROL) => {
                                 let text = log
                                     .iter()
                                     .map(|l| strip_ansi(l))
                                     .collect::<Vec<_>>()
                                     .join("\n");
-                                osc52_copy(&text);
+                                copy_to_clipboard(&text);
                                 status =
                                     format!("· 대화 {}줄을 클립보드에 복사했습니다 (Ctrl+Y)", log.len());
+                                last_sample = Instant::now();
                             }
                             // Ctrl+T: 마우스 캡처 토글. OFF 면 터미널 네이티브 드래그 선택/복사가
                             // 가능해지고, ON 이면 휠 스크롤이 로그 viewport 로 동작한다.
@@ -1398,6 +1499,7 @@ async fn chat_loop(
                     // 마우스 휠: 로그 viewport 스크롤(↑↓ 입력 history 대신). PageUp/Down과 동일한
                     // follow 규칙 — 위로 굴리면 follow 해제, 아래로 굴려 최하단 도달 시 follow 재개.
                     // 검색/확인 모드와 무관하게 스크롤만 한다(입력 상태는 건드리지 않음).
+                    // 좌클릭 드래그: 로그 줄 선택(REVERSED 강조) → 놓으면 클립보드 복사.
                     Some(Ok(Event::Mouse(m))) => match m.kind {
                         MouseEventKind::ScrollUp => {
                             follow = false;
@@ -1407,6 +1509,52 @@ async fn chat_loop(
                             scroll = (scroll + WHEEL_STEP).min(max);
                             if scroll >= max {
                                 follow = true;
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            select = None;
+                            if !log.is_empty() {
+                                let heights = wrapped_line_heights(&log_text, area.width);
+                                let total = heights.iter().map(|h| u32::from(*h)).sum::<u32>()
+                                    .min(u32::from(u16::MAX)) as u16;
+                                if let Some(row) =
+                                    mouse_log_row(m.row, area.y, log_h, total, scroll)
+                                {
+                                    let li = display_row_to_line(&heights, row);
+                                    select = Some((li, li, false));
+                                }
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            if let Some((_, cur, moved)) = select.as_mut() {
+                                *moved = true;
+                                let heights = wrapped_line_heights(&log_text, area.width);
+                                let total = heights.iter().map(|h| u32::from(*h)).sum::<u32>()
+                                    .min(u32::from(u16::MAX)) as u16;
+                                if let Some(row) =
+                                    mouse_log_row(m.row, area.y, log_h, total, scroll)
+                                {
+                                    *cur = display_row_to_line(&heights, row);
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            if let Some((a, b, moved)) = select.take() {
+                                // 클릭만(드래그 없음)은 선택 해제만 — 복사하지 않는다.
+                                // ring 폐기로 로그가 줄었을 수 있어 인덱스를 현재 길이로 clamp.
+                                if moved && !log.is_empty() {
+                                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                    let hi = hi.min(log.len() - 1);
+                                    let lo = lo.min(hi);
+                                    let text = strip_ansi(&log[lo..=hi].join("\n"));
+                                    copy_to_clipboard(&text);
+                                    status = format!(
+                                        "· {}줄을 클립보드에 복사했습니다 (드래그)",
+                                        hi - lo + 1
+                                    );
+                                    // 복사 안내가 다음 status 샘플에 바로 덮이지 않게 주기를 리셋.
+                                    last_sample = Instant::now();
+                                }
                             }
                         }
                         _ => {}
@@ -1657,6 +1805,54 @@ mod tests {
         let log = Text::from("a\nb\nc\nd\ne"); // 5줄, width 큼=wrap 없음
         assert_eq!(super::log_scroll_max(&log, 80, 3), 2, "5-3=2");
         assert_eq!(super::log_scroll_max(&log, 80, 10), 0, "height≥total");
+    }
+
+    #[test]
+    fn wrapped_heights_and_display_row_mapping() {
+        // 25자 줄은 width 10에서 3행으로 wrap → 누적 높이로 행→줄 매핑.
+        let text = Text::from(vec![
+            Line::raw("short"),
+            Line::raw("x".repeat(25)),
+            Line::raw("tail"),
+        ]);
+        let h = super::wrapped_line_heights(&text, 10);
+        assert_eq!(h, vec![1, 3, 1]);
+        assert_eq!(super::display_row_to_line(&h, 0), 0);
+        assert_eq!(super::display_row_to_line(&h, 1), 1);
+        assert_eq!(super::display_row_to_line(&h, 3), 1);
+        assert_eq!(super::display_row_to_line(&h, 4), 2);
+        // 범위 밖은 마지막 줄로 clamp.
+        assert_eq!(super::display_row_to_line(&h, 99), 2);
+    }
+
+    #[test]
+    fn mouse_log_row_bottom_align_and_scroll() {
+        // 내용(3) < 영역(10): 하단 정렬 — 위 7행은 패딩(None), 8행째가 첫 내용.
+        assert_eq!(super::mouse_log_row(6, 0, 10, 3, 0), None);
+        assert_eq!(super::mouse_log_row(7, 0, 10, 3, 0), Some(0));
+        assert_eq!(super::mouse_log_row(9, 0, 10, 3, 0), Some(2));
+        // 내용(20) > 영역(10): scroll 오프셋 가산.
+        assert_eq!(super::mouse_log_row(0, 0, 10, 20, 5), Some(5));
+        assert_eq!(super::mouse_log_row(9, 0, 10, 20, 5), Some(14));
+        // 로그 영역 밖(입력/status 줄)은 None.
+        assert_eq!(super::mouse_log_row(10, 0, 10, 20, 5), None);
+        // log_top 오프셋 반영.
+        assert_eq!(super::mouse_log_row(1, 2, 10, 20, 0), None);
+        assert_eq!(super::mouse_log_row(2, 2, 10, 20, 0), Some(0));
+    }
+
+    #[test]
+    fn highlight_log_lines_reverses_range_only() {
+        let text = Text::from(vec![Line::raw("a"), Line::raw("b"), Line::raw("c")]);
+        // 순서 무관(2,1) → [1,2]만 REVERSED, 0은 그대로.
+        let t = super::highlight_log_lines(&text, 2, 1);
+        assert!(!t.lines[0].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(t.lines[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(t.lines[2].style.add_modifier.contains(Modifier::REVERSED));
+        // 범위가 로그 길이를 넘어도 패닉 없음.
+        let t2 = super::highlight_log_lines(&text, 1, 99);
+        assert!(t2.lines[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert!(t2.lines[2].style.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]
