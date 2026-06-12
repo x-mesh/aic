@@ -4,6 +4,35 @@
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-13
+
+### Added
+- **SRE 심층 probe 10종(R8)** — 기존 catalog가 못 보던 고신호 신호를 추가해 "디스크가 꽉 찼나"뿐
+  아니라 "디스크가 느린가(iowait/await)", "이미 누가 OOM으로 죽었나", "어떤 서비스가 안 떴나"까지
+  진단한다. `journal_errors`(systemd 에러 로그)·`dmesg_oom`(커널 OOM-killer)·`iostat_devices`
+  (per-device I/O await/%util)·`vmstat_iowait`(iowait/run-queue)·`failed_units`(실패 systemd 유닛)·
+  `conntrack_max`(연결추적 테이블 포화)·`listen_backlog`(accept-queue 포화)·`time_sync`(NTP/clock
+  skew)·`block_topology`(블록디바이스/ro 리마운트)·`reboot_history`(재부팅 이력). `/diagnose`(증상
+  카테고리)·`/triage`·`/watch`에서 자동 선택되며, `journal_unit` follow-up 템플릿으로 실패 유닛 →
+  해당 unit 로그 2-hop 추적이 가능하다. Linux 전용 도구는 macOS에서 동등 read-only 명령으로 대체.
+- **결정적 임계 스캔(annotation)** — `/diagnose` 증거에서 LLM 호출 없이(오프라인/`--no-analyze`에서도)
+  확실한 위반만 골라 증거 상단에 `## ⚠ 자동 발견` 으로 고정한다: 디스크 사용률 ≥90%(실제 쓰기가능
+  마운트만 — snap/iso9660/DMG/ESP 등 항상-가득 read-only는 제외), 커널 OOM-killer 흔적, 누적 좀비
+  프로세스(≥10), 실패한 systemd 유닛. 오탐이 신뢰를 깎으므로 보수적으로(확실한 신호만) 잡는다.
+- **chat status bar 임계 컬러링** — 하단 status bar의 라이브 지표(load·cpu·mem·swap·disk free)에
+  임계 2단계를 둬 위반 지표만 **주황(warn)→빨강(crit)**으로 칠한다(정상은 기존 dim). 어느 자원이
+  문제인지 한눈에. 임계는 보수적(cpu≥85/95%·mem≥90/97%·swap≥50/90%·load≥코어수/2배), disk는
+  macOS APFS 사용률 % 부정확을 피해 **신뢰 가능한 free bytes 절대값**(≤5G/≤1G)으로 판정.
+
+### Changed
+- **risk_guard read-only safelist 확장** — `journalctl`/`dmesg`/`iostat`/`vmstat`/`systemctl`/
+  `timedatectl`/`last`/`lsblk` 의 **읽기 전용 형태만** 자동 실행(Safe)으로 허용한다. 상태 변경/파괴
+  형태는 차단: dmesg ring buffer clear(`-C`/`-c`/묶음 `-Tc`)·follow(`-w`/`-W`), journalctl
+  rotate/vacuum/flush·follow(`-f`/묶음 `-fn`)·임의 파일 소스(`--file`/`--root`/`-D`), systemctl
+  start/stop/restart/mask 등(read 서브커맨드만 carve-out), timedatectl `set-*`, vmstat/iostat
+  interval-only·count=0(무한스트림), last 임의 wtmp(`-f`/`--file`). `--no-pager` 강제로 pager hang
+  방지. secret 파일 자동 read 표면이 새로 생기지 않도록 임의 파일/경로 입력 옵션은 Safe에서 제외.
+
 ## [0.19.0] - 2026-06-11
 
 ### Added
