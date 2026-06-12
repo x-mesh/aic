@@ -259,6 +259,55 @@ PTY 테스트는 실제 터미널이 필요해 headless CI에서 제외된다.
 
 ---
 
+## 7. 심층 신호 probe + 자동 발견 (R8)
+
+기존 probe는 risk_guard safelist 바이너리(df/free/ps/ss/sysctl 등)만 써서 **"디스크가 꽉 찼나"는
+보지만 "디스크가 느린가(iowait/await)"·"이미 누가 OOM으로 죽었나"·"어떤 서비스가 안 떴나"는
+못 봤다.** R8은 read-only로 게이트한 도구(`journalctl`/`dmesg`/`iostat`/`vmstat`/`systemctl
+--failed`/`timedatectl`/`lsblk`/`last`)로 이 사각을 메운다.
+
+### 7-1. 시나리오: "서버가 느린데 CPU야 I/O야"
+
+```sh
+aic chat
+> /diagnose 서버가 느려요
+```
+
+→ cpu 카테고리에 `vmstat_iowait`가 붙어 iowait/run-queue/blocked를 분해한다. iowait가 높으면
+디스크 I/O 병목, run-queue가 높으면 CPU 병목으로 가른다(마지막 샘플이 현재값).
+
+### 7-2. 시나리오: "앱이 안 떠요" → 실패 유닛 → 로그 2-hop
+
+```sh
+aic chat
+> /diagnose 앱이 자꾸 죽어요
+```
+
+→ process/generic 카테고리에서 `failed_units`(systemctl --failed)와 `journal_errors`(systemd
+에러 로그)를 수집한다. follow-up으로 LLM이 `journal_unit <실패유닛>`을 제안하면 게이트를 통과해
+해당 unit의 최근 에러 로그를 자동 추적한다(실패 유닛 → 로그 2-hop 체인).
+
+### 7-3. 자동 발견(결정적 임계 스캔)
+
+`/diagnose` 증거 상단에 LLM 호출 없이(오프라인/`--no-analyze`에서도) 확실한 위반만 고정된다:
+
+```
+## ⚠ 자동 발견 (결정적 임계 스캔)
+- /System/Volumes/Data 디스크 92% 사용 (>= 90%)
+- 커널 OOM-killer 흔적 발견(3줄) — 메모리 부족으로 프로세스 강제 종료됨
+```
+
+→ 임계: 디스크 ≥90%(실제 쓰기가능 마운트만 — snap/iso9660/DMG/ESP 등 항상-가득 read-only 제외),
+OOM-killer 이벤트 시그니처, 누적 좀비(≥10), 실패 systemd 유닛. **오탐이 신뢰를 깎으므로** 보수적으로
+잡는다(불확실/baseline 필요 신호는 evidence에만 두고 ⚠로 강조하지 않는다).
+
+**왜 안전한가**: 모든 신규 probe는 단일 bounded Safe 명령(risk_guard arg-gate로 read-only 형태만
+Safe). 상태 변경(dmesg clear·journalctl rotate·systemctl start·timedatectl set-*)·무한스트림
+(follow·interval-only·count=0)·임의 파일 소스(journalctl/last `--file`)는 Safe에서 제외돼 자동
+실행되지 않는다. 자동 발견은 정규식 없는 토큰 파싱 순수 함수라 injection 안전(출력은 데이터로만 취급).
+
+---
+
 ## 부록: 한 장 요약
 
 | 기능 | 진입점 | 핵심 안전장치 |
@@ -269,3 +318,4 @@ PTY 테스트는 실제 터미널이 필요해 headless CI에서 제외된다.
 | R4 Anthropic | `[llm.providers.*] Anthropic` | 단일소스 변환 + 동일 risk/audit 게이트 |
 | R5 audit 조회 | `aic audit tail` / `search` | read-only, HMAC verify는 별도 |
 | R6 headless | `AIC_NO_KEYCHAIN=1` + 사내 endpoint | NeedsConfirm 비대화 거부(e2e 고정) |
+| R8 심층 probe + 자동 발견 | `/diagnose` / `/triage` / `/watch` | risk_guard arg-gate(read-only만 Safe) + 보수적 결정적 스캔 |
