@@ -400,6 +400,101 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "netstat -s | grep -i retrans | head -n 10",
         max_lines: Some(10),
     },
+    // ── SRE 심층 신호(R8) — risk_guard arg-gate로 read-only 보장된 도구. `/local` 기본엔 없고
+    // `/diagnose`(카테고리)·`/triage`·`/watch`에서 선택된다. Linux 전용 도구의 macOS 자리는
+    // 동등 Safe 명령 또는 무신호 placeholder(echo)로 채운다(미설치 시 'command not found'는
+    // docker/k8s probe와 동일하게 진단정보로 수용).
+    ProbeSpec {
+        id: "journal_errors",
+        category: "process",
+        tags: &["log", "journal", "error", "process"],
+        description: "systemd journal 오늘 에러 로그 50줄(-p err) — 서비스 크래시/panic/OOM 원인",
+        linux_command: "journalctl -p err --since today -n 50 --no-pager",
+        macos_command: "dmesg | tail -n 50",
+        max_lines: Some(50),
+    },
+    ProbeSpec {
+        id: "dmesg_oom",
+        category: "system",
+        tags: &["memory", "oom", "kernel", "process"],
+        description: "커널 ring buffer의 OOM-killer 라인 — '이미 죽인' OOM 결정(사후 분석)",
+        linux_command: "dmesg -T | grep -i oom | head -n 30",
+        macos_command: "dmesg | grep -i oom | head -n 30",
+        max_lines: Some(30),
+    },
+    ProbeSpec {
+        id: "iostat_devices",
+        category: "system",
+        tags: &["disk", "io", "iostat", "latency"],
+        description: "per-device I/O await/%util(iostat) — 디스크가 '꽉 찬게' 아니라 '느린가'(마지막 샘플=현재값)",
+        linux_command: "iostat -x 1 2 | head -n 40",
+        macos_command: "iostat -d -w 1 -c 2 | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "vmstat_iowait",
+        category: "system",
+        tags: &["cpu", "io", "iowait", "memory"],
+        description: "iowait/run-queue/blocked 분해(vmstat) — high-load가 CPU냐 I/O냐 판별(마지막 샘플=현재값)",
+        linux_command: "vmstat 1 3",
+        macos_command: "vm_stat",
+        max_lines: None,
+    },
+    ProbeSpec {
+        id: "failed_units",
+        category: "process",
+        tags: &["systemd", "service", "process", "failed"],
+        description: "실패한 systemd 유닛(systemctl --failed) — '앱이 안 뜬다'의 1차 신호",
+        linux_command: "systemctl --failed --no-pager --no-legend | head -n 40",
+        // macOS는 systemd 부재 — 무신호 placeholder(annotation·LLM 오탐 방지).
+        macos_command: "echo",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "conntrack_max",
+        category: "system",
+        tags: &["network", "conntrack", "nat"],
+        description: "conntrack count vs max(sysctl) — NAT/k8s 노드 연결추적 테이블 포화",
+        linux_command: "sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max",
+        macos_command: "sysctl net.inet.ip.maxfragpackets",
+        max_lines: Some(2),
+    },
+    ProbeSpec {
+        id: "listen_backlog",
+        category: "system",
+        tags: &["network", "backlog", "listen", "drop"],
+        description: "listen 소켓 accept-queue(ss -tln Recv-Q/Send-Q) — backlog 포화로 SYN 드롭",
+        linux_command: "ss -tln | head -n 50",
+        macos_command: "netstat -an | grep LISTEN | head -n 50",
+        max_lines: Some(50),
+    },
+    ProbeSpec {
+        id: "time_sync",
+        category: "system",
+        tags: &["time", "ntp", "clock", "sync"],
+        description: "NTP 동기/clock skew(timedatectl) — 인증서/TLS/replication 함정의 숨은 원인",
+        linux_command: "timedatectl show",
+        macos_command: "sysctl -n kern.boottime",
+        max_lines: None,
+    },
+    ProbeSpec {
+        id: "block_topology",
+        category: "system",
+        tags: &["disk", "block", "mount", "ro"],
+        description: "블록디바이스/마운트 토폴로지(lsblk) — ro 리마운트·마운트 소실 식별",
+        linux_command: "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO | head -n 40",
+        macos_command: "df -h | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "reboot_history",
+        category: "system",
+        tags: &["uptime", "reboot", "boot", "history"],
+        description: "재부팅/크래시 이력(last reboot) — '어제까지 됐는데'류에서 호스트 재시작 판별",
+        linux_command: "last -x reboot | head -n 15",
+        macos_command: "last reboot | head -n 15",
+        max_lines: Some(15),
+    },
 ];
 
 /// follow-up 전용 templated probe — 인자 1개를 받는 read-only 명령 템플릿.
@@ -505,6 +600,12 @@ pub(crate) static FOLLOWUP_TEMPLATES: &[FollowupTemplate] = &[
         linux_template: "ss -tnp | grep {arg} | head -n 30",
         macos_template: "lsof -nP -iTCP -sTCP:ESTABLISHED | grep {arg} | head -n 30",
     },
+    FollowupTemplate {
+        id: "journal_unit",
+        description: "특정 systemd unit의 최근 에러 로그 50줄 — 인자: unit 이름(failed_units→이 체인)",
+        linux_template: "journalctl -u {arg} -p err -n 50 --no-pager",
+        macos_template: "dmesg | grep {arg} | head -n 50",
+    },
 ];
 
 /// id로 follow-up 템플릿을 찾는다.
@@ -595,26 +696,30 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
             &[
                 "상위 CPU 프로세스 (process)",
                 "load average 추세 (uptime)",
+                "iowait/run-queue 분해 — high-load가 CPU냐 I/O냐 (vmstat_iowait)",
                 "thermal throttling — 코어별 클럭 저하 (cpu_throttle)",
             ],
-            &["uptime", "process", "cpu_throttle"],
+            &["uptime", "process", "vmstat_iowait", "cpu_throttle"],
         ),
         "memory" => (
             &[
                 "메모리/스왑 사용량 (memory, swap_usage)",
                 "RSS 상위 프로세스 — OOM 범인 (mem_top_proc)",
                 "메모리 압박 전조 (mem_pressure)",
+                "커널 OOM-killer 발생 이력 — 이미 죽인 결정 (dmesg_oom)",
             ],
-            &["memory", "mem_top_proc", "mem_pressure", "swap_usage", "uptime"],
+            &["memory", "mem_top_proc", "mem_pressure", "dmesg_oom", "swap_usage", "uptime"],
         ),
         "disk" => (
             &[
                 "파티션별 사용률/여유 공간 (disk)",
+                "per-device I/O await/%util — 꽉 찬게 아니라 느린가 (iostat_devices)",
+                "블록디바이스/ro 리마운트·마운트 소실 (block_topology)",
                 "디스크를 점유하는 프로세스 (process)",
                 "docker가 디스크를 점유하는가 — images/containers/volumes (docker_df)",
                 "/tmp에 큰 파일이 쌓였는가 (tmp_big)",
             ],
-            &["disk", "process", "docker_df", "tmp_big"],
+            &["disk", "iostat_devices", "block_topology", "process", "docker_df", "tmp_big"],
         ),
         "docker" => (
             &[
@@ -655,9 +760,11 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
                 "인터페이스 주소/링크 상태 (ip)",
                 "라우팅 테이블 (route)",
                 "LISTEN 포트/충돌 (ports)",
+                "listen accept-queue/backlog 포화 — SYN 드롭 (listen_backlog)",
+                "conntrack 테이블 포화 — NAT/k8s 노드 (conntrack_max)",
                 "TCP 재전송 — 패킷 로스 신호 (tcp_retrans)",
             ],
-            &["ip", "route", "ports", "tcp_retrans"],
+            &["ip", "route", "ports", "listen_backlog", "conntrack_max", "tcp_retrans"],
         ),
         "build-fail" => (
             &[
@@ -672,8 +779,10 @@ pub(crate) fn triage_plan(topic: Option<&str>) -> TriagePlan {
             &[
                 "기본 시스템 상태 (date/host/os/uptime)",
                 "리소스 사용량 (disk/memory)",
+                "실패한 systemd 유닛 — 앱이 안 뜨는가 (failed_units)",
+                "최근 재부팅/크래시 이력 (reboot_history)",
             ],
-            &["date", "host", "os", "uptime", "disk", "memory"],
+            &["date", "host", "os", "uptime", "disk", "memory", "failed_units", "reboot_history"],
         ),
     };
     TriagePlan {

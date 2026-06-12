@@ -651,6 +651,18 @@ fn sysctl_is_write(args: &[&str]) -> bool {
         .any(|a| *a == "-w" || (!a.starts_with('-') && a.contains('=')))
 }
 
+/// 단일 dash short-flag 토큰들(`-Tc` 같은 묶음 포함)에서 위험 문자가 하나라도 있는지.
+/// `dmesg -Tc`(c=clear)/`journalctl -fn`(f=follow) 같은 묶음 단축 우회를 per-char로 막는다.
+/// long-form(`--clear` 등)은 별도 정확 매칭으로 처리하므로 여기선 single-dash만 본다.
+fn short_flag_has_char(args: &[&str], bad: &[char]) -> bool {
+    args.iter().any(|a| {
+        a.starts_with('-')
+            && !a.starts_with("--")
+            && a.len() > 1
+            && a.chars().skip(1).any(|c| bad.contains(&c))
+    })
+}
+
 /// curl/wget args에 write/upload/output(=네트워크 쓰기 또는 파일 출력) 플래그가 있는지.
 /// 없으면 GET류(읽기/egress)로 본다. 둘 다 NeedsConfirm이지만 사유/rule을 구분한다.
 fn curl_has_write_flag(args: &[&str]) -> bool {
@@ -833,6 +845,8 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         "comm",
         // macOS 메모리 read-only 조회(SRE_PREFACE가 mem 진단에 사용).
         "vm_stat",
+        // 블록디바이스/마운트 토폴로지(Linux). 전 플래그 read-only·무한스트림 옵션 없음·자연 bounded.
+        "lsblk",
     ]
     .iter()
     .copied()
@@ -907,6 +921,125 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
             return Some(RiskAssessment::safe("docker.read"));
         }
     }
+    // ── SRE read-only 진단 도구(arg/subcommand 게이트) ──────────────────
+    // 모두 write/mutation·무한스트림·임의 파일 read 형태를 Safe에서 제외한다. 제외분은 Unknown으로
+    // 떨어져 자동 실행되지 않는다(NeedsConfirm와 동일하게 auto-confirm 불가).
+    if head == "journalctl" {
+        // mutation/메타 long-form(저널 회전·삭제·동기 등) 차단.
+        let bad_long = args.iter().any(|a| {
+            matches!(
+                *a,
+                "--follow"
+                    | "--rotate"
+                    | "--flush"
+                    | "--sync"
+                    | "--relinquish-var"
+                    | "--smart-relinquish-var"
+                    | "--update-catalog"
+                    | "--setup-keys"
+                    | "--header"
+            ) || a.starts_with("--vacuum")
+        });
+        // 임의 파일/디렉토리/루트를 저널 소스로 지정하는 옵션 차단 — 이게 없으면 `--file=/etc/shadow`
+        // 같은 임의 파일 read 프리미티브가 Safe로 새서 secret 차단이 무력화된다(저널 소스를 시스템 기본으로 한정).
+        // 분리형(`--file p`)·첨부형(`--file=p`)·단축(`-D p`/`-D/p`) 모두 막는다.
+        let bad_source = args.iter().any(|a| {
+            matches!(*a, "--file" | "--directory" | "--root" | "--image")
+                || a.starts_with("--file=")
+                || a.starts_with("--directory=")
+                || a.starts_with("--root=")
+                || a.starts_with("--image=")
+                || a.starts_with("-D")
+        });
+        // follow 단축(-f, 묶음 -fn 50 등)은 무한스트림 → per-char 차단.
+        if bad_long || bad_source || short_flag_has_char(args, &['f']) {
+            return None;
+        }
+        // pager hang 방지: --no-pager 강제(없으면 Safe 제외).
+        if !args.contains(&"--no-pager") {
+            return None;
+        }
+        return Some(RiskAssessment::safe("journalctl.read"));
+    }
+    if head == "dmesg" {
+        // clear(-c/-C)·console 토글(-E/-D)·follow(-w/-W)·set-level(-n) 차단. 묶음 단축 per-char.
+        let bad_long = args.iter().any(|a| {
+            matches!(
+                *a,
+                "--clear" | "--read-clear" | "--console-off" | "--console-on" | "--follow"
+                    | "--follow-new"
+            ) || a.starts_with("--console-level")
+        });
+        if bad_long || short_flag_has_char(args, &['c', 'C', 'E', 'D', 'w', 'W', 'n']) {
+            return None;
+        }
+        return Some(RiskAssessment::safe("dmesg.read"));
+    }
+    if head == "vmstat" || head == "iostat" {
+        // 무한스트림 차단: interval-only(positional 1개) 또는 interval/count에 0 포함(zero=무한·degenerate).
+        // 0개(1회 출력)·2개 이상(interval+양수 count)만 Safe. 순수 read 도구라 그 외 mutation 표면 없음.
+        let nums: Vec<&str> = args
+            .iter()
+            .copied()
+            .filter(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        let any_zero = nums.iter().any(|n| n.chars().all(|c| c == '0'));
+        if nums.len() == 1 || any_zero {
+            return None;
+        }
+        return Some(RiskAssessment::safe("iostat.read"));
+    }
+    if head == "systemctl" {
+        // read 서브커맨드/`--failed` 조회만 Safe carve-out. start/stop/restart/enable/mask/
+        // reload/daemon-reload 등은 allowlist 밖 → match_needs_confirm(systemctl 유지)이 받는다.
+        const SYSTEMCTL_READ: &[&str] = &[
+            "status",
+            "show",
+            "cat",
+            "is-active",
+            "is-enabled",
+            "is-failed",
+            "list-units",
+            "list-unit-files",
+            "list-timers",
+            "list-sockets",
+            "list-dependencies",
+            "list-jobs",
+            "get-default",
+            "help",
+        ];
+        match first_subcommand(args) {
+            Some(sub) if SYSTEMCTL_READ.contains(&sub) => {
+                return Some(RiskAssessment::safe("systemctl.read"));
+            }
+            // `systemctl --failed`처럼 서브커맨드 없이 플래그만인 조회 형태.
+            None if has_flag(args, "--failed") => {
+                return Some(RiskAssessment::safe("systemctl.read"));
+            }
+            _ => {}
+        }
+    }
+    if head == "timedatectl" {
+        // 조회 서브커맨드만 Safe. set-time/set-timezone/set-ntp/set-local-rtc는 allowlist 밖 → 제외.
+        const TIMEDATECTL_READ: &[&str] =
+            &["status", "show", "list-timezones", "timesync-status", "show-timesync"];
+        match first_subcommand(args) {
+            None => return Some(RiskAssessment::safe("timedatectl.read")), // 인자없음=status 출력
+            Some(sub) if TIMEDATECTL_READ.contains(&sub) => {
+                return Some(RiskAssessment::safe("timedatectl.read"));
+            }
+            _ => {}
+        }
+    }
+    if head == "last" {
+        // 로그인/재부팅 이력 read. 임의 wtmp/utmp 파싱은 secret 표면 축소 위해 제외 — 단축 `-f <file>`
+        // (묶음 -xf 포함)과 long-form `--file`/`--file=`(분리·첨부)을 모두 막아 wtmp 소스를 기본으로 한정한다.
+        let bad_file = args.iter().any(|a| *a == "--file" || a.starts_with("--file="));
+        if bad_file || short_flag_has_char(args, &['f']) {
+            return None;
+        }
+        return Some(RiskAssessment::safe("last.read"));
+    }
     None
 }
 
@@ -971,6 +1104,111 @@ mod tests {
         assert_eq!(lvl("docker rmi -f img"), RiskLevel::Dangerous);
         // system의 df가 아닌 하위(events 등)는 Safe가 아니다(자동 실행 금지).
         assert_ne!(lvl("docker system events"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn journalctl_read_safe_follow_and_mutation_not() {
+        // read-only 조회(--no-pager 동반)는 Safe — catalog journal_errors probe가 의존.
+        assert_eq!(
+            lvl("journalctl -p err --since today -n 50 --no-pager"),
+            RiskLevel::Safe
+        );
+        assert_eq!(lvl("journalctl -u nginx.service -n 200 --no-pager"), RiskLevel::Safe);
+        // --no-pager 누락 → pager hang 위험 → Safe 제외.
+        assert_ne!(lvl("journalctl -p err -n 50"), RiskLevel::Safe);
+        // follow(-f)는 무한스트림 → Safe 제외(묶음 단축 -fn도 차단해야 함 — 핵심 우회).
+        assert_ne!(lvl("journalctl -f --no-pager"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl -fn 50 --no-pager"), RiskLevel::Safe);
+        // mutation(저널 회전·삭제)은 Safe 제외.
+        assert_ne!(lvl("journalctl --rotate"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl --flush"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl --vacuum-size=100M --no-pager"), RiskLevel::Safe);
+        // 임의 파일/루트 소스(임의 read 프리미티브)는 분리·첨부·단축 모두 Safe 제외 — secret read 차단.
+        assert_ne!(lvl("journalctl --file /etc/shadow --no-pager"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl --file=/etc/shadow --no-pager"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl --directory=/var/x --no-pager"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl --root=/mnt/snap --no-pager"), RiskLevel::Safe);
+        assert_ne!(lvl("journalctl -D /var/log/journal --no-pager"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn dmesg_read_safe_clear_and_follow_not() {
+        // ring buffer 읽기는 Safe — catalog dmesg_oom probe가 의존.
+        assert_eq!(lvl("dmesg -T"), RiskLevel::Safe);
+        assert_eq!(lvl("dmesg --level=err"), RiskLevel::Safe);
+        // clear(-C/-c)는 ring buffer 변경(mutation) → Safe 제외.
+        assert_ne!(lvl("dmesg -C"), RiskLevel::Safe);
+        assert_ne!(lvl("dmesg -c"), RiskLevel::Safe);
+        assert_ne!(lvl("dmesg --clear"), RiskLevel::Safe);
+        // 핵심 우회: 묶음 단축 -Tc(c=clear)가 통과되면 안 됨.
+        assert_ne!(lvl("dmesg -Tc"), RiskLevel::Safe);
+        // follow(-w/-W)는 무한스트림 → Safe 제외.
+        assert_ne!(lvl("dmesg -w"), RiskLevel::Safe);
+        assert_ne!(lvl("dmesg -W"), RiskLevel::Safe);
+        assert_ne!(lvl("dmesg -TW"), RiskLevel::Safe);
+        // set console level(-n)도 제외.
+        assert_ne!(lvl("dmesg -n 1"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn vmstat_iostat_interval_only_not_safe() {
+        // 1회 출력(positional 0) 또는 interval+count(2+)는 Safe — catalog vmstat_iowait/iostat_devices.
+        assert_eq!(lvl("vmstat"), RiskLevel::Safe);
+        assert_eq!(lvl("vmstat 1 3"), RiskLevel::Safe);
+        assert_eq!(lvl("vmstat -s"), RiskLevel::Safe);
+        assert_eq!(lvl("iostat -x 1 2"), RiskLevel::Safe);
+        assert_eq!(lvl("iostat -d -w 1 -c 2"), RiskLevel::Safe); // macOS 형태
+        assert_eq!(lvl("iostat"), RiskLevel::Safe);
+        // interval-only(positional==1)는 무한스트림 → Safe 제외(timeout hang 방지).
+        assert_ne!(lvl("vmstat 1"), RiskLevel::Safe);
+        assert_ne!(lvl("iostat -x 1"), RiskLevel::Safe);
+        assert_ne!(lvl("iostat 5"), RiskLevel::Safe);
+        // count==0(또는 interval==0)은 일부 빌드에서 무한 출력 → Safe 제외(경계).
+        assert_ne!(lvl("vmstat 1 0"), RiskLevel::Safe);
+        assert_ne!(lvl("iostat -x 1 0"), RiskLevel::Safe);
+        assert_ne!(lvl("vmstat 0"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn systemctl_read_subcommand_safe_mutation_needs_confirm() {
+        // read 서브커맨드/--failed 조회는 Safe carve-out — catalog failed_units probe가 의존.
+        assert_eq!(lvl("systemctl --failed --no-pager --no-legend"), RiskLevel::Safe);
+        assert_eq!(lvl("systemctl status nginx"), RiskLevel::Safe);
+        assert_eq!(lvl("systemctl is-active sshd"), RiskLevel::Safe);
+        assert_eq!(lvl("systemctl list-units --state=failed"), RiskLevel::Safe);
+        assert_eq!(lvl("systemctl show nginx"), RiskLevel::Safe);
+        // mutation 서브커맨드는 NeedsConfirm 유지(자동 실행 금지).
+        assert_eq!(lvl("systemctl start nginx"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("systemctl restart nginx"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("systemctl daemon-reload"), RiskLevel::NeedsConfirm);
+        assert_eq!(lvl("systemctl mask foo"), RiskLevel::NeedsConfirm);
+        // sudo 동반 read는 floor에 의해 NeedsConfirm(권한 escalation)로 끌어올려진다.
+        assert_eq!(lvl("sudo systemctl status nginx"), RiskLevel::NeedsConfirm);
+    }
+
+    #[test]
+    fn timedatectl_read_safe_set_not() {
+        assert_eq!(lvl("timedatectl"), RiskLevel::Safe);
+        assert_eq!(lvl("timedatectl show"), RiskLevel::Safe);
+        assert_eq!(lvl("timedatectl timesync-status"), RiskLevel::Safe);
+        // set-*는 시각/타임존/NTP 변경(mutation) → Safe 제외.
+        assert_ne!(lvl("timedatectl set-ntp true"), RiskLevel::Safe);
+        assert_ne!(lvl("timedatectl set-timezone UTC"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn last_lsblk_read_safe() {
+        // 재부팅/로그인 이력·블록디바이스 토폴로지 read는 Safe — reboot_history/block_topology probe.
+        assert_eq!(lvl("last -x reboot"), RiskLevel::Safe);
+        assert_eq!(lvl("last reboot"), RiskLevel::Safe);
+        assert_eq!(lvl("last -n 20"), RiskLevel::Safe);
+        assert_eq!(lvl("lsblk"), RiskLevel::Safe);
+        assert_eq!(lvl("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO"), RiskLevel::Safe);
+        // last -f <file>(임의 wtmp, 묶음 -xf 포함)·long-form --file은 Safe 제외(secret 표면 축소).
+        assert_ne!(lvl("last -f /custom/wtmp"), RiskLevel::Safe);
+        assert_ne!(lvl("last -xf /custom/wtmp"), RiskLevel::Safe);
+        assert_ne!(lvl("last --file /etc/shadow"), RiskLevel::Safe);
+        assert_ne!(lvl("last --file=/etc/shadow"), RiskLevel::Safe);
     }
 
     #[test]

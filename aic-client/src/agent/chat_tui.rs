@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use super::sys_sampler::SysSampler;
+use super::sys_sampler::{Severity, SysSampler};
 
 /// 한 입력의 결과(reedline `ReadLine` 대응).
 pub(crate) enum ChatLine {
@@ -772,7 +772,7 @@ fn draw_full(
     f: &mut Frame,
     log_text: &Text,
     scroll: u16,
-    status: &str,
+    status: Line<'static>,
     textarea: &TextArea,
     prompt: &str,
     popup: &[&str],
@@ -866,10 +866,10 @@ fn draw_full(
         }
     }
 
-    // 구분선 + status.
+    // 구분선 + status(세그먼트별 색은 status Line이 직접 들고 있다 — 여기서 .dim() 강제 금지).
     let sep = "─".repeat(area.width as usize);
     f.render_widget(Paragraph::new(sep).dim(), rows[3]);
-    f.render_widget(Paragraph::new(status.to_string()).dim(), rows[4]);
+    f.render_widget(Paragraph::new(status), rows[4]);
 }
 
 /// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
@@ -967,16 +967,49 @@ fn highlight_log_lines(text: &Text<'static>, a: usize, b: usize) -> Text<'static
 /// status 문자열 끝에 컨텍스트 토큰 추정치를 ` · ctx ~Nk`로 덧붙인다(0이면 생략). 순수 함수.
 /// N = tokens/1000(1000 단위 k 절삭). `~`로 추정 표기(provider usage가 아닌 문자수/4 추정).
 fn status_with_ctx(status: &str, ctx_tokens: usize) -> String {
-    if ctx_tokens == 0 {
-        return status.to_string();
+    match ctx_label(ctx_tokens) {
+        None => status.to_string(),
+        Some(ctx) => format!("{status} · ctx {ctx}"),
     }
-    // 1000 미만은 `~512`처럼 정확한 수로(과거 `~0k`로 떠 '값 없음'처럼 보이던 문제), 이상은 `~12k`.
-    let ctx = if ctx_tokens >= 1000 {
+}
+
+/// ctx 토큰 추정치 라벨(`~Nk`/`~N`). 0이면 None. 1000 미만은 정확한 수, 이상은 k 절삭.
+/// `status_with_ctx`(plain)와 `build_status_line`(colored)이 공유한다.
+fn ctx_label(ctx_tokens: usize) -> Option<String> {
+    if ctx_tokens == 0 {
+        return None;
+    }
+    Some(if ctx_tokens >= 1000 {
         format!("~{}k", ctx_tokens / 1000)
     } else {
         format!("~{ctx_tokens}")
-    };
-    format!("{status} · ctx {ctx}")
+    })
+}
+
+/// status bar 색: 정상=dim · warn=주황 · crit=빨강(굵게). 단일 출처(named).
+fn sev_style(sev: Severity) -> Style {
+    match sev {
+        Severity::Normal => Style::default().add_modifier(Modifier::DIM),
+        Severity::Warn => Style::default().fg(Color::Rgb(255, 165, 0)),
+        Severity::Crit => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    }
+}
+
+/// 시스템 지표 세그먼트를 단계별 색(정상 dim/warn 주황/crit 빨강)으로 칠한 status bar 한 줄을 만든다.
+/// 구분선(` · `)·선두 `· `·ctx 접미는 dim. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
+fn build_status_line(segs: &[(String, Severity)], ctx_tokens: usize) -> Line<'static> {
+    let dim = sev_style(Severity::Normal);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("· ", dim)];
+    for (i, (text, sev)) in segs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(text.clone(), sev_style(*sev)));
+    }
+    if let Some(ctx) = ctx_label(ctx_tokens) {
+        spans.push(Span::styled(format!(" · ctx {ctx}"), dim));
+    }
+    Line::from(spans)
 }
 
 /// 검색 모드 search bar 텍스트(입력 줄 대체). `/{query}  (idx/total)`. hit가 없으면 `(0/0)`.
@@ -1156,6 +1189,8 @@ async fn chat_loop(
     let mut events = EventStream::new();
     let mut sampler = with_statusbar.then(SysSampler::new);
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
+    // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
+    let mut status_segs: Option<Vec<(String, Severity)>> = None;
     let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
     // 대화 로그: 원본 ANSI 줄(dump용·색 보존, M1) + Text 캐시(m3, log 변경 시만 재구성).
@@ -1188,7 +1223,9 @@ async fn chat_loop(
         // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
         if let Some(s) = sampler.as_mut() {
             if last_sample.elapsed().as_secs() >= 2 || status.starts_with("· (") {
-                status = format!("· {}", s.sample().status_line());
+                let m = s.sample();
+                status = format!("· {}", m.status_line());
+                status_segs = Some(m.status_segments());
                 last_sample = Instant::now();
             }
         }
@@ -1224,7 +1261,14 @@ async fn chat_loop(
         }
         let draw_scroll = scroll;
         // status 끝에 컨텍스트 토큰 추정치를 덧붙인다(0이면 생략).
-        let status_line = status_with_ctx(&status, ctx_tokens);
+        // 지표가 있으면 단계별 색(주황/빨강) Line, 없으면(첫 sample 전) help 텍스트를 plain dim으로.
+        let status_line: Line = match &status_segs {
+            Some(segs) => build_status_line(segs, ctx_tokens),
+            None => Line::from(Span::styled(
+                status_with_ctx(&status, ctx_tokens),
+                sev_style(Severity::Normal),
+            )),
+        };
         // 검색 모드면 입력 줄 대신 search bar(`/{query}  (idx/total)`)를 그린다(prompt는 빈 문자열로
         // 둬 textarea가 search bar 전체를 차지하게). popup은 위에서 막았고, spin도 검색 중엔 없다.
         let search_ta;
@@ -1253,7 +1297,7 @@ async fn chat_loop(
                     f,
                     draw_text,
                     draw_scroll,
-                    &status_line,
+                    status_line,
                     draw_ta,
                     draw_prompt,
                     &popup,
@@ -1922,7 +1966,7 @@ mod tests {
         let log = Text::from("L0\nL1\nL2");
         let ta = super::textarea_with("hi");
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "you ❯ ", &[], 0, None, None))
+        term.draw(|f| super::draw_full(f, &log, 0, super::Line::from("· load"), &ta, "you ❯ ", &[], 0, None, None))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
@@ -1946,7 +1990,7 @@ mod tests {
                 f,
                 &log,
                 0,
-                "· load",
+                super::Line::from("· load"),
                 &ta,
                 "you ❯ ",
                 &["diagnose", "doctor"],
@@ -1982,7 +2026,7 @@ mod tests {
                 f,
                 &log,
                 0,
-                "· load",
+                super::Line::from("· load"),
                 &ta,
                 "you ❯ ",
                 &["diagnose", "doctor"],
@@ -2068,6 +2112,32 @@ mod tests {
     }
 
     #[test]
+    fn build_status_line_colors_by_severity() {
+        use super::Severity::{Crit, Normal, Warn};
+        let segs = vec![
+            ("load 1.0".to_string(), Normal),
+            ("cpu 88%".to_string(), Warn),
+            ("mem 99%".to_string(), Crit),
+        ];
+        let line = super::build_status_line(&segs, 1500);
+        // 텍스트는 status_line과 동일 토큰 + ctx 접미.
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("load 1.0") && text.contains("cpu 88%") && text.contains("mem 99%"));
+        assert!(text.contains("ctx ~1k"), "ctx 접미: {text}");
+        // 위반 세그먼트가 정확한 색을 들고 있다: warn=주황, crit=빨강, 정상=색 없음(dim).
+        let span = |needle: &str| {
+            line.spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .unwrap_or_else(|| panic!("span 없음: {needle}"))
+                .style
+        };
+        assert_eq!(span("cpu 88%").fg, Some(ratatui::style::Color::Rgb(255, 165, 0)));
+        assert_eq!(span("mem 99%").fg, Some(ratatui::style::Color::Red));
+        assert_eq!(span("load 1.0").fg, None); // 정상은 색 미지정(dim modifier만)
+    }
+
+    #[test]
     fn search_bar_formats_query_and_counter() {
         // hit 없으면 (0/0), 있으면 1-based (idx+1/total).
         assert_eq!(super::search_bar("err", 0, 0), "/err  (0/0)");
@@ -2098,7 +2168,7 @@ mod tests {
         let bar = super::search_bar("found", 0, 1);
         let ta = super::textarea_with(&bar);
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, "· load", &ta, "", &[], 0, None, None))
+        term.draw(|f| super::draw_full(f, &log, 0, super::Line::from("· load"), &ta, "", &[], 0, None, None))
             .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
@@ -2117,11 +2187,34 @@ mod tests {
         let ta = super::textarea_with("hi");
         let status = super::status_with_ctx("· load", 12_000);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, &status, &ta, "you ❯ ", &[], 0, None, None))
-            .unwrap();
+        term.draw(|f| {
+            super::draw_full(f, &log, 0, super::Line::from(status.clone()), &ta, "you ❯ ", &[], 0, None, None)
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let row5: String = (0..40).map(|x| buf[(x, 5)].symbol()).collect();
         assert!(row5.contains("ctx ~12k"), "status에 ctx: {row5:?}");
+    }
+
+    #[test]
+    fn draw_full_status_row_paints_crit_red() {
+        // 엔드투엔드: crit 세그먼트가 status 행 셀에 실제 빨강(fg=Red)으로 그려지는지(렌더 파이프라인).
+        use super::Severity::{Crit, Normal};
+        let log = Text::from("x");
+        let ta = super::textarea_with("hi");
+        let segs = vec![("load 1.0".to_string(), Normal), ("mem 99%".to_string(), Crit)];
+        let status = super::build_status_line(&segs, 0);
+        let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        term.draw(|f| super::draw_full(f, &log, 0, status, &ta, "you ❯ ", &[], 0, None, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        // status 행(맨 아래 = height-1 = 5)에서 'mem' 글자가 있는 셀이 빨강인지 확인.
+        let row = 5u16;
+        let red = (0..60).any(|x| {
+            let cell = &buf[(x, row)];
+            cell.symbol() == "m" && cell.style().fg == Some(ratatui::style::Color::Red)
+        });
+        assert!(red, "crit 세그먼트가 빨강으로 렌더되지 않음");
     }
 
     #[test]
