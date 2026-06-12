@@ -15,10 +15,35 @@ pub(crate) struct SysSampler {
     last: Instant,
 }
 
+/// status bar 지표의 임계 단계 — 정상(dim) → 경고(주황) → 위험(빨강). status bar 컬러링용.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Severity {
+    Normal,
+    Warn,
+    Crit,
+}
+
+// status bar 임계값(named const). macOS dev 호스트 오탐을 줄이려 보수적으로 둔다.
+// cpu/mem/swap는 %, load는 코어수 배수, disk는 **신뢰 가능한 free bytes 절대값**(APFS % 부정확 회피).
+const CPU_WARN_PCT: f32 = 85.0;
+const CPU_CRIT_PCT: f32 = 95.0;
+const MEM_WARN_PCT: f64 = 90.0;
+const MEM_CRIT_PCT: f64 = 97.0;
+const SWAP_WARN_PCT: f64 = 50.0;
+const SWAP_CRIT_PCT: f64 = 90.0;
+/// load1/코어수 배수 — 1.0(코어수와 같음)=warn, 2.0(2배)=crit.
+const LOAD_WARN_RATIO: f64 = 1.0;
+const LOAD_CRIT_RATIO: f64 = 2.0;
+/// root fs 여유 용량 절대 임계(GiB). 사용률 %는 macOS APFS에서 부정확해 free bytes로 판정.
+const DISK_WARN_FREE: u64 = 5 * 1024 * 1024 * 1024;
+const DISK_CRIT_FREE: u64 = 1024 * 1024 * 1024;
+
 /// 한 번 sample한 지표 스냅샷.
 pub(crate) struct SysMetrics {
     pub load1: f64,
     pub cpu_pct: f32,
+    /// 논리 코어 수(load1 정규화용). 최소 1.
+    pub cores: usize,
     pub mem_used: u64,
     pub mem_total: u64,
     /// swap 사용량/총량(메모리 압박·OOM 조기 신호). total==0이면 swap 비활성.
@@ -71,6 +96,10 @@ impl SysSampler {
         SysMetrics {
             load1: System::load_average().one,
             cpu_pct: self.sys.global_cpu_usage(),
+            // 논리 코어 수 — sysinfo refresh 상태와 무관한 std API로 안정 측정(load 정규화 기준).
+            cores: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
             mem_used: self.sys.used_memory(),
             mem_total: self.sys.total_memory(),
             swap_used: self.sys.used_swap(),
@@ -117,6 +146,100 @@ impl SysMetrics {
             human_bytes(self.disk_write_bps),
         )
     }
+
+    fn mem_pct(&self) -> f64 {
+        if self.mem_total > 0 {
+            self.mem_used as f64 * 100.0 / self.mem_total as f64
+        } else {
+            0.0
+        }
+    }
+
+    fn load_sev(&self) -> Severity {
+        let ratio = self.load1 / self.cores.max(1) as f64;
+        sev_high(ratio, LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
+    }
+    fn cpu_sev(&self) -> Severity {
+        sev_high(self.cpu_pct as f64, CPU_WARN_PCT as f64, CPU_CRIT_PCT as f64)
+    }
+    fn mem_sev(&self) -> Severity {
+        sev_high(self.mem_pct(), MEM_WARN_PCT, MEM_CRIT_PCT)
+    }
+    fn swap_sev(&self) -> Severity {
+        // swap 비활성이면 정상. macOS는 평시에도 swap을 쓰므로 임계가 보수적(50/90%).
+        if self.swap_total == 0 {
+            return Severity::Normal;
+        }
+        let pct = self.swap_used as f64 * 100.0 / self.swap_total as f64;
+        sev_high(pct, SWAP_WARN_PCT, SWAP_CRIT_PCT)
+    }
+    fn disk_sev(&self) -> Severity {
+        // 읽기 실패(n/a)면 정상 취급. 사용률 %는 APFS 부정확이라 free bytes 절대값으로 판정(낮을수록 위험).
+        if self.disk_total == 0 {
+            return Severity::Normal;
+        }
+        sev_low(self.disk_avail, DISK_WARN_FREE, DISK_CRIT_FREE)
+    }
+
+    /// status bar를 (라벨, 단계) 세그먼트로 분해한다(컬러링용, 순수). 텍스트는 `status_line`과 동일 포맷.
+    /// io 세그먼트는 처리량이라 임계 없음(항상 Normal). chat_tui가 단계별 색을 입혀 렌더한다.
+    pub fn status_segments(&self) -> Vec<(String, Severity)> {
+        let swap = if self.swap_total > 0 {
+            format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+        } else {
+            "swap off".to_string()
+        };
+        let disk = if self.disk_total > 0 {
+            format!("disk {} free", human_bytes(self.disk_avail))
+        } else {
+            "disk n/a".to_string()
+        };
+        vec![
+            (format!("load {:.2}", self.load1), self.load_sev()),
+            (format!("cpu {:.0}%", self.cpu_pct), self.cpu_sev()),
+            (
+                format!(
+                    "mem {:.0}% ({}/{})",
+                    self.mem_pct(),
+                    human_bytes(self.mem_used),
+                    human_bytes(self.mem_total)
+                ),
+                self.mem_sev(),
+            ),
+            (swap, self.swap_sev()),
+            (disk, self.disk_sev()),
+            (
+                format!(
+                    "io r{}/s w{}/s",
+                    human_bytes(self.disk_read_bps),
+                    human_bytes(self.disk_write_bps)
+                ),
+                Severity::Normal,
+            ),
+        ]
+    }
+}
+
+/// 값이 높을수록 위험한 지표(cpu/mem/swap/load)의 단계 판정.
+fn sev_high(v: f64, warn: f64, crit: f64) -> Severity {
+    if v >= crit {
+        Severity::Crit
+    } else if v >= warn {
+        Severity::Warn
+    } else {
+        Severity::Normal
+    }
+}
+
+/// 값이 낮을수록 위험한 지표(disk free)의 단계 판정.
+fn sev_low(v: u64, warn: u64, crit: u64) -> Severity {
+    if v <= crit {
+        Severity::Crit
+    } else if v <= warn {
+        Severity::Warn
+    } else {
+        Severity::Normal
+    }
 }
 
 /// bytes를 사람이 읽는 단위로(B/K/M/G/T). 순수 함수.
@@ -153,6 +276,7 @@ mod tests {
         let m = SysMetrics {
             load1: 1.23,
             cpu_pct: 45.6,
+            cores: 8,
             mem_used: 8 * 1024 * 1024 * 1024,
             mem_total: 16 * 1024 * 1024 * 1024,
             swap_used: 1024 * 1024 * 1024,
@@ -177,6 +301,7 @@ mod tests {
         let m = SysMetrics {
             load1: 0.0,
             cpu_pct: 0.0,
+            cores: 4,
             mem_used: 1024,
             mem_total: 2048,
             swap_used: 0,
@@ -189,6 +314,50 @@ mod tests {
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
         assert!(line.contains("disk n/a"), "{line}");
+    }
+
+    fn metric(load1: f64, cpu: f32, cores: usize, mem_used: u64, mem_total: u64,
+              swap_used: u64, swap_total: u64, disk_avail: u64, disk_total: u64) -> SysMetrics {
+        SysMetrics {
+            load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
+            disk_avail, disk_total, disk_read_bps: 0, disk_write_bps: 0,
+        }
+    }
+
+    #[test]
+    fn severity_thresholds_normal_warn_crit() {
+        let g = 1024 * 1024 * 1024;
+        // 정상: 모든 지표 임계 미달 → 전부 Normal.
+        let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        for s in [ok.load_sev(), ok.cpu_sev(), ok.mem_sev(), ok.swap_sev(), ok.disk_sev()] {
+            assert_eq!(s, Severity::Normal);
+        }
+        // cpu warn(85~95), mem crit(>=97).
+        let m = metric(1.0, 88.0, 8, 159 * g / 10, 16 * g, 0, 0, 50 * g, 200 * g); // mem 99%
+        assert_eq!(m.cpu_sev(), Severity::Warn);
+        assert_eq!(m.mem_sev(), Severity::Crit);
+        // load: ratio>=2.0 → Crit (16 load / 8 cores = 2.0).
+        assert_eq!(metric(16.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(), Severity::Crit);
+        assert_eq!(metric(8.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(), Severity::Warn);
+        // disk: free bytes 절대 임계(<=1G crit, <=5G warn). %가 아니라 free라 macOS APFS 무관.
+        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 512 * 1024 * 1024, 999 * g).disk_sev(), Severity::Crit);
+        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 3 * g, 999 * g).disk_sev(), Severity::Warn);
+        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 999 * g).disk_sev(), Severity::Normal);
+        // disk/swap n/a(total 0)는 Normal(오탐 방지).
+        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 0, 0).disk_sev(), Severity::Normal);
+        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).swap_sev(), Severity::Normal);
+    }
+
+    #[test]
+    fn status_segments_labels_and_severity_align() {
+        let g = 1024 * 1024 * 1024;
+        let m = metric(1.0, 99.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        let segs = m.status_segments();
+        // 세그먼트 6개(load/cpu/mem/swap/disk/io), 텍스트는 status_line과 동일 토큰.
+        assert_eq!(segs.len(), 6);
+        assert!(segs[1].0.starts_with("cpu "));
+        assert_eq!(segs[1].1, Severity::Crit); // cpu 99% >= 95
+        assert_eq!(segs[5].1, Severity::Normal); // io는 임계 없음
     }
 
     #[test]
