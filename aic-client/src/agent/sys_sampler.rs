@@ -5,8 +5,10 @@
 //! `Disks` 인스턴스를 세션 내내 **재사용**해야 정확하다(매번 새로 만들면 0). 따라서 샘플러는
 //! 상태를 들고 다닌다. SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, System};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 /// load/cpu/memory/disk-i/o/net-i/o를 들고 있는 stateful 샘플러. status bar 전용.
 pub(crate) struct SysSampler {
@@ -17,7 +19,9 @@ pub(crate) struct SysSampler {
 }
 
 /// status bar 지표의 임계 단계 — 정상(dim) → 경고(주황) → 위험(빨강). status bar 컬러링용.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 변형 선언 순서(Normal < Warn < Crit)가 곧 심각도 순서다 — `Ord`로 `overall_severity`가
+/// 여러 지표 중 최댓값을 그대로 고른다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Severity {
     Normal,
     Warn,
@@ -39,7 +43,13 @@ const LOAD_CRIT_RATIO: f64 = 2.0;
 const DISK_WARN_FREE: u64 = 5 * 1024 * 1024 * 1024;
 const DISK_CRIT_FREE: u64 = 1024 * 1024 * 1024;
 
-/// 한 번 sample한 지표 스냅샷.
+// 적응형 샘플링 주기(초). 전부 Normal이면 느슨하게(노트북에서 2초마다 CPU를 깨우지 않아 배터리 절약),
+// Warn/Crit이면 촘촘하게 해상도를 확보한다. C4 council 합의: idle/Normal 5s, Warn/Crit 2s.
+const CADENCE_NORMAL_SECS: u64 = 5;
+const CADENCE_ALERT_SECS: u64 = 2;
+
+/// 한 번 sample한 지표 스냅샷. watch 채널로 publish하려면 `Clone`(모든 필드가 Copy 원시값).
+#[derive(Clone)]
 pub(crate) struct SysMetrics {
     pub load1: f64,
     pub cpu_pct: f32,
@@ -234,6 +244,67 @@ impl SysMetrics {
             ),
         ]
     }
+
+    /// 임계가 있는 지표(load/cpu/mem/swap/disk) 중 가장 높은 단계. 적응형 샘플링 주기 결정용 —
+    /// 전부 Normal이면 느슨하게, 하나라도 Warn/Crit이면 촘촘하게 샘플한다. io는 임계가 없어 제외
+    /// (status_segments와 동일 집합). `Severity`의 `Ord`로 최댓값을 그대로 고른다.
+    pub(crate) fn overall_severity(&self) -> Severity {
+        [
+            self.load_sev(),
+            self.cpu_sev(),
+            self.mem_sev(),
+            self.swap_sev(),
+            self.disk_sev(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(Severity::Normal)
+    }
+}
+
+/// status bar 지표를 **전용 tokio task**에서 샘플해 watch 채널(latest-wins)로 publish한다.
+///
+/// 핵심: blocking refresh(`disks.refresh`의 statvfs 등)를 `spawn_blocking`에서 돌려 호출자 task(=chat
+/// TUI 루프)를 막지 않는다. hung NFS/SMB mount에서 statfs가 멈춰도 UI는 얼지 않는다. 또한 sampler를
+/// blocking 클로저로 넘겼다 돌려받는 구조라 **직전 sample이 끝나기 전엔 다음 sample을 시작하지 않는다**
+/// (single-flight) — hung mount여도 blocking thread는 항상 ≤1개이고, sleep이 sample 완료 *후*에
+/// 걸리므로 밀린 tick이 몰아치지도 않는다.
+///
+/// 주기는 직전 sample의 `overall_severity`에 따라 적응형(Normal 5s / Warn·Crit 2s)이다.
+/// 초기값은 `None`(첫 sample 전, 호출자는 placeholder를 보여줄 수 있다), 이후 매 sample마다 `Some`.
+/// 반환된 `Receiver`가 모두 drop되면(채팅 종료) task는 다음 publish에서 스스로 끝난다. 호출자는
+/// 즉시 종료를 위해 반환된 `JoinHandle`을 `abort()`해도 된다.
+pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandle<()>) {
+    let (tx, rx) = watch::channel(None);
+    let handle = tokio::spawn(async move {
+        let mut sampler = SysSampler::new();
+        loop {
+            // sampler를 blocking thread로 넘겼다 돌려받는다(i/o delta 계산을 위해 상태를 보존해야 함).
+            // 이 await가 끝나기 전엔 절대 다음 sample을 시작하지 않으므로 blocking thread는 ≤1개다.
+            let (returned, metrics) = match tokio::task::spawn_blocking(move || {
+                let m = sampler.sample();
+                (sampler, m)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                // blocking 클로저 panic — 더는 못 돈다. task 종료.
+                Err(_) => break,
+            };
+            sampler = returned;
+            let cadence = if metrics.overall_severity() == Severity::Normal {
+                Duration::from_secs(CADENCE_NORMAL_SECS)
+            } else {
+                Duration::from_secs(CADENCE_ALERT_SECS)
+            };
+            // 수신자가 모두 사라졌으면(채팅 종료) 종료.
+            if tx.send(Some(metrics)).is_err() {
+                break;
+            }
+            tokio::time::sleep(cadence).await;
+        }
+    });
+    (rx, handle)
 }
 
 /// 값이 높을수록 위험한 지표(cpu/mem/swap/load)의 단계 판정.
@@ -344,6 +415,7 @@ mod tests {
         SysMetrics {
             load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
             disk_avail, disk_total, disk_read_bps: 0, disk_write_bps: 0,
+            net_rx_bps: 0, net_tx_bps: 0,
         }
     }
 
@@ -389,5 +461,50 @@ mod tests {
         let mut s = SysSampler::new();
         let m = s.sample();
         assert!(m.mem_total > 0, "mem_total should be positive on a real host");
+    }
+
+    #[test]
+    fn overall_severity_picks_highest() {
+        let g = 1024 * 1024 * 1024;
+        // 전부 정상 → Normal.
+        assert_eq!(
+            metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g).overall_severity(),
+            Severity::Normal
+        );
+        // mem crit(99%) 하나라도 있으면 전체 Crit(최댓값).
+        assert_eq!(
+            metric(1.0, 10.0, 8, 159 * g / 10, 16 * g, 0, 0, 50 * g, 200 * g).overall_severity(),
+            Severity::Crit
+        );
+        // 최고가 cpu warn(88%)뿐이면 Warn.
+        assert_eq!(
+            metric(1.0, 88.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g).overall_severity(),
+            Severity::Warn
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_sampler_publishes_metrics_off_thread() {
+        // 전용 task가 watch 채널로 첫 지표를 publish하는지 확인. blocking refresh가 spawn_blocking에서
+        // 돌므로 이 테스트(=호출자) task는 막히지 않는다. 타임아웃으로 무한 대기 방지.
+        let (mut rx, handle) = spawn_sampler();
+        // 초기값은 None(첫 sample 전).
+        assert!(rx.borrow().is_none(), "initial watch value should be None before first sample");
+        let got = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if rx.changed().await.is_err() {
+                    return None;
+                }
+                if let Some(m) = rx.borrow_and_update().clone() {
+                    return Some(m);
+                }
+            }
+        })
+        .await
+        .expect("sampler should publish within 5s");
+        let m = got.expect("first publish should carry Some(metrics)");
+        assert!(m.mem_total > 0, "published metrics should have a real mem_total");
+        // task 정리(수신자 drop만으로도 다음 cycle에 종료하나, 즉시 abort).
+        handle.abort();
     }
 }
