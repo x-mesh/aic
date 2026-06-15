@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use super::sys_sampler::{Severity, SysSampler};
+use super::sys_sampler::{spawn_sampler, Severity, SysMetrics, SysSampler};
 
 /// 한 입력의 결과(reedline `ReadLine` 대응).
 pub(crate) enum ChatLine {
@@ -303,6 +303,12 @@ impl HangulComposer {
     fn reset(&mut self) {
         self.state = None;
         self.cursor_after = None;
+    }
+
+    /// 한글 IME 조합이 진행 중인가(미완성 preedit jamo가 있나). 조합 중에 status 영역을 자발적으로
+    /// redraw하면 자모가 분리·이동될 수 있어, metrics tick으로 인한 redraw를 건너뛰는 판단에 쓴다.
+    fn is_composing(&self) -> bool {
+        self.state.is_some()
     }
 
     fn input(&mut self, textarea: &mut TextArea<'static>, k: KeyEvent) -> bool {
@@ -1147,6 +1153,16 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// metrics watch 채널 폴링 결과 — chat_loop의 select! arm이 채널 상태를 분기하는 데 쓴다.
+enum MetricsPoll {
+    /// 새 지표 도착(첫 sample 이후엔 항상 이 변형).
+    New(SysMetrics),
+    /// 채널이 변경됐으나 값이 아직 None(이론상 첫 sample 전 — 무시).
+    Empty,
+    /// 채널이 닫힘(sampler task 종료) — arm을 비활성화해 busy-loop를 막는다.
+    Closed,
+}
+
 /// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
 /// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
 /// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
@@ -1187,11 +1203,19 @@ async fn chat_loop(
     let mut textarea = TextArea::default();
     let mut hangul = HangulComposer::default();
     let mut events = EventStream::new();
-    let mut sampler = with_statusbar.then(SysSampler::new);
+    // status bar 지표는 전용 task(spawn_sampler)가 blocking refresh(statfs 등)를 spawn_blocking에서
+    // 돌려 watch 채널로 publish한다. UI 루프는 채널만 읽으므로 (1) hung mount에서 statfs가 멈춰도
+    // 얼지 않고, (2) 채널 갱신이 select!를 깨워 idle에서도 status가 흐른다(이전엔 tick이 spin 중에만
+    // 돌아 idle에서 status가 멈췄다).
+    let (mut metrics_rx, sampler_task) = if with_statusbar {
+        let (rx, handle) = spawn_sampler();
+        (Some(rx), Some(handle))
+    } else {
+        (None, None)
+    };
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
-    let mut last_sample = Instant::now();
     let mut spin: Option<SpinState> = None;
     // 대화 로그: 원본 ANSI 줄(dump용·색 보존, M1) + Text 캐시(m3, log 변경 시만 재구성).
     let mut log: Vec<String> = Vec::new();
@@ -1218,17 +1242,12 @@ async fn chat_loop(
     // 터미널 네이티브 선택 없이 드래그→복사가 되도록 TUI가 직접 선택을 구현한다(라인 단위).
     // MouseUp에서 drag가 있었으면 선택 줄들을 클립보드에 복사하고 해제한다. 클릭만은 no-op.
     let mut select: Option<(usize, usize, bool)> = None;
+    // 이번 루프 반복에서 terminal.draw()를 호출할지. 기본 true이며, IME 조합 중 metrics tick이
+    // 오면 그 반복만 false로 두어 자모 분리를 막는다(상태는 갱신하고 redraw만 건너뜀).
+    let mut should_draw = true;
 
     loop {
-        // status 갱신(2초 주기 또는 최초). spinner 유무와 무관하게 흐른다.
-        if let Some(s) = sampler.as_mut() {
-            if last_sample.elapsed().as_secs() >= 2 || status.starts_with("· (") {
-                let m = s.sample();
-                status = format!("· {}", m.status_line());
-                status_segs = Some(m.status_segments());
-                last_sample = Instant::now();
-            }
-        }
+        // status 지표는 전용 sampler task가 watch 채널로 밀어넣는다(아래 select! metrics arm에서 수신).
         // slash 후보 popup 계산(입력이 `/명령` 첫 토큰일 때만). MAX_POPUP로 제한, sel 보정.
         let mut popup = slash_candidates(&textarea.lines().join("\n"));
         popup.truncate(MAX_POPUP);
@@ -1291,25 +1310,31 @@ async fn chat_loop(
             }
             None => &log_text,
         };
-        let draw_ok = terminal
-            .draw(|f| {
-                draw_full(
-                    f,
-                    draw_text,
-                    draw_scroll,
-                    status_line,
-                    draw_ta,
-                    draw_prompt,
-                    &popup,
-                    popup_sel,
-                    spin_ref,
-                    confirm_ref,
-                )
-            })
-            .is_ok();
-        if !draw_ok {
-            break;
+        // IME 조합 중 metrics tick이 오면 should_draw=false로 이 redraw만 건너뛴다(자모 분리 방지).
+        // status 상태는 이미 갱신돼 있어, 다음 안전한 이벤트(키 등)의 redraw가 새 status로 칠한다.
+        if should_draw {
+            let draw_ok = terminal
+                .draw(|f| {
+                    draw_full(
+                        f,
+                        draw_text,
+                        draw_scroll,
+                        status_line,
+                        draw_ta,
+                        draw_prompt,
+                        &popup,
+                        popup_sel,
+                        spin_ref,
+                        confirm_ref,
+                    )
+                })
+                .is_ok();
+            if !draw_ok {
+                break;
+            }
         }
+        // 다음 반복은 기본적으로 그린다(metrics arm만 조건부로 false로 되돌린다).
+        should_draw = true;
 
         // 입력 대기 중에는 자발적인 redraw를 하지 않는다. macOS/iTerm/Terminal의 한글 IME
         // 조합창은 앱이 커서 줄을 다시 그리면 자모가 분리되거나 옆으로 밀릴 수 있다. spinner처럼
@@ -1440,7 +1465,6 @@ async fn chat_loop(
                                 copy_to_clipboard(&text);
                                 status =
                                     format!("· 대화 {}줄을 클립보드에 복사했습니다 (Ctrl+Y)", log.len());
-                                last_sample = Instant::now();
                             }
                             // Ctrl+T: 마우스 캡처 토글. OFF 면 터미널 네이티브 드래그 선택/복사가
                             // 가능해지고, ON 이면 휠 스크롤이 로그 viewport 로 동작한다.
@@ -1589,7 +1613,6 @@ async fn chat_loop(
                                 // 선택 범위를 status로 실시간 안내(강조와 함께 영역을 알 수 있게).
                                 let n = anchor.abs_diff(*cur) + 1;
                                 status = format!("· {n}줄 선택 중 — 놓으면 복사");
-                                last_sample = Instant::now();
                             }
                         }
                         MouseEventKind::Up(MouseButton::Left) => {
@@ -1606,8 +1629,6 @@ async fn chat_loop(
                                         "· {}줄을 클립보드에 복사했습니다 (드래그)",
                                         hi - lo + 1
                                     );
-                                    // 복사 안내가 다음 status 샘플에 바로 덮이지 않게 주기를 리셋.
-                                    last_sample = Instant::now();
                                 }
                             }
                         }
@@ -1627,6 +1648,35 @@ async fn chat_loop(
             _ = tokio::time::sleep(tick), if spin.is_some() => {
                 if let Some(sp) = spin.as_mut() {
                     sp.frame = sp.frame.wrapping_add(1);
+                }
+            }
+            // 전용 sampler task가 새 지표를 publish하면 status/segs를 갱신한다. 채널이 없으면(statusbar
+            // 비활성) 영원히 pending이라 이 arm은 비활성이다. 닫히면(task 종료) arm을 끈다(busy-loop 방지).
+            poll = async {
+                match metrics_rx.as_mut() {
+                    Some(rx) => match rx.changed().await {
+                        Ok(()) => match rx.borrow_and_update().clone() {
+                            Some(m) => MetricsPoll::New(m),
+                            None => MetricsPoll::Empty,
+                        },
+                        Err(_) => MetricsPoll::Closed,
+                    },
+                    None => std::future::pending().await,
+                }
+            } => {
+                match poll {
+                    MetricsPoll::New(m) => {
+                        status = format!("· {}", m.status_line());
+                        status_segs = Some(m.status_segments());
+                        // 조합 중이면 이 redraw만 건너뛴다(상태는 갱신됨, 다음 키 입력이 칠한다).
+                        if hangul.is_composing() {
+                            should_draw = false;
+                        }
+                    }
+                    MetricsPoll::Empty => {}
+                    MetricsPoll::Closed => {
+                        metrics_rx = None;
+                    }
                 }
             }
             msg = out_rx.recv() => {
@@ -1670,6 +1720,10 @@ async fn chat_loop(
         }
     }
 
+    // 전용 sampler task 중단(수신자 drop만으로도 다음 cycle에 끝나지만 즉시 정리).
+    if let Some(handle) = sampler_task {
+        handle.abort();
+    }
     // 마우스 캡처 해제 + alternate screen 떠나고 raw mode 복원(원래 화면 복귀).
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
