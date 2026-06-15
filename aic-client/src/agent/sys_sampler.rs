@@ -79,8 +79,9 @@ const ETA_MAX_HORIZON_SECS: f64 = 7200.0;
 /// 이만큼(256 MiB) 여유가 한 번에 늘면 = 공간 회수(build 종료 등) → 즉시 ETA 철회.
 const ETA_REFILL_BYTES: u64 = 256 * 1024 * 1024;
 
-/// 한 번 sample한 지표 스냅샷. watch 채널로 publish하려면 `Clone`(모든 필드가 Copy 원시값).
-#[derive(Clone)]
+/// 한 번 sample한 지표 스냅샷. watch 채널로 publish하려면 `Clone`. `Default`(전부 0/None)는 테스트
+/// 리터럴 작성을 단순화하고 "지표 없음" 초기 상태로도 의미가 있다.
+#[derive(Clone, Default)]
 pub(crate) struct SysMetrics {
     pub load1: f64,
     pub cpu_pct: f32,
@@ -104,9 +105,12 @@ pub(crate) struct SysMetrics {
     /// mem가 Warn 이상일 때만 채워지는 "가장 무거운(최대 RSS) 프로세스" — alert가 범인을 지목하는 데
     /// 쓴다(이름, RSS bytes). Normal이면 None(process 열거 비용 0). §C4 actionability.
     pub top_mem_proc: Option<(String, u64)>,
-    /// disk 소진 ETA(C2) — sampler task의 `DiskEtaTracker`가 채운다(`sample()`은 항상 None으로 두고
+    /// disk 소진 ETA(C2) — sampler task의 `TrendTracker`가 채운다(`sample()`은 항상 None으로 두고
     /// task가 덮어쓴다). status bar disk 세그먼트에 dim 접미로 표시. 비-task 경로(spinner 등)는 None.
     pub disk_eta: Option<DiskEta>,
+    /// metric sparkline(C2) — `(status_segments 세그먼트 인덱스, " ▁▂▇↑" 접미)`. task의 `TrendTracker`가
+    /// 가장 심각한 metric(cpu/mem/disk)에 대해 채운다. status_segments가 해당 세그먼트에 붙인다.
+    pub trend_spark: Option<(usize, String)>,
 }
 
 /// disk 여유 소진 예측(C2) — CRIT(1GiB)까지 남은 시간의 버킷 라벨. status bar disk 세그먼트에 dim
@@ -176,8 +180,10 @@ impl SysSampler {
             net_rx_bps: (rx as f64 / elapsed) as u64,
             net_tx_bps: (tx as f64 / elapsed) as u64,
             top_mem_proc: None,
-            // sample()은 ETA를 모른다(상태가 필요) — sampler task의 DiskEtaTracker가 publish 직전 덮어쓴다.
+            // sample()은 ETA·sparkline을 모른다(상태가 필요) — sampler task의 TrendTracker가 publish
+            // 직전 덮어쓴다.
             disk_eta: None,
+            trend_spark: None,
         };
         // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
         // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
@@ -292,7 +298,7 @@ impl SysMetrics {
             "swap off".to_string()
         };
         let disk = self.disk_label();
-        vec![
+        let mut segs = vec![
             (format!("load {:.2}", self.load1), self.load_sev()),
             (format!("cpu {:.0}%", self.cpu_pct), self.cpu_sev()),
             (
@@ -314,7 +320,14 @@ impl SysMetrics {
                 ),
                 Severity::Normal,
             ),
-        ]
+        ];
+        // sparkline(C2)을 대상 세그먼트에 접미 — 그 세그먼트 단계 색을 상속한다(standalone 무색 없음).
+        if let Some((idx, suffix)) = &self.trend_spark {
+            if let Some(seg) = segs.get_mut(*idx) {
+                seg.0.push_str(suffix);
+            }
+        }
+        segs
     }
 
     /// 임계가 있는 지표(load/cpu/mem/swap/disk) 중 가장 높은 단계. 적응형 샘플링 주기 결정용 —
@@ -464,7 +477,7 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
         let mut sampler = SysSampler::new();
         // trend ring + disk ETA 상태는 task 내부에 산다(§C4: ring은 sampler task가 소유). ETA 계산은
         // 순수 CPU(블로킹 없음)라 spawn_blocking 밖, async task에서 직접 돈다.
-        let mut eta = DiskEtaTracker::new();
+        let mut trend = TrendTracker::new();
         loop {
             // sampler를 blocking thread로 넘겼다 돌려받는다(i/o delta 계산을 위해 상태를 보존해야 함).
             // 이 await가 끝나기 전엔 절대 다음 sample을 시작하지 않으므로 blocking thread는 ≤1개다.
@@ -479,8 +492,10 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
                 Err(_) => break,
             };
             sampler = returned;
-            // disk 소진 ETA(C2): ring에 표본을 넣고 게이트·디바운스를 돌려 disk_eta를 채운다.
-            metrics.disk_eta = eta.observe(Instant::now(), metrics.disk_avail, metrics.disk_sev());
+            // 추세(C2): ring에 표본을 넣고 disk 소진 ETA와 metric sparkline을 함께 채운다.
+            let (disk_eta, trend_spark) = trend.observe(Instant::now(), &metrics);
+            metrics.disk_eta = disk_eta;
+            metrics.trend_spark = trend_spark;
             let cadence = if metrics.overall_severity() == Severity::Normal {
                 Duration::from_secs(CADENCE_NORMAL_SECS)
             } else {
@@ -496,12 +511,34 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
     (rx, handle)
 }
 
-/// disk 소진 ETA를 들고 다니는 상태 머신(sampler task 내부). ring에 표본을 쌓고, 순수 게이트
-/// `disk_eta_candidate`로 후보를 뽑은 뒤, 등장/소멸을 디바운스한다. 상태는 세션 로컬(stateless-pull).
-pub(crate) struct DiskEtaTracker {
-    /// (시각, 여유 바이트) ring — `ETA_WINDOW`보다 오래된 표본은 버린다. armed가 아니어도 계속 쌓아,
-    /// disk가 Warn으로 넘어오는 순간 이미 충분한 이력이 있게 한다.
-    ring: Vec<(Instant, u64)>,
+/// status_segments 세그먼트 인덱스(load/cpu/mem/swap/disk/io 순) — sparkline을 붙일 위치 지정용.
+const SEG_CPU: usize = 1;
+const SEG_MEM: usize = 2;
+const SEG_DISK: usize = 4;
+/// sparkline에 쓰는 ring 꼬리 표본 수(가독성·폭 예산). 2s cadence면 ~24s, 5s면 ~60s 창.
+const SPARK_TAIL: usize = 12;
+/// disk sparkline·화살표 공통 변동 임계 — 창 동안 이만큼(64MiB) 미만 변하면 평평으로 본다. disk는
+/// 창 min..max로 정규화하므로, 이 floor가 없으면 KB 단위 FS 잡음이 풀-진폭 막대로 증폭돼 화살표(→)와
+/// 어긋난다(리뷰 지적). 막대·화살표가 같은 임계를 써 일치시킨다. cpu/mem는 0..100 고정이라 불필요.
+const DISK_TREND_DELTA: f64 = 64.0 * 1024.0 * 1024.0;
+
+/// trend ring 표본 — 시각 + sparkline/ETA가 쓰는 지표. 합의(§C4)의 "timestamp + disk_avail + cpu/mem"
+/// 단일 ring을 구현한다(load/swap은 sparkline 대상이 아니라 제외).
+#[derive(Clone, Copy)]
+struct TrendSample {
+    t: Instant,
+    cpu_pct: f32,
+    mem_pct: f64,
+    disk_avail: u64,
+}
+
+/// 추세 상태 머신(sampler task 내부) — 단일 ring에서 disk 소진 ETA(C2a)와 metric sparkline(C2b)을
+/// 함께 낸다. ring은 `ETA_WINDOW`만큼 보존하고, sparkline은 그 꼬리 `SPARK_TAIL`개를 쓴다. 상태는
+/// 세션 로컬(stateless-pull). disk ETA 디바운스/리트랙션 규칙은 C2a와 동일.
+pub(crate) struct TrendTracker {
+    /// 추세 ring — `ETA_WINDOW`보다 오래된 표본은 버린다. armed가 아니어도 계속 쌓아, disk가 Warn으로
+    /// 넘어오는 순간 이미 충분한 이력이 있게 한다.
+    ring: Vec<TrendSample>,
     /// 현재 표시 중인 ETA(초). 값 갱신·grace 판단용.
     shown: Option<f64>,
     /// 등장 디바운스 — 연속 in-gate 후보 수가 2 이상이어야 표시(깜빡임 방지).
@@ -512,7 +549,7 @@ pub(crate) struct DiskEtaTracker {
     last_avail: Option<u64>,
 }
 
-impl DiskEtaTracker {
+impl TrendTracker {
     pub fn new() -> Self {
         Self {
             ring: Vec::new(),
@@ -523,12 +560,10 @@ impl DiskEtaTracker {
         }
     }
 
-    /// 새 disk 표본을 관찰해 표시할 ETA를 반환한다.
-    ///
-    /// 등장은 2연속 in-gate(디바운스), 소멸은 refill(>256MiB)·Normal 복귀 시 즉시 / 그 외 gate-miss는
-    /// 2연속 grace 후. arm은 `disk_sev∈{Warn,Crit}` — Normal이면 무조건 None(20GB transient 구조적 차단:
-    /// 그만한 transient는 non-full=Normal 디스크에만 착지하므로 ETA 경로 자체에 못 들어온다).
-    pub fn observe(&mut self, now: Instant, avail: u64, disk_sev: Severity) -> Option<DiskEta> {
+    /// 새 표본을 관찰해 (disk 소진 ETA, sparkline 접미)를 반환한다. sparkline은 `(세그먼트 인덱스,
+    /// " {스파크}{화살표}")` — 호출자가 해당 status 세그먼트에 붙이면 그 단계 색을 상속한다.
+    pub fn observe(&mut self, now: Instant, m: &SysMetrics) -> (Option<DiskEta>, Option<(usize, String)>) {
+        let avail = m.disk_avail;
         // refill 감지(직전보다 256MiB 이상 증가) = 공간 회수 → 즉시 철회.
         let refilled = self
             .last_avail
@@ -536,34 +571,43 @@ impl DiskEtaTracker {
         self.last_avail = Some(avail);
 
         // ring push + window trim(시간 기준). armed 여부와 무관하게 쌓아 이력을 확보한다.
-        self.ring.push((now, avail));
+        self.ring.push(TrendSample {
+            t: now,
+            cpu_pct: m.cpu_pct,
+            mem_pct: m.mem_pct(),
+            disk_avail: avail,
+        });
         while self
             .ring
             .first()
-            .is_some_and(|&(t, _)| now.duration_since(t) > ETA_WINDOW)
+            .is_some_and(|s| now.duration_since(s.t) > ETA_WINDOW)
         {
             self.ring.remove(0);
         }
 
-        // disarm: Normal이거나 refill이면 즉시 끈다.
+        let eta = self.disk_eta(avail, m.disk_sev(), refilled);
+        let spark = self.sparkline(m);
+        (eta, spark)
+    }
+
+    /// disk 소진 ETA — 게이트 + 등장/소멸 디바운스(C2a). arm은 `disk_sev∈{Warn,Crit}`; Normal·refill이면
+    /// 즉시 철회(20GB transient는 non-full=Normal 디스크에만 착지하므로 ETA 경로에 못 들어온다).
+    fn disk_eta(&mut self, avail: u64, disk_sev: Severity, refilled: bool) -> Option<DiskEta> {
         if disk_sev == Severity::Normal || refilled {
             self.shown = None;
             self.appear = 0;
             self.miss = 0;
             return None;
         }
-
-        // 순수 게이트: ring을 (경과초, 바이트) 점열로 바꿔 ETA 후보를 뽑는다.
-        let t0 = self.ring.first().map(|&(t, _)| t);
+        let t0 = self.ring.first().map(|s| s.t);
         let candidate = t0.and_then(|t0| {
             let points: Vec<(f64, f64)> = self
                 .ring
                 .iter()
-                .map(|&(t, a)| (t.duration_since(t0).as_secs_f64(), a as f64))
+                .map(|s| (s.t.duration_since(t0).as_secs_f64(), s.disk_avail as f64))
                 .collect();
             disk_eta_candidate(&points, avail as f64)
         });
-
         match candidate {
             Some(secs) => {
                 self.miss = 0;
@@ -591,11 +635,45 @@ impl DiskEtaTracker {
             bucket: bucket_label(secs),
         })
     }
+
+    /// 가장 심각한 metric(cpu/mem/disk 중; 동률·전부 Normal이면 cpu)의 sparkline+화살표를 만든다.
+    /// 반환 `(세그먼트 인덱스, " ▁▂▇↑")`. 표본이 3개 미만이면 None. cpu/mem는 0..100, disk는 창 min..max로
+    /// 정규화한다(disk는 낮을수록 위험 — 하강이 바로 보인다). load/swap은 ring 미보유라 대상 아님.
+    fn sparkline(&self, m: &SysMetrics) -> Option<(usize, String)> {
+        if self.ring.len() < 3 {
+            return None;
+        }
+        let tail = &self.ring[self.ring.len().saturating_sub(SPARK_TAIL)..];
+        // cpu 기본, mem/disk가 더 심각하면 그쪽으로(동률은 cpu 유지).
+        let mut chosen = (SEG_CPU, m.cpu_sev());
+        for &(idx, sev) in &[(SEG_MEM, m.mem_sev()), (SEG_DISK, m.disk_sev())] {
+            if sev > chosen.1 {
+                chosen = (idx, sev);
+            }
+        }
+        let vals: Vec<f64> = match chosen.0 {
+            SEG_MEM => tail.iter().map(|s| s.mem_pct).collect(),
+            SEG_DISK => tail.iter().map(|s| s.disk_avail as f64).collect(),
+            _ => tail.iter().map(|s| s.cpu_pct as f64).collect(),
+        };
+        let (lo, hi, arrow_thr, flat_below) = match chosen.0 {
+            SEG_DISK => {
+                let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                // disk: 막대·화살표 모두 64MiB 미만 변동은 평평으로(미세 잡음 증폭 방지).
+                (lo, hi, DISK_TREND_DELTA, DISK_TREND_DELTA)
+            }
+            _ => (0.0, 100.0, 3.0, 0.0), // cpu/mem %: 0..100 고정, 3%p 화살표 임계
+        };
+        let spark = sparkline(&vals, lo, hi, flat_below);
+        let arrow = trend_arrow(*vals.first()?, *vals.last()?, arrow_thr);
+        Some((chosen.0, format!(" {spark}{arrow}")))
+    }
 }
 
 /// 순수 게이트 — (경과초, 여유바이트) 점열에서 CRIT(1GiB)까지 ETA(초) 후보를 낸다. 어떤 게이트든
 /// 못 넘으면 None. cargo-build/docker-pull(V자)·sawtooth 같은 transient는 여기서 반드시 None이어야
-/// 한다(replay-vector 테스트가 강제). 상태 없음 — 디바운스·리트랙션은 `DiskEtaTracker`가 감싼다.
+/// 한다(replay-vector 테스트가 강제). 상태 없음 — 디바운스·리트랙션은 `TrendTracker`가 감싼다.
 fn disk_eta_candidate(points: &[(f64, f64)], avail_now: f64) -> Option<f64> {
     if points.len() < ETA_MIN_SAMPLES {
         return None;
@@ -673,6 +751,35 @@ fn linear_fit(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     let den = denom * (n * syy - sy * sy);
     let r2 = if den.abs() < f64::EPSILON { 0.0 } else { num / den };
     Some((slope, r2))
+}
+
+/// 값 시퀀스를 unicode 블록(▁▂▃▄▅▆▇█)으로 그린다. lo..hi로 정규화하며, 범위가 `flat_below` 이하면
+/// (= 의미 없는 미세 변동) 가운데(▄)로 평탄화해 잡음을 풀-진폭 막대로 증폭하지 않는다(화살표와 일치).
+fn sparkline(values: &[f64], lo: f64, hi: f64, flat_below: f64) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let range = hi - lo;
+    if range <= flat_below.max(f64::EPSILON) {
+        return BARS[3].to_string().repeat(values.len());
+    }
+    values
+        .iter()
+        .map(|&v| {
+            let frac = ((v - lo) / range).clamp(0.0, 1.0);
+            let n = (frac * (BARS.len() - 1) as f64).round() as usize;
+            BARS[n.min(BARS.len() - 1)]
+        })
+        .collect()
+}
+
+/// 최근 변화 방향 화살표 — 상승(↑)/하강(↓)/정체(→). 임계 이하 변화는 →로 둬 떨림을 막는다.
+fn trend_arrow(first: f64, last: f64, threshold: f64) -> char {
+    if last - first > threshold {
+        '↑'
+    } else if first - last > threshold {
+        '↓'
+    } else {
+        '→'
+    }
 }
 
 /// ETA(초)를 흔들리지 않는 버킷 라벨로 양자화 — tick마다 숫자가 떨리는 것을 막는다.
@@ -757,8 +864,7 @@ mod tests {
             disk_write_bps: 512 * 1024,
             net_rx_bps: 3 * 1024 * 1024,
             net_tx_bps: 256 * 1024,
-            top_mem_proc: None,
-            disk_eta: None,
+            ..Default::default()
         };
         let line = m.status_line();
         assert!(line.contains("load 1.23"), "{line}");
@@ -789,8 +895,7 @@ mod tests {
             disk_write_bps: 0,
             net_rx_bps: 0,
             net_tx_bps: 0,
-            top_mem_proc: None,
-            disk_eta: None,
+            ..Default::default()
         };
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
@@ -801,8 +906,7 @@ mod tests {
               swap_used: u64, swap_total: u64, disk_avail: u64, disk_total: u64) -> SysMetrics {
         SysMetrics {
             load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
-            disk_avail, disk_total, disk_read_bps: 0, disk_write_bps: 0,
-            net_rx_bps: 0, net_tx_bps: 0, top_mem_proc: None, disk_eta: None,
+            disk_avail, disk_total, ..Default::default()
         }
     }
 
@@ -959,17 +1063,18 @@ mod tests {
     }
 
     #[test]
-    fn disk_eta_tracker_debounce_arm_and_retract() {
+    fn trend_tracker_disk_eta_debounce_arm_and_retract() {
         let t0 = Instant::now();
         let g = 1024 * 1024 * 1024;
-        let mut tr = DiskEtaTracker::new();
+        let mut tr = TrendTracker::new();
         // armed(disk_sev Warn, 즉 ≤5GiB) 상태로 깨끗한 하강을 한 표본씩 흘려보낸다.
         // 5GiB에서 시작해 300s 동안 4GiB까지(1GiB/300s≈3.5MiB/s≈210MiB/min≥5). 20s 간격.
         let mut shown_at = None;
         for i in 0..=20 {
             let t = t0 + Duration::from_secs(i * 20);
             let avail = ((5.0 - 1.0 * (i as f64 * 20.0) / 400.0) * g as f64) as u64; // ≤5GiB → Warn arm
-            let eta = tr.observe(t, avail, Severity::Warn);
+            let m = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, avail, 200 * g);
+            let (eta, _spark) = tr.observe(t, &m);
             if eta.is_some() && shown_at.is_none() {
                 shown_at = Some(i);
             }
@@ -977,12 +1082,61 @@ mod tests {
         assert!(shown_at.is_some(), "ETA should appear once enough clean-decline history accrues");
         // 디바운스: 첫 in-gate 표본 즉시가 아니라 충분한 span(≥300s=15표본) 이후 + 2연속이라야 등장.
         assert!(shown_at.unwrap() >= 15, "appeared too early: {:?}", shown_at);
-        // refill(>256MiB 급증) → 즉시 철회.
+        // refill(>256MiB 급증) → 즉시 철회(여전히 Warn=5GiB이지만 회수 신호).
         let later = t0 + Duration::from_secs(500);
-        let eta = tr.observe(later, 5 * g, Severity::Warn);
-        assert!(eta.is_none(), "refill must instantly retract the ETA");
+        let m_refill = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 5 * g, 200 * g);
+        assert!(tr.observe(later, &m_refill).0.is_none(), "refill must instantly retract the ETA");
         // Normal 복귀 → 계속 None.
-        assert!(tr.observe(later + Duration::from_secs(20), 50 * g, Severity::Normal).is_none());
+        let m_norm = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        assert!(tr.observe(later + Duration::from_secs(20), &m_norm).0.is_none());
+    }
+
+    #[test]
+    fn sparkline_maps_values_to_bars() {
+        // 단조 증가 → 첫 칸은 최저(▁), 마지막은 최고(█).
+        let s = sparkline(&[0.0, 25.0, 50.0, 75.0, 100.0], 0.0, 100.0, 0.0);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.first(), Some(&'▁'));
+        assert_eq!(chars.last(), Some(&'█'));
+        assert_eq!(chars.len(), 5);
+        // 평평(범위 0) → 전부 가운데(▄).
+        assert_eq!(sparkline(&[42.0, 42.0, 42.0], 42.0, 42.0, 0.0), "▄▄▄");
+        // 미세 변동이 flat_below(여기선 64MiB) 이하면 평탄화 — 잡음 증폭 방지(리뷰 지적).
+        let mib = 1024.0 * 1024.0;
+        let lo = 4.0 * 1024.0 * mib;
+        let hi = lo + 1.0 * mib; // 1MiB 변동 < 64MiB
+        assert_eq!(sparkline(&[lo, hi, lo], lo, hi, DISK_TREND_DELTA), "▄▄▄");
+    }
+
+    #[test]
+    fn trend_arrow_thresholds() {
+        assert_eq!(trend_arrow(10.0, 20.0, 3.0), '↑');
+        assert_eq!(trend_arrow(20.0, 10.0, 3.0), '↓');
+        assert_eq!(trend_arrow(10.0, 11.0, 3.0), '→'); // 임계 이하 변화는 정체.
+    }
+
+    #[test]
+    fn trend_tracker_sparkline_picks_metric_by_severity() {
+        let t0 = Instant::now();
+        let g = 1024 * 1024 * 1024;
+        // 전부 Normal → cpu 기본 선택.
+        let mut tr = TrendTracker::new();
+        let mut spark = None;
+        for i in 0..5u64 {
+            let m = metric(1.0, 50.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        let (idx, s) = spark.expect("sparkline after >=3 samples");
+        assert_eq!(idx, SEG_CPU, "all-Normal should spark cpu by default");
+        assert!(s.contains('→') || s.contains('↑') || s.contains('↓'), "spark has an arrow: {s}");
+        // mem crit(99%) → mem 세그먼트 선택.
+        let mut tr = TrendTracker::new();
+        let mut spark = None;
+        for i in 0..5u64 {
+            let m = metric(1.0, 10.0, 8, 159 * g / 10, 16 * g, 0, 0, 50 * g, 200 * g); // mem 99%
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        assert_eq!(spark.expect("spark").0, SEG_MEM, "mem crit should spark the mem segment");
     }
 
     #[test]
