@@ -6,12 +6,13 @@
 //! 상태를 들고 다닌다. SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
 
 use std::time::Instant;
-use sysinfo::{Disks, System};
+use sysinfo::{Disks, Networks, System};
 
-/// load/cpu/memory/disk-i/o를 들고 있는 stateful 샘플러. status bar 전용.
+/// load/cpu/memory/disk-i/o/net-i/o를 들고 있는 stateful 샘플러. status bar 전용.
 pub(crate) struct SysSampler {
     sys: System,
     disks: Disks,
+    networks: Networks,
     last: Instant,
 }
 
@@ -56,6 +57,9 @@ pub(crate) struct SysMetrics {
     pub disk_total: u64,
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
+    /// 전체 인터페이스 합산 수신/송신 bytes/s (loopback 포함).
+    pub net_rx_bps: u64,
+    pub net_tx_bps: u64,
 }
 
 impl SysSampler {
@@ -66,20 +70,26 @@ impl SysSampler {
         Self {
             sys,
             disks: Disks::new_with_refreshed_list(),
+            networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
         }
     }
 
-    /// 현재 지표를 샘플한다. disk i/o는 직전 sample 이후 delta를 경과시간으로 나눠 bytes/s로 환산.
+    /// 현재 지표를 샘플한다. disk/net i/o는 직전 sample 이후 delta를 경과시간으로 나눠 bytes/s로 환산.
     pub fn sample(&mut self) -> SysMetrics {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
         self.disks.refresh(false);
+        self.networks.refresh(false);
         // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
             let u = d.usage();
             (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
+        });
+        // networks.refresh() 이후 received()/transmitted()는 마지막 refresh 이후 delta.
+        let (rx, tx) = self.networks.iter().fold((0u64, 0u64), |acc, (_, data)| {
+            (acc.0 + data.received(), acc.1 + data.transmitted())
         });
         // 용량은 root fs("/") 기준 — 디스크 full을 가장 직접적으로 드러낸다. macOS APFS는 볼륨
         // 그룹이 "/"에 공유 표시되고, Linux는 "/"가 명확하다. 못 찾으면(컨테이너 등) 첫 디스크로 폴백.
@@ -108,6 +118,8 @@ impl SysSampler {
             disk_total,
             disk_read_bps: (read as f64 / elapsed) as u64,
             disk_write_bps: (write as f64 / elapsed) as u64,
+            net_rx_bps: (rx as f64 / elapsed) as u64,
+            net_tx_bps: (tx as f64 / elapsed) as u64,
         }
     }
 }
@@ -133,8 +145,10 @@ impl SysMetrics {
         } else {
             "disk n/a".to_string()
         };
+        let clock = chrono::Local::now().format("%H:%M:%S").to_string();
         format!(
-            "load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s",
+            "{} · load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
+            clock,
             self.load1,
             self.cpu_pct,
             mem_pct,
@@ -144,6 +158,8 @@ impl SysMetrics {
             disk,
             human_bytes(self.disk_read_bps),
             human_bytes(self.disk_write_bps),
+            human_bytes(self.net_tx_bps),
+            human_bytes(self.net_rx_bps),
         )
     }
 
@@ -285,6 +301,8 @@ mod tests {
             disk_total: 280 * 1024 * 1024 * 1024,
             disk_read_bps: 2 * 1024 * 1024,
             disk_write_bps: 512 * 1024,
+            net_rx_bps: 3 * 1024 * 1024,
+            net_tx_bps: 256 * 1024,
         };
         let line = m.status_line();
         assert!(line.contains("load 1.23"), "{line}");
@@ -294,6 +312,9 @@ mod tests {
         // disk는 신뢰 가능한 free만(사용률 %는 macOS APFS에서 부정확).
         assert!(line.contains("disk 70.0G free"), "{line}");
         assert!(line.contains("io r2.0M/s w512.0K/s"), "{line}");
+        assert!(line.contains("net ↑256.0K/s ↓3.0M/s"), "{line}");
+        // clock: HH:MM:SS 형식 검증(값은 실행 시점 의존이므로 패턴만).
+        assert!(line.contains(':'), "{line}");
     }
 
     #[test]
@@ -310,6 +331,8 @@ mod tests {
             disk_total: 0,
             disk_read_bps: 0,
             disk_write_bps: 0,
+            net_rx_bps: 0,
+            net_tx_bps: 0,
         };
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
