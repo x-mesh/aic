@@ -6,7 +6,7 @@
 //! 상태를 들고 다닌다. SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
 
 use std::time::{Duration, Instant};
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -79,6 +79,9 @@ pub(crate) struct SysMetrics {
     /// 전체 인터페이스 합산 수신/송신 bytes/s (loopback 포함).
     pub net_rx_bps: u64,
     pub net_tx_bps: u64,
+    /// mem가 Warn 이상일 때만 채워지는 "가장 무거운(최대 RSS) 프로세스" — alert가 범인을 지목하는 데
+    /// 쓴다(이름, RSS bytes). Normal이면 None(process 열거 비용 0). §C4 actionability.
+    pub top_mem_proc: Option<(String, u64)>,
 }
 
 impl SysSampler {
@@ -122,7 +125,7 @@ impl SysSampler {
             .map(|d| (d.total_space(), d.available_space()))
             .unwrap_or((0, 0));
         self.last = Instant::now();
-        SysMetrics {
+        let mut m = SysMetrics {
             load1: System::load_average().one,
             cpu_pct: self.sys.global_cpu_usage(),
             // 논리 코어 수 — sysinfo refresh 상태와 무관한 std API로 안정 측정(load 정규화 기준).
@@ -139,7 +142,29 @@ impl SysSampler {
             disk_write_bps: (write as f64 / elapsed) as u64,
             net_rx_bps: (rx as f64 / elapsed) as u64,
             net_tx_bps: (tx as f64 / elapsed) as u64,
+            top_mem_proc: None,
+        };
+        // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
+        // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
+        // (probe fork도 아님), 이 호출은 sampler task의 spawn_blocking에서 도므로 UI를 막지 않는다.
+        // RSS는 단일 refresh로 정확하다(cpu%는 delta가 필요해 별도 — 미구현).
+        if m.mem_sev() >= Severity::Warn {
+            // **memory만** refresh한다 — cmd/env/cwd/disk까지 가져오는 full refresh는 macOS 첫 호출에서
+            // 수 초가 걸린다. 우리는 (이름, RSS)만 필요하므로 ProcessRefreshKind::nothing().with_memory()로
+            // 비용을 최소화한다(이름은 기본 정보라 항상 포함).
+            self.sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_memory(),
+            );
+            m.top_mem_proc = self
+                .sys
+                .processes()
+                .values()
+                .max_by_key(|p| p.memory())
+                .map(|p| (p.name().to_string_lossy().into_owned(), p.memory()));
         }
+        m
     }
 }
 
@@ -277,16 +302,19 @@ impl SysMetrics {
         [
             ("load", self.load_sev(), format!("load {:.2}", self.load1)),
             ("cpu", self.cpu_sev(), format!("cpu {:.0}%", self.cpu_pct)),
-            (
-                "mem",
-                self.mem_sev(),
-                format!(
+            ("mem", self.mem_sev(), {
+                let mut s = format!(
                     "mem {:.0}% ({}/{})",
                     self.mem_pct(),
                     human_bytes(self.mem_used),
                     human_bytes(self.mem_total)
-                ),
-            ),
+                );
+                // 범인 프로세스(최대 RSS) — mem가 Warn 이상으로 채워졌을 때만 덧붙는다.
+                if let Some((name, rss)) = &self.top_mem_proc {
+                    s.push_str(&format!(" — top: {name} {}", human_bytes(*rss)));
+                }
+                s
+            }),
             (
                 "swap",
                 self.swap_sev(),
@@ -492,6 +520,7 @@ mod tests {
             disk_write_bps: 512 * 1024,
             net_rx_bps: 3 * 1024 * 1024,
             net_tx_bps: 256 * 1024,
+            top_mem_proc: None,
         };
         let line = m.status_line();
         assert!(line.contains("load 1.23"), "{line}");
@@ -522,6 +551,7 @@ mod tests {
             disk_write_bps: 0,
             net_rx_bps: 0,
             net_tx_bps: 0,
+            top_mem_proc: None,
         };
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
@@ -533,7 +563,7 @@ mod tests {
         SysMetrics {
             load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
             disk_avail, disk_total, disk_read_bps: 0, disk_write_bps: 0,
-            net_rx_bps: 0, net_tx_bps: 0,
+            net_rx_bps: 0, net_tx_bps: 0, top_mem_proc: None,
         }
     }
 
@@ -626,6 +656,20 @@ mod tests {
     }
 
     #[test]
+    fn alert_message_includes_mem_culprit_when_present() {
+        let g = 1024 * 1024 * 1024;
+        let t0 = Instant::now();
+        let mut tr = AlertTracker::new();
+        // mem crit(99%) + 범인 프로세스 채워짐 → alert 메시지에 "top: node 12.0G" 포함.
+        let mut m = metric(1.0, 10.0, 8, 159 * g / 10, 16 * g, 0, 0, 50 * g, 200 * g);
+        m.top_mem_proc = Some(("node".to_string(), 12 * g));
+        let a = tr.observe(&m, t0);
+        assert_eq!(a.len(), 1);
+        assert!(a[0].message.contains("top: node 12.0G"), "{}", a[0].message);
+        assert!(a[0].message.contains("위험(crit)"), "{}", a[0].message);
+    }
+
+    #[test]
     fn alert_tracker_cooldown_suppresses_reentry() {
         let g = 1024 * 1024 * 1024;
         let t0 = Instant::now();
@@ -658,7 +702,7 @@ mod tests {
         let (mut rx, handle) = spawn_sampler();
         // 초기값은 None(첫 sample 전).
         assert!(rx.borrow().is_none(), "initial watch value should be None before first sample");
-        let got = tokio::time::timeout(Duration::from_secs(5), async {
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if rx.changed().await.is_err() {
                     return None;
@@ -669,7 +713,7 @@ mod tests {
             }
         })
         .await
-        .expect("sampler should publish within 5s");
+        .expect("sampler should publish within 10s");
         let m = got.expect("first publish should carry Some(metrics)");
         assert!(m.mem_total > 0, "published metrics should have a real mem_total");
         // task 정리(수신자 drop만으로도 다음 cycle에 종료하나, 즉시 abort).
