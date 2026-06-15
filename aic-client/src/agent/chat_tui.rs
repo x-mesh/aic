@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use super::sys_sampler::{spawn_sampler, Severity, SysMetrics, SysSampler};
+use super::sys_sampler::{spawn_sampler, AlertTracker, Severity, SysMetrics, SysSampler};
 
 /// 한 입력의 결과(reedline `ReadLine` 대응).
 pub(crate) enum ChatLine {
@@ -1163,6 +1163,41 @@ enum MetricsPoll {
     Closed,
 }
 
+/// 텍스트(답변·note·proactive alert)를 대화 로그에 추가한다 — 줄 단위로 넣어 ring 상한·dump가 줄
+/// 단위로 동작하게 하고(원본 ANSI 보존, M1), 상한 초과 시 앞에서 폐기하며 scroll을 보정하고,
+/// log_text 캐시를 재구성한 뒤 follow면 최하단으로 의도를 표시한다. Answer/Note/alert가 공유한다.
+fn append_to_log(
+    log: &mut Vec<String>,
+    log_text: &mut Text<'static>,
+    scroll: &mut u16,
+    follow: bool,
+    text: &str,
+) {
+    for l in text.lines() {
+        log.push(l.to_string());
+    }
+    if log.len() > LOG_CAP {
+        let drop = log.len() - LOG_CAP;
+        log.drain(0..drop);
+        *scroll = scroll.saturating_sub(drop as u16);
+    }
+    *log_text = rebuild_log_text(log);
+    if follow {
+        // 다음 draw의 clamp/follow가 max로 맞추지만, 의도를 명시.
+        *scroll = u16::MAX;
+    }
+}
+
+/// 터미널 벨(BEL) 1회 — proactive alert 발생 시 청각 신호. BEL은 커서를 움직이지 않으므로
+/// alternate screen(ratatui) 중에도 화면을 깨지 않는다. IME 조합 중 redraw를 건너뛰어도 이 신호는
+/// 울려, 사용자가 화면을 안 보고 있어도 위험을 알 수 있다.
+fn ring_bell() {
+    use std::io::Write;
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
 /// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
 /// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
 /// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
@@ -1213,6 +1248,9 @@ async fn chat_loop(
     } else {
         (None, None)
     };
+    // edge-triggered alert 트래커(C1). Some=무장(악화 전이 시 ambient Note+bell). statusbar가 켜졌을
+    // 때만 무장한다. 추후 C7의 `/watch off`가 이를 None으로 돌려 alert lane을 끌 수 있다.
+    let mut alert_tracker = with_statusbar.then(AlertTracker::new);
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
@@ -1668,7 +1706,24 @@ async fn chat_loop(
                     MetricsPoll::New(m) => {
                         status = format!("· {}", m.status_line());
                         status_segs = Some(m.status_segments());
-                        // 조합 중이면 이 redraw만 건너뛴다(상태는 갱신됨, 다음 키 입력이 칠한다).
+                        // edge-triggered alert(C1): 악화 전이를 ambient Note로 로그에 직접 push한다.
+                        // Note는 표시 전용 — LLM 컨텍스트엔 안 들어가고 turn을 시작하지도 않는다(§C1).
+                        if let Some(tracker) = alert_tracker.as_mut() {
+                            let alerts = tracker.observe(&m, Instant::now());
+                            if !alerts.is_empty() {
+                                // Crit이 하나라도 있으면 BEL 1회 — 화면을 안 봐도(조합 중 redraw 보류
+                                // 포함) 들린다. Warn은 조용한 ambient 줄로만 둬 alert fatigue를 줄인다.
+                                let has_crit =
+                                    alerts.iter().any(|a| a.severity == Severity::Crit);
+                                for a in &alerts {
+                                    append_to_log(&mut log, &mut log_text, &mut scroll, follow, &a.message);
+                                }
+                                if has_crit {
+                                    ring_bell();
+                                }
+                            }
+                        }
+                        // 조합 중이면 이 redraw만 건너뛴다(상태·로그는 갱신됨, 다음 키 입력이 칠한다).
                         if hangul.is_composing() {
                             should_draw = false;
                         }
@@ -1682,23 +1737,7 @@ async fn chat_loop(
             msg = out_rx.recv() => {
                 match msg {
                     Some(OutMsg::Answer(s)) | Some(OutMsg::Note(s)) => {
-                        // 답변/note를 대화 로그에 추가(insert_before 대체). 여러 줄이면 줄 단위로 넣어
-                        // ring 상한·dump가 줄 단위로 동작하게 한다(원본 ANSI 보존, M1).
-                        for l in s.lines() {
-                            log.push(l.to_string());
-                        }
-                        // ring 상한 초과 시 앞에서 폐기 + scroll 보정(폐기한 만큼 위로, critic M2).
-                        if log.len() > LOG_CAP {
-                            let drop = log.len() - LOG_CAP;
-                            log.drain(0..drop);
-                            scroll = scroll.saturating_sub(drop as u16);
-                        }
-                        log_text = rebuild_log_text(&log);
-                        // follow면 새 답변 도착 시 자동 최하단(scroll은 다음 draw에서 max로 재계산됨).
-                        if follow {
-                            // 다음 draw의 clamp/follow가 max로 맞춰주지만, 의도를 명시.
-                            scroll = u16::MAX;
-                        }
+                        append_to_log(&mut log, &mut log_text, &mut scroll, follow, &s);
                     }
                     Some(OutMsg::SpinStart(label)) => {
                         spin = Some(SpinState { label, frame: 0, started: Instant::now() });

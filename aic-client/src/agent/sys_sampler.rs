@@ -48,6 +48,15 @@ const DISK_CRIT_FREE: u64 = 1024 * 1024 * 1024;
 const CADENCE_NORMAL_SECS: u64 = 5;
 const CADENCE_ALERT_SECS: u64 = 2;
 
+// edge-triggered alert의 자원별 재발화 cooldown. 동일 자원이 악화 전이를 반복해도 이 주기 안엔 다시
+// 발화하지 않는다(alert fatigue 방지 + "idle ≤1건/10분" 예산의 실제 rate limiter). Crit이 Warn보다
+// 짧다 — 위험은 빨리 다시 알린다. C1 council 합의(§3).
+const WARN_COOLDOWN: Duration = Duration::from_secs(300);
+const CRIT_COOLDOWN: Duration = Duration::from_secs(120);
+
+/// alert 대상 자원 수(임계가 있는 load/cpu/mem/swap/disk — io 제외). `AlertTracker` 배열의 키 범위.
+const ALERT_RESOURCES: usize = 5;
+
 /// 한 번 sample한 지표 스냅샷. watch 채널로 publish하려면 `Clone`(모든 필드가 Copy 원시값).
 #[derive(Clone)]
 pub(crate) struct SysMetrics {
@@ -259,6 +268,115 @@ impl SysMetrics {
         .into_iter()
         .max()
         .unwrap_or(Severity::Normal)
+    }
+
+    /// alert 대상 자원의 (이름, 심각도, 사람이 읽는 현재값) 고정 순서 목록 — `AlertTracker`가 전이
+    /// 감지·메시지 작성에 쓴다. 임계가 있는 자원만(io 제외), 라벨은 status bar와 동일 토큰이라
+    /// 사용자가 색·alert·텍스트를 1:1로 대응시킬 수 있다.
+    fn alert_states(&self) -> [(&'static str, Severity, String); ALERT_RESOURCES] {
+        [
+            ("load", self.load_sev(), format!("load {:.2}", self.load1)),
+            ("cpu", self.cpu_sev(), format!("cpu {:.0}%", self.cpu_pct)),
+            (
+                "mem",
+                self.mem_sev(),
+                format!(
+                    "mem {:.0}% ({}/{})",
+                    self.mem_pct(),
+                    human_bytes(self.mem_used),
+                    human_bytes(self.mem_total)
+                ),
+            ),
+            (
+                "swap",
+                self.swap_sev(),
+                if self.swap_total > 0 {
+                    format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+                } else {
+                    "swap off".to_string()
+                },
+            ),
+            (
+                "disk",
+                self.disk_sev(),
+                format!("disk {} free", human_bytes(self.disk_avail)),
+            ),
+        ]
+    }
+}
+
+/// 한 건의 proactive alert — chat 로그에 ambient Note로 표시한다(LLM 컨텍스트엔 안 들어감).
+pub(crate) struct Alert {
+    /// 새로 진입한 단계(Warn 또는 Crit). bell·렌더 판단용.
+    pub severity: Severity,
+    /// 표시할 한 줄(예: `⚠ mem 97% (15.5G/16G) 위험(crit) — /diagnose 권장`).
+    pub message: String,
+}
+
+/// 자원별 직전 심각도와 마지막 발화 이력을 들고, 새 sample마다 **악화 전이**만 골라 alert를 낸다
+/// (edge-triggered). status bar와 동일한 임계(`*_sev`)를 재사용하므로 색과 alert가 어긋날 수 없다.
+/// 상태는 세션 로컬(프로세스와 함께 소멸) — 영속/cross-session 없음, stateless-pull 경계 안.
+pub(crate) struct AlertTracker {
+    /// 자원별 직전 심각도(전이 감지 기준). 인덱스는 `SysMetrics::alert_states` 순서.
+    prev: [Severity; ALERT_RESOURCES],
+    /// 자원별 마지막 발화 시각(cooldown·decay 판정). None이면 최근 발화 없음.
+    last_fired: [Option<Instant>; ALERT_RESOURCES],
+    /// 자원별 마지막으로 알린 단계(escalation 판정 기준). cooldown 경과 시 Normal로 decay.
+    last_fired_sev: [Severity; ALERT_RESOURCES],
+}
+
+impl AlertTracker {
+    pub fn new() -> Self {
+        Self {
+            prev: [Severity::Normal; ALERT_RESOURCES],
+            last_fired: [None; ALERT_RESOURCES],
+            last_fired_sev: [Severity::Normal; ALERT_RESOURCES],
+        }
+    }
+
+    /// 새 sample을 관찰해 발화할 alert를 반환한다.
+    ///
+    /// 규칙: (1) **악화 전이**(직전보다 심각도 상승)에서만 후보 — 같은 단계 유지·하강은 발화 안 함.
+    /// (2) 직전 발화보다 높은 단계로의 **escalation**(예: Warn→Crit)은 cooldown을 무시하고 즉시 알린다
+    /// (악화는 놓치면 안 됨). (3) 같은/낮은 단계 재진입만 자원별 **cooldown**(Crit `CRIT_COOLDOWN` < Warn
+    /// `WARN_COOLDOWN`)으로 묶어 깜빡임 스팸을 막는다 — 이게 "idle ≤1건/10분" 예산의 실제 rate limiter다.
+    /// (4) cooldown(긴 쪽)만큼 잠잠하면 발화 이력을 **decay**시켜, 한참 뒤 재발한 자원이 새 사건으로
+    /// 다시 알림되게 한다. 타이머가 turn을 시작하거나 토큰을 주입하는 일은 없다(§C1).
+    pub fn observe(&mut self, m: &SysMetrics, now: Instant) -> Vec<Alert> {
+        let states = m.alert_states();
+        let mut out = Vec::new();
+        for (i, (_name, sev, value)) in states.iter().enumerate() {
+            let sev = *sev;
+            // 이력 decay: 오래 잠잠했으면(긴 cooldown 경과) 발화 이력을 초기화해 다음 악화를 새 사건으로.
+            if self.last_fired[i].is_some_and(|t| now.duration_since(t) >= WARN_COOLDOWN) {
+                self.last_fired[i] = None;
+                self.last_fired_sev[i] = Severity::Normal;
+            }
+            if sev > self.prev[i] {
+                let escalation = sev > self.last_fired_sev[i];
+                let cooldown = if sev == Severity::Crit {
+                    CRIT_COOLDOWN
+                } else {
+                    WARN_COOLDOWN
+                };
+                let cooled = self.last_fired[i].is_none_or(|t| now.duration_since(t) >= cooldown);
+                if escalation || cooled {
+                    let (level, hint) = if sev == Severity::Crit {
+                        ("위험(crit)", " — /diagnose 권장")
+                    } else {
+                        ("경고(warn)", "")
+                    };
+                    out.push(Alert {
+                        severity: sev,
+                        message: format!("⚠ {value} {level}{hint}"),
+                    });
+                    self.last_fired[i] = Some(now);
+                    self.last_fired_sev[i] = sev;
+                }
+            }
+            self.prev[i] = sev;
+        }
+        out
     }
 }
 
@@ -480,6 +598,56 @@ mod tests {
         assert_eq!(
             metric(1.0, 88.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g).overall_severity(),
             Severity::Warn
+        );
+    }
+
+    #[test]
+    fn alert_tracker_fires_on_worsening_edges_only() {
+        let g = 1024 * 1024 * 1024;
+        let t0 = Instant::now();
+        let mut tr = AlertTracker::new();
+        // 정상 → 발화 없음.
+        let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        assert!(tr.observe(&ok, t0).is_empty());
+        // Normal→cpu warn(88%): 1건 발화(warn).
+        let cpu_warn = metric(1.0, 88.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        let a = tr.observe(&cpu_warn, t0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].severity, Severity::Warn);
+        assert!(a[0].message.contains("cpu 88%"), "{}", a[0].message);
+        // 같은 warn 유지 → 발화 없음(전이 아님).
+        assert!(tr.observe(&cpu_warn, t0).is_empty());
+        // cpu warn→crit(96%)은 악화 전이라 cooldown 무관하게 즉시 발화(crit).
+        let cpu_crit = metric(1.0, 96.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        let a = tr.observe(&cpu_crit, t0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].severity, Severity::Crit);
+        assert!(a[0].message.contains("/diagnose"), "crit should hint /diagnose: {}", a[0].message);
+    }
+
+    #[test]
+    fn alert_tracker_cooldown_suppresses_reentry() {
+        let g = 1024 * 1024 * 1024;
+        let t0 = Instant::now();
+        let mut tr = AlertTracker::new();
+        let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        let cpu_warn = metric(1.0, 88.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        // 첫 Normal→Warn 발화.
+        assert_eq!(tr.observe(&cpu_warn, t0).len(), 1);
+        // Normal로 내려갔다(전이 하강, 발화 없음) 다시 Warn으로 — cooldown(5분) 안이면 억제.
+        assert!(tr.observe(&ok, t0).is_empty());
+        let within = t0 + Duration::from_secs(60);
+        assert!(
+            tr.observe(&cpu_warn, within).is_empty(),
+            "warn re-entry within cooldown must be suppressed (rate budget)"
+        );
+        // cooldown 경과 후 다시 Warn이면 발화.
+        let after = t0 + WARN_COOLDOWN + Duration::from_secs(1);
+        assert!(tr.observe(&ok, after).is_empty()); // Normal 경유(전이 하강)
+        assert_eq!(
+            tr.observe(&cpu_warn, after + Duration::from_secs(1)).len(),
+            1,
+            "warn should fire again once cooldown elapsed"
         );
     }
 
