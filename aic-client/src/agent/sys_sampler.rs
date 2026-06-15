@@ -57,6 +57,28 @@ const CRIT_COOLDOWN: Duration = Duration::from_secs(120);
 /// alert 대상 자원 수(임계가 있는 load/cpu/mem/swap/disk — io 제외). `AlertTracker` 배열의 키 범위.
 const ALERT_RESOURCES: usize = 5;
 
+// disk 소진 ETA(C2) 게이트 — Round 3 deep-dive에서 확정한 수치. transient(cargo build/docker pull)·
+// sawtooth가 가짜 "~N분 후 full"을 절대 못 내게 다중 게이트를 쌓는다. disk_avail만 대상이며(swap→v1.1,
+// mem→sparkline only), disk_sev∈{Warn,Crit}일 때만 arm한다(20GB transient는 non-full 디스크에만 착지
+// =Normal=disarm이라 구조적으로 차단). 순수 게이트는 `disk_eta_candidate`, 상태는 `DiskEtaTracker`.
+const ETA_WINDOW: Duration = Duration::from_secs(300);
+/// 적합에 필요한 최소 표본 수 + 최소 시간 span(둘 다 충족해야 함 — 비균일 cadence를 시간으로 묶는다).
+const ETA_MIN_SAMPLES: usize = 10;
+const ETA_MIN_SPAN: Duration = Duration::from_secs(300);
+/// 비증가 run 최소 길이(상승 지터 `ETA_UP_JITTER`까지는 run 유지) + 감소 step 비율 최소.
+const ETA_MONOTONIC_RUN_MIN: usize = 6;
+const ETA_DECLINE_FRACTION_MIN: f64 = 0.75;
+const ETA_UP_JITTER: u64 = 16 * 1024 * 1024;
+/// 최소 기울기(bytes/s) = 5 MiB/min — 이보다 완만하면 FS 지터에 묻혀 ETA가 무의미.
+const ETA_MIN_SLOPE_BPS: f64 = 5.0 * 1024.0 * 1024.0 / 60.0;
+/// 선형 적합 품질 하한 — transient의 V자/톱니는 직선 R²가 낮아 여기서 걸린다.
+const ETA_R2_MIN: f64 = 0.90;
+/// 표시 horizon 밴드(초). 너무 짧으면(정적 crit 색이 소유) / 너무 멀면(actionable 아님) 숫자를 숨긴다.
+const ETA_MIN_HORIZON_SECS: f64 = 60.0;
+const ETA_MAX_HORIZON_SECS: f64 = 7200.0;
+/// 이만큼(256 MiB) 여유가 한 번에 늘면 = 공간 회수(build 종료 등) → 즉시 ETA 철회.
+const ETA_REFILL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// 한 번 sample한 지표 스냅샷. watch 채널로 publish하려면 `Clone`(모든 필드가 Copy 원시값).
 #[derive(Clone)]
 pub(crate) struct SysMetrics {
@@ -82,6 +104,17 @@ pub(crate) struct SysMetrics {
     /// mem가 Warn 이상일 때만 채워지는 "가장 무거운(최대 RSS) 프로세스" — alert가 범인을 지목하는 데
     /// 쓴다(이름, RSS bytes). Normal이면 None(process 열거 비용 0). §C4 actionability.
     pub top_mem_proc: Option<(String, u64)>,
+    /// disk 소진 ETA(C2) — sampler task의 `DiskEtaTracker`가 채운다(`sample()`은 항상 None으로 두고
+    /// task가 덮어쓴다). status bar disk 세그먼트에 dim 접미로 표시. 비-task 경로(spinner 등)는 None.
+    pub disk_eta: Option<DiskEta>,
+}
+
+/// disk 여유 소진 예측(C2) — CRIT(1GiB)까지 남은 시간의 버킷 라벨. status bar disk 세그먼트에 dim
+/// 접미(`· ~8m→crit`)로 붙어 disk 단계 색을 상속한다(standalone 무색 표시 없음).
+#[derive(Clone)]
+pub(crate) struct DiskEta {
+    /// 버킷 라벨(`~2m`/`~5m`/`~15m`/`~1h`/`~2h`) — tick마다 흔들리지 않게 양자화.
+    pub bucket: &'static str,
 }
 
 impl SysSampler {
@@ -143,6 +176,8 @@ impl SysSampler {
             net_rx_bps: (rx as f64 / elapsed) as u64,
             net_tx_bps: (tx as f64 / elapsed) as u64,
             top_mem_proc: None,
+            // sample()은 ETA를 모른다(상태가 필요) — sampler task의 DiskEtaTracker가 publish 직전 덮어쓴다.
+            disk_eta: None,
         };
         // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
         // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
@@ -182,13 +217,7 @@ impl SysMetrics {
         } else {
             "swap off".to_string()
         };
-        // disk: root fs 여유 용량(SRE는 "얼마 남았나"가 핵심). 사용률 %는 macOS APFS 컨테이너
-        // 공유로 부정확해(df 21% vs total-avail 93%) 신뢰 가능한 free만 쓴다. 못 읽으면 n/a.
-        let disk = if self.disk_total > 0 {
-            format!("disk {} free", human_bytes(self.disk_avail))
-        } else {
-            "disk n/a".to_string()
-        };
+        let disk = self.disk_label();
         let clock = chrono::Local::now().format("%H:%M:%S").to_string();
         format!(
             "{} · load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
@@ -213,6 +242,19 @@ impl SysMetrics {
         } else {
             0.0
         }
+    }
+
+    /// disk 세그먼트 텍스트 — 여유 용량 + (있으면) 소진 ETA 접미. status_line·status_segments 공용이라
+    /// 둘이 항상 같은 토큰을 보여준다(divergence 방지). 사용률 %는 macOS APFS 부정확이라 free만 쓴다.
+    fn disk_label(&self) -> String {
+        if self.disk_total == 0 {
+            return "disk n/a".to_string();
+        }
+        let mut s = format!("disk {} free", human_bytes(self.disk_avail));
+        if let Some(eta) = &self.disk_eta {
+            s.push_str(&format!(" · {}→crit", eta.bucket));
+        }
+        s
     }
 
     fn load_sev(&self) -> Severity {
@@ -249,11 +291,7 @@ impl SysMetrics {
         } else {
             "swap off".to_string()
         };
-        let disk = if self.disk_total > 0 {
-            format!("disk {} free", human_bytes(self.disk_avail))
-        } else {
-            "disk n/a".to_string()
-        };
+        let disk = self.disk_label();
         vec![
             (format!("load {:.2}", self.load1), self.load_sev()),
             (format!("cpu {:.0}%", self.cpu_pct), self.cpu_sev()),
@@ -424,10 +462,13 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
     let (tx, rx) = watch::channel(None);
     let handle = tokio::spawn(async move {
         let mut sampler = SysSampler::new();
+        // trend ring + disk ETA 상태는 task 내부에 산다(§C4: ring은 sampler task가 소유). ETA 계산은
+        // 순수 CPU(블로킹 없음)라 spawn_blocking 밖, async task에서 직접 돈다.
+        let mut eta = DiskEtaTracker::new();
         loop {
             // sampler를 blocking thread로 넘겼다 돌려받는다(i/o delta 계산을 위해 상태를 보존해야 함).
             // 이 await가 끝나기 전엔 절대 다음 sample을 시작하지 않으므로 blocking thread는 ≤1개다.
-            let (returned, metrics) = match tokio::task::spawn_blocking(move || {
+            let (returned, mut metrics) = match tokio::task::spawn_blocking(move || {
                 let m = sampler.sample();
                 (sampler, m)
             })
@@ -438,6 +479,8 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
                 Err(_) => break,
             };
             sampler = returned;
+            // disk 소진 ETA(C2): ring에 표본을 넣고 게이트·디바운스를 돌려 disk_eta를 채운다.
+            metrics.disk_eta = eta.observe(Instant::now(), metrics.disk_avail, metrics.disk_sev());
             let cadence = if metrics.overall_severity() == Severity::Normal {
                 Duration::from_secs(CADENCE_NORMAL_SECS)
             } else {
@@ -451,6 +494,200 @@ pub(crate) fn spawn_sampler() -> (watch::Receiver<Option<SysMetrics>>, JoinHandl
         }
     });
     (rx, handle)
+}
+
+/// disk 소진 ETA를 들고 다니는 상태 머신(sampler task 내부). ring에 표본을 쌓고, 순수 게이트
+/// `disk_eta_candidate`로 후보를 뽑은 뒤, 등장/소멸을 디바운스한다. 상태는 세션 로컬(stateless-pull).
+pub(crate) struct DiskEtaTracker {
+    /// (시각, 여유 바이트) ring — `ETA_WINDOW`보다 오래된 표본은 버린다. armed가 아니어도 계속 쌓아,
+    /// disk가 Warn으로 넘어오는 순간 이미 충분한 이력이 있게 한다.
+    ring: Vec<(Instant, u64)>,
+    /// 현재 표시 중인 ETA(초). 값 갱신·grace 판단용.
+    shown: Option<f64>,
+    /// 등장 디바운스 — 연속 in-gate 후보 수가 2 이상이어야 표시(깜빡임 방지).
+    appear: u8,
+    /// 소멸 grace — 표시 중 연속 gate-miss가 2 이상이면 숨긴다(refill/Normal은 즉시).
+    miss: u8,
+    /// refill 감지용 직전 여유 바이트.
+    last_avail: Option<u64>,
+}
+
+impl DiskEtaTracker {
+    pub fn new() -> Self {
+        Self {
+            ring: Vec::new(),
+            shown: None,
+            appear: 0,
+            miss: 0,
+            last_avail: None,
+        }
+    }
+
+    /// 새 disk 표본을 관찰해 표시할 ETA를 반환한다.
+    ///
+    /// 등장은 2연속 in-gate(디바운스), 소멸은 refill(>256MiB)·Normal 복귀 시 즉시 / 그 외 gate-miss는
+    /// 2연속 grace 후. arm은 `disk_sev∈{Warn,Crit}` — Normal이면 무조건 None(20GB transient 구조적 차단:
+    /// 그만한 transient는 non-full=Normal 디스크에만 착지하므로 ETA 경로 자체에 못 들어온다).
+    pub fn observe(&mut self, now: Instant, avail: u64, disk_sev: Severity) -> Option<DiskEta> {
+        // refill 감지(직전보다 256MiB 이상 증가) = 공간 회수 → 즉시 철회.
+        let refilled = self
+            .last_avail
+            .is_some_and(|prev| avail > prev.saturating_add(ETA_REFILL_BYTES));
+        self.last_avail = Some(avail);
+
+        // ring push + window trim(시간 기준). armed 여부와 무관하게 쌓아 이력을 확보한다.
+        self.ring.push((now, avail));
+        while self
+            .ring
+            .first()
+            .is_some_and(|&(t, _)| now.duration_since(t) > ETA_WINDOW)
+        {
+            self.ring.remove(0);
+        }
+
+        // disarm: Normal이거나 refill이면 즉시 끈다.
+        if disk_sev == Severity::Normal || refilled {
+            self.shown = None;
+            self.appear = 0;
+            self.miss = 0;
+            return None;
+        }
+
+        // 순수 게이트: ring을 (경과초, 바이트) 점열로 바꿔 ETA 후보를 뽑는다.
+        let t0 = self.ring.first().map(|&(t, _)| t);
+        let candidate = t0.and_then(|t0| {
+            let points: Vec<(f64, f64)> = self
+                .ring
+                .iter()
+                .map(|&(t, a)| (t.duration_since(t0).as_secs_f64(), a as f64))
+                .collect();
+            disk_eta_candidate(&points, avail as f64)
+        });
+
+        match candidate {
+            Some(secs) => {
+                self.miss = 0;
+                if self.shown.is_some() {
+                    self.shown = Some(secs); // 값 갱신.
+                } else {
+                    self.appear = self.appear.saturating_add(1);
+                    if self.appear >= 2 {
+                        self.shown = Some(secs);
+                    }
+                }
+            }
+            None => {
+                self.appear = 0;
+                if self.shown.is_some() {
+                    self.miss = self.miss.saturating_add(1);
+                    if self.miss >= 2 {
+                        self.shown = None;
+                        self.miss = 0;
+                    }
+                }
+            }
+        }
+        self.shown.map(|secs| DiskEta {
+            bucket: bucket_label(secs),
+        })
+    }
+}
+
+/// 순수 게이트 — (경과초, 여유바이트) 점열에서 CRIT(1GiB)까지 ETA(초) 후보를 낸다. 어떤 게이트든
+/// 못 넘으면 None. cargo-build/docker-pull(V자)·sawtooth 같은 transient는 여기서 반드시 None이어야
+/// 한다(replay-vector 테스트가 강제). 상태 없음 — 디바운스·리트랙션은 `DiskEtaTracker`가 감싼다.
+fn disk_eta_candidate(points: &[(f64, f64)], avail_now: f64) -> Option<f64> {
+    if points.len() < ETA_MIN_SAMPLES {
+        return None;
+    }
+    let span = points.last()?.0 - points.first()?.0;
+    if span < ETA_MIN_SPAN.as_secs_f64() {
+        return None;
+    }
+    // 단조성: 비증가 run(상승 지터 허용) 최장 길이 + 감소 step 비율.
+    let total_steps = points.len() - 1;
+    let mut longest_run = 0usize;
+    let mut cur_run = 0usize;
+    let mut declines = 0usize;
+    for w in points.windows(2) {
+        let delta = w[1].1 - w[0].1; // 바이트 변화(음수면 감소)
+        if delta < 0.0 {
+            declines += 1;
+        }
+        if delta <= ETA_UP_JITTER as f64 {
+            cur_run += 1;
+            longest_run = longest_run.max(cur_run);
+        } else {
+            cur_run = 0;
+        }
+    }
+    if longest_run < ETA_MONOTONIC_RUN_MIN {
+        return None;
+    }
+    if (declines as f64) < ETA_DECLINE_FRACTION_MIN * total_steps as f64 {
+        return None;
+    }
+    // 최소제곱 선형 적합 avail ~ a + b·t.
+    let (slope, r2) = linear_fit(points)?;
+    if slope >= 0.0 {
+        return None; // 감소(채워지는) 추세만.
+    }
+    if -slope < ETA_MIN_SLOPE_BPS {
+        return None; // 너무 완만 — FS 지터에 묻힘.
+    }
+    if r2 < ETA_R2_MIN {
+        return None; // 직선성 부족(V자/톱니).
+    }
+    // ETA = (현재 여유 - CRIT) / 감소율. 이미 CRIT 이하면 정적 색이 소유하므로 숫자 숨김.
+    let crit = DISK_CRIT_FREE as f64;
+    if avail_now <= crit {
+        return None;
+    }
+    let secs = (avail_now - crit) / (-slope);
+    if !(ETA_MIN_HORIZON_SECS..=ETA_MAX_HORIZON_SECS).contains(&secs) {
+        return None;
+    }
+    Some(secs)
+}
+
+/// 최소제곱 선형 적합 → (기울기 bytes/s, R²). 점이 2개 미만이거나 x가 모두 같으면 None.
+fn linear_fit(points: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let n = points.len() as f64;
+    if n < 2.0 {
+        return None;
+    }
+    let (mut sx, mut sy, mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(x, y) in points {
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
+    let denom = n * sxx - sx * sx;
+    if denom.abs() < f64::EPSILON {
+        return None;
+    }
+    let slope = (n * sxy - sx * sy) / denom;
+    let num = (n * sxy - sx * sy).powi(2);
+    let den = denom * (n * syy - sy * sy);
+    let r2 = if den.abs() < f64::EPSILON { 0.0 } else { num / den };
+    Some((slope, r2))
+}
+
+/// ETA(초)를 흔들리지 않는 버킷 라벨로 양자화 — tick마다 숫자가 떨리는 것을 막는다.
+fn bucket_label(secs: f64) -> &'static str {
+    if secs < 120.0 {
+        "~2m"
+    } else if secs < 300.0 {
+        "~5m"
+    } else if secs < 900.0 {
+        "~15m"
+    } else if secs < 3600.0 {
+        "~1h"
+    } else {
+        "~2h"
+    }
 }
 
 /// 값이 높을수록 위험한 지표(cpu/mem/swap/load)의 단계 판정.
@@ -521,6 +758,7 @@ mod tests {
             net_rx_bps: 3 * 1024 * 1024,
             net_tx_bps: 256 * 1024,
             top_mem_proc: None,
+            disk_eta: None,
         };
         let line = m.status_line();
         assert!(line.contains("load 1.23"), "{line}");
@@ -552,6 +790,7 @@ mod tests {
             net_rx_bps: 0,
             net_tx_bps: 0,
             top_mem_proc: None,
+            disk_eta: None,
         };
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
@@ -563,7 +802,7 @@ mod tests {
         SysMetrics {
             load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
             disk_avail, disk_total, disk_read_bps: 0, disk_write_bps: 0,
-            net_rx_bps: 0, net_tx_bps: 0, top_mem_proc: None,
+            net_rx_bps: 0, net_tx_bps: 0, top_mem_proc: None, disk_eta: None,
         }
     }
 
@@ -653,6 +892,97 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].severity, Severity::Crit);
         assert!(a[0].message.contains("/diagnose"), "crit should hint /diagnose: {}", a[0].message);
+    }
+
+    // (경과초, 여유 GiB-단위 바이트) 점열 빌더 — replay-vector 가독성용.
+    fn pts(samples: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        let g = 1024.0 * 1024.0 * 1024.0;
+        samples.iter().map(|&(t, gib)| (t, gib * g)).collect()
+    }
+
+    #[test]
+    fn disk_eta_fires_on_clean_linear_decline() {
+        let g = 1024.0 * 1024.0 * 1024.0;
+        // 6GiB→4GiB로 300s에 걸쳐 일정하게 감소(20s 간격 16표본). rate≈410MiB/min, R²≈1.
+        let samples: Vec<(f64, f64)> = (0..=15)
+            .map(|i| {
+                let t = i as f64 * 20.0;
+                (t, 6.0 - 2.0 * t / 300.0)
+            })
+            .collect();
+        let p = pts(&samples);
+        let avail_now = p.last().unwrap().1;
+        let secs = disk_eta_candidate(&p, avail_now).expect("clean linear decline should yield ETA");
+        // (avail_now-1GiB)/rate. avail_now≈4GiB → (3GiB)/(2GiB/300s)=450s 근방.
+        assert!(secs > 60.0 && secs < 7200.0, "secs={secs}");
+        let _ = g;
+    }
+
+    #[test]
+    fn disk_eta_suppresses_transient_v_shape() {
+        // cargo build/docker pull: 6→2GiB로 썼다(150s) 다시 6GiB로 회수(150s). V자 → 단조 run·R² 붕괴.
+        let mut samples = Vec::new();
+        for i in 0..=7 {
+            let t = i as f64 * 20.0;
+            samples.push((t, 6.0 - 4.0 * t / 140.0)); // 하강
+        }
+        for i in 1..=8 {
+            let t = 140.0 + i as f64 * 20.0;
+            samples.push((t, 2.0 + 4.0 * (i as f64 * 20.0) / 160.0)); // 회수
+        }
+        let p = pts(&samples);
+        let avail_now = p.last().unwrap().1;
+        assert!(
+            disk_eta_candidate(&p, avail_now).is_none(),
+            "V-shape transient must not yield an ETA"
+        );
+    }
+
+    #[test]
+    fn disk_eta_suppresses_sawtooth_and_flat_and_short() {
+        let g = 1024.0 * 1024.0 * 1024.0;
+        // 톱니: 4GiB 중심 ±500MiB 진동 → 감소비/R² 미달.
+        let saw: Vec<(f64, f64)> = (0..=15)
+            .map(|i| {
+                let t = i as f64 * 20.0;
+                let osc = if i % 2 == 0 { 0.5 } else { -0.5 };
+                (t, (4.0 + osc) * g)
+            })
+            .collect();
+        assert!(disk_eta_candidate(&saw, saw.last().unwrap().1).is_none(), "sawtooth");
+        // 평평: 일정 4GiB → slope≈0.
+        let flat: Vec<(f64, f64)> = (0..=15).map(|i| (i as f64 * 20.0, 4.0 * g)).collect();
+        assert!(disk_eta_candidate(&flat, flat.last().unwrap().1).is_none(), "flat");
+        // 짧은 윈도: span<300s & n<10 → None(깨끗한 하강이어도).
+        let short: Vec<(f64, f64)> = (0..5).map(|i| (i as f64 * 20.0, (5.0 - 0.2 * i as f64) * g)).collect();
+        assert!(disk_eta_candidate(&short, short.last().unwrap().1).is_none(), "short window");
+    }
+
+    #[test]
+    fn disk_eta_tracker_debounce_arm_and_retract() {
+        let t0 = Instant::now();
+        let g = 1024 * 1024 * 1024;
+        let mut tr = DiskEtaTracker::new();
+        // armed(disk_sev Warn, 즉 ≤5GiB) 상태로 깨끗한 하강을 한 표본씩 흘려보낸다.
+        // 5GiB에서 시작해 300s 동안 4GiB까지(1GiB/300s≈3.5MiB/s≈210MiB/min≥5). 20s 간격.
+        let mut shown_at = None;
+        for i in 0..=20 {
+            let t = t0 + Duration::from_secs(i * 20);
+            let avail = ((5.0 - 1.0 * (i as f64 * 20.0) / 400.0) * g as f64) as u64; // ≤5GiB → Warn arm
+            let eta = tr.observe(t, avail, Severity::Warn);
+            if eta.is_some() && shown_at.is_none() {
+                shown_at = Some(i);
+            }
+        }
+        assert!(shown_at.is_some(), "ETA should appear once enough clean-decline history accrues");
+        // 디바운스: 첫 in-gate 표본 즉시가 아니라 충분한 span(≥300s=15표본) 이후 + 2연속이라야 등장.
+        assert!(shown_at.unwrap() >= 15, "appeared too early: {:?}", shown_at);
+        // refill(>256MiB 급증) → 즉시 철회.
+        let later = t0 + Duration::from_secs(500);
+        let eta = tr.observe(later, 5 * g, Severity::Warn);
+        assert!(eta.is_none(), "refill must instantly retract the ETA");
+        // Normal 복귀 → 계속 None.
+        assert!(tr.observe(later + Duration::from_secs(20), 50 * g, Severity::Normal).is_none());
     }
 
     #[test]
