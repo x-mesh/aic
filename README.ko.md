@@ -260,6 +260,33 @@ aic session stop <id>  # 특정 세션 종료 (aicd 필요)
 aic audit verify       # audit log HMAC chain 무결성 (exit 0/2/3)
 ```
 
+### RCA workspace
+
+`aic rca`는 RCA를 incident id 기준으로 영속 저장한다. 증거는 `~/.aic/incidents/<id>/evidence.jsonl`,
+보고서는 같은 디렉터리의 `report.md`에 저장된다. 기본 저장 파일은 0600, incident 디렉터리는 0700
+권한으로 생성된다.
+
+```sh
+# incident workspace 생성
+aic rca start "api latency" --symptom "p99 latency spike"
+
+# 생성 직후 Safe probe 기반 초동 진단 evidence를 같이 붙이기
+aic rca start "disk full" --diagnose --no-analyze
+
+# 최근 incident 목록/상태
+aic rca status
+aic rca status <id-prefix>
+
+# 시간순 evidence timeline
+aic rca timeline <id-prefix>
+
+# evidence id([E1], [E2]...)가 붙은 markdown report 생성
+aic rca report <id-prefix> --write
+```
+
+P0 범위는 `start/status/timeline/report`다. `--diagnose`는 기존 headless `/diagnose` 엔진을 재사용해
+첫 RCA evidence로 저장하고, report는 결론을 evidence id로 역참조할 수 있게 Appendix를 붙인다.
+
 ### Chat slash 명령
 
 `aic chat` 안에서 `/`로 시작하는 줄은 로컬에서 가로채 처리한다 — **LLM에 전송되지 않고** 대화 history에도
@@ -279,6 +306,7 @@ Tab 순환, Enter 선택, Esc 닫기).
 | `/timeline [N]` | 세션 tool 기록 시간순(redacted) |
 | `/compare` | 고정 Safe 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출) |
 | `/bundle [name]` | 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장(dir 0700 / file 0600, Unix) |
+| `/rca start\|use\|add\|timeline\|report` | persistent RCA workspace에 chat 증거 저장. 예: `/rca start api-latency`, `/rca add last 3`, `/rca add note ...`, `/rca report --write` |
 | `/triage [--run] [topic]` | 토픽 체크리스트 + Probe Catalog 후보 probe; `--run`이면 실행(LLM 미호출). topics: `mac-slow web disk memory cpu network build-fail docker generic` (`disk` 토픽은 docker 디스크 사용량·큰 `/tmp` 파일도 점검) |
 | `/watch [target] [--count N] [--every Ns]` | probe를 몇 번 다시 실행해 tick마다 변화량을 요약(LLM 미호출). bounded: 기본 3회(최대 20), 간격 1s. `target`은 Probe Catalog id — LOCAL 섹션, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — 예: `/watch tmp_recent`는 `/tmp`에서 늘어나는 파일을 추적. 생략하면 compact 세트 |
 
