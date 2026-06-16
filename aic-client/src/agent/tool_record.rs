@@ -219,6 +219,12 @@ pub(crate) enum SlashCommand {
         count: usize,
         every_ms: u64,
     },
+    /// `/watch arm|on|off|mute` — proactive 알림 레인(C7)을 켜고 끈다. 기본은 켜짐(C1) — 끄면 edge
+    /// alert가 표시되지 않는다(edge-trigger라 켜둬도 안정 시엔 조용하다). bounded probe 형태인
+    /// `/watch <target> ...`와 명시 키워드로 구분한다.
+    AlertLane {
+        on: bool,
+    },
     /// `/metrics [-b backend] <promql>` — 등록된 Prometheus 백엔드에 PromQL instant 질의(SRE R1).
     /// 결과를 redacted raw로 출력(LLM 미호출). backend 미지정 시 등록 Prometheus가 1개면 자동 선택.
     Metrics {
@@ -527,6 +533,12 @@ fn parse_interval_ms(tok: &str) -> Option<u64> {
 /// `/watch [target] [--count N|-n N] [--every Ns|-i Ns]`. target은 섹션 라벨 전용(없으면 compact 기본).
 /// count/interval은 [1, MAX]·[MIN, MAX]ms로 clamp(무한/과도 방지). 순수 함수(테스트 가능).
 fn parse_watch_args(rest: &str) -> SlashCommand {
+    // 알림 레인 토글(C7) — bounded probe와 구분되는 명시 키워드. probe target과 겹치지 않는다.
+    match rest.trim() {
+        "arm" | "on" => return SlashCommand::AlertLane { on: true },
+        "off" | "mute" => return SlashCommand::AlertLane { on: false },
+        _ => {}
+    }
     let mut target: Option<String> = None;
     let mut count = WATCH_DEFAULT_COUNT;
     let mut every_ms = WATCH_DEFAULT_MS;
@@ -1779,6 +1791,11 @@ mod tests {
                 every_ms: WATCH_DEFAULT_MS
             })
         );
+        // 알림 레인 토글(C7) — arm/on/off/mute는 bounded probe가 아닌 AlertLane으로 파싱.
+        assert_eq!(parse_slash("/watch arm"), Some(SlashCommand::AlertLane { on: true }));
+        assert_eq!(parse_slash("/watch on"), Some(SlashCommand::AlertLane { on: true }));
+        assert_eq!(parse_slash("/watch off"), Some(SlashCommand::AlertLane { on: false }));
+        assert_eq!(parse_slash("/watch mute"), Some(SlashCommand::AlertLane { on: false }));
         // 과도한 count는 MAX로 clamp, 0/과소 interval은 MIN으로 clamp(무한/과도 방지).
         match parse_slash("/watch --count 999 --every 10ms") {
             Some(SlashCommand::Watch {

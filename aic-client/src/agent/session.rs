@@ -149,6 +149,14 @@ impl ChatOut {
         }
     }
 
+    /// proactive 알림 레인(C7)을 켜고 끈다. Tui면 `OutMsg::AlertsArmed`로 ChatLoop의 alert tracker를
+    /// 토글한다. Direct는 alert 레인이 없으므로 no-op(호출부가 안내 note를 따로 출력).
+    async fn alerts_armed(&self, on: bool) {
+        if let ChatOut::Tui(tx) = self {
+            let _ = tx.send(super::chat_tui::OutMsg::AlertsArmed(on)).await;
+        }
+    }
+
     /// NeedsConfirm 명령 확인. y면 true, 그 외(거부/Esc/비-TTY)는 false(기본 거부).
     /// - Direct: stdin y/N(비-TTY는 출력 없이 즉시 false — 기존 비대화형 거부와 byte-identical).
     /// - Tui: `OutMsg::Confirm`으로 ChatLoop에 위임하고 oneshot으로 결과를 받는다(EventStream과
@@ -795,6 +803,7 @@ impl AgentSession {
                 count,
                 every_ms,
             } => self.handle_watch(target.as_deref(), count, every_ms).await,
+            SlashCommand::AlertLane { on } => self.handle_alert_lane(on).await,
             SlashCommand::Metrics { backend, query } => {
                 self.handle_obs_query(
                     aic_common::BackendType::Prometheus,
@@ -1347,6 +1356,19 @@ impl AgentSession {
             }
         }
         self.out.note(&format!("watch 완료({count} ticks).")).await;
+    }
+
+    /// `/watch arm|on|off|mute` — proactive 알림 레인(C7)을 켜고 끈다. TUI의 alert tracker를 토글한다
+    /// (실제 상태는 ChatLoop가 보유 — OutMsg::AlertsArmed로 전달). 끄면 edge alert·sparkline 추세
+    /// 알림이 표시되지 않는다. Direct 모드엔 alert 레인이 없어 안내만 한다.
+    async fn handle_alert_lane(&mut self, on: bool) {
+        self.out.alerts_armed(on).await;
+        let msg = if on {
+            "알림 레인 ON — 시스템 자원이 위험 단계로 올라가면 대화에 한 줄로 알립니다 (/watch off로 끄기)"
+        } else {
+            "알림 레인 OFF — proactive 알림을 표시하지 않습니다 (/watch arm으로 켜기)"
+        };
+        self.out.note(msg).await;
     }
 
     /// `/bundle [name]` — 인시던트 증거(시스템+git+최근 기록)를 redacted markdown으로 파일 저장.

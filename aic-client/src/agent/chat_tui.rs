@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use super::sys_sampler::{spawn_sampler, AlertTracker, Severity, SysMetrics, SysSampler};
+use super::sys_sampler::{spawn_sampler, AlertKind, AlertTracker, Severity, SysMetrics, SysSampler};
 
 /// 한 입력의 결과(reedline `ReadLine` 대응).
 pub(crate) enum ChatLine {
@@ -174,6 +174,8 @@ pub(crate) enum OutMsg {
     /// NeedsConfirm 명령 확인 요청. prompt(예: `⚠ … 실행? [y/N]`)를 입력 줄에 띄우고,
     /// y/Y면 true·그 외 키(n/N/Esc/Enter/…)면 false를 oneshot으로 회신한다(기본 거부).
     Confirm(String, tokio::sync::oneshot::Sender<bool>),
+    /// proactive 알림 레인(C7) on/off — `/watch arm|off`가 보낸다. ChatLoop의 alert tracker를 토글한다.
+    AlertsArmed(bool),
     /// 루프 종료 — raw mode 복원 후 task 종료.
     Shutdown,
 }
@@ -1711,12 +1713,18 @@ async fn chat_loop(
                         if let Some(tracker) = alert_tracker.as_mut() {
                             let alerts = tracker.observe(&m, Instant::now());
                             if !alerts.is_empty() {
-                                // Crit이 하나라도 있으면 BEL 1회 — 화면을 안 봐도(조합 중 redraw 보류
-                                // 포함) 들린다. Warn은 조용한 ambient 줄로만 둬 alert fatigue를 줄인다.
-                                let has_crit =
-                                    alerts.iter().any(|a| a.severity == Severity::Crit);
+                                // Crit onset만 BEL 1회 — 화면을 안 봐도(조합 중 redraw 보류 포함) 들린다.
+                                // Warn·회복은 조용한 ambient 줄로만 둬 alert fatigue를 줄인다.
+                                let has_crit = alerts
+                                    .iter()
+                                    .any(|a| a.kind == AlertKind::Onset && a.severity == Severity::Crit);
                                 for a in &alerts {
-                                    append_to_log(&mut log, &mut log_text, &mut scroll, follow, &a.message);
+                                    // 회복(✓)은 녹색으로 칠해 onset(⚠)과 시각 구분(C7).
+                                    let line = match a.kind {
+                                        AlertKind::Recovered => super::ui::paint(&a.message, "32"),
+                                        AlertKind::Onset => a.message.clone(),
+                                    };
+                                    append_to_log(&mut log, &mut log_text, &mut scroll, follow, &line);
                                 }
                                 if has_crit {
                                     ring_bell();
@@ -1752,6 +1760,11 @@ async fn chat_loop(
                         // 확인 모드 진입 — 입력 줄을 prompt로 대체하고 다음 키 입력을 y/n으로 소비한다.
                         confirm_prompt = prompt;
                         confirm_pending = Some(tx);
+                    }
+                    Some(OutMsg::AlertsArmed(on)) => {
+                        // C7: 알림 레인 토글. 켜면 새 tracker(상태 초기화), 끄면 None(metrics arm이
+                        // 더 이상 alert를 내지 않는다). statusbar 비활성 시엔 어차피 metrics가 없어 무효.
+                        alert_tracker = on.then(AlertTracker::new);
                     }
                     Some(OutMsg::Shutdown) | None => break,
                 }
