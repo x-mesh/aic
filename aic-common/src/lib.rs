@@ -252,6 +252,9 @@ pub struct AppConfig {
     /// aicd 데몬 설정 (SRE R2: webhook alert ingestion). 레거시 호환 default.
     #[serde(default)]
     pub aicd: AicdConfig,
+    /// MCP 서버 설정 — 등록 서버의 tool을 chat에 노출한다. 레거시 호환 default(미설정 시 서버 없음).
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -401,6 +404,32 @@ pub enum BackendType {
     Loki,
     /// Elasticsearch / OpenSearch 검색 API
     Elasticsearch,
+}
+
+// ── McpConfig / McpServerConfig (MCP client) ───────────────
+
+/// MCP 서버 통합 설정. config.toml `[mcp]` 섹션. 등록된 서버의 tool을 chat tool-calling에 노출한다.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// 서버 이름 → 설정. config.toml `[mcp.servers.<name>]`.
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+/// 단일 MCP 서버 설정. 현재 transport는 Streamable HTTP(POST + 선택적 SSE 응답)만 지원한다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// MCP endpoint URL (예: `http://127.0.0.1:8787/mcp`). obs 백엔드와 동일한 SSRF 방어를 적용한다.
+    pub url: String,
+    /// 비활성 시 연결·노출하지 않는다. 기본 true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 인증 토큰(`Authorization: Bearer`). 평문 또는 `keychain:<account>`. 미지정 시 무인증.
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// 확인 없이 자동 실행할 (read-only) tool 이름 목록. 그 외 tool은 실행 전 사용자 확인을 받는다.
+    #[serde(default)]
+    pub auto_approve: Vec<String>,
 }
 
 // ── AicdConfig / AicdWebhookConfig (SRE R2) ────────────────
@@ -605,6 +634,7 @@ mod tests {
             session: SessionConfig::default(),
             observability: ObservabilityConfig::default(),
             aicd: AicdConfig::default(),
+            mcp: McpConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
