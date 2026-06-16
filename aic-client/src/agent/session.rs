@@ -225,6 +225,8 @@ pub struct AgentSession {
     tool_records: VecDeque<ToolRecord>,
     /// `/compare` 직전 시스템 스냅샷(baseline). 첫 호출 시 저장, 이후 diff 후 갱신.
     compare_baseline: Option<String>,
+    /// 현재 chat 세션에서 이어붙일 persistent RCA incident id.
+    active_rca_id: Option<String>,
     /// 화면 출력 sink. 기본 `Direct`(기존 동작), TTY chat은 `run()`에서 `Tui`로 교체(RFC-004 step 4).
     out: ChatOut,
     /// 관측 백엔드(Prometheus/Loki/ES) 질의 클라이언트(SRE R1). config에 등록 백엔드가
@@ -257,6 +259,7 @@ impl AgentSession {
             tool_seq: 0,
             tool_records: VecDeque::new(),
             compare_baseline: None,
+            active_rca_id: None,
             out: ChatOut::Direct { spinner: None },
             obs: None,
             mcp: None,
@@ -871,6 +874,7 @@ impl AgentSession {
             }
             SlashCommand::Compare => self.handle_compare().await,
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()).await,
+            SlashCommand::Rca(cmd) => self.handle_rca(cmd).await,
             SlashCommand::Triage { topic, run } => {
                 self.handle_triage(topic.as_deref(), run).await
             }
@@ -1478,6 +1482,208 @@ impl AgentSession {
             Ok(path) => self.out.note(&format!("\nbundle 저장됨: {}", path.display())).await,
             Err(e) => self.out.note(&format!("\nbundle 저장 실패: {e}")).await,
         }
+    }
+
+    /// `/rca ...` — persistent RCA workspace를 chat 안에서 조작한다.
+    async fn handle_rca(&mut self, cmd: tool_record::RcaCommand) {
+        use crate::rca::{self, EvidenceKind};
+        use tool_record::RcaCommand;
+
+        match cmd {
+            RcaCommand::Start { title } => {
+                let cwd = std::env::current_dir().ok();
+                match rca::create_incident(&title, Some(&title), cwd.as_deref()) {
+                    Ok(meta) => {
+                        self.active_rca_id = Some(meta.id.clone());
+                        self.out
+                            .note(&format!(
+                                "RCA 시작: {}\n경로: {}",
+                                meta.id,
+                                rca::incident_dir(&meta.id).display()
+                            ))
+                            .await;
+                    }
+                    Err(e) => self.out.note(&format!("RCA 시작 실패: {e}")).await,
+                }
+            }
+            RcaCommand::Use { id } => match rca::resolve_id(Some(&id)) {
+                Ok(resolved) => {
+                    self.active_rca_id = Some(resolved.clone());
+                    match rca::load_meta(&resolved) {
+                        Ok(meta) => {
+                            self.out
+                                .note(&format!(
+                                    "active RCA: {}\n{}",
+                                    resolved,
+                                    rca::render_status(&meta)
+                                ))
+                                .await;
+                        }
+                        Err(e) => self.out.note(&format!("RCA 로드 실패: {e}")).await,
+                    }
+                }
+                Err(e) => self.out.note(&format!("RCA 선택 실패: {e}")).await,
+            },
+            RcaCommand::Status { id } => {
+                let id = id.or_else(|| self.active_rca_id.clone());
+                if let Some(id) = id {
+                    match rca::resolve_id(Some(&id)).and_then(|rid| rca::load_meta(&rid)) {
+                        Ok(meta) => {
+                            self.active_rca_id = Some(meta.id.clone());
+                            self.out.note(&rca::render_status(&meta)).await;
+                        }
+                        Err(e) => self.out.note(&format!("RCA 상태 조회 실패: {e}")).await,
+                    }
+                } else {
+                    match rca::list_incidents() {
+                        Ok(list) if list.is_empty() => {
+                            self.out
+                                .note("RCA incident가 없습니다. `/rca start <title>`로 시작하세요.")
+                                .await;
+                        }
+                        Ok(list) => {
+                            let mut lines = vec!["최근 RCA incidents:".to_string()];
+                            for item in list.iter().take(10) {
+                                lines.push(format!(
+                                    "- {} · {:?} · {} · evidence={} · updated={}",
+                                    item.id,
+                                    item.status,
+                                    item.title,
+                                    item.evidence_count,
+                                    item.updated_at.to_rfc3339()
+                                ));
+                            }
+                            self.out.note(&lines.join("\n")).await;
+                        }
+                        Err(e) => self.out.note(&format!("RCA 목록 조회 실패: {e}")).await,
+                    }
+                }
+            }
+            RcaCommand::AddLast { count } => {
+                let Some(body) = self.rca_recent_tool_evidence(count) else {
+                    self.out
+                        .note("저장할 tool 기록이 없습니다. 먼저 진단 명령을 실행하세요.")
+                        .await;
+                    return;
+                };
+                match self.resolve_active_rca_id().and_then(|id| {
+                    let mut meta = rca::load_meta(&id)?;
+                    let event = rca::append_evidence(
+                        &mut meta,
+                        EvidenceKind::Timeline,
+                        &format!("chat tool records (last {count})"),
+                        "aic chat /rca add last",
+                        &body,
+                        &["chat", "tool"],
+                    )?;
+                    Ok((meta.id, event.id))
+                }) {
+                    Ok((id, ev)) => {
+                        self.active_rca_id = Some(id.clone());
+                        self.out
+                            .note(&format!("RCA {id}에 evidence 저장: {ev}"))
+                            .await;
+                    }
+                    Err(e) => self.out.note(&format!("RCA evidence 저장 실패: {e}")).await,
+                }
+            }
+            RcaCommand::AddNote { text } => {
+                if text.trim().is_empty() {
+                    self.out
+                        .note("note가 비었습니다. 예: /rca add note deploy 이후 p99 상승 확인")
+                        .await;
+                    return;
+                }
+                match self.resolve_active_rca_id().and_then(|id| {
+                    let mut meta = rca::load_meta(&id)?;
+                    let event = rca::append_evidence(
+                        &mut meta,
+                        EvidenceKind::Note,
+                        "chat note",
+                        "aic chat /rca add note",
+                        &text,
+                        &["chat", "note"],
+                    )?;
+                    Ok((meta.id, event.id))
+                }) {
+                    Ok((id, ev)) => {
+                        self.active_rca_id = Some(id.clone());
+                        self.out.note(&format!("RCA {id}에 note 저장: {ev}")).await;
+                    }
+                    Err(e) => self.out.note(&format!("RCA note 저장 실패: {e}")).await,
+                }
+            }
+            RcaCommand::Timeline { id } => {
+                match self.resolve_rca_id_for_read(id.as_deref()).and_then(|rid| {
+                    let meta = rca::load_meta(&rid)?;
+                    let events = rca::load_events(&rid)?;
+                    Ok((meta, events))
+                }) {
+                    Ok((meta, events)) => {
+                        self.active_rca_id = Some(meta.id.clone());
+                        self.out.note(&rca::render_timeline(&meta, &events)).await;
+                    }
+                    Err(e) => self.out.note(&format!("RCA timeline 조회 실패: {e}")).await,
+                }
+            }
+            RcaCommand::Report { id, write } => {
+                match self.resolve_rca_id_for_read(id.as_deref()).and_then(|rid| {
+                    let meta = rca::load_meta(&rid)?;
+                    let events = rca::load_events(&rid)?;
+                    let report = rca::render_report(&meta, &events);
+                    let path = if write {
+                        Some(rca::write_report(&meta, &report)?)
+                    } else {
+                        None
+                    };
+                    Ok((meta, report, path))
+                }) {
+                    Ok((meta, report, path)) => {
+                        self.active_rca_id = Some(meta.id.clone());
+                        let suffix = path
+                            .map(|p| format!("\nreport 저장됨: {}", p.display()))
+                            .unwrap_or_default();
+                        self.out.note(&format!("{report}{suffix}")).await;
+                    }
+                    Err(e) => self.out.note(&format!("RCA report 생성 실패: {e}")).await,
+                }
+            }
+        }
+    }
+
+    fn resolve_active_rca_id(&self) -> anyhow::Result<String> {
+        match self.active_rca_id.as_deref() {
+            Some(id) => crate::rca::resolve_id(Some(id)),
+            None => crate::rca::resolve_id(None),
+        }
+    }
+
+    fn resolve_rca_id_for_read(&self, id: Option<&str>) -> anyhow::Result<String> {
+        match id {
+            Some(id) => crate::rca::resolve_id(Some(id)),
+            None => self.resolve_active_rca_id(),
+        }
+    }
+
+    fn rca_recent_tool_evidence(&self, count: usize) -> Option<String> {
+        if self.tool_records.is_empty() {
+            return None;
+        }
+        let count = count.clamp(1, self.tool_records.len());
+        let skip = self.tool_records.len().saturating_sub(count);
+        let mut out = String::new();
+        for rec in self.tool_records.iter().skip(skip) {
+            let cmd = rec
+                .command_display
+                .as_deref()
+                .map(|c| format!("\ncommand: {c}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "## tool [{}] {} ({}){}\n{}\n\n",
+                rec.corr, rec.name, rec.status, cmd, rec.output
+            ));
+        }
+        Some(out)
     }
 
     /// `/triage [--run] [topic]` — 토픽별 read-only 체크리스트 + 후보 probe를 stderr로 렌더.
