@@ -157,6 +157,16 @@ impl ChatOut {
         }
     }
 
+    /// streaming chunk를 ChatLoop로 보낼 sender clone(Tui 모드만). 콜백에서 try_send로 비차단 전송하며,
+    /// 채널이 차면 미리보기 청크는 드롭된다(최종 Answer가 포맷본으로 교체하므로 결과엔 영향 없음).
+    /// Direct/비-TTY는 None — 호출부가 버퍼링 경로로 폴백한다.
+    fn chunk_sender(&self) -> Option<tokio::sync::mpsc::Sender<super::chat_tui::OutMsg>> {
+        match self {
+            ChatOut::Tui(tx) => Some(tx.clone()),
+            _ => None,
+        }
+    }
+
     /// NeedsConfirm 명령 확인. y면 true, 그 외(거부/Esc/비-TTY)는 false(기본 거부).
     /// - Direct: stdin y/N(비-TTY는 출력 없이 즉시 false — 기존 비대화형 거부와 byte-identical).
     /// - Tui: `OutMsg::Confirm`으로 ChatLoop에 위임하고 oneshot으로 결과를 받는다(EventStream과
@@ -486,7 +496,17 @@ impl AgentSession {
                 if self.allow_run_command { "on" } else { "off" }
             );
             self.out.spin_start("thinking...".to_string(), "90").await;
-            let resp = self.dispatcher.send_messages(&self.history, &specs).await;
+            // TUI 모드면 streaming으로 텍스트를 라이브 전달(첫 토큰이 spinner를 멈추고 최종 Answer가
+            // 미리보기를 포맷본으로 교체한다). Direct/비-TTY는 sink가 없어 버퍼링 경로를 그대로 쓴다.
+            let resp = if let Some(tx) = self.out.chunk_sender() {
+                self.dispatcher
+                    .send_messages_streaming(&self.history, &specs, |delta| {
+                        let _ = tx.try_send(super::chat_tui::OutMsg::AnswerChunk(delta.to_string()));
+                    })
+                    .await
+            } else {
+                self.dispatcher.send_messages(&self.history, &specs).await
+            };
             self.out.spin_stop().await;
 
             match resp {

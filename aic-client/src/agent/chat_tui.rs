@@ -165,6 +165,9 @@ pub(crate) enum OutMsg {
     Answer(String),
     /// UI/tool 카드/슬래시 출력(ANSI 포함) → insert_before(answer와 동일 경로, 의미 구분만).
     Note(String),
+    /// streaming 답변 텍스트 delta(raw). 라이브 미리보기로 누적 렌더하고, 턴 종료 시 `Answer`(포맷본)가
+    /// 미리보기를 교체한다.
+    AnswerChunk(String),
     /// thinking 표시 시작(라벨). viewport 입력 줄을 spinner 줄로 대체한다.
     SpinStart(String),
     /// thinking 표시 종료 → 입력 줄 복귀.
@@ -900,6 +903,10 @@ const LOG_CAP: usize = 2000;
 /// 마우스 휠 한 틱당 스크롤할 로그 줄 수.
 const WHEEL_STEP: u16 = 3;
 
+/// streaming 미리보기 재렌더 최소 간격(~20fps). 토큰마다 전체 scrollback을 재파싱(rebuild_log_text)하지
+/// 않도록 묶는다 — 그 사이 토큰은 stream_buf에 누적되고 다음 렌더/최종 Answer에 반영된다(리뷰 perf).
+const STREAM_RENDER_INTERVAL: Duration = Duration::from_millis(50);
+
 /// `log`(원본 ANSI 줄 벡터)를 `Text`로 재구성한다(m3 캐시 갱신용). ANSI 파싱 실패 시 plain 폴백
 /// (escape가 보일 수 있으나 패닉/누락 없음). 빈 로그는 빈 Text.
 fn rebuild_log_text(log: &[String]) -> Text<'static> {
@@ -1190,6 +1197,29 @@ fn append_to_log(
     }
 }
 
+/// streaming 라이브 미리보기를 `log`의 `base..`에 raw로 다시 그린다(직전 미리보기를 교체). LOG_CAP
+/// 초과 시 앞에서 폐기하고 scroll·base를 보정해 **갱신된 base**를 반환한다. 순수 함수(테스트 가능) —
+/// log_text 재구성·follow는 호출부가 한다. 최종 답변은 `OutMsg::Answer`가 포맷본으로 다시 교체한다.
+fn rebuild_stream_preview(
+    log: &mut Vec<String>,
+    base: usize,
+    stream_buf: &str,
+    scroll: &mut u16,
+) -> usize {
+    log.truncate(base);
+    for l in stream_buf.lines() {
+        log.push(l.to_string());
+    }
+    if log.len() > LOG_CAP {
+        let drop = log.len() - LOG_CAP;
+        log.drain(0..drop);
+        *scroll = scroll.saturating_sub(drop as u16);
+        base.saturating_sub(drop)
+    } else {
+        base
+    }
+}
+
 /// 터미널 벨(BEL) 1회 — proactive alert 발생 시 청각 신호. BEL은 커서를 움직이지 않으므로
 /// alternate screen(ratatui) 중에도 화면을 깨지 않는다. IME 조합 중 redraw를 건너뛰어도 이 신호는
 /// 울려, 사용자가 화면을 안 보고 있어도 위험을 알 수 있다.
@@ -1285,6 +1315,12 @@ async fn chat_loop(
     // 이번 루프 반복에서 terminal.draw()를 호출할지. 기본 true이며, IME 조합 중 metrics tick이
     // 오면 그 반복만 false로 두어 자모 분리를 막는다(상태는 갱신하고 redraw만 건너뜀).
     let mut should_draw = true;
+    // streaming 라이브 미리보기: stream_base=미리보기 시작 log 인덱스(None이면 비활성), stream_buf=
+    // 누적 raw 텍스트. AnswerChunk마다 base부터 다시 그리고, Answer가 도착하면 포맷본으로 교체한다.
+    // last_stream_render=직전 미리보기 렌더 시각(STREAM_RENDER_INTERVAL throttle 기준).
+    let mut stream_base: Option<usize> = None;
+    let mut stream_buf = String::new();
+    let mut last_stream_render: Option<Instant> = None;
 
     loop {
         // status 지표는 전용 sampler task가 watch 채널로 밀어넣는다(아래 select! metrics arm에서 수신).
@@ -1744,10 +1780,57 @@ async fn chat_loop(
             }
             msg = out_rx.recv() => {
                 match msg {
-                    Some(OutMsg::Answer(s)) | Some(OutMsg::Note(s)) => {
+                    Some(OutMsg::AnswerChunk(delta)) => {
+                        // 라이브 raw 미리보기. 첫 토큰이 spinner를 멈추고, 누적 텍스트를 stream_base부터
+                        // 다시 그린다(완료 시 OutMsg::Answer가 포맷본으로 교체). 미리보기 청크가 드롭돼도
+                        // 최종 Answer가 전체를 대체하므로 결과엔 영향 없다.
+                        if spin.is_some() {
+                            spin = None;
+                        }
+                        if stream_base.is_none() {
+                            stream_base = Some(log.len());
+                            stream_buf.clear();
+                            last_stream_render = None;
+                        }
+                        stream_buf.push_str(&delta);
+                        // IME 조합 중이거나 직전 렌더로부터 STREAM_RENDER_INTERVAL 미경과면 이번 반복은
+                        // 렌더 보류 — 텍스트는 stream_buf에 누적되고 다음 렌더/최종 Answer에 반영된다.
+                        // (1) 조합 중 자모 분리 방지(metrics arm과 동일 정책) (2) 토큰마다 전체 scrollback
+                        // 재파싱 비용을 ~20fps로 제한(리뷰 perf).
+                        let throttled =
+                            last_stream_render.is_some_and(|t| t.elapsed() < STREAM_RENDER_INTERVAL);
+                        if hangul.is_composing() || throttled {
+                            should_draw = false;
+                        } else {
+                            last_stream_render = Some(Instant::now());
+                            let base = stream_base.unwrap_or(0);
+                            stream_base =
+                                Some(rebuild_stream_preview(&mut log, base, &stream_buf, &mut scroll));
+                            log_text = rebuild_log_text(&log);
+                            if follow {
+                                scroll = u16::MAX;
+                            }
+                        }
+                    }
+                    Some(OutMsg::Answer(s)) => {
+                        // 스트리밍 미리보기(raw)를 포맷본(markdown+박스)으로 교체.
+                        if let Some(base) = stream_base.take() {
+                            log.truncate(base);
+                            stream_buf.clear();
+                        }
+                        append_to_log(&mut log, &mut log_text, &mut scroll, follow, &s);
+                    }
+                    Some(OutMsg::Note(s)) => {
+                        // 스트리밍 중이면 raw 미리보기를 그대로 확정(commit)하고 Note를 그 뒤에 붙인다
+                        // (pre-tool 내레이션 후 도구 카드가 오는 경우).
+                        stream_base = None;
+                        stream_buf.clear();
                         append_to_log(&mut log, &mut log_text, &mut scroll, follow, &s);
                     }
                     Some(OutMsg::SpinStart(label)) => {
+                        // 다음 사고 시작 — 스트리밍 미리보기를 확정(다음 출력이 그 뒤에 붙도록).
+                        stream_base = None;
+                        stream_buf.clear();
                         spin = Some(SpinState { label, frame: 0, started: Instant::now() });
                     }
                     Some(OutMsg::SpinStop) => {
@@ -2036,6 +2119,33 @@ mod tests {
         let t2 = super::highlight_log_lines(&text, 1, 99);
         assert!(t2.lines[1].style.add_modifier.contains(Modifier::REVERSED));
         assert!(t2.lines[2].style.add_modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn rebuild_stream_preview_replaces_from_base() {
+        let mut log = vec!["a".to_string(), "b".to_string()];
+        let mut scroll = 0u16;
+        // base=2부터 미리보기 추가.
+        let base = super::rebuild_stream_preview(&mut log, 2, "hello\nworld", &mut scroll);
+        assert_eq!(log, vec!["a", "b", "hello", "world"]);
+        assert_eq!(base, 2);
+        // 다음 청크: 같은 base에서 직전 미리보기를 교체(누적 버퍼 전체로 다시 그림).
+        let base = super::rebuild_stream_preview(&mut log, base, "hello\nworld!!", &mut scroll);
+        assert_eq!(log, vec!["a", "b", "hello", "world!!"]);
+        assert_eq!(base, 2);
+    }
+
+    #[test]
+    fn rebuild_stream_preview_trims_over_cap_and_adjusts_base() {
+        // log가 정확히 cap이고 base가 끝일 때, 미리보기를 더하면 앞에서 폐기되며 base가 그만큼 내려간다.
+        let mut log: Vec<String> = (0..super::LOG_CAP).map(|i| i.to_string()).collect();
+        let mut scroll = 10u16;
+        let base = log.len();
+        let new_base = super::rebuild_stream_preview(&mut log, base, "p1\np2\np3", &mut scroll);
+        assert_eq!(log.len(), super::LOG_CAP);
+        assert!(log.ends_with(&["p1".to_string(), "p2".to_string(), "p3".to_string()]));
+        assert_eq!(new_base, base - 3, "base shifts down by the dropped count");
+        assert_eq!(scroll, 7, "scroll adjusted by drop");
     }
 
     #[test]

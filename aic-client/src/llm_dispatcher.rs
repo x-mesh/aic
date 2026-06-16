@@ -620,6 +620,207 @@ impl LlmDispatcher {
         }
     }
 
+    /// `send_messages`의 streaming 버전(agent chat 전용). 텍스트 delta를 `on_chunk`로 라이브 전달하고
+    /// tool_calls를 SSE delta에서 재조립해 동일한 `ChatResponse`를 반환한다. 요청 body는 버퍼링 버전과
+    /// 동일하되 `stream:true`만 추가한다. CLI 등 미지원 provider는 버퍼링으로 fallback(보통 CLI는
+    /// ReplSession 경로라 여기 도달하지 않는다).
+    pub async fn send_messages_streaming<F>(
+        &self,
+        messages: &[crate::agent::types::ChatMessage],
+        tools: &[crate::agent::types::ToolSpec],
+        on_chunk: F,
+    ) -> Result<crate::agent::types::ChatResponse, AicError>
+    where
+        F: FnMut(&str),
+    {
+        let provider = self.resolve_provider()?;
+        match provider.provider_type {
+            ProviderType::Anthropic => {
+                self.stream_messages_anthropic(provider, messages, tools, on_chunk)
+                    .await
+            }
+            ProviderType::OpenAiCompatible | ProviderType::Groq => {
+                self.stream_messages_openai(provider, messages, tools, on_chunk)
+                    .await
+            }
+            ProviderType::CliBackend => {
+                let resp = self.send_messages(messages, tools).await?;
+                if let crate::agent::types::ChatResponse::Text(t) = &resp {
+                    let mut on_chunk = on_chunk;
+                    on_chunk(t);
+                }
+                Ok(resp)
+            }
+        }
+    }
+
+    /// OpenAI-compatible streaming(messages+tools). `send_messages`의 OpenAI 경로와 body가 동일하고
+    /// `stream:true`만 더한 뒤, 응답을 `accumulate_openai_stream`으로 누적한다.
+    async fn stream_messages_openai<F>(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[crate::agent::types::ChatMessage],
+        tools: &[crate::agent::types::ToolSpec],
+        on_chunk: F,
+    ) -> Result<crate::agent::types::ChatResponse, AicError>
+    where
+        F: FnMut(&str),
+    {
+        self.circuit.check()?;
+        let (default_endpoint, default_model) = openai_compat_defaults(&provider.provider_type);
+        let endpoint = provider.endpoint.as_deref().unwrap_or(default_endpoint);
+        let model = provider.model.as_deref().unwrap_or(default_model);
+        let raw = provider
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AicError::ApiKeyMissing {
+                provider: self.config.default_provider.clone(),
+            })?;
+        let resolved = crate::keychain::resolve(raw).map_err(|e| AicError::ApiKeyMissing {
+            provider: format!("{} ({e})", self.config.default_provider),
+        })?;
+        let redact_enabled = std::env::var("AIC_REDACT")
+            .map(|v| v.to_lowercase() != "off")
+            .unwrap_or(true);
+        let wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                let mut j = m.to_openai_json();
+                if redact_enabled {
+                    if let Some(c) = j.get("content").and_then(|v| v.as_str()) {
+                        let (red, _report) = crate::redaction::redact(c);
+                        j["content"] = serde_json::Value::String(red);
+                    }
+                }
+                j
+            })
+            .collect();
+        let mut body = json!({ "model": model, "messages": wire_messages, "stream": true });
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::Value::Array(tools.iter().map(|t| t.to_openai_json()).collect());
+            body["tool_choice"] = json!("auto");
+        }
+        let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
+        let resp = self
+            .http_client
+            .post(endpoint)
+            .header("Authorization", format!("Bearer {}", resolved.as_str()))
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: e.to_string(),
+            });
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                self.circuit.record_failure();
+                return Err(e);
+            }
+        };
+        if let Err(e) = handle_http_status(&resp) {
+            self.circuit.record_failure();
+            return Err(e);
+        }
+        let result = crate::streaming::accumulate_openai_stream(resp, on_chunk).await;
+        match &result {
+            Ok(_) => self.circuit.record_success(),
+            Err(_) => self.circuit.record_failure(),
+        }
+        result
+    }
+
+    /// Anthropic streaming(messages+tools). `send_messages_anthropic`와 body가 동일하고 `stream:true`만
+    /// 더한 뒤, 응답을 `accumulate_anthropic_stream`으로 누적한다.
+    async fn stream_messages_anthropic<F>(
+        &self,
+        provider: &ProviderConfig,
+        messages: &[crate::agent::types::ChatMessage],
+        tools: &[crate::agent::types::ToolSpec],
+        on_chunk: F,
+    ) -> Result<crate::agent::types::ChatResponse, AicError>
+    where
+        F: FnMut(&str),
+    {
+        self.circuit.check()?;
+        let endpoint = provider
+            .endpoint
+            .as_deref()
+            .unwrap_or("https://api.anthropic.com/v1/messages");
+        let raw = provider
+            .api_key
+            .as_deref()
+            .ok_or_else(|| AicError::ApiKeyMissing {
+                provider: self.config.default_provider.clone(),
+            })?;
+        let resolved = crate::keychain::resolve(raw).map_err(|e| AicError::ApiKeyMissing {
+            provider: format!("{} ({e})", self.config.default_provider),
+        })?;
+        let model = provider.model.as_deref().unwrap_or("claude-sonnet-4-6");
+        let redact_enabled = std::env::var("AIC_REDACT")
+            .map(|v| v.to_lowercase() != "off")
+            .unwrap_or(true);
+        let (system, mut wire_messages) = crate::agent::types::to_anthropic_request(messages);
+        if redact_enabled {
+            for m in &mut wire_messages {
+                redact_anthropic_content(m);
+            }
+        }
+        let mut body = json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": wire_messages,
+            "stream": true,
+        });
+        if let Some(sys) = system {
+            let sys = if redact_enabled {
+                crate::redaction::redact(&sys).0
+            } else {
+                sys
+            };
+            body["system"] = json!(sys);
+        }
+        if !tools.is_empty() {
+            body["tools"] =
+                serde_json::Value::Array(tools.iter().map(|t| t.to_anthropic_json()).collect());
+        }
+        let timeout = estimate_request_timeout(model, self.config.request_timeout_secs);
+        let resp = self
+            .http_client
+            .post(endpoint)
+            .header("x-api-key", resolved.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .timeout(timeout)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AicError::LlmApiError {
+                status: 0,
+                message: e.to_string(),
+            });
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                self.circuit.record_failure();
+                return Err(e);
+            }
+        };
+        if let Err(e) = handle_http_status(&resp) {
+            self.circuit.record_failure();
+            return Err(e);
+        }
+        let result = crate::streaming::accumulate_anthropic_stream(resp, on_chunk).await;
+        match &result {
+            Ok(_) => self.circuit.record_success(),
+            Err(_) => self.circuit.record_failure(),
+        }
+        result
+    }
+
     // ── 내부 헬퍼 ──────────────────────────────────────────────
 
     /// default_provider에 해당하는 ProviderConfig를 찾는다.
