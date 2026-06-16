@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-16
+
+### Added
+- **chat: MCP 도구 서버 연동(HTTP)** — config `[mcp.servers.<name>]`에 등록한 MCP 서버(예: mem-mesh
+  메모리)의 tool을 `aic chat` 에이전트가 직접 호출한다. Streamable HTTP transport(initialize/tools/list/
+  tools/call), 발견된 tool은 `<server>__<tool>` 이름으로 노출. `auto_approve`에 적은 read-only tool은
+  자동 실행, 변경 tool(add/delete 등)은 실행 전 확인을 받는다. SSRF 방어·응답 redaction·크기 cap을
+  obs 백엔드와 동일하게 적용하고, 서버 다운/지연 시 해당 서버만 건너뛴다(graceful degrade).
+
+### Fixed
+- **chat: `AIC_NO_STREAM`이 에이전트 chat 루프에도 적용** — 기존엔 에러 분석 경로만 streaming opt-out을
+  존중했고 tool-calling chat 루프는 무시했다. 이제 두 경로 모두 `AIC_NO_STREAM`으로 끌 수 있다.
+
 ## [0.21.0] - 2026-06-16
 
 ### Added
