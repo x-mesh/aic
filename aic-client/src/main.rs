@@ -4582,6 +4582,7 @@ fn default_config() -> AppConfig {
         session: aic_common::SessionConfig::default(),
         observability: aic_common::ObservabilityConfig::default(),
         aicd: aic_common::AicdConfig::default(),
+        mcp: aic_common::McpConfig::default(),
     }
 }
 
@@ -6176,6 +6177,7 @@ async fn handle_chat(
                 )
                 .allow_run_command(run_command_enabled)
                 .with_observability(&config.observability)
+                .with_mcp(&config.mcp)
                 .with_provider_model(provider_name.clone(), model_name.clone());
                 session.run().await?;
             }
@@ -7437,6 +7439,7 @@ mod tests {
             session: SessionConfig::default(),
             observability: aic_common::ObservabilityConfig::default(),
             aicd: aic_common::AicdConfig::default(),
+            mcp: aic_common::McpConfig::default(),
         }
     }
 

@@ -81,6 +81,7 @@ impl ConfigManager {
             session: aic_common::SessionConfig::default(),
             observability: aic_common::ObservabilityConfig::default(),
             aicd: aic_common::AicdConfig::default(),
+            mcp: aic_common::McpConfig::default(),
         }
     }
 }
@@ -397,6 +398,7 @@ boundary_strategy = { method = "prompt_marker" }
             session: aic_common::SessionConfig::default(),
             observability: aic_common::ObservabilityConfig::default(),
             aicd: aic_common::AicdConfig::default(),
+            mcp: aic_common::McpConfig::default(),
         })
     }
 

@@ -28,6 +28,8 @@ pub mod whitelist;
 // SRE R0/R2: 인시던트 증거 번들 작성(대화형 /bundle + 비대화 webhook/CLI 공유).
 pub mod bundle;
 pub(crate) mod markdown;
+// MCP(Model Context Protocol) 클라이언트 — config 등록 서버(mem-mesh 등)의 tool을 chat에 노출(HTTP).
+pub(crate) mod mcp;
 // SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
 pub mod obs_tools;
 pub(crate) mod probes;

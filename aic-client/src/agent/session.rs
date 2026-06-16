@@ -230,6 +230,9 @@ pub struct AgentSession {
     /// 관측 백엔드(Prometheus/Loki/ES) 질의 클라이언트(SRE R1). config에 등록 백엔드가
     /// 있을 때만 Some. 등록된 백엔드만 질의 가능 — endpoint allowlist.
     obs: Option<ObsClient>,
+    /// MCP 클라이언트 — config `[mcp.servers.*]`에 enabled 서버가 있을 때만 Some. 발견된 tool을
+    /// chat tool-calling에 노출하고, 변경 도구는 confirm 후 실행한다. 연결은 `run()`에서 비동기로 수행.
+    mcp: Option<super::mcp::McpClient>,
 }
 
 impl AgentSession {
@@ -256,6 +259,7 @@ impl AgentSession {
             compare_baseline: None,
             out: ChatOut::Direct { spinner: None },
             obs: None,
+            mcp: None,
         }
     }
 
@@ -274,6 +278,13 @@ impl AgentSession {
                 Err(e) => adbg!("obs client 생성 실패 — 관측 도구 비활성: {}", e),
             }
         }
+        self
+    }
+
+    /// MCP 클라이언트를 설정한다. config `[mcp.servers.*]`에 enabled 서버가 있을 때만 활성화된다.
+    /// 실제 연결(핸드셰이크·tool 발견)은 `run()`에서 비동기로 수행한다.
+    pub fn with_mcp(mut self, cfg: &aic_common::McpConfig) -> Self {
+        self.mcp = super::mcp::McpClient::new(cfg);
         self
     }
 
@@ -296,6 +307,17 @@ impl AgentSession {
             preface.push_str(SRE_PREFACE);
         }
         self.history.push(ChatMessage::System(preface));
+
+        // MCP 서버 연결(핸드셰이크 + tool 발견). 서버별 독립·graceful degrade — 무응답 서버는 서버당
+        // 상한(CONNECT_OVERALL_SECS) 후 skip하고 나머지로 진행한다(요청별로도 짧은 타임아웃). 서버는
+        // 순차 연결되며 요약은 Direct note로 남긴다(TUI 진입 전 — 다수 서버면 startup이 그만큼 늘 수 있음).
+        let mcp_notes = match &mut self.mcp {
+            Some(mcp) => mcp.connect().await,
+            None => Vec::new(),
+        };
+        for note in mcp_notes {
+            self.out.note(&note).await;
+        }
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -483,6 +505,11 @@ impl AgentSession {
         // 있으면 항상 노출한다.
         if let Some(obs) = &self.obs {
             specs.extend(obs.specs());
+        }
+        // MCP 서버 tool(mem-mesh 등)은 namespaced 이름(server__tool)으로 노출한다. read-only는 자동,
+        // 변경 도구는 exec_tool에서 confirm 게이팅.
+        if let Some(mcp) = &self.mcp {
+            specs.extend(mcp.specs());
         }
 
         for iter in 0..MAX_ITERATIONS {
@@ -721,6 +748,30 @@ impl AgentSession {
                 None => Ok("[tool error] 관측 백엔드가 설정되지 않았습니다. \
                     config [observability.backends.<name>]에 추가하세요."
                     .to_string()),
+            }
+        } else if self.mcp.as_ref().is_some_and(|m| m.is_tool(&call.name)) {
+            // MCP 도구(mem-mesh 등): auto_approve의 read-only는 자동 실행, 그 외(변경 도구)는 confirm.
+            let needs_confirm = self
+                .mcp
+                .as_ref()
+                .is_some_and(|m| m.needs_confirm(&call.name));
+            let approved = if needs_confirm {
+                self.out
+                    .confirm(&format!("⚠ MCP 도구 {} 실행? [y/N]", call.name))
+                    .await
+            } else {
+                true
+            };
+            if !approved {
+                Ok(format!(
+                    "[denied] MCP 도구 {} 실행을 사용자가 거부했습니다.",
+                    call.name
+                ))
+            } else {
+                match &self.mcp {
+                    Some(mcp) => mcp.call(&call.name, &args).await,
+                    None => Ok("[tool error] MCP 클라이언트가 없습니다.".to_string()),
+                }
             }
         } else {
             tools::execute(&call.name, &args, &self.sandbox)

@@ -323,7 +323,7 @@ fn build_url(base: &str, path: &str) -> Result<reqwest::Url, ToolError> {
 }
 
 /// scheme/host 안전성 검사. http(s)만, IP 리터럴 host는 link-local/unspecified 거부.
-fn ensure_safe_url(raw: &str) -> Result<reqwest::Url, ToolError> {
+pub(crate) fn ensure_safe_url(raw: &str) -> Result<reqwest::Url, ToolError> {
     let url = reqwest::Url::parse(raw)
         .map_err(|e| ToolError::new(format!("백엔드 URL 파싱 실패: {raw} ({e})")))?;
     match url.scheme() {
@@ -360,7 +360,7 @@ fn is_safe_index(index: &str) -> bool {
 }
 
 /// 응답을 MAX_RESPONSE_BYTES까지만 스트리밍으로 읽는다(거대 응답 OOM 방지).
-async fn read_bounded(resp: reqwest::Response) -> Result<Vec<u8>, ToolError> {
+pub(crate) async fn read_bounded(resp: reqwest::Response) -> Result<Vec<u8>, ToolError> {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -379,12 +379,12 @@ async fn read_bounded(resp: reqwest::Response) -> Result<Vec<u8>, ToolError> {
 }
 
 /// LLM/출력 전 최종 처리: redaction 적용 + 출력 길이 cap.
-fn finalize(body: &str) -> String {
+pub(crate) fn finalize(body: &str) -> String {
     let (redacted, _report) = crate::redaction::redact(body);
     truncate(&redacted, MAX_OUTPUT_BYTES)
 }
 
-fn truncate(s: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
