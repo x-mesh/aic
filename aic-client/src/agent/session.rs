@@ -525,7 +525,12 @@ impl AgentSession {
             self.out.spin_start("thinking...".to_string(), "90").await;
             // TUI 모드면 streaming으로 텍스트를 라이브 전달(첫 토큰이 spinner를 멈추고 최종 Answer가
             // 미리보기를 포맷본으로 교체한다). Direct/비-TTY는 sink가 없어 버퍼링 경로를 그대로 쓴다.
-            let resp = if let Some(tx) = self.out.chunk_sender() {
+            // `AIC_NO_STREAM`이면(REPL 경로와 동일 opt-out) streaming을 끄고 버퍼링으로 처리한다.
+            let chunk_sink = self
+                .out
+                .chunk_sender()
+                .filter(|_| !super::debug::env_truthy("AIC_NO_STREAM"));
+            let resp = if let Some(tx) = chunk_sink {
                 self.dispatcher
                     .send_messages_streaming(&self.history, &specs, |delta| {
                         let _ = tx.try_send(super::chat_tui::OutMsg::AnswerChunk(delta.to_string()));
