@@ -4,6 +4,18 @@
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-16
+
+### Added
+
+- **chat:** stream LLM responses token-by-token with spinner
+- **chat:** /watch alert toggle + recovery notes (C7)
+- **chat:** metric sparkline + delta arrow (C2b)
+- **chat:** disk exhaustion ETA (C2a)
+- **chat:** name top mem process in alerts (proc-enrich)
+- **chat:** edge-triggered system alerts (C1)
+- **chat:** off-thread sysinfo sampler (C4), fix status freeze
+
 ## [0.20.0] - 2026-06-13
 
 ### Added
