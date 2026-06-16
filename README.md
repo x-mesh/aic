@@ -36,6 +36,7 @@ graph LR
 - ✅ `aic chat` agent mode — explicit chat entry point. With an OpenAI-compatible provider it runs a tool-calling agent over your project; gracefully degrades to plain chat when the provider doesn't support tools
 - ✅ SRE shell execution (default-on) — the interactive agent can run **bounded** shell commands via `run_command`. Read-only diagnostics run automatically and may inspect the **whole host** (e.g. `tail /var/log/...`, `du -ah /tmp | sort -rh | head`, `find /tmp -mmin -10`); state-changing commands need confirmation and dangerous ones are blocked. Secret paths (`~/.ssh`, `~/.aws`, `/etc/shadow`, `*.pem`, `.env`, …) are blocked even for reads. Turn it off with `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1` for a read-only session (`read_file`/`list_dir`/`grep`/`glob` only)
 - ✅ Multiple LLM providers — OpenAI-compatible, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
+- ✅ MCP tool servers — `aic chat` can call tools from configured **MCP servers** (e.g. mem-mesh memory) over Streamable HTTP; discovered tools join the agent under `<server>__<tool>` names, read-only ones (in `auto_approve`) run automatically and mutating ones require confirmation. Config: `[mcp.servers.<name>]` (see Configuration)
 - ✅ TUI compatibility — alternate-screen-buffer detection keeps vim, htop, etc. working correctly
 - ✅ Cross-platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
 
@@ -45,6 +46,7 @@ graph LR
 - ✅ Structured trace logs — JSONL daily-rotate (7-day retention), `AIC_LOG=info|debug`
 - ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
+- ✅ Proactive chat status bar — the `aic chat` status line samples host metrics in an off-thread task (so a hung mount or an idle prompt never freezes the UI) and surfaces problems live: severity-colored segments, a per-metric sparkline + trend arrow, a gated disk-exhaustion ETA (`disk 4.2G free · ~8m→crit`), and edge-triggered alerts that name the top offending process (`⚠ mem 97% — top: node 12.1G`) with hysteresis/cooldown. Toggle the alert lane with `/watch arm|off`
 
 ### Security baseline
 - ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
@@ -54,7 +56,7 @@ graph LR
 - ✅ OS keychain — store API keys in macOS Keychain / Linux Secret Service / Windows Credential Manager; bulk migrate plaintext via `aic migrate-keys`
 
 ### LLM UX
-- ✅ Streaming — automatic streaming for OpenAI-compatible providers (in TTY environments); opt-out via `AIC_NO_STREAM=1`
+- ✅ Streaming — token-by-token streaming for OpenAI-compatible **and** Anthropic providers, including the `aic chat` tool-calling agent loop (spinner until the first token → live raw preview → formatted answer on completion); TTY only, opt-out via `AIC_NO_STREAM=1`
 - ✅ Result cache — same (cmd, exit, output) for 24h TTL, instant response
 - ✅ Dry-run preview — `aic --dry-run "..."` previews tokens, cost, and timeout in advance
 - ✅ Retry circuit breaker — after 5 failures within a 60s window, fail-fast for 30s
@@ -282,6 +284,7 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/bundle [name]` | Save incident evidence as redacted markdown under `~/.aic/bundles/` (dir 0700 / file 0600 on Unix) |
 | `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail docker generic` (the `disk` topic also checks docker disk usage and big `/tmp` files) |
 | `/watch [target] [--count N] [--every Ns]` | Re-run probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is any Probe Catalog id — LOCAL sections, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — e.g. `/watch tmp_recent` tracks files growing under `/tmp`; omit it for a compact set |
+| `/watch arm` \| `/watch off` | Toggle the proactive alert lane (default on). When armed, a worsening resource transition (Normal→Warn/Crit) drops a one-line ambient note into the chat (Crit also rings a bell) and recovery prints a `✓` line. `off`/`mute` silences it. Distinct from the bounded-probe `/watch <target>` above |
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
 local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +
@@ -336,7 +339,7 @@ aic run -- cargo build              # preserves stdout/stderr and exit code
 |---|---|
 | `AIC_LOG=info|debug|trace` | aic-session/aicd tracing level (default info) |
 | `AIC_REDACT=off` | disable secret/PII redaction (recorded in audit) |
-| `AIC_NO_STREAM=1` | disable streaming (spinner + sectional output) |
+| `AIC_NO_STREAM=1` | disable token streaming (error analysis **and** the `aic chat` agent loop); show the full answer at once |
 | `AIC_DEBUG=1` | client emits `[debug +X.XXXs]` prefix |
 | `AIC_AUDIT_KEYCHAIN=1` | store the audit HMAC key in the OS keychain (opt-in). **Default is a file key** |
 | `AIC_NO_KEYCHAIN=1` | force keychain off (highest priority) — overrides the opt-in; always uses the file key |
@@ -469,6 +472,29 @@ url = "http://elasticsearch:9200"
 
 # 또는 자연어로 물으면 에이전트가 prometheus_query/loki_query/es_search 도구를 호출한다.
 ```
+
+### MCP servers (mem-mesh 등 외부 도구)
+
+`aic chat`이 [Model Context Protocol](https://modelcontextprotocol.io) 서버(예: mem-mesh 메모리)의
+tool을 직접 호출하게 한다. 현재 transport는 **Streamable HTTP**다. 등록하면 서버의 tool이
+`<server>__<tool>` 이름으로 에이전트 tool 목록에 합류한다.
+
+```toml
+# ── MCP servers ──
+# 각 서버의 tool이 chat tool-calling에 노출된다. 세션 시작 시 핸드셰이크(initialize/tools/list)로
+# tool을 발견하며, 서버가 다운/지연이면 해당 서버만 건너뛰고 진행한다(graceful degrade).
+[mcp.servers.mem-mesh]
+url = "http://127.0.0.1:8787/mcp"     # Streamable HTTP endpoint. obs와 동일한 SSRF 방어 적용
+# enabled = true                       # 기본 true. false면 연결·노출 안 함
+# auth = "keychain:mem-mesh"           # 선택: Authorization: Bearer(평문 또는 keychain:<account>)
+auto_approve = ["search", "context", "get_links", "stats"]   # read-only tool은 확인 없이 자동 실행
+```
+
+- **`auto_approve`** 에 적은 (read-only) tool은 자동 실행되고, 그 외(예: `add`/`delete`/`update`)
+  변경 tool은 실행 전 **y/N 확인**을 받는다(`run_command`와 동일 게이트).
+- tool 결과는 LLM에 넘기기 전 redaction + 길이 cap이 적용되고, 응답 크기도 bound된다.
+- 등록하면 에이전트가 대화 중 알아서 `mem-mesh__search`로 과거 맥락을 찾거나
+  `mem-mesh__add`로 결정을 저장할 수 있다(변경은 확인 후).
 
 ### aicd webhook alert ingestion (SRE R2)
 
