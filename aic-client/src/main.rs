@@ -402,6 +402,11 @@ enum Commands {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// RCA workspace 관리 — incident id 아래 evidence/timeline/report를 영속 저장한다.
+    Rca {
+        #[command(subcommand)]
+        op: RcaOp,
+    },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
     /// 우선 source는 PTY 세션의 ring buffer. hook-only metadata record는
@@ -535,6 +540,60 @@ enum RecipesOp {
     Delete {
         /// fingerprint 또는 prefix.
         prefix: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RcaOp {
+    /// 새 RCA incident workspace를 만든다.
+    Start {
+        /// RCA 제목.
+        title: String,
+        /// 증상 설명. 생략하면 title을 증상으로도 사용한다.
+        #[arg(long)]
+        symptom: Option<String>,
+        /// 생성 직후 Safe probe 기반 headless diagnose를 실행해 evidence로 붙인다.
+        #[arg(long)]
+        diagnose: bool,
+        /// `--diagnose` 시 LLM 분석 없이 raw evidence만 저장한다.
+        #[arg(long)]
+        no_analyze: bool,
+        /// `--diagnose` 시 LLM follow-up probe 1라운드를 허용한다.
+        #[arg(long)]
+        follow_up: bool,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+        /// 사용할 provider 이름(config default 대신).
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// RCA incident 상태를 표시한다. id 생략 시 최근 incident.
+    Status {
+        /// incident id 또는 prefix.
+        id: Option<String>,
+        /// JSON 출력. id 생략 시 전체 목록을 출력한다.
+        #[arg(long)]
+        json: bool,
+    },
+    /// RCA evidence event를 시간순으로 출력한다.
+    Timeline {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// RCA report markdown을 생성한다.
+    Report {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// report.md 파일에도 저장한다.
+        #[arg(long)]
+        write: bool,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -905,6 +964,12 @@ async fn main() {
             )
             .await
             {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Rca { op }) => {
+            if let Err(e) = handle_rca(op, cli.provider).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -6241,6 +6306,131 @@ async fn handle_diagnose_cli(
         match aic_client::agent::bundle::write_bundle(name.as_deref(), &md) {
             Ok(path) => eprintln!("{COL_GREEN}✔{COL_RESET} 번들 저장: {}", path.display()),
             Err(e) => eprintln!("{COL_YELLOW}⚠{COL_RESET} 번들 저장 실패: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// `aic rca ...` — persistent RCA workspace commands.
+async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Result<()> {
+    match op {
+        RcaOp::Start {
+            title,
+            symptom,
+            diagnose,
+            no_analyze,
+            follow_up,
+            json,
+            provider,
+        } => {
+            let symptom_text = symptom.unwrap_or_else(|| title.clone());
+            let cwd = std::env::current_dir().ok();
+            let mut meta =
+                aic_client::rca::create_incident(&title, Some(&symptom_text), cwd.as_deref())?;
+
+            if diagnose {
+                let config = ConfigManager::load()?;
+                let (config, provider_name) =
+                    apply_provider_override(config, provider.or(global_provider).as_deref())?;
+                let sandbox = aic_client::agent::Sandbox::from_cwd()?;
+                let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+                let dispatcher_ref = if no_analyze { None } else { Some(&dispatcher) };
+                let corr = format!("rca-{}", meta.id);
+                let result = aic_client::agent::diagnose::run_headless_diagnose_opts(
+                    Some(&symptom_text),
+                    &sandbox,
+                    dispatcher_ref,
+                    &corr,
+                    aic_client::agent::diagnose::DiagnoseOptions { follow_up },
+                )
+                .await;
+                let md = result.to_markdown();
+                aic_client::rca::append_evidence(
+                    &mut meta,
+                    aic_client::rca::EvidenceKind::Diagnosis,
+                    "initial diagnosis",
+                    &format!("aic rca start --diagnose ({provider_name})"),
+                    &md,
+                    &["diagnosis"],
+                )?;
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&meta)?);
+            } else {
+                println!("RCA 생성: {}", meta.id);
+                println!("경로: {}", aic_client::rca::incident_dir(&meta.id).display());
+                if diagnose {
+                    println!("초동 진단 evidence 저장: E{}", meta.evidence_count);
+                }
+            }
+        }
+        RcaOp::Status { id, json } => {
+            if id.is_none() {
+                let list = aic_client::rca::list_incidents()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&list)?);
+                } else if list.is_empty() {
+                    println!("RCA incident가 없습니다. `aic rca start <title>`로 시작하세요.");
+                } else {
+                    println!("최근 RCA incidents:");
+                    for item in list.iter().take(20) {
+                        println!(
+                            "- {} · {:?} · {} · evidence={} · updated={}",
+                            item.id,
+                            item.status,
+                            item.title,
+                            item.evidence_count,
+                            item.updated_at.to_rfc3339()
+                        );
+                    }
+                }
+            } else {
+                let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+                let meta = aic_client::rca::load_meta(&resolved)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&meta)?);
+                } else {
+                    println!("{}", aic_client::rca::render_status(&meta));
+                }
+            }
+        }
+        RcaOp::Timeline { id, json } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let meta = aic_client::rca::load_meta(&resolved)?;
+            let events = aic_client::rca::load_events(&resolved)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                println!("{}", aic_client::rca::render_timeline(&meta, &events));
+            }
+        }
+        RcaOp::Report { id, write, json } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let meta = aic_client::rca::load_meta(&resolved)?;
+            let events = aic_client::rca::load_events(&resolved)?;
+            let report = aic_client::rca::render_report(&meta, &events);
+            let written = if write {
+                Some(aic_client::rca::write_report(&meta, &report)?)
+            } else {
+                None
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "incident": meta,
+                        "events": events,
+                        "report": report,
+                        "written": written,
+                    }))?
+                );
+            } else {
+                println!("{report}");
+                if let Some(path) = written {
+                    eprintln!("{COL_GREEN}✔{COL_RESET} report 저장: {}", path.display());
+                }
+            }
         }
     }
     Ok(())

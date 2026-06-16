@@ -206,6 +206,8 @@ pub(crate) enum SlashCommand {
     Compare,
     /// `/bundle [name]` — 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장. name은 파일 라벨.
     Bundle(Option<String>),
+    /// `/rca ...` — persistent RCA workspace를 chat 안에서 조작한다.
+    Rca(RcaCommand),
     /// `/triage [--run] [topic]` — 토픽별 read-only 체크리스트 + 후보 probe. `run`이면 probe 실행(LLM 없음).
     /// topic은 라벨 선택에만 쓰고 셸 명령에 섞지 않는다.
     Triage {
@@ -244,6 +246,25 @@ pub(crate) enum SlashCommand {
     },
     /// 알 수 없는 slash — LLM에 보내지 않고 안내만.
     Unknown(String),
+}
+
+/// `/rca` 하위 명령.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RcaCommand {
+    /// `/rca start <title>` — 새 incident를 만들고 active RCA로 설정.
+    Start { title: String },
+    /// `/rca use <id-prefix>` — 기존 incident를 active RCA로 설정.
+    Use { id: String },
+    /// `/rca status [id-prefix]` — active 또는 지정 incident 상태.
+    Status { id: Option<String> },
+    /// `/rca add last [N]` — 최근 tool 기록 N개(기본 1)를 evidence로 저장.
+    AddLast { count: usize },
+    /// `/rca add note <text>` — 사람이 확인한 사실/가설을 evidence note로 저장.
+    AddNote { text: String },
+    /// `/rca timeline [id-prefix]` — persistent evidence timeline 출력.
+    Timeline { id: Option<String> },
+    /// `/rca report [--write] [id-prefix]` — report markdown 생성/저장.
+    Report { id: Option<String>, write: bool },
 }
 
 /// `/`명령 토큰 prefix resolve 결과.
@@ -300,6 +321,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "trend",
     "compare",
     "bundle",
+    "rca",
     "triage",
     "watch",
     "metrics",
@@ -310,7 +332,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
 pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
         "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
-        "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "explain-last" => "Evidence",
+        "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => "Evidence",
         "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" => "System",
         _ => "Meta", // help 등
     }
@@ -346,6 +368,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
+        "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
         "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
         "watch" => "local probe를 짧게 반복 실행 (--count N --every Ns; 변화 요약, LLM 미호출)",
         "metrics" => "등록 Prometheus에 PromQL 질의 (-b backend; redacted raw, LLM 미호출)",
@@ -455,6 +478,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
                 Some(name.to_string())
             })
         }
+        "rca" => parse_rca_args(rest),
         "triage" => {
             // [--run] [topic]. topic은 라벨 선택 전용(따옴표 strip), 셸 명령에 미포함.
             let mut run = false;
@@ -488,6 +512,88 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         }
         other => SlashCommand::Unknown(other.to_string()),
     })
+}
+
+/// `/rca` 인자 파서. 하위 명령 뒤 본문은 셸 명령에 섞지 않는 라벨/텍스트 전용이다.
+fn parse_rca_args(rest: &str) -> SlashCommand {
+    let s = rest.trim_start();
+    if s.is_empty() {
+        return SlashCommand::Rca(RcaCommand::Status { id: None });
+    }
+    let mut split = s.splitn(2, char::is_whitespace);
+    let sub = split.next().unwrap_or("");
+    let tail = split.next().unwrap_or("").trim_start();
+    let cmd = match sub {
+        "start" => {
+            let title = strip_surrounding_quotes(tail.trim()).trim().to_string();
+            if title.is_empty() {
+                RcaCommand::Status { id: None }
+            } else {
+                RcaCommand::Start { title }
+            }
+        }
+        "use" | "attach" => {
+            let id = tail.split_whitespace().next().unwrap_or("").to_string();
+            if id.is_empty() {
+                RcaCommand::Status { id: None }
+            } else {
+                RcaCommand::Use { id }
+            }
+        }
+        "status" => {
+            let id = tail.split_whitespace().next().map(|v| v.to_string());
+            RcaCommand::Status { id }
+        }
+        "add" => parse_rca_add_args(tail),
+        "timeline" => {
+            let id = tail.split_whitespace().next().map(|v| v.to_string());
+            RcaCommand::Timeline { id }
+        }
+        "report" => {
+            let mut write = false;
+            let mut id = None;
+            for tok in tail.split_whitespace() {
+                if tok == "--write" || tok == "-w" {
+                    write = true;
+                } else if id.is_none() {
+                    id = Some(tok.to_string());
+                }
+            }
+            RcaCommand::Report { id, write }
+        }
+        other => {
+            let id = if other.is_empty() {
+                None
+            } else {
+                Some(other.to_string())
+            };
+            RcaCommand::Status { id }
+        }
+    };
+    SlashCommand::Rca(cmd)
+}
+
+fn parse_rca_add_args(rest: &str) -> RcaCommand {
+    let s = rest.trim_start();
+    let mut split = s.splitn(2, char::is_whitespace);
+    let kind = split.next().unwrap_or("");
+    let tail = split.next().unwrap_or("").trim_start();
+    match kind {
+        "last" => {
+            let count = tail
+                .split_whitespace()
+                .next()
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 20);
+            RcaCommand::AddLast { count }
+        }
+        "note" => {
+            let text = strip_surrounding_quotes(tail.trim()).trim().to_string();
+            RcaCommand::AddNote { text }
+        }
+        _ => RcaCommand::Status { id: None },
+    }
 }
 
 /// `/metrics`·`/logs` 인자 파서: 선행 `-b NAME`/`--backend NAME`만 소비하고 나머지
@@ -780,6 +886,8 @@ pub(crate) fn help_text() -> String {
         "  /timeline [N]        세션 tool 기록 시간순(최근 N개)",
         "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(변경 섹션/±라인 요약; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
+        "  /rca start|use|add|timeline|report  persistent RCA workspace에 chat 증거 저장",
+        "                       예: /rca start api-latency · /rca add last 3 · /rca add note ...",
         "  /triage [--run] [topic]  토픽 체크리스트+후보 probe (--run=실행; topic: mac-slow web disk",
         "                       memory cpu network build-fail generic)",
         "  /watch [target] [--count N] [--every Ns]  local probe 짧게 반복(변화 요약; 기본 3회/1s,",
@@ -1540,6 +1648,45 @@ mod tests {
             parse_slash("/bundle db-outage"),
             Some(SlashCommand::Bundle(Some("db-outage".to_string())))
         );
+    }
+
+    #[test]
+    fn parse_slash_rca_commands() {
+        assert_eq!(
+            parse_slash("/rca"),
+            Some(SlashCommand::Rca(RcaCommand::Status { id: None }))
+        );
+        assert_eq!(
+            parse_slash("/rca start api latency"),
+            Some(SlashCommand::Rca(RcaCommand::Start {
+                title: "api latency".to_string()
+            }))
+        );
+        assert_eq!(
+            parse_slash("/rca use 20260616"),
+            Some(SlashCommand::Rca(RcaCommand::Use {
+                id: "20260616".to_string()
+            }))
+        );
+        assert_eq!(
+            parse_slash("/rca add last 3"),
+            Some(SlashCommand::Rca(RcaCommand::AddLast { count: 3 }))
+        );
+        assert_eq!(
+            parse_slash("/rca add note deploy 이후 p99 상승"),
+            Some(SlashCommand::Rca(RcaCommand::AddNote {
+                text: "deploy 이후 p99 상승".to_string()
+            }))
+        );
+        assert_eq!(
+            parse_slash("/rca report --write 20260616"),
+            Some(SlashCommand::Rca(RcaCommand::Report {
+                id: Some("20260616".to_string()),
+                write: true
+            }))
+        );
+        assert!(SLASH_COMMANDS.contains(&"rca"));
+        assert!(help_text().contains("/rca"));
     }
 
     #[test]
