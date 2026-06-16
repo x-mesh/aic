@@ -384,10 +384,21 @@ impl SysMetrics {
     }
 }
 
+/// alert의 종류 — 악화 시작인지 정상 회복인지. 회복은 bell 없이 확인용 한 줄만 띄운다(C7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlertKind {
+    /// 악화 전이(Normal→Warn/Crit, Warn→Crit).
+    Onset,
+    /// Warn/Crit에서 Normal로 복귀(이전에 알린 자원에 한함).
+    Recovered,
+}
+
 /// 한 건의 proactive alert — chat 로그에 ambient Note로 표시한다(LLM 컨텍스트엔 안 들어감).
 pub(crate) struct Alert {
-    /// 새로 진입한 단계(Warn 또는 Crit). bell·렌더 판단용.
+    /// 진입(또는 회복 시 Normal)한 단계. bell·렌더 판단용.
     pub severity: Severity,
+    /// 악화(Onset)인지 회복(Recovered)인지.
+    pub kind: AlertKind,
     /// 표시할 한 줄(예: `⚠ mem 97% (15.5G/16G) 위험(crit) — /diagnose 권장`).
     pub message: String,
 }
@@ -447,11 +458,23 @@ impl AlertTracker {
                     };
                     out.push(Alert {
                         severity: sev,
+                        kind: AlertKind::Onset,
                         message: format!("⚠ {value} {level}{hint}"),
                     });
                     self.last_fired[i] = Some(now);
                     self.last_fired_sev[i] = sev;
                 }
+            } else if sev == Severity::Normal
+                && self.prev[i] != Severity::Normal
+                && self.last_fired_sev[i] != Severity::Normal
+            {
+                // 회복(C7): 우리가 알린 자원이 Normal로 내려온 첫 tick에만 확인 한 줄(bell 없음).
+                // last_fired_sev는 그대로 둬(cooldown decay에 맡김) 즉시 재발 시 flapping을 막는다.
+                out.push(Alert {
+                    severity: Severity::Normal,
+                    kind: AlertKind::Recovered,
+                    message: format!("✓ {value} 정상 회복"),
+                });
             }
             self.prev[i] = sev;
         }
@@ -1140,6 +1163,29 @@ mod tests {
     }
 
     #[test]
+    fn alert_tracker_emits_recovery_after_alerted() {
+        let g = 1024 * 1024 * 1024;
+        let t0 = Instant::now();
+        let mut tr = AlertTracker::new();
+        let cpu_crit = metric(1.0, 96.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        // Normal→Crit onset 발화.
+        let a = tr.observe(&cpu_crit, t0);
+        assert!(a.iter().any(|x| x.kind == AlertKind::Onset && x.severity == Severity::Crit));
+        // Crit→Normal 회복: 확인 한 줄(Normal severity → bell 없음).
+        let a = tr.observe(&ok, t0 + Duration::from_secs(1));
+        let rec: Vec<_> = a.iter().filter(|x| x.kind == AlertKind::Recovered).collect();
+        assert_eq!(rec.len(), 1, "one recovery line on return to Normal");
+        assert!(rec[0].message.contains("정상 회복"), "{}", rec[0].message);
+        assert_eq!(rec[0].severity, Severity::Normal);
+        // 계속 Normal → 회복 알림은 전이 edge에서만이라 더 안 뜬다.
+        assert!(tr
+            .observe(&ok, t0 + Duration::from_secs(2))
+            .iter()
+            .all(|x| x.kind != AlertKind::Recovered));
+    }
+
+    #[test]
     fn alert_message_includes_mem_culprit_when_present() {
         let g = 1024 * 1024 * 1024;
         let t0 = Instant::now();
@@ -1160,20 +1206,22 @@ mod tests {
         let mut tr = AlertTracker::new();
         let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
         let cpu_warn = metric(1.0, 88.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
-        // 첫 Normal→Warn 발화.
-        assert_eq!(tr.observe(&cpu_warn, t0).len(), 1);
-        // Normal로 내려갔다(전이 하강, 발화 없음) 다시 Warn으로 — cooldown(5분) 안이면 억제.
-        assert!(tr.observe(&ok, t0).is_empty());
+        let onsets = |v: Vec<Alert>| v.into_iter().filter(|a| a.kind == AlertKind::Onset).count();
+        // 첫 Normal→Warn onset 발화.
+        assert_eq!(onsets(tr.observe(&cpu_warn, t0)), 1);
+        // Normal로 내려갔다(하강 — onset 없음; 회복 라인은 있을 수 있음) 다시 Warn으로 — cooldown 안이면 억제.
+        assert_eq!(onsets(tr.observe(&ok, t0)), 0);
         let within = t0 + Duration::from_secs(60);
-        assert!(
-            tr.observe(&cpu_warn, within).is_empty(),
+        assert_eq!(
+            onsets(tr.observe(&cpu_warn, within)),
+            0,
             "warn re-entry within cooldown must be suppressed (rate budget)"
         );
         // cooldown 경과 후 다시 Warn이면 발화.
         let after = t0 + WARN_COOLDOWN + Duration::from_secs(1);
-        assert!(tr.observe(&ok, after).is_empty()); // Normal 경유(전이 하강)
+        assert_eq!(onsets(tr.observe(&ok, after)), 0); // Normal 경유(하강)
         assert_eq!(
-            tr.observe(&cpu_warn, after + Duration::from_secs(1)).len(),
+            onsets(tr.observe(&cpu_warn, after + Duration::from_secs(1))),
             1,
             "warn should fire again once cooldown elapsed"
         );
