@@ -1015,6 +1015,18 @@ fn sev_style(sev: Severity) -> Style {
     }
 }
 
+/// alert ambient 줄을 `[HH:MM:SS] <message>`로 렌더한다 — 시각([..])은 dim, 회복(Recovered) 본문은 녹색으로
+/// onset(⚠)과 시각 구분(C7). 시각은 "언제 자원이 치솟았나"를 로그·종료 dump에 남긴다. `hms`는 주입(호출부가
+/// `chrono::Local::now()`로 채움 — 테스트 결정성). 순수 함수.
+fn format_alert_line(kind: AlertKind, message: &str, hms: &str) -> String {
+    let ts = super::ui::paint(&format!("[{hms}]"), "2");
+    let body = match kind {
+        AlertKind::Recovered => super::ui::paint(message, "32"),
+        AlertKind::Onset => message.to_string(),
+    };
+    format!("{ts} {body}")
+}
+
 /// 시스템 지표 세그먼트를 단계별 색(정상 dim/warn 주황/crit 빨강)으로 칠한 status bar 한 줄을 만든다.
 /// 구분선(` · `)·선두 `· `·ctx 접미는 dim. `recording`이면 선두에 빨강 `● REC`를 붙여 자동 기록 활성을
 /// 한눈에 보인다. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
@@ -1785,11 +1797,9 @@ async fn chat_loop(
                                     .iter()
                                     .any(|a| a.kind == AlertKind::Onset && a.severity == Severity::Crit);
                                 for a in &alerts {
-                                    // 회복(✓)은 녹색으로 칠해 onset(⚠)과 시각 구분(C7).
-                                    let line = match a.kind {
-                                        AlertKind::Recovered => super::ui::paint(&a.message, "32"),
-                                        AlertKind::Onset => a.message.clone(),
-                                    };
+                                    // 발생 시각([HH:MM:SS])을 앞에 붙여 "언제 치솟았나"를 남긴다(로그·종료 dump).
+                                    let hms = chrono::Local::now().format("%H:%M:%S").to_string();
+                                    let line = format_alert_line(a.kind, &a.message, &hms);
                                     append_to_log(&mut log, &mut log_text, &mut scroll, follow, &line);
                                 }
                                 if has_crit {
@@ -2411,6 +2421,24 @@ mod tests {
         // 1000 미만은 정확한 수(~512), 1000 이상은 ~Nk.
         assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~999");
         assert_eq!(super::status_with_ctx("s", 1000), "s · ctx ~1k");
+    }
+
+    #[test]
+    fn alert_line_prefixes_timestamp() {
+        use super::AlertKind;
+        // onset: [시각] + 본문, 시각이 본문보다 앞(색은 color_enabled에 의존하므로 내용·순서만 검증).
+        let onset =
+            super::format_alert_line(AlertKind::Onset, "⚠ load 13.98 경고(warn)", "14:05:09");
+        assert!(onset.contains("[14:05:09]"), "시각 누락: {onset}");
+        assert!(onset.contains("⚠ load 13.98 경고(warn)"), "본문 누락: {onset}");
+        assert!(
+            onset.find("14:05:09").unwrap() < onset.find("load").unwrap(),
+            "시각이 본문보다 앞이어야: {onset}"
+        );
+        // recovered도 동일하게 시각 prefix.
+        let rec =
+            super::format_alert_line(AlertKind::Recovered, "✓ load 11.33 정상 회복", "14:06:00");
+        assert!(rec.contains("[14:06:00]") && rec.contains("✓ load 11.33 정상 회복"));
     }
 
     #[test]
