@@ -48,7 +48,15 @@ impl Finding {
         }
     }
 
+    /// 후속 확인 제안(`<catalog/template id> <arg>`)을 단다. arg는 증거에 whole-token으로 실존하고
+    /// 게이트(resolve_followup_line)를 그대로 통과하는 값이어야 한다(예: `journal_unit nginx.service`).
+    fn with_followup(mut self, fu: Option<String>) -> Self {
+        self.suggested_followup = fu;
+        self
+    }
+
     /// evidence 상단 prepend·요약용 한 줄 렌더(`<glyph> <message>`). glyph는 컬러 비의존(unicode).
+    /// suggested_followup은 한 줄 불변이라 여기서 렌더하지 않는다(render_findings_block_with가 별도 hint 줄로).
     pub(crate) fn render_line(&self) -> String {
         format!("{} {}", self.severity.glyph(), self.message)
     }
@@ -780,17 +788,23 @@ fn scan_zombies(body: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// 한 줄에서 systemd unit 이름 토큰(접미사 매칭) 하나를 찾는다. 선행 불릿 마커(●/*)·메타 토큰은 자연 무시.
+/// scan_failed_units(전체)·failed_unit_set(집합)·first_failed_unit(첫 1개)이 공유(세 번째 복제 방지).
+fn line_unit_token(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find(|t| UNIT_SUFFIXES.iter().any(|s| t.ends_with(s)))
+}
+
+/// failed_units 본문에서 **첫** unit 이름(소유). suggested_followup(journal_unit) arg용 — 집계 메시지는
+/// 여러 unit을 나열하지만 템플릿은 인자 1개라 첫 unit을 후속 확인 대상으로 삼는다.
+fn first_failed_unit(body: &str) -> Option<String> {
+    body.lines().find_map(line_unit_token).map(str::to_string)
+}
+
 /// failed_units 섹션(stdout)에서 unit 접미사 토큰을 가진 행(=실패 유닛)만 카운트한다. systemd 버전별
 /// 선행 마커(`●`/`*`)는 건너뛴다. macOS placeholder(echo)는 빈 출력이라 0(오탐 방지).
 fn scan_failed_units(body: &str) -> Vec<String> {
-    let names: Vec<&str> = body
-        .lines()
-        // 선행 불릿 마커(●/*) skip 후, 행의 임의 토큰이 unit 접미사면 그 토큰을 unit 이름으로 채택.
-        .filter_map(|l| {
-            l.split_whitespace()
-                .find(|t| UNIT_SUFFIXES.iter().any(|s| t.ends_with(s)))
-        })
-        .collect();
+    let names: Vec<&str> = body.lines().filter_map(line_unit_token).collect();
     if names.is_empty() {
         return Vec::new();
     }
@@ -906,10 +920,21 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
             "swap_usage" => (Severity::Warn, scan_swap(stdout)),
             _ => continue,
         };
+        // failed_units만 후속 확인(journal_unit) hint를 단다. **실제 게이트(resolve_followup_line)를
+        // 통과하는 값만** 노출해 렌더/--json의 suggested_followup이 항상 실행 가능하도록 한다 — 예:
+        // getty@tty1.service 같은 systemd template/instance unit은 arg_valid가 `@`를 거부하므로 hint 미부착
+        // (발견 자체는 표시). 나머지 스캐너는 깔끔한 단일-인자 템플릿이 없어 None(후속).
+        let followup = if name == "failed_units" {
+            first_failed_unit(stdout)
+                .map(|u| format!("journal_unit {u}"))
+                .filter(|line| resolve_followup_line(line, evidence).is_ok())
+        } else {
+            None
+        };
         findings.extend(
             messages
                 .into_iter()
-                .map(|m| Finding::new(severity, name, m)),
+                .map(|m| Finding::new(severity, name, m).with_followup(followup.clone())),
         );
     }
     findings
@@ -931,6 +956,10 @@ pub(crate) fn render_findings_block_with(findings: &[Finding], header: &str) -> 
     let mut s = format!("{header}\n");
     for f in findings {
         s.push_str(&format!("- {}\n", f.render_line()));
+        // 후속 확인 제안이 있으면 read-only hint 줄로 덧붙인다(자동 실행 아님 — 게이트 통과 가능한 제안).
+        if let Some(fu) = &f.suggested_followup {
+            s.push_str(&format!("  → 확인(read-only): {fu}\n"));
+        }
     }
     s
 }
@@ -959,11 +988,8 @@ fn section_body(snapshot: &str, id: &str) -> String {
 fn failed_unit_set(snapshot: &str) -> std::collections::BTreeSet<String> {
     section_body(snapshot, "failed_units")
         .lines()
-        .filter_map(|l| {
-            l.split_whitespace()
-                .find(|t| UNIT_SUFFIXES.iter().any(|s| t.ends_with(s)))
-                .map(|t| t.to_string())
-        })
+        .filter_map(line_unit_token)
+        .map(str::to_string)
         .collect()
 }
 
@@ -1588,6 +1614,51 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         let mf = scan_baseline_findings(mo, mn);
         assert!(mf.iter().any(|x| x.message.contains("127.0.0.1:3000")), "{mf:?}");
         assert_eq!(mf.len(), 1, "신규 1개만(pid 1169/device 0xabc 등 volatile은 키 아님): {mf:?}");
+    }
+
+    #[test]
+    fn failed_units_finding_carries_gate_acceptable_followup() {
+        use crate::risk_guard::{classify, RiskLevel};
+        // failed_units 발견에 'journal_unit <첫 unit>' hint가 달리고, 그게 기존 4층 게이트를 그대로 통과한다.
+        let ev = "## failed_units\ncommand: x\n--- stdout ---\n\
+● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\n--- stderr ---\n\n";
+        let f = scan_findings(ev);
+        let fu = f
+            .iter()
+            .find(|x| x.probe_id == "failed_units")
+            .unwrap()
+            .suggested_followup
+            .clone()
+            .unwrap();
+        assert_eq!(fu, "journal_unit nginx.service"); // 집계 메시지는 전부 나열하되 hint는 첫 unit.
+        // resolve_followup_line이 Ok를 반환한다는 것 자체가 4층 게이트(template id·whole-token·charset·
+        // risk_guard Safe)를 모두 통과했다는 증거 — 결정적이라 LLM 무관. 렌더 명령은 OS별(journalctl/dmesg)
+        // 이지만 둘 다 unit 인자를 담고 Safe다.
+        let (_, cmd) = resolve_followup_line(&fu, ev).unwrap();
+        assert!(cmd.contains("nginx.service"), "{cmd}");
+        assert_eq!(classify(&cmd).level, RiskLevel::Safe);
+        // 선택성: 다른 스캐너 발견은 followup None(dmesg_oom 등).
+        let oom = scan_findings(
+            "## dmesg_oom\n--- stdout ---\n[1] Out of memory: Killed process 9 (x)\n--- stderr ---\n",
+        );
+        assert!(oom[0].suggested_followup.is_none());
+        // 게이트 정합(Codex 리뷰): arg_valid가 `@`를 거부하므로 systemd template unit(getty@tty1.service)엔
+        // hint 미부착 — 실행 불가능한 제안 노출 방지(발견 자체는 표시). 게이트 통과분만 set.
+        let tev = "## failed_units\ncommand: x\n--- stdout ---\n● getty@tty1.service loaded failed failed Getty\n--- stderr ---\n\n";
+        let tf = scan_findings(tev);
+        let ff = tf.iter().find(|x| x.probe_id == "failed_units").unwrap();
+        assert!(ff.message.contains("getty@tty1.service"), "발견은 표시: {tf:?}");
+        assert!(ff.suggested_followup.is_none(), "@ unit엔 hint 미부착: {tf:?}");
+        // 렌더: hint가 별도 '→ 확인' 줄로 붙는다(render_line 한 줄 불변은 유지).
+        let block = render_findings_block(&f);
+        assert!(
+            block.contains("→ 확인(read-only): journal_unit nginx.service"),
+            "{block}"
+        );
+        // --json 직렬화 계약: failed_units finding은 suggested_followup 값을 담는다.
+        let j = serde_json::to_string(f.iter().find(|x| x.probe_id == "failed_units").unwrap())
+            .unwrap();
+        assert!(j.contains("journal_unit nginx.service"), "{j}");
     }
 
     #[test]
