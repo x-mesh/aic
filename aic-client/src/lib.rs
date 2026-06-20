@@ -19,6 +19,7 @@ pub mod redaction;
 pub mod repl;
 pub mod risk_guard;
 pub mod snapshot_store;
+pub mod snapshot_timer;
 pub mod spinner;
 pub mod streaming;
 pub mod top;
