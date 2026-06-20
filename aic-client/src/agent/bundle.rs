@@ -41,10 +41,15 @@ mod tests {
 
     #[test]
     fn write_bundle_creates_redacted_markdown_file() {
+        // HOME 변경은 프로세스 전역이라, HOME을 만지는 다른 모듈 테스트(rca/snapshot/auto_rca)와 같은
+        // 프로세스 전역 락으로 직렬화해야 병렬 실행 시 서로의 HOME을 덮지 않는다.
+        let _lock = crate::snapshot_store::home_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // HOME을 임시 디렉터리로 돌려 실제 파일 생성 경로를 검증한다.
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
-        // SAFETY: 단일 스레드 테스트 — 직후 복원.
+        // SAFETY: home_test_lock으로 직렬화됨 — 직후 복원.
         unsafe {
             std::env::set_var("HOME", tmp.path());
         }

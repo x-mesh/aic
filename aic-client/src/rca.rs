@@ -419,7 +419,7 @@ fn secure_file(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     struct HomeGuard {
@@ -429,8 +429,10 @@ mod tests {
 
     impl HomeGuard {
         fn set(path: &Path) -> Self {
-            static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+            // 크레이트 전역 HOME 테스트 락 공유(auto_rca 등 incidents_dir에 쓰는 다른 모듈과의 레이스 방지).
+            let lock = crate::snapshot_store::home_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("HOME");
             unsafe {
                 std::env::set_var("HOME", path);

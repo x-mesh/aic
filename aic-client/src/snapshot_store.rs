@@ -73,16 +73,22 @@ impl SnapshotRecord {
     }
 }
 
-/// 영구 스냅샷 기록 opt-in. 기본 off. `AIC_SNAPSHOT_RECORD`를 trim·소문자화 후 falsy 집합(""/0/false/no/off)이
-/// 아니면 on — 사용자가 `False`/`off`/공백을 끄려고 입력했는데 켜지는 footgun 방지.
-pub fn record_enabled() -> bool {
-    match std::env::var("AIC_SNAPSHOT_RECORD") {
+/// opt-in env 공통 파서. 기본 off. 값을 trim·소문자화 후 falsy 집합(""/0/false/no/off)이 아니면 on —
+/// 사용자가 `False`/`off`/공백을 끄려고 입력했는데 켜지는 footgun 방지. AIC_SNAPSHOT_RECORD(L0-L2)·
+/// AIC_AUTO_RCA(L3 auto_rca)가 공유한다.
+pub fn env_enabled(var: &str) -> bool {
+    match std::env::var(var) {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
         ),
         Err(_) => false,
     }
+}
+
+/// 영구 스냅샷 기록 opt-in(`AIC_SNAPSHOT_RECORD`). 기본 off.
+pub fn record_enabled() -> bool {
+    env_enabled("AIC_SNAPSHOT_RECORD")
 }
 
 /// `~/.aic/snapshots` 디렉터리(rca `incidents_dir`와 동형).
@@ -473,6 +479,32 @@ mod tests {
         }
         unsafe {
             std::env::remove_var("AIC_SNAPSHOT_RECORD");
+        }
+    }
+
+    #[test]
+    fn env_enabled_parser_contract() {
+        // 공유 파서 계약을 임의 var명으로 직접 고정(AIC_SNAPSHOT_RECORD·AIC_AUTO_RCA 양쪽이 의존).
+        let _h = HomeGuard::set(); // env 경합 직렬화
+        let var = "AIC_TEST_ENV_ENABLED_CONTRACT";
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert!(!env_enabled(var), "미설정은 off");
+        for off in ["", "0", "false", "False", "OFF", "no", "  off  "] {
+            unsafe {
+                std::env::set_var(var, off);
+            }
+            assert!(!env_enabled(var), "off로 인식돼야: {off:?}");
+        }
+        for on in ["1", "true", "yes", "on", "anything"] {
+            unsafe {
+                std::env::set_var(var, on);
+            }
+            assert!(env_enabled(var), "on으로 인식돼야: {on:?}");
+        }
+        unsafe {
+            std::env::remove_var(var);
         }
     }
 

@@ -118,6 +118,72 @@ pub struct DiagnoseOptions {
 const MAX_FOLLOWUP_CMDS: usize = 3;
 const MAX_FOLLOWUP_OUTPUT_BYTES: usize = 16 * 1024;
 
+/// 주어진 (섹션, 명령) probe 목록을 실행해 `## name\n<redacted out>` raw evidence를 만든다(공유 코어).
+/// execute_with_corr이 출력을 redact한다. confirm 클로저는 항상 거부 — NeedsConfirm/Dangerous가 섞여도
+/// 자동 실행되지 않는다(A4 읽기전용 보장).
+fn run_probe_list(
+    probes: Vec<(&'static str, String)>,
+    sandbox: &Sandbox,
+    corr_prefix: &str,
+) -> String {
+    let mut evidence = String::new();
+    for (idx, (name, cmd)) in probes.into_iter().enumerate() {
+        let corr = format!("{corr_prefix}.{idx}");
+        let args = serde_json::json!({ "command": cmd });
+        let out = super::run_command::execute_with_corr(&args, sandbox, &corr, |_, _, _| false)
+            .unwrap_or_else(|e| format!("[tool error] {e}"));
+        evidence.push_str(&format!("## {name}\n{out}\n\n"));
+    }
+    evidence
+}
+
+/// 증상에 맞는 Safe probe(`select_probes`)를 실행해 raw evidence를 만든다(findings 블록 미포함).
+/// `run_headless_diagnose`가 쓰는 증상-타게팅 수집 경로.
+pub(crate) fn collect_probe_evidence(
+    symptom: Option<&str>,
+    sandbox: &Sandbox,
+    corr_prefix: &str,
+) -> String {
+    run_probe_list(select_probes(symptom, docker_available()), sandbox, corr_prefix)
+}
+
+/// auto-RCA(L3) 전용 **포괄** 수집 — `scan_findings`가 키로 삼는 **모든** 섹션(disk·inodes·dmesg_oom·
+/// proc_states·failed_units·fd·swap_usage)을 트리거 자원과 무관하게 evidence에 넣는다. `select_probes`는
+/// 단일 카테고리로 좁혀(cpu/load Crit엔 scan 키가 0개, 복합 장애 disk+OOM엔 첫 매칭 카테고리만) 결정적
+/// 신호를 놓치므로, RCA는 메모리·디스크·프로세스 카테고리 probe를 union한다.
+pub(crate) fn collect_comprehensive_evidence(sandbox: &Sandbox, corr_prefix: &str) -> String {
+    run_probe_list(comprehensive_probes(docker_available()), sandbox, corr_prefix)
+}
+
+/// `scan_findings` 키 섹션을 모두 포함하는 포괄 probe 집합(base 컨텍스트 + 메모리/디스크/프로세스 union).
+/// 알 수 없는 id는 `section_command`가 None이라 조용히 빠진다(테스트가 키 누락을 잡는다).
+fn comprehensive_probes(docker_available: bool) -> Vec<(&'static str, String)> {
+    let mut sections: Vec<&'static str> = Vec::new();
+    // base + scan_findings 7키 전부 + 보강 컨텍스트(원인 추적용 상위 프로세스·압박 신호).
+    let want: &[&str] = &[
+        "date", "host", "os", "uptime", // 컨텍스트
+        "disk", "inodes", // disk 키
+        "memory", "swap_usage", "dmesg_oom", "mem_top_proc", "mem_pressure", // memory 키(+보강)
+        "process", "proc_states", "fd", "failed_units", "journal_errors", // process/services 키(+보강)
+    ];
+    for id in want {
+        if !sections.contains(id) {
+            sections.push(id);
+        }
+    }
+    if docker_available {
+        for id in ["docker_stats", "docker_df", "docker_ps"] {
+            if !sections.contains(&id) {
+                sections.push(id);
+            }
+        }
+    }
+    sections
+        .into_iter()
+        .filter_map(|name| section_command(name).map(|cmd| (name, cmd)))
+        .collect()
+}
+
 /// 대화형 세션 없이 read-only 진단을 수행한다(SRE R2: webhook 자동 초동 진단의 코어).
 ///
 /// 흐름: 증상→`select_probes`(고정 Safe probe)→각 probe를 `execute_with_corr`로 실행(confirm
@@ -145,17 +211,7 @@ pub async fn run_headless_diagnose_opts(
     corr_prefix: &str,
     opts: DiagnoseOptions,
 ) -> HeadlessDiagnosis {
-    let probes = select_probes(symptom, docker_available());
-    let mut evidence = String::new();
-    for (idx, (name, cmd)) in probes.into_iter().enumerate() {
-        let corr = format!("{corr_prefix}.{idx}");
-        let args = serde_json::json!({ "command": cmd });
-        // Safe 명령이라 confirm 미호출이지만, 비대화 안전을 위해 거부 클로저 전달
-        // (NeedsConfirm/Dangerous가 섞여도 자동 실행되지 않음 — A4 읽기전용 보장).
-        let out = super::run_command::execute_with_corr(&args, sandbox, &corr, |_, _, _| false)
-            .unwrap_or_else(|e| format!("[tool error] {e}"));
-        evidence.push_str(&format!("## {name}\n{out}\n\n"));
-    }
+    let mut evidence = collect_probe_evidence(symptom, sandbox, corr_prefix);
 
     // 결정적 임계 스캔 — LLM 호출 0으로 확실한 위반(디스크 full·OOM kill·좀비·실패 unit)을 추출해
     // evidence 상단에 고정한다. dispatcher가 없어도(오프라인/--no-analyze) 동작하는 유일 신호.
@@ -1509,6 +1565,30 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\n--- stderr -
 exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
 [1.2] Out of memory: Killed process 99 (node)\n--- stderr ---\n\n";
         assert!(scan_findings(real)[0].message.contains("OOM-killer"));
+    }
+
+    #[test]
+    fn comprehensive_probes_cover_all_scan_findings_keys() {
+        // auto-RCA 포괄 수집은 scan_findings가 키로 삼는 7개 섹션을 (트리거 자원과 무관하게) 모두 포함해야
+        // 한다 — 누락되면 해당 Crit 신호(예: cpu/load Crit 시 dmesg_oom)가 인시던트 findings에서 사라진다.
+        let names: Vec<&str> = comprehensive_probes(false)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        for key in [
+            "disk",
+            "inodes",
+            "dmesg_oom",
+            "proc_states",
+            "failed_units",
+            "fd",
+            "swap_usage",
+        ] {
+            assert!(
+                names.contains(&key),
+                "포괄 수집에 scan_findings 키 누락: {key} (있는 것: {names:?})"
+            );
+        }
     }
 
     #[test]

@@ -1285,6 +1285,8 @@ async fn chat_loop(
     let mut alert_tracker = with_statusbar.then(AlertTracker::new);
     // 이상-트리거 스냅샷 캡처(L1) cooldown 상태. alert_tracker와 수명 공유(세션-로컬).
     let mut last_capture: Option<Instant> = None;
+    // Crit auto-RCA(L3) cooldown 상태. 별도 한도(AUTO_RCA_COOLDOWN)로 인시던트 양산 방지.
+    let mut last_auto_rca: Option<Instant> = None;
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
@@ -1782,6 +1784,31 @@ async fn chat_loop(
                                         last_capture = Some(now);
                                         tokio::task::spawn_blocking(|| {
                                             let _ = super::snapshot_capture::capture("alert");
+                                        });
+                                    }
+                                }
+                                // Crit auto-RCA(L3, opt-in·best-effort): Crit Onset이고 AIC_AUTO_RCA가 on이며
+                                // cooldown 경과면 진단 증거를 모아 RCA 인시던트를 자동 생성한다(detached). off(기본)면
+                                // 회귀 0. Alert는 Clone이 없어 Crit 메시지만 Vec<String>으로 추출해 move한다.
+                                if super::auto_rca::alerts_trigger_rca(&alerts)
+                                    && super::auto_rca::auto_rca_enabled()
+                                {
+                                    let now = Instant::now();
+                                    let due = last_auto_rca.is_none_or(|t| {
+                                        now.duration_since(t) >= super::auto_rca::AUTO_RCA_COOLDOWN
+                                    });
+                                    if due {
+                                        last_auto_rca = Some(now);
+                                        let crit_msgs: Vec<String> = alerts
+                                            .iter()
+                                            .filter(|a| {
+                                                a.kind == AlertKind::Onset
+                                                    && a.severity == Severity::Crit
+                                            })
+                                            .map(|a| a.message.clone())
+                                            .collect();
+                                        tokio::task::spawn_blocking(move || {
+                                            let _ = super::auto_rca::capture_incident(&crit_msgs);
                                         });
                                     }
                                 }
