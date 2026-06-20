@@ -250,7 +250,11 @@ fn install_panic_hook() {
 
 /// ChatLoop task를 띄우고 핸들을 돌려준다. TTY 전용(호출 측이 확인). `with_statusbar`면 2초마다
 /// 시스템 지표를 status bar에 갱신한다(non-TTY/opt-out은 호출 측에서 Direct 경로로 우회).
-pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandle {
+pub(crate) fn start_chat_loop(
+    prompt: String,
+    with_statusbar: bool,
+    recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> ChatHandle {
     install_panic_hook();
     let (line_tx, line_rx) = mpsc::channel::<ChatLine>(8);
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
@@ -262,6 +266,7 @@ pub(crate) fn start_chat_loop(prompt: String, with_statusbar: bool) -> ChatHandl
         cancel_tx,
         prompt,
         with_statusbar,
+        recording,
     ));
     ChatHandle {
         line_rx,
@@ -1011,14 +1016,24 @@ fn sev_style(sev: Severity) -> Style {
 }
 
 /// 시스템 지표 세그먼트를 단계별 색(정상 dim/warn 주황/crit 빨강)으로 칠한 status bar 한 줄을 만든다.
-/// 구분선(` · `)·선두 `· `·ctx 접미는 dim. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
-fn build_status_line(segs: &[(String, Severity)], ctx_tokens: usize) -> Line<'static> {
+/// 구분선(` · `)·선두 `· `·ctx 접미는 dim. `recording`이면 선두에 빨강 `● REC`를 붙여 자동 기록 활성을
+/// 한눈에 보인다. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
+fn build_status_line(segs: &[(String, Severity)], ctx_tokens: usize, recording: bool) -> Line<'static> {
     let dim = sev_style(Severity::Normal);
     let mut spans: Vec<Span<'static>> = vec![Span::styled("· ", dim)];
-    for (i, (text, sev)) in segs.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    if recording {
+        spans.push(Span::styled(
+            "● REC",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+        first = false;
+    }
+    for (text, sev) in segs.iter() {
+        if !first {
             spans.push(Span::styled(" · ", dim));
         }
+        first = false;
         spans.push(Span::styled(text.clone(), sev_style(*sev)));
     }
     if let Some(ctx) = ctx_label(ctx_tokens) {
@@ -1230,6 +1245,10 @@ fn ring_bell() {
     let _ = out.flush();
 }
 
+/// 세션 자동 기록(`/record on`)의 주기 캡처 간격. L1 alert 캡처와 별개로, 알림이 없어도 이 간격마다 baseline
+/// 스냅샷을 남긴다. CAPTURE_COOLDOWN(120s)과 같은 값 — 같은 장애 구간 fork-storm을 피하는 동일 철학.
+const SESSION_RECORD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// ChatLoop 본체 — terminal 단독 소유. EnterAlternateScreen + enable_raw_mode로 전면 TUI에 진입하고,
 /// 대화 로그를 자체 스크롤 버퍼(`log`)로 관리한다. `tokio::select!`로 (키 입력 / status·spinner tick /
 /// 출력 메시지)를 한 곳에서 처리한다. 종료(Shutdown/stream EOF/draw 실패) 시 alternate screen을 떠나고
@@ -1240,6 +1259,7 @@ async fn chat_loop(
     cancel_tx: mpsc::Sender<()>,
     prompt: String,
     with_statusbar: bool,
+    recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if enable_raw_mode().is_err() {
         return;
@@ -1287,6 +1307,8 @@ async fn chat_loop(
     let mut last_capture: Option<Instant> = None;
     // Crit auto-RCA(L3) cooldown 상태. 별도 한도(AUTO_RCA_COOLDOWN)로 인시던트 양산 방지.
     let mut last_auto_rca: Option<Instant> = None;
+    // 세션 자동 기록(`/record on`)의 주기 캡처 상태. 알림과 무관하게 일정 간격으로 baseline 스냅샷을 남긴다.
+    let mut last_record_capture: Option<Instant> = None;
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
@@ -1362,7 +1384,11 @@ async fn chat_loop(
         // status 끝에 컨텍스트 토큰 추정치를 덧붙인다(0이면 생략).
         // 지표가 있으면 단계별 색(주황/빨강) Line, 없으면(첫 sample 전) help 텍스트를 plain dim으로.
         let status_line: Line = match &status_segs {
-            Some(segs) => build_status_line(segs, ctx_tokens),
+            Some(segs) => build_status_line(
+                segs,
+                ctx_tokens,
+                recording.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             None => Line::from(Span::styled(
                 status_with_ctx(&status, ctx_tokens),
                 sev_style(Severity::Normal),
@@ -1769,12 +1795,12 @@ async fn chat_loop(
                                 if has_crit {
                                     ring_bell();
                                 }
-                                // 이상-트리거 스냅샷 캡처(L1, opt-in·best-effort): Onset·Warn 이상이고
-                                // record_enabled이며 cooldown 경과면 전체 /local 스냅샷을 detached로 store에
-                                // 영구화한다. off(기본)면 아무 작업도 안 한다(회귀 0). probe fork×timeout이
-                                // UI select를 막지 않도록 spawn_blocking으로 분리.
-                                if super::snapshot_capture::alert_triggers_capture(&alerts)
-                                    && crate::snapshot_store::record_enabled()
+                                // 이상-트리거 스냅샷 캡처(L1, best-effort): 기록 on(env 또는 `/record on`)이고
+                                // Onset·Warn 이상이며 cooldown 경과면 전체 /local 스냅샷을 detached로 store에
+                                // 영구화한다. off(기본)면 아무 작업도 안 한다(회귀 0). 세션 토글이 곧 동의이므로
+                                // capture_forced(게이트 우회)를 쓴다 — env가 꺼져 있어도 `/record`로 켤 수 있게.
+                                if recording.load(std::sync::atomic::Ordering::Relaxed)
+                                    && super::snapshot_capture::alert_triggers_capture(&alerts)
                                 {
                                     let now = Instant::now();
                                     let due = last_capture.is_none_or(|t| {
@@ -1783,7 +1809,7 @@ async fn chat_loop(
                                     if due {
                                         last_capture = Some(now);
                                         tokio::task::spawn_blocking(|| {
-                                            let _ = super::snapshot_capture::capture("alert");
+                                            let _ = super::snapshot_capture::capture_forced("alert");
                                         });
                                     }
                                 }
@@ -1812,6 +1838,19 @@ async fn chat_loop(
                                         });
                                     }
                                 }
+                            }
+                        }
+                        // 세션 자동 기록(L1.5, best-effort): 기록 on이면 알림과 무관하게 SESSION_RECORD_INTERVAL마다
+                        // baseline 스냅샷을 detached로 남긴다(추세·"문제 직전 상태" 증거). off면 무동작(회귀 0).
+                        if recording.load(std::sync::atomic::Ordering::Relaxed) {
+                            let now = Instant::now();
+                            let due = last_record_capture
+                                .is_none_or(|t| now.duration_since(t) >= SESSION_RECORD_INTERVAL);
+                            if due {
+                                last_record_capture = Some(now);
+                                tokio::task::spawn_blocking(|| {
+                                    let _ = super::snapshot_capture::capture_forced("session");
+                                });
                             }
                         }
                         // 조합 중이면 이 redraw만 건너뛴다(상태·로그는 갱신됨, 다음 키 입력이 칠한다).
@@ -2382,11 +2421,16 @@ mod tests {
             ("cpu 88%".to_string(), Warn),
             ("mem 99%".to_string(), Crit),
         ];
-        let line = super::build_status_line(&segs, 1500);
+        let line = super::build_status_line(&segs, 1500, false);
         // 텍스트는 status_line과 동일 토큰 + ctx 접미.
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("load 1.0") && text.contains("cpu 88%") && text.contains("mem 99%"));
         assert!(text.contains("ctx ~1k"), "ctx 접미: {text}");
+        assert!(!text.contains("REC"), "recording=false면 REC 없음: {text}");
+        // recording=true면 선두에 ● REC.
+        let rec = super::build_status_line(&segs, 0, true);
+        let rtext: String = rec.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rtext.contains("● REC"), "recording=true면 REC 표시: {rtext}");
         // 위반 세그먼트가 정확한 색을 들고 있다: warn=주황, crit=빨강, 정상=색 없음(dim).
         let span = |needle: &str| {
             line.spans
@@ -2466,7 +2510,7 @@ mod tests {
         let log = Text::from("x");
         let ta = super::textarea_with("hi");
         let segs = vec![("load 1.0".to_string(), Normal), ("mem 99%".to_string(), Crit)];
-        let status = super::build_status_line(&segs, 0);
+        let status = super::build_status_line(&segs, 0, false);
         let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
         term.draw(|f| super::draw_full(f, &log, 0, status, &ta, "you ❯ ", &[], 0, None, None))
             .unwrap();

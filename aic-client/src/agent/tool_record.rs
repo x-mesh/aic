@@ -204,6 +204,11 @@ pub(crate) enum SlashCommand {
     Trend(Option<usize>),
     /// `/compare` — 현재 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출). 첫 호출은 baseline 저장.
     Compare,
+    /// `/record [on|off|now]` — 세션 스냅샷 자동 기록 토글. 인자 없으면 on↔off 반전, `now`=즉시 1회 캡처.
+    /// on이면 Warn↑ 알림·주기 캡처가 store에 쌓이고 status bar에 `● REC` 표시.
+    Record(RecordAction),
+    /// `/snapshots [N]` — store의 최근 스냅샷 N개(기본 10) inline 목록(LLM 미호출).
+    Snapshots(Option<usize>),
     /// `/bundle [name]` — 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장. name은 파일 라벨.
     Bundle(Option<String>),
     /// `/rca ...` — persistent RCA workspace를 chat 안에서 조작한다.
@@ -246,6 +251,16 @@ pub(crate) enum SlashCommand {
     },
     /// 알 수 없는 slash — LLM에 보내지 않고 안내만.
     Unknown(String),
+}
+
+/// `/record` 동작. 인자 없으면 `Toggle`(현재 상태 반전).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordAction {
+    Toggle,
+    On,
+    Off,
+    /// 즉시 1회 캡처(토글 상태 무관).
+    Now,
 }
 
 /// `/rca` 하위 명령.
@@ -320,6 +335,8 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "timeline",
     "trend",
     "compare",
+    "record",
+    "snapshots",
     "bundle",
     "rca",
     "triage",
@@ -333,7 +350,9 @@ pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
         "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => "Evidence",
-        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" => "System",
+        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots" => {
+            "System"
+        }
         _ => "Meta", // help 등
     }
 }
@@ -367,6 +386,8 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
         "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
+        "record" => "세션 스냅샷 자동 기록 토글 (on|off|now). on이면 알림·주기 캡처 + REC 표시",
+        "snapshots" => "store의 최근 스냅샷 N개 목록 (기본 10, LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
         "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
@@ -469,6 +490,18 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         "timeline" => SlashCommand::Timeline(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "trend" => SlashCommand::Trend(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "compare" => SlashCommand::Compare,
+        "record" => {
+            let action = match parts.next() {
+                Some("on") => RecordAction::On,
+                Some("off") => RecordAction::Off,
+                Some("now") => RecordAction::Now,
+                _ => RecordAction::Toggle,
+            };
+            SlashCommand::Record(action)
+        }
+        "snapshots" => {
+            SlashCommand::Snapshots(parts.next().and_then(|n| n.parse::<usize>().ok()))
+        }
         "bundle" => {
             // [name] — 라벨/파일명 전용(따옴표 strip), 셸 명령에 미포함.
             let name = strip_surrounding_quotes(rest.trim());
@@ -1648,6 +1681,43 @@ mod tests {
             parse_slash("/bundle db-outage"),
             Some(SlashCommand::Bundle(Some("db-outage".to_string())))
         );
+    }
+
+    #[test]
+    fn parse_slash_record_and_snapshots() {
+        // /record [on|off|now], 인자 없으면 Toggle.
+        assert_eq!(
+            parse_slash("/record"),
+            Some(SlashCommand::Record(RecordAction::Toggle))
+        );
+        assert_eq!(
+            parse_slash("/record on"),
+            Some(SlashCommand::Record(RecordAction::On))
+        );
+        assert_eq!(
+            parse_slash("/record off"),
+            Some(SlashCommand::Record(RecordAction::Off))
+        );
+        assert_eq!(
+            parse_slash("/record now"),
+            Some(SlashCommand::Record(RecordAction::Now))
+        );
+        // 알 수 없는 인자는 Toggle로 폴백(엄격 거부보다 관대).
+        assert_eq!(
+            parse_slash("/record bogus"),
+            Some(SlashCommand::Record(RecordAction::Toggle))
+        );
+        // /snapshots [N]
+        assert_eq!(parse_slash("/snapshots"), Some(SlashCommand::Snapshots(None)));
+        assert_eq!(
+            parse_slash("/snapshots 5"),
+            Some(SlashCommand::Snapshots(Some(5)))
+        );
+        // /snapshot(단수)는 여전히 /local 별칭(회귀 방지).
+        assert!(matches!(
+            parse_slash("/snapshot"),
+            Some(SlashCommand::Local { .. })
+        ));
     }
 
     #[test]

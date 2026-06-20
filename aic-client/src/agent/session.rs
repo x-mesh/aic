@@ -235,6 +235,15 @@ pub struct AgentSession {
     /// MCP 클라이언트 — config `[mcp.servers.*]`에 enabled 서버가 있을 때만 Some. 발견된 tool을
     /// chat tool-calling에 노출하고, 변경 도구는 confirm 후 실행한다. 연결은 `run()`에서 비동기로 수행.
     mcp: Option<super::mcp::McpClient>,
+    /// 세션 스냅샷 자동 기록 상태(`/record`). chat_tui 루프와 공유(Arc) — 루프는 이 값을 읽어 alert·주기
+    /// 자동 캡처와 status bar `● REC` 표시를 하고, `/compare` 영구화도 이 값을 따른다. `run()`에서
+    /// `record_enabled()`(env)로 seed되며 세션 중 `/record`로 토글한다 — 즉 이 atomic이 기록 여부의 단일
+    /// 진실원(env는 시작 기본값일 뿐, `/record off`가 진짜로 끈다).
+    snapshot_recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// alert·주기 자동 캡처와 REC 표시 lane이 실제 살아있는지(= status bar 활성 TUI). `run_loop_tui`에서
+    /// `statusbar_enabled()`로 설정. false면(Direct·status bar off) `/record on`은 `/compare`·`/record now`만
+    /// 켜므로 `handle_record`가 메시지를 정직하게 바꾼다.
+    recording_lane_live: bool,
 }
 
 impl AgentSession {
@@ -263,6 +272,8 @@ impl AgentSession {
             out: ChatOut::Direct { spinner: None },
             obs: None,
             mcp: None,
+            snapshot_recording: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recording_lane_live: false,
         }
     }
 
@@ -321,6 +332,14 @@ impl AgentSession {
         for note in mcp_notes {
             self.out.note(&note).await;
         }
+
+        // 스냅샷 기록 상태를 env(AIC_SNAPSHOT_RECORD)로 seed한다 — TUI/Direct 공용 단일 진실원. 이후
+        // `/record`가 이 atomic을 토글하고, /compare·alert·주기 캡처가 모두 이 값을 따른다(`/record off`가
+        // 진짜로 끈다 — env는 시작 기본값일 뿐).
+        self.snapshot_recording.store(
+            crate::snapshot_store::record_enabled(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -407,7 +426,15 @@ impl AgentSession {
     /// 배너는 raw mode 진입(spawn) 전에 일반 출력해 scrollback에 남긴다. slash 출력 이전은 4e.
     async fn run_loop_tui(&mut self) -> anyhow::Result<()> {
         let prompt = ui::prompt_label().to_string();
-        let mut handle = super::chat_tui::start_chat_loop(prompt, ui::statusbar_enabled());
+        // 스냅샷 기록 상태(`run()`에서 env로 seed)를 chat_tui 루프와 공유한다(동일 Arc). status bar 활성
+        // 여부를 lane_live로 기록해 `/record` 안내가 실제 동작과 일치하게 한다.
+        let statusbar = ui::statusbar_enabled();
+        self.recording_lane_live = statusbar;
+        let mut handle = super::chat_tui::start_chat_loop(
+            prompt,
+            statusbar,
+            self.snapshot_recording.clone(),
+        );
         self.out = ChatOut::Tui(handle.out_sender());
 
         // 시작 배너 — alternate screen이라 stderr 배너는 안 보이므로 대화 로그에 넣는다(step 8 후속).
@@ -873,6 +900,8 @@ impl AgentSession {
                     .await
             }
             SlashCommand::Compare => self.handle_compare().await,
+            SlashCommand::Record(action) => self.handle_record(action).await,
+            SlashCommand::Snapshots(n) => self.handle_snapshots(n).await,
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()).await,
             SlashCommand::Rca(cmd) => self.handle_rca(cmd).await,
             SlashCommand::Triage { topic, run } => {
@@ -1386,6 +1415,73 @@ impl AgentSession {
 
     /// `/compare` — 고정 Safe probe로 현재 시스템 스냅샷을 만들고 직전 baseline과 diff(LLM 미호출).
     /// 첫 호출은 baseline만 저장. 이후 diff 출력 후 baseline 갱신.
+    /// `/record [on|off|now]` — 세션 스냅샷 자동 기록 토글(+ `now`=즉시 1회 캡처).
+    async fn handle_record(&mut self, action: tool_record::RecordAction) {
+        use std::sync::atomic::Ordering;
+        use tool_record::RecordAction;
+        if let RecordAction::Now = action {
+            // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
+            // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
+            let res = tokio::task::spawn_blocking(|| {
+                super::snapshot_capture::capture_forced("manual")
+            })
+            .await;
+            let msg = match res {
+                Ok(Ok(Some(path))) => format!("✓ 스냅샷 캡처 → {}", path.display()),
+                Ok(Ok(None)) => "스냅샷이 기록되지 않았습니다.".to_string(),
+                Ok(Err(e)) => format!("스냅샷 캡처 실패: {e}"),
+                Err(e) => format!("스냅샷 캡처 task 실패: {e}"),
+            };
+            self.out.note(&msg).await;
+            return;
+        }
+        let now_on = match action {
+            RecordAction::On => true,
+            RecordAction::Off => false,
+            // Toggle: 현재 상태 반전.
+            _ => !self.snapshot_recording.load(Ordering::Relaxed),
+        };
+        self.snapshot_recording.store(now_on, Ordering::Relaxed);
+        if now_on {
+            // status bar lane이 살아있어야 alert·주기 캡처·REC가 실제 동작한다 — 꺼져 있으면(Direct·status bar
+            // off) 정직하게 안내한다(/compare 영구화·/record now만 켜짐).
+            let msg = if self.recording_lane_live {
+                "● 기록 시작 — Warn↑ 알림·주기(2분) 자동 캡처 + status bar REC. /compare도 영구화. 중지는 /record off."
+            } else {
+                "● 기록 on — /compare 영구화·/record now 캡처만 동작합니다(status bar가 꺼져 자동 캡처·REC 비활성)."
+            };
+            self.out.note(msg).await;
+        } else {
+            self.out.note("○ 기록 중지.").await;
+        }
+    }
+
+    /// `/snapshots [N]` — store의 최근 스냅샷 N개(기본 10)를 inline 목록으로 표시한다.
+    async fn handle_snapshots(&mut self, n: Option<usize>) {
+        let limit = n.unwrap_or(10);
+        match crate::snapshot_store::load_snapshots() {
+            Ok(all) if all.is_empty() => {
+                self.out
+                    .note("저장된 스냅샷이 없습니다. /record on으로 자동 기록을 켜거나 /record now로 1회 캡처하세요.")
+                    .await;
+            }
+            Ok(all) => {
+                let total = all.len();
+                let mut lines = vec![format!("최근 스냅샷 (총 {total}, store=~/.aic/snapshots):")];
+                for r in all.iter().rev().take(limit) {
+                    lines.push(format!(
+                        "· {} · {} · sections={}",
+                        r.captured_at.format("%m-%d %H:%M:%S"),
+                        r.kind,
+                        r.sections.len()
+                    ));
+                }
+                self.out.note(&lines.join("\n")).await;
+            }
+            Err(e) => self.out.note(&format!("스냅샷 조회 실패: {e}")).await,
+        }
+    }
+
     async fn handle_compare(&mut self) {
         if !self.allow_run_command {
             self.out
@@ -1396,9 +1492,13 @@ impl AgentSession {
         let snapshot = self
             .collect_local_snapshot(super::sysinfo::local_probes(), false)
             .await;
-        // 영구 기록 opt-in(스냅샷 레코더 L0): /compare 스냅샷을 시계열 store(~/.aic/snapshots)에 append한다.
-        // 기본 off(AIC_SNAPSHOT_RECORD). best-effort — 실패해도 /compare는 진행한다. 연속/이상-트리거는 후속(L1+).
-        if crate::snapshot_store::record_enabled() {
+        // 영구 기록(스냅샷 레코더 L0): /compare 스냅샷을 시계열 store(~/.aic/snapshots)에 append한다.
+        // 기록 상태(atomic)를 단일 진실원으로 따른다 — env로 seed되고 `/record`로 토글되므로, `/record off`면
+        // env가 켜져 있었어도 영구화하지 않는다(REC·자동 캡처와 일관). best-effort — 실패해도 /compare는 진행.
+        if self
+            .snapshot_recording
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
             let rec = crate::snapshot_store::SnapshotRecord::new(
                 "compare",
