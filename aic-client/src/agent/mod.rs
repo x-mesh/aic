@@ -36,6 +36,8 @@ pub(crate) mod probes;
 pub mod run_command;
 pub mod sandbox;
 pub mod session;
+// 스냅샷 레코더 L1: 이상-트리거 전체 /local 스냅샷 캡처(standalone, AgentSession 불요).
+pub(crate) mod snapshot_capture;
 pub(crate) mod sys_sampler;
 pub(crate) mod sysinfo;
 pub(crate) mod tool_record;

@@ -89,8 +89,21 @@ pub fn snapshots_dir() -> PathBuf {
     home.join(".aic").join("snapshots")
 }
 
+/// append 임계구역 직렬화용 프로세스 전역 락. L1 이상-트리거 캡처는 `spawn_blocking` 스레드에서, /compare·
+/// baseline append는 세션 task에서 — **같은 프로세스의 서로 다른 실행 컨텍스트**가 동시에 append할 수 있다.
+/// read-tail + append + `trim_to_max`(read-all→rename)는 비원자적이라, 한 쪽 append가 다른 쪽 trim의
+/// read-all과 rename 사이에 끼면 atomic rename이 그 쓰기를 덮어 **잃은 쓰기**가 된다. 임계구역 전체를
+/// 직렬화해 막는다. (다중 aic 프로세스 — 두 세션·L2 daemon — 간 경쟁은 이 in-process 락으론 못 막으며,
+/// 별도 lockfile이 필요하다 → L2에서 처리.)
+fn append_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 /// 레코드 한 건을 JSONL로 append하고 `MAX_SNAPSHOTS`로 head-trim한다(0o700/0o600 권한). 반환=파일 경로.
 pub fn append_snapshot(record: &SnapshotRecord) -> anyhow::Result<PathBuf> {
+    // 동시 writer 직렬화(위 [`append_lock`] 설명 참조). poison된 락은 회복해 best-effort store를 막지 않는다.
+    let _guard = append_lock().lock().unwrap_or_else(|e| e.into_inner());
     let dir = snapshots_dir();
     fs::create_dir_all(&dir)?;
     secure_dir(&dir);
@@ -291,6 +304,34 @@ mod tests {
             loaded.first().unwrap().captured_at,
             DateTime::from_timestamp(1_700_000_000 + 5, 0).unwrap()
         );
+    }
+
+    #[test]
+    fn concurrent_appends_during_trim_lose_no_records() {
+        // L1 회귀: 캡처(spawn_blocking)와 /compare(세션 task)가 같은 프로세스에서 동시에 append할 수 있다.
+        // 파일이 MAX를 넘은 상태의 동시 append는 각자 trim(read-all→rename)을 돌려, 직렬화가 없으면 한 쪽
+        // 쓰기가 다른 쪽 rename에 덮여 유실된다. append_lock이 이를 막는지(모든 동시 쓰기 보존) 검증한다.
+        let _h = HomeGuard::set();
+        for i in 0..(MAX_SNAPSHOTS as i64) {
+            // 파일을 MAX로 채워 이후 append마다 trim이 발생하게 한다(rename 경쟁 윈도우 노출).
+            append_snapshot(&rec("seed", "## x\nv\n", i)).unwrap();
+        }
+        let n: i64 = 40;
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    // seed보다 큰 captured_at → trim 유지 윈도우(마지막 MAX)에 반드시 포함.
+                    append_snapshot(&rec("hot", "## x\nv\n", MAX_SNAPSHOTS as i64 + i)).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let loaded = load_snapshots().unwrap();
+        assert_eq!(loaded.len(), MAX_SNAPSHOTS, "trim 후 정확히 MAX");
+        let hot = loaded.iter().filter(|r| r.kind == "hot").count();
+        assert_eq!(hot, n as usize, "동시 append 유실 없음(40건 모두 보존)");
     }
 
     #[test]
