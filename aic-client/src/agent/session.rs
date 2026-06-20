@@ -1014,7 +1014,18 @@ impl AgentSession {
         if !do_analyze {
             self.out.note("=== local system snapshot ===").await;
         }
-        let snapshot = self.collect_local_snapshot(probes, !do_analyze).await;
+        let mut snapshot = self.collect_local_snapshot(probes, !do_analyze).await;
+        // 결정적 임계 스캔 — /local 기본 섹션(disk 등)의 임계 위반을 LLM 무관하게 즉시 표면화한다.
+        // 사용자에게 표시하고, analyze면 분석 프롬프트 evidence 상단에도 prepend한다(/diagnose와 동일).
+        let findings = super::diagnose::scan_findings(&snapshot);
+        let block = super::diagnose::render_findings_block(&findings);
+        if !block.is_empty() {
+            self.out.note(&format!("\n{}", block.trim_end())).await;
+            // prepend는 LLM 프롬프트 evidence용 — analyze 모드에서만(raw는 표시만 하고 곧 return).
+            if do_analyze {
+                snapshot.insert_str(0, &format!("{block}\n"));
+            }
+        }
 
         if !do_analyze {
             return; // raw 출력 완료(또는 opt-out).
@@ -1196,7 +1207,18 @@ impl AgentSession {
                 symptom.unwrap_or("(generic health)")
             ))
             .await;
-        let snapshot = self.collect_local_snapshot(probes, !do_analyze).await;
+        let mut snapshot = self.collect_local_snapshot(probes, !do_analyze).await;
+        // 결정적 임계 스캔(LLM 무관 즉시 신호) — 대화형에도 노출(headless와 동등). 발견을 사용자에게
+        // 표시하고, analyze면 LLM evidence 상단에도 prepend해 진단을 그 신호 위에서 시작하게 한다.
+        let findings = super::diagnose::scan_findings(&snapshot);
+        let block = super::diagnose::render_findings_block(&findings);
+        if !block.is_empty() {
+            self.out.note(&format!("\n{}", block.trim_end())).await;
+            // prepend는 LLM 프롬프트 evidence용 — analyze 모드에서만(raw는 표시만 하고 곧 return).
+            if do_analyze {
+                snapshot.insert_str(0, &format!("{block}\n"));
+            }
+        }
         if !do_analyze {
             return;
         }
@@ -1382,11 +1404,21 @@ impl AgentSession {
                 self.compare_baseline = Some(snapshot);
             }
             Some(old) => {
+                // 엔티티 set diff(신규 listening 포트·실패 유닛)를 결정적으로 추출해 라인 diff 위에 ⚠로 표면화.
+                let findings = super::diagnose::scan_baseline_findings(&old, &snapshot);
+                // baseline 엔티티 diff는 임계 스캔이 아니므로 맥락에 맞는 헤더를 쓴다.
+                let block = super::diagnose::render_findings_block_with(
+                    &findings,
+                    "## ⚠ baseline 대비 신규 엔티티",
+                );
+                let report = tool_record::compare_report(&old, &snapshot);
+                let body = if block.is_empty() {
+                    report
+                } else {
+                    format!("{}\n{report}", block.trim_end())
+                };
                 self.out
-                    .note(&format!(
-                        "\n=== compare (직전 baseline 대비) ===\n{}",
-                        tool_record::compare_report(&old, &snapshot)
-                    ))
+                    .note(&format!("\n=== compare (직전 baseline 대비) ===\n{body}"))
                     .await;
                 self.compare_baseline = Some(snapshot);
             }

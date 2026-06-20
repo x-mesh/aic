@@ -495,6 +495,76 @@ static CATALOG: &[ProbeSpec] = &[
         macos_command: "last reboot | head -n 15",
         max_lines: Some(15),
     },
+    // P1 #7 batch1 — info-only(scan 규칙 없음). sysctl(read)/grep/systemctl list-timers는 이미 risk_guard
+    // Safe라 allowlist 변경 0. macOS는 Linux 전용 OID/도구에 'unknown oid'·placeholder로 무해하게 대응(OS-branched).
+    ProbeSpec {
+        id: "kernel_limits",
+        category: "system",
+        tags: &["kernel", "sysctl", "limits", "backlog"],
+        description: "커널 한계(accept-queue/매핑/PID/파일) — somaxconn·syn_backlog·max_map_count·pid_max 고갈 상한",
+        linux_command:
+            "sysctl net.core.somaxconn net.ipv4.tcp_max_syn_backlog vm.max_map_count kernel.pid_max",
+        macos_command: "sysctl kern.ipc.somaxconn kern.maxproc kern.maxfilesperproc",
+        max_lines: Some(8),
+    },
+    ProbeSpec {
+        id: "cpu_count",
+        category: "system",
+        tags: &["cpu", "cores", "load"],
+        description: "논리 코어 수 — load average를 코어수 대비로 해석하기 위한 컨텍스트",
+        linux_command: "grep -c processor /proc/cpuinfo",
+        macos_command: "sysctl -n hw.logicalcpu",
+        max_lines: Some(1),
+    },
+    ProbeSpec {
+        id: "timer_schedule",
+        category: "system",
+        tags: &["systemd", "timer", "cron", "schedule"],
+        description: "systemd timer 스케줄 상태(NEXT/LAST/PASSED, 전체) — 미실행 백업/로테이션 잡이 디스크/누적 문제의 숨은 원인",
+        linux_command: "systemctl list-timers --all --no-pager | head -n 30",
+        // macOS는 systemd 부재 — 무신호 placeholder(bare echo). 따옴표는 validator가 차단하므로
+        // 메시지 없이 빈 줄만 출력한다(failed_units:450과 동일 패턴, annotation/LLM 오탐 방지). launchctl은 후속.
+        macos_command: "echo",
+        max_lines: Some(30),
+    },
+    // P1 #7 batch2 — info-only(scan 규칙 없음). risk_guard에 read-only carve-out arm(pmset -g / launchctl
+    // list / crontab -l / scutil --dns)을 추가해 자동 실행 허용. macOS parity·cron·DNS 진단. OS-branched.
+    ProbeSpec {
+        id: "mac_thermal",
+        category: "system",
+        tags: &["cpu", "thermal", "throttle", "power"],
+        description: "macOS thermal/전력 throttle(pmset -g therm) — CPU_Speed_Limit<100이면 발열 제한 중",
+        linux_command: "echo",
+        macos_command: "pmset -g therm",
+        max_lines: Some(6),
+    },
+    ProbeSpec {
+        id: "cron_jobs",
+        category: "system",
+        tags: &["cron", "schedule", "jobs"],
+        description: "사용자 cron 작업 목록(crontab -l) — systemd timer의 cross-OS 짝, 백업/로테이션 잡 확인",
+        linux_command: "crontab -l",
+        macos_command: "crontab -l",
+        max_lines: None,
+    },
+    ProbeSpec {
+        id: "dns_resolver",
+        category: "system",
+        tags: &["network", "dns", "resolver"],
+        description: "DNS resolver 설정(nameserver/search) — 이름풀이 실패·간헐 지연의 숨은 원인",
+        linux_command: "cat /etc/resolv.conf",
+        macos_command: "scutil --dns | head -n 40",
+        max_lines: Some(40),
+    },
+    ProbeSpec {
+        id: "launchd_failed",
+        category: "process",
+        tags: &["launchd", "service", "process"],
+        description: "macOS launchd 서비스 목록(launchctl list) — failed_units의 macOS 짝(상태 PID/Status/Label)",
+        linux_command: "echo",
+        macos_command: "launchctl list | head -n 40",
+        max_lines: Some(40),
+    },
 ];
 
 /// follow-up 전용 templated probe — 인자 1개를 받는 read-only 명령 템플릿.
@@ -596,7 +666,9 @@ pub(crate) static FOLLOWUP_TEMPLATES: &[FollowupTemplate] = &[
     },
     FollowupTemplate {
         id: "proc_net",
-        description: "특정 프로세스/포트의 활성 TCP 연결(상대 IP 포함) — 인자: 프로세스명 또는 포트",
+        // 인자 게이트는 whole-token 매칭이라 증거에 공백 토큰으로 나타나는 프로세스명만 실제로 통과한다.
+        // 포트는 보통 `*:8500`처럼 콜론에 붙어 나와 bare 숫자가 증거에 없으므로 fail-closed(안전 거부)된다.
+        description: "특정 프로세스의 활성 TCP 연결(상대 IP 포함) — 인자: 프로세스명(증거에 토큰으로 등장한 값)",
         linux_template: "ss -tnp | grep {arg} | head -n 30",
         macos_template: "lsof -nP -iTCP -sTCP:ESTABLISHED | grep {arg} | head -n 30",
     },
