@@ -18,6 +18,7 @@ pub mod recipes;
 pub mod redaction;
 pub mod repl;
 pub mod risk_guard;
+pub mod snapshot_store;
 pub mod spinner;
 pub mod streaming;
 pub mod top;

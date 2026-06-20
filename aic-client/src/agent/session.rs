@@ -1396,6 +1396,21 @@ impl AgentSession {
         let snapshot = self
             .collect_local_snapshot(super::sysinfo::local_probes(), false)
             .await;
+        // 영구 기록 opt-in(스냅샷 레코더 L0): /compare 스냅샷을 시계열 store(~/.aic/snapshots)에 append한다.
+        // 기본 off(AIC_SNAPSHOT_RECORD). best-effort — 실패해도 /compare는 진행한다. 연속/이상-트리거는 후속(L1+).
+        if crate::snapshot_store::record_enabled() {
+            let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+            let rec = crate::snapshot_store::SnapshotRecord::new(
+                "compare",
+                &snapshot,
+                None,
+                cwd,
+                chrono::Utc::now(),
+            );
+            if let Err(e) = crate::snapshot_store::append_snapshot(&rec) {
+                adbg!("snapshot_store append failed: {e}");
+            }
+        }
         match self.compare_baseline.take() {
             None => {
                 self.out
