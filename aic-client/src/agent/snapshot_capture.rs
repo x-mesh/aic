@@ -26,13 +26,25 @@ pub(crate) fn alert_triggers_capture(alerts: &[Alert]) -> bool {
 }
 
 /// 전체 /local 스냅샷을 자체 Sandbox로 수집해 store에 append한다(opt-in·best-effort). off면 probe도 안 돈다.
-pub(crate) fn capture(kind: &str) -> anyhow::Result<()> {
-    if !crate::snapshot_store::record_enabled() {
-        return Ok(()); // opt-in off → probe fork 전 early-out(오버헤드 0).
+/// 반환=append된 레코드 경로(게이트 off로 no-op이면 `None`). L1 alert 경로(chat_tui)가 이 게이트형을 쓴다.
+pub fn capture(kind: &str) -> anyhow::Result<Option<PathBuf>> {
+    capture_opts(kind, false)
+}
+
+/// 게이트(`AIC_SNAPSHOT_RECORD`)를 **우회**해 무조건 캡처한다 — `aic snapshot capture --force` 수동 1회용.
+/// passive 경로(/compare·L1)는 여전히 게이트를 따르므로 opt-in 불변식은 유지된다(명시적 force만 예외).
+pub fn capture_forced(kind: &str) -> anyhow::Result<Option<PathBuf>> {
+    capture_opts(kind, true)
+}
+
+/// `force`면 게이트 무시, 아니면 opt-in 준수(off면 probe 전 early-out). 게이트는 여기와 [`store`] 두 곳에
+/// 있어 force가 양쪽을 모두 통과해야 한다(early-out 우회만으론 store에서 다시 막힘).
+fn capture_opts(kind: &str, force: bool) -> anyhow::Result<Option<PathBuf>> {
+    if !force && !crate::snapshot_store::record_enabled() {
+        return Ok(None); // opt-in off → probe fork 전 early-out(오버헤드 0).
     }
     let body = collect_local_body()?;
-    store_if_enabled(kind, &body, Utc::now())?;
-    Ok(())
+    store(kind, &body, Utc::now(), force)
 }
 
 /// local probe들을 자체 sandbox로 실행해 `## name\n<redacted out>` 본문을 만든다(AgentSession 불요).
@@ -50,9 +62,10 @@ fn collect_local_body() -> anyhow::Result<String> {
     Ok(body)
 }
 
-/// opt-in이면 body를 store에 append한다(`now` 주입 → 테스트 결정성, probe 미실행). off면 `Ok(None)`.
-fn store_if_enabled(kind: &str, body: &str, now: DateTime<Utc>) -> anyhow::Result<Option<PathBuf>> {
-    if !crate::snapshot_store::record_enabled() {
+/// body를 store에 append한다(`now` 주입 → 테스트 결정성, probe 미실행). `force`가 아니면 opt-in 게이트를
+/// 재확인해 off면 `Ok(None)`(capture의 early-out과 별개의 2차 게이트).
+fn store(kind: &str, body: &str, now: DateTime<Utc>, force: bool) -> anyhow::Result<Option<PathBuf>> {
+    if !force && !crate::snapshot_store::record_enabled() {
         return Ok(None);
     }
     let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
@@ -63,7 +76,7 @@ fn store_if_enabled(kind: &str, body: &str, now: DateTime<Utc>) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     fn alert(kind: AlertKind, severity: Severity) -> Alert {
@@ -97,8 +110,11 @@ mod tests {
     }
     impl HomeGuard {
         fn set() -> Self {
-            static HOME_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = HOME_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+            // snapshot_store와 **같은** 프로세스 전역 HOME 락을 공유한다(별도 락이면 `cargo test snapshot`에서
+            // 두 모듈이 HOME을 서로 덮어 store 오염·PoisonError 연쇄).
+            let lock = crate::snapshot_store::home_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let dir = TempDir::new().unwrap();
             let prev = std::env::var_os("HOME");
             unsafe {
@@ -123,20 +139,20 @@ mod tests {
     }
 
     #[test]
-    fn store_if_enabled_respects_opt_in() {
+    fn store_respects_opt_in() {
         let _h = HomeGuard::set();
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         // off(기본): 아무것도 안 쓴다.
         unsafe {
             std::env::remove_var("AIC_SNAPSHOT_RECORD");
         }
-        assert!(store_if_enabled("alert", "## x\n1\n", now).unwrap().is_none());
+        assert!(store("alert", "## x\n1\n", now, false).unwrap().is_none());
         assert!(crate::snapshot_store::load_snapshots().unwrap().is_empty());
         // on: kind=alert 레코드 1건 저장(probe 미실행 — 결정적).
         unsafe {
             std::env::set_var("AIC_SNAPSHOT_RECORD", "1");
         }
-        assert!(store_if_enabled("alert", "## host\nh\n## disk\nd\n", now)
+        assert!(store("alert", "## host\nh\n## disk\nd\n", now, false)
             .unwrap()
             .is_some());
         let loaded = crate::snapshot_store::load_snapshots().unwrap();
@@ -146,5 +162,23 @@ mod tests {
         unsafe {
             std::env::remove_var("AIC_SNAPSHOT_RECORD");
         }
+    }
+
+    #[test]
+    fn force_bypasses_opt_in_gate() {
+        // force=true는 env가 off여도 store에 쓴다(--force 수동 캡처 경로). 게이트가 2곳이라 store가
+        // 직접 force를 받아 둘 다 통과하는지 확인한다.
+        let _h = HomeGuard::set();
+        let now = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
+        unsafe {
+            std::env::remove_var("AIC_SNAPSHOT_RECORD");
+        }
+        assert!(
+            store("manual", "## host\nh\n", now, true).unwrap().is_some(),
+            "force인데 게이트에 막힘"
+        );
+        let loaded = crate::snapshot_store::load_snapshots().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].kind, "manual");
     }
 }

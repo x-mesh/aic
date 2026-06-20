@@ -413,6 +413,12 @@ enum Commands {
         #[command(subcommand)]
         op: RcaOp,
     },
+    /// 진단 스냅샷 store 관리 (스냅샷 레코더 L2) — 주기 캡처 타이머 설치 + 수동 캡처/조회.
+    /// `install`로 N초마다 redacted 전체 /local 스냅샷을 영구 store에 쌓는다(opt-in: 설치가 곧 동의).
+    Snapshot {
+        #[command(subcommand)]
+        op: SnapshotOp,
+    },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
     /// 우선 source는 PTY 세션의 ring buffer. hook-only metadata record는
@@ -601,6 +607,46 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SnapshotOp {
+    /// 전체 /local 스냅샷을 1회 캡처해 store에 append한다(타이머가 호출하는 leaf). 기본은 opt-in 게이트
+    /// (AIC_SNAPSHOT_RECORD)를 따른다 — 타이머 unit이 그 env를 켠다. 수동 1회 캡처는 `--force`로 게이트 우회.
+    Capture {
+        /// 레코드 kind 라벨(기본 manual). 타이머 unit은 내부적으로 그대로 두며 periodic 의미.
+        #[arg(long, default_value = "manual")]
+        kind: String,
+        /// opt-in 게이트를 무시하고 무조건 캡처한다(수동 1회용).
+        #[arg(long)]
+        force: bool,
+    },
+    /// store의 최근 스냅샷을 시간순으로 나열한다.
+    List {
+        /// 표시할 최대 레코드 수(기본 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// store 상태 + opt-in 게이트 + 타이머 설치 상태를 한 번에 표시한다.
+    Status {
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// 주기 캡처 타이머 unit을 설치한다(macOS launchd StartInterval / Linux systemd .timer).
+    Install {
+        /// 캡처 간격(초). 기본 300, 최소 60으로 clamp.
+        #[arg(long, default_value_t = aic_client::snapshot_timer::SNAPSHOT_INTERVAL_DEFAULT_SECS)]
+        interval: u64,
+        /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
+        #[arg(long)]
+        no_load: bool,
+    },
+    /// 주기 캡처 타이머 unit을 unload + 제거한다.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -978,6 +1024,12 @@ async fn main() {
         }
         Some(Commands::Rca { op }) => {
             if let Err(e) = handle_rca(op, cli.provider).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Snapshot { op }) => {
+            if let Err(e) = handle_snapshot(op) {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -1434,6 +1486,197 @@ fn handle_daemon_uninstall() {
             std::process::exit(1);
         }
     }
+}
+
+// ── 스냅샷 레코더 L2 (`aic snapshot ...`) ──────────────────────
+
+fn snapshot_platform_label(p: aic_client::daemon_install::Platform) -> &'static str {
+    use aic_client::daemon_install::Platform;
+    match p {
+        Platform::Macos => "macOS launchd",
+        Platform::Linux => "Linux systemd --user",
+        Platform::Unsupported => "unsupported",
+    }
+}
+
+fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
+    match op {
+        SnapshotOp::Capture { kind, force } => handle_snapshot_capture(&kind, force),
+        SnapshotOp::List { limit, json } => handle_snapshot_list(limit, json),
+        SnapshotOp::Status { json } => handle_snapshot_status(json),
+        SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
+        SnapshotOp::Uninstall => handle_snapshot_uninstall(),
+    }
+}
+
+/// 1회 캡처. best-effort: probe/sandbox 실패도 exit 0 + stderr 경고(L0/L1 철학 — 타이머가 실패로 죽지 않게).
+/// redacted 본문은 절대 stdout에 출력하지 않는다(경로/섹션 수 요약만).
+fn handle_snapshot_capture(kind: &str, force: bool) -> anyhow::Result<()> {
+    let captured = if force {
+        aic_client::agent::snapshot_capture::capture_forced(kind)
+    } else {
+        aic_client::agent::snapshot_capture::capture(kind)
+    };
+    match captured {
+        Ok(Some(path)) => {
+            println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
+        }
+        Ok(None) => {
+            // 게이트 off → no-op. 타이머가 호출하면 unit env로 보통 on이라 여기 안 온다.
+            eprintln!(
+                "{COL_DIM}스냅샷 기록이 꺼져 있습니다(AIC_SNAPSHOT_RECORD). \
+                 1회 캡처는 `--force`, 주기 활성은 `aic snapshot install`.{COL_RESET}"
+            );
+        }
+        Err(e) if force => {
+            // 명시적 `--force` 수동 캡처 실패는 exit 1로 표면화한다(스크립트가 성공으로 오인하지 않게).
+            return Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}"));
+        }
+        Err(e) => {
+            // 게이트/타이머 경로는 best-effort: 실패해도 exit 0. 경고만 stderr(타이머 로그에 남는다).
+            eprintln!("{COL_YELLOW}!{COL_RESET} 스냅샷 캡처 실패(best-effort, 무시): {e}");
+        }
+    }
+    Ok(())
+}
+
+/// store의 최근 스냅샷을 최신순으로 나열한다(메타데이터만 — body는 출력 안 함).
+fn handle_snapshot_list(limit: usize, json: bool) -> anyhow::Result<()> {
+    let all = aic_client::snapshot_store::load_snapshots()?;
+    let recent: Vec<_> = all.iter().rev().take(limit).collect();
+    if json {
+        let items: Vec<_> = recent
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "captured_at": r.captured_at.to_rfc3339(),
+                    "kind": r.kind,
+                    "sections": r.sections,
+                    "host": r.host,
+                    "cwd": r.cwd,
+                })
+            })
+            .collect();
+        let env = serde_json::json!({
+            "schema_version": 1,
+            "total": all.len(),
+            "count": items.len(),
+            "snapshots": items,
+        });
+        println!("{}", serde_json::to_string_pretty(&env)?);
+    } else if all.is_empty() {
+        println!(
+            "스냅샷이 없습니다. `aic snapshot install`로 주기 캡처를 켜거나 \
+             `aic snapshot capture --force`로 1회 캡처하세요."
+        );
+    } else {
+        println!("최근 스냅샷 {}개 (총 {}):", recent.len(), all.len());
+        for r in recent {
+            println!(
+                "- {} · {} · sections={} ({})",
+                r.captured_at.to_rfc3339(),
+                r.kind,
+                r.sections.len(),
+                r.sections.join(",")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// store + opt-in 게이트 + 타이머 설치 상태를 한 번에 표시한다(orient-first).
+fn handle_snapshot_status(json: bool) -> anyhow::Result<()> {
+    let all = aic_client::snapshot_store::load_snapshots()?;
+    let enabled = aic_client::snapshot_store::record_enabled();
+    let dir = aic_client::snapshot_store::snapshots_dir();
+    let timer = aic_client::snapshot_timer::status();
+    let last = all.last().map(|r| r.captured_at.to_rfc3339());
+    if json {
+        let env = serde_json::json!({
+            "schema_version": 1,
+            "store_dir": dir.display().to_string(),
+            "record_count": all.len(),
+            "record_enabled": enabled,
+            "last_captured_at": last,
+            "timer": {
+                "installed": timer.installed,
+                "unit_path": timer.unit_path.as_ref().map(|p| p.display().to_string()),
+                "interval_secs": timer.interval_secs,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&env)?);
+    } else {
+        println!("{COL_BOLD}스냅샷 store{COL_RESET}");
+        println!("  경로:        {}", dir.display());
+        println!("  레코드:      {}", all.len());
+        println!("  마지막:      {}", last.unwrap_or_else(|| "(없음)".into()));
+        let gate = if enabled {
+            format!("{COL_GREEN}on{COL_RESET}")
+        } else {
+            format!("{COL_DIM}off{COL_RESET}")
+        };
+        println!("  기록 게이트: {gate} (AIC_SNAPSHOT_RECORD)");
+        println!("{COL_BOLD}주기 캡처 타이머{COL_RESET}");
+        if timer.installed {
+            let iv = timer
+                .interval_secs
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "(unknown)".into());
+            println!("  설치됨:      {COL_GREEN}yes{COL_RESET} · 간격 {iv}");
+            if let Some(p) = &timer.unit_path {
+                println!("  unit:        {}", p.display());
+            }
+        } else {
+            println!("  설치됨:      {COL_DIM}no{COL_RESET} — `aic snapshot install`로 켜기");
+        }
+    }
+    Ok(())
+}
+
+fn handle_snapshot_install(interval: u64, no_load: bool) -> anyhow::Result<()> {
+    let report = aic_client::snapshot_timer::install(interval, no_load)?;
+    let plat = snapshot_platform_label(report.platform);
+    println!(
+        "{COL_GREEN}✓{COL_RESET} {plat} 주기 캡처 타이머 설치 완료 (간격 {}s)",
+        report.interval_secs
+    );
+    println!("  unit:    {}", report.unit_path.display());
+    println!("  aic:     {}", report.aic_path.display());
+    println!(
+        "  logs:    {}/aic-snapshot.{{out,err}}.log",
+        report.log_dir.display()
+    );
+    println!(
+        "  store:   {}",
+        aic_client::snapshot_store::snapshots_dir().display()
+    );
+    if report.loaded {
+        println!(
+            "  loaded:  {COL_GREEN}yes{COL_RESET} — 부팅 시 시작 + 즉시 1회 캡처. \
+             기록 게이트는 unit env로 자동 on."
+        );
+    } else {
+        let cmd = match report.platform {
+            aic_client::daemon_install::Platform::Macos => {
+                "launchctl bootstrap gui/$UID <plist>"
+            }
+            _ => "systemctl --user enable --now aic-snapshot.timer",
+        };
+        println!("  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}");
+    }
+    Ok(())
+}
+
+fn handle_snapshot_uninstall() -> anyhow::Result<()> {
+    let report = aic_client::snapshot_timer::uninstall()?;
+    let plat = snapshot_platform_label(report.platform);
+    if report.removed {
+        println!("{COL_GREEN}✓{COL_RESET} {plat} 주기 캡처 타이머 제거 완료");
+        println!("  unit: {}", report.unit_path.display());
+    } else {
+        println!("{COL_DIM}{plat} 타이머 unit 파일이 이미 없습니다 (이전 unload만 정리){COL_RESET}");
+    }
+    Ok(())
 }
 
 /// `aic daemon start`: aicd binary를 시작한다 (이미 떠 있으면 no-op).

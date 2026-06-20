@@ -56,7 +56,8 @@ pub struct UninstallReport {
 
 // ── 경로 결정 ──────────────────────────────────────────────────
 
-fn home_dir() -> Result<PathBuf> {
+// snapshot_timer(L2)가 같은 HOME 해석을 공유하도록 pub(crate).
+pub(crate) fn home_dir() -> Result<PathBuf> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| anyhow!("HOME 환경 변수가 설정되지 않았습니다"))
@@ -107,7 +108,8 @@ pub fn resolve_aicd_path() -> Result<PathBuf> {
     })
 }
 
-fn which_in_path(name: &str) -> Option<PathBuf> {
+// snapshot_timer(L2)의 resolve_aic_path 폴백이 공유.
+pub(crate) fn which_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let p = dir.join(name);
