@@ -1040,6 +1040,68 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         }
         return Some(RiskAssessment::safe("last.read"));
     }
+    // ── SRE batch2 read-only carve-out(P1 #7) — macOS parity·cron·DNS 진단 probe용. 각 arm은 조회
+    // subcommand/flag만 Safe로 인정하고 상태변경 형태는 매칭하지 않아(→ Unknown) 자동 실행되지 않는다.
+    if head == "pmset" {
+        // 전원/thermal **조회**(`-g <report>`, 예 `pmset -g therm`)만 Safe. 설정 변경은 제외:
+        // 스코프 setter(-a/-b/-c/-u/-d)와 mutation 서브커맨드(sleepnow/schedule/repeat 등). `pmset -g therm`의
+        // first_subcommand는 'therm'(리포트명)이므로 서브커맨드가 아닌 `-g` 플래그 존재로 게이트한다.
+        const PMSET_MUTATE_SUB: &[&str] = &[
+            "sleepnow",
+            "displaysleepnow",
+            "schedule",
+            "repeat",
+            "touch",
+            "boot",
+            "restoredefaults",
+        ];
+        let setter = ["-a", "-b", "-c", "-u", "-d"].iter().any(|f| has_flag(args, f));
+        let mutate_sub = first_subcommand(args)
+            .map(|s| PMSET_MUTATE_SUB.contains(&s))
+            .unwrap_or(false);
+        if has_flag(args, "-g") && !setter && !mutate_sub {
+            return Some(RiskAssessment::safe("pmset.read"));
+        }
+    }
+    if head == "launchctl" {
+        // 조회 서브커맨드만 Safe. load/unload/bootstrap/bootout/enable/disable/kickstart/kill/start/
+        // stop/setenv/remove/submit/reboot 등 상태변경은 매칭 안 함 → 자동 실행 불가.
+        const LAUNCHCTL_READ: &[&str] = &[
+            "list",
+            "print",
+            "print-disabled",
+            "dumpstate",
+            "blame",
+            "procinfo",
+        ];
+        if let Some(sub) = first_subcommand(args) {
+            if LAUNCHCTL_READ.contains(&sub) {
+                return Some(RiskAssessment::safe("launchctl.read"));
+            }
+        }
+    }
+    if head == "crontab" {
+        // 현재 crontab **조회**(`-l`)만 Safe. -r(삭제)/-e(편집·hang)/-i/-u(타 유저)와 positional 파일 인자
+        // (=crontab 설치=mutation)는 제외. positional이 하나라도 있으면 설치이므로 거부한다.
+        let mutate = ["-r", "-e", "-i", "-u"].iter().any(|f| has_flag(args, f));
+        // positional 파일명 또는 `-`(stdin 설치 pseudo-filename, man crontab)는 설치=mutation → 거부.
+        // first_subcommand는 `-`를 flag로 보아 놓치므로 `-`를 명시적으로 잡는다(다운스트림 binary 거부에 의존 X).
+        let installs = first_subcommand(args).is_some() || args.contains(&"-");
+        if has_flag(args, "-l") && !mutate && !installs {
+            return Some(RiskAssessment::safe("crontab.read"));
+        }
+    }
+    if head == "scutil" {
+        // 네트워크/DNS **조회** 플래그(--dns/--proxy/--nwi/--get)만 Safe. --set(변경)과 인자 없는 대화형
+        // (프롬프트 hang)은 제외 — read 플래그를 명시적으로 요구해 무인자 형태를 자동으로 막는다.
+        let read_flag = has_flag(args, "--dns")
+            || has_flag(args, "--proxy")
+            || has_flag(args, "--nwi")
+            || has_flag(args, "--get");
+        if read_flag && !has_flag(args, "--set") {
+            return Some(RiskAssessment::safe("scutil.read"));
+        }
+    }
     None
 }
 
@@ -1055,6 +1117,44 @@ mod tests {
     fn empty_command_is_unknown() {
         assert_eq!(lvl(""), RiskLevel::Unknown);
         assert_eq!(lvl("   "), RiskLevel::Unknown);
+    }
+
+    #[test]
+    fn batch2_readonly_arms_safe_mutation_not() {
+        // P1 #7 batch2: 조회 형태만 Safe(자동 실행 가능), 상태변경/대화형은 Safe 아님(자동 실행 차단).
+        // read forms (probe가 실제로 쓰는 형태 포함).
+        for cmd in [
+            "pmset -g therm",
+            "pmset -g",
+            "launchctl list",
+            "launchctl print-disabled system",
+            "launchctl dumpstate",
+            "crontab -l",
+            "scutil --dns",
+            "scutil --proxy",
+            "scutil --nwi",
+        ] {
+            assert_eq!(lvl(cmd), RiskLevel::Safe, "read form은 Safe여야 함: '{cmd}'");
+        }
+        // mutation/interactive forms — 절대 Safe면 안 됨(자동 실행 금지).
+        for cmd in [
+            "pmset -a disablesleep 1",   // setter scope (first_subcommand 함정: 'disablesleep')
+            "pmset sleepnow",            // mutation 서브커맨드
+            "pmset schedule wake 0",
+            "launchctl load /tmp/x.plist",
+            "launchctl bootout system",
+            "launchctl kickstart -k foo",
+            "crontab -r",                // 삭제
+            "crontab -e",                // 편집(hang)
+            "crontab /tmp/evil",         // positional = 설치
+            "crontab -l -",              // `-` = stdin 설치(pseudo-filename) — 정적으로 거부해야 함
+            "crontab -",                 // stdin 설치
+            "crontab -u root -l",        // 타 유저
+            "scutil",                    // 무인자 대화형(hang)
+            "scutil --set HostName foo", // 변경
+        ] {
+            assert_ne!(lvl(cmd), RiskLevel::Safe, "mutation/interactive는 Safe면 안 됨: '{cmd}'");
+        }
     }
 
     #[test]

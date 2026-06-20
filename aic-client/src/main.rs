@@ -383,7 +383,9 @@ enum Commands {
     /// stdout에 markdown으로 출력한다. headless(서버/cron/webhook)에서 쓰며 TTY가 필요 없다.
     Diagnose {
         /// 증상(자유 텍스트, 여러 단어 가능). 생략 시 generic health 점검.
-        #[arg(trailing_var_arg = true)]
+        /// variadic positional이지만 trailing_var_arg는 쓰지 않는다 — 그러면 첫 증상 토큰 뒤의 flag가
+        /// 증상으로 흡수돼 `aic diagnose disk full --json`이 JSON 모드를 못 켠다(Codex 리뷰). 대신 flag를
+        /// 증상 앞·뒤 어디서나 인식한다(손실: `-`로 시작하는 증상 토큰 불가 — SRE 증상엔 사실상 무관).
         symptom: Vec<String>,
         /// LLM 분석을 끄고 redacted 증거만 수집한다.
         #[arg(long)]
@@ -398,6 +400,10 @@ enum Commands {
         /// 번들 라벨(파일명에 포함). `--bundle`과 함께 사용.
         #[arg(long)]
         name: Option<String>,
+        /// 사람용 markdown 대신 machine-readable JSON을 stdout에 출력한다(자동화/대시보드/jq용).
+        /// `{schema_version, diagnosis:{...}}` 봉투. 진행/번들 메시지는 stderr라 JSON을 오염시키지 않는다.
+        #[arg(long)]
+        json: bool,
         /// 사용할 provider 이름(config default 대신).
         #[arg(long)]
         provider: Option<String>,
@@ -952,6 +958,7 @@ async fn main() {
             follow_up,
             bundle,
             name,
+            json,
             provider,
         }) => {
             if let Err(e) = handle_diagnose_cli(
@@ -959,6 +966,7 @@ async fn main() {
                 no_analyze,
                 follow_up,
                 bundle,
+                json,
                 name,
                 provider.or(cli.provider),
             )
@@ -6269,6 +6277,7 @@ async fn handle_diagnose_cli(
     no_analyze: bool,
     follow_up: bool,
     bundle: bool,
+    json: bool,
     name: Option<String>,
     provider_override: Option<String>,
 ) -> anyhow::Result<()> {
@@ -6300,9 +6309,17 @@ async fn handle_diagnose_cli(
     .await;
 
     let md = result.to_markdown();
-    println!("{md}");
+    if json {
+        // --json: stdout = JSON only(envelope). 사람용 markdown은 억제해 파이프 소비자(jq/trend/RCA)를
+        // 보호한다. schema_version 봉투로 P1 시계열 진화에 forward-safe. 진행/번들 메시지는 stderr 유지.
+        let envelope = serde_json::json!({ "schema_version": 1, "diagnosis": &result });
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!("{md}");
+    }
 
     if bundle {
+        // 번들은 두 모드 공통으로 사람용 markdown 아티팩트(JSON/SARIF 번들은 후속). 알림은 stderr라 JSON 미오염.
         match aic_client::agent::bundle::write_bundle(name.as_deref(), &md) {
             Ok(path) => eprintln!("{COL_GREEN}✔{COL_RESET} 번들 저장: {}", path.display()),
             Err(e) => eprintln!("{COL_YELLOW}⚠{COL_RESET} 번들 저장 실패: {e}"),
@@ -7439,7 +7456,7 @@ mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled,
         is_destructive_command, parse_session_capture_mode, resolve_init_modes, resolve_provider,
-        ATTACH_SNIPPET,
+        Cli, Commands, ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -7452,6 +7469,50 @@ mod tests {
     fn chat_run_command_default_enabled() {
         // 기본 chat(opt-out 없음) → run_command 활성.
         assert!(chat_run_command_enabled(false, false));
+    }
+
+    #[test]
+    fn diagnose_flags_parse_around_symptom() {
+        use clap::Parser;
+        // 회귀(Codex 리뷰): trailing_var_arg 제거 후 --json이 증상 **뒤**에서도 flag로 인식돼야 한다.
+        // 이전엔 "disk full --json"의 --json이 증상으로 흡수돼 JSON 모드가 조용히 안 켜졌다.
+        let cli = Cli::try_parse_from(["aic", "diagnose", "disk", "full", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Diagnose {
+                symptom,
+                json,
+                no_analyze,
+                ..
+            }) => {
+                assert_eq!(symptom, vec!["disk".to_string(), "full".to_string()]);
+                assert!(json, "증상 뒤 --json이 flag로 인식되지 않음");
+                assert!(!no_analyze);
+            }
+            _ => panic!("expected Diagnose subcommand"),
+        }
+        // 증상 앞·사이에 섞인 flag도 동일하게 동작(증상은 단어만 모음).
+        let cli2 =
+            Cli::try_parse_from(["aic", "diagnose", "--no-analyze", "disk", "--json", "full"]).unwrap();
+        match cli2.command {
+            Some(Commands::Diagnose {
+                symptom,
+                json,
+                no_analyze,
+                ..
+            }) => {
+                assert_eq!(symptom, vec!["disk".to_string(), "full".to_string()]);
+                assert!(json && no_analyze);
+            }
+            _ => panic!("expected Diagnose subcommand"),
+        }
+        // 증상 없이 flag만 — generic health.
+        let cli3 = Cli::try_parse_from(["aic", "diagnose", "--json"]).unwrap();
+        match cli3.command {
+            Some(Commands::Diagnose { symptom, json, .. }) => {
+                assert!(symptom.is_empty() && json);
+            }
+            _ => panic!("expected Diagnose subcommand"),
+        }
     }
 
     #[test]

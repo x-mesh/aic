@@ -5,6 +5,7 @@
 //! `Disks` 인스턴스를 세션 내내 **재사용**해야 정확하다(매번 새로 만들면 0). 따라서 샘플러는
 //! 상태를 들고 다닌다. SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
 
+use serde::Serialize;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::watch;
@@ -21,11 +22,24 @@ pub(crate) struct SysSampler {
 /// status bar 지표의 임계 단계 — 정상(dim) → 경고(주황) → 위험(빨강). status bar 컬러링용.
 /// 변형 선언 순서(Normal < Warn < Crit)가 곧 심각도 순서다 — `Ord`로 `overall_severity`가
 /// 여러 지표 중 최댓값을 그대로 고른다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")] // --json 계약(diagnose Finding): "normal"/"warn"/"crit". 외부 JSON 소비자 없음(grep 확인).
 pub(crate) enum Severity {
     Normal,
     Warn,
     Crit,
+}
+
+impl Severity {
+    /// 한 줄 발견·요약 렌더용 글리프(🟢 Normal / 🟡 Warn / 🔴 Crit). ANSI 컬러 비의존(unicode)이라
+    /// non-TTY·RCA markdown·LLM evidence 어디서나 안전하다. SRE Finding(`diagnose::Finding`)과 공유한다.
+    pub(crate) fn glyph(self) -> &'static str {
+        match self {
+            Severity::Normal => "🟢",
+            Severity::Warn => "🟡",
+            Severity::Crit => "🔴",
+        }
+    }
 }
 
 // status bar 임계값(named const). macOS dev 호스트 오탐을 줄이려 보수적으로 둔다.
