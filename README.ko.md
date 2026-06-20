@@ -45,6 +45,9 @@ graph LR
 - ✅ 구조화 trace 로그 — JSONL daily rotate (7일 보존), `AIC_LOG=info|debug`
 - ✅ `aic doctor` — 9축 환경 진단 (config/provider/소켓/데몬/supervisor/셸hook/LLM endpoint/keychain/audit)
 - ✅ `aic status` — 데몬 PID/ping/마지막 명령어 1회 출력
+- ✅ `aic diagnose` — 증상 기반 Safe probe → typed **Finding**(severity/confidence/probe_id). 결정적 임계 스캔이 disk/inode/fd/swap 고갈·커널 OOM-kill·실패 systemd 유닛을 **LLM 없이** 표시하고, `aic diagnose --json`은 machine-readable 봉투로 출력
+- ✅ `aic rca` — persistent RCA workspace: `~/.aic/incidents/<id>/`(`evidence.jsonl` + `report.md`)에 incident 영속 저장, `start`/`status`/`timeline`/`report`. `--diagnose`는 headless `/diagnose` 엔진의 초동 증거를 첨부
+- ✅ 세션 스냅샷 레코더 (opt-in) — `~/.aic/snapshots/`에 백그라운드 시스템 스냅샷 기록, `AIC_SNAPSHOT_RECORD`로 게이트: alert 트리거 전체 캡처(L1), 주기 타이머(L2, `aic snapshot install`), Crit auto-RCA(L3, `AIC_AUTO_RCA`). 아래 [세션 스냅샷 레코더](#세션-스냅샷-레코더) 참고
 
 ### 보안 baseline
 - ✅ Secret/PII redaction — secret 5종(AWS/GitHub/OpenAI/Anthropic/JWT) + PII 4종(email/한국 전화/주민번호/IPv4) 자동 마스킹, `AIC_REDACT=off` opt-out
@@ -247,7 +250,7 @@ NO_COLOR=1 aic chat                           # plain 출력(ANSI 없음; non-TT
 #   채팅 프롬프트는 TTY면 "◇ you ❯ ", 파이프면 plain "you> ". LLM 답변은 stdout,
 #   banner/status/command card/debug는 stderr로 분리(파이프 안전).
 # → 세션 내 slash 명령은 로컬에서 가로채 처리하며 LLM에 전송되지 않는다:
-#   /local /diagnose /explain-last /incident /doctor /timeline /compare /bundle /triage /watch /help.
+#   /local /diagnose /explain-last /incident /rca /doctor /timeline /compare /record /snapshots /bundle /triage /watch /help.
 #   TTY에서 "/"를 입력하면 후보 패널이 열린다. 자세한 표는 아래 "Chat slash 명령" 참고.
 # (레거시 --sre / --allow-run은 파싱은 되지만 이제 no-op: run_command가 기본 활성)
 # 설계 문서: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
@@ -258,6 +261,9 @@ aic status             # 데몬 PID/ping/마지막 명령어
 aic sessions           # 모든 활성 세션 (aicd registry-first)
 aic session stop <id>  # 특정 세션 종료 (aicd 필요)
 aic audit verify       # audit log HMAC chain 무결성 (exit 0/2/3)
+aic diagnose <증상>    # 증상 기반 read-only 진단 (--json으로 machine 출력)
+aic rca status         # persistent RCA incident (start / status / timeline / report)
+aic snapshot status    # 세션 스냅샷 레코더 (capture / list / status / install / uninstall)
 ```
 
 ### RCA workspace
@@ -287,6 +293,34 @@ aic rca report <id-prefix> --write
 P0 범위는 `start/status/timeline/report`다. `--diagnose`는 기존 headless `/diagnose` 엔진을 재사용해
 첫 RCA evidence로 저장하고, report는 결론을 evidence id로 역참조할 수 있게 Appendix를 붙인다.
 
+### 세션 스냅샷 레코더
+
+인시던트 *직전* 호스트 상태를 되돌아볼 수 있도록 시스템 스냅샷을 `~/.aic/snapshots/`에 영속 기록한다.
+**opt-in** — `AIC_SNAPSHOT_RECORD=1`(또는 chat 안에서 `/record on`)이 아니면 아무것도 쓰지 않는다. 각
+스냅샷은 `/local`과 동일한 redacted 증거를 JSONL로 append하며(file 0600, 최근 200개 유지), `aic rca`
+인시던트와는 분리된 silo다.
+
+4계층, 각각 독립 게이트:
+
+- **L0** — 기록 on이면 `/compare` 스냅샷을 append.
+- **L1** — `aic chat` status bar 샘플러가 자원 악화(Normal→Warn/Crit)를 감지하면 전체 `/local` 스냅샷을
+  off-thread로 캡처(hung mount가 UI를 막지 않음).
+- **L2** — 주기 캡처 타이머(`aic snapshot install`, macOS launchd / Linux systemd-user)와 수동 CLI.
+- **L3** — Crit 전이 시 `AIC_AUTO_RCA=1`이면 수집한 증거로 RCA 인시던트를 자동 생성(LLM 미호출).
+
+```sh
+aic snapshot capture                  # opt-in 게이트 준수 1회 캡처(--force는 우회)
+aic snapshot list --json              # 최근 스냅샷(메타 봉투, 본문 미출력)
+aic snapshot status --json            # 레코더 + 타이머 상태
+aic snapshot install --interval 300   # 주기 타이머 설치(간격 최소 60s clamp)
+aic snapshot uninstall
+```
+
+chat 안에서 `/record [on|off|now]`로 세션 기록을 토글하고(`now`=게이트 우회 즉시 1회), `/snapshots [N]`로
+최근 N개(기본 10)를 조회한다. 기록 중엔 status bar 선두에 빨강 `● REC`가 표시된다. 동시 writer(off-thread
+캡처 vs 세션의 `/compare` append)는 process-internal mutex + cross-process flock으로 직렬화돼 잃은 쓰기가
+없다.
+
 ### Chat slash 명령
 
 `aic chat` 안에서 `/`로 시작하는 줄은 로컬에서 가로채 처리한다 — **LLM에 전송되지 않고** 대화 history에도
@@ -305,6 +339,8 @@ Tab 순환, Enter 선택, Esc 닫기).
 | `/doctor` | AIC 자체 상태: provider/model, tool-calling 지원, run_command on/off, env flag는 set/unset만(secret 값 없음) |
 | `/timeline [N]` | 세션 tool 기록 시간순(redacted) |
 | `/compare` | 고정 Safe 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출) |
+| `/record [on\|off\|now]` | 세션 스냅샷 자동 기록 토글(`now`=게이트 우회 즉시 1회 캡처). 아래 [세션 스냅샷 레코더](#세션-스냅샷-레코더) 참고. 기록 중엔 status bar 선두에 빨강 `● REC` |
+| `/snapshots [N]` | store 최근 N개(기본 10) inline 조회(메타만, 본문 미표시) |
 | `/bundle [name]` | 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장(dir 0700 / file 0600, Unix) |
 | `/rca start\|use\|add\|timeline\|report` | persistent RCA workspace에 chat 증거 저장. 예: `/rca start api-latency`, `/rca add last 3`, `/rca add note ...`, `/rca report --write` |
 | `/triage [--run] [topic]` | 토픽 체크리스트 + Probe Catalog 후보 probe; `--run`이면 실행(LLM 미호출). topics: `mac-slow web disk memory cpu network build-fail docker generic` (`disk` 토픽은 docker 디스크 사용량·큰 `/tmp` 파일도 점검) |
