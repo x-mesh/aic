@@ -47,6 +47,9 @@ graph LR
 - ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
 - ✅ Proactive chat status bar — the `aic chat` status line samples host metrics in an off-thread task (so a hung mount or an idle prompt never freezes the UI) and surfaces problems live: severity-colored segments, a per-metric sparkline + trend arrow, a gated disk-exhaustion ETA (`disk 4.2G free · ~8m→crit`), and edge-triggered alerts that name the top offending process (`⚠ mem 97% — top: node 12.1G`) with hysteresis/cooldown. Toggle the alert lane with `/watch arm|off`
+- ✅ `aic diagnose` — symptom-driven Safe probes → typed **Findings** (severity / confidence / probe_id). A deterministic threshold scan flags disk / inode / fd / swap exhaustion, kernel OOM-kills, and failed systemd units **without an LLM**; `aic diagnose --json` emits a machine-readable envelope
+- ✅ `aic rca` — persistent RCA workspace: incidents under `~/.aic/incidents/<id>/` (`evidence.jsonl` + `report.md`), with `start` / `status` / `timeline` / `report`; `--diagnose` attaches first evidence from the headless `/diagnose` engine
+- ✅ Session snapshot recorder (opt-in) — background system snapshots to `~/.aic/snapshots/`, gated by `AIC_SNAPSHOT_RECORD`: alert-triggered full capture (L1), a periodic timer (L2, `aic snapshot install`), and Crit auto-RCA (L3, `AIC_AUTO_RCA`). See [Session snapshot recorder](#session-snapshot-recorder)
 
 ### Security baseline
 - ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
@@ -250,7 +253,7 @@ NO_COLOR=1 aic chat                         # plain output (no ANSI; also auto o
 #   The chat prompt is "◇ you ❯ " on a TTY, plain "you> " when piped. LLM answers go
 #   to stdout; banner/status/command-cards/debug go to stderr (clean piping).
 # → In-session slash commands are intercepted locally and never sent to the LLM:
-#   /local /diagnose /explain-last /incident /doctor /timeline /compare /bundle /triage /watch /help.
+#   /local /diagnose /explain-last /incident /rca /doctor /timeline /compare /record /snapshots /bundle /triage /watch /help.
 #   Type "/" on a TTY to open the completion panel. See "Chat slash commands" below for the full table.
 # (legacy flags --sre / --allow-run still parse but are now no-ops: run_command is on by default)
 # Design: docs/PRD-AIC-SRE-CHAT.md · docs/RFC-002-AIC-CHAT-AGENTIC.md
@@ -261,7 +264,70 @@ aic status             # daemon PID / ping / last command
 aic sessions           # all active sessions (aicd registry-first)
 aic session stop <id>  # terminate a specific session (requires aicd)
 aic audit verify       # audit-log HMAC-chain integrity (exit 0/2/3)
+aic diagnose <symptom> # symptom-driven read-only diagnosis (add --json for machine output)
+aic rca status         # persistent RCA incidents (start / status / timeline / report)
+aic snapshot status    # session snapshot recorder (capture / list / status / install / uninstall)
 ```
+
+### RCA workspace
+
+`aic rca` persists root-cause analysis per incident id. Evidence goes to
+`~/.aic/incidents/<id>/evidence.jsonl` and the report to `report.md` in the same directory (evidence
+files 0600, incident dirs 0700).
+
+```sh
+# create an incident workspace
+aic rca start "api latency" --symptom "p99 latency spike"
+
+# attach Safe-probe evidence right after creation
+aic rca start "disk full" --diagnose --no-analyze
+
+# recent incidents / status
+aic rca status
+aic rca status <id-prefix>
+
+# chronological evidence timeline
+aic rca timeline <id-prefix>
+
+# markdown report with evidence ids ([E1], [E2]…)
+aic rca report <id-prefix> --write
+```
+
+P0 scope is `start/status/timeline/report`. `--diagnose` reuses the headless `/diagnose` engine to store
+the first RCA evidence, and the report cross-references its conclusions back to evidence ids in an
+appendix. Inside `aic chat`, `/rca start|use|add|timeline|report` appends conversation evidence to the
+same workspace.
+
+### Session snapshot recorder
+
+Persistently record system snapshots to `~/.aic/snapshots/` so you can look back at what the host looked
+like *before* an incident. **Opt-in** — nothing is written unless `AIC_SNAPSHOT_RECORD=1` (or `/record
+on` inside a chat). Each snapshot is the same redacted evidence as `/local`, appended as JSONL (file
+0600, newest 200 kept), in a silo separate from `aic rca` incidents.
+
+Four layers, each independently gated:
+
+- **L0** — `/compare` snapshots are appended while recording is on.
+- **L1** — the `aic chat` status-bar sampler captures a full `/local` snapshot when a resource worsens
+  (Normal→Warn/Crit), off-thread so a hung mount never blocks the UI.
+- **L2** — a periodic capture timer (`aic snapshot install`, macOS launchd / Linux systemd-user) plus a
+  manual CLI.
+- **L3** — on a Crit transition, `AIC_AUTO_RCA=1` auto-creates an RCA incident from collected evidence
+  (no LLM call).
+
+```sh
+aic snapshot capture                  # one capture honoring the opt-in gate (--force ignores it)
+aic snapshot list --json              # recent snapshots (metadata envelope; bodies never printed)
+aic snapshot status --json            # recorder + timer status
+aic snapshot install --interval 300   # install the periodic timer (interval clamped to ≥60s)
+aic snapshot uninstall
+```
+
+Inside `aic chat`, `/record [on|off|now]` toggles recording for the session (`now` = capture once,
+bypassing the gate) and `/snapshots [N]` lists the most recent N (default 10). While recording, a red
+`● REC` segment leads the status bar. Concurrent writers (the off-thread capture vs. the session's
+`/compare` append) are serialized by a process-internal mutex plus a cross-process flock, so no writes
+are lost.
 
 ### Chat slash commands
 
@@ -281,7 +347,10 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/doctor` | AIC self-status: provider/model, tool-calling support, run_command on/off, env flags as set/unset only (no secret values) |
 | `/timeline [N]` | Session tool records in chronological order (redacted) |
 | `/compare` | Diff a fixed-Safe system snapshot against the previous baseline (no LLM) |
+| `/record [on\|off\|now]` | Toggle session snapshot recording (`now` = capture once, bypassing the gate). See [Session snapshot recorder](#session-snapshot-recorder). While on, a red `● REC` leads the status bar |
+| `/snapshots [N]` | List the most recent N (default 10) recorded snapshots inline (metadata only; bodies never shown) |
 | `/bundle [name]` | Save incident evidence as redacted markdown under `~/.aic/bundles/` (dir 0700 / file 0600 on Unix) |
+| `/rca start\|use\|add\|timeline\|report` | Save chat evidence to a persistent RCA workspace. e.g. `/rca start api-latency`, `/rca add last 3`, `/rca add note ...`, `/rca report --write`. See [RCA workspace](#rca-workspace) |
 | `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail docker generic` (the `disk` topic also checks docker disk usage and big `/tmp` files) |
 | `/watch [target] [--count N] [--every Ns]` | Re-run probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is any Probe Catalog id — LOCAL sections, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — e.g. `/watch tmp_recent` tracks files growing under `/tmp`; omit it for a compact set |
 | `/watch arm` \| `/watch off` | Toggle the proactive alert lane (default on). When armed, a worsening resource transition (Normal→Warn/Crit) drops a one-line ambient note into the chat (Crit also rings a bell) and recovery prints a `✓` line. `off`/`mute` silences it. Distinct from the bounded-probe `/watch <target>` above |
