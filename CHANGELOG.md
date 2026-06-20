@@ -4,6 +4,38 @@
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-20
+
+### Added
+- **세션 스냅샷 레코더 (L0–L3)** — opt-in(`AIC_SNAPSHOT_RECORD=1`, 기본 off)으로 시스템 스냅샷을
+  `~/.aic/snapshots/`에 영속 기록한다. **(L0)** `/compare` 스냅샷을 JSONL append(0600 atomic, 최근
+  200개 self-heal trim). **(L1)** `aic chat` status bar 샘플러가 자원 악화(Normal→Warn↑)를 감지하면
+  전체 `/local` 스냅샷을 자동 캡처. **(L2)** `aic snapshot install`로 주기 캡처 타이머(macOS launchd /
+  Linux systemd-user)를 설치하고 `aic snapshot capture|list|status|uninstall` CLI로 제어. **(L3)** Crit
+  전이 시 `AIC_AUTO_RCA=1`이면 진단 증거를 모아 RCA 인시던트를 LLM 호출 없이 자동 생성. 동시 writer는
+  process-internal Mutex + cross-process flock으로 직렬화(잃은 쓰기 0).
+- **chat `/record`, `/snapshots` 슬래시 명령 + `● REC` 인디케이터** — `/record [on|off|now]`로 세션
+  스냅샷 자동 기록을 토글(`now`=즉시 1회 캡처, 게이트 우회), `/snapshots [N]`으로 store 최근 N개(기본
+  10)를 메타만 inline 조회. 기록 중에는 status bar 선두에 빨강 `● REC`가 표시된다. (`/snapshot` 단수는
+  기존 `/local` 별칭 유지.)
+- **RCA workspace (`aic rca`) + `/rca` 슬래시** — RCA를 incident id 기준으로 `~/.aic/incidents/<id>/`에
+  영속 저장한다(evidence.jsonl 0600 / report.md, incident dir 0700). `aic rca start|status|timeline|report`,
+  `--diagnose`로 headless `/diagnose` 엔진을 재사용해 초동 증거를 첨부. chat에서는 `/rca start|use|add|timeline|report`로
+  대화 증거를 워크스페이스에 적립한다.
+- **`aic diagnose --json` + typed Finding 모델** — 진단 결과를 machine-readable 봉투
+  (`{schema_version, diagnosis}`, snake_case enum)로 출력한다. severity/confidence/probe_id를 갖는 통합
+  Finding 모델로 `/local`·`/diagnose`에 결정적 발견을 노출하고, 결정적 임계 스캔을 inodes/fd/swap까지
+  확대(macOS `df -i` `%iused='-'` 오탐 수정).
+- **read-only probe 확대 + baseline 엔티티 diff** — `kernel_limits`/`cpu_count`/`timer_schedule`/
+  `mac_thermal`/`cron_jobs`/`dns_resolver`/`launchd_failed` probe 추가(전부 read-only Safe). 실패
+  systemd 유닛에는 실행 가능한 값만 노출하는 `journal_unit <unit>` follow-up hint를 달고, `/compare`는
+  신규 listening 포트·실패 유닛을 set diff로 보고(ephemeral ≥32768 제외).
+
+### Changed
+- **risk_guard read-only safelist 확장** — `pmset -g`/`launchctl list`/`crontab -l`(stdin `-` 차단)/
+  `scutil --dns` 등 **읽기 전용 형태만** 자동 실행(Safe)으로 허용한다. 상태 변경·임의 파일/stdin 입력
+  형태는 Safe에서 제외해 secret 자동 read 표면이 늘지 않도록 한다.
+
 ## [0.22.0] - 2026-06-16
 
 ### Added
