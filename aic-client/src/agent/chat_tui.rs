@@ -1283,6 +1283,8 @@ async fn chat_loop(
     // edge-triggered alert 트래커(C1). Some=무장(악화 전이 시 ambient Note+bell). statusbar가 켜졌을
     // 때만 무장한다. 추후 C7의 `/watch off`가 이를 None으로 돌려 alert lane을 끌 수 있다.
     let mut alert_tracker = with_statusbar.then(AlertTracker::new);
+    // 이상-트리거 스냅샷 캡처(L1) cooldown 상태. alert_tracker와 수명 공유(세션-로컬).
+    let mut last_capture: Option<Instant> = None;
     let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
@@ -1764,6 +1766,24 @@ async fn chat_loop(
                                 }
                                 if has_crit {
                                     ring_bell();
+                                }
+                                // 이상-트리거 스냅샷 캡처(L1, opt-in·best-effort): Onset·Warn 이상이고
+                                // record_enabled이며 cooldown 경과면 전체 /local 스냅샷을 detached로 store에
+                                // 영구화한다. off(기본)면 아무 작업도 안 한다(회귀 0). probe fork×timeout이
+                                // UI select를 막지 않도록 spawn_blocking으로 분리.
+                                if super::snapshot_capture::alert_triggers_capture(&alerts)
+                                    && crate::snapshot_store::record_enabled()
+                                {
+                                    let now = Instant::now();
+                                    let due = last_capture.is_none_or(|t| {
+                                        now.duration_since(t) >= super::snapshot_capture::CAPTURE_COOLDOWN
+                                    });
+                                    if due {
+                                        last_capture = Some(now);
+                                        tokio::task::spawn_blocking(|| {
+                                            let _ = super::snapshot_capture::capture("alert");
+                                        });
+                                    }
                                 }
                             }
                         }
