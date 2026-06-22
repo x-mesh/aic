@@ -386,7 +386,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
         "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
-        "record" => "세션 스냅샷 자동 기록 토글 (on|off|now). on이면 알림·주기 캡처 + REC 표시",
+        "record" => "세션 스냅샷 자동 기록 토글 (on|off|now). on이면 Warn↑ 알림·주기(2분) 캡처 + REC 표시",
         "snapshots" => "store의 최근 스냅샷 N개 목록 (기본 10, LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
@@ -917,7 +917,11 @@ pub(crate) fn help_text() -> String {
         "  /doctor              AIC 자체 상태(provider/도구/플래그 presence; secret 미노출)",
         "  /fix                 직전 진단·대화 맥락에서 실행할 안전한 명령을 제안·실행(확인 후; run_command 필요)",
         "  /timeline [N]        세션 tool 기록 시간순(최근 N개)",
+        "  /trend [N]           최근 명령 exit 추세 ✓/✗ + 실패율(최근 N개; LLM 미호출)",
         "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(변경 섹션/±라인 요약; LLM 미호출)",
+        "  /record [on|off|now]  세션 스냅샷 자동 기록 토글. on이면 Warn↑ 알림·주기(2분) 캡처가 store에",
+        "                       쌓이고 status bar에 ● REC 표시. now=즉시 1회 캡처. (LLM 미호출)",
+        "  /snapshots [N]       store의 최근 스냅샷 N개 inline 목록(기본 10; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
         "  /rca start|use|add|timeline|report  persistent RCA workspace에 chat 증거 저장",
         "                       예: /rca start api-latency · /rca add last 3 · /rca add note ...",
@@ -925,10 +929,26 @@ pub(crate) fn help_text() -> String {
         "                       memory cpu network build-fail generic)",
         "  /watch [target] [--count N] [--every Ns]  local probe 짧게 반복(변화 요약; 기본 3회/1s,",
         "                       count≤20; target: 섹션 이름 또는 생략(compact 세트). LLM 미호출)",
+        "  /watch arm|on|off|mute  proactive 자원 알림 레인 토글(기본 켜짐; 끄면 edge alert 미표시)",
+        "  /metrics [-b backend] <promql>  등록 Prometheus에 PromQL instant 질의(redacted raw; LLM 미호출)",
+        "  /logs [-b backend] <logql>      등록 Loki에 LogQL range 질의(redacted raw; LLM 미호출)",
         "  exit, quit           종료",
         "참고: persistent audit 파일 조회(/audit)는 추후(P2-2) 제공.",
     ]
     .join("\n")
+}
+
+/// LLM system preface에 주입할 slash 명령 레퍼런스. [`help_text`]를 단일 소스로 감싼다.
+/// 사용자가 `/record` 주기처럼 명령 자체를 물을 때, LLM이 코드베이스를 grep하지 않고
+/// 이 레퍼런스로 즉답하도록 한다(명령은 클라이언트가 처리하며 LLM에 전달되지 않는다).
+pub(crate) fn slash_reference_preface() -> String {
+    format!(
+        "\n\n<slash_commands>\n다음은 이 REPL(`aic chat`)에서 사용자가 입력 줄 맨 앞에 `/`로 \
+실행하는 메타 명령이다(예: `/record`, `/watch`). 이 명령들은 클라이언트가 직접 처리하며 너에게 \
+전달되지 않는다. 사용자가 명령의 용도·인자·기본값·동작(주기 등)을 물으면, 코드베이스를 검색하지 \
+말고 아래 레퍼런스로 바로 답하라.\n{}\n</slash_commands>\n",
+        help_text()
+    )
 }
 
 /// `/last` 렌더링. `n=None`이면 직전 1개 카드, `Some(k)`면 최근 k개 요약.
@@ -1311,6 +1331,30 @@ mod tests {
 
     fn ring(records: Vec<ToolRecord>) -> VecDeque<ToolRecord> {
         records.into_iter().collect()
+    }
+
+    #[test]
+    fn help_text_documents_all_slash_commands() {
+        let help = help_text();
+        // 이전에 누락됐던 명령들이 /help에 빠짐없이 등장해야 한다.
+        for cmd in ["/trend", "/record", "/snapshots", "/metrics", "/logs"] {
+            assert!(help.contains(cmd), "help_text missing {cmd}");
+        }
+        // /record 주기는 구체 값으로 안내한다.
+        assert!(help.contains("주기(2분)"), "help_text missing record interval");
+        // alert-lane 토글 형태도 문서화한다.
+        assert!(help.contains("/watch arm"), "help_text missing alert-lane toggle");
+    }
+
+    #[test]
+    fn slash_reference_preface_wraps_help_for_llm() {
+        let preface = slash_reference_preface();
+        // help_text를 단일 소스로 감싼다 — 명령 세부가 그대로 들어가야 한다.
+        assert!(preface.contains("주기(2분)"));
+        assert!(preface.contains("/record"));
+        // LLM에 "검색하지 말고 답하라" 프레이밍과 태그 경계가 있어야 한다.
+        assert!(preface.contains("<slash_commands>"));
+        assert!(preface.contains("검색하지"));
     }
 
     #[test]
