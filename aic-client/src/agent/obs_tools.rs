@@ -331,7 +331,13 @@ pub(crate) fn ensure_safe_url(raw: &str) -> Result<reqwest::Url, ToolError> {
         other => return Err(ToolError::new(format!("지원하지 않는 URL scheme: {other}"))),
     }
     if let Some(host) = url.host_str() {
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        // `url`은 IPv6를 대괄호 포함(`[fe80::1]`)으로 반환하므로 벗긴 뒤 파싱해야 한다 —
+        // 안 벗기면 IPv6 주소의 Ip 파싱이 항상 실패해 link-local/metadata 차단이 무력화된다.
+        let host_ip = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = host_ip.parse::<IpAddr>() {
             if is_blocked_ip(&ip) {
                 return Err(ToolError::new(format!(
                     "차단된 IP 대역(link-local/metadata/unspecified): {host}"
@@ -347,7 +353,13 @@ pub(crate) fn ensure_safe_url(raw: &str) -> Result<reqwest::Url, ToolError> {
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_broadcast(),
-        IpAddr::V6(v6) => v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            // unspecified(::) + link-local(fe80::/10). IPv4-mapped(::ffff:a.b.c.d)는 매핑된 v4 규칙 재적용
+            // — fe80::/10이나 169.254.0.0/16을 IPv6 표기로 우회하는 SSRF를 막는다.
+            v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(|m| is_blocked_ip(&IpAddr::V4(m)))
+        }
     }
 }
 
@@ -443,6 +455,16 @@ mod tests {
     #[test]
     fn unspecified_ip_is_blocked() {
         assert!(ensure_safe_url("http://0.0.0.0:9090/api/v1/query").is_err());
+    }
+
+    #[test]
+    fn ipv6_link_local_and_mapped_are_blocked() {
+        // fe80::/10 link-local 직접 표기.
+        assert!(ensure_safe_url("http://[fe80::1]:9090/api/v1/query").is_err());
+        // IPv4-mapped로 metadata(169.254.169.254)를 우회하려는 시도도 차단.
+        assert!(ensure_safe_url("http://[::ffff:169.254.169.254]/latest/meta-data/").is_err());
+        // 정상 IPv6(loopback ::1, 사설)은 허용.
+        assert!(ensure_safe_url("http://[::1]:9090/api/v1/query").is_ok());
     }
 
     #[test]

@@ -122,7 +122,7 @@ function tab(btn) {
 async function connect() {
   TOKEN = document.getElementById("tok").value.trim();
   if (!TOKEN) { setStatus("토큰을 입력하세요", "err"); return; }
-  localStorage.setItem("aic_web_token", TOKEN);
+  sessionStorage.setItem("aic_web_token", TOKEN);
   try {
     const r = await api("/web/backends");
     const b = await r.json();
@@ -269,7 +269,7 @@ function lokiToText(raw) {
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 // 토큰 복원
-(function(){ const t = localStorage.getItem("aic_web_token"); if (t) { document.getElementById("tok").value = t; } })();
+(function(){ const t = sessionStorage.getItem("aic_web_token"); if (t) { document.getElementById("tok").value = t; } })();
 </script>
 </body>
 </html>

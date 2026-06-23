@@ -21,7 +21,10 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Request, State},
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS},
+        StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -131,9 +134,17 @@ fn internal(_e: anyhow::Error) -> (StatusCode, &'static str) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
 }
 
-/// 대시보드 셸(자체완결 HTML).
+/// 대시보드 셸(자체완결 HTML). clickjacking/MIME-sniffing 방어 헤더를 함께 싣는다.
 async fn dashboard() -> Response {
-    ([(CONTENT_TYPE, "text/html; charset=utf-8")], DASHBOARD).into_response()
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (X_FRAME_OPTIONS, "DENY"),
+            (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        DASHBOARD,
+    )
+        .into_response()
 }
 
 async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (StatusCode, &'static str)>
@@ -142,14 +153,46 @@ async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (Statu
     Ok(Json(snaps))
 }
 
-async fn incidents() -> Result<Json<Vec<rca::IncidentSummary>>, (StatusCode, &'static str)> {
+/// RCA 인시던트 목록. `IncidentSummary`를 그대로 직렬화하면 `path`(서버 홈 절대경로)가 노출되고
+/// `title`/`symptom`/`cwd`는 redaction 미적용이다(report 본문은 redact하면서 목록은 누락하던 gap).
+/// 여기서 `path`를 제외하고 사용자 입력 필드에 redaction을 적용한 DTO로 내보낸다.
+async fn incidents() -> Result<Json<Vec<Value>>, (StatusCode, &'static str)> {
     let list = rca::list_incidents().map_err(internal)?;
-    Ok(Json(list))
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|i| {
+            json!({
+                "id": i.id,
+                "title": redaction::redact(&i.title).0,
+                "status": i.status,
+                "symptom": i.symptom.map(|s| redaction::redact(&s).0),
+                "cwd": i.cwd.map(|s| redaction::redact(&s).0),
+                "created_at": i.created_at,
+                "updated_at": i.updated_at,
+                "evidence_count": i.evidence_count,
+            })
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// 인시던트 id는 생성 시 timestamp + slug(`[A-Za-z0-9_-]`)만 쓴다. 데이터 디렉터리에 닿기 전에
+/// allowlist로 검증해 path traversal을 차단한다 — axum `Path`는 `%2F`를 `/`로 percent-decode하고
+/// `PathBuf::join`은 절대경로 인자로 base를 통째로 치환하므로, `/`·`\`·`.`(따라서 `..`)를 모두 거른다.
+fn is_safe_incident_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// RCA report.md를 markdown으로 서빙한다. `render_report`는 redaction 미적용이므로 서빙 직전
 /// `redaction::redact`를 한 번 더 통과시켜 secret 유출을 방어한다.
 async fn incident_report(Path(id): Path<String>) -> Result<Response, (StatusCode, &'static str)> {
+    if !is_safe_incident_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid incident id\n"));
+    }
     let meta = rca::load_meta(&id).map_err(internal)?;
     let events = rca::load_events(&id).map_err(internal)?;
     let report = rca::render_report(&meta, &events);
@@ -229,6 +272,21 @@ mod tests {
         assert!(!bearer_ok(Some("Basic s3cret"), "s3cret"));
         // 토큰만 있고 스킴 없음.
         assert!(!bearer_ok(Some("s3cret"), "s3cret"));
+    }
+
+    #[test]
+    fn is_safe_incident_id_rejects_traversal() {
+        // 정상 slug id(timestamp-제목)는 허용.
+        assert!(is_safe_incident_id("20260623-031042-web-demo"));
+        assert!(is_safe_incident_id("abc_123-XY"));
+        // path traversal 벡터는 전부 거부.
+        assert!(!is_safe_incident_id("../../etc"));
+        assert!(!is_safe_incident_id("/etc")); // PathBuf::join 절대경로 치환
+        assert!(!is_safe_incident_id("..")); // '.' 불허로 자동 차단
+        assert!(!is_safe_incident_id("a/b")); // %2F 디코딩 결과
+        assert!(!is_safe_incident_id("a\\b"));
+        assert!(!is_safe_incident_id("")); // 빈 값
+        assert!(!is_safe_incident_id(&"x".repeat(200))); // 과다 길이
     }
 
     #[test]
