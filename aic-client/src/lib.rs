@@ -25,3 +25,4 @@ pub mod streaming;
 pub mod top;
 pub mod uds_client;
 pub mod update;
+pub mod web;

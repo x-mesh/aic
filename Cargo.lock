@@ -25,6 +25,7 @@ dependencies = [
  "aic-server",
  "ansi-to-tui",
  "anyhow",
+ "axum",
  "chrono",
  "clap",
  "crossterm",

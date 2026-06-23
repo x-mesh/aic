@@ -419,6 +419,18 @@ enum Commands {
         #[command(subcommand)]
         op: SnapshotOp,
     },
+    /// 읽기 전용 web 대시보드를 띄운다 (MVP-0; run_command·chat 없음).
+    ///
+    /// VPN 안에서 필요할 때만 여는 용도 — 기본 미기동, on-demand. 토큰 필수(`--token` 또는
+    /// `AIC_WEB_TOKEN`). 스냅샷·RCA 인시던트/report를 read-only로 서빙한다.
+    Web {
+        /// 바인드 주소 (예: `127.0.0.1:8787` 또는 `<vpn-ip>:8787`). 기본값 없음 — 명시 필수(오노출 방지).
+        #[arg(long)]
+        bind: String,
+        /// 인증 토큰(Bearer). 미지정 시 env `AIC_WEB_TOKEN`. 둘 다 없으면 거부.
+        #[arg(long, env = "AIC_WEB_TOKEN")]
+        token: Option<String>,
+    },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
     /// 우선 source는 PTY 세션의 ring buffer. hook-only metadata record는
@@ -1034,6 +1046,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Web { bind, token }) => {
+            if let Err(e) = handle_web(bind, token).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::History {
             limit,
             failed,
@@ -1507,6 +1525,21 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
         SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
         SnapshotOp::Uninstall => handle_snapshot_uninstall(),
     }
+}
+
+/// `aic web` — 읽기 전용 대시보드 기동. 토큰은 `--token` 또는 `AIC_WEB_TOKEN`이 반드시 있어야 한다
+/// (web 노출은 인증 필수 — VPN은 네트워크 경계지 인증이 아니다). Ctrl+C로 graceful 종료.
+async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
+    let token = token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--token 또는 AIC_WEB_TOKEN이 필요합니다 — web 노출은 인증 필수입니다."
+            )
+        })?;
+    eprintln!("aic web (read-only) → http://{bind}  ·  auth: Bearer <token>  ·  Ctrl+C 종료");
+    aic_client::web::serve(aic_client::web::WebConfig { bind, token }).await
 }
 
 /// 1회 캡처. best-effort: probe/sandbox 실패도 exit 0 + stderr 경고(L0/L1 철학 — 타이머가 실패로 죽지 않게).
