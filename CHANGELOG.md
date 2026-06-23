@@ -4,6 +4,21 @@
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-23
+
+### Added
+- **LLM 미등록 세션 지원** — provider가 하나도 등록되지 않아도 `aic chat`이 status bar와 진단 slash
+  명령(`/local`·`/watch`·`/metrics`·`/logs` 등)을 그대로 제공한다. 이전에는 LLM이 없으면 최소
+  line REPL로 빠져 하단 status line이 표시되지 않았다. 이제 LLM 미등록 시 agent UI로 진입하되 채팅
+  답변만 비활성화한다.
+
+### Changed
+- **LLM 미등록 경고를 세션 시작 시 표시** — 메시지를 입력한 뒤에야 cryptic한 provider 에러를 보던 것을,
+  진입 즉시 "등록된 LLM provider가 없습니다" 경고 + provider 등록 방법·LLM 없이 동작하는 명령 안내로
+  바꿨다. 미등록 세션에서 일반 채팅은 등록 안내만 내고 LLM을 호출하지 않는다.
+- **`/local`은 LLM 미등록 시 raw 스냅샷으로 자동 degrade** — 분석(analyze) 모드가 LLM을 필요로 하므로,
+  provider가 없으면 raw 시스템 스냅샷을 바로 보여준다.
+
 ## [0.23.0] - 2026-06-20
 
 ### Added
