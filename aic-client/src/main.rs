@@ -6480,11 +6480,24 @@ async fn handle_chat(
             ..Default::default()
         });
 
-    // provider가 tool-calling을 지원하면 읽기 전용 agent 세션, 아니면 기존 REPL.
-    if dispatcher.supports_tool_calling() {
+    // 등록된 LLM provider가 있는지(=default_provider가 [llm.providers]에 존재). 미등록이면 채팅 답변은
+    // 비활성이지만, status bar·진단 slash 명령은 살아있도록 agent UI로 진입시킨다.
+    let llm_registered = config.llm.providers.contains_key(&provider_name);
+    if !llm_registered {
+        // 세션 진입 전 1회 경고 — TUI 진입 전이라 스크롤백/Direct 모두에 남는다(세션 시작 note로도 재노출).
+        eprintln!(
+            "\x1b[33m⚠ 등록된 LLM provider가 없습니다. `aic chat`은 status bar·진단 명령만 동작합니다.\x1b[0m"
+        );
+    }
+
+    // tool-calling provider면 full agent 세션. LLM 미등록이어도 agent UI(status bar+진단 명령)로 진입하되
+    // 답변만 비활성화한다. 등록됐지만 tool-calling 미지원 provider는 기존 ReplSession(작동하는 LLM·도구만 없음).
+    if dispatcher.supports_tool_calling() || !llm_registered {
         match aic_client::agent::Sandbox::from_cwd() {
             Ok(sandbox) => {
-                debug_log!("mode     chat-agent (run_command={})", run_command_enabled);
+                debug_log!(
+                    "mode     chat-agent (run_command={run_command_enabled}, llm={llm_registered})"
+                );
                 let mut session = aic_client::agent::AgentSession::new(
                     dispatcher,
                     sandbox,
@@ -6494,7 +6507,11 @@ async fn handle_chat(
                 .allow_run_command(run_command_enabled)
                 .with_observability(&config.observability)
                 .with_mcp(&config.mcp)
-                .with_provider_model(provider_name.clone(), model_name.clone());
+                .llm_available(llm_registered);
+                // provider/model 표시는 실제 등록된 경우에만 — 미등록이면 배너에 잘못된 default를 안 띄운다.
+                if llm_registered {
+                    session = session.with_provider_model(provider_name.clone(), model_name.clone());
+                }
                 session.run().await?;
             }
             Err(e) => {
