@@ -3,26 +3,41 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aic web (read-only)</title>
+<title>aic web — 로컬 자원</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  body { margin: 0; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
          background: #0d1117; color: #c9d1d9; }
-  header { padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d;
+  header { padding: 9px 16px; background: #161b22; border-bottom: 1px solid #30363d;
            display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-  header h1 { font-size: 15px; margin: 0; color: #58a6ff; }
+  header h1 { font-size: 14px; margin: 0; color: #58a6ff; }
   header .sp { flex: 1; }
-  input, select, button, textarea { font: inherit; background: #0d1117; color: #c9d1d9;
+  input, select, button { font: inherit; background: #0d1117; color: #c9d1d9;
            border: 1px solid #30363d; border-radius: 6px; padding: 5px 8px; }
   button { cursor: pointer; background: #21262d; }
   button:hover { border-color: #58a6ff; }
   button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  label.tgl { display: inline-flex; align-items: center; gap: 5px; color: #8b949e; }
   nav { display: flex; gap: 4px; padding: 8px 16px; border-bottom: 1px solid #30363d; }
   nav button.tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  nav button.tab[hidden] { display: none; }
   main { padding: 16px; }
   .panel { display: none; }
   .panel.active { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+           gap: 10px; margin-bottom: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; }
+  .card .k { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .v { font-size: 20px; margin-top: 2px; }
+  .card .s { color: #8b949e; font-size: 11px; }
+  .card.warn .v { color: #d29922; } .card.crit .v { color: #f85149; } .card.ok .v { color: #3fb950; }
+  .charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; }
+  .chart h3 { font-size: 12px; color: #8b949e; margin: 0 0 4px; font-weight: 600; }
+  canvas { background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 100%; height: 180px; }
+  .legend { font-size: 11px; margin-top: 3px; }
+  .legend span { margin-right: 12px; } .legend i { display: inline-block; width: 9px; height: 9px;
+           border-radius: 2px; margin-right: 4px; vertical-align: middle; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
   th { color: #8b949e; font-weight: 600; }
@@ -30,34 +45,40 @@
   .row input.q { flex: 1; min-width: 240px; }
   pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px;
         overflow: auto; white-space: pre-wrap; word-break: break-word; }
-  canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; height: 320px; }
-  .muted { color: #8b949e; }
-  .err { color: #f85149; }
-  .ok { color: #3fb950; }
-  a { color: #58a6ff; }
-  .legend span { display: inline-block; margin-right: 12px; }
-  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .muted { color: #8b949e; } .err { color: #f85149; } .ok { color: #3fb950; } a { color: #58a6ff; }
 </style>
 </head>
 <body>
 <header>
   <h1>aic web</h1>
-  <span class="muted">read-only · run_command 없음</span>
+  <span class="muted">로컬 자원 · read-only</span>
   <span class="sp"></span>
-  <input id="tok" type="password" placeholder="Bearer token" size="22">
+  <label class="tgl"><input type="checkbox" id="auto" checked> 자동(2s)</label>
+  <input id="tok" type="password" placeholder="Bearer token" size="20">
   <button class="primary" onclick="connect()">연결</button>
   <span id="status" class="muted">미연결</span>
 </header>
 <nav>
-  <button class="tab active" data-panel="snapshots" onclick="tab(this)">Snapshots</button>
+  <button class="tab active" data-panel="resources" onclick="tab(this)">Resources</button>
+  <button class="tab" data-panel="snapshots" onclick="tab(this)">Snapshots</button>
   <button class="tab" data-panel="incidents" onclick="tab(this)">Incidents</button>
-  <button class="tab" data-panel="metrics" onclick="tab(this)">Metrics</button>
-  <button class="tab" data-panel="logs" onclick="tab(this)">Logs</button>
+  <button class="tab" data-panel="external" id="tab-external" hidden onclick="tab(this)">External</button>
 </nav>
 <main>
-  <section id="snapshots" class="panel active">
+  <section id="resources" class="panel active">
+    <div class="cards" id="cards"><p class="muted">연결하면 로컬 호스트 자원이 실시간으로 표시됩니다.</p></div>
+    <div class="charts">
+      <div class="chart"><h3>CPU %</h3><canvas id="c-cpu"></canvas><div class="legend" id="lg-cpu"></div></div>
+      <div class="chart"><h3>Memory / Swap %</h3><canvas id="c-mem"></canvas><div class="legend" id="lg-mem"></div></div>
+      <div class="chart"><h3>Load (1m)</h3><canvas id="c-load"></canvas><div class="legend" id="lg-load"></div></div>
+      <div class="chart"><h3>Disk I/O</h3><canvas id="c-disk"></canvas><div class="legend" id="lg-disk"></div></div>
+      <div class="chart"><h3>Network I/O</h3><canvas id="c-net"></canvas><div class="legend" id="lg-net"></div></div>
+    </div>
+  </section>
+
+  <section id="snapshots" class="panel">
     <div class="row"><button onclick="loadSnapshots()">새로고침</button>
-      <span class="muted">~/.aic/snapshots/</span></div>
+      <span class="muted">~/.aic/snapshots/ — 기록된 /local 스냅샷</span></div>
     <div id="snapshots-out"><p class="muted">연결 후 새로고침하세요.</p></div>
   </section>
 
@@ -68,47 +89,39 @@
     <pre id="report-out" style="display:none"></pre>
   </section>
 
-  <section id="metrics" class="panel">
+  <section id="external" class="panel">
+    <p class="muted">등록된 Prometheus/Loki 백엔드 질의(선택 기능).</p>
     <div class="row">
-      <select id="m-backend"><option value="">(backend)</option></select>
+      <select id="m-backend"></select>
       <input class="q" id="m-query" placeholder='PromQL (예: rate(node_cpu_seconds_total[5m]))'>
-      <select id="m-range">
-        <option value="900">15m</option><option value="3600" selected>1h</option>
-        <option value="21600">6h</option><option value="86400">24h</option>
-      </select>
-      <button class="primary" onclick="runMetrics()">질의</button>
+      <select id="m-range"><option value="900">15m</option><option value="3600" selected>1h</option>
+        <option value="21600">6h</option></select>
+      <button class="primary" onclick="runMetrics()">metrics</button>
     </div>
-    <div id="m-legend" class="legend"></div>
-    <canvas id="m-canvas" width="900" height="320"></canvas>
-    <div id="m-msg" class="muted"></div>
-  </section>
-
-  <section id="logs" class="panel">
-    <div class="row">
-      <select id="l-backend"><option value="">(backend)</option></select>
+    <div class="legend" id="x-legend"></div>
+    <canvas id="x-canvas" style="height:220px"></canvas>
+    <div id="x-msg" class="muted"></div>
+    <div class="row" style="margin-top:14px">
+      <select id="l-backend"></select>
       <input class="q" id="l-query" placeholder='LogQL (예: {app="api"} |= "error")'>
-      <select id="l-range">
-        <option value="900">15m</option><option value="3600" selected>1h</option>
-        <option value="21600">6h</option>
-      </select>
-      <button class="primary" onclick="runLogs()">질의</button>
+      <button class="primary" onclick="runLogs()">logs</button>
     </div>
-    <pre id="l-out" class="muted">연결 후 질의하세요.</pre>
+    <pre id="l-out" class="muted"></pre>
   </section>
 </main>
 
 <script>
-let TOKEN = "";
+let TOKEN = "", timer = null, lastPoints = [];
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) { const s = document.getElementById("status"); s.textContent = t; s.className = cls || "muted"; }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 async function api(path, opts) {
-  opts = opts || {};
-  opts.headers = Object.assign({}, opts.headers || {}, H());
+  opts = opts || {}; opts.headers = Object.assign({}, opts.headers || {}, H());
   const r = await fetch(path, opts);
   if (r.status === 401) { setStatus("401 — 토큰 확인", "err"); throw new Error("unauthorized"); }
-  if (!r.ok) { const t = await r.text(); throw new Error(t || ("HTTP " + r.status)); }
+  if (!r.ok) { throw new Error((await r.text()) || ("HTTP " + r.status)); }
   return r;
 }
 
@@ -117,6 +130,8 @@ function tab(btn) {
   document.querySelectorAll("main .panel").forEach(p => p.classList.remove("active"));
   btn.classList.add("active");
   document.getElementById(btn.dataset.panel).classList.add("active");
+  if (btn.dataset.panel === "snapshots") loadSnapshots();
+  if (btn.dataset.panel === "incidents") loadIncidents();
 }
 
 async function connect() {
@@ -124,152 +139,175 @@ async function connect() {
   if (!TOKEN) { setStatus("토큰을 입력하세요", "err"); return; }
   sessionStorage.setItem("aic_web_token", TOKEN);
   try {
-    const r = await api("/web/backends");
-    const b = await r.json();
-    fillBackends("m-backend", b.prometheus || []);
-    fillBackends("l-backend", b.loki || []);
-    setStatus("연결됨 · prom " + (b.prometheus||[]).length + " · loki " + (b.loki||[]).length, "ok");
-    loadSnapshots(); loadIncidents();
+    await pollLocal();                       // 즉시 1회 — 토큰 검증 겸
+    setStatus("연결됨 · 로컬 자원 수집 중", "ok");
+    restartTimer();
+    const b = await (await api("/web/backends")).json();
+    const hasExt = (b.prometheus||[]).length || (b.loki||[]).length;
+    document.getElementById("tab-external").hidden = !hasExt;
+    if (hasExt) { fillBackends("m-backend", b.prometheus||[]); fillBackends("l-backend", b.loki||[]); }
   } catch (e) { /* status set by api() */ }
 }
 
-function fillBackends(id, names) {
-  const sel = document.getElementById(id);
-  sel.innerHTML = "";
-  if (!names.length) { sel.innerHTML = '<option value="">(none)</option>'; return; }
-  names.forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
+function restartTimer() {
+  if (timer) clearInterval(timer);
+  if (document.getElementById("auto").checked) timer = setInterval(pollLocal, 2000);
+}
+document.getElementById("auto").addEventListener("change", restartTimer);
+
+// ── 로컬 자원 ─────────────────────────────────────────────
+async function pollLocal() {
+  if (!TOKEN) return;
+  const d = await (await api("/web/local")).json();
+  lastPoints = d.points || [];
+  renderResources(lastPoints);
 }
 
+function pct(used, total) { return total > 0 ? (used / total * 100) : 0; }
+function fmtBytes(n) { n = +n || 0; const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; } return n.toFixed(i?1:0) + u[i]; }
+function fmtBps(n) { return fmtBytes(n) + "/s"; }
+
+function card(k, v, s, cls) {
+  return '<div class="card ' + (cls||"") + '"><div class="k">' + esc(k) + '</div><div class="v">' +
+         esc(v) + '</div><div class="s">' + esc(s||"") + '</div></div>';
+}
+
+function renderResources(pts) {
+  const cards = document.getElementById("cards");
+  if (!pts.length) { cards.innerHTML = '<p class="muted">샘플 수집 중… (최대 2초)</p>'; return; }
+  const p = pts[pts.length - 1];
+  const memP = pct(p.mem_used, p.mem_total), swapP = pct(p.swap_used, p.swap_total);
+  const diskUsedP = pct(p.disk_total - p.disk_avail, p.disk_total);
+  const loadR = p.cores ? p.load1 / p.cores : p.load1;
+  const sev = (x, w, c) => x >= c ? "crit" : x >= w ? "warn" : "ok";
+  cards.innerHTML =
+    card("CPU", p.cpu_pct.toFixed(1) + "%", p.cores + " cores", sev(p.cpu_pct, 70, 90)) +
+    card("Load 1m", p.load1.toFixed(2), "× " + loadR.toFixed(2) + " /core", sev(loadR, 1, 2)) +
+    card("Memory", memP.toFixed(0) + "%", fmtBytes(p.mem_used) + " / " + fmtBytes(p.mem_total), sev(memP, 75, 90)) +
+    card("Swap", swapP.toFixed(0) + "%", fmtBytes(p.swap_used) + " / " + fmtBytes(p.swap_total), sev(swapP, 25, 60)) +
+    card("Disk", diskUsedP.toFixed(0) + "%", "free " + fmtBytes(p.disk_avail) + " / " + fmtBytes(p.disk_total), sev(diskUsedP, 80, 92)) +
+    card("Disk I/O", fmtBps(p.disk_read_bps), "↓r  ↑w " + fmtBps(p.disk_write_bps), "") +
+    card("Net I/O", fmtBps(p.net_rx_bps), "↓rx  ↑tx " + fmtBps(p.net_tx_bps), "");
+
+  const xs = pts.map(q => q.ts);
+  draw("c-cpu", "lg-cpu", xs, [{ n: "cpu%", c: "#58a6ff", y: pts.map(q => q.cpu_pct) }], { ymax: 100, fmt: v => v.toFixed(0)+"%" });
+  draw("c-mem", "lg-mem", xs, [
+    { n: "mem%", c: "#3fb950", y: pts.map(q => pct(q.mem_used, q.mem_total)) },
+    { n: "swap%", c: "#d29922", y: pts.map(q => pct(q.swap_used, q.swap_total)) }], { ymax: 100, fmt: v => v.toFixed(0)+"%" });
+  draw("c-load", "lg-load", xs, [{ n: "load1", c: "#bc8cff", y: pts.map(q => q.load1) }], { fmt: v => v.toFixed(2) });
+  draw("c-disk", "lg-disk", xs, [
+    { n: "read", c: "#58a6ff", y: pts.map(q => q.disk_read_bps) },
+    { n: "write", c: "#f85149", y: pts.map(q => q.disk_write_bps) }], { fmt: fmtBps });
+  draw("c-net", "lg-net", xs, [
+    { n: "rx", c: "#3fb950", y: pts.map(q => q.net_rx_bps) },
+    { n: "tx", c: "#d29922", y: pts.map(q => q.net_tx_bps) }], { fmt: fmtBps });
+}
+
+// ── canvas 라인 차트 ───────────────────────────────────────
+function draw(canvasId, legendId, xs, series, opts) {
+  opts = opts || {};
+  const cv = document.getElementById(canvasId);
+  // 표시 크기에 맞춰 내부 해상도 맞춤(흐림 방지).
+  const w = cv.clientWidth || 420, h = cv.clientHeight || 180;
+  cv.width = w; cv.height = h;
+  const ctx = cv.getContext("2d"), pad = 40;
+  ctx.clearRect(0, 0, w, h);
+  const leg = document.getElementById(legendId); if (leg) leg.innerHTML = "";
+  if (!xs.length) { ctx.fillStyle = "#8b949e"; ctx.fillText("수집 중…", pad, h/2); return; }
+  const xmin = xs[0], xmax = xs[xs.length-1];
+  let ymin = 0, ymax = opts.ymax || 0;
+  if (!opts.ymax) { series.forEach(s => s.y.forEach(v => { if (isFinite(v) && v > ymax) ymax = v; })); }
+  if (ymax <= 0) ymax = 1;
+  const X = x => pad + (w-pad-8) * (xmax===xmin ? 1 : (x-xmin)/(xmax-xmin));
+  const Y = y => h-22 - (h-22-8) * (y-ymin)/(ymax-ymin);
+  const fmt = opts.fmt || (v => v.toFixed(1));
+  ctx.strokeStyle = "#21262d"; ctx.fillStyle = "#8b949e"; ctx.lineWidth = 1;
+  for (let i=0;i<=2;i++){ const v = ymin+(ymax-ymin)*i/2, yy = Y(v);
+    ctx.beginPath(); ctx.moveTo(pad,yy); ctx.lineTo(w-8,yy); ctx.stroke(); ctx.fillText(fmt(v), 2, yy+3); }
+  series.forEach(s => {
+    ctx.strokeStyle = s.c; ctx.lineWidth = 1.5; ctx.beginPath();
+    s.y.forEach((v,j) => { const xx = X(xs[j]), yy = Y(isFinite(v)?v:0); j?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+    ctx.stroke();
+    if (leg) { const sp = document.createElement("span");
+      const last = s.y.length ? s.y[s.y.length-1] : 0;
+      sp.innerHTML = '<i style="background:'+s.c+'"></i>'+esc(s.n)+' '+esc(fmt(isFinite(last)?last:0));
+      leg.appendChild(sp); }
+  });
+}
+
+// ── snapshots / incidents ─────────────────────────────────
 async function loadSnapshots() {
-  const out = document.getElementById("snapshots-out");
+  if (!TOKEN) return; const out = document.getElementById("snapshots-out");
   try {
     const data = await (await api("/web/snapshots")).json();
     if (!data.length) { out.innerHTML = '<p class="muted">스냅샷 없음.</p>'; return; }
     let h = "<table><tr><th>captured_at</th><th>kind</th><th>sections</th><th>host</th></tr>";
-    data.slice().reverse().forEach(s => {
-      h += "<tr><td>" + esc(s.captured_at) + "</td><td>" + esc(s.kind) + "</td><td>" +
-           ((s.sections||[]).length) + "</td><td>" + esc(s.host || "") + "</td></tr>";
-    });
+    data.slice().reverse().forEach(s => { h += "<tr><td>" + esc(s.captured_at) + "</td><td>" + esc(s.kind) +
+      "</td><td>" + ((s.sections||[]).length) + "</td><td>" + esc(s.host || "") + "</td></tr>"; });
     out.innerHTML = h + "</table>";
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
-
 async function loadIncidents() {
-  const out = document.getElementById("incidents-out");
+  if (!TOKEN) return; const out = document.getElementById("incidents-out");
   try {
     const data = await (await api("/web/incidents")).json();
     if (!data.length) { out.innerHTML = '<p class="muted">인시던트 없음.</p>'; return; }
     let h = "<table><tr><th>id</th><th>title</th><th>status</th><th>evidence</th><th>updated</th></tr>";
-    data.forEach(i => {
-      h += '<tr><td><a href="#" onclick="showReport(\'' + encodeURIComponent(i.id) + "');return false\">" +
-           esc(i.id) + "</a></td><td>" + esc(i.title) + "</td><td>" + esc(i.status) +
-           "</td><td>" + i.evidence_count + "</td><td>" + esc(i.updated_at) + "</td></tr>";
-    });
+    data.forEach(i => { h += '<tr><td><a href="#" data-id="' + esc(i.id) + '" class="rep">' + esc(i.id) +
+      "</a></td><td>" + esc(i.title) + "</td><td>" + esc(i.status) + "</td><td>" + (+i.evidence_count||0) +
+      "</td><td>" + esc(i.updated_at) + "</td></tr>"; });
     out.innerHTML = h + "</table>";
+    out.querySelectorAll("a.rep").forEach(a => a.addEventListener("click", ev => { ev.preventDefault(); showReport(a.dataset.id); }));
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
-
 async function showReport(id) {
-  const pre = document.getElementById("report-out");
-  pre.style.display = "block";
-  pre.textContent = "로딩...";
-  try {
-    pre.textContent = await (await api("/web/incidents/" + id + "/report")).text();
-  } catch (e) { pre.textContent = e.message; }
+  const pre = document.getElementById("report-out"); pre.style.display = "block"; pre.textContent = "로딩...";
+  try { pre.textContent = await (await api("/web/incidents/" + encodeURIComponent(id) + "/report")).text(); }
+  catch (e) { pre.textContent = e.message; }
 }
 
+// ── external (선택) ───────────────────────────────────────
+function fillBackends(id, names) {
+  const sel = document.getElementById(id); sel.innerHTML = "";
+  (names.length ? names : ["(none)"]).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
+}
 async function runMetrics() {
-  const msg = document.getElementById("m-msg");
-  const backend = document.getElementById("m-backend").value;
-  const query = document.getElementById("m-query").value.trim();
-  if (!backend || !query) { msg.textContent = "backend와 query를 입력하세요."; return; }
-  const span = parseInt(document.getElementById("m-range").value, 10);
-  const end = Math.floor(Date.now() / 1000), start = end - span;
-  const step = Math.max(15, Math.floor(span / 240)) + "s";
+  const msg = document.getElementById("x-msg");
+  const backend = document.getElementById("m-backend").value, query = document.getElementById("m-query").value.trim();
+  if (!backend || !query) { msg.textContent = "backend·query 입력"; return; }
+  const span = +document.getElementById("m-range").value, end = Math.floor(Date.now()/1000), start = end - span;
   msg.textContent = "질의 중...";
   try {
-    const body = JSON.stringify({ backend, query, start: "" + start, end: "" + end, step });
-    const raw = await (await api("/web/metrics", { method: "POST", headers: { "Content-Type": "application/json" }, body })).json();
-    const series = promToSeries(raw);
-    drawChart(document.getElementById("m-canvas"), series);
-    msg.textContent = series.length ? (series.length + " series") : "결과 없음.";
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+    const body = JSON.stringify({ backend, query, start:""+start, end:""+end, step: Math.max(15, Math.floor(span/200))+"s" });
+    const raw = await (await api("/web/metrics", { method:"POST", headers:{"Content-Type":"application/json"}, body })).json();
+    const res = (raw.data && raw.data.result) || [];
+    const xs = res.length && res[0].values ? res[0].values.map(v => +v[0]*1000) : [];
+    const series = res.slice(0,6).map((r,i) => ({ n: shortMetric(r.metric), c: ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf"][i],
+      y: (r.values||[]).map(v => parseFloat(v[1])) }));
+    draw("x-canvas", "x-legend", xs, series, { fmt: v => v.toFixed(2) });
+    msg.textContent = series.length ? series.length+" series" : "결과 없음";
+  } catch (e) { msg.innerHTML = '<span class="err">'+esc(e.message)+"</span>"; }
 }
-
-function promToSeries(raw) {
-  const res = (raw && raw.data && raw.data.result) || [];
-  return res.map(r => {
-    const name = metricName(r.metric);
-    let pts = [];
-    if (r.values) pts = r.values.map(v => [parseFloat(v[0]), parseFloat(v[1])]);
-    else if (r.value) pts = [[parseFloat(r.value[0]), parseFloat(r.value[1])]];
-    return { name, points: pts.filter(p => isFinite(p[1])) };
-  }).filter(s => s.points.length);
-}
-
-function metricName(m) {
-  if (!m) return "value";
-  if (m.__name__) { const o = Object.assign({}, m); delete o.__name__;
-    const lbls = Object.entries(o).map(e => e[0] + "=" + e[1]).join(","); return m.__name__ + (lbls ? "{" + lbls + "}" : ""); }
-  const e = Object.entries(m); return e.length ? e.map(x => x[0] + "=" + x[1]).join(",") : "value";
-}
-
-const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf","#ff7b72","#a5d6ff"];
-function drawChart(cv, series) {
-  const ctx = cv.getContext("2d"), W = cv.width, Ht = cv.height, pad = 38;
-  ctx.clearRect(0, 0, W, Ht);
-  const leg = document.getElementById("m-legend"); leg.innerHTML = "";
-  if (!series.length) { ctx.fillStyle = "#8b949e"; ctx.fillText("no data", pad, Ht/2); return; }
-  let xmin=Infinity,xmax=-Infinity,ymin=Infinity,ymax=-Infinity;
-  series.forEach(s => s.points.forEach(p => { xmin=Math.min(xmin,p[0]); xmax=Math.max(xmax,p[0]);
-    ymin=Math.min(ymin,p[1]); ymax=Math.max(ymax,p[1]); }));
-  if (ymin === ymax) { ymax = ymin + 1; }
-  const X = x => pad + (W-2*pad) * (xmax===xmin ? 0.5 : (x-xmin)/(xmax-xmin));
-  const Y = y => Ht-pad - (Ht-2*pad) * (y-ymin)/(ymax-ymin);
-  ctx.strokeStyle = "#30363d"; ctx.fillStyle = "#8b949e"; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(pad,pad); ctx.lineTo(pad,Ht-pad); ctx.lineTo(W-pad,Ht-pad); ctx.stroke();
-  for (let i=0;i<=4;i++){ const v = ymin+(ymax-ymin)*i/4; const yy=Y(v);
-    ctx.fillText(fmt(v), 2, yy+3); ctx.strokeStyle="#21262d"; ctx.beginPath(); ctx.moveTo(pad,yy); ctx.lineTo(W-pad,yy); ctx.stroke(); }
-  series.slice(0,8).forEach((s,i) => {
-    ctx.strokeStyle = COLORS[i%COLORS.length]; ctx.lineWidth = 1.5; ctx.beginPath();
-    s.points.forEach((p,j) => { const xx=X(p[0]), yy=Y(p[1]); j?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
-    ctx.stroke();
-    const sp = document.createElement("span"); sp.innerHTML = '<i style="background:'+COLORS[i%COLORS.length]+'"></i>'+esc(s.name);
-    leg.appendChild(sp);
-  });
-}
-function fmt(v){ const a=Math.abs(v); if(a>=1e6)return (v/1e6).toFixed(1)+"M"; if(a>=1e3)return (v/1e3).toFixed(1)+"k"; if(a<1&&a>0)return v.toFixed(3); return v.toFixed(1); }
-
+function shortMetric(m){ if(!m) return "value"; const e=Object.entries(m).filter(x=>x[0]!=="__name__");
+  return (m.__name__||"")+(e.length?"{"+e.map(x=>x[0]+"="+x[1]).join(",")+"}":""); }
 async function runLogs() {
   const out = document.getElementById("l-out");
-  const backend = document.getElementById("l-backend").value;
-  const query = document.getElementById("l-query").value.trim();
-  if (!backend || !query) { out.textContent = "backend와 query를 입력하세요."; return; }
-  const span = parseInt(document.getElementById("l-range").value, 10);
-  const end = (Date.now()*1e6), start = end - span*1e9;
+  const backend = document.getElementById("l-backend").value, query = document.getElementById("l-query").value.trim();
+  if (!backend || !query) { out.textContent = "backend·query 입력"; return; }
+  const end = Date.now()*1e6, start = end - 3600*1e9;
   out.textContent = "질의 중...";
   try {
     const body = JSON.stringify({ backend, query, start: start.toFixed(0), end: end.toFixed(0), limit: 200 });
-    const raw = await (await api("/web/logs", { method: "POST", headers: { "Content-Type": "application/json" }, body })).json();
-    out.textContent = lokiToText(raw) || "(결과 없음)";
-  } catch (e) { out.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+    const raw = await (await api("/web/logs", { method:"POST", headers:{"Content-Type":"application/json"}, body })).json();
+    const res = (raw.data && raw.data.result) || []; let rows = [];
+    res.forEach(st => (st.values||[]).forEach(v => rows.push([parseInt(v[0],10), v[1]])));
+    rows.sort((a,b)=>a[0]-b[0]);
+    out.textContent = rows.map(r => new Date(r[0]/1e6).toISOString()+"  "+r[1]).join("\n") || "(결과 없음)";
+  } catch (e) { out.innerHTML = '<span class="err">'+esc(e.message)+"</span>"; }
 }
 
-function lokiToText(raw) {
-  const res = (raw && raw.data && raw.data.result) || [];
-  let rows = [];
-  res.forEach(stream => {
-    const lbl = metricName(stream.stream || stream.metric);
-    (stream.values || []).forEach(v => rows.push([parseInt(v[0],10), lbl, v[1]]));
-  });
-  rows.sort((a,b) => a[0]-b[0]);
-  return rows.map(r => new Date(r[0]/1e6).toISOString() + "  " + r[1] + "  " + r[2]).join("\n");
-}
-
-function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
-
-// 토큰 복원
-(function(){ const t = sessionStorage.getItem("aic_web_token"); if (t) { document.getElementById("tok").value = t; } })();
+(function(){ const t = sessionStorage.getItem("aic_web_token"); if (t) document.getElementById("tok").value = t; })();
 </script>
 </body>
 </html>
