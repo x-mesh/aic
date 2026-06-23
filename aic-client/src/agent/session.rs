@@ -29,6 +29,16 @@ const MAX_ITERATIONS: usize = 8;
 /// 단일 tool 결과를 LLM에 전달할 때의 최대 바이트.
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
+/// LLM provider 미등록 시 세션 시작 1회 경고(배너 직후 note). 채팅 답변만 비활성이고
+/// status bar·진단 slash 명령은 그대로 동작함을 함께 안내한다.
+const NO_LLM_BANNER: &str = "\x1b[33m⚠ 등록된 LLM provider가 없어 채팅 답변은 비활성입니다.\x1b[0m\n  \
+provider 등록: `aic config set llm.default_provider <name>` + config.toml `[llm.providers.<name>]`.\n  \
+LLM 없이도 status bar와 /local·/watch·/metrics·/logs 등 진단 명령은 사용할 수 있습니다.";
+
+/// LLM 미등록 세션에서 (slash가 아닌) 채팅을 입력했을 때의 턴별 안내.
+const NO_LLM_TURN_HINT: &str = "등록된 LLM이 없어 답변할 수 없습니다 — provider 등록 후 다시 시도하세요 \
+(진단 명령 /local·/watch·/metrics 등은 그대로 사용 가능).";
+
 /// SRE 모드(run_command 활성) 전용 시스템 지침. generic preface 뒤에 덧붙인다.
 const SRE_PREFACE: &str = "\n\nYou are operating as an SRE diagnostics assistant with a \
 run_command tool. Behave like an autonomous on-call engineer:\n\
@@ -211,6 +221,10 @@ pub struct AgentSession {
     /// provider가 tool-calling을 거부하면 true로 전환되어 이후 턴은 단발 send()로
     /// 처리한다(읽기 도구 없이 일반 대화). 기존 REPL과 동등하게 degrade.
     degraded: bool,
+    /// 등록된 LLM provider가 있는지. false면 채팅 턴은 LLM을 호출하지 않고 등록 안내만 낸다 —
+    /// LLM 미등록에도 status bar·진단 slash 명령(/local·/watch 등)은 그대로 동작하도록 agent UI로
+    /// 진입시키되 답변만 비활성화하는 용도(`handle_chat`에서 `llm_available`로 설정).
+    llm_available: bool,
     /// run_command 도구를 registry에 노출할지. `aic chat`에서 기본 true이며
     /// `--no-run`/`--read-only`/`AIC_AGENT_NO_RUN`로 끄면 false(읽기 전용).
     allow_run_command: bool,
@@ -261,6 +275,7 @@ impl AgentSession {
             history: Vec::new(),
             first_turn: true,
             degraded: false,
+            llm_available: true,
             allow_run_command: false,
             provider: None,
             model: None,
@@ -280,6 +295,13 @@ impl AgentSession {
     /// run_command 도구 노출 여부를 설정한다(`aic chat` 기본 활성, `--no-run`로 끔).
     pub fn allow_run_command(mut self, enabled: bool) -> Self {
         self.allow_run_command = enabled;
+        self
+    }
+
+    /// 등록된 LLM provider 유무를 설정한다. false면 채팅 답변은 비활성(등록 안내만)이고
+    /// status bar·진단 slash 명령은 그대로 동작한다. 기본 true.
+    pub fn llm_available(mut self, available: bool) -> Self {
+        self.llm_available = available;
         self
     }
 
@@ -377,10 +399,19 @@ impl AgentSession {
         }
     }
 
+    /// LLM provider가 미등록이면 세션 시작 시 1회 경고 note를 낸다(배너 직후). Direct=stderr,
+    /// TUI=대화 로그 — 두 경로 모두 시작 화면에 노출된다.
+    async fn note_no_llm_if_needed(&self) {
+        if !self.llm_available {
+            self.out.note(NO_LLM_BANNER).await;
+        }
+    }
+
     /// 기존 line-based REPL 루프(reedline/stdin). non-TTY·기본 경로. 출력은 stdout=답변/stderr=UI.
     async fn run_loop_direct(&mut self) -> anyhow::Result<()> {
         let mut reader = repl::LineReader::new();
         self.print_banner();
+        self.note_no_llm_if_needed().await;
 
         // status bar 샘플러 — TTY이고 opt-out 미설정일 때만 생성(비-TTY/파이프/CI는 None = 비용 0).
         let mut sampler = ui::statusbar_enabled().then(super::sys_sampler::SysSampler::new);
@@ -454,6 +485,7 @@ impl AgentSession {
             });
             self.out.note(&banner).await;
         }
+        self.note_no_llm_if_needed().await;
 
         // 시작 시 1회 컨텍스트 토큰 표시(preface seed 후 — 보통 system 프롬프트만 있는 상태).
         self.out.send_ctx(self.estimate_tokens()).await;
@@ -523,6 +555,9 @@ impl AgentSession {
     /// 한 번의 사용자 입력에 대해 tool-calling loop를 돈다.
     /// degrade 상태이면 도구 없이 단발 send()로 처리한다.
     async fn run_turn(&mut self) -> anyhow::Result<()> {
+        if !self.llm_available {
+            return self.run_turn_no_llm().await;
+        }
         if self.degraded {
             return self.run_turn_degraded().await;
         }
@@ -688,6 +723,14 @@ impl AgentSession {
                 Err(anyhow::anyhow!(e))
             }
         }
+    }
+
+    /// LLM 미등록 경로 — 직전 user 입력은 history에 남기되 LLM은 호출하지 않고 등록 방법만 안내한다.
+    /// status bar·진단 slash 명령은 정상 동작하므로 세션 자체는 유지된다(Err 아님).
+    async fn run_turn_no_llm(&mut self) -> anyhow::Result<()> {
+        adbg!("no-llm turn: provider 미등록 → 안내만, dispatcher 미호출");
+        self.out.note(NO_LLM_TURN_HINT).await;
+        Ok(())
     }
 
     /// 단일 도구 호출을 실행하고 LLM에 회신할 문자열을 만든다(에러도 문자열로 흡수).
@@ -1040,7 +1083,9 @@ impl AgentSession {
             }
         };
 
-        let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
+        // LLM 미등록이면 분석이 불가능하므로 raw 스냅샷으로 자동 degrade한다(no-LLM 배너 안내와 일치).
+        let do_analyze = self.llm_available
+            && tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
 
         // raw 모드만 snapshot 헤더/섹션/본문을 보인다. analyze 모드는 spinner만 두고 조용히 수집한다.
         if !do_analyze {
@@ -2585,6 +2630,40 @@ mod tests {
         assert_eq!(session.history.len(), before);
         // probe는 ring에 기록되어 /last·/raw로 재조회 가능.
         assert!(!session.tool_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_llm_turn_short_circuits_without_calling_dispatcher() {
+        use crate::llm_dispatcher::LlmDispatcher;
+        use aic_common::{CommandRecord, LlmConfig};
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path()).unwrap();
+        // providers 비어 있음 = LLM 미등록. 정상 경로면 resolve_provider가 Err를 내므로,
+        // llm_available(false)가 dispatcher를 건드리지 않고 Ok로 단락하는지로 검증한다.
+        let cfg = LlmConfig {
+            default_provider: "openai".to_string(),
+            providers: HashMap::new(),
+            lang: "korean".to_string(),
+            connect_timeout_secs: 5,
+            request_timeout_secs: 30,
+        };
+        let dispatcher = LlmDispatcher::from_config(cfg);
+        let mut session = AgentSession::new(
+            dispatcher,
+            sb,
+            CommandRecord::default(),
+            "korean".to_string(),
+        )
+        .llm_available(false);
+
+        session.history.push(ChatMessage::User("안녕".to_string()));
+        let before = session.history.len();
+        // dispatcher.send_messages를 탔다면 ConfigError로 Err였을 것 — Ok면 단락 확인.
+        assert!(session.run_turn().await.is_ok());
+        // 안내만 내고 assistant 답변은 history에 추가하지 않는다.
+        assert_eq!(session.history.len(), before);
     }
 
     #[test]
