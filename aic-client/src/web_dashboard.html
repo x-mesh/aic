@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aic web (read-only)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #0d1117; color: #c9d1d9; }
+  header { padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d;
+           display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; color: #58a6ff; }
+  header .sp { flex: 1; }
+  input, select, button, textarea { font: inherit; background: #0d1117; color: #c9d1d9;
+           border: 1px solid #30363d; border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; background: #21262d; }
+  button:hover { border-color: #58a6ff; }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  nav { display: flex; gap: 4px; padding: 8px 16px; border-bottom: 1px solid #30363d; }
+  nav button.tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  main { padding: 16px; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  th { color: #8b949e; font-weight: 600; }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+  .row input.q { flex: 1; min-width: 240px; }
+  pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px;
+        overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; height: 320px; }
+  .muted { color: #8b949e; }
+  .err { color: #f85149; }
+  .ok { color: #3fb950; }
+  a { color: #58a6ff; }
+  .legend span { display: inline-block; margin-right: 12px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<header>
+  <h1>aic web</h1>
+  <span class="muted">read-only · run_command 없음</span>
+  <span class="sp"></span>
+  <input id="tok" type="password" placeholder="Bearer token" size="22">
+  <button class="primary" onclick="connect()">연결</button>
+  <span id="status" class="muted">미연결</span>
+</header>
+<nav>
+  <button class="tab active" data-panel="snapshots" onclick="tab(this)">Snapshots</button>
+  <button class="tab" data-panel="incidents" onclick="tab(this)">Incidents</button>
+  <button class="tab" data-panel="metrics" onclick="tab(this)">Metrics</button>
+  <button class="tab" data-panel="logs" onclick="tab(this)">Logs</button>
+</nav>
+<main>
+  <section id="snapshots" class="panel active">
+    <div class="row"><button onclick="loadSnapshots()">새로고침</button>
+      <span class="muted">~/.aic/snapshots/</span></div>
+    <div id="snapshots-out"><p class="muted">연결 후 새로고침하세요.</p></div>
+  </section>
+
+  <section id="incidents" class="panel">
+    <div class="row"><button onclick="loadIncidents()">새로고침</button>
+      <span class="muted">~/.aic/incidents/ — RCA</span></div>
+    <div id="incidents-out"><p class="muted">연결 후 새로고침하세요.</p></div>
+    <pre id="report-out" style="display:none"></pre>
+  </section>
+
+  <section id="metrics" class="panel">
+    <div class="row">
+      <select id="m-backend"><option value="">(backend)</option></select>
+      <input class="q" id="m-query" placeholder='PromQL (예: rate(node_cpu_seconds_total[5m]))'>
+      <select id="m-range">
+        <option value="900">15m</option><option value="3600" selected>1h</option>
+        <option value="21600">6h</option><option value="86400">24h</option>
+      </select>
+      <button class="primary" onclick="runMetrics()">질의</button>
+    </div>
+    <div id="m-legend" class="legend"></div>
+    <canvas id="m-canvas" width="900" height="320"></canvas>
+    <div id="m-msg" class="muted"></div>
+  </section>
+
+  <section id="logs" class="panel">
+    <div class="row">
+      <select id="l-backend"><option value="">(backend)</option></select>
+      <input class="q" id="l-query" placeholder='LogQL (예: {app="api"} |= "error")'>
+      <select id="l-range">
+        <option value="900">15m</option><option value="3600" selected>1h</option>
+        <option value="21600">6h</option>
+      </select>
+      <button class="primary" onclick="runLogs()">질의</button>
+    </div>
+    <pre id="l-out" class="muted">연결 후 질의하세요.</pre>
+  </section>
+</main>
+
+<script>
+let TOKEN = "";
+
+function H() { return { "Authorization": "Bearer " + TOKEN }; }
+function setStatus(t, cls) { const s = document.getElementById("status"); s.textContent = t; s.className = cls || "muted"; }
+
+async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, H());
+  const r = await fetch(path, opts);
+  if (r.status === 401) { setStatus("401 — 토큰 확인", "err"); throw new Error("unauthorized"); }
+  if (!r.ok) { const t = await r.text(); throw new Error(t || ("HTTP " + r.status)); }
+  return r;
+}
+
+function tab(btn) {
+  document.querySelectorAll("nav .tab").forEach(b => b.classList.remove("active"));
+  document.querySelectorAll("main .panel").forEach(p => p.classList.remove("active"));
+  btn.classList.add("active");
+  document.getElementById(btn.dataset.panel).classList.add("active");
+}
+
+async function connect() {
+  TOKEN = document.getElementById("tok").value.trim();
+  if (!TOKEN) { setStatus("토큰을 입력하세요", "err"); return; }
+  localStorage.setItem("aic_web_token", TOKEN);
+  try {
+    const r = await api("/web/backends");
+    const b = await r.json();
+    fillBackends("m-backend", b.prometheus || []);
+    fillBackends("l-backend", b.loki || []);
+    setStatus("연결됨 · prom " + (b.prometheus||[]).length + " · loki " + (b.loki||[]).length, "ok");
+    loadSnapshots(); loadIncidents();
+  } catch (e) { /* status set by api() */ }
+}
+
+function fillBackends(id, names) {
+  const sel = document.getElementById(id);
+  sel.innerHTML = "";
+  if (!names.length) { sel.innerHTML = '<option value="">(none)</option>'; return; }
+  names.forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
+}
+
+async function loadSnapshots() {
+  const out = document.getElementById("snapshots-out");
+  try {
+    const data = await (await api("/web/snapshots")).json();
+    if (!data.length) { out.innerHTML = '<p class="muted">스냅샷 없음.</p>'; return; }
+    let h = "<table><tr><th>captured_at</th><th>kind</th><th>sections</th><th>host</th></tr>";
+    data.slice().reverse().forEach(s => {
+      h += "<tr><td>" + esc(s.captured_at) + "</td><td>" + esc(s.kind) + "</td><td>" +
+           ((s.sections||[]).length) + "</td><td>" + esc(s.host || "") + "</td></tr>";
+    });
+    out.innerHTML = h + "</table>";
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
+}
+
+async function loadIncidents() {
+  const out = document.getElementById("incidents-out");
+  try {
+    const data = await (await api("/web/incidents")).json();
+    if (!data.length) { out.innerHTML = '<p class="muted">인시던트 없음.</p>'; return; }
+    let h = "<table><tr><th>id</th><th>title</th><th>status</th><th>evidence</th><th>updated</th></tr>";
+    data.forEach(i => {
+      h += '<tr><td><a href="#" onclick="showReport(\'' + encodeURIComponent(i.id) + "');return false\">" +
+           esc(i.id) + "</a></td><td>" + esc(i.title) + "</td><td>" + esc(i.status) +
+           "</td><td>" + i.evidence_count + "</td><td>" + esc(i.updated_at) + "</td></tr>";
+    });
+    out.innerHTML = h + "</table>";
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
+}
+
+async function showReport(id) {
+  const pre = document.getElementById("report-out");
+  pre.style.display = "block";
+  pre.textContent = "로딩...";
+  try {
+    pre.textContent = await (await api("/web/incidents/" + id + "/report")).text();
+  } catch (e) { pre.textContent = e.message; }
+}
+
+async function runMetrics() {
+  const msg = document.getElementById("m-msg");
+  const backend = document.getElementById("m-backend").value;
+  const query = document.getElementById("m-query").value.trim();
+  if (!backend || !query) { msg.textContent = "backend와 query를 입력하세요."; return; }
+  const span = parseInt(document.getElementById("m-range").value, 10);
+  const end = Math.floor(Date.now() / 1000), start = end - span;
+  const step = Math.max(15, Math.floor(span / 240)) + "s";
+  msg.textContent = "질의 중...";
+  try {
+    const body = JSON.stringify({ backend, query, start: "" + start, end: "" + end, step });
+    const raw = await (await api("/web/metrics", { method: "POST", headers: { "Content-Type": "application/json" }, body })).json();
+    const series = promToSeries(raw);
+    drawChart(document.getElementById("m-canvas"), series);
+    msg.textContent = series.length ? (series.length + " series") : "결과 없음.";
+  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+}
+
+function promToSeries(raw) {
+  const res = (raw && raw.data && raw.data.result) || [];
+  return res.map(r => {
+    const name = metricName(r.metric);
+    let pts = [];
+    if (r.values) pts = r.values.map(v => [parseFloat(v[0]), parseFloat(v[1])]);
+    else if (r.value) pts = [[parseFloat(r.value[0]), parseFloat(r.value[1])]];
+    return { name, points: pts.filter(p => isFinite(p[1])) };
+  }).filter(s => s.points.length);
+}
+
+function metricName(m) {
+  if (!m) return "value";
+  if (m.__name__) { const o = Object.assign({}, m); delete o.__name__;
+    const lbls = Object.entries(o).map(e => e[0] + "=" + e[1]).join(","); return m.__name__ + (lbls ? "{" + lbls + "}" : ""); }
+  const e = Object.entries(m); return e.length ? e.map(x => x[0] + "=" + x[1]).join(",") : "value";
+}
+
+const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf","#ff7b72","#a5d6ff"];
+function drawChart(cv, series) {
+  const ctx = cv.getContext("2d"), W = cv.width, Ht = cv.height, pad = 38;
+  ctx.clearRect(0, 0, W, Ht);
+  const leg = document.getElementById("m-legend"); leg.innerHTML = "";
+  if (!series.length) { ctx.fillStyle = "#8b949e"; ctx.fillText("no data", pad, Ht/2); return; }
+  let xmin=Infinity,xmax=-Infinity,ymin=Infinity,ymax=-Infinity;
+  series.forEach(s => s.points.forEach(p => { xmin=Math.min(xmin,p[0]); xmax=Math.max(xmax,p[0]);
+    ymin=Math.min(ymin,p[1]); ymax=Math.max(ymax,p[1]); }));
+  if (ymin === ymax) { ymax = ymin + 1; }
+  const X = x => pad + (W-2*pad) * (xmax===xmin ? 0.5 : (x-xmin)/(xmax-xmin));
+  const Y = y => Ht-pad - (Ht-2*pad) * (y-ymin)/(ymax-ymin);
+  ctx.strokeStyle = "#30363d"; ctx.fillStyle = "#8b949e"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad,pad); ctx.lineTo(pad,Ht-pad); ctx.lineTo(W-pad,Ht-pad); ctx.stroke();
+  for (let i=0;i<=4;i++){ const v = ymin+(ymax-ymin)*i/4; const yy=Y(v);
+    ctx.fillText(fmt(v), 2, yy+3); ctx.strokeStyle="#21262d"; ctx.beginPath(); ctx.moveTo(pad,yy); ctx.lineTo(W-pad,yy); ctx.stroke(); }
+  series.slice(0,8).forEach((s,i) => {
+    ctx.strokeStyle = COLORS[i%COLORS.length]; ctx.lineWidth = 1.5; ctx.beginPath();
+    s.points.forEach((p,j) => { const xx=X(p[0]), yy=Y(p[1]); j?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy); });
+    ctx.stroke();
+    const sp = document.createElement("span"); sp.innerHTML = '<i style="background:'+COLORS[i%COLORS.length]+'"></i>'+esc(s.name);
+    leg.appendChild(sp);
+  });
+}
+function fmt(v){ const a=Math.abs(v); if(a>=1e6)return (v/1e6).toFixed(1)+"M"; if(a>=1e3)return (v/1e3).toFixed(1)+"k"; if(a<1&&a>0)return v.toFixed(3); return v.toFixed(1); }
+
+async function runLogs() {
+  const out = document.getElementById("l-out");
+  const backend = document.getElementById("l-backend").value;
+  const query = document.getElementById("l-query").value.trim();
+  if (!backend || !query) { out.textContent = "backend와 query를 입력하세요."; return; }
+  const span = parseInt(document.getElementById("l-range").value, 10);
+  const end = (Date.now()*1e6), start = end - span*1e9;
+  out.textContent = "질의 중...";
+  try {
+    const body = JSON.stringify({ backend, query, start: start.toFixed(0), end: end.toFixed(0), limit: 200 });
+    const raw = await (await api("/web/logs", { method: "POST", headers: { "Content-Type": "application/json" }, body })).json();
+    out.textContent = lokiToText(raw) || "(결과 없음)";
+  } catch (e) { out.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
+}
+
+function lokiToText(raw) {
+  const res = (raw && raw.data && raw.data.result) || [];
+  let rows = [];
+  res.forEach(stream => {
+    const lbl = metricName(stream.stream || stream.metric);
+    (stream.values || []).forEach(v => rows.push([parseInt(v[0],10), lbl, v[1]]));
+  });
+  rows.sort((a,b) => a[0]-b[0]);
+  return rows.map(r => new Date(r[0]/1e6).toISOString() + "  " + r[1] + "  " + r[2]).join("\n");
+}
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// 토큰 복원
+(function(){ const t = localStorage.getItem("aic_web_token"); if (t) { document.getElementById("tok").value = t; } })();
+</script>
+</body>
+</html>

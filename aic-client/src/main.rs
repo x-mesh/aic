@@ -1538,8 +1538,17 @@ async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
                 "--token 또는 AIC_WEB_TOKEN이 필요합니다 — web 노출은 인증 필수입니다."
             )
         })?;
+    // 관측 백엔드(Prometheus/Loki)는 config에서 읽어 metrics/logs 질의에 재사용한다(없으면 503).
+    let obs_config = ConfigManager::load()
+        .map(|c| c.observability)
+        .unwrap_or_default();
     eprintln!("aic web (read-only) → http://{bind}  ·  auth: Bearer <token>  ·  Ctrl+C 종료");
-    aic_client::web::serve(aic_client::web::WebConfig { bind, token }).await
+    aic_client::web::serve(aic_client::web::WebConfig {
+        bind,
+        token,
+        obs_config,
+    })
+    .await
 }
 
 /// 1회 캡처. best-effort: probe/sandbox 실패도 exit 0 + stderr 경고(L0/L1 철학 — 타이머가 실패로 죽지 않게).
