@@ -2,13 +2,20 @@
 //!
 //! `aic chat`의 agentic 실행면(run_command·LLM chat)은 **노출하지 않는다**. 오직 이미 수집된
 //! read-only 자산만 HTTP로 서빙한다:
-//! - `GET /web/snapshots`           — 스냅샷 store(`~/.aic/snapshots/`) JSON
-//! - `GET /web/incidents`           — RCA 인시던트 목록 JSON
-//! - `GET /web/incidents/{id}/report` — RCA report.md(redaction 재적용) markdown
+//! - `GET  /`                        — 자체완결 대시보드(외부 CDN 없음 — VPN/오프라인 대응)
+//! - `GET  /web/snapshots`           — 스냅샷 store(`~/.aic/snapshots/`) JSON
+//! - `GET  /web/incidents`           — RCA 인시던트 목록 JSON
+//! - `GET  /web/incidents/{id}/report` — RCA report.md(redaction 재적용) markdown
+//! - `GET  /web/backends`            — 등록된 Prometheus/Loki 백엔드 이름
+//! - `POST /web/metrics`             — PromQL 질의(ObsClient 재사용, redacted bounded JSON)
+//! - `POST /web/logs`               — LogQL 질의(ObsClient 재사용, redacted bounded JSON)
 //!
 //! 설계 근거(investigate/scaffold): web에 `run_command`를 여는 보안 부담을 피하고, web의 유일한
 //! 실강점(시각화·공유)만 취한다. 노출은 **on-demand**(`aic web --bind`, 기본 미기동) + **토큰 필수**
 //! (webhook의 secret-미설정 우회 함정을 닫는다 — VPN은 네트워크 경계지 인증이 아니다).
+//!
+//! 데이터 엔드포인트(`/web/*`)는 Bearer 토큰을 요구한다. 대시보드 셸(`/`, `/web/health`)은 민감
+//! 데이터가 없어 인증을 면제한다 — 사용자가 페이지에서 토큰을 입력하면 JS가 이후 fetch에 Bearer로 싣는다.
 
 use std::sync::Arc;
 
@@ -17,33 +24,52 @@ use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
+use serde_json::{json, Value};
 
+use crate::agent::obs_tools::ObsClient;
 use crate::{rca, redaction, snapshot_store};
 
+/// 대시보드 셸(자체완결 HTML+JS, 외부 의존 없음).
+const DASHBOARD: &str = include_str!("web_dashboard.html");
+
 /// web 서버 구성. `token`은 빈 문자열이 아니어야 한다(호출부 `handle_web`에서 보장).
+/// `obs_config`로 관측 백엔드(Prometheus/Loki) 질의를 활성화한다(등록 백엔드 없으면 metrics/logs 비활성).
 pub struct WebConfig {
     pub bind: String,
     pub token: String,
+    pub obs_config: aic_common::ObservabilityConfig,
 }
 
 struct WebState {
     token: String,
+    /// 등록 관측 백엔드가 있을 때만 Some. 없으면 metrics/logs는 503.
+    obs: Option<ObsClient>,
 }
 
 /// 읽기 전용 대시보드를 `cfg.bind`에 바인드하고 Ctrl+C까지 서빙한다.
 pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.bind).await?;
-    let state = Arc::new(WebState { token: cfg.token });
+    // 등록 백엔드가 있을 때만 ObsClient 생성(없거나 실패면 metrics/logs는 503으로 graceful).
+    let obs = ObsClient::new(&cfg.obs_config)
+        .ok()
+        .filter(|c| !c.is_empty());
+    let state = Arc::new(WebState {
+        token: cfg.token,
+        obs,
+    });
 
     let app = Router::new()
         .route("/web/health", get(|| async { "ok" }))
-        .route("/", get(index))
+        .route("/", get(dashboard))
         .route("/web/snapshots", get(snapshots))
         .route("/web/incidents", get(incidents))
         .route("/web/incidents/{id}/report", get(incident_report))
+        .route("/web/backends", get(backends))
+        .route("/web/metrics", post(metrics))
+        .route("/web/logs", post(logs))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state);
 
@@ -55,14 +81,15 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bearer 토큰 인증 미들웨어. `/web/health`만 면제(헬스 체크). 나머지는 `Authorization: Bearer <token>`
-/// 상수시간 일치를 요구한다.
-async fn require_token(
-    State(state): State<Arc<WebState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    if req.uri().path() == "/web/health" {
+/// 인증 면제 경로 — 대시보드 셸과 헬스 체크(민감 데이터 없음). 나머지 `/web/*`는 Bearer 토큰 필수.
+fn auth_exempt(path: &str) -> bool {
+    path == "/" || path == "/web/health"
+}
+
+/// Bearer 토큰 인증 미들웨어. [`auth_exempt`] 경로만 면제하고, 나머지는
+/// `Authorization: Bearer <token>` 상수시간 일치를 요구한다.
+async fn require_token(State(state): State<Arc<WebState>>, req: Request, next: Next) -> Response {
+    if auth_exempt(req.uri().path()) {
         return next.run(req).await;
     }
     let header = req
@@ -104,17 +131,13 @@ fn internal(_e: anyhow::Error) -> (StatusCode, &'static str) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
 }
 
-/// 최소 인덱스 — 엔드포인트 안내(프런트엔드 차트는 후속).
-async fn index() -> Response {
-    let body = "<!doctype html><meta charset=utf-8><title>aic web</title>\
-<h1>aic web (read-only)</h1><ul>\
-<li><a href=\"/web/snapshots\">/web/snapshots</a></li>\
-<li><a href=\"/web/incidents\">/web/incidents</a></li>\
-</ul><p>auth: Authorization: Bearer &lt;token&gt;</p>";
-    ([(CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+/// 대시보드 셸(자체완결 HTML).
+async fn dashboard() -> Response {
+    ([(CONTENT_TYPE, "text/html; charset=utf-8")], DASHBOARD).into_response()
 }
 
-async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (StatusCode, &'static str)> {
+async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (StatusCode, &'static str)>
+{
     let snaps = snapshot_store::load_snapshots().map_err(internal)?;
     Ok(Json(snaps))
 }
@@ -136,6 +159,46 @@ async fn incident_report(Path(id): Path<String>) -> Result<Response, (StatusCode
         redacted,
     )
         .into_response())
+}
+
+/// 등록된 관측 백엔드 이름(타입별). 프런트엔드 드롭다운용. 백엔드 없으면 빈 목록.
+async fn backends(State(state): State<Arc<WebState>>) -> Json<Value> {
+    use aic_common::BackendType;
+    let (prom, loki) = match &state.obs {
+        Some(o) => (
+            o.backend_names_of(BackendType::Prometheus),
+            o.backend_names_of(BackendType::Loki),
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+    Json(json!({ "prometheus": prom, "loki": loki }))
+}
+
+/// PromQL 질의 — ObsClient를 그대로 재사용(redacted·bounded JSON). 백엔드 미등록이면 503.
+async fn metrics(State(state): State<Arc<WebState>>, Json(args): Json<Value>) -> Response {
+    obs_query(&state, "prometheus_query", &args).await
+}
+
+/// LogQL 질의 — ObsClient를 그대로 재사용(redacted·bounded JSON). 백엔드 미등록이면 503.
+async fn logs(State(state): State<Arc<WebState>>, Json(args): Json<Value>) -> Response {
+    obs_query(&state, "loki_query", &args).await
+}
+
+/// 관측 질의 공통 — ObsClient.run의 출력(이미 redact·bounded)을 application/json으로 서빙한다.
+/// 백엔드 allowlist·URL 검증·결과 bound는 모두 ObsClient가 담당한다(web은 얇은 어댑터).
+async fn obs_query(state: &WebState, tool: &str, args: &Value) -> Response {
+    let Some(obs) = &state.obs else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "관측 백엔드가 등록되지 않았습니다 ([observability.backends.*])\n",
+        )
+            .into_response();
+    };
+    match obs.run(tool, args).await {
+        Ok(body) => ([(CONTENT_TYPE, "application/json")], body).into_response(),
+        // ObsClient 에러는 backend 이름/사용법 안내(secret 아님) — 400으로 그대로 surface.
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +229,30 @@ mod tests {
         assert!(!bearer_ok(Some("Basic s3cret"), "s3cret"));
         // 토큰만 있고 스킴 없음.
         assert!(!bearer_ok(Some("s3cret"), "s3cret"));
+    }
+
+    #[test]
+    fn auth_exempt_only_shell_and_health() {
+        // 셸·헬스만 면제.
+        assert!(auth_exempt("/"));
+        assert!(auth_exempt("/web/health"));
+        // 데이터 엔드포인트는 전부 인증 필수.
+        assert!(!auth_exempt("/web/snapshots"));
+        assert!(!auth_exempt("/web/incidents"));
+        assert!(!auth_exempt("/web/metrics"));
+        assert!(!auth_exempt("/web/logs"));
+        assert!(!auth_exempt("/web/backends"));
+    }
+
+    #[test]
+    fn dashboard_html_is_self_contained() {
+        // 외부 CDN/원격 스크립트 의존이 없어야 한다(VPN/오프라인 대응).
+        assert!(!DASHBOARD.contains("http://"));
+        assert!(!DASHBOARD.contains("https://"));
+        assert!(!DASHBOARD.contains("src=\"//"));
+        // 핵심 엔드포인트를 호출한다.
+        assert!(DASHBOARD.contains("/web/backends"));
+        assert!(DASHBOARD.contains("/web/metrics"));
+        assert!(DASHBOARD.contains("Bearer "));
     }
 }
