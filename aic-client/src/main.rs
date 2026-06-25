@@ -927,7 +927,11 @@ async fn main() {
             json,
             all,
         }) => handle_status(watch, interval, session, json, all).await,
-        Some(Commands::Ssh { target, cmd, identity_file }) => handle_hosts_ping(target, cmd, identity_file).await,
+        Some(Commands::Ssh {
+            target,
+            cmd,
+            identity_file,
+        }) => handle_hosts_ping(target, cmd, identity_file).await,
         Some(Commands::Hosts { op }) => match op {
             HostsOp::Show { name, json } => handle_hosts_show(name, json),
             HostsOp::Ping {
@@ -1530,13 +1534,14 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
 /// `aic web` — 읽기 전용 대시보드 기동. 토큰은 `--token` 또는 `AIC_WEB_TOKEN`이 반드시 있어야 한다
 /// (web 노출은 인증 필수 — VPN은 네트워크 경계지 인증이 아니다). Ctrl+C로 graceful 종료.
 async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
+    // 포트 누락(`--bind 127.0.0.1`)은 흔한 실수인데 tokio bind는 "invalid socket address"로만
+    // 떨어져 원인을 안 짚는다 — 호스트명도 resolve 대상이므로 SocketAddr 전체 파싱 대신 포트만 검증.
+    validate_bind(&bind)?;
     let token = token
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "--token 또는 AIC_WEB_TOKEN이 필요합니다 — web 노출은 인증 필수입니다."
-            )
+            anyhow::anyhow!("--token 또는 AIC_WEB_TOKEN이 필요합니다 — web 노출은 인증 필수입니다.")
         })?;
     // 관측 백엔드(Prometheus/Loki)는 config에서 읽어 metrics/logs 질의에 재사용한다(없으면 503).
     let obs_config = ConfigManager::load()
@@ -1549,6 +1554,22 @@ async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
         obs_config,
     })
     .await
+}
+
+/// `--bind` 값에 포트가 붙어 있는지만 확인한다. 호스트명(`localhost`)도 tokio가 resolve하므로
+/// IP 파싱은 하지 않고, IPv6 bracket(`[::1]:8787`)과 일반(`host:port`)에서 끝의 `:포트`만 본다.
+fn validate_bind(bind: &str) -> anyhow::Result<()> {
+    let port = if let Some(rest) = bind.strip_prefix('[') {
+        rest.rsplit_once("]:").map(|(_, p)| p)
+    } else {
+        bind.rsplit_once(':').map(|(_, p)| p)
+    };
+    match port {
+        Some(p) if p.parse::<u16>().is_ok() => Ok(()),
+        _ => anyhow::bail!(
+            "--bind 주소에 포트가 없습니다: '{bind}' — '{bind}:8787'처럼 포트를 붙여주세요."
+        ),
+    }
 }
 
 /// 1회 캡처. best-effort: probe/sandbox 실패도 exit 0 + stderr 경고(L0/L1 철학 — 타이머가 실패로 죽지 않게).
@@ -1699,9 +1720,7 @@ fn handle_snapshot_install(interval: u64, no_load: bool) -> anyhow::Result<()> {
         );
     } else {
         let cmd = match report.platform {
-            aic_client::daemon_install::Platform::Macos => {
-                "launchctl bootstrap gui/$UID <plist>"
-            }
+            aic_client::daemon_install::Platform::Macos => "launchctl bootstrap gui/$UID <plist>",
             _ => "systemctl --user enable --now aic-snapshot.timer",
         };
         println!("  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}");
@@ -1716,7 +1735,9 @@ fn handle_snapshot_uninstall() -> anyhow::Result<()> {
         println!("{COL_GREEN}✓{COL_RESET} {plat} 주기 캡처 타이머 제거 완료");
         println!("  unit: {}", report.unit_path.display());
     } else {
-        println!("{COL_DIM}{plat} 타이머 unit 파일이 이미 없습니다 (이전 unload만 정리){COL_RESET}");
+        println!(
+            "{COL_DIM}{plat} 타이머 unit 파일이 이미 없습니다 (이전 unload만 정리){COL_RESET}"
+        );
     }
     Ok(())
 }
@@ -2454,7 +2475,11 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
     }
 
     // auto-attach 스니펫은 source보다 앞 (위 ATTACH_SNIPPET 주석의 진입 순서 참조).
-    let attach = if effective_no_attach { "" } else { ATTACH_SNIPPET };
+    let attach = if effective_no_attach {
+        ""
+    } else {
+        ATTACH_SNIPPET
+    };
     let snippet = format!(
         "{MARKER_BEGIN}\n{attach}source {hook}\n{MARKER_END}\n",
         hook = hook_path.display()
@@ -2760,10 +2785,9 @@ fn print_audit_records(records: &[aic_client::audit::AuditRecord], json: bool) {
     }
     println!("audit 이벤트 {}개:", records.len());
     for r in records {
-        let ts = r
-            .ts
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "?".to_string());
+        let ts =
+            r.ts.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "?".to_string());
         let host = r.host.as_deref().unwrap_or("-");
         // raw data 한 줄 요약(길면 cap).
         let mut summary = r.raw.to_string();
@@ -2789,7 +2813,10 @@ fn handle_audit_batch_verify(date: Option<String>) {
     let segments: Vec<std::path::PathBuf> = if let Some(d) = &date {
         let p = audit_dir.join(format!("{d}.jsonl"));
         if !p.exists() {
-            eprintln!("{COL_YELLOW}⚠{COL_RESET} segment not found: {}", p.display());
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} segment not found: {}",
+                p.display()
+            );
             std::process::exit(3);
         }
         vec![p]
@@ -2797,7 +2824,10 @@ fn handle_audit_batch_verify(date: Option<String>) {
         match list_segments(&audit_dir) {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
-                println!("{COL_YELLOW}⚠{COL_RESET} no audit segments in {}", audit_dir.display());
+                println!(
+                    "{COL_YELLOW}⚠{COL_RESET} no audit segments in {}",
+                    audit_dir.display()
+                );
                 std::process::exit(0);
             }
             Err(e) => {
@@ -3015,26 +3045,25 @@ async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<Pa
 
     // target 해석 우선순위: `@group`/등록명 → resolve_pattern.
     // 그 외에 `user@host[:port]` 패턴이면 ad-hoc 임시 호스트(인벤토리 미저장).
-    let mut hosts: Vec<aic_client::agent::hosts::HostEntry> = if target.starts_with('@')
-        || inv.host(&target).is_some()
-    {
-        match inv.resolve_pattern(&target) {
-            Ok(refs) => refs.into_iter().cloned().collect(),
-            Err(e) => {
-                eprintln!("{COL_RED}✗{COL_RESET} {e}");
-                std::process::exit(1);
+    let mut hosts: Vec<aic_client::agent::hosts::HostEntry> =
+        if target.starts_with('@') || inv.host(&target).is_some() {
+            match inv.resolve_pattern(&target) {
+                Ok(refs) => refs.into_iter().cloned().collect(),
+                Err(e) => {
+                    eprintln!("{COL_RED}✗{COL_RESET} {e}");
+                    std::process::exit(1);
+                }
             }
-        }
-    } else if let Some(ad_hoc) = parse_ad_hoc(&target) {
-        vec![ad_hoc]
-    } else {
-        eprintln!(
-            "{COL_RED}✗{COL_RESET} host not found: {target}\n\
+        } else if let Some(ad_hoc) = parse_ad_hoc(&target) {
+            vec![ad_hoc]
+        } else {
+            eprintln!(
+                "{COL_RED}✗{COL_RESET} host not found: {target}\n\
              → 인벤토리 등록명, `@group`, 또는 `user@host[:port]` 형식만 허용.\n\
              → `aic hosts show`로 인벤토리 확인."
-        );
-        std::process::exit(1);
-    };
+            );
+            std::process::exit(1);
+        };
 
     // -i 옵션이 주어지면 모든 대상 호스트의 identity_file을 일회성으로 override.
     if let Some(idf) = identity_file.as_ref() {
@@ -3119,13 +3148,15 @@ async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<Pa
 
     // Audit batch — best-effort. 실패해도 진단은 계속 진행하되 stderr에 경고.
     let mut appender = match dirs::home_dir().map(|h| h.join(".aic").join("audit")) {
-        Some(dir) => match aic_client::agent::audit_batch::BatchAppender::open(dir, batch_id.clone()) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                eprintln!("{COL_YELLOW}⚠ audit batch open 실패(계속):{COL_RESET} {e:#}");
-                None
+        Some(dir) => {
+            match aic_client::agent::audit_batch::BatchAppender::open(dir, batch_id.clone()) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("{COL_YELLOW}⚠ audit batch open 실패(계속):{COL_RESET} {e:#}");
+                    None
+                }
             }
-        },
+        }
         None => None,
     };
     if let Some(a) = appender.as_mut() {
@@ -3155,17 +3186,69 @@ async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<Pa
     // 진단 헤더: 카운트 + 실패 호스트명 inline (5개 초과면 +N more).
     let c = r.counts();
     let mut parts_buf: Vec<String> = Vec::new();
-    if c.ok > 0 { parts_buf.push(format!("{COL_GREEN}{} ok{COL_RESET}", c.ok)); }
-    if c.ok_warn > 0 { parts_buf.push(format!("{COL_YELLOW}{} ok_warn{COL_RESET}", c.ok_warn)); }
+    if c.ok > 0 {
+        parts_buf.push(format!("{COL_GREEN}{} ok{COL_RESET}", c.ok));
+    }
+    if c.ok_warn > 0 {
+        parts_buf.push(format!("{COL_YELLOW}{} ok_warn{COL_RESET}", c.ok_warn));
+    }
     // 실패 카테고리는 호스트명 inline.
-    add_named(&mut parts_buf, "unreachable", c.unreachable, COL_YELLOW, &r.results, HostStatus::Unreachable);
-    add_named(&mut parts_buf, "timeout", c.timeout, COL_RED, &r.results, HostStatus::Timeout);
-    add_named(&mut parts_buf, "auth_fail", c.auth_fail, COL_RED, &r.results, HostStatus::AuthFail);
-    add_named(&mut parts_buf, "proxy_fail", c.proxy_fail, COL_RED, &r.results, HostStatus::ProxyFail);
-    add_named(&mut parts_buf, "remote_err", c.remote_err, COL_RED, &r.results, HostStatus::RemoteErr);
-    add_named(&mut parts_buf, "host_key_mismatch", c.host_key_mismatch, COL_RED, &r.results, HostStatus::HostKeyMismatch);
-    if c.cancelled > 0 { parts_buf.push(format!("{COL_RED}{} cancelled{COL_RESET}", c.cancelled)); }
-    println!("  {} · {:.1}s elapsed", parts_buf.join(" · "), elapsed.as_secs_f32());
+    add_named(
+        &mut parts_buf,
+        "unreachable",
+        c.unreachable,
+        COL_YELLOW,
+        &r.results,
+        HostStatus::Unreachable,
+    );
+    add_named(
+        &mut parts_buf,
+        "timeout",
+        c.timeout,
+        COL_RED,
+        &r.results,
+        HostStatus::Timeout,
+    );
+    add_named(
+        &mut parts_buf,
+        "auth_fail",
+        c.auth_fail,
+        COL_RED,
+        &r.results,
+        HostStatus::AuthFail,
+    );
+    add_named(
+        &mut parts_buf,
+        "proxy_fail",
+        c.proxy_fail,
+        COL_RED,
+        &r.results,
+        HostStatus::ProxyFail,
+    );
+    add_named(
+        &mut parts_buf,
+        "remote_err",
+        c.remote_err,
+        COL_RED,
+        &r.results,
+        HostStatus::RemoteErr,
+    );
+    add_named(
+        &mut parts_buf,
+        "host_key_mismatch",
+        c.host_key_mismatch,
+        COL_RED,
+        &r.results,
+        HostStatus::HostKeyMismatch,
+    );
+    if c.cancelled > 0 {
+        parts_buf.push(format!("{COL_RED}{} cancelled{COL_RESET}", c.cancelled));
+    }
+    println!(
+        "  {} · {:.1}s elapsed",
+        parts_buf.join(" · "),
+        elapsed.as_secs_f32()
+    );
 
     // severity-sort: 가장 심각한 카드가 위로(host_key_mismatch > auth_fail > ... > ok).
     let mut sorted: Vec<&aic_client::agent::remote::RemoteResult> = r.results.iter().collect();
@@ -3251,9 +3334,10 @@ async fn handle_hosts_ping(target: String, cmd: String, identity_file: Option<Pa
     }
 
     // exit code: 모든 호스트가 ok/ok_warn이면 0, 하나라도 실패면 1.
-    let all_ok = r.results.iter().all(|res| {
-        matches!(res.status, HostStatus::Ok | HostStatus::OkWithWarn)
-    });
+    let all_ok = r
+        .results
+        .iter()
+        .all(|res| matches!(res.status, HostStatus::Ok | HostStatus::OkWithWarn));
     std::process::exit(if all_ok { 0 } else { 1 });
 }
 
@@ -3328,7 +3412,10 @@ async fn try_auto_trust(host: &aic_client::agent::hosts::HostEntry, stderr: &str
     use aic_client::agent::remote::tofu;
     use std::io::{IsTerminal, Write};
 
-    if !stderr.to_lowercase().contains("host key verification failed") {
+    if !stderr
+        .to_lowercase()
+        .contains("host key verification failed")
+    {
         return false;
     }
     if !std::io::stdin().is_terminal() {
@@ -3361,7 +3448,9 @@ async fn try_auto_trust(host: &aic_client::agent::hosts::HostEntry, stderr: &str
         }
     };
 
-    let Some(home) = dirs::home_dir() else { return false };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
     let known_hosts = home.join(".ssh").join("known_hosts");
     if let Err(e) = tofu::append_known_hosts(&known_hosts, &scan.host_keys) {
         eprintln!("  {COL_RED}✗{COL_RESET} known_hosts append 실패: {e:#}");
@@ -3378,9 +3467,7 @@ async fn try_auto_trust(host: &aic_client::agent::hosts::HostEntry, stderr: &str
 /// stderr 패턴별 단계적 해결 안내(RFC-005 §4.4 U3).
 async fn print_auth_fail_hint(stderr: &str) {
     let agent = probe_local_ssh_agent().await;
-    println!(
-        "  {COL_BOLD}local ssh-agent{COL_RESET}  (auto-probed)"
-    );
+    println!("  {COL_BOLD}local ssh-agent{COL_RESET}  (auto-probed)");
     match agent {
         SshAgentStatus::NoSocket => println!("    SSH_AUTH_SOCK: {COL_YELLOW}unset{COL_RESET}  → ssh-agent를 시작하거나 `eval $(ssh-agent)`"),
         SshAgentStatus::NoKeys(sock) => {
@@ -3543,7 +3630,10 @@ async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
         }
     };
 
-    println!("\n{COL_BOLD}수집한 host key{COL_RESET} ({} 종)", scan.host_keys.len());
+    println!(
+        "\n{COL_BOLD}수집한 host key{COL_RESET} ({} 종)",
+        scan.host_keys.len()
+    );
     for key in &scan.host_keys {
         let fp = match tofu::fingerprint_sha256(&key.known_hosts_line).await {
             Ok(f) => f,
@@ -3552,7 +3642,10 @@ async fn handle_hosts_trust(name: String, timeout_secs: u32, yes: bool) {
                 continue;
             }
         };
-        println!("    {COL_BOLD}{}{COL_RESET}  {COL_GREEN}{fp}{COL_RESET}", key.key_type);
+        println!(
+            "    {COL_BOLD}{}{COL_RESET}  {COL_GREEN}{fp}{COL_RESET}",
+            key.key_type
+        );
     }
     println!(
         "\n{COL_YELLOW}⚠ 보안:{COL_RESET} ssh-keyscan은 MITM 공격에 노출될 수 있다. fingerprint를"
@@ -3623,10 +3716,7 @@ async fn probe_local_ssh_agent() -> SshAgentStatus {
             if combined.contains("no identities") || combined.contains("agent has no") {
                 SshAgentStatus::NoKeys(sock)
             } else {
-                let keys = combined
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .count();
+                let keys = combined.lines().filter(|l| !l.trim().is_empty()).count();
                 SshAgentStatus::Loaded { sock, keys }
             }
         }
@@ -6552,7 +6642,8 @@ async fn handle_chat(
                 .llm_available(llm_registered);
                 // provider/model 표시는 실제 등록된 경우에만 — 미등록이면 배너에 잘못된 default를 안 띄운다.
                 if llm_registered {
-                    session = session.with_provider_model(provider_name.clone(), model_name.clone());
+                    session =
+                        session.with_provider_model(provider_name.clone(), model_name.clone());
                 }
                 session.run().await?;
             }
@@ -6678,7 +6769,10 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 println!("{}", serde_json::to_string_pretty(&meta)?);
             } else {
                 println!("RCA 생성: {}", meta.id);
-                println!("경로: {}", aic_client::rca::incident_dir(&meta.id).display());
+                println!(
+                    "경로: {}",
+                    aic_client::rca::incident_dir(&meta.id).display()
+                );
                 if diagnose {
                     println!("초동 진단 evidence 저장: E{}", meta.evidence_count);
                 }
@@ -7758,7 +7852,7 @@ mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled,
         is_destructive_command, parse_session_capture_mode, resolve_init_modes, resolve_provider,
-        Cli, Commands, ATTACH_SNIPPET,
+        validate_bind, Cli, Commands, ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -7771,6 +7865,20 @@ mod tests {
     fn chat_run_command_default_enabled() {
         // 기본 chat(opt-out 없음) → run_command 활성.
         assert!(chat_run_command_enabled(false, false));
+    }
+
+    #[test]
+    fn validate_bind_requires_port() {
+        // 포트 있으면 통과: IPv4 / 호스트명 / IPv6 bracket / 와일드카드.
+        assert!(validate_bind("127.0.0.1:8787").is_ok());
+        assert!(validate_bind("localhost:8787").is_ok());
+        assert!(validate_bind("[::1]:8787").is_ok());
+        assert!(validate_bind("0.0.0.0:80").is_ok());
+        // 포트 없거나 잘못된 포트는 거부 — 흔한 실수(`--bind 127.0.0.1`)를 선제 안내.
+        assert!(validate_bind("127.0.0.1").is_err());
+        assert!(validate_bind("localhost").is_err());
+        assert!(validate_bind("127.0.0.1:").is_err());
+        assert!(validate_bind("127.0.0.1:99999").is_err());
     }
 
     #[test]
@@ -7794,7 +7902,8 @@ mod tests {
         }
         // 증상 앞·사이에 섞인 flag도 동일하게 동작(증상은 단어만 모음).
         let cli2 =
-            Cli::try_parse_from(["aic", "diagnose", "--no-analyze", "disk", "--json", "full"]).unwrap();
+            Cli::try_parse_from(["aic", "diagnose", "--no-analyze", "disk", "--json", "full"])
+                .unwrap();
         match cli2.command {
             Some(Commands::Diagnose {
                 symptom,
