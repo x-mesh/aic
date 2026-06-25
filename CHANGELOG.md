@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-25
+
+### Added
+- **`aic web` 로컬 대시보드 (MVP-0)** — 토큰으로 게이트되는 read-only 웹 대시보드를 on-demand로 띄운다
+  (`aic web`). 라이브 로컬 자원 차트(CPU·메모리·디스크·네트워크)를 zero-config·self-contained로
+  제공하고, metrics/logs 쿼리 엔드포인트와 차트 대시보드를 포함한다.
+- **chat 관찰(observability) 탭** — 대시보드에서 실행 중·과거 `aic chat` 세션을 추적한다. chat run
+  registry가 세션 메타데이터를 기록하고, 프로세스 fallback으로 registry에 없는 활성 세션도 노출한다.
+
+### Security
+- **web 대시보드 보안 하드닝** — path traversal 차단, incident 목록의 민감정보 redaction, SSRF 및 응답
+  헤더 방어를 적용했다.
+
 ## [0.24.0] - 2026-06-23
 
 ### Added
