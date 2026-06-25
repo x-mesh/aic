@@ -10,6 +10,7 @@
 //! - `GET  /web/incidents/{id}/report` — RCA report.md(redaction 재적용) markdown
 //! - `GET  /web/audit`               — aicd 감사 로그(`audit.log`) tail(redacted)
 //! - `GET  /web/history`             — aicd CommandRecordStore 최근 세션 명령(없으면 available:false)
+//! - `GET  /web/chat[/{session}]`    — aic chat 세션/명령/audit 관측 timeline(read-only)
 //! - `GET  /web/webhooks`            — webhook alert ingestion 이벤트 tail(redacted, 없으면 빈 목록)
 //! - `GET  /web/config`              — 현재 config 요약(토큰/secret 미노출)
 //! - `GET  /web/backends`            — 등록된 Prometheus/Loki 백엔드 이름(없으면 빈 목록)
@@ -57,6 +58,9 @@ const RING_CAP: usize = 300;
 const AUDIT_TAIL: usize = 200;
 const WEBHOOK_TAIL: usize = 100;
 const HISTORY_TAIL: usize = 50;
+const CHAT_SESSION_LIMIT: usize = 20;
+const CHAT_RECORD_TAIL: usize = 30;
+const CHAT_AUDIT_TAIL: usize = 80;
 /// runtime health는 audit verify 등 파일 IO를 포함하므로 resource 샘플보다 느슨하게 갱신한다.
 const RUNTIME_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 /// resource 탭 top process 목록 길이. 너무 길면 2초 샘플마다 JSON payload와 UI scan 비용이 커진다.
@@ -225,6 +229,8 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/incidents/{id}/report", get(incident_report))
         .route("/web/audit", get(audit_log))
         .route("/web/history", get(history))
+        .route("/web/chat", get(chat_observability))
+        .route("/web/chat/{session}", get(chat_observability_for_session))
         .route("/web/webhooks", get(webhooks))
         .route("/web/config", get(config_view))
         .route("/web/backends", get(backends))
@@ -940,6 +946,183 @@ async fn history() -> Json<Value> {
     Json(json!({ "available": true, "session": session, "records": records }))
 }
 
+/// `aic chat` 관측 view. 실행 권한은 노출하지 않고, aicd registry/session command store와 audit tail을
+/// 결합해 "어떤 세션에서 어떤 명령/이벤트가 있었는지"를 탐색 가능하게 만든다.
+async fn chat_observability() -> Json<Value> {
+    chat_observability_inner(None).await
+}
+
+async fn chat_observability_for_session(Path(session): Path<String>) -> Json<Value> {
+    chat_observability_inner(Some(session)).await
+}
+
+async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    if !matches!(client.ping().await, Ok(true)) {
+        return Json(json!({
+            "available": false,
+            "reason": "aicd가 실행 중이지 않습니다 — aic daemon start 후 aic chat/session을 실행하세요.",
+            "sessions": [],
+            "timeline": [],
+            "stats": {
+                "session_count": 0,
+                "command_count": 0,
+                "failed_count": 0,
+                "audit_count": 0,
+            }
+        }));
+    }
+
+    let mut sessions = match client.list_sessions().await {
+        Ok(s) => s,
+        Err(e) => {
+            return Json(json!({
+                "available": false,
+                "reason": format!("aicd 세션 목록 조회 실패: {e}"),
+                "sessions": [],
+                "timeline": [],
+            }))
+        }
+    };
+    sessions.sort_by(|a, b| session_sort_millis(b).cmp(&session_sort_millis(a)));
+
+    let selected = selected_arg
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| sessions.first().map(|s| s.id.clone()));
+
+    let mut session_rows = Vec::new();
+    let mut selected_records = Vec::new();
+    let mut command_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for s in sessions.iter().take(CHAT_SESSION_LIMIT) {
+        let records = client
+            .get_recent_commands_for_session(&s.id, CHAT_RECORD_TAIL)
+            .await
+            .unwrap_or_default();
+        command_count += records.len();
+        failed_count += records.iter().filter(|r| r.exit_code != 0).count();
+        if selected.as_deref() == Some(s.id.as_str()) {
+            selected_records = records.clone();
+        }
+        let last = records.last();
+        session_rows.push(json!({
+            "id": s.id,
+            "label": s.label,
+            "state": format!("{:?}", s.state),
+            "pid": s.pid,
+            "created_at": s.created_at,
+            "last_seen_at": s.last_seen_at,
+            "last_command_at": s.last_command_at,
+            "attached_tty": s.attached_tty.as_ref().map(|v| redaction::redact(v).0),
+            "shell": s.shell.as_ref().map(|v| redaction::redact(v).0),
+            "cwd": s.cwd.as_ref().map(|p| redaction::redact(&p.display().to_string()).0),
+            "record_count": records.len(),
+            "failed_count": records.iter().filter(|r| r.exit_code != 0).count(),
+            "last_exit_code": last.map(|r| r.exit_code),
+            "last_command": last.and_then(|r| r.command.as_ref()).map(|c| truncate_chars(&redaction::redact(c).0, 120)),
+        }));
+    }
+
+    if selected_records.is_empty() {
+        if let Some(id) = selected.as_deref() {
+            selected_records = client
+                .get_recent_commands_for_session(id, CHAT_RECORD_TAIL)
+                .await
+                .unwrap_or_default();
+        }
+    }
+
+    let audit_records = audit::tail_events(CHAT_AUDIT_TAIL).unwrap_or_default();
+    let mut timeline = Vec::new();
+    for r in &selected_records {
+        let command = r
+            .command
+            .as_ref()
+            .map(|c| redaction::redact(c).0)
+            .unwrap_or_else(|| "(no command)".to_string());
+        let output = redaction::redact(&r.output_lines.join("\n")).0;
+        timeline.push(json!({
+            "ts": r.timestamp,
+            "ts_ms": r.timestamp.timestamp_millis(),
+            "kind": "command",
+            "status": if r.exit_code == 0 { "ok" } else { "error" },
+            "title": truncate_chars(&command, 160),
+            "summary": format!("exit {} · {} output lines", r.exit_code, r.output_lines.len()),
+            "detail": {
+                "id": r.id,
+                "command": command,
+                "exit_code": r.exit_code,
+                "capture_mode": format!("{:?}", r.capture_mode),
+                "capture_quality": format!("{:?}", r.capture_quality),
+                "output_preview": truncate_chars(&output, 4000),
+                "output_metadata": r.output_metadata.clone(),
+            }
+        }));
+    }
+    for r in &audit_records {
+        let data = redacted_json_value(&r.raw);
+        let ts_ms = r.ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
+        timeline.push(json!({
+            "ts": r.ts,
+            "ts_ms": ts_ms,
+            "kind": "audit",
+            "status": audit_status(&r.kind),
+            "title": r.kind,
+            "summary": r.host.as_deref().unwrap_or("local"),
+            "detail": data,
+        }));
+    }
+    timeline.sort_by(|a, b| {
+        b.get("ts_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .cmp(&a.get("ts_ms").and_then(Value::as_i64).unwrap_or(0))
+    });
+
+    Json(json!({
+        "available": true,
+        "selected_session": selected,
+        "sessions": session_rows,
+        "timeline": timeline,
+        "stats": {
+            "session_count": sessions.len(),
+            "shown_session_count": sessions.len().min(CHAT_SESSION_LIMIT),
+            "command_count": command_count,
+            "failed_count": failed_count,
+            "audit_count": audit_records.len(),
+        }
+    }))
+}
+
+fn session_sort_millis(s: &aic_common::SessionInfo) -> i64 {
+    s.last_seen_at
+        .or(s.last_command_at)
+        .unwrap_or(s.created_at)
+        .timestamp_millis()
+}
+
+fn audit_status(kind: &str) -> &'static str {
+    let k = kind.to_ascii_lowercase();
+    if k.contains("blocked") || k.contains("denied") || k.contains("error") || k.contains("fail") {
+        "error"
+    } else if k.contains("warn") || k.contains("degrade") || k.contains("timeout") {
+        "warn"
+    } else {
+        "event"
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// aicd webhook alert ingestion 이벤트(`webhook-events.jsonl`) tail. 파일 부재는 빈 목록(에러 아님).
 /// 자유 텍스트 필드(action/source/alert)에 redaction을 적용한다.
 async fn webhooks() -> Json<Vec<Value>> {
@@ -1144,6 +1327,7 @@ mod tests {
         // 새 데이터 엔드포인트도 토큰 필수(감사/명령기록/webhook/config 모두 민감).
         assert!(!auth_exempt("/web/audit"));
         assert!(!auth_exempt("/web/history"));
+        assert!(!auth_exempt("/web/chat"));
         assert!(!auth_exempt("/web/webhooks"));
         assert!(!auth_exempt("/web/config"));
     }

@@ -255,6 +255,34 @@
   .card.ok .state-label { background: var(--ok-soft); border-color: color-mix(in oklch, var(--ok), white 45%); }
   .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); gap: 14px; }
   .runtime-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .chat-shell { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 12px; align-items: start; }
+  .chat-sessions, .chat-main {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    box-shadow: 0 1px 2px color-mix(in oklch, var(--text), transparent 92%);
+  }
+  .chat-sessions { padding: 8px; }
+  .chat-session {
+    display: grid;
+    gap: 3px;
+    width: 100%;
+    min-height: 58px;
+    margin-bottom: 6px;
+    padding: 8px;
+    text-align: left;
+    background: var(--surface);
+  }
+  .chat-session.active { border-color: var(--accent); background: var(--accent-soft); }
+  .chat-session strong { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+  .chat-session span { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+  .chat-main { padding: 12px; }
+  .chat-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 12px; }
+  .chat-timeline { overflow-x: auto; }
+  .chat-timeline table { min-width: 760px; }
+  .chat-detail { margin-top: 12px; }
+  .chat-detail pre { max-height: 320px; margin: 0; }
   .process-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 12px; margin-bottom: 18px; }
   .resource-detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 12px; margin-bottom: 18px; }
   .process-panel, .resource-panel {
@@ -357,7 +385,7 @@
   .legend { min-height: 19px; color: var(--muted); font-size: 12px; margin-top: 7px; }
   .legend span { margin-right: 12px; } .legend i { display: inline-block; width: 9px; height: 9px;
            border-radius: 2px; margin-right: 4px; vertical-align: middle; }
-  #snapshots-out, #incidents-out, #audit-out, #history-out, #webhooks-out { overflow-x: auto; }
+  #snapshots-out, #incidents-out, #audit-out, #history-out, #webhooks-out, #chat-out { overflow-x: auto; }
   table {
     border-collapse: separate;
     border-spacing: 0;
@@ -446,6 +474,7 @@
     main { padding: 12px; }
     .panel-head { align-items: flex-start; flex-direction: column; }
     .cards { grid-template-columns: repeat(auto-fit, minmax(138px, 1fr)); }
+    .chat-shell { grid-template-columns: 1fr; }
     .pressure-metrics { grid-template-columns: 1fr; }
     .resource-panel-head { align-items: flex-start; flex-direction: column; }
     .row input.q { min-width: 100%; }
@@ -478,6 +507,7 @@
 </header>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
   <button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="resources" data-panel="resources" onclick="tab(this)">Resources</button>
+  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="chat" data-panel="chat" onclick="tab(this)">Chat</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="snapshots" data-panel="snapshots" onclick="tab(this)">Snapshots</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="incidents" data-panel="incidents" onclick="tab(this)">Incidents</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="audit" data-panel="audit" onclick="tab(this)">Audit</button>
@@ -527,6 +557,19 @@
       </div>
       <div id="network-detail"></div>
     </section>
+  </section>
+
+  <section id="chat" class="panel" role="tabpanel">
+    <div class="panel-head">
+      <div>
+        <h2>Chat observability</h2>
+        <p class="panel-sub">aicd sessions · command records · audit correlation</p>
+      </div>
+      <button type="button" onclick="loadChat()">새로고침</button>
+    </div>
+    <div id="chat-out">
+      <div class="empty-state"><strong>연결 후 표시</strong><span>aic chat/session 실행 흔적을 read-only로 탐색</span></div>
+    </div>
   </section>
 
   <section id="snapshots" class="panel" role="tabpanel">
@@ -596,7 +639,7 @@
 </main>
 
 <script>
-let TOKEN = "", timer = null, lastPoints = [], SNAPS = [];
+let TOKEN = "", timer = null, lastPoints = [], SNAPS = [], CHAT = null;
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) {
@@ -622,6 +665,7 @@ function tab(btn) {
   });
   document.querySelectorAll("main .panel").forEach(p => p.classList.remove("active"));
   document.getElementById(btn.dataset.panel).classList.add("active");
+  if (btn.dataset.panel === "chat") loadChat();
   if (btn.dataset.panel === "snapshots") loadSnapshots();
   if (btn.dataset.panel === "incidents") loadIncidents();
   if (btn.dataset.panel === "audit") loadAudit();
@@ -1048,6 +1092,92 @@ function showSnapshot(idx) {
   }).join("");
 }
 function snapToggleAll(open) { document.querySelectorAll("#snap-sections details.sec").forEach(d => d.open = open); }
+
+// ── chat observability ───────────────────────────────────
+async function loadChat(session) {
+  if (!TOKEN) return;
+  const out = document.getElementById("chat-out");
+  try {
+    const path = "/web/chat" + (session ? "/" + encodeURIComponent(session) : "");
+    CHAT = await (await api(path)).json();
+    renderChat(CHAT);
+  } catch (e) {
+    out.innerHTML = '<p class="err">' + esc(e.message) + "</p>";
+  }
+}
+function chatBadge(status) {
+  if (status === "error") return badge("error", "bad");
+  if (status === "warn") return badge("warn", "warn");
+  if (status === "ok") return badge("ok", "ok");
+  return badge(status || "event", "muted");
+}
+function renderChat(d) {
+  const out = document.getElementById("chat-out");
+  if (!d || !d.available) {
+    out.innerHTML = '<div class="empty-state"><strong>chat 관측 불가</strong><span>' + esc((d && d.reason) || "aicd 상태 확인 필요") + '</span></div>';
+    return;
+  }
+  const sessions = d.sessions || [];
+  const selected = d.selected_session || "";
+  const stats = d.stats || {};
+  const sessionList = sessions.length ? sessions.map(s =>
+    '<button type="button" class="chat-session ' + (s.id === selected ? "active" : "") + '" data-session="' + esc(s.id) + '">' +
+      '<strong>' + esc(s.label || s.id) + '</strong>' +
+      '<span>' + esc(s.state || "unknown") + ' · records ' + esc(s.record_count || 0) + ' · failed ' + esc(s.failed_count || 0) + '</span>' +
+      '<span>' + esc(s.cwd || s.shell || "no context") + '</span>' +
+    '</button>'
+  ).join("") : '<div class="empty-state"><strong>세션 없음</strong><span>aic chat 또는 aic-session 실행 후 표시</span></div>';
+  out.innerHTML =
+    '<div class="chat-shell">' +
+      '<aside class="chat-sessions">' + sessionList + '</aside>' +
+      '<section class="chat-main">' +
+        '<div class="chat-summary">' +
+          card("Sessions", String(stats.session_count || 0), "shown " + (stats.shown_session_count || 0), "", "") +
+          card("Commands", String(stats.command_count || 0), "selected window", "", "") +
+          card("Failures", String(stats.failed_count || 0), "non-zero exits", stats.failed_count ? "warn" : "ok", "") +
+          card("Audit events", String(stats.audit_count || 0), "tail correlation", "", "") +
+        '</div>' +
+        '<div class="chat-timeline" id="chat-timeline"></div>' +
+        '<div class="chat-detail" id="chat-detail"></div>' +
+      '</section>' +
+    '</div>';
+  out.querySelectorAll(".chat-session").forEach(btn => btn.addEventListener("click", () => loadChat(btn.dataset.session)));
+  renderChatTimeline(d.timeline || []);
+}
+function renderChatTimeline(items) {
+  const box = document.getElementById("chat-timeline");
+  const detail = document.getElementById("chat-detail");
+  if (!box || !detail) return;
+  if (!items.length) {
+    box.innerHTML = '<div class="empty-state"><strong>timeline 없음</strong><span>선택한 세션에 command record가 없고 audit tail도 비어 있음</span></div>';
+    detail.innerHTML = "";
+    return;
+  }
+  let h = '<table><tr><th>time</th><th>kind</th><th>status</th><th>event</th><th>summary</th></tr>';
+  items.forEach((x, i) => {
+    h += '<tr class="clk" data-idx="' + i + '"><td>' + esc(fmtTs(x.ts)) + '</td><td>' + esc(x.kind || "") +
+      '</td><td>' + chatBadge(x.status) + '</td><td>' + esc(x.title || "") +
+      '</td><td>' + esc(x.summary || "") + '</td></tr>';
+  });
+  box.innerHTML = h + "</table>";
+  box.querySelectorAll("tr.clk").forEach(tr => tr.addEventListener("click", () => showChatDetail(+tr.dataset.idx)));
+  showChatDetail(0);
+}
+function showChatDetail(idx) {
+  const detail = document.getElementById("chat-detail");
+  const item = CHAT && CHAT.timeline && CHAT.timeline[idx];
+  if (!detail || !item) return;
+  document.querySelectorAll("#chat-timeline tr.clk").forEach(tr => tr.classList.toggle("sel", +tr.dataset.idx === idx));
+  if (item.kind === "command") {
+    const d = item.detail || {};
+    detail.innerHTML = '<details class="sec" open><summary><strong>' + esc(d.id || "command") + '</strong>' +
+      chatBadge(item.status) + '<span class="cmd">' + esc(d.command || "") + '</span></summary>' +
+      '<pre>' + esc(d.output_preview || "(output 없음)") + '</pre></details>';
+    return;
+  }
+  detail.innerHTML = '<details class="sec" open><summary><strong>' + esc(item.title || "audit") + '</strong>' +
+    chatBadge(item.status) + '</summary>' + renderJsonTable(item.detail || {}) + '</details>';
+}
 async function loadIncidents() {
   if (!TOKEN) return; const out = document.getElementById("incidents-out");
   try {
