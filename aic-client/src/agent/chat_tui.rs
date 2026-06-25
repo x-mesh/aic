@@ -248,6 +248,46 @@ fn install_panic_hook() {
     });
 }
 
+/// 전면 TUI(마우스 캡처 + alternate screen) 중 외부 SIGINT/SIGTERM/SIGHUP/SIGQUIT로 **비정상 종료**될
+/// 때도 터미널을 복원하도록 시그널 핸들러를 1회 설치한다. panic hook(정상 panic)·teardown(정상 종료)은
+/// 이 경로를 못 거치므로 — 셸은 "terminated"만 찍고 마우스 모드/alternate screen이 PTY에 살아남아,
+/// 복귀한 셸에 마우스 모션 좌표(`35;col;row M`)가 텍스트로 새어든다.
+///
+/// raw mode에선 ISIG가 꺼져 Ctrl+C가 키 이벤트로 들어오므로(이 핸들러로 안 옴) 외부 kill·pane close에만
+/// 반응한다. async-signal-safe하게 **상수 escape 시퀀스만** fd 1에 직접 write하고(crossterm/alloc 미사용),
+/// 디폴트 처분으로 되돌린 뒤 같은 신호를 re-raise해 프로세스가 올바른 신호 상태로 종료되게 한다
+/// (셸 job control의 "terminated" 표기 유지). cooked mode로 새어 들어온 신호엔 시퀀스가 no-op이라 무해하다.
+fn install_signal_handler() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        // SAFETY: 핸들러는 async-signal-safe한 write/signal/raise만 호출하고 힙 할당을 하지 않는다.
+        unsafe {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+                libc::signal(sig, restore_terminal_on_signal as *const () as libc::sighandler_t);
+            }
+        }
+    });
+}
+
+/// async-signal-safe 시그널 핸들러: 마우스 모드(노멀/버튼/모션/urxvt/SGR) 끄기 + 커서 표시 +
+/// alternate screen 떠나기 시퀀스만 fd 1에 직접 write한 뒤, 디폴트 처분으로 신호를 재발생시킨다.
+/// raw mode(termios)는 복귀한 셸의 line editor가 tcsetattr로 자체 복원하므로 여기서 건드리지 않는다.
+extern "C" fn restore_terminal_on_signal(sig: libc::c_int) {
+    const RESTORE: &[u8] =
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1015l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+    // SAFETY: 상수 바이트 슬라이스의 직접 write — async-signal-safe. 반환값은 무시(핸들러 내 에러 처리 불가).
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            RESTORE.as_ptr() as *const libc::c_void,
+            RESTORE.len(),
+        );
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
 /// ChatLoop task를 띄우고 핸들을 돌려준다. TTY 전용(호출 측이 확인). `with_statusbar`면 2초마다
 /// 시스템 지표를 status bar에 갱신한다(non-TTY/opt-out은 호출 측에서 Direct 경로로 우회).
 pub(crate) fn start_chat_loop(
@@ -256,6 +296,7 @@ pub(crate) fn start_chat_loop(
     recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> ChatHandle {
     install_panic_hook();
+    install_signal_handler();
     let (line_tx, line_rx) = mpsc::channel::<ChatLine>(8);
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
     // 취소 채널: 용량 1이면 충분(중복 Ctrl+C는 try_send 실패로 자연 병합). turn마다 drain_cancel로 비운다.

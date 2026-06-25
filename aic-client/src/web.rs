@@ -45,7 +45,7 @@ use crate::config::ConfigManager;
 use crate::history::resolve_session_id;
 use crate::uds_client::UdsClient;
 use crate::{audit, rca, redaction, snapshot_store, snapshot_timer};
-use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
+use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// 대시보드 셸(자체완결 HTML+JS, 외부 의존 없음).
 const DASHBOARD: &str = include_str!("web_dashboard.html");
@@ -958,10 +958,28 @@ async fn chat_observability_for_session(Path(session): Path<String>) -> Json<Val
 
 async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
     let client = UdsClient::new(aic_common::aicd_socket_path());
-    if !matches!(client.ping().await, Ok(true)) {
+    let mut chat_runs = crate::chat_registry::list_recent(CHAT_SESSION_LIMIT).unwrap_or_default();
+    mark_stale_chat_runs(&mut chat_runs);
+    let history_fallback = chat_history_fallback();
+    if !chat_runs.iter().any(|r| r.status == "active") {
+        let known_pids: Vec<u32> = chat_runs.iter().map(|r| r.pid).collect();
+        chat_runs.extend(chat_process_fallback(
+            history_fallback.as_ref(),
+            &known_pids,
+        ));
+        chat_runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        chat_runs.truncate(CHAT_SESSION_LIMIT);
+    }
+    if chat_runs.is_empty() {
+        if let Some(history) = history_fallback {
+            chat_runs.push(history);
+        }
+    }
+    let aicd_online = matches!(client.ping().await, Ok(true));
+    if !aicd_online && chat_runs.is_empty() {
         return Json(json!({
             "available": false,
-            "reason": "aicd가 실행 중이지 않습니다 — aic daemon start 후 aic chat/session을 실행하세요.",
+            "reason": "aicd와 aic chat registry가 비어 있습니다 — aic chat 또는 aic-session을 실행하세요.",
             "sessions": [],
             "timeline": [],
             "stats": {
@@ -973,23 +991,34 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
         }));
     }
 
-    let mut sessions = match client.list_sessions().await {
-        Ok(s) => s,
-        Err(e) => {
-            return Json(json!({
-                "available": false,
-                "reason": format!("aicd 세션 목록 조회 실패: {e}"),
-                "sessions": [],
-                "timeline": [],
-            }))
+    let mut sessions = if aicd_online {
+        match client.list_sessions().await {
+            Ok(s) => s,
+            Err(e) if chat_runs.is_empty() => {
+                return Json(json!({
+                    "available": false,
+                    "reason": format!("aicd 세션 목록 조회 실패: {e}"),
+                    "sessions": [],
+                    "timeline": [],
+                }))
+            }
+            Err(_) => Vec::new(),
         }
+    } else {
+        Vec::new()
     };
     sessions.sort_by(|a, b| session_sort_millis(b).cmp(&session_sort_millis(a)));
 
     let selected = selected_arg
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .or_else(|| sessions.first().map(|s| s.id.clone()));
+        .or_else(|| sessions.first().map(|s| s.id.clone()))
+        .or_else(|| chat_runs.first().map(|r| chat_session_id(&r.run_id)));
+
+    let selected_chat_run = selected
+        .as_deref()
+        .and_then(|id| id.strip_prefix("chat:"))
+        .and_then(|run_id| chat_runs.iter().find(|r| r.run_id == run_id).cloned());
 
     let mut session_rows = Vec::new();
     let mut selected_records = Vec::new();
@@ -1009,6 +1038,7 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
         let last = records.last();
         session_rows.push(json!({
             "id": s.id,
+            "kind": "aicd",
             "label": s.label,
             "state": format!("{:?}", s.state),
             "pid": s.pid,
@@ -1025,7 +1055,27 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
         }));
     }
 
-    if selected_records.is_empty() {
+    for r in chat_runs.iter().take(CHAT_SESSION_LIMIT) {
+        session_rows.push(json!({
+            "id": chat_session_id(&r.run_id),
+            "kind": "chat",
+            "label": format!("aic chat {}", r.run_id),
+            "state": r.status,
+            "pid": r.pid,
+            "created_at": r.started_at,
+            "last_seen_at": r.updated_at,
+            "last_command_at": Value::Null,
+            "attached_tty": Value::Null,
+            "shell": Value::Null,
+            "cwd": r.cwd.as_ref().map(|v| redaction::redact(v).0),
+            "record_count": r.turn_count,
+            "failed_count": 0,
+            "last_exit_code": Value::Null,
+            "last_command": r.last_input,
+        }));
+    }
+
+    if selected_records.is_empty() && selected_chat_run.is_none() {
         if let Some(id) = selected.as_deref() {
             selected_records = client
                 .get_recent_commands_for_session(id, CHAT_RECORD_TAIL)
@@ -1036,6 +1086,33 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
 
     let audit_records = audit::tail_events(CHAT_AUDIT_TAIL).unwrap_or_default();
     let mut timeline = Vec::new();
+
+    if let Some(run) = &selected_chat_run {
+        timeline.push(json!({
+            "ts": run.updated_at,
+            "ts_ms": run.updated_at.timestamp_millis(),
+            "kind": "chat",
+            "status": run.status,
+            "title": format!("aic chat {}", run.run_id),
+            "summary": format!("{} turns · pid {}", run.turn_count, run.pid),
+            "detail": {
+                "run_id": run.run_id,
+                "pid": run.pid,
+                "status": run.status,
+                "started_at": run.started_at,
+                "updated_at": run.updated_at,
+                "ended_at": run.ended_at,
+                "cwd": run.cwd,
+                "provider": run.provider,
+                "model": run.model,
+                "allow_run_command": run.allow_run_command,
+                "llm_available": run.llm_available,
+                "turn_count": run.turn_count,
+                "last_input": run.last_input,
+            }
+        }));
+    }
+
     for r in &selected_records {
         let command = r
             .command
@@ -1061,7 +1138,13 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
             }
         }));
     }
+
     for r in &audit_records {
+        if let Some(run) = &selected_chat_run {
+            if !r.raw.to_string().contains(&run.run_id) {
+                continue;
+            }
+        }
         let data = redacted_json_value(&r.raw);
         let ts_ms = r.ts.map(|ts| ts.timestamp_millis()).unwrap_or(0);
         timeline.push(json!({
@@ -1087,8 +1170,9 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
         "sessions": session_rows,
         "timeline": timeline,
         "stats": {
-            "session_count": sessions.len(),
-            "shown_session_count": sessions.len().min(CHAT_SESSION_LIMIT),
+            "session_count": sessions.len() + chat_runs.len(),
+            "shown_session_count": session_rows.len(),
+            "chat_run_count": chat_runs.len(),
             "command_count": command_count,
             "failed_count": failed_count,
             "audit_count": audit_records.len(),
@@ -1101,6 +1185,110 @@ fn session_sort_millis(s: &aic_common::SessionInfo) -> i64 {
         .or(s.last_command_at)
         .unwrap_or(s.created_at)
         .timestamp_millis()
+}
+
+fn chat_session_id(run_id: &str) -> String {
+    format!("chat:{run_id}")
+}
+
+fn chat_history_fallback() -> Option<crate::chat_registry::ChatRunRecord> {
+    let history = crate::repl::load_chat_history();
+    let last_input = history
+        .last()
+        .map(|s| truncate_chars(&redaction::redact(s).0, 180))?;
+    let updated_at = fs::metadata(crate::repl::chat_history_path())
+        .and_then(|m| m.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .unwrap_or_else(|_| chrono::Utc::now());
+    Some(crate::chat_registry::ChatRunRecord {
+        run_id: "history".to_string(),
+        pid: 0,
+        status: "history".to_string(),
+        started_at: updated_at,
+        updated_at,
+        ended_at: None,
+        cwd: None,
+        provider: None,
+        model: None,
+        allow_run_command: false,
+        llm_available: false,
+        turn_count: history.len() as u64,
+        last_input: Some(last_input),
+    })
+}
+
+fn mark_stale_chat_runs(runs: &mut [crate::chat_registry::ChatRunRecord]) {
+    if !runs.iter().any(|r| r.status == "active" && r.pid != 0) {
+        return;
+    }
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    for run in runs {
+        if run.status == "active" && run.pid != 0 && sys.process(Pid::from_u32(run.pid)).is_none() {
+            run.status = "stale".to_string();
+            run.ended_at = Some(run.updated_at);
+        }
+    }
+}
+
+fn chat_process_fallback(
+    history: Option<&crate::chat_registry::ChatRunRecord>,
+    known_pids: &[u32],
+) -> Vec<crate::chat_registry::ChatRunRecord> {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::OnlyIfNotSet),
+    );
+    let now = chrono::Utc::now();
+    let mut out = Vec::new();
+    for process in sys.processes().values() {
+        let pid = process.pid().as_u32();
+        if known_pids.contains(&pid) {
+            continue;
+        }
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if !looks_like_aic_chat_cmd(&cmd) {
+            continue;
+        }
+        let started_at =
+            chrono::DateTime::<chrono::Utc>::from_timestamp(process.start_time() as i64, 0)
+                .unwrap_or(now);
+        out.push(crate::chat_registry::ChatRunRecord {
+            run_id: format!("process{:x}", pid),
+            pid,
+            status: "process".to_string(),
+            started_at,
+            updated_at: now,
+            ended_at: None,
+            cwd: process.cwd().map(|p| p.display().to_string()),
+            provider: None,
+            model: None,
+            allow_run_command: false,
+            llm_available: false,
+            turn_count: history.map(|h| h.turn_count).unwrap_or(0),
+            last_input: history.and_then(|h| h.last_input.clone()),
+        });
+    }
+    out
+}
+
+fn looks_like_aic_chat_cmd(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "chat")
+        && args.iter().any(|arg| {
+            std::path::Path::new(arg)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "aic" || name == "aic-client")
+                .unwrap_or(false)
+        })
 }
 
 fn audit_status(kind: &str) -> &'static str {
@@ -1445,6 +1633,27 @@ mod tests {
         assert_eq!(out["nested"]["ok"], true);
         assert_eq!(out["token"], "[REDACTED:bearer_token]");
         assert_eq!(out["nested"]["email"], "[REDACTED:email]");
+    }
+
+    #[test]
+    fn chat_process_matcher_requires_aic_chat() {
+        assert!(looks_like_aic_chat_cmd(&[
+            "/tmp/aic".to_string(),
+            "chat".to_string()
+        ]));
+        assert!(looks_like_aic_chat_cmd(&[
+            "/tmp/aic-client".to_string(),
+            "--flag".to_string(),
+            "chat".to_string()
+        ]));
+        assert!(!looks_like_aic_chat_cmd(&[
+            "/tmp/aic".to_string(),
+            "web".to_string()
+        ]));
+        assert!(!looks_like_aic_chat_cmd(&[
+            "/tmp/other".to_string(),
+            "chat".to_string()
+        ]));
     }
 
     #[test]

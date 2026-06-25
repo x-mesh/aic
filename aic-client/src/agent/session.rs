@@ -36,7 +36,8 @@ provider 등록: `aic config set llm.default_provider <name>` + config.toml `[ll
 LLM 없이도 status bar와 /local·/watch·/metrics·/logs 등 진단 명령은 사용할 수 있습니다.";
 
 /// LLM 미등록 세션에서 (slash가 아닌) 채팅을 입력했을 때의 턴별 안내.
-const NO_LLM_TURN_HINT: &str = "등록된 LLM이 없어 답변할 수 없습니다 — provider 등록 후 다시 시도하세요 \
+const NO_LLM_TURN_HINT: &str =
+    "등록된 LLM이 없어 답변할 수 없습니다 — provider 등록 후 다시 시도하세요 \
 (진단 명령 /local·/watch·/metrics 등은 그대로 사용 가능).";
 
 /// SRE 모드(run_command 활성) 전용 시스템 지침. generic preface 뒤에 덧붙인다.
@@ -233,6 +234,8 @@ pub struct AgentSession {
     model: Option<String>,
     /// 세션 correlation id(run). debug/card/audit에서 tool call들을 묶는다.
     run_id: String,
+    /// web 관측 registry에 표시할 사용자 입력 수.
+    turn_count: u64,
     /// tool call 순번 — correlation id `{run_id}.{seq}`로 사용.
     tool_seq: u64,
     /// in-memory tool 실행 기록(P2-1 `/last`·`/raw` 조회용). 상한 ring buffer.
@@ -280,6 +283,7 @@ impl AgentSession {
             provider: None,
             model: None,
             run_id: new_run_id(),
+            turn_count: 0,
             tool_seq: 0,
             tool_records: VecDeque::new(),
             compare_baseline: None,
@@ -365,6 +369,7 @@ impl AgentSession {
             crate::snapshot_store::record_enabled(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.chat_registry_start();
 
         use std::io::IsTerminal;
         let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -378,8 +383,29 @@ impl AgentSession {
             self.run_loop_direct().await
         };
         // 루프 종료(=세션 종료) 시점에 1회 저장 → `/resume`로 복원. best-effort(출력 없음).
+        self.chat_registry_finish();
         self.save_session();
         result
+    }
+
+    fn chat_registry_start(&self) {
+        let _ = crate::chat_registry::start(crate::chat_registry::ChatRunStart {
+            run_id: self.run_id.clone(),
+            cwd: Some(self.sandbox.root().display().to_string()),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            allow_run_command: self.allow_run_command,
+            llm_available: self.llm_available,
+        });
+    }
+
+    fn chat_registry_touch(&mut self, input: &str) {
+        self.turn_count = self.turn_count.saturating_add(1);
+        let _ = crate::chat_registry::touch_input(&self.run_id, input);
+    }
+
+    fn chat_registry_finish(&self) {
+        let _ = crate::chat_registry::finish(&self.run_id);
     }
 
     /// 시작 배너 + context 헤더(banner opt-out이면 생략). Direct/Tui 공용.
@@ -436,6 +462,7 @@ impl AgentSession {
             if input.is_empty() {
                 continue;
             }
+            self.chat_registry_touch(input);
 
             // slash 명령은 LLM 전송 전에 가로채 처리한다 — history/context에 push하지 않고,
             // 출력은 stderr로만 내보내 stdout(LLM 답변)을 오염시키지 않는다.
@@ -464,11 +491,8 @@ impl AgentSession {
         // 여부를 lane_live로 기록해 `/record` 안내가 실제 동작과 일치하게 한다.
         let statusbar = ui::statusbar_enabled();
         self.recording_lane_live = statusbar;
-        let mut handle = super::chat_tui::start_chat_loop(
-            prompt,
-            statusbar,
-            self.snapshot_recording.clone(),
-        );
+        let mut handle =
+            super::chat_tui::start_chat_loop(prompt, statusbar, self.snapshot_recording.clone());
         self.out = ChatOut::Tui(handle.out_sender());
 
         // 시작 배너 — alternate screen이라 stderr 배너는 안 보이므로 대화 로그에 넣는다(step 8 후속).
@@ -502,12 +526,11 @@ impl AgentSession {
             if input.is_empty() {
                 continue;
             }
+            self.chat_registry_touch(input);
             if let Some(cmd) = tool_record::parse_slash(input) {
                 // slash 처리 동안 spin으로 즉시 반응 + 입력 차단(probe 수집 등으로 무반응·중복 실행
                 // 되던 문제 해소). 분석 단계의 run_analysis가 라벨을 "분석 중…"으로 덮어쓴다.
-                self.out
-                    .spin_start(format!("{input} 처리 중…"), "90")
-                    .await;
+                self.out.spin_start(format!("{input} 처리 중…"), "90").await;
                 // Ctrl+C 취소: probe 수집/분석이 길어질 때 중단(future drop). 직전 잔여 신호는 drain.
                 handle.drain_cancel();
                 let cancelled = tokio::select! {
@@ -601,7 +624,8 @@ impl AgentSession {
             let resp = if let Some(tx) = chunk_sink {
                 self.dispatcher
                     .send_messages_streaming(&self.history, &specs, |delta| {
-                        let _ = tx.try_send(super::chat_tui::OutMsg::AnswerChunk(delta.to_string()));
+                        let _ =
+                            tx.try_send(super::chat_tui::OutMsg::AnswerChunk(delta.to_string()));
                     })
                     .await
             } else {
@@ -810,10 +834,7 @@ impl AgentSession {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let preview = build_write_preview(&call.name, &args, &self.sandbox);
             self.out.note(&preview).await;
-            let ok = self
-                .out
-                .confirm(&format!("⚠ {path} 쓰기? [y/N]"))
-                .await;
+            let ok = self.out.confirm(&format!("⚠ {path} 쓰기? [y/N]")).await;
             if ok {
                 tools::execute(&call.name, &args, &self.sandbox)
             } else {
@@ -950,9 +971,7 @@ impl AgentSession {
             SlashCommand::Snapshots(n) => self.handle_snapshots(n).await,
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()).await,
             SlashCommand::Rca(cmd) => self.handle_rca(cmd).await,
-            SlashCommand::Triage { topic, run } => {
-                self.handle_triage(topic.as_deref(), run).await
-            }
+            SlashCommand::Triage { topic, run } => self.handle_triage(topic.as_deref(), run).await,
             SlashCommand::Watch {
                 target,
                 count,
@@ -1276,8 +1295,7 @@ impl AgentSession {
             return;
         }
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
-        let probes =
-            super::diagnose::select_probes(symptom, super::diagnose::docker_available());
+        let probes = super::diagnose::select_probes(symptom, super::diagnose::docker_available());
         self.out
             .note(&format!(
                 "=== diagnose: {} ===",
@@ -1328,7 +1346,10 @@ impl AgentSession {
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
         if !do_analyze {
             self.out
-                .note(&format!("=== explain-last (raw evidence) ===\n{}", evidence))
+                .note(&format!(
+                    "=== explain-last (raw evidence) ===\n{}",
+                    evidence
+                ))
                 .await;
             return;
         }
@@ -1356,7 +1377,10 @@ impl AgentSession {
         }
         let do_analyze = tool_record::local_analyze_enabled(analyze, env_local_no_analyze());
         self.out
-            .note(&format!("=== incident: {} ===", name.unwrap_or("(unnamed)")))
+            .note(&format!(
+                "=== incident: {} ===",
+                name.unwrap_or("(unnamed)")
+            ))
             .await;
 
         // raw 모드는 full 출력(print_bodies=true)을 보이고, analyze 모드는 조용히 수집한 뒤
@@ -1437,7 +1461,9 @@ impl AgentSession {
         } else {
             report
         };
-        self.out.note(&format!("\n=== aic doctor ===\n{body}")).await;
+        self.out
+            .note(&format!("\n=== aic doctor ===\n{body}"))
+            .await;
     }
 
     /// `/fix` — 직전 대화·진단 맥락에서 지금 실행하면 좋을 **안전한 명령 하나**를 run_command로
@@ -1470,10 +1496,9 @@ impl AgentSession {
         if let RecordAction::Now = action {
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
-            let res = tokio::task::spawn_blocking(|| {
-                super::snapshot_capture::capture_forced("manual")
-            })
-            .await;
+            let res =
+                tokio::task::spawn_blocking(|| super::snapshot_capture::capture_forced("manual"))
+                    .await;
             let msg = match res {
                 Ok(Ok(Some(path))) => format!("✓ 스냅샷 캡처 → {}", path.display()),
                 Ok(Ok(None)) => "스냅샷이 기록되지 않았습니다.".to_string(),
@@ -1547,7 +1572,9 @@ impl AgentSession {
             .snapshot_recording
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            let cwd = std::env::current_dir().ok().map(|p| p.display().to_string());
+            let cwd = std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string());
             let rec = crate::snapshot_store::SnapshotRecord::new(
                 "compare",
                 &snapshot,
@@ -1674,7 +1701,11 @@ impl AgentSession {
         ));
 
         match super::bundle::write_bundle(name, &evidence) {
-            Ok(path) => self.out.note(&format!("\nbundle 저장됨: {}", path.display())).await,
+            Ok(path) => {
+                self.out
+                    .note(&format!("\nbundle 저장됨: {}", path.display()))
+                    .await
+            }
             Err(e) => self.out.note(&format!("\nbundle 저장 실패: {e}")).await,
         }
     }
@@ -2293,8 +2324,14 @@ fn build_write_preview(name: &str, args: &serde_json::Value, sandbox: &Sandbox) 
             out
         }
         "edit_file" => {
-            let old_string = args.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
-            let new_string = args.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+            let old_string = args
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new_string = args
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             format!(
                 "[edit_file] {path}\n- {}\n+ {}",
                 cap_preview_str(old_string, WRITE_PREVIEW_STR_CAP),
