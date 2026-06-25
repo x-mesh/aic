@@ -617,7 +617,7 @@ fn fd_soft_limit() -> Option<u64> {
     if lim.rlim_cur == libc::RLIM_INFINITY {
         None
     } else {
-        Some(lim.rlim_cur as u64)
+        Some(lim.rlim_cur)
     }
 }
 
@@ -967,7 +967,7 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
             history_fallback.as_ref(),
             &known_pids,
         ));
-        chat_runs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        chat_runs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         chat_runs.truncate(CHAT_SESSION_LIMIT);
     }
     if chat_runs.is_empty() {
@@ -1007,7 +1007,7 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
     } else {
         Vec::new()
     };
-    sessions.sort_by(|a, b| session_sort_millis(b).cmp(&session_sort_millis(a)));
+    sessions.sort_by_key(|b| std::cmp::Reverse(session_sort_millis(b)));
 
     let selected = selected_arg
         .map(|s| s.trim().to_string())
