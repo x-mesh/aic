@@ -85,11 +85,14 @@ const PROCESS_NET_SAMPLE: usize = 50;
 /// Linux kernel-stack raw 출력 문자 상한(payload bound). macOS는 구조화 파싱이라 미사용.
 #[cfg(target_os = "linux")]
 const SAMPLE_CAP: usize = 12000;
-/// macOS `sample` 샘플링 윈도(초). 길수록 통계가 안정되나 요청이 길어진다.
-#[cfg(target_os = "macos")]
+/// 스택 샘플 윈도(초). macOS `sample`/Linux `perf record` 둘 다 이 시간 동안 샘플링한다.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SAMPLE_SECS: u64 = 2;
+/// Linux `perf record` 샘플링 주파수(Hz). 99는 timer interrupt와 lock-step되는 100Hz를 피하는 관행.
+#[cfg(target_os = "linux")]
+const PERF_HZ: &str = "99";
 /// 구조화 샘플에서 노출할 hot frame(self-time 상위) 개수.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const HOT_FRAMES: usize = 25;
 /// web 접근 감사 이벤트 kind — 누가/언제/어디서 대시보드를 봤는지 audit log(HMAC chain)에 남긴다.
 const WEB_ACCESS_KIND: &str = "web_access";
@@ -1113,7 +1116,10 @@ fn run_stack_sample(pid: u32) -> Option<Value> {
     }
     #[cfg(target_os = "linux")]
     {
-        // /proc/<pid>/stack은 kernel wait-channel 스택만 — userspace hotspot은 perf 필요(추후).
+        // 우선 perf로 userspace CPU 프로파일을 시도하고, 미설치/권한 실패 시 kernel stack 스냅샷으로 강등.
+        if let Some(v) = run_perf_sample(pid) {
+            return Some(v);
+        }
         let stack = std::fs::read_to_string(format!("/proc/{pid}/stack")).ok()?;
         if stack.trim().is_empty() {
             return None;
@@ -1125,7 +1131,8 @@ fn run_stack_sample(pid: u32) -> Option<Value> {
             "hot_frames": [],
             "threads": [],
             "total_samples": 0,
-            "note": "Linux는 /proc/<pid>/stack(kernel wait-channel)만 제공 — userspace 프로파일은 perf 필요(예정).",
+            "note": "perf 사용 불가(미설치 또는 perf_event_paranoid 권한) — kernel wait-channel 스택만 표시. \
+                     userspace 프로파일은 perf_event_paranoid<=1 또는 root 필요.",
             "raw": redaction::redact(&truncate_chars(&stack, SAMPLE_CAP)).0,
         }))
     }
@@ -1248,6 +1255,106 @@ fn parse_top_frame(s: &str) -> Option<(&str, &str, u64)> {
     let binary = after[..close].trim();
     let count: u64 = after[close + 1..].split_whitespace().next()?.parse().ok()?;
     Some((symbol, binary, count))
+}
+
+/// Linux userspace CPU 프로파일 — `perf record -F 99 -g -p <pid> -- sleep <secs>` → `perf script` 파싱.
+/// 미설치/권한(perf_event_paranoid) 실패는 None(호출부가 /proc kernel-stack으로 강등). perf.data는 temp에
+/// 쓰고 즉시 삭제한다.
+#[cfg(target_os = "linux")]
+fn run_perf_sample(pid: u32) -> Option<Value> {
+    use std::process::Command;
+    let tmp = std::env::temp_dir().join(format!("aic-perf-{}-{pid}.data", std::process::id()));
+    let tmp_s = tmp.to_str()?;
+    let rec = Command::new("perf")
+        .args([
+            "record",
+            "-F",
+            PERF_HZ,
+            "-g",
+            "-o",
+            tmp_s,
+            "-p",
+            &pid.to_string(),
+            "--",
+            "sleep",
+            &SAMPLE_SECS.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !rec.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return None; // 미설치/권한 → fallback
+    }
+    let script = Command::new("perf").args(["script", "-i", tmp_s]).output();
+    let _ = std::fs::remove_file(&tmp);
+    let script = script.ok()?;
+    if !script.status.success() {
+        return None;
+    }
+    Some(parse_perf_script(&String::from_utf8_lossy(&script.stdout)))
+}
+
+/// `perf script` 출력을 self-time hot frame으로 집계(순수 함수 — fixture로 테스트). 각 sample은 헤더 줄 +
+/// 들여쓴 frame 줄들로 구성되고, **첫 frame(leaf) = CPU가 있던 곳**이다. leaf symbol을 세어 랭킹한다.
+#[cfg(any(target_os = "linux", test))]
+fn parse_perf_script(text: &str) -> Value {
+    let mut counts: HashMap<String, (String, u64)> = HashMap::new();
+    let mut total = 0u64;
+    let mut expecting_leaf = false;
+    for line in text.lines() {
+        let indented = line.starts_with('\t') || line.starts_with("    ");
+        if !indented {
+            // 비들여쓰기 + 비공백 = sample 헤더 → 다음 들여쓴 줄이 leaf.
+            expecting_leaf = !line.trim().is_empty();
+            continue;
+        }
+        if expecting_leaf {
+            expecting_leaf = false;
+            total += 1;
+            if let Some((sym, module)) = parse_perf_frame(line.trim()) {
+                let e = counts.entry(sym).or_insert((module, 0));
+                e.1 += 1;
+            }
+        }
+    }
+    let mut hot: Vec<(String, (String, u64))> = counts.into_iter().collect();
+    hot.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then_with(|| a.0.cmp(&b.0)));
+    hot.truncate(HOT_FRAMES);
+    let hot_frames: Vec<Value> = hot
+        .into_iter()
+        .map(|(sym, (module, cnt))| {
+            json!({
+                "symbol": redaction::redact(&sym).0,
+                "binary": redaction::redact(&module).0,
+                "count": cnt,
+            })
+        })
+        .collect();
+    json!({
+        "available": true,
+        "platform": "linux",
+        "kind": "cpu",
+        "total_samples": total,
+        "threads": [],
+        "hot_frames": hot_frames,
+    })
+}
+
+/// `perf script` frame 한 줄 파싱: "<addr> <symbol>+<offset> (<module>)" → (symbol, module).
+#[cfg(any(target_os = "linux", test))]
+fn parse_perf_frame(s: &str) -> Option<(String, String)> {
+    let after_addr = s.splitn(2, char::is_whitespace).nth(1)?;
+    let (symoff, module) = match after_addr.rsplit_once('(') {
+        Some((sym, m)) => (sym.trim(), m.trim_end_matches(')').trim()),
+        None => (after_addr.trim(), ""),
+    };
+    let symbol = symoff.split('+').next().unwrap_or(symoff).trim();
+    if symbol.is_empty() {
+        return None;
+    }
+    // module은 full path일 수 있으므로 basename만 — path/deploy 구조 노출 방지(macOS dylib basename과 일관).
+    let module = module.rsplit('/').next().unwrap_or(module);
+    Some((symbol.to_string(), module.to_string()))
 }
 
 /// `process_detail`의 blocking 본체. cpu%는 연속 refresh 간 delta라 짧게 두 번 샘플링한다.
@@ -2230,6 +2337,43 @@ Binary Images:\n\
         assert_eq!(hot[0]["count"], 143);
         // Binary Images / Path 등 path-heavy 줄은 구조화 결과에 포함되지 않는다.
         assert!(!v.to_string().contains("/Users/someone"));
+    }
+
+    #[test]
+    fn parse_perf_script_counts_leaf_self_time() {
+        let fixture = "myapp  1234 [001] 1000.1: cycles:\n\
+\t7f01 hot_func+0x12 (/usr/lib/libfoo.so)\n\
+\t7f02 caller+0x4 (/usr/lib/libfoo.so)\n\
+\n\
+myapp  1234 [001] 1000.2: cycles:\n\
+\t7f01 hot_func+0x20 (/usr/lib/libfoo.so)\n\
+\t7f03 other+0x8 (/usr/lib/libbar.so)\n\
+\n\
+myapp  1234 [001] 1000.3: cycles:\n\
+\t7f04 idle+0x0 ([kernel.kallsyms])\n";
+        let v = parse_perf_script(fixture);
+        assert_eq!(v["available"], true);
+        assert_eq!(v["kind"], "cpu");
+        assert_eq!(v["total_samples"], 3);
+        let hot = v["hot_frames"].as_array().unwrap();
+        assert_eq!(hot[0]["symbol"], "hot_func"); // leaf 2회 → 1위
+        assert_eq!(hot[0]["binary"], "libfoo.so"); // path가 아니라 basename
+        assert_eq!(hot[0]["count"], 2);
+        assert!(hot.iter().any(|f| f["symbol"] == "idle" && f["count"] == 1));
+        // 절대경로는 노출되지 않는다.
+        assert!(!v.to_string().contains("/usr/lib"));
+    }
+
+    #[test]
+    fn parse_perf_frame_extracts_symbol_and_basename() {
+        assert_eq!(
+            parse_perf_frame("7f01 hot_func+0x12 (/usr/lib/libfoo.so)"),
+            Some(("hot_func".to_string(), "libfoo.so".to_string()))
+        );
+        assert_eq!(
+            parse_perf_frame("ffffff native_halt+0x0 ([kernel.kallsyms])"),
+            Some(("native_halt".to_string(), "[kernel.kallsyms]".to_string()))
+        );
     }
 
     #[test]
