@@ -848,11 +848,26 @@ async function showProcess(pid) {
       '<table class="pd-table"><tbody>' +
       rows.map(r => '<tr><th>' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td></tr>').join("") +
       '</tbody></table>' +
+      procState(d.runtime_state) +
       procNet(d.network) +
-      '<p class="pd-note muted">env·tracing은 노출하지 않습니다(공유 대시보드 안전 경계). cmd/cwd 및 네트워크 peer IP는 secret/IP 마스킹 적용.</p>';
+      '<p class="pd-note muted">env은 노출하지 않습니다. runtime은 read-only(프로세스 첨부·메모리 읽기 없음). cmd/cwd 및 네트워크 peer IP는 secret/IP 마스킹 적용.</p>';
   } catch (e) {
     box.innerHTML = head() + '<p class="err">' + esc(e.message) + '</p>';
   }
+}
+// Tier A read-only 상태(첨부 없음): state·blocked-in(wchan)·threads·context-switch(contention 신호).
+function procState(s) {
+  if (!s) return "";
+  if (!s.available) return '<div class="pd-net muted">runtime: ' + esc(s.reason || "사용 불가") + '</div>';
+  const parts = [];
+  if (s.state) parts.push("state " + s.state);
+  if (s.wchan) parts.push("blocked in " + s.wchan);
+  if (s.threads != null) parts.push(s.threads + " threads");
+  if (s.nonvoluntary_ctxt_switches != null)
+    parts.push("ctx-switch vol/nonvol " + (s.voluntary_ctxt_switches || 0) + "/" + s.nonvoluntary_ctxt_switches);
+  let html = '<div class="pd-net"><strong>runtime</strong> · ' + parts.map(esc).join(" · ");
+  if (s.note) html += '<br><span class="muted">' + esc(s.note) + '</span>';
+  return html + '</div>';
 }
 // 프로세스 네트워크 섹션(redacted). listen 포트 + 연결 수 + bounded sample. peer IP는 서버에서 마스킹됨.
 function procNet(n) {
