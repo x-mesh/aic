@@ -235,6 +235,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/health", get(|| async { "ok" }))
         .route("/", get(dashboard))
         .route("/web/local", get(local_metrics))
+        .route("/web/process/{pid}", get(process_detail))
         .route("/web/snapshots", get(snapshots))
         .route("/web/incidents", get(incidents))
         .route("/web/incidents/{id}/report", get(incident_report))
@@ -966,6 +967,71 @@ async fn local_metrics(
         .map(|v| v.clone())
         .unwrap_or_else(|_| json!({ "status": "unavailable" }));
     Json(json!({ "points": points, "runtime": runtime }))
+}
+
+/// 단일 프로세스 상세(top cpu/mem 행 클릭 시). "이 데몬이 뭘 하는지"를 read-only로 답한다:
+/// cmdline/exe/cwd(모두 `redaction` 통과 — secret만 마스킹), status/parent/threads/start·run time, mem/IO.
+/// **env는 노출하지 않고** 네트워크/tracing도 포함하지 않는다(공유 대시보드 안전 경계). sysinfo refresh는
+/// blocking이라 [`spawn_blocking`]으로 보낸다.
+async fn process_detail(Path(pid): Path<u32>) -> Json<Value> {
+    let detail = tokio::task::spawn_blocking(move || collect_process_detail(pid))
+        .await
+        .ok()
+        .flatten();
+    Json(detail.unwrap_or_else(|| {
+        json!({
+            "available": false,
+            "pid": pid,
+            "reason": "프로세스를 찾을 수 없습니다(이미 종료됐거나 접근 권한이 없습니다).",
+        })
+    }))
+}
+
+/// `process_detail`의 blocking 본체. cpu%는 연속 refresh 간 delta라 짧게 두 번 샘플링한다.
+fn collect_process_detail(pid: u32) -> Option<Value> {
+    let spid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    let kind = ProcessRefreshKind::nothing()
+        .with_cpu()
+        .with_memory()
+        .with_disk_usage()
+        .with_cmd(UpdateKind::Always)
+        .with_cwd(UpdateKind::Always)
+        .with_exe(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[spid]), true, kind);
+    // cpu%는 두 샘플 사이 delta — 최소 간격 후 한 번 더 refresh.
+    std::thread::sleep(Duration::from_millis(200));
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[spid]),
+        true,
+        ProcessRefreshKind::nothing().with_cpu(),
+    );
+    let p = sys.process(spid)?;
+    let cmd = p
+        .cmd()
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let du = p.disk_usage();
+    Some(json!({
+        "available": true,
+        "pid": pid,
+        "name": p.name().to_string_lossy(),
+        "status": p.status().to_string(),
+        "parent": p.parent().map(|pp| pp.as_u32()),
+        "cmd": redaction::redact(cmd.trim()).0,
+        "exe": p.exe().map(|e| redaction::redact(&e.display().to_string()).0),
+        "cwd": p.cwd().map(|c| redaction::redact(&c.display().to_string()).0),
+        "start_time": p.start_time(),
+        "run_time": p.run_time(),
+        "threads": p.tasks().map(|t| t.len()),
+        "cpu_pct": p.cpu_usage(),
+        "memory": p.memory(),
+        "virtual_memory": p.virtual_memory(),
+        "disk_read_total": du.total_read_bytes,
+        "disk_written_total": du.total_written_bytes,
+    }))
 }
 
 async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (StatusCode, &'static str)>

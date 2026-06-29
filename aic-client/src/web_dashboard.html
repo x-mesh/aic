@@ -327,6 +327,16 @@
   .process-rank { color: var(--subtle); font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .process-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
   .process-pid, .process-metric { color: var(--muted); font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+  .process-row.clickable { cursor: pointer; }
+  .process-row.clickable:hover { border-color: var(--accent, var(--line)); background: var(--canvas-2, var(--canvas)); }
+  .process-detail { margin-bottom: 18px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface, var(--canvas)); }
+  .pd-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--text); }
+  .pd-close { margin-left: auto; border: 1px solid var(--line-soft); background: transparent; color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; width: 24px; height: 24px; line-height: 1; }
+  .pd-close:hover { color: var(--text); }
+  .pd-table { width: 100%; border-collapse: collapse; }
+  .pd-table th { text-align: left; vertical-align: top; white-space: nowrap; padding: 3px 12px 3px 0; color: var(--subtle); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; width: 1%; }
+  .pd-table td { padding: 3px 0; color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .pd-note { margin: 8px 0 0; font-size: 11px; }
   .table-scroll { overflow-x: auto; border-radius: var(--radius-sm); }
   .resource-table { min-width: 520px; background: var(--canvas); border-radius: var(--radius-sm); }
   .resource-table th, .resource-table td { padding: 6px 8px; font-size: 12px; }
@@ -529,6 +539,7 @@
     <div id="host-identity" class="identity-strip"><span><strong>host</strong> 연결 대기</span></div>
     <div class="cards" id="cards"><div class="empty-state"><strong>연결 대기</strong><span>Bearer token 입력 후 연결</span></div></div>
     <div class="process-grid" id="top-processes"></div>
+    <div id="process-detail" class="process-detail" hidden></div>
     <div class="resource-detail-grid">
       <section class="resource-panel"><h3>Disk detail</h3><div id="disk-detail"></div></section>
       <section class="resource-panel"><h3>Process pressure</h3><div id="process-pressure"></div></section>
@@ -789,7 +800,10 @@ function procRows(list, metric) {
   if (!rows.length) return '<div class="empty-state"><strong>프로세스 없음</strong><span>샘플 대기</span></div>';
   return '<div class="process-list">' + rows.map((p, i) => {
     const value = metric === "cpu" ? procCpu(p) : procMem(p);
-    return '<div class="process-row"><div class="process-rank">#' + (i + 1) + '</div><div class="process-name" title="' +
+    const pid = p.pid || "";
+    // 행 클릭 → 해당 pid 상세(cmdline/cwd/IO 등). pid는 숫자 문자열이라 따옴표 안전.
+    const click = pid ? ' role="button" tabindex="0" onclick="showProcess(\'' + esc(pid) + '\')"' : '';
+    return '<div class="process-row clickable"' + click + '><div class="process-rank">#' + (i + 1) + '</div><div class="process-name" title="' +
       esc(p.name || "unknown") + '">' + esc(p.name || "unknown") + '</div><div class="process-pid">pid ' +
       esc(p.pid || "?") + '</div><div class="process-metric">' + esc(value) + '</div></div>';
   }).join("") + '</div>';
@@ -801,6 +815,45 @@ function renderTopProcesses(p) {
   el.innerHTML =
     '<section class="process-panel"><h3>Top CPU processes</h3>' + procRows(p.top_cpu_procs || (p.top_cpu_proc ? [p.top_cpu_proc] : []), "cpu") + '</section>' +
     '<section class="process-panel"><h3>Top memory processes</h3>' + procRows(p.top_mem_procs || (p.top_mem_proc ? [p.top_mem_proc] : []), "mem") + '</section>';
+}
+
+// 프로세스 행 클릭 → /web/process/{pid} 상세. #top-processes는 2초마다 재렌더되므로 상세는 그 밖의
+// #process-detail에 그린다(폴링에 안 지워짐). cmdline/cwd는 서버에서 redacted, env/네트워크/tracing 미노출.
+async function showProcess(pid) {
+  const box = document.getElementById("process-detail");
+  if (!box) return;
+  const head = (extra) => '<div class="pd-head"><strong>pid ' + esc(pid) + '</strong>' + (extra || "") +
+    '<button class="pd-close" type="button" onclick="closeProcDetail()">×</button></div>';
+  box.hidden = false;
+  box.innerHTML = head(" 로딩…");
+  try {
+    const d = await (await api("/web/process/" + encodeURIComponent(pid))).json();
+    if (!d.available) { box.innerHTML = head() + '<p class="muted">' + esc(d.reason || "사용 불가") + '</p>'; return; }
+    const cpu = (+d.cpu_pct || 0).toFixed(1) + "%";
+    const rows = [
+      ["name", d.name],
+      ["status", d.status],
+      ["parent pid", d.parent == null ? "n/a" : d.parent],
+      ["cmd", d.cmd || "(없음)"],
+      ["exe", opt(d.exe)],
+      ["cwd", opt(d.cwd)],
+      ["threads", d.threads == null ? "n/a" : d.threads],
+      ["cpu · mem", cpu + " · " + fmtBytes(d.memory) + " (vmem " + fmtBytes(d.virtual_memory) + ")"],
+      ["disk r/w (total)", fmtBytes(d.disk_read_total) + " / " + fmtBytes(d.disk_written_total)],
+      ["run time", fmtDuration(d.run_time)],
+    ];
+    box.innerHTML = head(" · " + esc(d.name)) +
+      '<table class="pd-table"><tbody>' +
+      rows.map(r => '<tr><th>' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td></tr>').join("") +
+      '</tbody></table>' +
+      '<p class="pd-note muted">env·네트워크·tracing은 노출하지 않습니다(공유 대시보드 안전 경계). cmd/cwd는 secret 마스킹 적용.</p>';
+  } catch (e) {
+    box.innerHTML = head() + '<p class="err">' + esc(e.message) + '</p>';
+  }
+}
+function closeProcDetail() {
+  const box = document.getElementById("process-detail");
+  if (box) { box.hidden = true; box.innerHTML = ""; }
 }
 
 function renderHostIdentity(p) {
