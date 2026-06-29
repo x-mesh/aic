@@ -655,6 +655,17 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// 조사 중 관찰을 incident에 수동 evidence(Note)로 기록한다.
+    Note {
+        /// 기록할 관찰 내용.
+        text: String,
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        #[arg(long)]
+        incident: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
     /// RCA report markdown을 생성한다.
     Report {
         /// incident id 또는 prefix. 생략 시 최근 incident.
@@ -6993,6 +7004,32 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 println!("{}", serde_json::to_string_pretty(&meta)?);
             } else {
                 println!("{}", aic_client::rca::render_status(&meta));
+            }
+        }
+        RcaOp::Note {
+            text,
+            incident,
+            json,
+        } => {
+            let resolved = aic_client::rca::resolve_id(incident.as_deref())?;
+            let mut meta = aic_client::rca::load_meta(&resolved)?;
+            // timeline 가독성을 위해 title은 본문 앞부분, body는 전문(둘 다 append_evidence가 redaction).
+            let title: String = text.chars().take(80).collect();
+            let ev = aic_client::rca::append_evidence(
+                &mut meta,
+                aic_client::rca::EvidenceKind::Note,
+                &title,
+                "aic rca note",
+                &text,
+                &["note"],
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ev)?);
+            } else {
+                println!(
+                    "{COL_GREEN}✔{COL_RESET} note 저장: [{}] {}",
+                    ev.id, ev.title
+                );
             }
         }
         RcaOp::Observe {
