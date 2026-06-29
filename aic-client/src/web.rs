@@ -80,6 +80,8 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 /// `/web/metrics`·`/web/logs` 요청 본문 상한. PromQL/LogQL 질의 + args JSON은 작으므로 64KB면 충분하다 —
 /// axum 기본(2MB)을 좁혀 비정상 대용량 본문을 413으로 거른다.
 const OBS_BODY_LIMIT: usize = 64 * 1024;
+/// 프로세스 상세의 network 연결 sample 상한(redacted). 너무 길면 payload·UI noise가 커진다.
+const PROCESS_NET_SAMPLE: usize = 50;
 /// web 접근 감사 이벤트 kind — 누가/언제/어디서 대시보드를 봤는지 audit log(HMAC chain)에 남긴다.
 const WEB_ACCESS_KIND: &str = "web_access";
 const WEB_AUTH_DENIED_KIND: &str = "web_auth_denied";
@@ -1031,7 +1033,60 @@ fn collect_process_detail(pid: u32) -> Option<Value> {
         "virtual_memory": p.virtual_memory(),
         "disk_read_total": du.total_read_bytes,
         "disk_written_total": du.total_written_bytes,
+        "network": collect_process_network(pid),
     }))
+}
+
+/// pid의 네트워크 소켓을 `lsof -nP -p <pid> -i`로 수집한다(probes.rs와 동일 패턴). args는 고정이고 pid는
+/// u32라 injection 여지가 없다. 주소는 `redaction`으로 IP를 마스킹해 포트·state·proto만 남긴다(공유
+/// 대시보드 정책 일관 — "사용 여부/규모"는 보이되 peer는 가린다). lsof 미설치/실패는 available:false.
+fn collect_process_network(pid: u32) -> Value {
+    // `-a`로 선택조건을 AND(pid AND internet)로 묶는다 — 없으면 lsof가 OR로 해석해 시스템 전체
+    // 소켓을 반환한다(해당 pid가 아님).
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-i"])
+        .output();
+    let Ok(output) = output else {
+        return json!({ "available": false, "reason": "lsof 미설치 또는 실행 실패" });
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut listening: Vec<String> = Vec::new();
+    let mut sample: Vec<String> = Vec::new();
+    let mut connections = 0usize;
+    // 첫 줄은 헤더(COMMAND PID …). NODE(TCP/UDP) 토큰을 찾아 그 뒤를 주소+state로 본다.
+    for line in text.lines().skip(1) {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let Some(ni) = toks.iter().position(|t| *t == "TCP" || *t == "UDP") else {
+            continue;
+        };
+        let proto = toks[ni];
+        let rest = toks[ni + 1..].join(" ");
+        let state = rest
+            .rsplit_once('(')
+            .and_then(|(_, s)| s.strip_suffix(')'))
+            .unwrap_or("");
+        let addr = rest.split(" (").next().unwrap_or(rest.as_str());
+        let red = redaction::redact(addr).0;
+        if state == "LISTEN" {
+            listening.push(format!("{proto} {red}"));
+        } else {
+            connections += 1;
+            if sample.len() < PROCESS_NET_SAMPLE {
+                let st = if state.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({state})")
+                };
+                sample.push(format!("{proto} {red}{st}"));
+            }
+        }
+    }
+    json!({
+        "available": true,
+        "listening": listening,
+        "connections": connections,
+        "sample": sample,
+    })
 }
 
 async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (StatusCode, &'static str)>
