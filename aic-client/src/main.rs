@@ -445,10 +445,10 @@ enum Commands {
         /// 인증 토큰(Bearer). 미지정 시 env `AIC_WEB_TOKEN`. 둘 다 없으면 거부.
         #[arg(long, env = "AIC_WEB_TOKEN")]
         token: Option<String>,
-        /// (opt-in) top 프로세스 클릭 시 스택 샘플 허용(macOS `sample`/Linux `/proc/stack`). 비침습이나
-        /// 타 유저 pid엔 권한이 필요해 기본 off — 명시적으로 켤 때만 노출한다.
+        /// top 프로세스 클릭 시 CPU 스택 샘플(macOS `sample`)을 **기본 활성**. 비침습(첨부·메모리읽기 없음)이고
+        /// top-list pid로 제한되지만, 끄려면 이 플래그를 준다.
         #[arg(long)]
-        allow_stack_sample: bool,
+        no_stack_sample: bool,
     },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
@@ -1232,9 +1232,9 @@ async fn main() {
         Some(Commands::Web {
             bind,
             token,
-            allow_stack_sample,
+            no_stack_sample,
         }) => {
-            if let Err(e) = handle_web(bind, token, allow_stack_sample).await {
+            if let Err(e) = handle_web(bind, token, !no_stack_sample).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
