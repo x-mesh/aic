@@ -22,13 +22,17 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
     http::{
-        header::{CONTENT_TYPE, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS},
+        header::{
+            CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
+            X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+        },
         StatusCode,
     },
     middleware::{self, Next},
@@ -72,6 +76,13 @@ const STATUS_OK: &str = "ok";
 const STATUS_WARN: &str = "warn";
 const STATUS_CRIT: &str = "crit";
 const STATUS_UNAVAILABLE: &str = "unavailable";
+
+/// `/web/metrics`·`/web/logs` 요청 본문 상한. PromQL/LogQL 질의 + args JSON은 작으므로 64KB면 충분하다 —
+/// axum 기본(2MB)을 좁혀 비정상 대용량 본문을 413으로 거른다.
+const OBS_BODY_LIMIT: usize = 64 * 1024;
+/// web 접근 감사 이벤트 kind — 누가/언제/어디서 대시보드를 봤는지 audit log(HMAC chain)에 남긴다.
+const WEB_ACCESS_KIND: &str = "web_access";
+const WEB_AUTH_DENIED_KIND: &str = "web_auth_denied";
 
 /// resource 탭에 표시할 프로세스 요약. command line/env/cwd는 노출하지 않는다.
 #[derive(Serialize, Clone)]
@@ -234,16 +245,26 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/webhooks", get(webhooks))
         .route("/web/config", get(config_view))
         .route("/web/backends", get(backends))
-        .route("/web/metrics", post(metrics))
-        .route("/web/logs", post(logs))
+        .route(
+            "/web/metrics",
+            post(metrics).route_layer(DefaultBodyLimit::max(OBS_BODY_LIMIT)),
+        )
+        .route(
+            "/web/logs",
+            post(logs).route_layer(DefaultBodyLimit::max(OBS_BODY_LIMIT)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // ConnectInfo<SocketAddr>로 peer 주소를 추출 — require_token이 접근 감사에 source IP를 남긴다.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await?;
     Ok(())
 }
 
@@ -515,7 +536,7 @@ fn network_samples(networks: &Networks) -> Vec<NetworkSample> {
             tx_packets: n.packets_transmitted(),
             rx_errors: n.errors_on_received(),
             tx_errors: n.errors_on_transmitted(),
-            mac: n.mac_address().to_string(),
+            mac: mask_mac(&n.mac_address().to_string()),
             loopback: is_loopback_interface(name),
         })
         .collect();
@@ -526,6 +547,23 @@ fn network_samples(networks: &Networks) -> Vec<NetworkSample> {
 fn is_loopback_interface(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n == "lo" || n.starts_with("lo") || n.starts_with("loopback")
+}
+
+/// MAC은 장치 고유 식별자라 공유 대시보드 노출 전 host-specific 하위 3옥텟을 마스킹한다. 벤더 OUI(상위
+/// 3옥텟)만 남겨 인터페이스 식별 가치는 유지한다. 표준 6옥텟 형식이 아니면(빈 값 포함) 통째로 마스킹한다.
+fn mask_mac(mac: &str) -> String {
+    let octets: Vec<&str> = mac.split(':').collect();
+    if octets.len() == 6
+        && octets
+            .iter()
+            .all(|o| o.len() == 2 && o.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        format!("{}:{}:{}:**:**:**", octets[0], octets[1], octets[2])
+    } else if mac.is_empty() {
+        String::new()
+    } else {
+        "**".to_string()
+    }
 }
 
 fn process_pressure(sys: &System) -> ProcessPressure {
@@ -798,21 +836,52 @@ fn auth_exempt(path: &str) -> bool {
     path == "/" || path == "/web/health"
 }
 
+/// `/web/local`은 2초 주기 폴링이라 매 요청 감사 시 audit log가 폭주한다 — exempt/health/resource-poll을
+/// 제외한 민감 read 엔드포인트(audit·incidents·history·chat·config·webhooks·snapshots·metrics·logs)만 감사한다.
+fn web_access_is_audited(path: &str) -> bool {
+    !auth_exempt(path) && path != "/web/local"
+}
+
 /// Bearer 토큰 인증 미들웨어. [`auth_exempt`] 경로만 면제하고, 나머지는
-/// `Authorization: Bearer <token>` 상수시간 일치를 요구한다.
+/// `Authorization: Bearer <token>` 상수시간 일치를 요구한다. 대시보드가 audit log를 노출하면서도
+/// "누가 봤는지"는 못 남기던 공백을 메우기 위해, 인증 실패(항상)와 민감 엔드포인트 성공 접근을 감사한다.
 async fn require_token(State(state): State<Arc<WebState>>, req: Request, next: Next) -> Response {
-    if auth_exempt(req.uri().path()) {
+    let path = req.uri().path().to_string();
+    if auth_exempt(&path) {
         return next.run(req).await;
     }
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string());
+    let method = req.method().as_str().to_string();
     let header = req
         .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok());
     if bearer_ok(header, &state.token) {
+        if web_access_is_audited(&path) {
+            audit_web_access(WEB_ACCESS_KIND, &method, &path, peer.as_deref());
+        }
         next.run(req).await
     } else {
+        // 인증 실패는 빈도와 무관하게 항상 감사 — probing/brute-force의 1차 신호.
+        audit_web_access(WEB_AUTH_DENIED_KIND, &method, &path, peer.as_deref());
         (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
     }
+}
+
+/// web 접근을 audit log에 best-effort로 남긴다. `audit::append`는 동기 파일 IO(HMAC chain)이므로
+/// async 워커를 막지 않도록 blocking 풀로 보낸다. 실패해도 요청 처리에는 영향을 주지 않는다.
+fn audit_web_access(kind: &'static str, method: &str, path: &str, peer: Option<&str>) {
+    let data = json!({
+        "method": method,
+        "path": path,
+        "peer": peer,
+    });
+    tokio::task::spawn_blocking(move || {
+        let _ = audit::append(kind, data);
+    });
 }
 
 /// `Authorization` 헤더 값이 `Bearer <token>`이고 토큰이 상수시간 일치하면 true.
@@ -843,25 +912,53 @@ fn internal(_e: anyhow::Error) -> (StatusCode, &'static str) {
     (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n")
 }
 
-/// 대시보드 셸(자체완결 HTML). clickjacking/MIME-sniffing 방어 헤더를 함께 싣는다.
+/// 대시보드는 자체완결(인라인 script/style, 외부 자원 0)이므로 CSP의 `default-src 'self'` + inline 허용으로
+/// 충분하다. 핵심은 `connect-src 'self'`·`script-src 'self'`: 설령 DOM-XSS가 주입돼도 client가 보관한 Bearer
+/// 토큰을 외부 origin으로 유출하지 못하게 막는 심층방어(esc() 렌더 이스케이프 위의 2차 방어선).
+const DASHBOARD_CSP: &str = "default-src 'self'; \
+script-src 'self' 'unsafe-inline'; \
+style-src 'self' 'unsafe-inline'; \
+img-src 'self' data:; \
+connect-src 'self'; \
+base-uri 'none'; \
+form-action 'none'; \
+frame-ancestors 'none'";
+
+/// 대시보드 셸(자체완결 HTML). clickjacking/MIME-sniffing 방어 + CSP/Referrer/Cache 정책 헤더를 함께 싣는다.
+/// 토큰 입력형 SPA이므로 referrer 미전송·캐시 금지로 토큰/세션 흔적 노출을 줄인다.
 async fn dashboard() -> Response {
     (
         [
             (CONTENT_TYPE, "text/html; charset=utf-8"),
             (X_FRAME_OPTIONS, "DENY"),
             (X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (CONTENT_SECURITY_POLICY, DASHBOARD_CSP),
+            (REFERRER_POLICY, "no-referrer"),
+            (CACHE_CONTROL, "no-store"),
         ],
         DASHBOARD,
     )
         .into_response()
 }
 
-/// 로컬 자원 시계열 — 무설정 동작의 핵심. ring buffer 전체를 JSON으로 낸다(수치만, 식별정보 없음).
-async fn local_metrics(State(state): State<Arc<WebState>>) -> Json<Value> {
+/// `/web/local` 증분 폴링 파라미터. `since`(unix epoch ms) 이후 포인트만 돌려준다.
+#[derive(serde::Deserialize)]
+struct LocalQuery {
+    since: Option<i64>,
+}
+
+/// 로컬 자원 시계열 — 무설정 동작의 핵심. 수치만 담고 식별정보는 없다. 대시보드가 매 2초 폴링하므로,
+/// `?since=<ts_ms>`로 마지막 수신 이후 신규 포인트만 반환한다(steady-state에서 ~300 → ~1 포인트). `since`
+/// 미지정/0은 ring buffer 전량(최초 로드·재연결)을 그대로 내보내 하위호환을 유지한다.
+async fn local_metrics(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<LocalQuery>,
+) -> Json<Value> {
+    let since = q.since.unwrap_or(0);
     let points: Vec<LocalPoint> = state
         .local
         .lock()
-        .map(|b| b.iter().cloned().collect())
+        .map(|b| b.iter().filter(|p| p.ts > since).cloned().collect())
         .unwrap_or_default();
     let runtime = state
         .runtime
@@ -958,23 +1055,31 @@ async fn chat_observability_for_session(Path(session): Path<String>) -> Json<Val
 
 async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
     let client = UdsClient::new(aic_common::aicd_socket_path());
-    let mut chat_runs = crate::chat_registry::list_recent(CHAT_SESSION_LIMIT).unwrap_or_default();
-    mark_stale_chat_runs(&mut chat_runs);
-    let history_fallback = chat_history_fallback();
-    if !chat_runs.iter().any(|r| r.status == "active") {
-        let known_pids: Vec<u32> = chat_runs.iter().map(|r| r.pid).collect();
-        chat_runs.extend(chat_process_fallback(
-            history_fallback.as_ref(),
-            &known_pids,
-        ));
-        chat_runs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
-        chat_runs.truncate(CHAT_SESSION_LIMIT);
-    }
-    if chat_runs.is_empty() {
-        if let Some(history) = history_fallback {
-            chat_runs.push(history);
+    // chat run 수집(mark_stale + process fallback)은 전체 프로세스 스캔(sysinfo refresh)을 돈다 —
+    // async 워커를 막지 않도록 통째로 blocking 풀로 보낸다.
+    let chat_runs = tokio::task::spawn_blocking(|| {
+        let mut chat_runs =
+            crate::chat_registry::list_recent(CHAT_SESSION_LIMIT).unwrap_or_default();
+        mark_stale_chat_runs(&mut chat_runs);
+        let history_fallback = chat_history_fallback();
+        if !chat_runs.iter().any(|r| r.status == "active") {
+            let known_pids: Vec<u32> = chat_runs.iter().map(|r| r.pid).collect();
+            chat_runs.extend(chat_process_fallback(
+                history_fallback.as_ref(),
+                &known_pids,
+            ));
+            chat_runs.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+            chat_runs.truncate(CHAT_SESSION_LIMIT);
         }
-    }
+        if chat_runs.is_empty() {
+            if let Some(history) = history_fallback {
+                chat_runs.push(history);
+            }
+        }
+        chat_runs
+    })
+    .await
+    .unwrap_or_default();
     let aicd_online = matches!(client.ping().await, Ok(true));
     if !aicd_online && chat_runs.is_empty() {
         return Json(json!({
@@ -1025,11 +1130,21 @@ async fn chat_observability_inner(selected_arg: Option<String>) -> Json<Value> {
     let mut command_count = 0usize;
     let mut failed_count = 0usize;
 
-    for s in sessions.iter().take(CHAT_SESSION_LIMIT) {
-        let records = client
-            .get_recent_commands_for_session(&s.id, CHAT_RECORD_TAIL)
-            .await
-            .unwrap_or_default();
+    // 세션별 command 조회는 UDS 왕복이라 순차로 돌리면 최대 CHAT_SESSION_LIMIT번 N+1 직렬 대기가 된다.
+    // 각 호출이 독립 연결을 열므로 join_all로 동시에 돌린다(요청당 wall-clock을 1왕복 수준으로 단축).
+    let session_slice: Vec<&aic_common::SessionInfo> =
+        sessions.iter().take(CHAT_SESSION_LIMIT).collect();
+    let session_records: Vec<Vec<_>> = futures::future::join_all(
+        session_slice
+            .iter()
+            .map(|s| client.get_recent_commands_for_session(&s.id, CHAT_RECORD_TAIL)),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.unwrap_or_default())
+    .collect();
+
+    for (s, records) in session_slice.iter().zip(session_records) {
         command_count += records.len();
         failed_count += records.iter().filter(|r| r.exit_code != 0).count();
         if selected.as_deref() == Some(s.id.as_str()) {
@@ -1391,7 +1506,8 @@ async fn webhooks() -> Json<Vec<Value>> {
 async fn config_view() -> Json<Value> {
     let cfg = match ConfigManager::load() {
         Ok(c) => c,
-        Err(e) => return Json(json!({ "error": format!("config 로드 실패: {e}") })),
+        // 내부 에러 본문은 노출하지 않는다(`internal()`과 동일 정책) — 경로/파싱 detail 누출 방지.
+        Err(_e) => return Json(json!({ "error": "config 로드 실패" })),
     };
     let backends: Vec<Value> = cfg
         .observability
@@ -1503,7 +1619,12 @@ async fn obs_query(state: &WebState, tool: &str, args: &Value) -> Response {
     };
     match obs.run(tool, args).await {
         Ok(body) => ([(CONTENT_TYPE, "application/json")], body).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}\n")).into_response(),
+        // 백엔드 에러 Display는 URL/응답 본문을 담을 수 있어 그대로 노출하지 않는다(`internal()` 정책).
+        Err(_e) => (
+            StatusCode::BAD_REQUEST,
+            "관측 질의 실패 (쿼리 또는 백엔드 응답 오류)\n",
+        )
+            .into_response(),
     }
 }
 
@@ -1596,6 +1717,30 @@ mod tests {
         assert!(!auth_exempt("/web/chat"));
         assert!(!auth_exempt("/web/webhooks"));
         assert!(!auth_exempt("/web/config"));
+    }
+
+    #[test]
+    fn web_access_audits_sensitive_reads_but_not_resource_poll() {
+        // 2초 폴링 엔드포인트와 exempt 경로는 감사 제외(로그 폭주 방지).
+        assert!(!web_access_is_audited("/web/local"));
+        assert!(!web_access_is_audited("/"));
+        assert!(!web_access_is_audited("/web/health"));
+        // 민감 read는 감사.
+        assert!(web_access_is_audited("/web/audit"));
+        assert!(web_access_is_audited("/web/incidents/x/report"));
+        assert!(web_access_is_audited("/web/config"));
+        assert!(web_access_is_audited("/web/chat"));
+    }
+
+    #[test]
+    fn mask_mac_keeps_oui_and_masks_device_suffix() {
+        assert_eq!(mask_mac("aa:bb:cc:dd:ee:ff"), "aa:bb:cc:**:**:**");
+        assert_eq!(mask_mac("00:1A:2B:3C:4D:5E"), "00:1A:2B:**:**:**");
+        // 빈 값(불명)·비표준 형식은 통째로 마스킹.
+        assert_eq!(mask_mac(""), "");
+        assert_eq!(mask_mac("not-a-mac"), "**");
+        assert_eq!(mask_mac("aa:bb:cc"), "**");
+        assert_eq!(mask_mac("aa:bb:cc:dd:ee:gg"), "**"); // 비-hex
     }
 
     #[test]
