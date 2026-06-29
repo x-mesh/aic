@@ -1201,7 +1201,7 @@ mod tests {
             body: String::new(),
             tags: vec![],
         };
-        let mut v = vec![mk("E3"), mk("E1"), mk("E2")];
+        let mut v = [mk("E3"), mk("E1"), mk("E2")];
         v.sort_by(|a, b| {
             a.at.cmp(&b.at)
                 .then_with(|| evidence_seq(&a.id).cmp(&evidence_seq(&b.id)))
