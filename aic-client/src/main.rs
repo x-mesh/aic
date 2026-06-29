@@ -430,6 +430,10 @@ enum Commands {
         /// 인증 토큰(Bearer). 미지정 시 env `AIC_WEB_TOKEN`. 둘 다 없으면 거부.
         #[arg(long, env = "AIC_WEB_TOKEN")]
         token: Option<String>,
+        /// (opt-in) top 프로세스 클릭 시 스택 샘플 허용(macOS `sample`/Linux `/proc/stack`). 비침습이나
+        /// 타 유저 pid엔 권한이 필요해 기본 off — 명시적으로 켤 때만 노출한다.
+        #[arg(long)]
+        allow_stack_sample: bool,
     },
     /// 세션 ring buffer의 최근 command record 목록 조회 (P1).
     ///
@@ -1199,8 +1203,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Web { bind, token }) => {
-            if let Err(e) = handle_web(bind, token).await {
+        Some(Commands::Web {
+            bind,
+            token,
+            allow_stack_sample,
+        }) => {
+            if let Err(e) = handle_web(bind, token, allow_stack_sample).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -1682,7 +1690,11 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
 
 /// `aic web` — 읽기 전용 대시보드 기동. 토큰은 `--token` 또는 `AIC_WEB_TOKEN`이 반드시 있어야 한다
 /// (web 노출은 인증 필수 — VPN은 네트워크 경계지 인증이 아니다). Ctrl+C로 graceful 종료.
-async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
+async fn handle_web(
+    bind: String,
+    token: Option<String>,
+    allow_stack_sample: bool,
+) -> anyhow::Result<()> {
     // 포트 누락(`--bind 127.0.0.1`)은 흔한 실수인데 tokio bind는 "invalid socket address"로만
     // 떨어져 원인을 안 짚는다 — 호스트명도 resolve 대상이므로 SocketAddr 전체 파싱 대신 포트만 검증.
     validate_bind(&bind)?;
@@ -1701,6 +1713,7 @@ async fn handle_web(bind: String, token: Option<String>) -> anyhow::Result<()> {
         bind,
         token,
         obs_config,
+        allow_stack_sample,
     })
     .await
 }

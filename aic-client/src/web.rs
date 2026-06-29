@@ -82,6 +82,8 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 const OBS_BODY_LIMIT: usize = 64 * 1024;
 /// 프로세스 상세의 network 연결 sample 상한(redacted). 너무 길면 payload·UI noise가 커진다.
 const PROCESS_NET_SAMPLE: usize = 50;
+/// 스택 샘플 출력 문자 상한 — `sample`/`/proc/stack`이 길어도 payload를 bound한다.
+const SAMPLE_CAP: usize = 12000;
 /// web 접근 감사 이벤트 kind — 누가/언제/어디서 대시보드를 봤는지 audit log(HMAC chain)에 남긴다.
 const WEB_ACCESS_KIND: &str = "web_access";
 const WEB_AUTH_DENIED_KIND: &str = "web_auth_denied";
@@ -199,6 +201,8 @@ pub struct WebConfig {
     pub bind: String,
     pub token: String,
     pub obs_config: aic_common::ObservabilityConfig,
+    /// (opt-in) 프로세스 스택 샘플 허용. 기본 false면 `/web/process/{pid}/sample`은 403.
+    pub allow_stack_sample: bool,
 }
 
 struct WebState {
@@ -209,6 +213,8 @@ struct WebState {
     runtime: Arc<Mutex<Value>>,
     /// 등록 관측 백엔드가 있을 때만 Some. 없으면 외부 metrics/logs는 503.
     obs: Option<ObsClient>,
+    /// 스택 샘플(Tier B) opt-in. false면 sample 엔드포인트 비활성.
+    allow_stack_sample: bool,
 }
 
 /// 대시보드를 `cfg.bind`에 바인드하고 Ctrl+C까지 서빙한다. 동시에 로컬 자원 샘플러를 백그라운드로 돌린다.
@@ -231,6 +237,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         local,
         runtime,
         obs,
+        allow_stack_sample: cfg.allow_stack_sample,
     });
 
     let app = Router::new()
@@ -238,6 +245,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/", get(dashboard))
         .route("/web/local", get(local_metrics))
         .route("/web/process/{pid}", get(process_detail))
+        .route("/web/process/{pid}/sample", get(process_stack_sample))
         .route("/web/snapshots", get(snapshots))
         .route("/web/incidents", get(incidents))
         .route("/web/incidents/{id}/report", get(incident_report))
@@ -975,18 +983,84 @@ async fn local_metrics(
 /// cmdline/exe/cwd(모두 `redaction` 통과 — secret만 마스킹), status/parent/threads/start·run time, mem/IO.
 /// **env는 노출하지 않고** 네트워크/tracing도 포함하지 않는다(공유 대시보드 안전 경계). sysinfo refresh는
 /// blocking이라 [`spawn_blocking`]으로 보낸다.
-async fn process_detail(Path(pid): Path<u32>) -> Json<Value> {
+async fn process_detail(State(state): State<Arc<WebState>>, Path(pid): Path<u32>) -> Json<Value> {
     let detail = tokio::task::spawn_blocking(move || collect_process_detail(pid))
         .await
         .ok()
         .flatten();
-    Json(detail.unwrap_or_else(|| {
+    let mut out = detail.unwrap_or_else(|| {
         json!({
             "available": false,
             "pid": pid,
             "reason": "프로세스를 찾을 수 없습니다(이미 종료됐거나 접근 권한이 없습니다).",
         })
-    }))
+    });
+    // 프론트가 "스택 샘플" 버튼 노출 여부를 정하도록 opt-in 상태를 함께 알린다.
+    if let Some(map) = out.as_object_mut() {
+        map.insert("sample_allowed".into(), json!(state.allow_stack_sample));
+    }
+    Json(out)
+}
+
+/// (opt-in, Tier B) 프로세스 스택 샘플. `--allow-stack-sample`이 꺼져 있으면 403. 비침습 — ptrace 첨부가
+/// 아니라 stack을 샘플링/스냅샷할 뿐이다. macOS `sample <pid> 1`, Linux `/proc/<pid>/stack`(perf 권장).
+async fn process_stack_sample(
+    State(state): State<Arc<WebState>>,
+    Path(pid): Path<u32>,
+) -> Response {
+    if !state.allow_stack_sample {
+        return (
+            StatusCode::FORBIDDEN,
+            "스택 샘플이 비활성화됨 — `aic web --allow-stack-sample`로 켜세요.\n",
+        )
+            .into_response();
+    }
+    let sampled = tokio::task::spawn_blocking(move || run_stack_sample(pid))
+        .await
+        .ok()
+        .flatten();
+    match sampled {
+        Some(text) => ([(CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "스택 샘플 수집 실패(미지원 플랫폼·권한 부족·프로세스 종료).\n",
+        )
+            .into_response(),
+    }
+}
+
+/// 스택 샘플 본체(blocking). 출력은 redact + 길이 cap. macOS `sample`은 같은 유저 pid엔 권한 불필요·비침습.
+fn run_stack_sample(pid: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sample")
+            .args([pid.to_string(), "1".to_string()])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(redaction::redact(&truncate_chars(&text, SAMPLE_CAP)).0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 비침습 userspace 프로파일은 perf(권한 필요). 여기선 kernel stack 스냅샷을 best-effort로 읽는다.
+        let stack = std::fs::read_to_string(format!("/proc/{pid}/stack")).ok()?;
+        if stack.trim().is_empty() {
+            return None;
+        }
+        let body = truncate_chars(&stack, SAMPLE_CAP);
+        Some(format!(
+            "[/proc/{pid}/stack — kernel stack 스냅샷. userspace 프로파일은 perf 권장(권한 필요)]\n{}",
+            redaction::redact(&body).0
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// `process_detail`의 blocking 본체. cpu%는 연속 refresh 간 delta라 짧게 두 번 샘플링한다.

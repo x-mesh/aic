@@ -339,6 +339,10 @@
   .pd-note { margin: 8px 0 0; font-size: 11px; }
   .pd-net { margin: 10px 0 4px; color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
   .pd-net-table td { color: var(--muted); }
+  .pd-sample-bar { margin: 10px 0 0; }
+  .pd-sample-btn { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; padding: 4px 10px; font-size: 12px; }
+  .pd-sample-btn:hover { border-color: var(--accent, var(--line)); }
+  .pd-sample { margin: 8px 0 0; max-height: 320px; overflow: auto; white-space: pre; background: var(--canvas); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
   .table-scroll { overflow-x: auto; border-radius: var(--radius-sm); }
   .resource-table { min-width: 520px; background: var(--canvas); border-radius: var(--radius-sm); }
   .resource-table th, .resource-table td { padding: 6px 8px; font-size: 12px; }
@@ -850,6 +854,9 @@ async function showProcess(pid) {
       '</tbody></table>' +
       procState(d.runtime_state) +
       procNet(d.network) +
+      (d.sample_allowed
+        ? '<div class="pd-sample-bar"><button type="button" class="pd-sample-btn" onclick="sampleProcess(\'' + esc(pid) + '\')">스택 샘플 (1s)</button></div><pre id="pd-sample" class="pd-sample" hidden></pre>'
+        : '') +
       '<p class="pd-note muted">env은 노출하지 않습니다. runtime은 read-only(프로세스 첨부·메모리 읽기 없음). cmd/cwd 및 네트워크 peer IP는 secret/IP 마스킹 적용.</p>';
   } catch (e) {
     box.innerHTML = head() + '<p class="err">' + esc(e.message) + '</p>';
@@ -883,6 +890,18 @@ function procNet(n) {
       sample.map(s => '<tr><td>' + esc(s) + '</td></tr>').join("") + '</tbody></table>';
   }
   return html;
+}
+// Tier B(opt-in): 1초 스택 샘플. 서버가 --allow-stack-sample일 때만 버튼이 보인다. 비침습(첨부 아님).
+async function sampleProcess(pid) {
+  const pre = document.getElementById("pd-sample");
+  if (!pre) return;
+  pre.hidden = false;
+  pre.textContent = "샘플링 중 (약 1초)…";
+  try {
+    pre.textContent = await (await api("/web/process/" + encodeURIComponent(pid) + "/sample")).text();
+  } catch (e) {
+    pre.textContent = "샘플 실패: " + e.message;
+  }
 }
 function closeProcDetail() {
   const box = document.getElementById("process-detail");
