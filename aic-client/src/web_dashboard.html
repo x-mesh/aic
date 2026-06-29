@@ -342,7 +342,15 @@
   .pd-sample-bar { margin: 10px 0 0; }
   .pd-sample-btn { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: var(--radius-sm); cursor: pointer; padding: 4px 10px; font-size: 12px; }
   .pd-sample-btn:hover { border-color: var(--accent, var(--line)); }
-  .pd-sample { margin: 8px 0 0; max-height: 320px; overflow: auto; white-space: pre; background: var(--canvas); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+  .pd-sample { margin: 8px 0 0; max-height: 360px; overflow: auto; background: var(--canvas); border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 8px; font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); }
+  .pd-sample pre { white-space: pre; margin: 0; }
+  .hot-head { margin: 0 0 6px; font-size: 11px; }
+  .hot-frames { display: grid; gap: 3px; }
+  .hot-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; align-items: center; padding: 3px 6px; border-radius: var(--radius-sm); overflow: hidden; }
+  .hot-bar { position: absolute; left: 0; top: 0; bottom: 0; background: color-mix(in srgb, var(--accent, #5b8def) 22%, transparent); z-index: 0; }
+  .hot-sym, .hot-bin, .hot-cnt { position: relative; z-index: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hot-sym { color: var(--text); }
+  .hot-cnt { color: var(--text); font-variant-numeric: tabular-nums; }
   .table-scroll { overflow-x: auto; border-radius: var(--radius-sm); }
   .resource-table { min-width: 520px; background: var(--canvas); border-radius: var(--radius-sm); }
   .resource-table th, .resource-table td { padding: 6px 8px; font-size: 12px; }
@@ -855,7 +863,7 @@ async function showProcess(pid) {
       procState(d.runtime_state) +
       procNet(d.network) +
       (d.sample_allowed
-        ? '<div class="pd-sample-bar"><button type="button" class="pd-sample-btn" onclick="sampleProcess(\'' + esc(pid) + '\')">스택 샘플 (1s)</button></div><pre id="pd-sample" class="pd-sample" hidden></pre>'
+        ? '<div class="pd-sample-bar"><button type="button" class="pd-sample-btn" onclick="sampleProcess(\'' + esc(pid) + '\')">CPU 스택 샘플 (2s)</button></div><div id="pd-sample" class="pd-sample" hidden></div>'
         : '') +
       '<p class="pd-note muted">env은 노출하지 않습니다. runtime은 read-only(프로세스 첨부·메모리 읽기 없음). cmd/cwd 및 네트워크 peer IP는 secret/IP 마스킹 적용.</p>';
   } catch (e) {
@@ -893,15 +901,36 @@ function procNet(n) {
 }
 // Tier B(opt-in): 1초 스택 샘플. 서버가 --allow-stack-sample일 때만 버튼이 보인다. 비침습(첨부 아님).
 async function sampleProcess(pid) {
-  const pre = document.getElementById("pd-sample");
-  if (!pre) return;
-  pre.hidden = false;
-  pre.textContent = "샘플링 중 (약 1초)…";
+  const box = document.getElementById("pd-sample");
+  if (!box) return;
+  box.hidden = false;
+  box.innerHTML = '<span class="muted">샘플링 중 (약 2초)…</span>';
   try {
-    pre.textContent = await (await api("/web/process/" + encodeURIComponent(pid) + "/sample")).text();
+    const d = await (await api("/web/process/" + encodeURIComponent(pid) + "/sample")).json();
+    box.innerHTML = renderSample(d);
   } catch (e) {
-    pre.textContent = "샘플 실패: " + e.message;
+    box.innerHTML = '<span class="err">샘플 실패: ' + esc(e.message) + '</span>';
   }
+}
+// 구조화 샘플 렌더: self-time hot frame 랭크드 바(count·%) + thread 요약. macOS는 cpu, Linux는 kernel_stack.
+function renderSample(d) {
+  if (!d || !d.available) return '<span class="muted">' + esc((d && d.reason) || "사용 불가") + '</span>';
+  if (d.kind === "kernel_stack") {
+    return '<div class="muted" style="margin-bottom:6px">' + esc(d.note || "") + '</div><pre>' + esc(d.raw || "") + '</pre>';
+  }
+  const hot = d.hot_frames || [], total = +d.total_samples || 0;
+  if (!hot.length) return '<span class="muted">hot frame 없음 (유휴 프로세스이거나 샘플 부족)</span>';
+  const max = hot[0].count || 1;
+  const head = (total ? total + " samples" : "") + ((d.threads || []).length ? " · " + d.threads.length + " threads" : "");
+  const rows = hot.map(f => {
+    const pct = total ? (100 * f.count / total) : 0;
+    const w = Math.max(3, 100 * f.count / max);
+    return '<div class="hot-row"><div class="hot-bar" style="width:' + w.toFixed(0) + '%"></div>' +
+      '<span class="hot-sym" title="' + esc(f.symbol) + '">' + esc(f.symbol) + '</span>' +
+      '<span class="hot-bin muted">' + esc(f.binary) + '</span>' +
+      '<span class="hot-cnt">' + esc(f.count) + (total ? ' · ' + pct.toFixed(1) + '%' : '') + '</span></div>';
+  }).join("");
+  return '<div class="hot-head muted">' + esc(head) + ' · self-time 상위</div><div class="hot-frames">' + rows + '</div>';
 }
 function closeProcDetail() {
   const box = document.getElementById("process-detail");
