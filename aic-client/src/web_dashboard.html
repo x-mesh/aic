@@ -337,6 +337,8 @@
   .pd-table th { text-align: left; vertical-align: top; white-space: nowrap; padding: 3px 12px 3px 0; color: var(--subtle); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; width: 1%; }
   .pd-table td { padding: 3px 0; color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
   .pd-note { margin: 8px 0 0; font-size: 11px; }
+  .pd-net { margin: 10px 0 4px; color: var(--text); font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .pd-net-table td { color: var(--muted); }
   .table-scroll { overflow-x: auto; border-radius: var(--radius-sm); }
   .resource-table { min-width: 520px; background: var(--canvas); border-radius: var(--radius-sm); }
   .resource-table th, .resource-table td { padding: 6px 8px; font-size: 12px; }
@@ -846,10 +848,26 @@ async function showProcess(pid) {
       '<table class="pd-table"><tbody>' +
       rows.map(r => '<tr><th>' + esc(r[0]) + '</th><td>' + esc(r[1]) + '</td></tr>').join("") +
       '</tbody></table>' +
-      '<p class="pd-note muted">env·네트워크·tracing은 노출하지 않습니다(공유 대시보드 안전 경계). cmd/cwd는 secret 마스킹 적용.</p>';
+      procNet(d.network) +
+      '<p class="pd-note muted">env·tracing은 노출하지 않습니다(공유 대시보드 안전 경계). cmd/cwd 및 네트워크 peer IP는 secret/IP 마스킹 적용.</p>';
   } catch (e) {
     box.innerHTML = head() + '<p class="err">' + esc(e.message) + '</p>';
   }
+}
+// 프로세스 네트워크 섹션(redacted). listen 포트 + 연결 수 + bounded sample. peer IP는 서버에서 마스킹됨.
+function procNet(n) {
+  if (!n) return "";
+  if (!n.available) return '<div class="pd-net muted">network: ' + esc(n.reason || "사용 불가") + '</div>';
+  const listen = n.listening || [], sample = n.sample || [];
+  if (!listen.length && !(n.connections || 0)) return '<div class="pd-net muted">network: 활성 소켓 없음</div>';
+  let html = '<div class="pd-net"><strong>network</strong> · ' + (n.connections || 0) + ' connections';
+  if (listen.length) html += ' · listen: ' + listen.map(esc).join(", ");
+  html += '</div>';
+  if (sample.length) {
+    html += '<table class="pd-table pd-net-table"><tbody>' +
+      sample.map(s => '<tr><td>' + esc(s) + '</td></tr>').join("") + '</tbody></table>';
+  }
+  return html;
 }
 function closeProcDetail() {
   const box = document.getElementById("process-detail");
