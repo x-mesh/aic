@@ -1034,7 +1034,91 @@ fn collect_process_detail(pid: u32) -> Option<Value> {
         "disk_read_total": du.total_read_bytes,
         "disk_written_total": du.total_written_bytes,
         "network": collect_process_network(pid),
+        "runtime_state": collect_process_runtime_state(pid),
     }))
+}
+
+/// Tier A tracing — **read-only** 프로세스 상태. ptrace 첨부·정지·메모리 읽기가 전혀 없어 공유 대시보드에
+/// 안전하다. Linux는 `/proc/<pid>/{status,wchan}`로 state·blocked-in 심볼·threads·context-switch(=contention
+/// 신호)를, macOS는 `ps` fallback(state/wchan)을 준다. 종료/권한 부족은 available:false.
+fn collect_process_runtime_state(pid: u32) -> Value {
+    #[cfg(target_os = "linux")]
+    {
+        let base = format!("/proc/{pid}");
+        let status = std::fs::read_to_string(format!("{base}/status")).unwrap_or_default();
+        if status.is_empty() {
+            json!({ "available": false, "platform": "linux", "reason": "/proc 읽기 실패(종료됐거나 권한 없음)" })
+        } else {
+            let wchan = std::fs::read_to_string(format!("{base}/wchan")).ok();
+            parse_proc_status(&status, wchan.as_deref())
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        runtime_state_macos(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        json!({ "available": false, "platform": "other", "reason": "지원하지 않는 플랫폼" })
+    }
+}
+
+/// `/proc/<pid>/status` 텍스트(+wchan)에서 read-only 상태 필드를 뽑는 순수 함수. Linux에서만 호출되지만
+/// 순수 함수라 macOS에서도 test로 검증한다(그래서 cfg에 test 포함).
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_status(status: &str, wchan: Option<&str>) -> Value {
+    let field = |key: &str| -> Option<String> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
+    };
+    let num = |key: &str| {
+        field(key)
+            .and_then(|v| v.split_whitespace().next().map(str::to_string))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    // wchan은 block된 kernel 심볼. 실행 중이면 "0"이라 의미 없어 거른다.
+    let wchan = wchan
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "0");
+    json!({
+        "available": true,
+        "platform": "linux",
+        "state": field("State:"),
+        "threads": num("Threads:"),
+        "voluntary_ctxt_switches": num("voluntary_ctxt_switches:"),
+        "nonvoluntary_ctxt_switches": num("nonvoluntary_ctxt_switches:"),
+        "wchan": wchan,
+    })
+}
+
+/// macOS는 `/proc`이 없다. `ps`로 state/wchan만 best-effort(ptrace 첨부 없음). threads·ctx-switch는 Linux 전용.
+#[cfg(target_os = "macos")]
+fn runtime_state_macos(pid: u32) -> Value {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "state=,wchan=", "-p", &pid.to_string()])
+        .output();
+    let Ok(output) = output else {
+        return json!({ "available": false, "platform": "macos", "reason": "ps 실행 실패" });
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut it = line.split_whitespace();
+    let state = it.next().map(str::to_string);
+    let wchan = it.next().map(str::to_string).filter(|s| s != "-");
+    match state {
+        None => {
+            json!({ "available": false, "platform": "macos", "reason": "프로세스를 찾을 수 없습니다" })
+        }
+        Some(state) => json!({
+            "available": true,
+            "platform": "macos",
+            "state": state,
+            "wchan": wchan,
+            "note": "macOS는 /proc 미지원 — state/wchan만(threads·ctx-switch는 Linux 전용).",
+        }),
+    }
 }
 
 /// pid의 네트워크 소켓을 `lsof -nP -p <pid> -i`로 수집한다(probes.rs와 동일 패턴). args는 고정이고 pid는
@@ -1852,6 +1936,23 @@ mod tests {
         assert!(web_access_is_audited("/web/incidents/x/report"));
         assert!(web_access_is_audited("/web/config"));
         assert!(web_access_is_audited("/web/chat"));
+    }
+
+    #[test]
+    fn parse_proc_status_extracts_state_and_contention() {
+        let fixture = "Name:\tpostgres\nState:\tS (sleeping)\nThreads:\t12\n\
+                       voluntary_ctxt_switches:\t34567\nnonvoluntary_ctxt_switches:\t89\n";
+        let v = parse_proc_status(fixture, Some("futex_wait_queue_me\n"));
+        assert_eq!(v["available"], true);
+        assert_eq!(v["state"], "S (sleeping)");
+        assert_eq!(v["threads"], 12);
+        assert_eq!(v["voluntary_ctxt_switches"], 34567);
+        assert_eq!(v["nonvoluntary_ctxt_switches"], 89);
+        assert_eq!(v["wchan"], "futex_wait_queue_me");
+        // 실행 중(wchan "0")은 의미 없어 거른다.
+        let running = parse_proc_status("State:\tR (running)\nThreads:\t1\n", Some("0\n"));
+        assert!(running["wchan"].is_null());
+        assert_eq!(running["state"], "R (running)");
     }
 
     #[test]
