@@ -20,7 +20,7 @@
 //! Bearer 토큰을 요구하고, 대시보드 셸(`/`, `/web/health`)만 면제한다(민감 데이터 없음 — 사용자가
 //! 페이지에서 토큰 입력 → JS가 이후 fetch에 Bearer로 싣는다).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -220,8 +220,10 @@ struct WebState {
     runtime: Arc<Mutex<Value>>,
     /// 등록 관측 백엔드가 있을 때만 Some. 없으면 외부 metrics/logs는 503.
     obs: Option<ObsClient>,
-    /// 스택 샘플(Tier B) opt-in. false면 sample 엔드포인트 비활성.
+    /// 스택 샘플 활성(기본 ON; `--no-stack-sample`로 off). false면 sample 엔드포인트 403.
     allow_stack_sample: bool,
+    /// 진행 중인 sample pid 집합(single-flight) — 같은 pid 동시 샘플/연타 폭주를 막는다.
+    sampling: Arc<Mutex<HashSet<u32>>>,
 }
 
 /// 대시보드를 `cfg.bind`에 바인드하고 Ctrl+C까지 서빙한다. 동시에 로컬 자원 샘플러를 백그라운드로 돌린다.
@@ -245,6 +247,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         runtime,
         obs,
         allow_stack_sample: cfg.allow_stack_sample,
+        sampling: Arc::new(Mutex::new(HashSet::new())),
     });
 
     let app = Router::new()
@@ -1009,8 +1012,41 @@ async fn process_detail(State(state): State<Arc<WebState>>, Path(pid): Path<u32>
     Json(out)
 }
 
-/// (opt-in, Tier B) 프로세스 스택 샘플. `--allow-stack-sample`이 꺼져 있으면 403. 비침습 — ptrace 첨부가
-/// 아니라 stack을 샘플링/스냅샷할 뿐이다. macOS `sample <pid> 1`, Linux `/proc/<pid>/stack`(perf 권장).
+/// single-flight guard — 핸들러 종료(성공·에러·panic) 시 sampling set에서 pid를 제거한다.
+struct SamplingGuard {
+    set: Arc<Mutex<HashSet<u32>>>,
+    pid: u32,
+}
+
+impl Drop for SamplingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut s) = self.set.lock() {
+            s.remove(&self.pid);
+        }
+    }
+}
+
+/// pid가 최신 샘플의 top CPU/mem 프로세스 목록에 있는지 — 임의 pid 샘플을 막는 authz(UI 클릭 대상과 동일).
+fn pid_in_top_list(state: &WebState, pid: u32) -> bool {
+    let p = pid.to_string();
+    state
+        .local
+        .lock()
+        .ok()
+        .and_then(|b| {
+            b.back().map(|pt| {
+                pt.top_cpu_procs
+                    .iter()
+                    .chain(pt.top_mem_procs.iter())
+                    .any(|ps| ps.pid == p)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 프로세스 CPU 스택 샘플(기본 ON; `--no-stack-sample`로 off). 비침습 — ptrace 첨부가 아니라 stack을
+/// 샘플링할 뿐이다. 안전장치: ① 비활성 시 403, ② **표시된 top 프로세스 pid만** 허용(임의 pid 차단),
+/// ③ 같은 pid single-flight(429), ④ sample 서브프로세스 timeout. macOS `sample`, Linux는 kernel stack.
 async fn process_stack_sample(
     State(state): State<Arc<WebState>>,
     Path(pid): Path<u32>,
@@ -1018,10 +1054,33 @@ async fn process_stack_sample(
     if !state.allow_stack_sample {
         return (
             StatusCode::FORBIDDEN,
-            "스택 샘플이 비활성화됨 — `aic web --allow-stack-sample`로 켜세요.\n",
+            "스택 샘플이 비활성화됨(`--no-stack-sample`).\n",
         )
             .into_response();
     }
+    // 임의 pid 차단 — 대시보드가 현재 보여주는 top CPU/mem 프로세스만 샘플 가능(UI 클릭 대상과 동일).
+    if !pid_in_top_list(&state, pid) {
+        return (
+            StatusCode::FORBIDDEN,
+            "표시된 top 프로세스만 샘플할 수 있습니다.\n",
+        )
+            .into_response();
+    }
+    // single-flight: 같은 pid가 이미 샘플 중이면 거절(연타·동시요청 폭주 방지). guard가 종료 시 해제.
+    {
+        let mut s = state.sampling.lock().unwrap_or_else(|e| e.into_inner());
+        if !s.insert(pid) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "이미 이 프로세스를 샘플링 중입니다.\n",
+            )
+                .into_response();
+        }
+    }
+    let _guard = SamplingGuard {
+        set: state.sampling.clone(),
+        pid,
+    };
     let sampled = tokio::task::spawn_blocking(move || run_stack_sample(pid))
         .await
         .ok()
@@ -1042,10 +1101,10 @@ async fn process_stack_sample(
 fn run_stack_sample(pid: u32) -> Option<Value> {
     #[cfg(target_os = "macos")]
     {
-        let out = std::process::Command::new("sample")
-            .args([pid.to_string(), SAMPLE_SECS.to_string()])
-            .output()
-            .ok()?;
+        let mut cmd = std::process::Command::new("sample");
+        cmd.args([pid.to_string(), SAMPLE_SECS.to_string()]);
+        // `sample`은 SAMPLE_SECS 후 자체 종료하지만, wedge 대비 hard deadline으로 강제 kill한다.
+        let out = output_with_timeout(cmd, SAMPLE_SECS + 5)?;
         let text = String::from_utf8_lossy(&out.stdout);
         if text.trim().is_empty() {
             return None;
@@ -1075,6 +1134,36 @@ fn run_stack_sample(pid: u32) -> Option<Value> {
         let _ = pid;
         None
     }
+}
+
+/// 서브프로세스를 실행하되 `secs`초 후 강제 종료한다(wedge 방지). stdout만 capture, stderr는 버린다.
+#[cfg(target_os = "macos")]
+fn output_with_timeout(mut cmd: std::process::Command, secs: u64) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    use std::time::Instant;
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    child.wait_with_output().ok()
 }
 
 /// macOS `sample` 출력을 구조화한다(순수 함수 — fixture로 테스트). "Sort by top of stack" 섹션을 self-time
