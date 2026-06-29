@@ -413,6 +413,21 @@ enum Commands {
         #[command(subcommand)]
         op: RcaOp,
     },
+    /// (운영자) 프로세스 트레이스 — Linux strace(침습: 대상 느려짐), macOS는 비침습 sample. confirm + timeout.
+    /// web 대시보드에는 노출하지 않는다(특권·메모리 노출·교란 위험은 로컬 명시 동의 하에서만).
+    Trace {
+        /// 대상 pid.
+        pid: u32,
+        /// 트레이스 시간(초). 종료 후 결과를 출력한다.
+        #[arg(long, default_value_t = 5)]
+        duration: u64,
+        /// 확인 프롬프트를 생략한다.
+        #[arg(long)]
+        yes: bool,
+        /// 출력 최대 줄 수(redacted).
+        #[arg(long, default_value_t = 200)]
+        max_lines: usize,
+    },
     /// 진단 스냅샷 store 관리 (스냅샷 레코더 L2) — 주기 캡처 타이머 설치 + 수동 캡처/조회.
     /// `install`로 N초마다 redacted 전체 /local 스냅샷을 영구 store에 쌓는다(opt-in: 설치가 곧 동의).
     Snapshot {
@@ -1193,6 +1208,17 @@ async fn main() {
         }
         Some(Commands::Rca { op }) => {
             if let Err(e) = handle_rca(op, cli.provider).await {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Trace {
+            pid,
+            duration,
+            yes,
+            max_lines,
+        }) => {
+            if let Err(e) = handle_trace(pid, duration, yes, max_lines).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -6254,6 +6280,75 @@ fn confirm_yes_no(question: &str) -> bool {
         return false;
     }
     matches!(buf.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// `aic trace <pid>` — 운영자 명시 동의 하의 프로세스 트레이스(web 노출 안 함). Linux strace(침습),
+/// macOS는 비침습 sample. 출력은 redaction(syscall 버퍼의 secret 마스킹) + 줄 수 cap.
+async fn handle_trace(pid: u32, duration: u64, yes: bool, max_lines: usize) -> anyhow::Result<()> {
+    if !yes {
+        let q = format!(
+            "pid {pid}에 트레이스를 {duration}s 붙입니다 — Linux strace는 대상 프로세스를 느리게/멈출 수 \
+             있고 메모리·syscall 버퍼가 보일 수 있습니다. 계속하시겠습니까?"
+        );
+        if !confirm_yes_no(&q) {
+            println!("취소됨.");
+            return Ok(());
+        }
+    }
+    eprintln!("트레이스 중({duration}s)…");
+    let (output, label) = tokio::task::spawn_blocking(move || run_trace(pid, duration)).await??;
+    let total = output.lines().count();
+    let bounded: Vec<&str> = output.lines().take(max_lines).collect();
+    println!("[{label}]");
+    println!("{}", aic_client::redaction::redact(&bounded.join("\n")).0);
+    if total > max_lines {
+        eprintln!("… (총 {total}줄 중 {max_lines}줄 표시 — --max-lines로 조정)");
+    }
+    Ok(())
+}
+
+/// Linux: `timeout <dur> strace -f -p <pid>`(strace는 stderr 출력). 침습적 — confirm gate 뒤에서만 호출된다.
+#[cfg(target_os = "linux")]
+fn run_trace(pid: u32, duration: u64) -> anyhow::Result<(String, &'static str)> {
+    let args = vec![
+        duration.to_string(),
+        "strace".to_string(),
+        "-f".to_string(),
+        "-p".to_string(),
+        pid.to_string(),
+    ];
+    let out = std::process::Command::new("timeout")
+        .args(&args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("timeout/strace 실행 실패(설치 확인): {e}"))?;
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    if text.trim().is_empty() {
+        anyhow::bail!(
+            "strace 출력이 없습니다 — 권한 부족일 수 있습니다(CAP_SYS_PTRACE/root, yama ptrace_scope 확인)."
+        );
+    }
+    Ok((text, "strace -f (Linux)"))
+}
+
+/// macOS: full syscall trace(dtruss)는 SIP/root가 필요해 자동 실행하지 않는다. 비침습 `sample`로 대체한다.
+#[cfg(target_os = "macos")]
+fn run_trace(pid: u32, duration: u64) -> anyhow::Result<(String, &'static str)> {
+    let out = std::process::Command::new("sample")
+        .args([pid.to_string(), duration.to_string()])
+        .output()
+        .map_err(|e| anyhow::anyhow!("sample 실행 실패: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    if text.trim().is_empty() {
+        anyhow::bail!(
+            "sample 출력이 없습니다(프로세스 종료/권한). full syscall trace는 `sudo dtruss -p {pid}` 수동 실행 필요."
+        );
+    }
+    Ok((text, "sample (macOS · 비침습; full dtruss는 sudo/SIP 필요)"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn run_trace(_pid: u32, _duration: u64) -> anyhow::Result<(String, &'static str)> {
+    anyhow::bail!("이 플랫폼은 trace를 지원하지 않습니다")
 }
 
 async fn handle_last(json: bool, session: Option<String>) {
