@@ -25,6 +25,13 @@ pub struct IncidentMeta {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub evidence_count: usize,
+    /// 최초 Mitigated 전이 시각(TTM = mitigated_at − created_at). 미전이면 None.
+    /// `#[serde(default)]`로 이 필드가 없는 기존 meta.json도 호환 로드된다.
+    #[serde(default)]
+    pub mitigated_at: Option<DateTime<Utc>>,
+    /// Closed 전이 시각(MTTR = closed_at − created_at). reopen 시 None으로 되돌린다.
+    #[serde(default)]
+    pub closed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +119,8 @@ pub fn create_incident(
         created_at: now,
         updated_at: now,
         evidence_count: 0,
+        mitigated_at: None,
+        closed_at: None,
     };
     save_meta(&meta)?;
 
@@ -180,6 +189,41 @@ pub fn append_evidence(
     meta.updated_at = event.at;
     save_meta(meta)?;
     Ok(event)
+}
+
+/// incident 상태를 전이하고 그 사실을 lifecycle evidence로 timeline에 남긴다. Mitigated/Closed 전이 시각을
+/// 기록해 MTTR(Closed−created)·TTM(Mitigated−created)을 도출 가능하게 한다. Closed는 Mitigated를 함의하고
+/// (mitigated_at 미설정 시 함께 채움), Open으로의 재개방(reopen)은 closed_at을 해제한다. 임의 전이를 막지
+/// 않되 모든 전이를 evidence로 남겨 상태 히스토리를 보존한다. append_evidence가 atomic save까지 수행한다.
+pub fn set_status(meta: &mut IncidentMeta, new: IncidentStatus) -> anyhow::Result<EvidenceEvent> {
+    let now = Utc::now();
+    let prev = meta.status;
+    match new {
+        IncidentStatus::Mitigated => {
+            if meta.mitigated_at.is_none() {
+                meta.mitigated_at = Some(now);
+            }
+        }
+        IncidentStatus::Closed => {
+            if meta.mitigated_at.is_none() {
+                meta.mitigated_at = Some(now); // closed implies mitigated
+            }
+            meta.closed_at = Some(now);
+        }
+        IncidentStatus::Open => {
+            meta.closed_at = None; // reopen
+        }
+    }
+    meta.status = new;
+    let body = format!("status: {prev:?} -> {new:?}");
+    append_evidence(
+        meta,
+        EvidenceKind::Lifecycle,
+        &format!("status -> {new:?}"),
+        "aic rca status",
+        &body,
+        &["lifecycle", "transition"],
+    )
 }
 
 pub fn load_meta(id: &str) -> anyhow::Result<IncidentMeta> {
@@ -272,7 +316,7 @@ pub fn resolve_id(id: Option<&str>) -> anyhow::Result<String> {
 }
 
 pub fn render_status(meta: &IncidentMeta) -> String {
-    format!(
+    let mut s = format!(
         "RCA {}\n상태: {:?}\n제목: {}\n증상: {}\n생성: {}\n갱신: {}\n증거: {}개\n경로: {}",
         meta.id,
         meta.status,
@@ -282,7 +326,40 @@ pub fn render_status(meta: &IncidentMeta) -> String {
         meta.updated_at.to_rfc3339(),
         meta.evidence_count,
         incident_dir(&meta.id).display()
-    )
+    );
+    if let Some(m) = meta.mitigated_at {
+        s.push_str(&format!(
+            "\n완화까지(TTM): {}",
+            humanize_duration(m - meta.created_at)
+        ));
+    }
+    if let Some(c) = meta.closed_at {
+        s.push_str(&format!(
+            "\nMTTR: {}",
+            humanize_duration(c - meta.created_at)
+        ));
+    }
+    s
+}
+
+/// 사람이 읽는 기간 포맷(MTTR/TTM 표시). 음수(시계 역전)는 0으로 클램프.
+fn humanize_duration(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    let (days, hours, mins, s) = (
+        secs / 86400,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 pub fn render_timeline(meta: &IncidentMeta, events: &[EvidenceEvent]) -> String {
@@ -316,6 +393,28 @@ pub fn render_report(meta: &IncidentMeta, events: &[EvidenceEvent]) -> String {
         meta.created_at.to_rfc3339(),
         meta.updated_at.to_rfc3339()
     ));
+
+    // Resolution & Postmortem — 완화/종료된 incident에만 MTTR/TTM을 싣는다(미해결 incident엔 노이즈 안 됨).
+    if meta.mitigated_at.is_some() || meta.closed_at.is_some() {
+        md.push_str("## Resolution\n\n");
+        if let Some(m) = meta.mitigated_at {
+            md.push_str(&format!(
+                "- Time to mitigate (TTM): {} (opened {} → mitigated {})\n",
+                humanize_duration(m - meta.created_at),
+                meta.created_at.to_rfc3339(),
+                m.to_rfc3339()
+            ));
+        }
+        if let Some(c) = meta.closed_at {
+            md.push_str(&format!(
+                "- MTTR (time to resolve): {} (opened {} → closed {})\n",
+                humanize_duration(c - meta.created_at),
+                meta.created_at.to_rfc3339(),
+                c.to_rfc3339()
+            ));
+        }
+        md.push('\n');
+    }
 
     md.push_str("## Timeline\n\n");
     for ev in events {
@@ -890,5 +989,68 @@ mod tests {
         let ev = append_evidence(&mut meta, EvidenceKind::Note, "n3", "s", "b", &[]).unwrap();
         assert_eq!(ev.id, "E3", "stale count가 아니라 파일 줄 수로 E-id 산출");
         assert_eq!(meta.evidence_count, 3);
+    }
+
+    // (B) lifecycle: 전이가 타임스탬프·evidence·MTTR로 기록되고 영속된다.
+    #[test]
+    fn set_status_records_lifecycle_mttr_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+
+        let mut meta = create_incident("svc down", None, None).unwrap();
+        assert_eq!(meta.status, IncidentStatus::Open);
+        assert!(meta.mitigated_at.is_none() && meta.closed_at.is_none());
+
+        set_status(&mut meta, IncidentStatus::Mitigated).unwrap();
+        assert_eq!(meta.status, IncidentStatus::Mitigated);
+        assert!(meta.mitigated_at.is_some());
+
+        set_status(&mut meta, IncidentStatus::Closed).unwrap();
+        assert_eq!(meta.status, IncidentStatus::Closed);
+        assert!(meta.closed_at.is_some());
+
+        // 영속성 + report Resolution(MTTR) 섹션 + 전이 evidence.
+        let loaded = load_meta(&meta.id).unwrap();
+        assert_eq!(loaded.status, IncidentStatus::Closed);
+        assert!(loaded.mitigated_at.is_some() && loaded.closed_at.is_some());
+        let events = load_events(&meta.id).unwrap();
+        let report = render_report(&loaded, &events);
+        assert!(report.contains("## Resolution") && report.contains("MTTR"));
+        assert!(events
+            .iter()
+            .any(|e| e.tags.iter().any(|t| t == "transition")));
+
+        // reopen → closed_at 해제.
+        set_status(&mut meta, IncidentStatus::Open).unwrap();
+        assert!(meta.closed_at.is_none());
+        assert_eq!(meta.status, IncidentStatus::Open);
+    }
+
+    // Closed는 Mitigated를 함의한다(중간 단계 생략 시 mitigated_at도 채움).
+    #[test]
+    fn closed_implies_mitigated() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let mut meta = create_incident("direct close", None, None).unwrap();
+        set_status(&mut meta, IncidentStatus::Closed).unwrap();
+        assert!(meta.mitigated_at.is_some() && meta.closed_at.is_some());
+    }
+
+    #[test]
+    fn humanize_duration_formats() {
+        use chrono::Duration;
+        assert_eq!(humanize_duration(Duration::seconds(45)), "45s");
+        assert_eq!(humanize_duration(Duration::seconds(125)), "2m 5s");
+        assert_eq!(humanize_duration(Duration::seconds(3700)), "1h 1m");
+        assert_eq!(humanize_duration(Duration::seconds(90061)), "1d 1h 1m");
+        assert_eq!(humanize_duration(Duration::seconds(-5)), "0s");
+    }
+
+    // 기존(lifecycle 필드 없는) meta.json도 호환 로드된다.
+    #[test]
+    fn meta_without_lifecycle_fields_deserializes() {
+        let old = r#"{"id":"x","title":"t","status":"open","symptom":null,"cwd":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","evidence_count":0}"#;
+        let m: IncidentMeta = serde_json::from_str(old).unwrap();
+        assert!(m.mitigated_at.is_none() && m.closed_at.is_none());
     }
 }

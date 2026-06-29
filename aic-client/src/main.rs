@@ -608,6 +608,39 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// incident를 완화(Mitigated)로 전이한다. id 생략 시 최근 incident. TTM이 기록된다.
+    Mitigate {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 완화 조치 메모를 evidence로 함께 남긴다.
+        #[arg(long)]
+        note: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// incident를 종료(Closed)로 전이한다 — MTTR이 확정되고 report에 Resolution이 추가된다.
+    Close {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 해소/재발방지 메모를 evidence로 함께 남긴다(postmortem용).
+        #[arg(long)]
+        note: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// 종료된 incident를 재개방(Open)한다 — closed_at을 해제한다.
+    Reopen {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 재개방 사유 메모를 evidence로 남긴다.
+        #[arg(long)]
+        note: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
     /// RCA report markdown을 생성한다.
     Report {
         /// incident id 또는 prefix. 생략 시 최근 incident.
@@ -6818,6 +6851,15 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 println!("{}", aic_client::rca::render_timeline(&meta, &events));
             }
         }
+        RcaOp::Mitigate { id, note, json } => {
+            rca_transition(id, aic_client::rca::IncidentStatus::Mitigated, note, json)?;
+        }
+        RcaOp::Close { id, note, json } => {
+            rca_transition(id, aic_client::rca::IncidentStatus::Closed, note, json)?;
+        }
+        RcaOp::Reopen { id, note, json } => {
+            rca_transition(id, aic_client::rca::IncidentStatus::Open, note, json)?;
+        }
         RcaOp::Report { id, write, json } => {
             let resolved = aic_client::rca::resolve_id(id.as_deref())?;
             let meta = aic_client::rca::load_meta(&resolved)?;
@@ -6845,6 +6887,35 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `aic rca mitigate|close|reopen` 공통 — incident를 전이하고(전이는 lifecycle evidence로 기록됨)
+/// 선택적 메모를 evidence로 붙인 뒤 갱신된 상태(MTTR 포함)를 출력한다.
+fn rca_transition(
+    id: Option<String>,
+    status: aic_client::rca::IncidentStatus,
+    note: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+    let mut meta = aic_client::rca::load_meta(&resolved)?;
+    aic_client::rca::set_status(&mut meta, status)?;
+    if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        aic_client::rca::append_evidence(
+            &mut meta,
+            aic_client::rca::EvidenceKind::Note,
+            "resolution note",
+            "aic rca",
+            note,
+            &["resolution"],
+        )?;
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&meta)?);
+    } else {
+        println!("{}", aic_client::rca::render_status(&meta));
     }
     Ok(())
 }
