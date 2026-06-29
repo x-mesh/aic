@@ -652,6 +652,29 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// incident 시간창으로 Prometheus/Loki를 질의해 결과를 evidence로 붙인다 — probe를 관측 데이터로 뒷받침.
+    Observe {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 질의할 등록 백엔드 이름([observability.backends.<name>]). prometheus/loki 타입은 자동 추론.
+        #[arg(long)]
+        backend: String,
+        /// PromQL 또는 LogQL 식.
+        #[arg(long)]
+        query: String,
+        /// incident 시작 이전 lookback(예: 15m, 1h, 30s, 2d). 기본 15m. 끝은 closed_at 또는 now.
+        #[arg(long)]
+        before: Option<String>,
+        /// Prometheus range query step(기본 60s).
+        #[arg(long)]
+        step: Option<String>,
+        /// Loki 최대 로그 행 수.
+        #[arg(long)]
+        limit: Option<u64>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6860,6 +6883,17 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         RcaOp::Reopen { id, note, json } => {
             rca_transition(id, aic_client::rca::IncidentStatus::Open, note, json)?;
         }
+        RcaOp::Observe {
+            id,
+            backend,
+            query,
+            before,
+            step,
+            limit,
+            json,
+        } => {
+            rca_observe(id, backend, query, before, step, limit, json).await?;
+        }
         RcaOp::Report { id, write, json } => {
             let resolved = aic_client::rca::resolve_id(id.as_deref())?;
             let meta = aic_client::rca::load_meta(&resolved)?;
@@ -6918,6 +6952,121 @@ fn rca_transition(
         println!("{}", aic_client::rca::render_status(&meta));
     }
     Ok(())
+}
+
+/// `aic rca observe` — incident 시간창([created_at − before, closed_at 또는 now])으로 등록된
+/// Prometheus/Loki 백엔드를 ObsClient로 질의하고, bounded·redacted 결과를 Observability evidence로 붙인다.
+/// 백엔드 타입은 이름으로 추론한다. 임의 URL 불가(등록 백엔드만) — SSRF 방어는 ObsClient가 담당.
+async fn rca_observe(
+    id: Option<String>,
+    backend: String,
+    query: String,
+    before: Option<String>,
+    step: Option<String>,
+    limit: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use aic_common::BackendType;
+
+    let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+    let mut meta = aic_client::rca::load_meta(&resolved)?;
+
+    let config = ConfigManager::load()?;
+    let obs = aic_client::agent::obs_tools::ObsClient::new(&config.observability)
+        .ok()
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "등록된 관측 백엔드가 없습니다. config [observability.backends.<name>]에 추가하세요."
+            )
+        })?;
+
+    // 백엔드 이름으로 도구 타입을 추론한다(prometheus/loki).
+    let (tool, label) = if obs
+        .backend_names_of(BackendType::Prometheus)
+        .iter()
+        .any(|n| n == &backend)
+    {
+        ("prometheus_query", "prometheus")
+    } else if obs
+        .backend_names_of(BackendType::Loki)
+        .iter()
+        .any(|n| n == &backend)
+    {
+        ("loki_query", "loki")
+    } else {
+        anyhow::bail!(
+            "백엔드 '{backend}'를 Prometheus/Loki에서 찾을 수 없습니다. 등록된 백엔드: {}",
+            obs.backend_names().join(", ")
+        );
+    };
+
+    // incident 시간창: [created_at − before, closed_at 또는 now].
+    let before = parse_duration_arg(before.as_deref().unwrap_or("15m"))
+        .ok_or_else(|| anyhow::anyhow!("--before 형식 오류(예: 15m, 1h, 30s, 2d)"))?;
+    let start = (meta.created_at - before).to_rfc3339();
+    let end = meta.closed_at.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+
+    let mut args = serde_json::json!({
+        "backend": backend,
+        "query": query,
+        "start": start,
+        "end": end,
+    });
+    if tool == "prometheus_query" {
+        args["step"] = serde_json::Value::String(step.unwrap_or_else(|| "60s".to_string()));
+    } else if let Some(l) = limit {
+        args["limit"] = serde_json::Value::from(l);
+    }
+
+    let result = obs
+        .run(tool, &args)
+        .await
+        .map_err(|e| anyhow::anyhow!("관측 질의 실패: {e}"))?;
+
+    let ev = aic_client::rca::append_evidence(
+        &mut meta,
+        aic_client::rca::EvidenceKind::Observability,
+        &format!("{label}: {query}"),
+        &format!("aic rca observe ({backend}, {start} .. {end})"),
+        &result,
+        &["observability", label],
+    )?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "incident": meta.id,
+                "evidence": ev,
+            }))?
+        );
+    } else {
+        println!(
+            "{COL_GREEN}✔{COL_RESET} 관측 evidence 저장: [{}] {label} ({start} .. {end})",
+            ev.id
+        );
+        println!("{result}");
+    }
+    Ok(())
+}
+
+/// `15m` / `1h` / `30s` / `2d` 형태의 기간을 파싱한다. 접미사가 없으면 초로 본다. 음수/형식오류는 None.
+fn parse_duration_arg(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let n: i64 = num.trim().parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    match unit.trim() {
+        "" | "s" => Some(chrono::Duration::seconds(n)),
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
 }
 
 /// `aic webhook list [--limit N] [--json]` — aicd webhook-events.jsonl을 최근순으로 출력 (SRE R2 t11).
@@ -7922,14 +8071,27 @@ fn print_command_block(title: &str, cmd: &str) {
 mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled,
-        is_destructive_command, parse_session_capture_mode, resolve_init_modes, resolve_provider,
-        validate_bind, Cli, Commands, ATTACH_SNIPPET,
+        is_destructive_command, parse_duration_arg, parse_session_capture_mode, resolve_init_modes,
+        resolve_provider, validate_bind, Cli, Commands, ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
         AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType, ServerConfig,
         SessionCaptureMode, SessionConfig,
     };
+
+    #[test]
+    fn parse_duration_arg_units_and_errors() {
+        use chrono::Duration;
+        assert_eq!(parse_duration_arg("30s"), Some(Duration::seconds(30)));
+        assert_eq!(parse_duration_arg("15m"), Some(Duration::minutes(15)));
+        assert_eq!(parse_duration_arg("2h"), Some(Duration::hours(2)));
+        assert_eq!(parse_duration_arg("1d"), Some(Duration::days(1)));
+        assert_eq!(parse_duration_arg("45"), Some(Duration::seconds(45))); // 접미사 없음 → 초
+        assert_eq!(parse_duration_arg("5x"), None); // 미지원 단위
+        assert_eq!(parse_duration_arg("-3m"), None); // 음수
+        assert_eq!(parse_duration_arg("abc"), None);
+    }
     use std::collections::HashMap;
 
     #[test]

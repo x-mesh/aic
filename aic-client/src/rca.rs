@@ -62,6 +62,8 @@ pub enum EvidenceKind {
     Timeline,
     Analysis,
     Note,
+    /// incident 시간창으로 질의한 관측 백엔드(Prometheus/Loki) 결과 — probe 증거를 메트릭/로그로 뒷받침한다.
+    Observability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
