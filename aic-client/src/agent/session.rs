@@ -1856,7 +1856,8 @@ impl AgentSession {
                 match self.resolve_rca_id_for_read(id.as_deref()).and_then(|rid| {
                     let meta = rca::load_meta(&rid)?;
                     let events = rca::load_events(&rid)?;
-                    let report = rca::render_report(&meta, &events);
+                    let hypotheses = rca::load_hypotheses(&rid).unwrap_or_default();
+                    let report = rca::render_report(&meta, &events, &hypotheses);
                     let path = if write {
                         Some(rca::write_report(&meta, &report)?)
                     } else {
