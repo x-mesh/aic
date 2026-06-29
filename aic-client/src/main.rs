@@ -576,6 +576,9 @@ enum RcaOp {
         /// 증상 설명. 생략하면 title을 증상으로도 사용한다.
         #[arg(long)]
         symptom: Option<String>,
+        /// triage 심각도(sev1..sev4 / 1..4 / critical·high·medium·low).
+        #[arg(long)]
+        severity: Option<String>,
         /// 생성 직후 Safe probe 기반 headless diagnose를 실행해 evidence로 붙인다.
         #[arg(long)]
         diagnose: bool,
@@ -597,6 +600,17 @@ enum RcaOp {
         /// incident id 또는 prefix.
         id: Option<String>,
         /// JSON 출력. id 생략 시 전체 목록을 출력한다.
+        #[arg(long)]
+        json: bool,
+    },
+    /// incident 심각도를 설정/변경한다(sev1..sev4 / 1..4 / critical·high·medium·low).
+    Severity {
+        /// 심각도 값.
+        level: String,
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        #[arg(long)]
+        incident: Option<String>,
+        /// JSON 출력.
         #[arg(long)]
         json: bool,
     },
@@ -6851,6 +6865,7 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         RcaOp::Start {
             title,
             symptom,
+            severity,
             diagnose,
             no_analyze,
             follow_up,
@@ -6861,6 +6876,15 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
             let cwd = std::env::current_dir().ok();
             let mut meta =
                 aic_client::rca::create_incident(&title, Some(&symptom_text), cwd.as_deref())?;
+
+            if let Some(raw) = severity.as_deref() {
+                let sev = aic_client::rca::Severity::from_arg(raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "심각도 형식 오류: '{raw}' (sev1..sev4 / 1..4 / critical·high·medium·low)"
+                    )
+                })?;
+                aic_client::rca::set_severity(&mut meta, sev)?;
+            }
 
             if diagnose {
                 let config = ConfigManager::load()?;
@@ -6913,9 +6937,10 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                     println!("최근 RCA incidents:");
                     for item in list.iter().take(20) {
                         println!(
-                            "- {} · {:?} · {} · evidence={} · updated={}",
+                            "- {} · {:?} · {} · {} · evidence={} · updated={}",
                             item.id,
                             item.status,
+                            item.severity.map(|s| s.as_label()).unwrap_or("(unset)"),
                             item.title,
                             item.evidence_count,
                             item.updated_at.to_rfc3339()
@@ -6950,6 +6975,25 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         }
         RcaOp::Reopen { id, note, json } => {
             rca_transition(id, aic_client::rca::IncidentStatus::Open, note, json)?;
+        }
+        RcaOp::Severity {
+            level,
+            incident,
+            json,
+        } => {
+            let sev = aic_client::rca::Severity::from_arg(&level).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "심각도 형식 오류: '{level}' (sev1..sev4 / 1..4 / critical·high·medium·low)"
+                )
+            })?;
+            let resolved = aic_client::rca::resolve_id(incident.as_deref())?;
+            let mut meta = aic_client::rca::load_meta(&resolved)?;
+            aic_client::rca::set_severity(&mut meta, sev)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&meta)?);
+            } else {
+                println!("{}", aic_client::rca::render_status(&meta));
+            }
         }
         RcaOp::Observe {
             id,

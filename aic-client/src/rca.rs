@@ -26,6 +26,9 @@ pub struct IncidentMeta {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub evidence_count: usize,
+    /// triage 심각도. None = 미설정(`aic rca start --severity` 또는 `aic rca severity`로 지정).
+    #[serde(default)]
+    pub severity: Option<Severity>,
     /// 최초 Mitigated 전이 시각(TTM = mitigated_at − created_at). 미전이면 None.
     /// `#[serde(default)]`로 이 필드가 없는 기존 meta.json도 호환 로드된다.
     #[serde(default)]
@@ -41,6 +44,39 @@ pub enum IncidentStatus {
     Open,
     Mitigated,
     Closed,
+}
+
+/// incident 심각도(triage용). Sev1이 가장 심각 — enum 순서가 곧 우선순위라 정렬 시 Sev1이 먼저 온다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Sev1,
+    Sev2,
+    Sev3,
+    Sev4,
+}
+
+impl Severity {
+    /// `SEV1`..`SEV4` 라벨.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Severity::Sev1 => "SEV1",
+            Severity::Sev2 => "SEV2",
+            Severity::Sev3 => "SEV3",
+            Severity::Sev4 => "SEV4",
+        }
+    }
+
+    /// CLI 인자 파싱 — `sev1`..`sev4`, 숫자 `1`..`4`, 또는 `critical/high/medium/low`(대소문자 무시).
+    pub fn from_arg(s: &str) -> Option<Severity> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sev1" | "1" | "critical" => Some(Severity::Sev1),
+            "sev2" | "2" | "high" => Some(Severity::Sev2),
+            "sev3" | "3" | "medium" => Some(Severity::Sev3),
+            "sev4" | "4" | "low" => Some(Severity::Sev4),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +148,8 @@ pub struct IncidentSummary {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub evidence_count: usize,
+    #[serde(default)]
+    pub severity: Option<Severity>,
     pub path: PathBuf,
 }
 
@@ -157,6 +195,7 @@ pub fn create_incident(
         created_at: now,
         updated_at: now,
         evidence_count: 0,
+        severity: None,
         mitigated_at: None,
         closed_at: None,
     };
@@ -261,6 +300,25 @@ pub fn set_status(meta: &mut IncidentMeta, new: IncidentStatus) -> anyhow::Resul
         "aic rca status",
         &body,
         &["lifecycle", "transition"],
+    )
+}
+
+/// incident 심각도를 설정/변경하고 그 사실을 lifecycle evidence로 남긴다(triage 변경 이력 보존).
+pub fn set_severity(meta: &mut IncidentMeta, sev: Severity) -> anyhow::Result<EvidenceEvent> {
+    let prev = meta.severity;
+    meta.severity = Some(sev);
+    let body = format!(
+        "severity: {} -> {}",
+        prev.map(|s| s.as_label()).unwrap_or("(unset)"),
+        sev.as_label()
+    );
+    append_evidence(
+        meta,
+        EvidenceKind::Lifecycle,
+        &format!("severity -> {}", sev.as_label()),
+        "aic rca severity",
+        &body,
+        &["lifecycle", "severity"],
     )
 }
 
@@ -511,9 +569,10 @@ pub fn resolve_id(id: Option<&str>) -> anyhow::Result<String> {
 
 pub fn render_status(meta: &IncidentMeta) -> String {
     let mut s = format!(
-        "RCA {}\n상태: {:?}\n제목: {}\n증상: {}\n생성: {}\n갱신: {}\n증거: {}개\n경로: {}",
+        "RCA {}\n상태: {:?}\n심각도: {}\n제목: {}\n증상: {}\n생성: {}\n갱신: {}\n증거: {}개\n경로: {}",
         meta.id,
         meta.status,
+        meta.severity.map(|s| s.as_label()).unwrap_or("(unset)"),
         meta.title,
         meta.symptom.as_deref().unwrap_or("(none)"),
         meta.created_at.to_rfc3339(),
@@ -584,9 +643,10 @@ pub fn render_report(
     md.push_str(&format!("# RCA Report: {}\n\n", meta.title));
     md.push_str("## Summary\n\n");
     md.push_str(&format!(
-        "- Incident ID: `{}`\n- Status: `{:?}`\n- Symptom: {}\n- Created: {}\n- Updated: {}\n\n",
+        "- Incident ID: `{}`\n- Status: `{:?}`\n- Severity: `{}`\n- Symptom: {}\n- Created: {}\n- Updated: {}\n\n",
         meta.id,
         meta.status,
+        meta.severity.map(|s| s.as_label()).unwrap_or("(unset)"),
         meta.symptom.as_deref().unwrap_or("(none)"),
         meta.created_at.to_rfc3339(),
         meta.updated_at.to_rfc3339()
@@ -680,6 +740,7 @@ fn summary(meta: IncidentMeta) -> IncidentSummary {
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         evidence_count: meta.evidence_count,
+        severity: meta.severity,
     }
 }
 
@@ -1256,6 +1317,39 @@ mod tests {
         let old = r#"{"id":"x","title":"t","status":"open","symptom":null,"cwd":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","evidence_count":0}"#;
         let m: IncidentMeta = serde_json::from_str(old).unwrap();
         assert!(m.mitigated_at.is_none() && m.closed_at.is_none());
+        assert!(m.severity.is_none()); // severity 없는 기존 meta도 호환.
+    }
+
+    // severity 설정이 영속·렌더되고 전이가 evidence로 기록된다.
+    #[test]
+    fn severity_set_persists_and_renders() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let mut meta = create_incident("outage", None, None).unwrap();
+        assert!(meta.severity.is_none());
+
+        set_severity(&mut meta, Severity::Sev1).unwrap();
+        assert_eq!(meta.severity, Some(Severity::Sev1));
+        let loaded = load_meta(&meta.id).unwrap();
+        assert_eq!(loaded.severity, Some(Severity::Sev1));
+        assert!(render_status(&loaded).contains("SEV1"));
+        let events = load_events(&meta.id).unwrap();
+        assert!(render_report(&loaded, &events, &[]).contains("SEV1"));
+        assert!(events
+            .iter()
+            .any(|e| e.tags.iter().any(|t| t == "severity")));
+    }
+
+    #[test]
+    fn severity_from_arg_aliases_and_order() {
+        assert_eq!(Severity::from_arg("sev1"), Some(Severity::Sev1));
+        assert_eq!(Severity::from_arg("1"), Some(Severity::Sev1));
+        assert_eq!(Severity::from_arg("Critical"), Some(Severity::Sev1));
+        assert_eq!(Severity::from_arg("HIGH"), Some(Severity::Sev2));
+        assert_eq!(Severity::from_arg("low"), Some(Severity::Sev4));
+        assert_eq!(Severity::from_arg("nope"), None);
+        // Sev1이 가장 심각(Ord상 가장 작음) — 정렬/triage용.
+        assert!(Severity::Sev1 < Severity::Sev2 && Severity::Sev2 < Severity::Sev4);
     }
 
     // (B) hypothesis: support/refute로 수렴하고 probable cause가 도출되며 report/timeline에 반영된다.
