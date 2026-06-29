@@ -82,8 +82,15 @@ const STATUS_UNAVAILABLE: &str = "unavailable";
 const OBS_BODY_LIMIT: usize = 64 * 1024;
 /// 프로세스 상세의 network 연결 sample 상한(redacted). 너무 길면 payload·UI noise가 커진다.
 const PROCESS_NET_SAMPLE: usize = 50;
-/// 스택 샘플 출력 문자 상한 — `sample`/`/proc/stack`이 길어도 payload를 bound한다.
+/// Linux kernel-stack raw 출력 문자 상한(payload bound). macOS는 구조화 파싱이라 미사용.
+#[cfg(target_os = "linux")]
 const SAMPLE_CAP: usize = 12000;
+/// macOS `sample` 샘플링 윈도(초). 길수록 통계가 안정되나 요청이 길어진다.
+#[cfg(target_os = "macos")]
+const SAMPLE_SECS: u64 = 2;
+/// 구조화 샘플에서 노출할 hot frame(self-time 상위) 개수.
+#[cfg(any(target_os = "macos", test))]
+const HOT_FRAMES: usize = 25;
 /// web 접근 감사 이벤트 kind — 누가/언제/어디서 대시보드를 봤는지 audit log(HMAC chain)에 남긴다.
 const WEB_ACCESS_KIND: &str = "web_access";
 const WEB_AUTH_DENIED_KIND: &str = "web_auth_denied";
@@ -1020,47 +1027,138 @@ async fn process_stack_sample(
         .ok()
         .flatten();
     match sampled {
-        Some(text) => ([(CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "스택 샘플 수집 실패(미지원 플랫폼·권한 부족·프로세스 종료).\n",
-        )
-            .into_response(),
+        Some(v) => Json(v).into_response(),
+        None => Json(json!({
+            "available": false,
+            "reason": "스택 샘플 수집 실패(미지원 플랫폼·권한 부족·프로세스 종료).",
+        }))
+        .into_response(),
     }
 }
 
-/// 스택 샘플 본체(blocking). 출력은 redact + 길이 cap. macOS `sample`은 같은 유저 pid엔 권한 불필요·비침습.
-fn run_stack_sample(pid: u32) -> Option<String> {
+/// 스택 샘플 본체(blocking) — **구조화** 결과를 돌려준다. macOS는 `sample`의 집계 call-tree를 파싱해
+/// self-time 상위 hot frame과 thread별 sample 수로, Linux는 kernel stack 스냅샷(userspace 프로파일은 perf
+/// 필요 — 별도)으로. 구조화 덕에 path-heavy 헤더(`Path:`/`Binary Images`)는 자연히 빠진다.
+fn run_stack_sample(pid: u32) -> Option<Value> {
     #[cfg(target_os = "macos")]
     {
         let out = std::process::Command::new("sample")
-            .args([pid.to_string(), "1".to_string()])
+            .args([pid.to_string(), SAMPLE_SECS.to_string()])
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         if text.trim().is_empty() {
             return None;
         }
-        Some(redaction::redact(&truncate_chars(&text, SAMPLE_CAP)).0)
+        Some(parse_macos_sample(&text))
     }
     #[cfg(target_os = "linux")]
     {
-        // 비침습 userspace 프로파일은 perf(권한 필요). 여기선 kernel stack 스냅샷을 best-effort로 읽는다.
+        // /proc/<pid>/stack은 kernel wait-channel 스택만 — userspace hotspot은 perf 필요(추후).
         let stack = std::fs::read_to_string(format!("/proc/{pid}/stack")).ok()?;
         if stack.trim().is_empty() {
             return None;
         }
-        let body = truncate_chars(&stack, SAMPLE_CAP);
-        Some(format!(
-            "[/proc/{pid}/stack — kernel stack 스냅샷. userspace 프로파일은 perf 권장(권한 필요)]\n{}",
-            redaction::redact(&body).0
-        ))
+        Some(json!({
+            "available": true,
+            "platform": "linux",
+            "kind": "kernel_stack",
+            "hot_frames": [],
+            "threads": [],
+            "total_samples": 0,
+            "note": "Linux는 /proc/<pid>/stack(kernel wait-channel)만 제공 — userspace 프로파일은 perf 필요(예정).",
+            "raw": redaction::redact(&truncate_chars(&stack, SAMPLE_CAP)).0,
+        }))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
     }
+}
+
+/// macOS `sample` 출력을 구조화한다(순수 함수 — fixture로 테스트). "Sort by top of stack" 섹션을 self-time
+/// hot frame 랭킹으로, "Call graph"의 thread 헤더를 thread별 sample 수로 뽑는다. symbol/binary는 redact.
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_sample(text: &str) -> Value {
+    let mut threads: Vec<Value> = Vec::new();
+    let mut hot: Vec<Value> = Vec::new();
+    let mut total: u64 = 0;
+    let mut section = "";
+    for line in text.lines() {
+        if line.starts_with("Call graph:") {
+            section = "callgraph";
+            continue;
+        }
+        if line.starts_with("Sort by top of stack") {
+            section = "topstack";
+            continue;
+        }
+        if line.starts_with("Binary Images:") || line.starts_with("Total number in stack") {
+            section = "";
+            continue;
+        }
+        let t = line.trim_start();
+        match section {
+            // thread 헤더: "<count> Thread_<id>  <desc>" (frame 줄은 count 뒤가 Thread_가 아니라 제외됨).
+            "callgraph" => {
+                if let Some((cnt, rest)) = split_count_prefix(t) {
+                    if let Some(after) = rest.strip_prefix("Thread_") {
+                        total += cnt;
+                        let mut parts = after.splitn(2, char::is_whitespace);
+                        let tid = parts.next().unwrap_or("");
+                        let desc = parts.next().unwrap_or("").trim();
+                        threads.push(json!({
+                            "thread": format!("Thread_{tid}"),
+                            "samples": cnt,
+                            "desc": redaction::redact(desc).0,
+                        }));
+                    }
+                }
+            }
+            // "<symbol>  (in <binary>)        <count>"
+            "topstack" if hot.len() < HOT_FRAMES => {
+                if let Some((sym, bin, cnt)) = parse_top_frame(t) {
+                    hot.push(json!({
+                        "symbol": redaction::redact(sym).0,
+                        "binary": redaction::redact(bin).0,
+                        "count": cnt,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "available": true,
+        "platform": "macos",
+        "kind": "cpu",
+        "total_samples": total,
+        "threads": threads,
+        "hot_frames": hot,
+    })
+}
+
+/// "<count> <rest>"에서 선두 정수와 나머지를 분리. 정수가 아니면 None(`+`/`!` 마커 줄 등은 걸러진다).
+#[cfg(any(target_os = "macos", test))]
+fn split_count_prefix(s: &str) -> Option<(u64, &str)> {
+    let (num, rest) = s.split_once(char::is_whitespace)?;
+    Some((num.parse().ok()?, rest.trim_start()))
+}
+
+/// "Sort by top of stack" 한 줄 파싱: "<symbol>  (in <binary>)  <count>".
+#[cfg(any(target_os = "macos", test))]
+fn parse_top_frame(s: &str) -> Option<(&str, &str, u64)> {
+    let open = s.find("(in ")?;
+    let symbol = s[..open].trim_end();
+    if symbol.is_empty() {
+        return None;
+    }
+    let after = &s[open + 4..];
+    let close = after.find(')')?;
+    let binary = after[..close].trim();
+    let count: u64 = after[close + 1..].split_whitespace().next()?.parse().ok()?;
+    Some((symbol, binary, count))
 }
 
 /// `process_detail`의 blocking 본체. cpu%는 연속 refresh 간 delta라 짧게 두 번 샘플링한다.
@@ -2010,6 +2108,47 @@ mod tests {
         assert!(web_access_is_audited("/web/incidents/x/report"));
         assert!(web_access_is_audited("/web/config"));
         assert!(web_access_is_audited("/web/chat"));
+    }
+
+    #[test]
+    fn parse_macos_sample_extracts_hot_frames_and_threads() {
+        let fixture = "Analysis of sampling python3 (pid 100) every 1 millisecond\n\
+Process:         python3.13 [100]\n\
+Path:            /Users/someone/venv/python3.13\n\
+Call graph:\n\
+    846 Thread_111   DispatchQueue_1: com.apple.main-thread  (serial)\n\
+      846 start  (in dyld) + 6992  [0x18e]\n\
+        846 Py_BytesMain  (in libpython3.13.dylib) + 44  [0x103]\n\
+    12 Thread_222\n\
+      12 _pthread_start  (in libsystem_pthread.dylib) + 99\n\
+Total number in stack (recursive counted multiple, when >=5):\n\
+Sort by top of stack, same collapsed (when >= 5):\n\
+        _PyEval_EvalFrameDefault  (in libpython3.13.dylib)        143\n\
+        _PyLong_FromSTwoDigits  (in libpython3.13.dylib)        121\n\
+        _Py_dict_lookup  (in libpython3.13.dylib)        82\n\
+Binary Images:\n\
+        0x100000000 - 0x100ffffff  python3.13\n";
+        let v = parse_macos_sample(fixture);
+        assert_eq!(v["available"], true);
+        assert_eq!(v["total_samples"], 858); // 846 + 12
+        assert_eq!(v["threads"].as_array().unwrap().len(), 2);
+        assert_eq!(v["threads"][0]["samples"], 846);
+        assert_eq!(v["threads"][0]["thread"], "Thread_111");
+        let hot = v["hot_frames"].as_array().unwrap();
+        assert_eq!(hot.len(), 3);
+        assert_eq!(hot[0]["symbol"], "_PyEval_EvalFrameDefault");
+        assert_eq!(hot[0]["binary"], "libpython3.13.dylib");
+        assert_eq!(hot[0]["count"], 143);
+        // Binary Images / Path 등 path-heavy 줄은 구조화 결과에 포함되지 않는다.
+        assert!(!v.to_string().contains("/Users/someone"));
+    }
+
+    #[test]
+    fn parse_top_frame_handles_symbol_binary_count() {
+        let (s, b, c) =
+            parse_top_frame("_Py_dict_lookup  (in libpython3.13.dylib)        82").unwrap();
+        assert_eq!((s, b, c), ("_Py_dict_lookup", "libpython3.13.dylib", 82));
+        assert!(parse_top_frame("no binary here 5").is_none());
     }
 
     #[test]
