@@ -1311,19 +1311,61 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// append-only 로그의 마지막 `n`개 비어있지 않은 라인을 끝에서부터 읽는다(역방향 청크 스캔).
+/// 파일 전체를 메모리에 올리지 않으므로, 회전 없이 증가하는 `webhook-events.jsonl` 같은 파일도
+/// 요청당 비용이 `n`에 바운드된다. 파일 부재/읽기 실패는 빈 Vec(에러 아님).
+fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut pos = match file.seek(SeekFrom::End(0)) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    // 끝에서부터 청크를 역방향으로 읽어 buf 앞쪽에 prepend. 개행 n개 초과 확보 또는 파일 시작
+    // 도달 시 중단(맨 앞 partial 라인은 마지막 n개만 take하므로 자동 폐기된다).
+    while pos > 0 {
+        let read = CHUNK.min(pos);
+        pos -= read;
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            break;
+        }
+        let mut chunk = vec![0u8; read as usize];
+        if file.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        chunk.extend_from_slice(&buf);
+        buf = chunk;
+        if buf.iter().filter(|&&b| b == b'\n').count() > n {
+            break;
+        }
+    }
+    let mut lines: Vec<String> = String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    if lines.len() > n {
+        lines = lines.split_off(lines.len() - n);
+    }
+    lines
+}
+
 /// aicd webhook alert ingestion 이벤트(`webhook-events.jsonl`) tail. 파일 부재는 빈 목록(에러 아님).
 /// 자유 텍스트 필드(action/source/alert)에 redaction을 적용한다.
 async fn webhooks() -> Json<Vec<Value>> {
     let path = aic_common::paths::webhook_events_path();
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut evs: Vec<Value> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
+    let evs: Vec<Value> = tail_lines(&path, WEBHOOK_TAIL)
+        .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .collect();
-    if evs.len() > WEBHOOK_TAIL {
-        evs = evs.split_off(evs.len() - WEBHOOK_TAIL);
-    }
     let red = |v: &Value, k: &str| {
         v.get(k)
             .and_then(|x| x.as_str())
@@ -1502,6 +1544,42 @@ mod tests {
         assert!(!is_safe_incident_id("a\\b"));
         assert!(!is_safe_incident_id(""));
         assert!(!is_safe_incident_id(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n_across_chunks() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 64KB CHUNK를 넘기도록 충분히 많은 라인(역방향 다중 청크 경계 검증).
+        for i in 0..8000 {
+            writeln!(f, "{{\"n\":{i}}}").unwrap();
+        }
+        writeln!(f).unwrap(); // 끝에 빈 줄: skip 되어야 함.
+        drop(f);
+        let lines = tail_lines(&path, 100);
+        assert_eq!(lines.len(), 100);
+        assert_eq!(lines.first().unwrap(), "{\"n\":7900}");
+        assert_eq!(lines.last().unwrap(), "{\"n\":7999}");
+    }
+
+    #[test]
+    fn tail_lines_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(tail_lines(&dir.path().join("nope.jsonl"), 100).is_empty());
+    }
+
+    #[test]
+    fn tail_lines_fewer_than_n_returns_all_in_order() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "a").unwrap();
+        writeln!(f, "b").unwrap();
+        drop(f);
+        assert_eq!(tail_lines(&path, 100), vec!["a".to_string(), "b".to_string()]);
     }
 
     #[test]
