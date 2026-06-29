@@ -1579,7 +1579,8 @@ async fn incident_report(Path(id): Path<String>) -> Result<Response, (StatusCode
     }
     let meta = rca::load_meta(&id).map_err(internal)?;
     let events = rca::load_events(&id).map_err(internal)?;
-    let report = rca::render_report(&meta, &events);
+    let hypotheses = rca::load_hypotheses(&id).unwrap_or_default();
+    let report = rca::render_report(&meta, &events, &hypotheses);
     let (redacted, _) = redaction::redact(&report);
     Ok(([(CONTENT_TYPE, "text/markdown; charset=utf-8")], redacted).into_response())
 }

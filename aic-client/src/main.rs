@@ -675,6 +675,74 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// 후보 root cause(가설)를 관리한다 — 추가/support/refute/confirm/reject로 원인에 수렴시킨다.
+    Hypothesis {
+        #[command(subcommand)]
+        op: HypothesisOp,
+    },
+}
+
+/// `aic rca hypothesis <op>` — 가설을 쌓고 evidence로 좁혀 probable cause에 수렴시킨다.
+/// incident는 `--incident`로 지정(생략 시 최근). 각 액션은 timeline에 evidence로도 남는다.
+#[derive(Subcommand)]
+enum HypothesisOp {
+    /// 후보 원인을 추가한다(Proposed).
+    Add {
+        /// 후보 원인 설명.
+        text: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 가설을 뒷받침한다(support++; terminal 아니면 Supported).
+    Support {
+        /// 가설 id (예: H1).
+        hid: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 가설을 반박한다(refute++; terminal 아니면 Refuted).
+    Refute {
+        hid: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 가설을 확정한다(Confirmed = probable cause).
+    Confirm {
+        hid: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 가설을 기각한다(Rejected).
+    Reject {
+        hid: String,
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 가설 목록과 probable cause를 출력한다.
+    List {
+        #[arg(long)]
+        incident: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6894,11 +6962,15 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         } => {
             rca_observe(id, backend, query, before, step, limit, json).await?;
         }
+        RcaOp::Hypothesis { op } => {
+            handle_rca_hypothesis(op)?;
+        }
         RcaOp::Report { id, write, json } => {
             let resolved = aic_client::rca::resolve_id(id.as_deref())?;
             let meta = aic_client::rca::load_meta(&resolved)?;
             let events = aic_client::rca::load_events(&resolved)?;
-            let report = aic_client::rca::render_report(&meta, &events);
+            let hypotheses = aic_client::rca::load_hypotheses(&resolved).unwrap_or_default();
+            let report = aic_client::rca::render_report(&meta, &events, &hypotheses);
             let written = if write {
                 Some(aic_client::rca::write_report(&meta, &report)?)
             } else {
@@ -6950,6 +7022,94 @@ fn rca_transition(
         println!("{}", serde_json::to_string_pretty(&meta)?);
     } else {
         println!("{}", aic_client::rca::render_status(&meta));
+    }
+    Ok(())
+}
+
+/// `aic rca hypothesis <op>` 디스패치 — 가설 추가/support/refute/confirm/reject/list.
+fn handle_rca_hypothesis(op: HypothesisOp) -> anyhow::Result<()> {
+    use aic_client::rca::HypothesisAction;
+    match op {
+        HypothesisOp::Add {
+            text,
+            incident,
+            json,
+        } => {
+            let resolved = aic_client::rca::resolve_id(incident.as_deref())?;
+            let mut meta = aic_client::rca::load_meta(&resolved)?;
+            let h = aic_client::rca::add_hypothesis(&mut meta, &text)?;
+            print_hypothesis_result(&resolved, &h, json)?;
+        }
+        HypothesisOp::Support {
+            hid,
+            incident,
+            note,
+            json,
+        } => rca_hyp_update(incident, &hid, HypothesisAction::Support, note, json)?,
+        HypothesisOp::Refute {
+            hid,
+            incident,
+            note,
+            json,
+        } => rca_hyp_update(incident, &hid, HypothesisAction::Refute, note, json)?,
+        HypothesisOp::Confirm {
+            hid,
+            incident,
+            note,
+            json,
+        } => rca_hyp_update(incident, &hid, HypothesisAction::Confirm, note, json)?,
+        HypothesisOp::Reject {
+            hid,
+            incident,
+            note,
+            json,
+        } => rca_hyp_update(incident, &hid, HypothesisAction::Reject, note, json)?,
+        HypothesisOp::List { incident, json } => {
+            let resolved = aic_client::rca::resolve_id(incident.as_deref())?;
+            let hyps = aic_client::rca::load_hypotheses(&resolved)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hyps)?);
+            } else {
+                println!("{}", aic_client::rca::render_hypotheses(&hyps));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rca_hyp_update(
+    incident: Option<String>,
+    hid: &str,
+    action: aic_client::rca::HypothesisAction,
+    note: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let resolved = aic_client::rca::resolve_id(incident.as_deref())?;
+    let mut meta = aic_client::rca::load_meta(&resolved)?;
+    let h = aic_client::rca::update_hypothesis(
+        &mut meta,
+        hid,
+        action,
+        note.as_deref().map(str::trim).filter(|n| !n.is_empty()),
+    )?;
+    print_hypothesis_result(&resolved, &h, json)
+}
+
+/// 갱신된 가설 1건 + 갱신 후 probable cause/목록을 함께 출력한다.
+fn print_hypothesis_result(
+    incident: &str,
+    h: &aic_client::rca::Hypothesis,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(h)?);
+    } else {
+        println!(
+            "{COL_GREEN}✔{COL_RESET} [{}] ({:?}, +{}/-{}) {}",
+            h.id, h.status, h.support, h.refute, h.text
+        );
+        let hyps = aic_client::rca::load_hypotheses(incident).unwrap_or_default();
+        println!("{}", aic_client::rca::render_hypotheses(&hyps));
     }
     Ok(())
 }

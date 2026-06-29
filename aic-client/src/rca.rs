@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 const INDEX_FILE: &str = "index.json";
 const META_FILE: &str = "meta.json";
 const EVIDENCE_FILE: &str = "evidence.jsonl";
+const HYPOTHESES_FILE: &str = "hypotheses.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IncidentMeta {
@@ -64,6 +65,41 @@ pub enum EvidenceKind {
     Note,
     /// incident 시간창으로 질의한 관측 백엔드(Prometheus/Loki) 결과 — probe 증거를 메트릭/로그로 뒷받침한다.
     Observability,
+}
+
+/// 후보 root cause의 수렴 상태. Proposed에서 evidence로 support/refute가 쌓이며 Confirmed(=probable cause)
+/// 또는 Rejected로 수렴한다. Confirmed/Rejected는 terminal이라 support/refute가 더는 status를 바꾸지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HypothesisStatus {
+    Proposed,
+    Supported,
+    Refuted,
+    Confirmed,
+    Rejected,
+}
+
+impl HypothesisStatus {
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            HypothesisStatus::Confirmed | HypothesisStatus::Rejected
+        )
+    }
+}
+
+/// incident의 후보 원인 하나. support/refute 카운트로 수렴 정도를 표현하고, confirm/reject로 확정한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hypothesis {
+    pub id: String,
+    pub text: String,
+    pub status: HypothesisStatus,
+    #[serde(default)]
+    pub support: u32,
+    #[serde(default)]
+    pub refute: u32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +264,162 @@ pub fn set_status(meta: &mut IncidentMeta, new: IncidentStatus) -> anyhow::Resul
     )
 }
 
+/// hypothesis 상태 갱신 액션. Support/Refute는 카운트를 올리고(terminal이 아니면 status도 갱신),
+/// Confirm/Reject는 terminal 상태로 확정한다.
+#[derive(Debug, Clone, Copy)]
+pub enum HypothesisAction {
+    Support,
+    Refute,
+    Confirm,
+    Reject,
+}
+
+impl HypothesisAction {
+    fn verb(self) -> &'static str {
+        match self {
+            HypothesisAction::Support => "supported",
+            HypothesisAction::Refute => "refuted",
+            HypothesisAction::Confirm => "confirmed",
+            HypothesisAction::Reject => "rejected",
+        }
+    }
+}
+
+/// incident의 가설 목록을 로드한다(없으면 빈 목록). corrupt JSON은 빈 목록으로 강등(주석성 데이터,
+/// atomic_write로 저장하므로 torn 손상은 사실상 없음).
+pub fn load_hypotheses(id: &str) -> anyhow::Result<Vec<Hypothesis>> {
+    if !is_safe_id(id) {
+        anyhow::bail!("RCA incident id가 유효하지 않습니다: {id}");
+    }
+    let path = incident_dir(id).join(HYPOTHESES_FILE);
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(serde_json::from_str(&s).unwrap_or_default()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn save_hypotheses(id: &str, hyps: &[Hypothesis]) -> anyhow::Result<()> {
+    let path = incident_dir(id).join(HYPOTHESES_FILE);
+    atomic_write(&path, serde_json::to_string_pretty(hyps)?.as_bytes())?;
+    Ok(())
+}
+
+/// 후보 원인(가설)을 추가한다(Proposed). 추가 사실을 Analysis evidence로 timeline에도 남긴다.
+pub fn add_hypothesis(meta: &mut IncidentMeta, text: &str) -> anyhow::Result<Hypothesis> {
+    let mut hyps = load_hypotheses(&meta.id)?;
+    let now = Utc::now();
+    let id = format!("H{}", hyps.len() + 1);
+    let h = Hypothesis {
+        id: id.clone(),
+        text: crate::redaction::redact(text.trim()).0,
+        status: HypothesisStatus::Proposed,
+        support: 0,
+        refute: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    hyps.push(h.clone());
+    save_hypotheses(&meta.id, &hyps)?;
+    // 저장은 위에서 끝났으므로 여기서 append_evidence(자체 IncidentLock)를 호출해도 nested lock이 아니다.
+    append_evidence(
+        meta,
+        EvidenceKind::Analysis,
+        &format!("hypothesis {id} proposed"),
+        "aic rca hypothesis",
+        &h.text,
+        &["hypothesis", "propose", &id],
+    )?;
+    Ok(h)
+}
+
+/// 가설 상태를 전이한다. Support/Refute는 카운트++(terminal 아니면 Supported/Refuted로), Confirm/Reject는
+/// 확정. 각 액션을 Analysis evidence로 남겨 수렴 과정을 timeline에 보존한다. 선택 note는 근거로 함께 기록.
+pub fn update_hypothesis(
+    meta: &mut IncidentMeta,
+    hid: &str,
+    action: HypothesisAction,
+    note: Option<&str>,
+) -> anyhow::Result<Hypothesis> {
+    let mut hyps = load_hypotheses(&meta.id)?;
+    let h = hyps
+        .iter_mut()
+        .find(|h| h.id == hid)
+        .ok_or_else(|| anyhow::anyhow!("hypothesis를 찾을 수 없습니다: {hid}"))?;
+    match action {
+        HypothesisAction::Support => {
+            h.support += 1;
+            if !h.status.is_terminal() {
+                h.status = HypothesisStatus::Supported;
+            }
+        }
+        HypothesisAction::Refute => {
+            h.refute += 1;
+            if !h.status.is_terminal() {
+                h.status = HypothesisStatus::Refuted;
+            }
+        }
+        HypothesisAction::Confirm => h.status = HypothesisStatus::Confirmed,
+        HypothesisAction::Reject => h.status = HypothesisStatus::Rejected,
+    }
+    h.updated_at = Utc::now();
+    let snapshot = h.clone();
+    save_hypotheses(&meta.id, &hyps)?;
+    let body = note
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{hid}: {:?}", snapshot.status));
+    append_evidence(
+        meta,
+        EvidenceKind::Analysis,
+        &format!("hypothesis {hid} {}", action.verb()),
+        "aic rca hypothesis",
+        &body,
+        &["hypothesis", action.verb(), hid],
+    )?;
+    Ok(snapshot)
+}
+
+/// 가장 유력한 원인 — Confirmed가 있으면 그것, 없으면 Rejected/Refuted가 아니면서 support>0인 후보 중
+/// net support(support−refute)가 최대인 것. 없으면 None.
+fn probable_cause(hyps: &[Hypothesis]) -> Option<&Hypothesis> {
+    if let Some(c) = hyps
+        .iter()
+        .find(|h| h.status == HypothesisStatus::Confirmed)
+    {
+        return Some(c);
+    }
+    hyps.iter()
+        .filter(|h| {
+            !matches!(
+                h.status,
+                HypothesisStatus::Rejected | HypothesisStatus::Refuted
+            ) && h.support > 0
+        })
+        .max_by_key(|h| h.support as i64 - h.refute as i64)
+}
+
+/// 가설 목록을 markdown으로 렌더한다(report와 `aic rca hypothesis list`가 공유하는 단일 소스).
+/// 헤드라인으로 probable cause를, 이어서 전체 가설을 support/refute와 함께 보여준다.
+pub fn render_hypotheses(hyps: &[Hypothesis]) -> String {
+    let mut md = String::from("## Probable Cause\n\n");
+    match probable_cause(hyps) {
+        Some(h) => md.push_str(&format!("- [{}] ({:?}) {}\n\n", h.id, h.status, h.text)),
+        None => md.push_str("- 아직 확정된 원인이 없습니다.\n\n"),
+    }
+    md.push_str("## Hypotheses\n\n");
+    if hyps.is_empty() {
+        md.push_str("- (가설 없음) `aic rca hypothesis add \"<원인>\"`로 추가하세요.\n");
+    } else {
+        for h in hyps {
+            md.push_str(&format!(
+                "- [{}] ({:?}, +{}/-{}) {}\n",
+                h.id, h.status, h.support, h.refute, h.text
+            ));
+        }
+    }
+    md
+}
+
 pub fn load_meta(id: &str) -> anyhow::Result<IncidentMeta> {
     if !is_safe_id(id) {
         anyhow::bail!("RCA incident id가 유효하지 않습니다: {id}");
@@ -383,7 +575,11 @@ pub fn render_timeline(meta: &IncidentMeta, events: &[EvidenceEvent]) -> String 
     lines.join("\n")
 }
 
-pub fn render_report(meta: &IncidentMeta, events: &[EvidenceEvent]) -> String {
+pub fn render_report(
+    meta: &IncidentMeta,
+    events: &[EvidenceEvent],
+    hypotheses: &[Hypothesis],
+) -> String {
     let mut md = String::new();
     md.push_str(&format!("# RCA Report: {}\n\n", meta.title));
     md.push_str("## Summary\n\n");
@@ -415,6 +611,12 @@ pub fn render_report(meta: &IncidentMeta, events: &[EvidenceEvent]) -> String {
                 c.to_rfc3339()
             ));
         }
+        md.push('\n');
+    }
+
+    // 후보 원인이 있으면 probable cause + 가설 목록을 싣는다(report와 hypothesis list가 같은 렌더 공유).
+    if !hypotheses.is_empty() {
+        md.push_str(&render_hypotheses(hypotheses));
         md.push('\n');
     }
 
@@ -797,7 +999,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].id, "E2");
 
-        let report = render_report(&loaded, &events);
+        let report = render_report(&loaded, &events, &[]);
         assert!(report.contains("[E2]"));
         assert!(report.contains("Evidence Appendix"));
     }
@@ -918,7 +1120,7 @@ mod tests {
         )
         .unwrap();
         let events = load_events(&meta.id).unwrap();
-        let report = render_report(&meta, &events);
+        let report = render_report(&meta, &events, &[]);
         // 주입된 body가 4-backtick 펜스로 감싸여 3-backtick으로 펜스를 못 닫는다.
         assert!(report.contains("````text"), "더 긴 펜스로 감싸야 한다");
     }
@@ -1016,7 +1218,7 @@ mod tests {
         assert_eq!(loaded.status, IncidentStatus::Closed);
         assert!(loaded.mitigated_at.is_some() && loaded.closed_at.is_some());
         let events = load_events(&meta.id).unwrap();
-        let report = render_report(&loaded, &events);
+        let report = render_report(&loaded, &events, &[]);
         assert!(report.contains("## Resolution") && report.contains("MTTR"));
         assert!(events
             .iter()
@@ -1054,5 +1256,76 @@ mod tests {
         let old = r#"{"id":"x","title":"t","status":"open","symptom":null,"cwd":null,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","evidence_count":0}"#;
         let m: IncidentMeta = serde_json::from_str(old).unwrap();
         assert!(m.mitigated_at.is_none() && m.closed_at.is_none());
+    }
+
+    // (B) hypothesis: support/refute로 수렴하고 probable cause가 도출되며 report/timeline에 반영된다.
+    #[test]
+    fn hypothesis_convergence_and_probable_cause() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let mut meta = create_incident("svc 5xx", None, None).unwrap();
+
+        let h1 = add_hypothesis(&mut meta, "network blip").unwrap();
+        let h2 = add_hypothesis(&mut meta, "bad migration locked table").unwrap();
+        assert_eq!((h1.id.as_str(), h2.id.as_str()), ("H1", "H2"));
+        assert_eq!(h1.status, HypothesisStatus::Proposed);
+
+        update_hypothesis(&mut meta, "H1", HypothesisAction::Refute, None).unwrap();
+        update_hypothesis(
+            &mut meta,
+            "H2",
+            HypothesisAction::Support,
+            Some("lock wait timeout"),
+        )
+        .unwrap();
+        update_hypothesis(&mut meta, "H2", HypothesisAction::Support, None).unwrap();
+
+        let hyps = load_hypotheses(&meta.id).unwrap();
+        let h2l = hyps.iter().find(|h| h.id == "H2").unwrap();
+        assert_eq!(h2l.status, HypothesisStatus::Supported);
+        assert_eq!(h2l.support, 2);
+        assert_eq!(
+            hyps.iter().find(|h| h.id == "H1").unwrap().status,
+            HypothesisStatus::Refuted
+        );
+        assert_eq!(probable_cause(&hyps).unwrap().id, "H2");
+
+        // confirm → terminal; 이후 refute는 status를 안 바꾼다.
+        update_hypothesis(&mut meta, "H2", HypothesisAction::Confirm, None).unwrap();
+        update_hypothesis(&mut meta, "H2", HypothesisAction::Refute, None).unwrap();
+        let hyps = load_hypotheses(&meta.id).unwrap();
+        assert_eq!(
+            hyps.iter().find(|h| h.id == "H2").unwrap().status,
+            HypothesisStatus::Confirmed
+        );
+
+        let events = load_events(&meta.id).unwrap();
+        let report = render_report(&meta, &events, &hyps);
+        assert!(report.contains("## Probable Cause") && report.contains("bad migration"));
+        assert!(report.contains("## Hypotheses"));
+        assert!(events
+            .iter()
+            .any(|e| e.tags.iter().any(|t| t == "hypothesis")));
+    }
+
+    #[test]
+    fn probable_cause_prefers_confirmed_then_none_without_support() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let mut meta = create_incident("x", None, None).unwrap();
+        add_hypothesis(&mut meta, "a").unwrap(); // H1
+        add_hypothesis(&mut meta, "b").unwrap(); // H2
+                                                 // 미검증 상태면 probable cause 없음.
+        assert!(probable_cause(&load_hypotheses(&meta.id).unwrap()).is_none());
+        // H1 net +2, H2 confirmed → confirmed가 우선.
+        update_hypothesis(&mut meta, "H1", HypothesisAction::Support, None).unwrap();
+        update_hypothesis(&mut meta, "H1", HypothesisAction::Support, None).unwrap();
+        update_hypothesis(&mut meta, "H2", HypothesisAction::Confirm, None).unwrap();
+        assert_eq!(
+            probable_cause(&load_hypotheses(&meta.id).unwrap())
+                .unwrap()
+                .id,
+            "H2"
+        );
     }
 }
