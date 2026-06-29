@@ -678,6 +678,7 @@ async function connect() {
   TOKEN = document.getElementById("tok").value.trim();
   if (!TOKEN) { setStatus("토큰을 입력하세요", "err"); return; }
   sessionStorage.setItem("aic_web_token", TOKEN);
+  lastPoints = [];                           // 재연결 시 since=0으로 전량 재로드(증분 누적 초기화)
   try {
     await pollLocal();                       // 즉시 1회, 토큰 검증 겸
     setStatus("연결됨 · 로컬 자원 수집 중", "ok");
@@ -701,10 +702,20 @@ document.getElementById("network-limit").addEventListener("change", () => {
 });
 
 // ── 로컬 자원 ─────────────────────────────────────────────
+// 서버 ring buffer 상한(web.rs RING_CAP)과 동일. 증분 폴링 후 client 버퍼를 같은 길이로 trim한다.
+const RING_CAP = 300;
 async function pollLocal() {
   if (!TOKEN) return;
-  const d = await (await api("/web/local")).json();
-  lastPoints = d.points || [];
+  // 마지막 수신 포인트 이후만 요청 — steady-state에서 전체 시계열 재전송(~300 포인트)을 신규 1~몇 개로 줄인다.
+  const since = lastPoints.length ? lastPoints[lastPoints.length - 1].ts : 0;
+  const d = await (await api("/web/local?since=" + since)).json();
+  const fresh = d.points || [];
+  if (!since) {
+    lastPoints = fresh;                         // 최초/재연결: 전량 수신
+  } else if (fresh.length) {
+    lastPoints = lastPoints.concat(fresh);      // 이후: 신규 포인트만 append
+    if (lastPoints.length > RING_CAP) lastPoints = lastPoints.slice(lastPoints.length - RING_CAP);
+  }
   renderResources(lastPoints, d.runtime || {});
 }
 
