@@ -679,6 +679,9 @@ enum RcaOp {
         /// 해소/재발방지 메모를 evidence로 함께 남긴다(postmortem용).
         #[arg(long)]
         note: Option<String>,
+        /// 닫은 incident를 sre-agent incident-memory에 기록한다(핸드오프, best-effort). [mcp] sre-agent 구성 필요.
+        #[arg(long)]
+        remember: bool,
         /// JSON 출력.
         #[arg(long)]
         json: bool,
@@ -721,6 +724,17 @@ enum RcaOp {
         /// incident id 또는 prefix. 생략 시 최근 incident.
         id: Option<String>,
         /// JSON 출력(번들 경로).
+        #[arg(long)]
+        json: bool,
+    },
+    /// sre-agent incident-memory에서 유사한 과거 incident를 찾는다(읽기 전용 pull). [mcp] sre-agent 구성 필요.
+    Similar {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 최대 결과 수.
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+        /// JSON 출력.
         #[arg(long)]
         json: bool,
     },
@@ -7164,8 +7178,30 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         RcaOp::Mitigate { id, note, json } => {
             rca_transition(id, aic_client::rca::IncidentStatus::Mitigated, note, json)?;
         }
-        RcaOp::Close { id, note, json } => {
+        RcaOp::Close {
+            id,
+            note,
+            remember,
+            json,
+        } => {
+            // record 전에 resolve(전이가 id를 move하므로). transition은 그대로 수행하고,
+            // 기록은 best-effort 핸드오프 — 실패해도 close 자체는 완료된 상태.
+            let resolved = remember
+                .then(|| aic_client::rca::resolve_id(id.as_deref()))
+                .transpose()?;
             rca_transition(id, aic_client::rca::IncidentStatus::Closed, note, json)?;
+            if let Some(resolved) = resolved {
+                let meta = aic_client::rca::load_meta(&resolved)?;
+                let config = ConfigManager::load()?;
+                match aic_client::rca_memory::record_incident(&config.mcp, &meta).await {
+                    Some(_) => {
+                        println!("{COL_GREEN}✔{COL_RESET} sre-agent incident-memory에 기록(handoff)")
+                    }
+                    None => eprintln!(
+                        "sre-agent incident-memory 미구성([mcp] sre-agent) 또는 record_incident 없음 — 기록 건너뜀(close는 완료)"
+                    ),
+                }
+            }
         }
         RcaOp::Reopen { id, note, json } => {
             rca_transition(id, aic_client::rca::IncidentStatus::Open, note, json)?;
@@ -7281,6 +7317,29 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                     meta.id,
                     meta.evidence_count
                 );
+            }
+        }
+        RcaOp::Similar { id, limit, json } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let meta = aic_client::rca::load_meta(&resolved)?;
+            let config = ConfigManager::load()?;
+            match aic_client::rca_memory::match_incidents(&config.mcp, &meta, limit).await {
+                Some(out) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "incident": meta.id,
+                                "matches": out,
+                            }))?
+                        );
+                    } else {
+                        println!("유사 incident(sre-agent incident-memory):\n{out}");
+                    }
+                }
+                None => eprintln!(
+                    "sre-agent incident-memory 미구성([mcp] sre-agent) 또는 match_incidents 없음 — 건너뜀"
+                ),
             }
         }
     }

@@ -15,6 +15,7 @@ pub mod llm_dispatcher;
 pub mod local_record;
 pub mod project_context;
 pub mod rca;
+pub mod rca_memory;
 pub mod recipes;
 pub mod redaction;
 pub mod repl;
