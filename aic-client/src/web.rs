@@ -61,6 +61,7 @@ const RING_CAP: usize = 300;
 /// 각 store 조회 시 반환할 tail 상한(대시보드 표시용 — 전량 직렬화 방지).
 const AUDIT_TAIL: usize = 200;
 const WEBHOOK_TAIL: usize = 100;
+const SERVER_LOG_TAIL: usize = 200;
 const HISTORY_TAIL: usize = 50;
 const CHAT_SESSION_LIMIT: usize = 20;
 const CHAT_RECORD_TAIL: usize = 30;
@@ -267,6 +268,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/chat", get(chat_observability))
         .route("/web/chat/{session}", get(chat_observability_for_session))
         .route("/web/webhooks", get(webhooks))
+        .route("/web/serverlog", get(server_log))
         .route("/web/config", get(config_view))
         .route("/web/backends", get(backends))
         .route(
@@ -2069,6 +2071,46 @@ async fn webhooks() -> Json<Vec<Value>> {
                 "alert": red(e, "alert"),
                 "severity": e.get("severity"),
                 "fingerprint": red(e, "fingerprint"),
+            })
+        })
+        .collect();
+    Json(out)
+}
+
+/// aicd가 쓰는 일별 회전 JSON 로그(`server.<date>.log`)의 최신 파일을 tail해 redacted로 반환한다.
+/// 고정·앱소유 경로(state_dir)만 읽으며 임의 파일 경로는 받지 않는다(path traversal 차단). 데몬 자체의
+/// 동작/경고/에러 가시성 — runtime 카드가 요약만 주는 것을 보완한다. message는 redaction 통과.
+async fn server_log() -> Json<Vec<Value>> {
+    let dir = aic_common::paths::state_dir();
+    // 파일명에 ISO 날짜가 들어 있어 lexical max = 최신 파일.
+    let latest = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("server.") && n.ends_with(".log"))
+        })
+        .max();
+    let Some(path) = latest else {
+        return Json(vec![]);
+    };
+    let out: Vec<Value> = tail_lines(&path, SERVER_LOG_TAIL)
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|e| {
+            let msg = e
+                .get("fields")
+                .and_then(|f| f.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            json!({
+                "ts": e.get("timestamp"),
+                "level": e.get("level"),
+                "target": e.get("target"),
+                "msg": redaction::redact(msg).0,
             })
         })
         .collect();

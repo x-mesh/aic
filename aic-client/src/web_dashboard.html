@@ -570,6 +570,7 @@
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="audit" data-panel="audit" onclick="tab(this)">Audit</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="history" data-panel="history" onclick="tab(this)">History</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="webhooks" data-panel="webhooks" onclick="tab(this)">Webhooks</button>
+  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="serverlog" data-panel="serverlog" onclick="tab(this)">Server log</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="config" data-panel="config" onclick="tab(this)">Config</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="external" data-panel="external" id="tab-external" hidden onclick="tab(this)">External</button>
 </nav>
@@ -682,6 +683,13 @@
     <div id="webhooks-out"><p class="muted">연결 후 새로고침하세요.</p></div>
   </section>
 
+  <section id="serverlog" class="panel" role="tabpanel">
+    <div class="row"><button onclick="loadServerLog()">새로고침</button>
+      <input class="tbl-filter" placeholder="필터…" oninput="filterTable('serverlog-out', this.value)">
+      <span class="muted">server.&lt;date&gt;.log · aicd 데몬 자체 로그(최신 파일 tail), redacted</span></div>
+    <div id="serverlog-out"><p class="muted">연결 후 새로고침하세요.</p></div>
+  </section>
+
   <section id="config" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadConfig()">새로고침</button>
       <span class="muted">현재 설정 요약 · 토큰/secret 미노출(auth는 존재 여부만)</span></div>
@@ -763,6 +771,7 @@ function tab(btn) {
   if (btn.dataset.panel === "audit") loadAudit();
   if (btn.dataset.panel === "history") loadHistory();
   if (btn.dataset.panel === "webhooks") loadWebhooks();
+  if (btn.dataset.panel === "serverlog") loadServerLog();
   if (btn.dataset.panel === "config") loadConfig();
   HASH = { tab: btn.dataset.panel }; writeHash();   // #3: 탭 전환 시 sub-state 리셋
 }
@@ -1706,6 +1715,21 @@ async function loadWebhooks() {
     d.slice().reverse().forEach(e => { h += "<tr><td>" + esc(fmtTs(e.ts)) + "</td><td>" + esc(e.action || "") +
       "</td><td>" + esc(e.source || "") + "</td><td>" + esc(e.severity || "") + "</td><td>" + esc(e.alert || "") +
       "</td><td class='muted'>" + esc(e.fingerprint || "") + "</td></tr>"; });
+    out.innerHTML = h + "</table>"; reapplyFilter(out.id);
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
+}
+async function loadServerLog() {
+  if (!TOKEN) return; const out = document.getElementById("serverlog-out");
+  try {
+    const d = await (await api("/web/serverlog")).json();
+    if (!d.length) { out.innerHTML = '<p class="muted">server 로그 없음(aicd 미실행이거나 로그 파일 없음).</p>'; return; }
+    let h = "<table><tr><th>ts</th><th>level</th><th>target</th><th>message</th></tr>";
+    d.slice().reverse().forEach(e => {
+      const lvl = String(e.level || "").toUpperCase();
+      const col = { ERROR: "#e5484d", WARN: "#b5740a" }[lvl] || "var(--muted)";
+      h += "<tr><td>" + esc(fmtTs(e.ts)) + '</td><td style="color:' + col + '">' + esc(lvl) +
+        "</td><td class='muted'>" + esc(e.target || "") + "</td><td>" + esc(e.msg || "") + "</td></tr>";
+    });
     out.innerHTML = h + "</table>"; reapplyFilter(out.id);
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
