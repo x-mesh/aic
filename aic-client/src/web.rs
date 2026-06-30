@@ -1343,7 +1343,7 @@ fn parse_perf_script(text: &str) -> Value {
 /// `perf script` frame 한 줄 파싱: "<addr> <symbol>+<offset> (<module>)" → (symbol, module).
 #[cfg(any(target_os = "linux", test))]
 fn parse_perf_frame(s: &str) -> Option<(String, String)> {
-    let after_addr = s.splitn(2, char::is_whitespace).nth(1)?;
+    let after_addr = s.split_once(char::is_whitespace)?.1;
     let (symoff, module) = match after_addr.rsplit_once('(') {
         Some((sym, m)) => (sym.trim(), m.trim_end_matches(')').trim()),
         None => (after_addr.trim(), ""),
