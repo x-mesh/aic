@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-30
+
+### Added
+- `aic web` resource charts are now investigable: hover or click a chart to pin a moment and see that instant's CPU/mem/load/disk/net plus the top CPU/memory processes (click to drill in) and any threshold events at that time. ResourceEvent threshold transitions are overlaid as severity-colored markers, with 1m/5m/10m zoom and wall-clock axis labels (the 10-minute ring buffer is unchanged).
+- `aic web` incident-now banner under the header aggregating worst-state across signals (resource crit/warn, open incidents + worst severity, latest webhook alert, aicd online, audit-chain validity), each segment clicking through to its tab.
+- `aic web` URL hash deep-links — the active tab and the open process/incident/chat-session are reflected in the URL and restored on load, so a shared dashboard URL lands on the exact view.
+- `aic web` chart moment → External query deep-link: pick a moment on a chart and jump to the External tab with the Prometheus/Loki query window anchored on that timestamp.
+- `aic web` Server log tab tailing aicd's own daily-rotated JSON log (redacted, fixed app-owned path); client-side filter boxes on the audit/history/webhooks/incidents tables; snapshot N-vs-N-1 diff (changed/new section badges); and a "similar past incidents" button on an incident.
+- `aic rca diagnose [id]` re-runs the headless Safe-probe diagnose into an existing incident so evidence accumulates across rounds and converges on the cause.
+- `aic rca bundle [id]` exports a full incident (meta + evidence + hypotheses + report) as a single shareable redacted markdown bundle.
+- RCA ↔ sre-agent incident-memory bridge (best-effort, no-op without sre-agent): `aic rca similar [id]` finds similar past incidents, `aic rca runbooks [id]` asks for recommended runbooks, and `aic rca close --remember` (or `[rca] auto_remember`) hands a closed incident off to sre-agent.
+
+### Changed
+- `/web/incidents` now exposes incident severity and `/web/webhooks` now exposes the alert fingerprint, so the dashboard can color incidents by severity and tie deduplicated alerts together.
+
+### Security
+- The new `/web/serverlog` reads only the fixed app-owned state directory (no caller-supplied path, no traversal); the incident-memory bridge reads via MCP only, whose responses the client redacts and caps. The dashboard stays read-only.
+
 ## [0.26.0] - 2026-06-30
 
 ### Added
