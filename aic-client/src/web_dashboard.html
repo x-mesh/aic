@@ -79,6 +79,13 @@
   header h1 { font-size: 16px; line-height: 1.15; margin: 0; color: var(--text); font-weight: 720; }
   .brand-sub { margin-top: 2px; color: var(--muted); font-size: 12px; }
   .topbar-actions { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+  .incident-banner { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 7px 16px; border-bottom: 1px solid var(--line); background: var(--surface, var(--canvas)); font-size: 12px; }
+  .banner-seg { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border: 1px solid var(--line-soft); border-radius: 999px; color: var(--text); background: var(--canvas); }
+  .banner-seg.click { cursor: pointer; }
+  .banner-seg.click:hover { border-color: var(--accent, var(--line)); }
+  .banner-seg.crit { border-color: #e5484d; color: #e5484d; }
+  .banner-seg.warn { border-color: #f5a623; color: #b5740a; }
+  .banner-label { color: var(--subtle); }
   input, select, button {
     min-height: 32px;
     font: inherit;
@@ -545,6 +552,7 @@
     <span id="status" class="status-pill muted" aria-live="polite">미연결</span>
   </div>
 </header>
+<div id="incident-banner" class="incident-banner" hidden></div>
 <nav class="tabs" role="tablist" aria-label="Dashboard sections">
   <button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="resources" data-panel="resources" onclick="tab(this)">Resources</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="chat" data-panel="chat" onclick="tab(this)">Chat</button>
@@ -691,6 +699,8 @@
 let TOKEN = "", timer = null, lastPoints = [], SNAPS = [], CHAT = null;
 // 가시성(#1): 차트 zoom 윈도(분), crosshair 상태, 현재 렌더 중인 포인트/xs.
 let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
+// 가시성(#2): incident-now 배너 — 느리게 갱신하는 incidents/webhooks 캐시 + 최신 runtime.
+let BANNER_INC = null, BANNER_WH = null, LAST_RUNTIME = {}, bannerTimer = null;
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) {
@@ -738,6 +748,9 @@ async function connect() {
     const hasExt = (b.prometheus||[]).length || (b.loki||[]).length;
     document.getElementById("tab-external").hidden = !hasExt;
     if (hasExt) { fillBackends("m-backend", b.prometheus||[]); fillBackends("l-backend", b.loki||[]); }
+    fetchBannerData();                                    // #2 incident-now 배너 초기 + 12s 갱신
+    if (bannerTimer) clearInterval(bannerTimer);
+    bannerTimer = setInterval(fetchBannerData, 12000);
   } catch (e) { if (e.message !== "unauthorized") setStatus(e.message, "err"); }
 }
 
@@ -1113,6 +1126,7 @@ function renderRuntime(rt) {
 
 function renderResources(pts, runtime) {
   const cards = document.getElementById("cards");
+  LAST_RUNTIME = runtime || {};
   renderRuntime(runtime);
   if (!pts.length) {
     setSampleAge(null);
@@ -1170,6 +1184,7 @@ function renderResources(pts, runtime) {
   wireCharts();
   drawCharts();
   renderMoment();
+  updateBanner();
 }
 
 // 5개 자원 차트를 현재 RENDER.pts로 그린다(event 마커 + crosshair 공유).
@@ -1261,6 +1276,61 @@ function setZoom(m) {
   RENDER.pts = ZOOM_MIN ? lastPoints.filter(q => q.ts >= p.ts - ZOOM_MIN * 60000) : lastPoints.slice();
   if (RENDER.pts.length < 2) RENDER.pts = lastPoints.slice();
   CROSS = null; drawCharts(); renderMoment();
+}
+
+// ── 가시성(#2): incident-now 배너 ─────────────────────────
+// 느리게 변하는 incidents/webhooks는 캐시(12s), 자원 crit/warn·aicd·audit는 매 poll의 live 데이터로 합친다.
+async function fetchBannerData() {
+  if (!TOKEN) return;
+  try { BANNER_INC = await (await api("/web/incidents")).json(); } catch (e) {}
+  try { BANNER_WH = await (await api("/web/webhooks")).json(); } catch (e) {}
+  updateBanner();
+}
+function gotoTab(panel) { const b = document.querySelector('.tab[data-panel="' + panel + '"]'); if (b) b.click(); }
+function bannerSeg(label, val, cls, panel) {
+  const cl = "banner-seg " + (cls || "") + (panel ? " click" : "");
+  const on = panel ? ' onclick="gotoTab(\'' + panel + '\')"' : '';
+  return '<span class="' + cl + '"' + on + '><span class="banner-label">' + esc(label) + '</span>' + esc(val) + '</span>';
+}
+function bannerAge(ts) {
+  const d = new Date(ts); if (isNaN(d.getTime())) return "";
+  const s = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
+  return s < 60 ? s + "s 전" : s < 3600 ? Math.floor(s / 60) + "m 전" : Math.floor(s / 3600) + "h 전";
+}
+function liveResourceState(p) {
+  const loadR = p.cores ? p.load1 / p.cores : p.load1;
+  const states = [sev(p.cpu_pct, 70, 90), sev(loadR, 1, 2), sev(pct(p.mem_used, p.mem_total), 75, 90),
+    sev(pct(p.swap_used, p.swap_total), 25, 60), sev(pct(p.disk_total - p.disk_avail, p.disk_total), 80, 92)];
+  if (p.process_pressure && p.process_pressure.fd_status) states.push(p.process_pressure.fd_status);
+  return { crit: states.filter(s => s === "crit").length, warn: states.filter(s => s === "warn").length };
+}
+function updateBanner() {
+  const el = document.getElementById("incident-banner"); if (!el) return;
+  if (!TOKEN) { el.hidden = true; return; }
+  const segs = [];
+  const p = lastPoints[lastPoints.length - 1];
+  if (p) {
+    const st = liveResourceState(p);
+    segs.push(bannerSeg("자원", st.crit || st.warn ? st.crit + " crit / " + st.warn + " warn" : "정상",
+      st.crit ? "crit" : st.warn ? "warn" : "", "resources"));
+  }
+  if (Array.isArray(BANNER_INC)) {
+    const open = BANNER_INC.filter(i => i.status !== "closed");
+    const worst = open.map(i => i.severity).filter(Boolean).sort()[0];
+    segs.push(bannerSeg("incidents", open.length + " open" + (worst ? " (" + worst.toUpperCase() + ")" : ""),
+      worst === "sev1" || worst === "sev2" ? "crit" : open.length ? "warn" : "", "incidents"));
+  }
+  if (Array.isArray(BANNER_WH) && BANNER_WH.length) {
+    const w = BANNER_WH[BANNER_WH.length - 1];
+    const sevTxt = (w.severity || "alert");
+    segs.push(bannerSeg("webhook", sevTxt + " · " + bannerAge(w.ts),
+      String(sevTxt).toLowerCase().includes("crit") ? "crit" : "warn", "webhooks"));
+  }
+  const rt = LAST_RUNTIME || {};
+  if (rt.aicd) segs.push(bannerSeg("aicd", rt.aicd.status || (rt.aicd.ok ? "online" : "offline"), rt.aicd.ok ? "" : "crit", null));
+  if (rt.audit) segs.push(bannerSeg("audit", rt.audit.status || (rt.audit.ok ? "valid" : "broken"), rt.audit.ok ? "" : "crit", "audit"));
+  if (!segs.length) { el.hidden = true; return; }
+  el.hidden = false; el.innerHTML = segs.join("");
 }
 
 // ── canvas 라인 차트 ───────────────────────────────────────
