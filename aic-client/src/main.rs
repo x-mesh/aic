@@ -738,6 +738,17 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// 이 incident 패턴에 권장되는 runbook을 sre-agent에 묻는다(읽기 전용 pull) — "무엇을 해야 하나". [mcp] sre-agent 구성 필요.
+    Runbooks {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 최대 결과 수.
+        #[arg(long, default_value_t = 5)]
+        limit: u32,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
     /// incident 시간창으로 Prometheus/Loki를 질의해 결과를 evidence로 붙인다 — probe를 관측 데이터로 뒷받침.
     Observe {
         /// incident id 또는 prefix. 생략 시 최근 incident.
@@ -7350,6 +7361,29 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 }
                 None => eprintln!(
                     "sre-agent incident-memory 미구성([mcp] sre-agent) 또는 match_incidents 없음 — 건너뜀"
+                ),
+            }
+        }
+        RcaOp::Runbooks { id, limit, json } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let meta = aic_client::rca::load_meta(&resolved)?;
+            let config = ConfigManager::load()?;
+            match aic_client::rca_memory::recommend_runbooks(&config.mcp, &meta, limit).await {
+                Some(out) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "incident": meta.id,
+                                "runbooks": out,
+                            }))?
+                        );
+                    } else {
+                        println!("권장 runbook(sre-agent):\n{out}");
+                    }
+                }
+                None => eprintln!(
+                    "sre-agent 미구성([mcp] sre-agent) 또는 recommend_runbooks 없음 — 건너뜀"
                 ),
             }
         }
