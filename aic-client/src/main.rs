@@ -614,6 +614,26 @@ enum RcaOp {
         #[arg(long)]
         provider: Option<String>,
     },
+    /// 열린 incident에 진단을 **다시** 실행해 evidence로 붙인다(원인 수렴). id 생략 시 최근 incident.
+    Diagnose {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 증상(생략 시 incident의 기존 symptom/title 사용).
+        #[arg(long)]
+        symptom: Option<String>,
+        /// LLM 분석 없이 raw evidence만 저장한다.
+        #[arg(long)]
+        no_analyze: bool,
+        /// LLM follow-up probe 1라운드를 허용한다.
+        #[arg(long)]
+        follow_up: bool,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+        /// 사용할 provider 이름(config default 대신).
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// RCA incident 상태를 표시한다. id 생략 시 최근 incident.
     Status {
         /// incident id 또는 prefix.
@@ -7043,6 +7063,53 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 if diagnose {
                     println!("초동 진단 evidence 저장: E{}", meta.evidence_count);
                 }
+            }
+        }
+        RcaOp::Diagnose {
+            id,
+            symptom,
+            no_analyze,
+            follow_up,
+            json,
+            provider,
+        } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let mut meta = aic_client::rca::load_meta(&resolved)?;
+            // 증상은 지정값 → incident의 기존 symptom → title 순으로 결정.
+            let symptom_text = symptom
+                .or_else(|| meta.symptom.clone())
+                .unwrap_or_else(|| meta.title.clone());
+            let config = ConfigManager::load()?;
+            let (config, provider_name) =
+                apply_provider_override(config, provider.or(global_provider).as_deref())?;
+            let sandbox = aic_client::agent::Sandbox::from_cwd()?;
+            let dispatcher = LlmDispatcher::from_config(config.llm.clone());
+            let dispatcher_ref = if no_analyze { None } else { Some(&dispatcher) };
+            let corr = format!("rca-{}-followup", meta.id);
+            let result = aic_client::agent::diagnose::run_headless_diagnose_opts(
+                Some(&symptom_text),
+                &sandbox,
+                dispatcher_ref,
+                &corr,
+                aic_client::agent::diagnose::DiagnoseOptions { follow_up },
+            )
+            .await;
+            let md = result.to_markdown();
+            let ev = aic_client::rca::append_evidence(
+                &mut meta,
+                aic_client::rca::EvidenceKind::Diagnosis,
+                "follow-up diagnosis",
+                &format!("aic rca diagnose ({provider_name})"),
+                &md,
+                &["diagnosis", "follow-up"],
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ev)?);
+            } else {
+                println!(
+                    "{COL_GREEN}✔{COL_RESET} follow-up 진단 evidence 저장: [{}] (incident {})",
+                    ev.id, meta.id
+                );
             }
         }
         RcaOp::Status { id, json } => {
