@@ -660,6 +660,10 @@
       <span class="muted">~/.aic/incidents/ · RCA</span></div>
     <div id="incidents-out"><p class="muted">연결 후 새로고침하세요.</p></div>
     <pre id="report-out" style="display:none"></pre>
+    <div id="similar-box" style="display:none; margin-top:10px">
+      <button type="button" onclick="loadSimilar()">유사 과거 incident 찾기 (sre-agent)</button>
+      <pre id="similar-out" class="muted" style="margin-top:8px"></pre>
+    </div>
   </section>
 
   <section id="audit" class="panel" role="tabpanel">
@@ -1641,11 +1645,26 @@ async function loadIncidents() {
     out.querySelectorAll("a.rep").forEach(a => a.addEventListener("click", ev => { ev.preventDefault(); showReport(a.dataset.id); }));
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
+let CUR_INCIDENT = null;
 async function showReport(id) {
   HASH.tab = "incidents"; HASH.id = id; writeHash();   // #3 딥링크
+  CUR_INCIDENT = id;
+  // 새 report를 열 때 이전 유사검색 결과는 비우고 버튼만 보여준다.
+  document.getElementById("similar-box").style.display = "block";
+  document.getElementById("similar-out").textContent = "";
   const pre = document.getElementById("report-out"); pre.style.display = "block"; pre.textContent = "로딩...";
   try { pre.textContent = await (await api("/web/incidents/" + encodeURIComponent(id) + "/report")).text(); }
   catch (e) { pre.textContent = e.message; }
+}
+// 유사 과거 incident(sre-agent incident-memory) — read-only pull. 미구성이면 안내만.
+async function loadSimilar() {
+  if (!CUR_INCIDENT) return;
+  const out = document.getElementById("similar-out"); out.textContent = "질의 중...";
+  try {
+    const d = await (await api("/web/incidents/" + encodeURIComponent(CUR_INCIDENT) + "/similar")).json();
+    out.textContent = d.available ? (d.text || "(결과 없음)")
+      : "sre-agent incident-memory 미연결 — [mcp] sre-agent를 구성하면 과거 유사 incident를 보여줍니다.";
+  } catch (e) { out.innerHTML = '<span class="err">' + esc(e.message) + "</span>"; }
 }
 
 // ── audit / history / webhooks / config ───────────────────
