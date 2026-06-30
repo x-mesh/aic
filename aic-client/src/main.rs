@@ -716,6 +716,14 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// incident(meta+evidence+hypothesis+report)를 공유 가능한 단일 redacted 번들로 내보낸다(~/.aic/bundles/). id 생략 시 최근 incident.
+    Bundle {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// JSON 출력(번들 경로).
+        #[arg(long)]
+        json: bool,
+    },
     /// incident 시간창으로 Prometheus/Loki를 질의해 결과를 evidence로 붙인다 — probe를 관측 데이터로 뒷받침.
     Observe {
         /// incident id 또는 prefix. 생략 시 최근 incident.
@@ -7247,6 +7255,32 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 if let Some(path) = written {
                     eprintln!("{COL_GREEN}✔{COL_RESET} report 저장: {}", path.display());
                 }
+            }
+        }
+        RcaOp::Bundle { id, json } => {
+            let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+            let meta = aic_client::rca::load_meta(&resolved)?;
+            let events = aic_client::rca::load_events(&resolved)?;
+            let hypotheses = aic_client::rca::load_hypotheses(&resolved).unwrap_or_default();
+            // evidence/meta/hypothesis는 저장 시점에 이미 redaction됨 → render_report 출력도 redacted.
+            let report = aic_client::rca::render_report(&meta, &events, &hypotheses);
+            let path = aic_client::agent::bundle::write_bundle(Some(&meta.id), &report)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "bundle": path,
+                        "incident": meta.id,
+                        "evidence_count": meta.evidence_count,
+                    }))?
+                );
+            } else {
+                println!(
+                    "{COL_GREEN}✔{COL_RESET} RCA 번들 저장: {} (incident {}, evidence {})",
+                    path.display(),
+                    meta.id,
+                    meta.evidence_count
+                );
             }
         }
     }
