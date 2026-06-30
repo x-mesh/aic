@@ -433,6 +433,9 @@
   .moment-ev { padding: 1px 7px; border-radius: var(--radius-sm); font-size: 11px; }
   .moment-ev.bad { background: rgba(229,72,77,0.14); color: #e5484d; }
   .moment-ev.warn { background: rgba(245,166,35,0.14); color: #b5740a; }
+  .moment-ext { border: 1px solid var(--accent, var(--line)); background: transparent; color: var(--accent, var(--text)); border-radius: var(--radius-sm); cursor: pointer; padding: 2px 8px; font-size: 11px; }
+  .x-anchor { display: flex; align-items: center; gap: 8px; margin: 8px 0; padding: 5px 10px; border: 1px solid var(--accent, var(--line)); border-radius: var(--radius-sm); background: var(--canvas); font-size: 12px; }
+  .x-anchor button { border: 1px solid var(--line-soft); background: transparent; color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; padding: 1px 8px; font-size: 11px; }
   #snapshots-out, #incidents-out, #audit-out, #history-out, #webhooks-out, #chat-out { overflow-x: auto; }
   table {
     border-collapse: separate;
@@ -688,6 +691,7 @@
         <option value="21600">6h</option></select>
       <button class="primary" onclick="runMetrics()">metrics</button>
     </div>
+    <div id="x-anchor" class="x-anchor" hidden></div>
     <div class="legend" id="x-legend"></div>
     <canvas id="x-canvas" style="height:220px"></canvas>
     <div id="x-msg" class="muted"></div>
@@ -708,6 +712,8 @@ let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
 let BANNER_INC = null, BANNER_WH = null, LAST_RUNTIME = {}, bannerTimer = null;
 // 가시성(#3): URL hash 딥링크 상태(#tab=…&process=…&id=…&session=…) — 공유/복원.
 let HASH = {};
+// 가시성(후속A): External 쿼리 anchor — chart moment에서 넘어온 시점(ms). set이면 그 시점 중심으로 조회.
+let EXT_ANCHOR = null;
 // 가시성(#4): 테이블별 클라이언트측 필터(이미 로드된 tail 대상 substring, 새 fetch 없음).
 let FILTERS = {};
 function filterTable(id, q) {
@@ -1302,9 +1308,11 @@ function renderMoment() {
   const evs = (RENDER.pts[RENDER.pts.length - 1].events || [])
     .filter(ev => Math.abs(ev.ts - q.ts) <= 4000)
     .map(ev => '<span class="moment-ev ' + statusClass(ev.severity) + '">' + esc(ev.resource) + ' ' + esc(ev.value) + '</span>').join("");
+  const extAvail = !document.getElementById("tab-external").hidden;
   box.innerHTML =
     '<div class="moment-head"><strong>' + esc(momentTime(q.ts)) + '</strong>' +
       (CROSS.pinned ? ' ' + badge("고정", "ok") : ' <span class="muted">hover</span>') +
+      (extAvail ? ' <button type="button" class="moment-ext" onclick="externalAtMoment(' + q.ts + ')">External 조회</button>' : '') +
       '<button type="button" class="moment-x" onclick="clearCross()">×</button></div>' +
     '<div class="moment-vals">' + vals.map(esc).join(" · ") + '</div>' +
     (cpuP ? '<div class="moment-row"><span class="moment-k">top cpu</span>' + cpuP + '</div>' : '') +
@@ -1672,11 +1680,28 @@ function fillBackends(id, names) {
   const sel = document.getElementById(id); sel.innerHTML = "";
   (names.length ? names : ["(none)"]).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
 }
+// 가시성(후속A): chart moment에서 External로 점프 — 그 시점을 anchor로 잡아 ±윈도로 조회한다(증상→관측 루프).
+function externalAtMoment(tsMs) {
+  if (document.getElementById("tab-external").hidden) return;   // 등록 백엔드 없으면 무시
+  EXT_ANCHOR = tsMs; gotoTab("external"); renderExtAnchor();
+  const q = document.getElementById("m-query"); if (q) q.focus();
+}
+function clearExtAnchor() { EXT_ANCHOR = null; renderExtAnchor(); }
+function renderExtAnchor() {
+  const el = document.getElementById("x-anchor"); if (!el) return;
+  if (EXT_ANCHOR == null) { el.hidden = true; el.innerHTML = ""; return; }
+  el.hidden = false;
+  el.innerHTML = '<span>📍 <strong>' + esc(new Date(EXT_ANCHOR).toLocaleString()) +
+    '</strong> 기준 ± 윈도로 조회</span><button type="button" onclick="clearExtAnchor()">해제(현재시각)</button>';
+}
 async function runMetrics() {
   const msg = document.getElementById("x-msg");
   const backend = document.getElementById("m-backend").value, query = document.getElementById("m-query").value.trim();
   if (!backend || !query) { msg.textContent = "backend·query 입력"; return; }
-  const span = +document.getElementById("m-range").value, end = Math.floor(Date.now()/1000), start = end - span;
+  const span = +document.getElementById("m-range").value;
+  // anchor가 있으면 그 시점 중심, 없으면 [now-span, now].
+  const center = EXT_ANCHOR != null ? Math.floor(EXT_ANCHOR / 1000) : Math.floor(Date.now() / 1000);
+  const end = EXT_ANCHOR != null ? center + Math.floor(span / 2) : center, start = end - span;
   msg.textContent = "질의 중...";
   try {
     const body = JSON.stringify({ backend, query, start:""+start, end:""+end, step: Math.max(15, Math.floor(span/200))+"s" });
@@ -1695,7 +1720,9 @@ async function runLogs() {
   const out = document.getElementById("l-out");
   const backend = document.getElementById("l-backend").value, query = document.getElementById("l-query").value.trim();
   if (!backend || !query) { out.textContent = "backend·query 입력"; return; }
-  const end = Date.now()*1e6, start = end - 3600*1e9;
+  // anchor가 있으면 그 시점 중심 1h, 없으면 [now-1h, now] (ns 단위).
+  const win = 3600 * 1e9, center = (EXT_ANCHOR != null ? EXT_ANCHOR : Date.now()) * 1e6;
+  const end = EXT_ANCHOR != null ? center + win / 2 : center, start = end - win;
   out.textContent = "질의 중...";
   try {
     const body = JSON.stringify({ backend, query, start: start.toFixed(0), end: end.toFixed(0), limit: 200 });
