@@ -2052,29 +2052,29 @@ fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
 /// 자유 텍스트 필드(action/source/alert)에 redaction을 적용한다.
 async fn webhooks() -> Json<Vec<Value>> {
     let path = aic_common::paths::webhook_events_path();
-    let evs: Vec<Value> = tail_lines(&path, WEBHOOK_TAIL)
+    let out = tail_lines(&path, WEBHOOK_TAIL)
         .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|e| webhook_event_view(&e))
         .collect();
-    let red = |v: &Value, k: &str| {
-        v.get(k)
+    Json(out)
+}
+
+/// webhook 이벤트 한 건을 노출용으로 매핑한다 — 자유 텍스트(action/source/alert/fingerprint)는 redaction.
+fn webhook_event_view(e: &Value) -> Value {
+    let red = |k: &str| {
+        e.get(k)
             .and_then(|x| x.as_str())
             .map(|s| redaction::redact(s).0)
     };
-    let out = evs
-        .iter()
-        .map(|e| {
-            json!({
-                "ts": e.get("ts"),
-                "action": red(e, "action"),
-                "source": red(e, "source"),
-                "alert": red(e, "alert"),
-                "severity": e.get("severity"),
-                "fingerprint": red(e, "fingerprint"),
-            })
-        })
-        .collect();
-    Json(out)
+    json!({
+        "ts": e.get("ts"),
+        "action": red("action"),
+        "source": red("source"),
+        "alert": red("alert"),
+        "severity": e.get("severity"),
+        "fingerprint": red("fingerprint"),
+    })
 }
 
 /// aicd가 쓰는 일별 회전 JSON 로그(`server.<date>.log`)의 최신 파일을 tail해 redacted로 반환한다.
@@ -2100,21 +2100,24 @@ async fn server_log() -> Json<Vec<Value>> {
     let out: Vec<Value> = tail_lines(&path, SERVER_LOG_TAIL)
         .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .map(|e| {
-            let msg = e
-                .get("fields")
-                .and_then(|f| f.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
-            json!({
-                "ts": e.get("timestamp"),
-                "level": e.get("level"),
-                "target": e.get("target"),
-                "msg": redaction::redact(msg).0,
-            })
-        })
+        .map(|e| server_log_view(&e))
         .collect();
     Json(out)
+}
+
+/// aicd JSON 로그 한 줄(파싱된 Value)을 노출용으로 매핑한다 — `fields.message`는 redaction 통과.
+fn server_log_view(e: &Value) -> Value {
+    let msg = e
+        .get("fields")
+        .and_then(|f| f.get("message"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    json!({
+        "ts": e.get("timestamp"),
+        "level": e.get("level"),
+        "target": e.get("target"),
+        "msg": redaction::redact(msg).0,
+    })
 }
 
 /// 현재 config 요약 — **토큰/secret은 절대 노출하지 않는다**. 백엔드 `auth`는 존재 여부(bool)만, URL은
@@ -2158,23 +2161,23 @@ async fn config_view() -> Json<Value> {
 /// `title`/`symptom`/`cwd`는 redaction 미적용이다. 여기서 `path`를 제외하고 입력 필드에 redaction을 적용한다.
 async fn incidents() -> Result<Json<Vec<Value>>, (StatusCode, &'static str)> {
     let list = rca::list_incidents().map_err(internal)?;
-    let out: Vec<Value> = list
-        .into_iter()
-        .map(|i| {
-            json!({
-                "id": i.id,
-                "title": redaction::redact(&i.title).0,
-                "status": i.status,
-                "severity": i.severity,
-                "symptom": i.symptom.map(|s| redaction::redact(&s).0),
-                "cwd": i.cwd.map(|s| redaction::redact(&s).0),
-                "created_at": i.created_at,
-                "updated_at": i.updated_at,
-                "evidence_count": i.evidence_count,
-            })
-        })
-        .collect();
+    let out: Vec<Value> = list.iter().map(incident_view).collect();
     Ok(Json(out))
+}
+
+/// incident 요약 한 건을 목록 노출용으로 매핑한다 — title/symptom/cwd는 redaction, severity는 그대로 노출.
+fn incident_view(i: &rca::IncidentSummary) -> Value {
+    json!({
+        "id": i.id,
+        "title": redaction::redact(&i.title).0,
+        "status": i.status,
+        "severity": i.severity,
+        "symptom": i.symptom.as_deref().map(|s| redaction::redact(s).0),
+        "cwd": i.cwd.as_deref().map(|s| redaction::redact(s).0),
+        "created_at": i.created_at,
+        "updated_at": i.updated_at,
+        "evidence_count": i.evidence_count,
+    })
 }
 
 /// 인시던트 id는 생성 시 timestamp + slug(`[A-Za-z0-9_-]`)만 쓴다. 데이터 디렉터리에 닿기 전에
@@ -2307,6 +2310,71 @@ mod tests {
     fn tail_lines_missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(tail_lines(&dir.path().join("nope.jsonl"), 100).is_empty());
+    }
+
+    #[test]
+    fn webhook_event_view_exposes_fingerprint_and_passes_severity() {
+        let e = json!({
+            "ts": "2026-06-30T00:00:00Z", "action": "diagnosed", "source": "alertmanager",
+            "alert": "disk full", "severity": "critical", "fingerprint": "fp-redis-oom",
+        });
+        let v = webhook_event_view(&e);
+        assert_eq!(v["fingerprint"], "fp-redis-oom"); // dedup 키 노출(상관용)
+        assert_eq!(v["severity"], "critical");
+        assert_eq!(v["action"], "diagnosed");
+    }
+
+    #[test]
+    fn webhook_event_view_missing_fingerprint_is_null_and_redacts_alert() {
+        let v = webhook_event_view(&json!({ "action": "received", "alert": "from admin@corp.io" }));
+        assert!(v["fingerprint"].is_null()); // 없으면 null(패닉 없음)
+        assert!(v["alert"].as_str().unwrap().contains("[REDACTED:email]")); // 자유 텍스트 redaction 적용
+    }
+
+    #[test]
+    fn server_log_view_extracts_level_target_and_message() {
+        let e = json!({
+            "timestamp": "2026-06-29T23:49:23Z", "level": "WARN",
+            "target": "aic_server::control_server",
+            "fields": { "message": "stale session", "count": 1 },
+        });
+        let v = server_log_view(&e);
+        assert_eq!(v["level"], "WARN");
+        assert_eq!(v["target"], "aic_server::control_server");
+        assert_eq!(v["msg"], "stale session"); // 중첩 fields.message 추출
+        assert_eq!(v["ts"], "2026-06-29T23:49:23Z");
+    }
+
+    #[test]
+    fn server_log_view_redacts_message_and_handles_missing() {
+        let with_ip = json!({ "level": "ERROR", "fields": { "message": "peer 10.1.2.3 reset" } });
+        assert!(server_log_view(&with_ip)["msg"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ipv4]")); // message redaction 적용
+        let no_msg = json!({ "level": "INFO" });
+        assert_eq!(server_log_view(&no_msg)["msg"], ""); // message 없으면 빈 문자열
+    }
+
+    #[test]
+    fn incident_view_includes_severity_and_redacts_title() {
+        use crate::rca::{IncidentStatus, IncidentSummary, Severity};
+        let i = IncidentSummary {
+            id: "20260630-000000-x".to_string(),
+            title: "checkout 5xx from admin@corp.io".to_string(),
+            status: IncidentStatus::Open,
+            symptom: Some("5xx spike".to_string()),
+            cwd: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            evidence_count: 2,
+            severity: Some(Severity::Sev2),
+            path: std::path::PathBuf::from("/tmp/x"),
+        };
+        let v = incident_view(&i);
+        assert_eq!(v["severity"], json!(Severity::Sev2)); // severity 노출(배너 색상용)
+        assert_eq!(v["evidence_count"], 2);
+        assert!(v["title"].as_str().unwrap().contains("[REDACTED:email]")); // title redaction
     }
 
     #[test]
