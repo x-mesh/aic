@@ -701,6 +701,8 @@ let TOKEN = "", timer = null, lastPoints = [], SNAPS = [], CHAT = null;
 let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
 // 가시성(#2): incident-now 배너 — 느리게 갱신하는 incidents/webhooks 캐시 + 최신 runtime.
 let BANNER_INC = null, BANNER_WH = null, LAST_RUNTIME = {}, bannerTimer = null;
+// 가시성(#3): URL hash 딥링크 상태(#tab=…&process=…&id=…&session=…) — 공유/복원.
+let HASH = {};
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) {
@@ -733,6 +735,29 @@ function tab(btn) {
   if (btn.dataset.panel === "history") loadHistory();
   if (btn.dataset.panel === "webhooks") loadWebhooks();
   if (btn.dataset.panel === "config") loadConfig();
+  HASH = { tab: btn.dataset.panel }; writeHash();   // #3: 탭 전환 시 sub-state 리셋
+}
+
+// ── 가시성(#3): URL hash 딥링크 ───────────────────────────
+function writeHash() {
+  // location.hash로 쓴다(WKWebView 등 일부 환경에서 history.replaceState가 예외를 던짐). reload 없음.
+  const joined = Object.keys(HASH).filter(k => HASH[k] != null && HASH[k] !== "")
+    .map(k => k + "=" + encodeURIComponent(HASH[k])).join("&");
+  if (joined !== location.hash.replace(/^#/, "")) { try { location.hash = joined; } catch (e) {} }
+}
+function parseHash() {
+  const out = {}; const h = location.hash.replace(/^#/, "");
+  if (h) h.split("&").forEach(kv => { const i = kv.indexOf("="); const k = i < 0 ? kv : kv.slice(0, i); if (k) out[k] = decodeURIComponent(i < 0 ? "" : kv.slice(i + 1)); });
+  return out;
+}
+// onload/연결 후 hash를 복원 — 공유 URL이 올바른 탭+상세로 착지한다(데이터는 on-demand로 가져옴).
+function restoreFromHash() {
+  const s = parseHash();
+  const panel = s.tab || (s.process ? "resources" : s.id ? "incidents" : s.session ? "chat" : "");
+  if (panel) { const b = document.querySelector('.tab[data-panel="' + panel + '"]'); if (b) b.click(); }
+  if (s.process) showProcess(s.process);
+  if (s.id) showReport(s.id);
+  if (s.session) loadChat(s.session);
 }
 
 async function connect() {
@@ -751,6 +776,7 @@ async function connect() {
     fetchBannerData();                                    // #2 incident-now 배너 초기 + 12s 갱신
     if (bannerTimer) clearInterval(bannerTimer);
     bannerTimer = setInterval(fetchBannerData, 12000);
+    restoreFromHash();                                    // #3 공유 URL의 탭/상세 복원
   } catch (e) { if (e.message !== "unauthorized") setStatus(e.message, "err"); }
 }
 
@@ -875,6 +901,7 @@ function renderTopProcesses(p) {
 async function showProcess(pid) {
   const box = document.getElementById("process-detail");
   if (!box) return;
+  HASH.tab = "resources"; HASH.process = String(pid); writeHash();   // #3 딥링크
   const head = (extra) => '<div class="pd-head"><strong>pid ' + esc(pid) + '</strong>' + (extra || "") +
     '<button class="pd-close" type="button" onclick="closeProcDetail()">×</button></div>';
   box.hidden = false;
@@ -1434,6 +1461,7 @@ function snapToggleAll(open) { document.querySelectorAll("#snap-sections details
 // ── chat observability ───────────────────────────────────
 async function loadChat(session) {
   if (!TOKEN) return;
+  if (session) { HASH.tab = "chat"; HASH.session = session; writeHash(); }   // #3 딥링크
   const out = document.getElementById("chat-out");
   try {
     const path = "/web/chat" + (session ? "/" + encodeURIComponent(session) : "");
@@ -1530,6 +1558,7 @@ async function loadIncidents() {
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
 async function showReport(id) {
+  HASH.tab = "incidents"; HASH.id = id; writeHash();   // #3 딥링크
   const pre = document.getElementById("report-out"); pre.style.display = "block"; pre.textContent = "로딩...";
   try { pre.textContent = await (await api("/web/incidents/" + encodeURIComponent(id) + "/report")).text(); }
   catch (e) { pre.textContent = e.message; }
