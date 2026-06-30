@@ -409,6 +409,22 @@
   .legend { min-height: 19px; color: var(--muted); font-size: 12px; margin-top: 7px; }
   .legend span { margin-right: 12px; } .legend i { display: inline-block; width: 9px; height: 9px;
            border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .chart-tools { display: flex; align-items: center; gap: 6px; margin: 4px 0 8px; font-size: 12px; flex-wrap: wrap; }
+  .zoom-btn { border: 1px solid var(--line-soft); background: transparent; color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; padding: 2px 8px; font: 12px ui-monospace, Menlo, monospace; }
+  .zoom-btn.on { color: var(--text); border-color: var(--accent, var(--line)); background: var(--canvas); }
+  .chart-hint { margin-left: 6px; }
+  .charts canvas { cursor: crosshair; }
+  .moment { margin: 10px 0 4px; padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface, var(--canvas)); font-size: 12px; }
+  .moment-head { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; color: var(--text); }
+  .moment-x { margin-left: auto; border: 1px solid var(--line-soft); background: transparent; color: var(--muted); border-radius: var(--radius-sm); cursor: pointer; width: 22px; height: 22px; line-height: 1; }
+  .moment-vals { color: var(--muted); font: 12px/1.5 ui-monospace, Menlo, monospace; }
+  .moment-row { margin-top: 5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .moment-k { color: var(--subtle); min-width: 52px; }
+  .moment-proc { border: 1px solid var(--line-soft); background: var(--canvas); color: var(--text); border-radius: var(--radius-sm); cursor: pointer; padding: 2px 7px; font: 11px ui-monospace, Menlo, monospace; }
+  .moment-proc:hover { border-color: var(--accent, var(--line)); }
+  .moment-ev { padding: 1px 7px; border-radius: var(--radius-sm); font-size: 11px; }
+  .moment-ev.bad { background: rgba(229,72,77,0.14); color: #e5484d; }
+  .moment-ev.warn { background: rgba(245,166,35,0.14); color: #b5740a; }
   #snapshots-out, #incidents-out, #audit-out, #history-out, #webhooks-out, #chat-out { overflow-x: auto; }
   table {
     border-collapse: separate;
@@ -560,6 +576,13 @@
       <section class="resource-panel"><h3>Resource event timeline</h3><div id="resource-events"></div></section>
     </div>
     <div class="runtime-grid" id="runtime"><div class="runtime-card"><div class="k">aic runtime</div><div class="v">warming</div><div class="s">상태 수집 대기</div></div></div>
+    <div class="chart-tools">
+      <span class="muted">차트</span>
+      <button type="button" class="zoom-btn on" data-m="10" onclick="setZoom(10)">10m</button>
+      <button type="button" class="zoom-btn" data-m="5" onclick="setZoom(5)">5m</button>
+      <button type="button" class="zoom-btn" data-m="1" onclick="setZoom(1)">1m</button>
+      <span class="muted chart-hint">hover로 시점 조사 · 클릭으로 고정 · "자동 2s" 끄면 정지(scrub)</span>
+    </div>
     <div class="charts">
       <div class="chart"><h3>CPU utilization</h3><canvas id="c-cpu"></canvas><div class="legend" id="lg-cpu"></div></div>
       <div class="chart"><h3>Memory / swap</h3><canvas id="c-mem"></canvas><div class="legend" id="lg-mem"></div></div>
@@ -567,6 +590,7 @@
       <div class="chart"><h3>Disk I/O</h3><canvas id="c-disk"></canvas><div class="legend" id="lg-disk"></div></div>
       <div class="chart"><h3>Network I/O</h3><canvas id="c-net"></canvas><div class="legend" id="lg-net"></div></div>
     </div>
+    <div id="moment" class="moment" hidden></div>
     <section class="resource-panel network-panel">
       <div class="resource-panel-head">
         <h3>Network interfaces</h3>
@@ -665,6 +689,8 @@
 
 <script>
 let TOKEN = "", timer = null, lastPoints = [], SNAPS = [], CHAT = null;
+// 가시성(#1): 차트 zoom 윈도(분), crosshair 상태, 현재 렌더 중인 포인트/xs.
+let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) {
@@ -1138,18 +1164,103 @@ function renderResources(pts, runtime) {
     card("Top CPU", procCpu(p.top_cpu_proc), procLine(p.top_cpu_proc), p.top_cpu_proc ? sev(p.top_cpu_proc.cpu_pct || 0, 70, 90) : "", p.top_cpu_proc ? "mem " + fmtBytes(p.top_cpu_proc.memory) : "") +
     card("Top Memory", procMem(p.top_mem_proc), procLine(p.top_mem_proc), "", p.top_mem_proc ? "cpu " + procCpu(p.top_mem_proc) : "");
 
-  const xs = pts.map(q => q.ts);
-  draw("c-cpu", "lg-cpu", xs, [{ n: "cpu%", c: "#632ca6", y: pts.map(q => q.cpu_pct) }], { ymax: 100, fmt: v => v.toFixed(0)+"%" });
+  // 차트는 zoom 윈도로 필터(버퍼 자체는 그대로 — 영속화/확장 X). 마커·crosshair·moment를 그 위에 얹는다.
+  RENDER.pts = ZOOM_MIN ? pts.filter(q => q.ts >= p.ts - ZOOM_MIN * 60000) : pts.slice();
+  if (RENDER.pts.length < 2) RENDER.pts = pts.slice();
+  wireCharts();
+  drawCharts();
+  renderMoment();
+}
+
+// 5개 자원 차트를 현재 RENDER.pts로 그린다(event 마커 + crosshair 공유).
+function drawCharts() {
+  const pts = RENDER.pts; const xs = pts.map(q => q.ts); RENDER.xs = xs;
+  const markers = chartMarkers(pts);
+  const crossTs = CROSS && pts[CROSS.idx] ? pts[CROSS.idx].ts : null;
+  const o = extra => Object.assign({ markers, crossTs }, extra);
+  draw("c-cpu", "lg-cpu", xs, [{ n: "cpu%", c: "#632ca6", y: pts.map(q => q.cpu_pct) }], o({ ymax: 100, fmt: v => v.toFixed(0)+"%" }));
   draw("c-mem", "lg-mem", xs, [
     { n: "mem%", c: "#008f8c", y: pts.map(q => pct(q.mem_used, q.mem_total)) },
-    { n: "swap%", c: "#d9822b", y: pts.map(q => pct(q.swap_used, q.swap_total)) }], { ymax: 100, fmt: v => v.toFixed(0)+"%" });
-  draw("c-load", "lg-load", xs, [{ n: "load1", c: "#9b51e0", y: pts.map(q => q.load1) }], { fmt: v => v.toFixed(2) });
+    { n: "swap%", c: "#d9822b", y: pts.map(q => pct(q.swap_used, q.swap_total)) }], o({ ymax: 100, fmt: v => v.toFixed(0)+"%" }));
+  draw("c-load", "lg-load", xs, [{ n: "load1", c: "#9b51e0", y: pts.map(q => q.load1) }], o({ fmt: v => v.toFixed(2) }));
   draw("c-disk", "lg-disk", xs, [
     { n: "read", c: "#2676d9", y: pts.map(q => q.disk_read_bps) },
-    { n: "write", c: "#d6557c", y: pts.map(q => q.disk_write_bps) }], { fmt: fmtBps });
+    { n: "write", c: "#d6557c", y: pts.map(q => q.disk_write_bps) }], o({ fmt: fmtBps }));
   draw("c-net", "lg-net", xs, [
     { n: "rx", c: "#008f8c", y: pts.map(q => q.net_rx_bps) },
-    { n: "tx", c: "#d9822b", y: pts.map(q => q.net_tx_bps) }], { fmt: fmtBps });
+    { n: "tx", c: "#d9822b", y: pts.map(q => q.net_tx_bps) }], o({ fmt: fmtBps }));
+}
+// 표시 윈도 안의 ResourceEvent(임계전환)를 severity색 마커로.
+function chartMarkers(pts) {
+  if (!pts.length) return [];
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts;
+  const COL = { crit: "#e5484d", warn: "#f5a623", ok: "#30a46c" };
+  return (pts[pts.length - 1].events || [])
+    .filter(e => e.ts >= t0 && e.ts <= t1)
+    .map(e => ({ ts: e.ts, color: COL[e.severity] || "#8b949e" }));
+}
+// 차트 영역 hover/click → crosshair. mousemove는 hover, click은 고정(pin) 토글, leave는 비고정 해제.
+function wireCharts() {
+  const grid = document.querySelector(".charts");
+  if (!grid || grid._wired) return; grid._wired = true;
+  grid.addEventListener("mousemove", e => {
+    if (CROSS && CROSS.pinned) return;
+    const idx = chartIdxFromEvent(e); if (idx == null) return;
+    CROSS = { idx, pinned: false }; drawCharts(); renderMoment();
+  });
+  grid.addEventListener("mouseleave", () => { if (CROSS && !CROSS.pinned) clearCross(); });
+  grid.addEventListener("click", e => {
+    const idx = chartIdxFromEvent(e); if (idx == null) return;
+    CROSS = { idx, pinned: !(CROSS && CROSS.pinned && CROSS.idx === idx) };
+    drawCharts(); renderMoment();
+  });
+}
+function chartIdxFromEvent(e) {
+  const cv = e.target.closest && e.target.closest("canvas"); if (!cv) return null;
+  const xs = RENDER.xs; if (xs.length < 2) return null;
+  const r = cv.getBoundingClientRect(), pad = 40, w = cv.clientWidth || r.width;
+  const frac = Math.max(0, Math.min(1, (e.clientX - r.left - pad) / Math.max(1, w - pad - 8)));
+  const ts = xs[0] + frac * (xs[xs.length - 1] - xs[0]);
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < xs.length; i++) { const dd = Math.abs(xs[i] - ts); if (dd < bd) { bd = dd; best = i; } }
+  return best;
+}
+function clearCross() { CROSS = null; drawCharts(); renderMoment(); }
+function momentTime(ms) { const d = new Date(ms); return isNaN(d.getTime()) ? String(ms) : d.toLocaleTimeString(); }
+// crosshair 시점의 값 + 그 시점 top 프로세스(클릭→showProcess) + 인접 event를 한 패널에 묶는다(correlation).
+function renderMoment() {
+  const box = document.getElementById("moment"); if (!box) return;
+  const q = CROSS && RENDER.pts[CROSS.idx];
+  if (!q) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  const memP = pct(q.mem_used, q.mem_total), loadR = q.cores ? q.load1 / q.cores : q.load1;
+  const vals = ["cpu " + fmtPct(q.cpu_pct), "mem " + fmtPct(memP), "load x" + (loadR || 0).toFixed(2),
+    "disk r/w " + fmtBps(q.disk_read_bps) + "/" + fmtBps(q.disk_write_bps),
+    "net rx/tx " + fmtBps(q.net_rx_bps) + "/" + fmtBps(q.net_tx_bps)];
+  const chip = (pr, extra) => pr ? '<button type="button" class="moment-proc" onclick="showProcess(\'' + esc(pr.pid) + '\')">' + esc(pr.name || "?") + ' ' + esc(extra) + '</button>' : '';
+  const cpuP = (q.top_cpu_procs || []).slice(0, 4).map(pr => chip(pr, procCpu(pr))).join("");
+  const memProcs = (q.top_mem_procs || []).slice(0, 4).map(pr => chip(pr, fmtBytes(pr.memory))).join("");
+  const evs = (RENDER.pts[RENDER.pts.length - 1].events || [])
+    .filter(ev => Math.abs(ev.ts - q.ts) <= 4000)
+    .map(ev => '<span class="moment-ev ' + statusClass(ev.severity) + '">' + esc(ev.resource) + ' ' + esc(ev.value) + '</span>').join("");
+  box.innerHTML =
+    '<div class="moment-head"><strong>' + esc(momentTime(q.ts)) + '</strong>' +
+      (CROSS.pinned ? ' ' + badge("고정", "ok") : ' <span class="muted">hover</span>') +
+      '<button type="button" class="moment-x" onclick="clearCross()">×</button></div>' +
+    '<div class="moment-vals">' + vals.map(esc).join(" · ") + '</div>' +
+    (cpuP ? '<div class="moment-row"><span class="moment-k">top cpu</span>' + cpuP + '</div>' : '') +
+    (memProcs ? '<div class="moment-row"><span class="moment-k">top mem</span>' + memProcs + '</div>' : '') +
+    (evs ? '<div class="moment-row"><span class="moment-k">events</span>' + evs + '</div>' : '');
+}
+// zoom 윈도 변경 — 버퍼는 그대로, 표시 범위만 좁힌다. crosshair는 인덱스 의미가 바뀌므로 리셋.
+function setZoom(m) {
+  ZOOM_MIN = m;
+  document.querySelectorAll(".zoom-btn").forEach(b => b.classList.toggle("on", +b.dataset.m === m));
+  if (!lastPoints.length) return;
+  const p = lastPoints[lastPoints.length - 1];
+  RENDER.pts = ZOOM_MIN ? lastPoints.filter(q => q.ts >= p.ts - ZOOM_MIN * 60000) : lastPoints.slice();
+  if (RENDER.pts.length < 2) RENDER.pts = lastPoints.slice();
+  CROSS = null; drawCharts(); renderMoment();
 }
 
 // ── canvas 라인 차트 ───────────────────────────────────────
@@ -1182,6 +1293,18 @@ function draw(canvasId, legendId, xs, series, opts) {
       sp.innerHTML = '<i style="background:'+s.c+'"></i>'+esc(s.n)+' '+esc(fmt(isFinite(last)?last:0));
       leg.appendChild(sp); }
   });
+  // ResourceEvent 임계전환 마커(severity색 수직선).
+  (opts.markers || []).forEach(m => {
+    const mx = X(m.ts); if (mx < pad || mx > w - 8) return;
+    ctx.save(); ctx.strokeStyle = m.color; ctx.globalAlpha = 0.4; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(mx, 8); ctx.lineTo(mx, h - 22); ctx.stroke(); ctx.restore();
+  });
+  // crosshair(hover/고정 시점) 점선 수직선.
+  if (opts.crossTs != null) {
+    const cx = X(opts.crossTs);
+    ctx.save(); ctx.strokeStyle = "#6b7280"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(cx, 8); ctx.lineTo(cx, h - 22); ctx.stroke(); ctx.restore();
+  }
 }
 
 // ── snapshots / incidents ─────────────────────────────────
