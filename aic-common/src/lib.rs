@@ -647,6 +647,7 @@ mod tests {
             observability: ObservabilityConfig::default(),
             aicd: AicdConfig::default(),
             mcp: McpConfig::default(),
+            rca: RcaConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
