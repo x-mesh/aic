@@ -81,6 +81,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                     observability: ObservabilityConfig::default(),
                     aicd: AicdConfig::default(),
                     mcp: McpConfig::default(),
+                    rca: RcaConfig::default(),
                 }
             },
         )
