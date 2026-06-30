@@ -60,6 +60,15 @@ pub async fn match_incidents(mcp: &McpConfig, meta: &IncidentMeta, limit: u32) -
     sre_call(mcp, "__match_incidents", args).await
 }
 
+/// 이 incident 패턴에 권장되는 runbook을 sre-agent에 묻는다(읽기 전용 pull) — "무엇을 해야 하나".
+/// severity는 sre-agent의 runbook enum(debug/info/warn/error)이 RCA 라벨과 달라 생략하고, 원문 증상을 query로 넘긴다.
+pub async fn recommend_runbooks(mcp: &McpConfig, meta: &IncidentMeta, limit: u32) -> Option<String> {
+    let (sensor, event, _severity) = sre_keys(meta);
+    let query = meta.symptom.clone().unwrap_or_else(|| meta.title.clone());
+    let args = json!({ "sensor": sensor, "event": event, "query": query, "limit": limit });
+    sre_call(mcp, "__recommend_runbooks", args).await
+}
+
 /// 닫은 incident를 sre-agent 기억에 기록한다(핸드오프). 성공 시 `Some(응답 텍스트)`.
 pub async fn record_incident(mcp: &McpConfig, meta: &IncidentMeta) -> Option<String> {
     let (sensor, event, severity) = sre_keys(meta);
