@@ -87,6 +87,11 @@
   .banner-seg.warn { border-color: #f5a623; color: #b5740a; }
   .banner-label { color: var(--subtle); }
   .tbl-filter { padding: 3px 8px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--canvas); color: var(--text); font-size: 12px; width: 160px; }
+  .snap-diff-head { margin: 0 0 8px; padding: 5px 10px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--canvas); font-size: 12px; color: var(--muted); }
+  .snap-diff-tgl { margin-left: 10px; }
+  .diff-badge { margin-left: 6px; padding: 1px 7px; border-radius: var(--radius-sm); font-size: 11px; }
+  .diff-badge.new { background: rgba(48,163,108,0.16); color: #1a7f4f; }
+  .diff-badge.changed { background: rgba(245,166,35,0.16); color: #b5740a; }
   input, select, button {
     min-height: 32px;
     font: inherit;
@@ -643,6 +648,7 @@
         <button onclick="snapToggleAll(true)">모두 펼치기</button>
         <button onclick="snapToggleAll(false)">모두 접기</button>
       </div>
+      <div id="snap-diff-head" class="snap-diff-head" hidden></div>
       <div id="snap-sections"></div>
     </div>
   </section>
@@ -1475,6 +1481,12 @@ function snapSections(body) {
     return { name, cmd, exit, stdout, stderr };
   });
 }
+// 같은 kind의 직전(시간상 더 이른) snapshot — diff 비교 기준.
+function prevSnapshotOfKind(idx) {
+  const cur = SNAPS[idx]; if (!cur) return null;
+  for (let i = idx - 1; i >= 0; i--) if (SNAPS[i].kind === cur.kind) return SNAPS[i];
+  return null;
+}
 function showSnapshot(idx) {
   const s = SNAPS[idx]; if (!s) return;
   document.querySelectorAll("#snapshots-out tr.clk").forEach(tr => tr.classList.toggle("sel", +tr.dataset.idx === idx));
@@ -1482,14 +1494,42 @@ function showSnapshot(idx) {
   document.getElementById("snap-title").textContent =
     fmtTs(s.captured_at) + " · " + s.kind + (s.cwd ? "  (" + s.cwd + ")" : "");
   const secs = snapSections(s.body), box = document.getElementById("snap-sections");
+  // diff(소1): 같은 kind 직전 snapshot 대비 섹션별 신규/변경 판정. 직전이 없으면 비교 없음.
+  const prev = prevSnapshotOfKind(idx);
+  const prevMap = {};
+  if (prev) snapSections(prev.body).forEach(p => { prevMap[p.name] = p; });
+  const diffOf = x => {
+    if (!prev) return "";
+    const p = prevMap[x.name];
+    if (!p) return "new";
+    return (p.stdout !== x.stdout || p.stderr !== x.stderr || p.exit !== x.exit || p.cmd !== x.cmd) ? "changed" : "same";
+  };
+  const counts = { new: 0, changed: 0 };
+  const head = document.getElementById("snap-diff-head");
+  if (head) {
+    secs.forEach(x => { const d = diffOf(x); if (d === "new") counts.new++; else if (d === "changed") counts.changed++; });
+    head.innerHTML = prev
+      ? '직전(' + esc(fmtTs(prev.captured_at)) + ') 대비 <strong>' + counts.changed + '</strong> 변경 · <strong>' + counts.new + '</strong> 신규' +
+        ' <label class="snap-diff-tgl"><input type="checkbox" id="snap-diff-only" onchange="snapDiffOnly(this.checked)"> 변경/신규만</label>'
+      : '<span class="muted">같은 kind의 직전 snapshot 없음 — diff 비교 불가</span>';
+    head.hidden = false;
+  }
   if (!secs.length) { box.innerHTML = '<p class="muted">본문 없음.</p>'; return; }
   box.innerHTML = secs.map((x, i) => {
     const badge = x.exit == null ? "" : '<span class="badge ' + (x.exit === 0 ? "ok" : "bad") + '">exit ' + x.exit + "</span>";
     const cmd = x.cmd ? '<span class="cmd">' + esc(x.cmd) + "</span>" : "";
     const err = x.stderr ? '<div class="stderr-h">stderr</div><pre>' + esc(x.stderr) + "</pre>" : "";
-    return '<details class="sec"' + (i < 3 ? " open" : "") + '><summary><strong>' + esc(x.name) + "</strong>" +
-      badge + cmd + "</summary><pre>" + esc(x.stdout || "(빈 출력)") + "</pre>" + err + "</details>";
+    const d = diffOf(x);
+    const dbadge = d === "new" ? '<span class="diff-badge new">신규</span>' : d === "changed" ? '<span class="diff-badge changed">변경</span>' : "";
+    const openSec = d === "new" || d === "changed" || (!prev && i < 3);
+    return '<details class="sec" data-diff="' + d + '"' + (openSec ? " open" : "") + '><summary><strong>' + esc(x.name) + "</strong>" +
+      dbadge + badge + cmd + "</summary><pre>" + esc(x.stdout || "(빈 출력)") + "</pre>" + err + "</details>";
   }).join("");
+}
+function snapDiffOnly(only) {
+  document.querySelectorAll("#snap-sections details.sec").forEach(d => {
+    d.style.display = (only && d.dataset.diff === "same") ? "none" : "";
+  });
 }
 function snapToggleAll(open) { document.querySelectorAll("#snap-sections details.sec").forEach(d => d.open = open); }
 
