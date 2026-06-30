@@ -4,6 +4,41 @@
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-30
+
+### Added
+- **`aic rca` 인시던트 워크플로 대폭 확장** — evidence 저장소를 넘어 원인 분석 도구로:
+  - **lifecycle + MTTR** — `aic rca mitigate|close|reopen`으로 상태를 전이하고(전이는 timeline에
+    evidence로 기록), 종료 시 MTTR(time-to-resolve)·TTM(time-to-mitigate)을 계산해 report의 Resolution
+    섹션에 싣는다.
+  - **`aic rca observe`** — incident 시간창([created−before, closed/now])으로 등록된 Prometheus/Loki를
+    질의해 결과를 Observability evidence로 첨부한다(redacted, 등록 백엔드만).
+  - **`aic rca hypothesis`** — 후보 root cause를 추가하고 `support`/`refute`/`confirm`/`reject`로 좁혀
+    probable cause에 수렴시킨다. report에 Probable Cause + Hypotheses 섹션.
+  - **`aic rca severity`** — sev1~4 triage 심각도(`--severity`로 생성 시 지정 가능, status/report/list에 표시).
+  - **`aic rca note`** — 조사 중 관찰을 수동 evidence로 기록한다.
+- **`aic web` 프로세스 드릴다운** — top CPU/메모리 프로세스를 클릭하면 상세를 보여준다: 명령행·exe·cwd
+  (redacted), 네트워크 소켓(listen 포트·연결 수, peer IP 마스킹), read-only runtime 상태(state·blocked-in
+  심볼·threads·context-switch).
+- **`aic web` CPU 스택 샘플 (기본 활성)** — 프로세스의 self-time hot frame을 구조화해 보여준다
+  (macOS `sample`, Linux `perf`). 표시된 top 프로세스로 범위 제한 + single-flight + timeout + redaction으로
+  공유 대시보드에서도 안전하다. 끄려면 `aic web --no-stack-sample`.
+- **`aic trace <pid>`** — 운영자용 프로세스 트레이스(Linux strace / macOS sample). confirm gate + timeout +
+  redaction을 거치며, 침습적이라 web 대시보드에는 노출하지 않는다.
+
+### Fixed
+- **RCA incident workspace 견고성** — meta/index/report를 원자적(temp+rename)·내구적으로 쓰고, incident
+  목록을 디렉터리 스캔으로 권위화해(corrupt index가 incident를 숨기지 못함) 손상된 evidence 줄은 건너뛴다.
+  동시 append를 flock으로 직렬화하고(중복 id 방지), incident id 충돌과 path traversal을 막으며, redaction을
+  metadata까지 확장했다.
+- **webhook 이벤트 tail을 전체 파일 로드 없이 읽기** — 큰 `webhook-events.jsonl`도 요청당 비용이 표시 개수에
+  바운드된다.
+
+### Security
+- **`aic web` 추가 하드닝** — web 접근 감사 로깅(인증 실패·민감 read), CSP/Referrer-Policy/Cache-Control
+  헤더, MAC 주소 마스킹, 내부 에러 메시지 누출 차단, metrics/logs 프록시 본문 크기 제한, `/web/local` 증분
+  폴링.
+
 ## [0.25.0] - 2026-06-25
 
 ### Added
