@@ -86,6 +86,7 @@
   .banner-seg.crit { border-color: #e5484d; color: #e5484d; }
   .banner-seg.warn { border-color: #f5a623; color: #b5740a; }
   .banner-label { color: var(--subtle); }
+  .tbl-filter { padding: 3px 8px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--canvas); color: var(--text); font-size: 12px; width: 160px; }
   input, select, button {
     min-height: 32px;
     font: inherit;
@@ -645,6 +646,7 @@
 
   <section id="incidents" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadIncidents()">새로고침</button>
+      <input class="tbl-filter" placeholder="필터…" oninput="filterTable('incidents-out', this.value)">
       <span class="muted">~/.aic/incidents/ · RCA</span></div>
     <div id="incidents-out"><p class="muted">연결 후 새로고침하세요.</p></div>
     <pre id="report-out" style="display:none"></pre>
@@ -652,18 +654,21 @@
 
   <section id="audit" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadAudit()">새로고침</button>
+      <input class="tbl-filter" placeholder="필터…" oninput="filterTable('audit-out', this.value)">
       <span class="muted">~/.local/state/aic/audit.log · aicd 감사 추적(hash-chain), redacted</span></div>
     <div id="audit-out"><p class="muted">연결 후 새로고침하세요.</p></div>
   </section>
 
   <section id="history" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadHistory()">새로고침</button>
+      <input class="tbl-filter" placeholder="필터…" oninput="filterTable('history-out', this.value)">
       <span class="muted">aicd CommandRecordStore · 최근 세션 실행 명령 · 행을 클릭하면 출력</span></div>
     <div id="history-out"><p class="muted">연결 후 새로고침하세요.</p></div>
   </section>
 
   <section id="webhooks" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadWebhooks()">새로고침</button>
+      <input class="tbl-filter" placeholder="필터…" oninput="filterTable('webhooks-out', this.value)">
       <span class="muted">webhook-events.jsonl · alert ingestion, redacted</span></div>
     <div id="webhooks-out"><p class="muted">연결 후 새로고침하세요.</p></div>
   </section>
@@ -703,6 +708,18 @@ let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
 let BANNER_INC = null, BANNER_WH = null, LAST_RUNTIME = {}, bannerTimer = null;
 // 가시성(#3): URL hash 딥링크 상태(#tab=…&process=…&id=…&session=…) — 공유/복원.
 let HASH = {};
+// 가시성(#4): 테이블별 클라이언트측 필터(이미 로드된 tail 대상 substring, 새 fetch 없음).
+let FILTERS = {};
+function filterTable(id, q) {
+  FILTERS[id] = q;
+  const el = document.getElementById(id); if (!el) return;
+  const needle = (q || "").toLowerCase();
+  el.querySelectorAll("tr").forEach(tr => {
+    if (tr.querySelector("th")) return;                 // 헤더 행은 항상 표시
+    tr.style.display = (!needle || tr.textContent.toLowerCase().includes(needle)) ? "" : "none";
+  });
+}
+function reapplyFilter(id) { if (FILTERS[id]) filterTable(id, FILTERS[id]); }
 
 function H() { return { "Authorization": "Bearer " + TOKEN }; }
 function setStatus(t, cls) {
@@ -1402,6 +1419,16 @@ function draw(canvasId, legendId, xs, series, opts) {
     ctx.save(); ctx.strokeStyle = "#6b7280"; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
     ctx.beginPath(); ctx.moveTo(cx, 8); ctx.lineTo(cx, h - 22); ctx.stroke(); ctx.restore();
   }
+  // x축 wall-clock 라벨(#4) — 좌/중/우 HH:MM. 라이브 차트가 "언제"인지 보이게 한다.
+  if (xmax > xmin) {
+    ctx.fillStyle = "#9aa1ab"; ctx.font = "10px ui-monospace, Menlo, monospace";
+    const hm = ms => { const d = new Date(ms); return d.getHours().toString().padStart(2, "0") + ":" + d.getMinutes().toString().padStart(2, "0"); };
+    [[0, "left"], [0.5, "center"], [1, "right"]].forEach(([f, al]) => {
+      const ts = xmin + (xmax - xmin) * f; ctx.textAlign = al;
+      ctx.fillText(hm(ts), Math.max(pad, Math.min(w - 6, X(ts))), h - 8);
+    });
+    ctx.textAlign = "left";
+  }
 }
 
 // ── snapshots / incidents ─────────────────────────────────
@@ -1417,7 +1444,7 @@ async function loadSnapshots() {
       h += '<tr class="clk" data-idx="' + idx + '"><td>' + esc(fmtTs(s.captured_at)) + "</td><td>" + esc(s.kind) +
         "</td><td>" + ((s.sections || []).length) + "</td><td>" + esc(s.host || "") + "</td><td>" + esc(s.cwd || "") + "</td></tr>";
     });
-    out.innerHTML = h + "</table>";
+    out.innerHTML = h + "</table>"; reapplyFilter(out.id);
     out.querySelectorAll("tr.clk").forEach(tr => tr.addEventListener("click", () => showSnapshot(+tr.dataset.idx)));
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
@@ -1553,7 +1580,7 @@ async function loadIncidents() {
     data.forEach(i => { h += '<tr><td><a href="#" data-id="' + esc(i.id) + '" class="rep">' + esc(i.id) +
       "</a></td><td>" + esc(i.title) + "</td><td>" + esc(i.status) + "</td><td>" + (+i.evidence_count||0) +
       "</td><td>" + esc(i.updated_at) + "</td></tr>"; });
-    out.innerHTML = h + "</table>";
+    out.innerHTML = h + "</table>"; reapplyFilter(out.id);
     out.querySelectorAll("a.rep").forEach(a => a.addEventListener("click", ev => { ev.preventDefault(); showReport(a.dataset.id); }));
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
@@ -1573,7 +1600,7 @@ async function loadAudit() {
     let h = "<table><tr><th>ts</th><th>kind</th><th>host</th><th>data</th></tr>";
     d.slice().reverse().forEach(r => { h += "<tr><td>" + esc(fmtTs(r.ts)) +
       "</td><td>" + esc(r.kind) + "</td><td>" + esc(r.host || "") + "</td><td>" + renderJsonTable(r.data) + "</td></tr>"; });
-    out.innerHTML = h + "</table>";
+    out.innerHTML = h + "</table>"; reapplyFilter(out.id);
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
 function jsonRows(value, prefix, out) {
@@ -1615,7 +1642,7 @@ async function loadHistory() {
         '</td><td><span class="badge ' + (bad ? "bad" : "ok") + '">' + (+r.exit_code || 0) + "</span></td><td><code>" +
         esc(r.command || "") + "</code></td></tr>";
     });
-    out.innerHTML = h + '</table><pre id="hist-out" style="display:none"></pre>';
+    out.innerHTML = h + '</table><pre id="hist-out" style="display:none"></pre>'; reapplyFilter(out.id);
     out.querySelectorAll("tr.clk").forEach(tr => tr.addEventListener("click", () => {
       const p = document.getElementById("hist-out"); p.style.display = "block";
       p.textContent = decodeURIComponent(tr.dataset.out) || "(빈 출력)";
@@ -1627,10 +1654,11 @@ async function loadWebhooks() {
   try {
     const d = await (await api("/web/webhooks")).json();
     if (!d.length) { out.innerHTML = '<p class="muted">webhook 이벤트 없음. aicd webhook opt-in([aicd.webhook] enabled=true).</p>'; return; }
-    let h = "<table><tr><th>ts</th><th>action</th><th>source</th><th>severity</th><th>alert</th></tr>";
+    let h = "<table><tr><th>ts</th><th>action</th><th>source</th><th>severity</th><th>alert</th><th>fingerprint</th></tr>";
     d.slice().reverse().forEach(e => { h += "<tr><td>" + esc(fmtTs(e.ts)) + "</td><td>" + esc(e.action || "") +
-      "</td><td>" + esc(e.source || "") + "</td><td>" + esc(e.severity || "") + "</td><td>" + esc(e.alert || "") + "</td></tr>"; });
-    out.innerHTML = h + "</table>";
+      "</td><td>" + esc(e.source || "") + "</td><td>" + esc(e.severity || "") + "</td><td>" + esc(e.alert || "") +
+      "</td><td class='muted'>" + esc(e.fingerprint || "") + "</td></tr>"; });
+    out.innerHTML = h + "</table>"; reapplyFilter(out.id);
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
 async function loadConfig() {

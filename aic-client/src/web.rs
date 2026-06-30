@@ -2068,6 +2068,7 @@ async fn webhooks() -> Json<Vec<Value>> {
                 "source": red(e, "source"),
                 "alert": red(e, "alert"),
                 "severity": e.get("severity"),
+                "fingerprint": red(e, "fingerprint"),
             })
         })
         .collect();
