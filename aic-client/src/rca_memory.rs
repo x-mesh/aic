@@ -14,11 +14,19 @@ use serde_json::{json, Value};
 use crate::agent::mcp::McpClient;
 use crate::rca::IncidentMeta;
 
+/// event 키를 정규화한다 — 대소문자/공백 차이로 같은 증상이 다른 키가 되어 매칭을 놓치지 않게.
+/// 보수적으로만(소문자화 + 연속 공백을 단일 공백으로 + trim) — 숫자/에러코드(5xx 등)는 의미가 있어 보존한다.
+/// record와 match가 같은 정규화를 거치므로 양쪽 키가 일치한다.
+fn normalize_event(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
 /// aic RCA incident → sre-agent incident-memory 키 `(sensor, event, severity)`.
-/// sensor는 출처를 나타내는 상수 `aic-rca`, event는 증상(없으면 제목), severity는 라벨(없으면 `unknown`).
+/// sensor는 출처를 나타내는 상수 `aic-rca`, event는 정규화한 증상(없으면 제목), severity는 라벨(없으면 `unknown`).
 pub fn sre_keys(meta: &IncidentMeta) -> (String, String, String) {
     let sensor = "aic-rca".to_string();
-    let event = meta.symptom.clone().unwrap_or_else(|| meta.title.clone());
+    let raw_event = meta.symptom.clone().unwrap_or_else(|| meta.title.clone());
+    let event = normalize_event(&raw_event);
     let severity = meta
         .severity
         .map(|s| s.as_label().to_string())
@@ -100,5 +108,16 @@ mod tests {
         let (_, event, severity) = sre_keys(&meta(None, None));
         assert_eq!(event, "checkout 5xx spike"); // symptom 없으면 title
         assert_eq!(severity, "unknown"); // severity 없으면 unknown
+    }
+
+    #[test]
+    fn event_is_normalized_case_and_whitespace() {
+        // 대소문자/연속 공백/개행이 달라도 같은 키로 정규화 → record와 match가 일치.
+        let a = sre_keys(&meta(Some("Redis  OOM\tkill"), None)).1;
+        let b = sre_keys(&meta(Some("redis oom kill"), None)).1;
+        assert_eq!(a, "redis oom kill");
+        assert_eq!(a, b);
+        // 숫자/에러코드는 의미가 있어 보존한다.
+        assert_eq!(sre_keys(&meta(Some("HTTP 5xx Spike"), None)).1, "http 5xx spike");
     }
 }
