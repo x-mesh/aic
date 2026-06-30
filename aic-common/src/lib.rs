@@ -255,6 +255,18 @@ pub struct AppConfig {
     /// MCP 서버 설정 — 등록 서버의 tool을 chat에 노출한다. 레거시 호환 default(미설정 시 서버 없음).
     #[serde(default)]
     pub mcp: McpConfig,
+    /// RCA 워크플로 설정. 레거시 호환 default — 미설정 시 모든 기능 opt-in 유지.
+    #[serde(default)]
+    pub rca: RcaConfig,
+}
+
+/// RCA 워크플로 설정 (SRE).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RcaConfig {
+    /// `aic rca close` 시 `--remember` 없이도 sre-agent incident-memory에 자동 기록한다(best-effort handoff).
+    /// 기본 false — incident-memory 배선은 명시적 opt-in을 유지한다.
+    #[serde(default)]
+    pub auto_remember: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

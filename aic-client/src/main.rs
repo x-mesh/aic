@@ -5261,6 +5261,7 @@ fn default_config() -> AppConfig {
         observability: aic_common::ObservabilityConfig::default(),
         aicd: aic_common::AicdConfig::default(),
         mcp: aic_common::McpConfig::default(),
+        rca: aic_common::RcaConfig::default(),
     }
 }
 
@@ -7184,22 +7185,32 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
             remember,
             json,
         } => {
+            // config는 한 번만 로드(실패해도 close는 진행). --remember 또는 [rca] auto_remember면 기록.
+            let config = ConfigManager::load().ok();
+            let do_remember =
+                remember || config.as_ref().is_some_and(|c| c.rca.auto_remember);
             // record 전에 resolve(전이가 id를 move하므로). transition은 그대로 수행하고,
             // 기록은 best-effort 핸드오프 — 실패해도 close 자체는 완료된 상태.
-            let resolved = remember
+            let resolved = do_remember
                 .then(|| aic_client::rca::resolve_id(id.as_deref()))
                 .transpose()?;
             rca_transition(id, aic_client::rca::IncidentStatus::Closed, note, json)?;
             if let Some(resolved) = resolved {
                 let meta = aic_client::rca::load_meta(&resolved)?;
-                let config = ConfigManager::load()?;
-                match aic_client::rca_memory::record_incident(&config.mcp, &meta).await {
-                    Some(_) => {
-                        println!("{COL_GREEN}✔{COL_RESET} sre-agent incident-memory에 기록(handoff)")
+                match config {
+                    Some(config) => {
+                        match aic_client::rca_memory::record_incident(&config.mcp, &meta).await {
+                            Some(_) => println!(
+                                "{COL_GREEN}✔{COL_RESET} sre-agent incident-memory에 기록(handoff)"
+                            ),
+                            None => eprintln!(
+                                "sre-agent incident-memory 미구성([mcp] sre-agent) 또는 record_incident 없음 — 기록 건너뜀(close는 완료)"
+                            ),
+                        }
                     }
-                    None => eprintln!(
-                        "sre-agent incident-memory 미구성([mcp] sre-agent) 또는 record_incident 없음 — 기록 건너뜀(close는 완료)"
-                    ),
+                    None => {
+                        eprintln!("config 로드 실패 — 기록 건너뜀(close는 완료)")
+                    }
                 }
             }
         }
