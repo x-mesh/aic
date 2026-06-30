@@ -2122,6 +2122,7 @@ async fn incidents() -> Result<Json<Vec<Value>>, (StatusCode, &'static str)> {
                 "id": i.id,
                 "title": redaction::redact(&i.title).0,
                 "status": i.status,
+                "severity": i.severity,
                 "symptom": i.symptom.map(|s| redaction::redact(&s).0),
                 "cwd": i.cwd.map(|s| redaction::redact(&s).0),
                 "created_at": i.created_at,
