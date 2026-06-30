@@ -263,6 +263,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/snapshots", get(snapshots))
         .route("/web/incidents", get(incidents))
         .route("/web/incidents/{id}/report", get(incident_report))
+        .route("/web/incidents/{id}/similar", get(incident_similar))
         .route("/web/audit", get(audit_log))
         .route("/web/history", get(history))
         .route("/web/chat", get(chat_observability))
@@ -2203,6 +2204,24 @@ async fn incident_report(Path(id): Path<String>) -> Result<Response, (StatusCode
     let report = rca::render_report(&meta, &events, &hypotheses);
     let (redacted, _) = redaction::redact(&report);
     Ok(([(CONTENT_TYPE, "text/markdown; charset=utf-8")], redacted).into_response())
+}
+
+/// incident 패턴으로 sre-agent incident-memory에서 유사 과거 incident를 찾는다(읽기 전용 pull).
+/// [mcp] sre-agent 미구성/tool 부재면 `available:false` — 대시보드는 "연결 안 됨"으로 표시한다.
+/// MCP 응답은 McpClient가 redact+cap해서 돌려준다. 로컬 상태를 바꾸지 않는 pull이라 read-only 경계 안.
+async fn incident_similar(
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, &'static str)> {
+    if !is_safe_incident_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid incident id\n"));
+    }
+    let meta = rca::load_meta(&id).map_err(internal)?;
+    let cfg = ConfigManager::load().map_err(internal)?;
+    let matches = crate::rca_memory::match_incidents(&cfg.mcp, &meta, 5).await;
+    Ok(Json(json!({
+        "available": matches.is_some(),
+        "text": matches,
+    })))
 }
 
 /// 등록된 관측 백엔드 이름(타입별). 외부 metrics/logs 탭 활성화 판단 + 드롭다운용. 없으면 빈 목록.
