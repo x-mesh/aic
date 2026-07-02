@@ -36,7 +36,10 @@ use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
 
-use super::sys_sampler::{spawn_sampler, AlertKind, AlertTracker, Severity, SysMetrics, SysSampler};
+use super::sys_sampler::{
+    spawn_sampler, AlertKind, AlertTracker, NoiseGate, Severity, SysMetrics, SysSampler,
+};
+use super::webhook_watch::{spawn_webhook_watcher, WebhookAlert};
 
 /// 한 입력의 결과(reedline `ReadLine` 대응).
 pub(crate) enum ChatLine {
@@ -264,7 +267,10 @@ fn install_signal_handler() {
         // SAFETY: 핸들러는 async-signal-safe한 write/signal/raise만 호출하고 힙 할당을 하지 않는다.
         unsafe {
             for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
-                libc::signal(sig, restore_terminal_on_signal as *const () as libc::sighandler_t);
+                libc::signal(
+                    sig,
+                    restore_terminal_on_signal as *const () as libc::sighandler_t,
+                );
             }
         }
     });
@@ -1068,10 +1074,31 @@ fn format_alert_line(kind: AlertKind, message: &str, hms: &str) -> String {
     format!("{ts} {body}")
 }
 
+/// C1: webhook alert 유입 줄을 `[HH:MM:SS] 🔔 webhook <SEV>: <alert> (<fingerprint>)`로 렌더한다.
+/// critical severity 본문은 빨강, 그 외는 주황으로 자원 alert와 시각적으로 구분한다. `hms`는 주입(테스트
+/// 결정성). 순수 함수. 자유 텍스트는 aicd가 저장 시 이미 다뤄진 값이며 여기선 표시만 한다.
+fn format_webhook_alert_line(a: &WebhookAlert, hms: &str) -> String {
+    let ts = super::ui::paint(&format!("[{hms}]"), "2");
+    let sev = a.severity.as_deref().unwrap_or("alert");
+    let alert = a.alert.as_deref().unwrap_or("(unnamed)");
+    let fp = if a.fingerprint.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", a.fingerprint)
+    };
+    let msg = format!("🔔 webhook {sev}: {alert}{fp}");
+    let body = super::ui::paint(&msg, if a.is_critical() { "31" } else { "33" });
+    format!("{ts} {body}")
+}
+
 /// 시스템 지표 세그먼트를 단계별 색(정상 dim/warn 주황/crit 빨강)으로 칠한 status bar 한 줄을 만든다.
 /// 구분선(` · `)·선두 `· `·ctx 접미는 dim. `recording`이면 선두에 빨강 `● REC`를 붙여 자동 기록 활성을
 /// 한눈에 보인다. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
-fn build_status_line(segs: &[(String, Severity)], ctx_tokens: usize, recording: bool) -> Line<'static> {
+fn build_status_line(
+    segs: &[(String, Severity)],
+    ctx_tokens: usize,
+    recording: bool,
+) -> Line<'static> {
     let dim = sev_style(Severity::Normal);
     let mut spans: Vec<Span<'static>> = vec![Span::styled("· ", dim)];
     let mut first = true;
@@ -1356,13 +1383,20 @@ async fn chat_loop(
     // edge-triggered alert 트래커(C1). Some=무장(악화 전이 시 ambient Note+bell). statusbar가 켜졌을
     // 때만 무장한다. 추후 C7의 `/watch off`가 이를 None으로 돌려 alert lane을 끌 수 있다.
     let mut alert_tracker = with_statusbar.then(AlertTracker::new);
+    // C1: webhook alert의 chat 유입 — 세션 스코프 파일 tail. baseline=시작 시점 EOF라 과거 alert는 무시.
+    // 주입은 alert lane과 같은 arm 상태(alert_tracker.is_some(), `/watch`로 토글)를 따른다.
+    let (webhook_rx0, webhook_task) = spawn_webhook_watcher();
+    let mut webhook_rx = Some(webhook_rx0);
+    // D5: webhook 유입 소음 억제 — 동일 fingerprint는 5분 창에서 1회만 알린다(폭주 방어).
+    let mut webhook_gate = NoiseGate::new(Duration::from_secs(300));
     // 이상-트리거 스냅샷 캡처(L1) cooldown 상태. alert_tracker와 수명 공유(세션-로컬).
     let mut last_capture: Option<Instant> = None;
     // Crit auto-RCA(L3) cooldown 상태. 별도 한도(AUTO_RCA_COOLDOWN)로 인시던트 양산 방지.
     let mut last_auto_rca: Option<Instant> = None;
     // 세션 자동 기록(`/record on`)의 주기 캡처 상태. 알림과 무관하게 일정 간격으로 baseline 스냅샷을 남긴다.
     let mut last_record_capture: Option<Instant> = None;
-    let mut status = String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
+    let mut status =
+        String::from("· 드래그=선택 복사 · Ctrl+Y 전체 복사 · Ctrl+T 마우스 · (metrics…)");
     // 임계 단계 컬러링용 지표 세그먼트(없으면 위 help 텍스트를 plain dim으로). 첫 sample 후 Some.
     let mut status_segs: Option<Vec<(String, Severity)>> = None;
     let mut spin: Option<SpinState> = None;
@@ -1915,6 +1949,39 @@ async fn chat_loop(
                     }
                 }
             }
+            // C1: webhook alert 유입 arm. armed(=/watch on)일 때만 ambient Note로 로그에 push한다.
+            // Note는 표시 전용 — LLM 컨텍스트에 안 들어가고 turn을 시작하지 않는다(§C1, 자원 alert와 동일).
+            wa = async {
+                match webhook_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match wa {
+                    Some(a) => {
+                        // arm 상태 + NoiseGate(D5, fingerprint) 통과 시에만 알린다. 그 외엔 화면 변화 없음.
+                        if alert_tracker.is_some()
+                            && webhook_gate.allow(&a.dedup_key(), Instant::now())
+                        {
+                            let hms = chrono::Local::now().format("%H:%M:%S").to_string();
+                            let line = format_webhook_alert_line(&a, &hms);
+                            append_to_log(&mut log, &mut log_text, &mut scroll, follow, &line);
+                            // critical만 BEL 1회(화면을 안 봐도 들린다). 그 외는 조용한 ambient 줄.
+                            if a.is_critical() {
+                                ring_bell();
+                            }
+                            if hangul.is_composing() {
+                                should_draw = false;
+                            }
+                        } else {
+                            should_draw = false;
+                        }
+                    }
+                    None => {
+                        webhook_rx = None; // watcher task 종료 → 폴링 중단(hot loop 방지)
+                    }
+                }
+            }
             msg = out_rx.recv() => {
                 match msg {
                     Some(OutMsg::AnswerChunk(delta)) => {
@@ -1996,6 +2063,8 @@ async fn chat_loop(
     if let Some(handle) = sampler_task {
         handle.abort();
     }
+    // C1: webhook watcher task도 즉시 정리(세션 종료 = tail 중단).
+    webhook_task.abort();
     // 마우스 캡처 해제 + alternate screen 떠나고 raw mode 복원(원래 화면 복귀).
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -2231,11 +2300,18 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(20, 2);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| {
-            f.render_widget(Paragraph::new(t.clone()).wrap(Wrap { trim: false }), f.area());
+            f.render_widget(
+                Paragraph::new(t.clone()).wrap(Wrap { trim: false }),
+                f.area(),
+            );
         })
         .unwrap();
         let buf = term.backend().buffer();
-        for (x, y, what) in [(0u16, 0u16, "blue 첫 글자"), (5, 0, "tail"), (0, 1, "plain")] {
+        for (x, y, what) in [
+            (0u16, 0u16, "blue 첫 글자"),
+            (5, 0, "tail"),
+            (0, 1, "plain"),
+        ] {
             assert!(
                 buf[(x, y)].modifier.contains(Modifier::REVERSED),
                 "{what} 셀에 REVERSED 없음: {:?}",
@@ -2319,8 +2395,21 @@ mod tests {
         let log = Text::from("L0\nL1\nL2");
         let ta = super::textarea_with("hi");
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, super::Line::from("· load"), &ta, "you ❯ ", &[], 0, None, None))
-            .unwrap();
+        term.draw(|f| {
+            super::draw_full(
+                f,
+                &log,
+                0,
+                super::Line::from("· load"),
+                &ta,
+                "you ❯ ",
+                &[],
+                0,
+                None,
+                None,
+            )
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
         // 로그(3줄)는 영역(8-3=5줄)보다 짧아 하단 정렬 → L2가 로그 영역 맨 아래(row 4).
@@ -2471,7 +2560,10 @@ mod tests {
         let onset =
             super::format_alert_line(AlertKind::Onset, "⚠ load 13.98 경고(warn)", "14:05:09");
         assert!(onset.contains("[14:05:09]"), "시각 누락: {onset}");
-        assert!(onset.contains("⚠ load 13.98 경고(warn)"), "본문 누락: {onset}");
+        assert!(
+            onset.contains("⚠ load 13.98 경고(warn)"),
+            "본문 누락: {onset}"
+        );
         assert!(
             onset.find("14:05:09").unwrap() < onset.find("load").unwrap(),
             "시각이 본문보다 앞이어야: {onset}"
@@ -2480,6 +2572,30 @@ mod tests {
         let rec =
             super::format_alert_line(AlertKind::Recovered, "✓ load 11.33 정상 회복", "14:06:00");
         assert!(rec.contains("[14:06:00]") && rec.contains("✓ load 11.33 정상 회복"));
+    }
+
+    #[test]
+    fn webhook_alert_line_shows_severity_alert_and_fingerprint() {
+        let a = WebhookAlert {
+            action: "received".into(),
+            severity: Some("critical".into()),
+            alert: Some("redis oom".into()),
+            fingerprint: "fp-a".into(),
+        };
+        let line = super::format_webhook_alert_line(&a, "14:05:09");
+        assert!(line.contains("[14:05:09]"));
+        assert!(line.contains("🔔 webhook critical: redis oom"));
+        assert!(line.contains("(fp-a)"));
+        // fingerprint 없으면 괄호 생략, alert 없으면 (unnamed).
+        let bare = WebhookAlert {
+            action: "diagnosing".into(),
+            severity: None,
+            alert: None,
+            fingerprint: String::new(),
+        };
+        let line2 = super::format_webhook_alert_line(&bare, "00:00:00");
+        assert!(line2.contains("webhook alert: (unnamed)"));
+        assert!(!line2.contains("()"));
     }
 
     #[test]
@@ -2499,7 +2615,10 @@ mod tests {
         // recording=true면 선두에 ● REC.
         let rec = super::build_status_line(&segs, 0, true);
         let rtext: String = rec.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(rtext.contains("● REC"), "recording=true면 REC 표시: {rtext}");
+        assert!(
+            rtext.contains("● REC"),
+            "recording=true면 REC 표시: {rtext}"
+        );
         // 위반 세그먼트가 정확한 색을 들고 있다: warn=주황, crit=빨강, 정상=색 없음(dim).
         let span = |needle: &str| {
             line.spans
@@ -2508,7 +2627,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("span 없음: {needle}"))
                 .style
         };
-        assert_eq!(span("cpu 88%").fg, Some(ratatui::style::Color::Rgb(255, 165, 0)));
+        assert_eq!(
+            span("cpu 88%").fg,
+            Some(ratatui::style::Color::Rgb(255, 165, 0))
+        );
         assert_eq!(span("mem 99%").fg, Some(ratatui::style::Color::Red));
         assert_eq!(span("load 1.0").fg, None); // 정상은 색 미지정(dim modifier만)
     }
@@ -2544,8 +2666,21 @@ mod tests {
         let bar = super::search_bar("found", 0, 1);
         let ta = super::textarea_with(&bar);
         let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
-        term.draw(|f| super::draw_full(f, &log, 0, super::Line::from("· load"), &ta, "", &[], 0, None, None))
-            .unwrap();
+        term.draw(|f| {
+            super::draw_full(
+                f,
+                &log,
+                0,
+                super::Line::from("· load"),
+                &ta,
+                "",
+                &[],
+                0,
+                None,
+                None,
+            )
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let row = |y: u16| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
         assert!(
@@ -2564,7 +2699,18 @@ mod tests {
         let status = super::status_with_ctx("· load", 12_000);
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
         term.draw(|f| {
-            super::draw_full(f, &log, 0, super::Line::from(status.clone()), &ta, "you ❯ ", &[], 0, None, None)
+            super::draw_full(
+                f,
+                &log,
+                0,
+                super::Line::from(status.clone()),
+                &ta,
+                "you ❯ ",
+                &[],
+                0,
+                None,
+                None,
+            )
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -2578,7 +2724,10 @@ mod tests {
         use super::Severity::{Crit, Normal};
         let log = Text::from("x");
         let ta = super::textarea_with("hi");
-        let segs = vec![("load 1.0".to_string(), Normal), ("mem 99%".to_string(), Crit)];
+        let segs = vec![
+            ("load 1.0".to_string(), Normal),
+            ("mem 99%".to_string(), Crit),
+        ];
         let status = super::build_status_line(&segs, 0, false);
         let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
         term.draw(|f| super::draw_full(f, &log, 0, status, &ta, "you ❯ ", &[], 0, None, None))
