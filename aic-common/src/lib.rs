@@ -306,6 +306,9 @@ pub struct AppConfig {
     /// RCA 워크플로 설정. 레거시 호환 default — 미설정 시 모든 기능 opt-in 유지.
     #[serde(default)]
     pub rca: RcaConfig,
+    /// 외부 전송(팀 공유) 설정 (Phase 2 O3). 레거시 호환 default — 미설정 시 등록 목적지 없음.
+    #[serde(default)]
+    pub outbound: OutboundConfig,
 }
 
 /// RCA 워크플로 설정 (SRE).
@@ -315,6 +318,30 @@ pub struct RcaConfig {
     /// 기본 false — incident-memory 배선은 명시적 opt-in을 유지한다.
     #[serde(default)]
     pub auto_remember: bool,
+}
+
+/// 외부 전송 설정 (Phase 2 O3). 목적지 이름 → 설정. 미설정 시 빈 맵(전송 불가 — deny-by-default).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OutboundConfig {
+    /// 전송 목적지들(`[outbound.targets.<name>]`). 이름이 곧 allowlist 키다.
+    #[serde(default)]
+    pub targets: HashMap<String, OutboundTarget>,
+}
+
+/// 한 전송 목적지. `kind`로 어댑터를 고른다("file" | "webhook"). webhook은 `enabled=true`여야 실제 전송.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutboundTarget {
+    /// "file"(로컬 디렉터리 기록, 기본 활성) 또는 "webhook"(HTTP POST, 기본 비활성).
+    pub kind: String,
+    /// webhook 목적지의 활성 여부. 기본 false — 명시적으로 켜야 전송(file은 항상 활성).
+    #[serde(default)]
+    pub enabled: bool,
+    /// file 목적지의 기록 디렉터리(없으면 `~/.aic/outbound`).
+    #[serde(default)]
+    pub dir: Option<PathBuf>,
+    /// webhook 목적지의 POST URL(http/https).
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -699,6 +726,7 @@ mod tests {
             aicd: AicdConfig::default(),
             mcp: McpConfig::default(),
             rca: RcaConfig::default(),
+            outbound: OutboundConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
