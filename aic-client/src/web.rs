@@ -279,6 +279,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/process/{pid}", get(process_detail))
         .route("/web/process/{pid}/sample", get(process_stack_sample))
         .route("/web/snapshots", get(snapshots))
+        .route("/web/snapshots/compare", get(snapshots_compare))
         .route("/web/summary", get(summary))
         .route("/web/incidents", get(incidents))
         .route("/web/incidents/{id}", get(incident_detail))
@@ -1610,6 +1611,34 @@ async fn snapshots() -> Result<Json<Vec<snapshot_store::SnapshotRecord>>, (Statu
 {
     let snaps = snapshot_store::load_snapshots().map_err(internal)?;
     Ok(Json(snaps))
+}
+
+/// (D-time) 최신 스냅샷을 이전(또는 `?ago=<초>` 시점) 스냅샷과 비교한 리포트를 반환한다 — "변화점=용의자".
+/// body는 이미 redacted 스냅샷이고 compare는 chat `/compare`와 동일 로직. 스냅샷 2개 미만이면 available:false.
+async fn snapshots_compare(
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, &'static str)> {
+    let all = snapshot_store::load_snapshots().map_err(internal)?;
+    if all.len() < 2 {
+        return Ok(Json(
+            json!({ "available": false, "status": "비교할 스냅샷이 부족합니다(2개 이상 필요)." }),
+        ));
+    }
+    let new = all.last().unwrap();
+    let old_idx = match q.get("ago").and_then(|s| s.parse::<i64>().ok()) {
+        Some(secs) => {
+            let target = new.captured_at - chrono::Duration::seconds(secs);
+            snapshot_store::index_at_or_before(&all, target).unwrap_or(0)
+        }
+        None => all.len() - 2,
+    };
+    let old = &all[old_idx];
+    Ok(Json(json!({
+        "available": true,
+        "old_at": old.captured_at,
+        "new_at": new.captured_at,
+        "report": snapshot_store::compare(&old.body, &new.body),
+    })))
 }
 
 /// aicd 감사 로그(`~/.local/state/aic/audit.log`) tail. 저장은 평문(보안 원본 보존)이므로 노출 직전

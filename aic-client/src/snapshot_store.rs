@@ -203,6 +203,30 @@ pub fn load_snapshots() -> anyhow::Result<Vec<SnapshotRecord>> {
     Ok(out)
 }
 
+/// (D-time) 두 스냅샷 body의 변화를 사람이 읽는 리포트로 만든다 — chat `/compare`와 **동일 로직**을
+/// 재사용한다(volatile 메타 정규화 + 섹션별 추가/삭제/변경 + 라인 diff). `aic snapshot compare`와 web
+/// Snapshots diff 뷰가 공유한다. body는 이미 redacted 스냅샷 텍스트다.
+pub fn compare(old_body: &str, new_body: &str) -> String {
+    crate::agent::tool_record::compare_report(old_body, new_body)
+}
+
+/// (D-time) `records`(captured_at 오름차순)에서 `newest` 이전이며 `target` 시각 이하인 **가장 최근**
+/// 스냅샷 인덱스를 고른다(= "N분 전"에 가장 가까운 과거). 해당하는 게 없으면 가장 오래된 것(0). records가
+/// 2개 미만이면 None. pure — 단위 테스트 대상.
+pub fn index_at_or_before(records: &[SnapshotRecord], target: DateTime<Utc>) -> Option<usize> {
+    if records.len() < 2 {
+        return None;
+    }
+    let newest = records.len() - 1;
+    // newest 제외하고 뒤에서부터 target 이하 첫 매칭.
+    for i in (0..newest).rev() {
+        if records[i].captured_at <= target {
+            return Some(i);
+        }
+    }
+    Some(0) // target보다 이른 게 없으면 가장 오래된 스냅샷과 비교
+}
+
 /// 라인 수가 `MAX_SNAPSHOTS`를 넘으면 마지막 N개만 남기고 atomic(tmp+rename) 재작성한다(append-only JSONL은
 /// 제자리 trim 불가). 경계 내면 무동작.
 fn trim_to_max(path: &Path) -> anyhow::Result<()> {
@@ -225,7 +249,10 @@ fn trim_to_max(path: &Path) -> anyhow::Result<()> {
     let tmp = path.with_extension("jsonl.tmp");
     {
         let mut f = open_secure(
-            fs::OpenOptions::new().create(true).write(true).truncate(true),
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true),
             &tmp,
         )?;
         for l in keep {
@@ -307,9 +334,47 @@ mod tests {
     }
 
     #[test]
+    fn index_at_or_before_picks_closest_past() {
+        // captured_at: 0s, 10s, 20s, 30s(newest). 15s 전 target(=30-15=15s 시점) → 10s(idx1)이 최근 과거.
+        let recs = vec![
+            rec("a", "## x\n1\n", 0),
+            rec("b", "## x\n2\n", 10),
+            rec("c", "## x\n3\n", 20),
+            rec("d", "## x\n4\n", 30),
+        ];
+        let newest = recs.last().unwrap().captured_at;
+        assert_eq!(
+            index_at_or_before(&recs, newest - chrono::Duration::seconds(15)),
+            Some(1)
+        );
+        // 아주 먼 과거 target → 가장 오래된 것(0).
+        assert_eq!(
+            index_at_or_before(&recs, newest - chrono::Duration::seconds(9999)),
+            Some(0)
+        );
+        // 2개 미만 → None.
+        assert_eq!(index_at_or_before(&recs[..1], newest), None);
+    }
+
+    #[test]
+    fn compare_surfaces_changed_section() {
+        let old = "## disk\n/dev/sda1 80% /\n## ports\n:22\n";
+        let new = "## disk\n/dev/sda1 95% /\n## ports\n:22\n";
+        let report = compare(old, new);
+        assert!(report.contains("disk"), "변경 섹션에 disk: {report}");
+        // 동일 입력은 변화 없음.
+        assert!(compare(old, old).contains("변화 없음"));
+    }
+
+    #[test]
     fn append_load_roundtrip_and_sections() {
         let _h = HomeGuard::set();
-        append_snapshot(&rec("local", "## host\nmyhost\n## disk\n/dev/sda1 90% /\n", 0)).unwrap();
+        append_snapshot(&rec(
+            "local",
+            "## host\nmyhost\n## disk\n/dev/sda1 90% /\n",
+            0,
+        ))
+        .unwrap();
         let loaded = load_snapshots().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].kind, "local");
@@ -395,7 +460,10 @@ mod tests {
         let loaded = load_snapshots().unwrap();
         // .lock은 snapshots.jsonl만 읽는 load에 절대 섞이지 않는다 — 레코드는 정확히 2건.
         assert_eq!(loaded.len(), 2, "lockfile이 데이터에 섞였거나 append 유실");
-        assert_eq!(loaded.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(
+            loaded.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
     }
 
     #[cfg(unix)]
@@ -534,7 +602,12 @@ mod tests {
             append_snapshot(&rec("k", "## x\nv\n", i)).unwrap();
         }
         let loaded = load_snapshots().unwrap();
-        assert_eq!(loaded.len(), MAX_SNAPSHOTS, "유효 레코드만 MAX개여야: {}", loaded.len());
+        assert_eq!(
+            loaded.len(),
+            MAX_SNAPSHOTS,
+            "유효 레코드만 MAX개여야: {}",
+            loaded.len()
+        );
         assert_eq!(
             loaded.first().unwrap().captured_at,
             DateTime::from_timestamp(1_700_000_000 + 5, 0).unwrap()
@@ -555,8 +628,15 @@ mod tests {
         );
         append_snapshot(&r).unwrap();
         let l = &load_snapshots().unwrap()[0];
-        assert!(!l.cwd.as_ref().unwrap().contains("10.0.0.9"), "cwd 미마스킹: {:?}", l.cwd);
-        assert!(!l.host.as_ref().unwrap().contains("10.0.0.9"), "host 미마스킹: {:?}", l.host);
+        assert!(
+            !l.cwd.as_ref().unwrap().contains("10.0.0.9"),
+            "cwd 미마스킹: {:?}",
+            l.cwd
+        );
+        assert!(
+            !l.host.as_ref().unwrap().contains("10.0.0.9"),
+            "host 미마스킹: {:?}",
+            l.host
+        );
     }
 }
-
