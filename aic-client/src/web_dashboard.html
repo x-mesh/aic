@@ -85,6 +85,7 @@
   .banner-seg.click:hover { border-color: var(--accent, var(--line)); }
   .banner-seg.crit { border-color: #e5484d; color: #e5484d; }
   .banner-seg.warn { border-color: #f5a623; color: #b5740a; }
+  .banner-seg.ok { border-color: #2ea043; color: #2ea043; }
   .banner-label { color: var(--subtle); }
   .tbl-filter { padding: 3px 8px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--canvas); color: var(--text); font-size: 12px; width: 160px; }
   .snap-diff-head { margin: 0 0 8px; padding: 5px 10px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--canvas); font-size: 12px; color: var(--muted); }
@@ -659,6 +660,7 @@
       <input class="tbl-filter" placeholder="필터…" oninput="filterTable('incidents-out', this.value)">
       <span class="muted">~/.aic/incidents/ · RCA</span></div>
     <div id="incidents-out"><p class="muted">연결 후 새로고침하세요.</p></div>
+    <div id="incident-detail" style="display:none; margin-top:10px"></div>
     <pre id="report-out" style="display:none"></pre>
     <div id="similar-box" style="display:none; margin-top:10px">
       <button type="button" onclick="loadSimilar()">유사 과거 incident 찾기 (sre-agent)</button>
@@ -682,6 +684,7 @@
 
   <section id="webhooks" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadWebhooks()">새로고침</button>
+      <label class="muted"><input type="checkbox" id="wh-group" onchange="loadWebhooks()"> fingerprint별 그룹</label>
       <input class="tbl-filter" placeholder="필터…" oninput="filterTable('webhooks-out', this.value)">
       <span class="muted">webhook-events.jsonl · alert ingestion, redacted</span></div>
     <div id="webhooks-out"><p class="muted">연결 후 새로고침하세요.</p></div>
@@ -727,7 +730,7 @@ let TOKEN = "", timer = null, lastPoints = [], SNAPS = [], CHAT = null;
 // 가시성(#1): 차트 zoom 윈도(분), crosshair 상태, 현재 렌더 중인 포인트/xs.
 let ZOOM_MIN = 10, CROSS = null, RENDER = { pts: [], xs: [] };
 // 가시성(#2): incident-now 배너 — 느리게 갱신하는 incidents/webhooks 캐시 + 최신 runtime.
-let BANNER_INC = null, BANNER_WH = null, LAST_RUNTIME = {}, bannerTimer = null;
+let BANNER_INC = null, BANNER_WH = null, BANNER_SUMMARY = null, LAST_RUNTIME = {}, bannerTimer = null;
 // 가시성(#3): URL hash 딥링크 상태(#tab=…&process=…&id=…&session=…) — 공유/복원.
 let HASH = {};
 // 가시성(후속A): External 쿼리 anchor — chart moment에서 넘어온 시점(ms). set이면 그 시점 중심으로 조회.
@@ -1353,8 +1356,8 @@ function setZoom(m) {
 // 느리게 변하는 incidents/webhooks는 캐시(12s), 자원 crit/warn·aicd·audit는 매 poll의 live 데이터로 합친다.
 async function fetchBannerData() {
   if (!TOKEN) return;
-  try { BANNER_INC = await (await api("/web/incidents")).json(); } catch (e) {}
-  try { BANNER_WH = await (await api("/web/webhooks")).json(); } catch (e) {}
+  // W2: 단일 /web/summary 로 open incident·최근 alert·소스 신선도를 한 번에(프런트 waterfall 제거).
+  try { BANNER_SUMMARY = await (await api("/web/summary")).json(); } catch (e) { BANNER_SUMMARY = null; }
   updateBanner();
 }
 function gotoTab(panel) { const b = document.querySelector('.tab[data-panel="' + panel + '"]'); if (b) b.click(); }
@@ -1385,21 +1388,28 @@ function updateBanner() {
     segs.push(bannerSeg("자원", st.crit || st.warn ? st.crit + " crit / " + st.warn + " warn" : "정상",
       st.crit ? "crit" : st.warn ? "warn" : "", "resources"));
   }
-  if (Array.isArray(BANNER_INC)) {
-    const open = BANNER_INC.filter(i => i.status !== "closed");
-    const worst = open.map(i => i.severity).filter(Boolean).sort()[0];
-    segs.push(bannerSeg("incidents", open.length + " open" + (worst ? " (" + worst.toUpperCase() + ")" : ""),
-      worst === "sev1" || worst === "sev2" ? "crit" : open.length ? "warn" : "", "incidents"));
+  const sm = BANNER_SUMMARY || {};
+  const openN = sm.open_incidents || 0;
+  const inc = sm.latest_incident;
+  const worst = (inc && openN && inc.status !== "closed") ? inc.severity : null;
+  if (sm.open_incidents != null) {
+    segs.push(bannerSeg("incidents", openN + " open" + (worst ? " (" + String(worst).toUpperCase() + ")" : ""),
+      worst === "sev1" || worst === "sev2" ? "crit" : openN ? "warn" : "", "incidents"));
   }
-  if (Array.isArray(BANNER_WH) && BANNER_WH.length) {
-    const w = BANNER_WH[BANNER_WH.length - 1];
-    const sevTxt = (w.severity || "alert");
-    segs.push(bannerSeg("webhook", sevTxt + " · " + bannerAge(w.ts),
-      String(sevTxt).toLowerCase().includes("crit") ? "crit" : "warn", "webhooks"));
+  if (sm.recent_alerts_1h) {
+    segs.push(bannerSeg("webhook", sm.recent_alerts_1h + " · 1h", "warn", "webhooks"));
   }
+  // D3: 데이터 신선도 — 수집이 조용해진 소스를 crit로 표시(수집 실패가 "정상"으로 위장되는 것 방지).
+  (sm.sources || []).forEach(s => {
+    if (s.present && s.stale) segs.push(bannerSeg(s.name, "stale " + (s.age_secs != null ? s.age_secs + "s" : ""), "crit", null));
+  });
   const rt = LAST_RUNTIME || {};
   if (rt.aicd) segs.push(bannerSeg("aicd", rt.aicd.status || (rt.aicd.ok ? "online" : "offline"), rt.aicd.ok ? "" : "crit", null));
   if (rt.audit) segs.push(bannerSeg("audit", rt.audit.status || (rt.audit.ok ? "valid" : "broken"), rt.audit.ok ? "" : "crit", "audit"));
+  // D4: 모두 정상 + 소스 fresh면 명시적 all-clear(빈 화면이 아니라 초록 "이상 없음").
+  if (sm.all_clear && !segs.some(s => s.includes("crit"))) {
+    segs.unshift(bannerSeg("상태", "이상 없음", "ok", null));
+  }
   if (!segs.length) { el.hidden = true; return; }
   el.hidden = false; el.innerHTML = segs.join("");
 }
@@ -1646,9 +1656,44 @@ async function loadIncidents() {
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
 let CUR_INCIDENT = null;
+function fmtDur(secs) {
+  if (secs == null) return null;
+  const s = Math.max(0, +secs), d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+  return d ? d+"d "+h+"h "+m+"m" : h ? h+"h "+m+"m" : m ? m+"m "+(s%60)+"s" : (s%60)+"s";
+}
+// W1: 인시던트 상세 — evidence/가설/타임라인/TTM·MTTR을 브라우저에서(터미널 복귀 불필요).
+async function showIncidentDetail(id) {
+  const box = document.getElementById("incident-detail"); box.style.display = "block";
+  box.innerHTML = '<p class="muted">상세 로딩...</p>';
+  try {
+    const d = await (await api("/web/incidents/" + encodeURIComponent(id))).json();
+    const ttm = fmtDur(d.ttm_secs), mttr = fmtDur(d.mttr_secs);
+    let h = '<details class="sec" open><summary><strong>' + esc(d.title || id) + '</strong> · ' + esc(d.status || "") +
+      (d.severity ? ' · ' + esc(String(d.severity).toUpperCase()) : "") + '</summary>';
+    h += '<p class="muted">생성 ' + esc(fmtTs(d.created_at)) + ' · 갱신 ' + esc(fmtTs(d.updated_at)) +
+      (ttm ? ' · TTM ' + esc(ttm) : "") + (mttr ? ' · MTTR ' + esc(mttr) : "") + '</p>';
+    if (d.hypotheses && d.hypotheses.length) {
+      h += '<h4>가설</h4><table><tr><th>status</th><th>±</th><th>text</th></tr>';
+      d.hypotheses.forEach(y => { h += "<tr><td>" + esc(y.status) + "</td><td class='muted'>+" + (+y.support||0) +
+        "/-" + (+y.refute||0) + "</td><td>" + esc(y.text) + "</td></tr>"; });
+      h += '</table>';
+    }
+    h += '<h4>evidence (' + (+d.evidence_total||0) + ')</h4>';
+    if (d.evidence && d.evidence.length) {
+      h += '<table><tr><th>at</th><th>kind</th><th>title</th><th>source</th></tr>';
+      d.evidence.forEach(e => { h += "<tr><td>" + esc(fmtTs(e.at)) + "</td><td>" + esc(e.kind) +
+        "</td><td>" + esc(e.title) + "</td><td class='muted'>" + esc(e.source) + "</td></tr>"; });
+      h += '</table>';
+      if (d.evidence_total > d.evidence.length) h += '<p class="muted">' + d.evidence.length + '/' + d.evidence_total + ' 표시(페이지네이션).</p>';
+    } else { h += '<p class="muted">evidence 없음.</p>'; }
+    h += '</details>';
+    box.innerHTML = h;
+  } catch (e) { box.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
+}
 async function showReport(id) {
   HASH.tab = "incidents"; HASH.id = id; writeHash();   // #3 딥링크
   CUR_INCIDENT = id;
+  showIncidentDetail(id);   // W1 상세 패널
   // 새 report를 열 때 이전 유사검색 결과는 비우고 버튼만 보여준다.
   document.getElementById("similar-box").style.display = "block";
   document.getElementById("similar-out").textContent = "";
@@ -1727,7 +1772,18 @@ async function loadHistory() {
 }
 async function loadWebhooks() {
   if (!TOKEN) return; const out = document.getElementById("webhooks-out");
+  const grouped = document.getElementById("wh-group") && document.getElementById("wh-group").checked;
   try {
+    if (grouped) {
+      // W3: fingerprint별 반복 추이 — 같은 알림이 몇 번, 언제부터·언제 마지막.
+      const g = await (await api("/web/webhooks?group=fingerprint")).json();
+      if (!g.length) { out.innerHTML = '<p class="muted">webhook 이벤트 없음(최근 24h).</p>'; return; }
+      let h = "<table><tr><th>count</th><th>severity</th><th>alert</th><th>fingerprint</th><th>first</th><th>last</th></tr>";
+      g.forEach(row => { h += "<tr><td><strong>" + (+row.count||0) + "</strong></td><td>" + esc(row.severity || "") +
+        "</td><td>" + esc(row.alert || "") + "</td><td class='muted'>" + esc(row.fingerprint || "") +
+        "</td><td>" + esc(fmtTs(row.first_ts)) + "</td><td>" + esc(fmtTs(row.last_ts)) + "</td></tr>"; });
+      out.innerHTML = h + "</table>"; reapplyFilter(out.id); return;
+    }
     const d = await (await api("/web/webhooks")).json();
     if (!d.length) { out.innerHTML = '<p class="muted">webhook 이벤트 없음. aicd webhook opt-in([aicd.webhook] enabled=true).</p>'; return; }
     let h = "<table><tr><th>ts</th><th>action</th><th>source</th><th>severity</th><th>alert</th><th>fingerprint</th></tr>";
