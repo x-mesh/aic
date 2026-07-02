@@ -76,6 +76,8 @@ const CHAT_RECORD_TAIL: usize = 30;
 const CHAT_AUDIT_TAIL: usize = 80;
 /// runtime health는 audit verify 등 파일 IO를 포함하므로 resource 샘플보다 느슨하게 갱신한다.
 const RUNTIME_HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+/// (W4) sre-agent 조회 주기. 매 30s 백그라운드로 anomaly/finding/fingerprint 스냅샷을 새로 고친다.
+const SRE_WATCH_INTERVAL: Duration = Duration::from_secs(30);
 /// resource 탭 top process 목록 길이. 너무 길면 2초 샘플마다 JSON payload와 UI scan 비용이 커진다.
 const TOP_PROCESS_LIMIT: usize = 5;
 /// resource 이벤트 timeline 상한. 상태 전환만 남겨 payload와 시각 noise를 제한한다.
@@ -230,6 +232,9 @@ struct WebState {
     local: Arc<Mutex<VecDeque<LocalPoint>>>,
     /// aic runtime 상태(aicd/session/snapshot/audit). 별도 주기로 갱신해 `/web/local`에 합친다.
     runtime: Arc<Mutex<Value>>,
+    /// (W4) sre-agent 조회 스냅샷 캐시. 백그라운드가 주기적으로 MCP를 조회해 채운다 — web 요청 경로는
+    /// 이 캐시만 읽어 대시보드가 sre-agent 지연/장애에 물리지 않는다(stale-while-revalidate).
+    sre: Arc<Mutex<Value>>,
     /// 등록 관측 백엔드가 있을 때만 Some. 없으면 외부 metrics/logs는 503.
     obs: Option<ObsClient>,
     /// 스택 샘플 활성(기본 ON; `--no-stack-sample`로 off). false면 sample 엔드포인트 403.
@@ -252,11 +257,16 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         "status": "warming",
     })));
     spawn_runtime_health_sampler(runtime.clone());
+    let sre = Arc::new(Mutex::new(
+        json!({ "available": false, "status": "warming" }),
+    ));
+    spawn_sre_watch_sampler(sre.clone());
 
     let state = Arc::new(WebState {
         token: cfg.token,
         local,
         runtime,
+        sre,
         obs,
         allow_stack_sample: cfg.allow_stack_sample,
         sampling: Arc::new(Mutex::new(HashSet::new())),
@@ -278,6 +288,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/history", get(history))
         .route("/web/chat", get(chat_observability))
         .route("/web/chat/{session}", get(chat_observability_for_session))
+        .route("/web/watch", get(watch))
         .route("/web/webhooks", get(webhooks))
         .route("/web/serverlog", get(server_log))
         .route("/web/config", get(config_view))
@@ -820,6 +831,47 @@ async fn collect_runtime_health() -> Value {
         "sessions": sessions,
         "snapshots": snapshots,
         "audit": audit,
+    })
+}
+
+/// (W4) sre-agent 조회 스냅샷을 주기적으로 캐시에 채운다. **web 요청 경로가 아니라 백그라운드**에서만 MCP를
+/// 왕복하므로 대시보드 응답이 sre-agent 지연/장애에 물리지 않는다(stale-while-revalidate). MCP 미구성이면
+/// `available:false`만 유지한다(조회 시도 안 함).
+fn spawn_sre_watch_sampler(slot: Arc<Mutex<Value>>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SRE_WATCH_INTERVAL);
+        loop {
+            let snap = collect_sre_watch().await;
+            if let Ok(mut dst) = slot.lock() {
+                *dst = snap;
+            }
+            tick.tick().await;
+        }
+    });
+}
+
+/// sre-agent에서 anomaly/finding/fingerprint 스냅샷을 조회해 캐시 Value로 조립한다. 세 조회는 전부
+/// read-only pull이고, MCP 미구성/tool 부재면 각 필드가 null이 된다. 하나라도 값이 오면 available:true.
+async fn collect_sre_watch() -> Value {
+    let cfg = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(_) => return json!({ "available": false, "status": "config 로드 실패" }),
+    };
+    // MCP 서버가 하나도 없으면 조회 왕복 없이 즉시 미구성 처리(불필요한 handshake 방지).
+    if cfg.mcp.servers.is_empty() {
+        return json!({ "available": false, "status": "sre-agent 미구성 ([mcp] 서버 없음)" });
+    }
+    let anomaly = crate::rca_memory::anomaly_scores(&cfg.mcp, 24.0).await;
+    let findings = crate::rca_memory::list_findings(&cfg.mcp, 168.0, 30).await;
+    let fingerprint = crate::rca_memory::fingerprint_status(&cfg.mcp, 14.0).await;
+    let available = anomaly.is_some() || findings.is_some() || fingerprint.is_some();
+    json!({
+        "available": available,
+        "ts": chrono::Utc::now().timestamp_millis(),
+        "anomaly_scores": anomaly,
+        "findings": findings,
+        "fingerprint_status": fingerprint,
+        "status": if available { "ok" } else { "sre-agent 연결됐으나 조회 tool 없음" },
     })
 }
 
@@ -2517,6 +2569,17 @@ fn incident_detail_view(
         "evidence": slice,
         "hypotheses": hypotheses,
     })
+}
+
+/// (W4) sre-agent 조회 스냅샷(anomaly/finding/fingerprint)을 **캐시에서만** 반환한다 — MCP를 요청 경로에서
+/// 호출하지 않으므로 sre-agent가 죽어도 대시보드는 마지막 스냅샷으로 응답한다. 미구성이면 available:false.
+async fn watch(State(state): State<Arc<WebState>>) -> Json<Value> {
+    let snap = state
+        .sre
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_else(|_| json!({ "available": false, "status": "lock" }));
+    Json(snap)
 }
 
 /// 등록된 관측 백엔드 이름(타입별). 외부 metrics/logs 탭 활성화 판단 + 드롭다운용. 없으면 빈 목록.
