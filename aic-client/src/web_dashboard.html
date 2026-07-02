@@ -643,7 +643,15 @@
 
   <section id="snapshots" class="panel" role="tabpanel">
     <div class="row"><button onclick="loadSnapshots()">새로고침</button>
-      <span class="muted">~/.aic/snapshots/ · 기록된 스냅샷 · 행을 클릭하면 본문</span></div>
+      <button onclick="loadSnapshotDiff()">변화 비교(diff)</button>
+      <select id="snap-ago" onchange="loadSnapshotDiff()">
+        <option value="">직전 스냅샷</option>
+        <option value="600">10분 전</option>
+        <option value="1800">30분 전</option>
+        <option value="3600">1시간 전</option>
+      </select>
+      <span class="muted">~/.aic/snapshots/ · 행 클릭=본문 · diff=변화점(용의자)</span></div>
+    <pre id="snapshot-diff" style="display:none"></pre>
     <div id="snapshots-out"><p class="muted">연결 후 새로고침하세요.</p></div>
     <div id="snapshot-detail" style="display:none; margin-top:14px">
       <div class="row" style="margin-bottom:6px">
@@ -1483,6 +1491,17 @@ function draw(canvasId, legendId, xs, series, opts) {
 }
 
 // ── snapshots / incidents ─────────────────────────────────
+// D-time: 최신 스냅샷 vs 이전(선택 시점) 비교 — 변화점이 RCA 용의자.
+async function loadSnapshotDiff() {
+  if (!TOKEN) return; const pre = document.getElementById("snapshot-diff");
+  const ago = document.getElementById("snap-ago").value;
+  pre.style.display = "block"; pre.textContent = "비교 중...";
+  try {
+    const d = await (await api("/web/snapshots/compare" + (ago ? "?ago=" + ago : ""))).json();
+    if (!d.available) { pre.textContent = d.status || "비교 불가"; return; }
+    pre.textContent = fmtTs(d.old_at) + "  →  " + fmtTs(d.new_at) + "\n\n" + d.report;
+  } catch (e) { pre.textContent = e.message; }
+}
 async function loadSnapshots() {
   if (!TOKEN) return; const out = document.getElementById("snapshots-out");
   try {

@@ -932,6 +932,15 @@ enum SnapshotOp {
     },
     /// 주기 캡처 타이머 unit을 unload + 제거한다.
     Uninstall,
+    /// (D-time) 최신 스냅샷을 이전 스냅샷과 비교해 무엇이 바뀌었는지 보여준다("변화점=용의자").
+    Compare {
+        /// 얼마 전 스냅샷과 비교할지(예: 10m, 1h, 30s, 2d). 생략 시 직전 스냅샷.
+        #[arg(long)]
+        ago: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1816,6 +1825,7 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
         SnapshotOp::Status { json } => handle_snapshot_status(json),
         SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
         SnapshotOp::Uninstall => handle_snapshot_uninstall(),
+        SnapshotOp::Compare { ago, json } => handle_snapshot_compare(ago, json),
     }
 }
 
@@ -1936,6 +1946,45 @@ fn handle_snapshot_list(limit: usize, json: bool) -> anyhow::Result<()> {
                 r.sections.join(",")
             );
         }
+    }
+    Ok(())
+}
+
+/// (D-time) 최신 스냅샷을 이전(또는 `--ago` 시점) 스냅샷과 비교한다. 변화가 곧 RCA의 용의자다.
+fn handle_snapshot_compare(ago: Option<String>, json: bool) -> anyhow::Result<()> {
+    let all = aic_client::snapshot_store::load_snapshots()?;
+    if all.len() < 2 {
+        println!(
+            "비교할 스냅샷이 부족합니다(2개 이상 필요) — `aic snapshot capture --force`로 더 쌓으세요."
+        );
+        return Ok(());
+    }
+    let new = all.last().unwrap();
+    let old_idx = match ago.as_deref() {
+        Some(a) => {
+            let dur = parse_duration_arg(a)
+                .ok_or_else(|| anyhow::anyhow!("--ago 형식 오류(예: 10m, 1h, 30s, 2d)"))?;
+            aic_client::snapshot_store::index_at_or_before(&all, new.captured_at - dur).unwrap_or(0)
+        }
+        None => all.len() - 2, // 직전 스냅샷
+    };
+    let old = &all[old_idx];
+    let report = aic_client::snapshot_store::compare(&old.body, &new.body);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "old_at": old.captured_at.to_rfc3339(),
+                "new_at": new.captured_at.to_rfc3339(),
+                "report": report,
+            }))?
+        );
+    } else {
+        println!(
+            "스냅샷 비교: {} → {}\n{report}",
+            old.captured_at.to_rfc3339(),
+            new.captured_at.to_rfc3339()
+        );
     }
     Ok(())
 }
