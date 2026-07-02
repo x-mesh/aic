@@ -815,6 +815,20 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// (O3) incident report를 등록된 목적지(`[outbound.targets.<name>]`)로 내보낸다 — redaction + confirm gate + audit.
+    Send {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 목적지 이름([outbound.targets.<name>]). deny-by-default — 등록·활성 목적지만 전송된다.
+        #[arg(long)]
+        to: String,
+        /// 실제 전송 없이 redacted 페이로드 미리보기만 출력한다("이렇게 나갑니다").
+        #[arg(long)]
+        dry_run: bool,
+        /// confirm 프롬프트 없이 전송한다(비-interactive 필수).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `aic rca hypothesis <op>` — 가설을 쌓고 evidence로 좁혀 probable cause에 수렴시킨다.
@@ -5602,6 +5616,7 @@ fn default_config() -> AppConfig {
         aicd: aic_common::AicdConfig::default(),
         mcp: aic_common::McpConfig::default(),
         rca: aic_common::RcaConfig::default(),
+        outbound: aic_common::OutboundConfig::default(),
     }
 }
 
@@ -7860,8 +7875,121 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 }
             }
         }
+        RcaOp::Send {
+            id,
+            to,
+            dry_run,
+            yes,
+        } => {
+            rca_send(id, &to, dry_run, yes).await?;
+        }
     }
     Ok(())
+}
+
+/// (O3) `aic rca send` — incident report를 등록 목적지로 내보낸다. 파이프라인: incident 로드 → report
+/// 렌더 → OutboundPayload(생성 시 redaction 강제) → config에서 목적지·어댑터 resolve → dry-run이면
+/// 미리보기만, 아니면 confirm gate 후 전송 → 성공/실패를 HMAC audit에 기록. deny-by-default이므로
+/// 미등록·비활성 목적지는 어댑터 단계에서 거부된다.
+async fn rca_send(id: Option<String>, to: &str, dry_run: bool, yes: bool) -> anyhow::Result<()> {
+    use aic_client::outbound::adapter::{
+        render_dry_run, FileAdapter, OutboundAdapter, WebhookAdapter,
+    };
+    use aic_client::outbound::{OutboundPayload, OutboundPolicy};
+
+    let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+    let meta = aic_client::rca::load_meta(&resolved)?;
+    let events = aic_client::rca::load_events(&resolved)?;
+    let hypotheses = aic_client::rca::load_hypotheses(&resolved).unwrap_or_default();
+    let report = aic_client::rca::render_report(&meta, &events, &hypotheses);
+    let evidence_refs: Vec<String> = events.iter().map(|e| e.id.clone()).collect();
+    // OutboundPayload 생성자가 title/body/host에 redaction을 강제한다(우회 불가 — 타입으로 보장).
+    let payload = OutboundPayload::from_incident(&meta, &report, evidence_refs);
+
+    let config = ConfigManager::load()?;
+    let target = config.outbound.targets.get(to).ok_or_else(|| {
+        anyhow::anyhow!(
+            "목적지 '{to}' 미등록 — [outbound.targets.{to}]를 config에 추가하세요(deny-by-default)"
+        )
+    })?;
+
+    // dry-run: 실제 전송 없이 "이렇게 나갑니다"(redacted)만 출력하고 종료.
+    if dry_run {
+        println!("=== dry-run: '{to}'로 전송될 내용(redacted, 실제 전송 안 함) ===");
+        println!("{}", render_dry_run(&payload));
+        return Ok(());
+    }
+
+    // confirm gate: 외부 전송은 되돌리기 어려우므로 명시적 동의를 받는다(--yes 또는 interactive y).
+    if !yes {
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("비-interactive 환경에서는 --yes가 필요합니다(외부 전송 confirm gate).");
+        }
+        eprint!("incident {resolved}을(를) '{to}'로 전송하시겠습니까? [y/N]: ");
+        let _ = std::io::stderr().flush();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let t = input.trim().to_lowercase();
+        if t != "y" && t != "yes" {
+            eprintln!("취소됨 — 전송하지 않았습니다.");
+            return Ok(());
+        }
+    }
+
+    // 목적지 kind로 어댑터를 만든다. webhook allowlist는 config에서 활성인 목적지 이름들로 구성한다.
+    let allow: Vec<String> = config
+        .outbound
+        .targets
+        .iter()
+        .filter(|(_, t)| t.enabled)
+        .map(|(n, _)| n.clone())
+        .collect();
+    let result = match target.kind.as_str() {
+        "file" => {
+            let dir = target.dir.clone().unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".aic")
+                    .join("outbound")
+            });
+            FileAdapter::new(to, dir).deliver(&payload).await
+        }
+        "webhook" => {
+            let url = target
+                .url
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("webhook 목적지 '{to}'에 url이 없습니다"))?;
+            WebhookAdapter::new(to, url, target.enabled, OutboundPolicy::new(allow))
+                .deliver(&payload)
+                .await
+        }
+        other => anyhow::bail!("알 수 없는 목적지 kind '{other}'(file|webhook)"),
+    };
+
+    // 성공/실패를 HMAC audit에 남긴다(전송 사실의 추적 가능성 — 본문은 담지 않음).
+    match result {
+        Ok(receipt) => {
+            let _ = aic_client::audit::append(
+                "outbound_send",
+                serde_json::json!({
+                    "target": to, "incident": resolved, "ok": true,
+                    "bytes": receipt.bytes, "detail": receipt.detail,
+                }),
+            );
+            println!("전송 완료 → {} ({} bytes)", receipt.detail, receipt.bytes);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = aic_client::audit::append(
+                "outbound_send",
+                serde_json::json!({
+                    "target": to, "incident": resolved, "ok": false, "error": e.to_string(),
+                }),
+            );
+            Err(e)
+        }
+    }
 }
 
 /// `aic rca mitigate|close|reopen` 공통 — incident를 전이하고(전이는 lifecycle evidence로 기록됨)
@@ -9363,6 +9491,7 @@ mod tests {
             aicd: aic_common::AicdConfig::default(),
             mcp: aic_common::McpConfig::default(),
             rca: aic_common::RcaConfig::default(),
+            outbound: aic_common::OutboundConfig::default(),
         }
     }
 

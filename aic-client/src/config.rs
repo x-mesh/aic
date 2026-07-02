@@ -83,6 +83,7 @@ impl ConfigManager {
             aicd: aic_common::AicdConfig::default(),
             mcp: aic_common::McpConfig::default(),
             rca: aic_common::RcaConfig::default(),
+            outbound: aic_common::OutboundConfig::default(),
         }
     }
 }
@@ -401,6 +402,7 @@ boundary_strategy = { method = "prompt_marker" }
             aicd: aic_common::AicdConfig::default(),
             mcp: aic_common::McpConfig::default(),
             rca: aic_common::RcaConfig::default(),
+            outbound: aic_common::OutboundConfig::default(),
         })
     }
 
