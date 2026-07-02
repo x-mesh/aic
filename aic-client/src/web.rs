@@ -62,6 +62,14 @@ const RING_CAP: usize = 300;
 const AUDIT_TAIL: usize = 200;
 const WEBHOOK_TAIL: usize = 100;
 const SERVER_LOG_TAIL: usize = 200;
+/// W1 incident 상세: 한 요청에 반환하는 evidence 최대 줄 수(페이지네이션 상한).
+const INCIDENT_EVIDENCE_PAGE: usize = 200;
+/// W3 fingerprint 그룹핑: 기본 시간창(시간). 이 창보다 오래된 alert는 그룹 집계에서 제외.
+const WEBHOOK_GROUP_WINDOW_HOURS: i64 = 24;
+/// W3 fingerprint 그룹핑: 반환 그룹 상한(top-N, 최근 발생 우선). UI·성능 무한 확장 방지.
+const WEBHOOK_GROUP_TOP_N: usize = 50;
+/// D3 데이터 신선도: 소스가 이 배수×기대주기를 넘겨 조용하면 stale로 표시.
+const FRESHNESS_STALE_SECS: i64 = 30;
 const HISTORY_TAIL: usize = 50;
 const CHAT_SESSION_LIMIT: usize = 20;
 const CHAT_RECORD_TAIL: usize = 30;
@@ -261,7 +269,9 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         .route("/web/process/{pid}", get(process_detail))
         .route("/web/process/{pid}/sample", get(process_stack_sample))
         .route("/web/snapshots", get(snapshots))
+        .route("/web/summary", get(summary))
         .route("/web/incidents", get(incidents))
+        .route("/web/incidents/{id}", get(incident_detail))
         .route("/web/incidents/{id}/report", get(incident_report))
         .route("/web/incidents/{id}/similar", get(incident_similar))
         .route("/web/audit", get(audit_log))
@@ -2051,14 +2061,114 @@ fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
 
 /// aicd webhook alert ingestion 이벤트(`webhook-events.jsonl`) tail. 파일 부재는 빈 목록(에러 아님).
 /// 자유 텍스트 필드(action/source/alert)에 redaction을 적용한다.
-async fn webhooks() -> Json<Vec<Value>> {
+async fn webhooks(Query(q): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
     let path = aic_common::paths::webhook_events_path();
-    let out = tail_lines(&path, WEBHOOK_TAIL)
+    let events: Vec<Value> = tail_lines(&path, WEBHOOK_TAIL)
         .iter()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .map(|e| webhook_event_view(&e))
         .collect();
-    Json(out)
+    // W3: `?group=fingerprint`면 반복 추이로 접어 반환한다. 없으면 기존처럼 flat 이벤트 목록.
+    if q.get("group").map(|s| s.as_str()) == Some("fingerprint") {
+        let now = chrono::Utc::now().timestamp_millis();
+        return Json(json!(group_webhooks_by_fingerprint(
+            &events,
+            now,
+            WEBHOOK_GROUP_WINDOW_HOURS,
+            WEBHOOK_GROUP_TOP_N,
+        )));
+    }
+    let out: Vec<Value> = events.iter().map(webhook_event_view).collect();
+    Json(json!(out))
+}
+
+/// webhook 이벤트의 `ts`를 epoch-ms로 파싱한다. aicd는 RFC3339 문자열로 기록하지만(webhook_server),
+/// 숫자(epoch-ms) 형태도 방어적으로 받는다. 파싱 실패는 None.
+fn event_ts_ms(v: &Value) -> Option<i64> {
+    match v.get("ts") {
+        Some(Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.timestamp_millis()),
+        Some(Value::Number(n)) => n.as_i64(),
+        _ => None,
+    }
+}
+
+/// W3: webhook 이벤트를 fingerprint별로 접어 반복 추이를 만든다. `now_ms` 기준 `window_hours` 안의
+/// 이벤트만 집계하고, 최근 발생 시각 내림차순으로 상위 `top_n` 그룹만 반환한다(무한 확장 방지).
+/// fingerprint가 없는 이벤트는 개별 그룹(`(none)`)으로 묶는다. 자유 텍스트는 redaction 통과.
+fn group_webhooks_by_fingerprint(
+    events: &[Value],
+    now_ms: i64,
+    window_hours: i64,
+    top_n: usize,
+) -> Vec<Value> {
+    use std::collections::BTreeMap;
+    let cutoff = now_ms - window_hours * 3600 * 1000;
+    // 삽입 순서와 무관하게 결정적 집계를 위해 fingerprint를 key로 모은다.
+    struct Group {
+        alert: Option<String>,
+        severity: Value,
+        occurrences: Vec<i64>,
+        last_ts: i64,
+    }
+    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+    for e in events {
+        let Some(ts) = event_ts_ms(e) else {
+            continue;
+        };
+        if ts < cutoff {
+            continue;
+        }
+        let fp = e
+            .get("fingerprint")
+            .and_then(|x| x.as_str())
+            .map(|s| redaction::redact(s).0)
+            .unwrap_or_else(|| "(none)".to_string());
+        let alert = e
+            .get("alert")
+            .and_then(|x| x.as_str())
+            .map(|s| redaction::redact(s).0);
+        let g = groups.entry(fp).or_insert_with(|| Group {
+            alert: alert.clone(),
+            severity: e.get("severity").cloned().unwrap_or(Value::Null),
+            occurrences: Vec::new(),
+            last_ts: ts,
+        });
+        g.occurrences.push(ts);
+        if ts >= g.last_ts {
+            g.last_ts = ts;
+            // 가장 최근 이벤트의 severity/alert를 대표값으로 갱신.
+            g.severity = e.get("severity").cloned().unwrap_or(Value::Null);
+            if alert.is_some() {
+                g.alert = alert;
+            }
+        }
+    }
+    let mut out: Vec<Value> = groups
+        .into_iter()
+        .map(|(fp, g)| {
+            let mut occ = g.occurrences;
+            occ.sort_unstable();
+            let first = occ.first().copied().unwrap_or(0);
+            json!({
+                "fingerprint": fp,
+                "alert": g.alert,
+                "severity": g.severity,
+                "count": occ.len(),
+                "first_ts": first,
+                "last_ts": g.last_ts,
+                "occurrences": occ,
+            })
+        })
+        .collect();
+    // 최근 발생 우선 정렬 후 top-N.
+    out.sort_by(|a, b| {
+        b.get("last_ts")
+            .and_then(|v| v.as_i64())
+            .cmp(&a.get("last_ts").and_then(|v| v.as_i64()))
+    });
+    out.truncate(top_n);
+    out
 }
 
 /// webhook 이벤트 한 건을 노출용으로 매핑한다 — 자유 텍스트(action/source/alert/fingerprint)는 redaction.
@@ -2222,6 +2332,180 @@ async fn incident_similar(
         "available": matches.is_some(),
         "text": matches,
     })))
+}
+
+/// W2/D3/D4: 첫 화면 "지금 상태" 요약. 열린 incident·최근 alert·리소스 신선도를 **서버에서 한 번에**
+/// 조립해(프런트 waterfall 방지) 내려준다. 각 데이터 소스에 freshness(D3)를 실어 수집 실패를 "정상"으로
+/// 오인하지 않게 하고, 모두 정상+fresh면 명시적 all-clear(D4)를 세운다. 신규 데이터 수집 없이 기존
+/// 소스(incident index·webhook tail·로컬 ring)만 읽는다.
+async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // 로컬 샘플러 신선도 + 마지막 이벤트: ring buffer의 마지막 point에서 읽는다.
+    let (local_last_ts, latest_event) = {
+        let ring = state.local.lock().unwrap();
+        let last_ts = ring.back().map(|p| p.ts);
+        let ev = ring.back().and_then(|p| p.events.last().cloned());
+        (last_ts, ev)
+    };
+
+    // 인시던트: 열린 것 개수 + 가장 최근 갱신 1건.
+    let incidents = rca::list_incidents().unwrap_or_default();
+    let open_count = incidents
+        .iter()
+        .filter(|i| i.status == rca::IncidentStatus::Open)
+        .count();
+    let latest_incident = incidents
+        .iter()
+        .max_by_key(|i| i.updated_at)
+        .map(incident_view);
+
+    // webhook: 최근 1시간 alert 수 + 마지막 이벤트 시각.
+    let wh_events: Vec<Value> = tail_lines(&aic_common::paths::webhook_events_path(), WEBHOOK_TAIL)
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect();
+    let hour_ago = now - 3600 * 1000;
+    let recent_alerts = wh_events
+        .iter()
+        .filter(|e| event_ts_ms(e).is_some_and(|ts| ts >= hour_ago))
+        .count();
+    let webhook_last_ts = wh_events.iter().filter_map(event_ts_ms).max();
+
+    let local_src = data_source_freshness("local", local_last_ts, now, FRESHNESS_STALE_SECS);
+    // webhook은 항상 도는 소스가 아니라, 파일이 없으면 stale이 아니라 "미수신"으로 present:false.
+    let webhook_src = data_source_freshness("webhook", webhook_last_ts, now, i64::MAX);
+    let sources = vec![local_src.clone(), webhook_src.clone()];
+    // all-clear는 수집이 살아있을 때(로컬 fresh)만 유효 — 죽은 채 초록 금지.
+    let local_fresh = local_src.get("stale").and_then(|v| v.as_bool()) == Some(false);
+    let all_clear = open_count == 0 && recent_alerts == 0 && local_fresh;
+
+    Json(json!({
+        "now": now,
+        "open_incidents": open_count,
+        "latest_incident": latest_incident,
+        "recent_alerts_1h": recent_alerts,
+        "latest_event": latest_event,
+        "sources": sources,
+        "all_clear": all_clear,
+    }))
+}
+
+/// D3: 한 데이터 소스의 신선도를 노출용 JSON으로(pure — 단위 테스트 대상). last_ts가 없으면
+/// present:false(수집된 적 없음). stale은 age가 stale_secs를 넘겼는지 — 수집이 조용해진 소스를
+/// 노랑/빨강으로 표시하게 해, "수집 실패"가 "이상 없음"으로 위장되는 것을 막는다.
+fn data_source_freshness(
+    name: &str,
+    last_ts_ms: Option<i64>,
+    now_ms: i64,
+    stale_secs: i64,
+) -> Value {
+    match last_ts_ms {
+        None => json!({ "name": name, "present": false, "stale": false, "age_secs": Value::Null }),
+        Some(ts) => {
+            let age = ((now_ms - ts).max(0)) / 1000;
+            json!({
+                "name": name,
+                "present": true,
+                "stale": age > stale_secs,
+                "age_secs": age,
+                "last_ts": ts,
+            })
+        }
+    }
+}
+
+/// W1: 인시던트 상세(evidence·가설·타임라인·TTM/MTTR). 목록 뷰가 요약 6필드만 주던 것을 보완한다.
+/// evidence는 `?offset=`으로 페이지네이션(요청당 `INCIDENT_EVIDENCE_PAGE` 상한). 모든 자유 텍스트는
+/// redaction 통과. 파일 I/O는 `spawn_blocking`으로 옮겨 axum async 런타임을 블로킹하지 않는다.
+async fn incident_detail(
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, &'static str)> {
+    if !is_safe_incident_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid incident id\n"));
+    }
+    let offset: usize = q.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let loaded = tokio::task::spawn_blocking(move || {
+        let meta = rca::load_meta(&id)?;
+        // 손상/부분기록 evidence는 load_events가 파싱 실패 줄을 건너뛴다(rca.rs). 여기선 성공분만 받는다.
+        let events = rca::load_events(&id)?;
+        let hyps = rca::load_hypotheses(&id).unwrap_or_default();
+        anyhow::Ok((meta, events, hyps))
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "join error\n"))?
+    .map_err(internal)?;
+    let (meta, events, hyps) = loaded;
+    Ok(Json(incident_detail_view(
+        &meta,
+        &events,
+        &hyps,
+        offset,
+        INCIDENT_EVIDENCE_PAGE,
+    )))
+}
+
+/// incident 상세를 노출용 JSON으로 조립한다(pure — 단위 테스트 대상). title/symptom/cwd 및 evidence·
+/// 가설 자유 텍스트는 redaction. TTM/MTTR은 meta의 mitigated_at/closed_at에서 초 단위로 계산한다.
+fn incident_detail_view(
+    meta: &rca::IncidentMeta,
+    events: &[rca::EvidenceEvent],
+    hyps: &[rca::Hypothesis],
+    offset: usize,
+    page: usize,
+) -> Value {
+    let total = events.len();
+    let slice: Vec<Value> = events
+        .iter()
+        .skip(offset)
+        .take(page)
+        .map(|ev| {
+            json!({
+                "id": ev.id,
+                "at": ev.at,
+                "kind": format!("{:?}", ev.kind),
+                "title": redaction::redact(&ev.title).0,
+                "source": redaction::redact(&ev.source).0,
+                "body": redaction::redact(&ev.body).0,
+                "tags": ev.tags,
+            })
+        })
+        .collect();
+    let hypotheses: Vec<Value> = hyps
+        .iter()
+        .map(|h| {
+            json!({
+                "id": h.id,
+                "text": redaction::redact(&h.text).0,
+                "status": format!("{:?}", h.status),
+                "support": h.support,
+                "refute": h.refute,
+            })
+        })
+        .collect();
+    let ttm_secs = meta
+        .mitigated_at
+        .map(|m| (m - meta.created_at).num_seconds().max(0));
+    let mttr_secs = meta
+        .closed_at
+        .map(|c| (c - meta.created_at).num_seconds().max(0));
+    json!({
+        "id": meta.id,
+        "title": redaction::redact(&meta.title).0,
+        "status": meta.status,
+        "severity": meta.severity.map(|s| s.as_label()),
+        "symptom": meta.symptom.as_deref().map(|s| redaction::redact(s).0),
+        "cwd": meta.cwd.as_deref().map(|s| redaction::redact(s).0),
+        "created_at": meta.created_at,
+        "updated_at": meta.updated_at,
+        "ttm_secs": ttm_secs,
+        "mttr_secs": mttr_secs,
+        "evidence_total": total,
+        "evidence_offset": offset,
+        "evidence": slice,
+        "hypotheses": hypotheses,
+    })
 }
 
 /// 등록된 관측 백엔드 이름(타입별). 외부 metrics/logs 탭 활성화 판단 + 드롭다운용. 없으면 빈 목록.
@@ -2397,6 +2681,125 @@ mod tests {
     }
 
     #[test]
+    fn group_webhooks_folds_by_fingerprint_and_bounds_window() {
+        let now = 1_000_000_000_000i64;
+        let hour = 3600 * 1000;
+        let events = vec![
+            json!({ "ts": now - hour, "alert": "redis oom", "severity": "critical", "fingerprint": "fp-a" }),
+            json!({ "ts": now - 2 * hour, "alert": "redis oom", "severity": "critical", "fingerprint": "fp-a" }),
+            json!({ "ts": now - 3 * hour, "alert": "disk full", "severity": "high", "fingerprint": "fp-b" }),
+            // 창(24h) 밖 — 집계 제외.
+            json!({ "ts": now - 100 * hour, "alert": "old", "severity": "low", "fingerprint": "fp-a" }),
+        ];
+        let out = group_webhooks_by_fingerprint(&events, now, 24, 50);
+        assert_eq!(out.len(), 2); // fp-a, fp-b
+        let a = out.iter().find(|g| g["fingerprint"] == "fp-a").unwrap();
+        assert_eq!(a["count"], 2); // 창 밖 1건은 제외
+        assert_eq!(a["last_ts"], now - hour);
+        assert_eq!(a["occurrences"].as_array().unwrap().len(), 2);
+        // 최근 발생 우선 정렬: fp-a(가장 최근)가 먼저.
+        assert_eq!(out[0]["fingerprint"], "fp-a");
+    }
+
+    #[test]
+    fn event_ts_ms_parses_rfc3339_and_number() {
+        // aicd 실제 포맷은 RFC3339 문자열.
+        let s = json!({ "ts": "2026-07-02T00:00:00Z" });
+        assert_eq!(event_ts_ms(&s), Some(1782950400000));
+        // 숫자(epoch-ms)도 방어적으로 허용.
+        assert_eq!(
+            event_ts_ms(&json!({ "ts": 1782950400000i64 })),
+            Some(1782950400000)
+        );
+        assert_eq!(event_ts_ms(&json!({ "ts": "garbage" })), None);
+        assert_eq!(event_ts_ms(&json!({})), None);
+    }
+
+    #[test]
+    fn group_webhooks_handles_rfc3339_ts() {
+        // 실제 aicd가 쓰는 문자열 ts로 그룹핑이 동작하는지(회귀 방지 — as_i64로 파싱하던 버그).
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-02T12:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let events = vec![
+            json!({ "ts": "2026-07-02T11:00:00Z", "alert": "a", "fingerprint": "fp-x" }),
+            json!({ "ts": "2026-07-02T11:30:00Z", "alert": "a", "fingerprint": "fp-x" }),
+        ];
+        let out = group_webhooks_by_fingerprint(&events, now, 24, 50);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["count"], 2); // 문자열 ts가 창 안으로 정상 파싱됨
+    }
+
+    #[test]
+    fn group_webhooks_truncates_to_top_n() {
+        let now = 10_000i64;
+        let events: Vec<Value> = (0..10)
+            .map(|i| json!({ "ts": now - i, "fingerprint": format!("fp-{i}") }))
+            .collect();
+        let out = group_webhooks_by_fingerprint(&events, now, 24, 3);
+        assert_eq!(out.len(), 3); // top-N 상한
+    }
+
+    #[test]
+    fn data_source_freshness_marks_stale_and_absent() {
+        let now = 100_000i64;
+        // 없음 → present:false, stale 아님.
+        let absent = data_source_freshness("local", None, now, 30);
+        assert_eq!(absent["present"], false);
+        assert_eq!(absent["stale"], false);
+        // 5초 전 → fresh.
+        let fresh = data_source_freshness("local", Some(now - 5_000), now, 30);
+        assert_eq!(fresh["present"], true);
+        assert_eq!(fresh["stale"], false);
+        assert_eq!(fresh["age_secs"], 5);
+        // 60초 전, 상한 30초 → stale.
+        let stale = data_source_freshness("local", Some(now - 60_000), now, 30);
+        assert_eq!(stale["stale"], true);
+    }
+
+    #[test]
+    fn incident_detail_view_paginates_and_computes_ttm_mttr() {
+        use crate::rca::{EvidenceEvent, EvidenceKind, IncidentMeta, IncidentStatus, Severity};
+        let created = chrono::Utc::now();
+        let meta = IncidentMeta {
+            id: "20260702-000000-x".to_string(),
+            title: "checkout 5xx from admin@corp.io".to_string(),
+            status: IncidentStatus::Closed,
+            symptom: Some("5xx".to_string()),
+            cwd: None,
+            created_at: created,
+            updated_at: created,
+            evidence_count: 3,
+            severity: Some(Severity::Sev2),
+            mitigated_at: Some(created + chrono::Duration::seconds(120)),
+            closed_at: Some(created + chrono::Duration::seconds(600)),
+        };
+        let events: Vec<EvidenceEvent> = (0..3)
+            .map(|i| EvidenceEvent {
+                id: format!("e{i}"),
+                at: created,
+                kind: EvidenceKind::Diagnosis,
+                title: format!("finding {i} at 10.0.0.{i}"),
+                source: "diagnose".to_string(),
+                body: "body".to_string(),
+                tags: vec![],
+            })
+            .collect();
+        let v = incident_detail_view(&meta, &events, &[], 1, 1);
+        assert_eq!(v["ttm_secs"], 120);
+        assert_eq!(v["mttr_secs"], 600);
+        assert_eq!(v["evidence_total"], 3);
+        assert_eq!(v["evidence_offset"], 1);
+        assert_eq!(v["evidence"].as_array().unwrap().len(), 1); // page=1
+                                                                // title/ evidence 자유 텍스트 redaction 적용.
+        assert!(v["title"].as_str().unwrap().contains("[REDACTED:email]"));
+        assert!(v["evidence"][0]["title"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED:ipv4]"));
+    }
+
+    #[test]
     fn tail_lines_fewer_than_n_returns_all_in_order() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
@@ -2405,7 +2808,10 @@ mod tests {
         writeln!(f, "a").unwrap();
         writeln!(f, "b").unwrap();
         drop(f);
-        assert_eq!(tail_lines(&path, 100), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            tail_lines(&path, 100),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
