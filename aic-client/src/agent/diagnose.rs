@@ -21,6 +21,41 @@ pub(crate) enum Confidence {
     High,
 }
 
+impl Confidence {
+    /// 사람용 짧은 라벨(신뢰도 배지). --json은 serde snake_case를 쓴다(별도 계약).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Confidence::Low => "low",
+            Confidence::Medium => "med",
+            Confidence::High => "high",
+        }
+    }
+}
+
+/// (D1) finding의 출처 품질 — "이 신호가 얼마나 직접적인가". 신뢰도(Confidence)와 직교하는 축이다:
+/// 직접 측정된 사실인지, 다른 신호로부터의 추론인지, 외부 백엔드에서 온 값인지. 결정적 임계 스캔은
+/// 전부 로컬에서 직접 측정한 사실이라 `Measured`다. `Inferred`(교차 상관·LLM 제안)·`External`
+/// (Prometheus/Loki/sre-agent)은 그 소스가 배선되는 후속(D2/W4/C3)에서 쓰인다.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SourceQuality {
+    Measured,
+    Inferred,
+    External,
+}
+
+impl SourceQuality {
+    /// 사람용 짧은 라벨(출처 배지).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SourceQuality::Measured => "측정",
+            SourceQuality::Inferred => "추론",
+            SourceQuality::External => "외부",
+        }
+    }
+}
+
 /// 결정적 임계 스캔(`scan_findings`)이 만든 단일 발견 — LLM 무관, injection-safe data.
 ///
 /// `severity`는 status bar(`sys_sampler::Severity`)와 **동일 타입을 재사용**해 심각도 표현을 한 곳으로
@@ -31,21 +66,30 @@ pub(crate) enum Confidence {
 pub(crate) struct Finding {
     pub(crate) severity: Severity,
     pub(crate) confidence: Confidence,
+    /// (D1) 출처 품질 — 측정/추론/외부. 결정적 임계 스캔은 전부 `Measured`.
+    pub(crate) source: SourceQuality,
     pub(crate) probe_id: String,
     pub(crate) message: String,
     pub(crate) suggested_followup: Option<String>,
 }
 
 impl Finding {
-    /// 결정적 단일-임계 발견(신뢰도 High). `probe_id`는 발견을 만든 evidence 섹션 id.
+    /// 결정적 단일-임계 발견(신뢰도 High, 출처 Measured). `probe_id`는 발견을 만든 evidence 섹션 id.
     fn new(severity: Severity, probe_id: &str, message: String) -> Self {
         Self {
             severity,
             confidence: Confidence::High,
+            source: SourceQuality::Measured,
             probe_id: probe_id.to_string(),
             message,
             suggested_followup: None,
         }
+    }
+
+    /// (D1) 신뢰도·출처 배지 `[신뢰도 high · 측정]`. render_line 뒤에 붙여 직접 측정과 (후속) 추론을
+    /// 시각적으로 구분한다. 순수.
+    pub(crate) fn grade_badge(&self) -> String {
+        format!("[{} · {}]", self.confidence.label(), self.source.label())
     }
 
     /// 후속 확인 제안(`<catalog/template id> <arg>`)을 단다. arg는 증거에 whole-token으로 실존하고
@@ -144,7 +188,11 @@ pub(crate) fn collect_probe_evidence(
     sandbox: &Sandbox,
     corr_prefix: &str,
 ) -> String {
-    run_probe_list(select_probes(symptom, docker_available()), sandbox, corr_prefix)
+    run_probe_list(
+        select_probes(symptom, docker_available()),
+        sandbox,
+        corr_prefix,
+    )
 }
 
 /// auto-RCA(L3) 전용 **포괄** 수집 — `scan_findings`가 키로 삼는 **모든** 섹션(disk·inodes·dmesg_oom·
@@ -152,7 +200,11 @@ pub(crate) fn collect_probe_evidence(
 /// 단일 카테고리로 좁혀(cpu/load Crit엔 scan 키가 0개, 복합 장애 disk+OOM엔 첫 매칭 카테고리만) 결정적
 /// 신호를 놓치므로, RCA는 메모리·디스크·프로세스 카테고리 probe를 union한다.
 pub(crate) fn collect_comprehensive_evidence(sandbox: &Sandbox, corr_prefix: &str) -> String {
-    run_probe_list(comprehensive_probes(docker_available()), sandbox, corr_prefix)
+    run_probe_list(
+        comprehensive_probes(docker_available()),
+        sandbox,
+        corr_prefix,
+    )
 }
 
 /// `scan_findings` 키 섹션을 모두 포함하는 포괄 probe 집합(base 컨텍스트 + 메모리/디스크/프로세스 union).
@@ -161,10 +213,22 @@ fn comprehensive_probes(docker_available: bool) -> Vec<(&'static str, String)> {
     let mut sections: Vec<&'static str> = Vec::new();
     // base + scan_findings 7키 전부 + 보강 컨텍스트(원인 추적용 상위 프로세스·압박 신호).
     let want: &[&str] = &[
-        "date", "host", "os", "uptime", // 컨텍스트
-        "disk", "inodes", // disk 키
-        "memory", "swap_usage", "dmesg_oom", "mem_top_proc", "mem_pressure", // memory 키(+보강)
-        "process", "proc_states", "fd", "failed_units", "journal_errors", // process/services 키(+보강)
+        "date",
+        "host",
+        "os",
+        "uptime", // 컨텍스트
+        "disk",
+        "inodes", // disk 키
+        "memory",
+        "swap_usage",
+        "dmesg_oom",
+        "mem_top_proc",
+        "mem_pressure", // memory 키(+보강)
+        "process",
+        "proc_states",
+        "fd",
+        "failed_units",
+        "journal_errors", // process/services 키(+보강)
     ];
     for id in want {
         if !sections.contains(id) {
@@ -197,8 +261,14 @@ pub async fn run_headless_diagnose(
     dispatcher: Option<&LlmDispatcher>,
     corr_prefix: &str,
 ) -> HeadlessDiagnosis {
-    run_headless_diagnose_opts(symptom, sandbox, dispatcher, corr_prefix, Default::default())
-        .await
+    run_headless_diagnose_opts(
+        symptom,
+        sandbox,
+        dispatcher,
+        corr_prefix,
+        Default::default(),
+    )
+    .await
 }
 
 /// `run_headless_diagnose` + 옵션. `opts.follow_up`이면 1차 분석의 ```aic-followup``` 블록을
@@ -252,11 +322,14 @@ pub async fn run_headless_diagnose_opts(
             let mut executed = 0usize;
             for line in lines {
                 if executed >= MAX_FOLLOWUP_CMDS {
-                    followup_rejected.push(format!("{line} — 명령 수 상한({MAX_FOLLOWUP_CMDS}) 초과"));
+                    followup_rejected
+                        .push(format!("{line} — 명령 수 상한({MAX_FOLLOWUP_CMDS}) 초과"));
                     continue;
                 }
                 if fu_evidence.len() >= MAX_FOLLOWUP_OUTPUT_BYTES {
-                    followup_rejected.push(format!("{line} — 출력 예산({MAX_FOLLOWUP_OUTPUT_BYTES}B) 소진"));
+                    followup_rejected.push(format!(
+                        "{line} — 출력 예산({MAX_FOLLOWUP_OUTPUT_BYTES}B) 소진"
+                    ));
                     continue;
                 }
                 let (name, cmd) = match resolve_followup_line(&line, &evidence) {
@@ -290,7 +363,8 @@ pub async fn run_headless_diagnose_opts(
                 executed += 1;
             }
             if executed > 0 {
-                let prompt2 = build_followup_reanalysis_prompt(symptom, &first, &evidence, &fu_evidence);
+                let prompt2 =
+                    build_followup_reanalysis_prompt(symptom, &first, &evidence, &fu_evidence);
                 match d.send(&prompt2).await {
                     Ok(text) => analysis = Some(text.trim().to_string()),
                     // 재분석 실패 시 1차 분석 유지 — follow-up 증거는 bundle에 남는다.
@@ -552,19 +626,41 @@ pub(crate) fn select_probes(
             // R8 심층 신호: iostat(느린 디스크)·block_topology(ro 리마운트), vmstat(iowait),
             // dmesg_oom(OOM kill), failed_units/journal_errors(서비스 크래시), conntrack/listen(연결 포화).
             "disk" => &[
-                "inodes", "log_big", "tmp_big", "tmp_recent", "iostat_devices", "block_topology",
+                "inodes",
+                "log_big",
+                "tmp_big",
+                "tmp_recent",
+                "iostat_devices",
+                "block_topology",
                 "timer_schedule",
             ],
             "generic" => &[
-                "inodes", "fd", "tmp_big", "failed_units", "journal_errors", "reboot_history",
-                "time_sync", "kernel_limits", "cpu_count", "timer_schedule", "cron_jobs",
+                "inodes",
+                "fd",
+                "tmp_big",
+                "failed_units",
+                "journal_errors",
+                "reboot_history",
+                "time_sync",
+                "kernel_limits",
+                "cpu_count",
+                "timer_schedule",
+                "cron_jobs",
             ],
             "network" => &[
-                "conn_states", "tcp_retrans", "listen_backlog", "conntrack_max", "kernel_limits",
+                "conn_states",
+                "tcp_retrans",
+                "listen_backlog",
+                "conntrack_max",
+                "kernel_limits",
                 "dns_resolver",
             ],
             "process" => &[
-                "proc_states", "mem_top_proc", "fd", "failed_units", "journal_errors",
+                "proc_states",
+                "mem_top_proc",
+                "fd",
+                "failed_units",
+                "journal_errors",
                 "launchd_failed",
             ],
             "cpu" => &["cpu_throttle", "vmstat_iowait", "cpu_count", "mac_thermal"],
@@ -676,7 +772,12 @@ const ZOMBIE_WARN_MIN: u32 = 10;
 /// `⚠ 실패한 systemd 유닛` 라벨에 나열할 unit 이름 최대 개수.
 const FAILED_UNIT_NAME_CAP: usize = 5;
 /// OOM-killer **이벤트** 시그니처(소문자 contains). bare "oom"은 zoom/room 오탐이라 쓰지 않는다.
-const OOM_SIGNATURES: &[&str] = &["out of memory", "killed process", "oom-killer", "oom_reaper"];
+const OOM_SIGNATURES: &[&str] = &[
+    "out of memory",
+    "killed process",
+    "oom-killer",
+    "oom_reaper",
+];
 /// systemd unit 이름으로 인정하는 접미사(failed_units 행 판별·placeholder 오탐 방지).
 const UNIT_SUFFIXES: &[&str] = &[
     ".service",
@@ -731,18 +832,18 @@ fn scan_mount_pct(body: &str, threshold: u32, use_last_pct: bool) -> Vec<(String
     const PSEUDO_FS: &[&str] = &["tmpfs", "devfs", "overlay", "udev", "none", "map", "shm"];
     // 마운트 경로 기준 — 본질적으로 읽기전용/항상-가득(용량 경고가 무의미).
     const READONLY_MOUNT_PREFIXES: &[&str] = &[
-        "/snap/",                      // Linux snap squashfs (항상 100%)
-        "/media/",                     // Linux 제거식/광학(iso9660 등) 마운트
-        "/run/media/",                 // Linux(udisks) 제거식 마운트
-        "/boot/efi",                   // ESP(vfat) — 작고 상시 높음, 비-actionable
-        "/Volumes/",                   // macOS 제거식/DMG 마운트
+        "/snap/",      // Linux snap squashfs (항상 100%)
+        "/media/",     // Linux 제거식/광학(iso9660 등) 마운트
+        "/run/media/", // Linux(udisks) 제거식 마운트
+        "/boot/efi",   // ESP(vfat) — 작고 상시 높음, 비-actionable
+        "/Volumes/",   // macOS 제거식/DMG 마운트
         "/System/Volumes/Preboot",
         "/System/Volumes/VM",
         "/System/Volumes/Update",
         "/System/Volumes/xarts",
         "/System/Volumes/iSCPreboot",
         "/System/Volumes/Hardware",
-        "/private/var/run/com.apple",   // macOS cryptex/MobileAsset
+        "/private/var/run/com.apple", // macOS cryptex/MobileAsset
     ];
     let mut out = Vec::new();
     for line in body.lines() {
@@ -760,9 +861,17 @@ fn scan_mount_pct(body: &str, threshold: u32, use_last_pct: bool) -> Vec<(String
         let pcts: Vec<(usize, u32)> = toks
             .iter()
             .enumerate()
-            .filter_map(|(i, t)| t.strip_suffix('%').and_then(|n| n.parse::<u32>().ok()).map(|v| (i, v)))
+            .filter_map(|(i, t)| {
+                t.strip_suffix('%')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .map(|v| (i, v))
+            })
             .collect();
-        let Some(&(pos, pct)) = (if use_last_pct { pcts.last() } else { pcts.first() }) else {
+        let Some(&(pos, pct)) = (if use_last_pct {
+            pcts.last()
+        } else {
+            pcts.first()
+        }) else {
             continue;
         };
         // inode 모드: 마지막 %가 진짜 %iused인지 — 바로 뒤 토큰이 마운트 경로(`/`)여야 한다. macOS df -i의
@@ -820,7 +929,9 @@ fn scan_oom(body: &str) -> Vec<String> {
         })
         .count();
     if n > 0 {
-        vec![format!("커널 OOM-killer 흔적 발견({n}줄) — 메모리 부족으로 프로세스 강제 종료됨")]
+        vec![format!(
+            "커널 OOM-killer 흔적 발견({n}줄) — 메모리 부족으로 프로세스 강제 종료됨"
+        )]
     } else {
         Vec::new()
     }
@@ -830,7 +941,9 @@ fn scan_oom(body: &str) -> Vec<String> {
 fn scan_zombies(body: &str) -> Vec<String> {
     for line in body.lines() {
         let mut it = line.split_whitespace();
-        let (Some(count), Some(stat)) = (it.next(), it.next()) else { continue };
+        let (Some(count), Some(stat)) = (it.next(), it.next()) else {
+            continue;
+        };
         if stat.starts_with('Z') {
             if let Ok(n) = count.parse::<u32>() {
                 if n >= ZOMBIE_WARN_MIN {
@@ -875,7 +988,10 @@ fn scan_failed_units(body: &str) -> Vec<String> {
     } else {
         String::new()
     };
-    vec![format!("실패한 systemd 유닛 {}개: {shown}{more}", names.len())]
+    vec![format!(
+        "실패한 systemd 유닛 {}개: {shown}{more}",
+        names.len()
+    )]
 }
 
 /// fd 섹션에서 열린 파일 디스크립터 current/max 비율이 임계 이상이면 ⚠(순수). OS별 sysctl 포맷을 모두
@@ -941,7 +1057,8 @@ fn scan_swap(body: &str) -> Vec<String> {
         if it.next() != Some("Swap:") {
             continue;
         }
-        let (Some(total), Some(used)) = (it.next().and_then(to_bytes), it.next().and_then(to_bytes))
+        let (Some(total), Some(used)) =
+            (it.next().and_then(to_bytes), it.next().and_then(to_bytes))
         else {
             continue;
         };
@@ -950,7 +1067,9 @@ fn scan_swap(body: &str) -> Vec<String> {
         }
         let pct = (used / total * 100.0) as u64;
         if pct >= SWAP_USED_PCT {
-            return vec![format!("swap {pct}% 사용 (>= {SWAP_USED_PCT}%) — 메모리 압박/스왑 thrash 의심")];
+            return vec![format!(
+                "swap {pct}% 사용 (>= {SWAP_USED_PCT}%) — 메모리 압박/스왑 thrash 의심"
+            )];
         }
     }
     Vec::new()
@@ -1011,7 +1130,8 @@ pub(crate) fn render_findings_block_with(findings: &[Finding], header: &str) -> 
     }
     let mut s = format!("{header}\n");
     for f in findings {
-        s.push_str(&format!("- {}\n", f.render_line()));
+        // (D1) 발견 줄 끝에 신뢰도·출처 배지를 붙여 "얼마나 확실한가"를 함께 보여준다.
+        s.push_str(&format!("- {} {}\n", f.render_line(), f.grade_badge()));
         // 후속 확인 제안이 있으면 read-only hint 줄로 덧붙인다(자동 실행 아님 — 게이트 통과 가능한 제안).
         if let Some(fu) = &f.suggested_followup {
             s.push_str(&format!("  → 확인(read-only): {fu}\n"));
@@ -1172,7 +1292,11 @@ mod tests {
         assert!(names.contains(&"k8s_pods_notready"), "names={names:?}");
         assert!(names.contains(&"k8s_node_pressure"));
         for (name, cmd) in &probes {
-            assert_eq!(classify(cmd).level, RiskLevel::Safe, "{name} not Safe: {cmd}");
+            assert_eq!(
+                classify(cmd).level,
+                RiskLevel::Safe,
+                "{name} not Safe: {cmd}"
+            );
         }
     }
 
@@ -1228,7 +1352,10 @@ mod tests {
         assert!(names.contains(&"docker_df"));
         assert!(names.contains(&"docker_ps"));
         assert!(names.contains(&"docker_images"));
-        assert!(names.contains(&"docker_stats"), "docker stats 누락: {names:?}");
+        assert!(
+            names.contains(&"docker_stats"),
+            "docker stats 누락: {names:?}"
+        );
     }
 
     #[test]
@@ -1322,7 +1449,13 @@ mod tests {
     #[test]
     fn docker_unavailable_adds_no_docker_probes() {
         // docker 미설치 호스트: 명시적 docker 카테고리가 아니면 docker probe 를 붙이지 않는다(노이즈 0).
-        for sym in ["서버가 느려", "메모리 누수", "앱이 죽어", "디스크 full", "원인 모름 그냥 이상"] {
+        for sym in [
+            "서버가 느려",
+            "메모리 누수",
+            "앱이 죽어",
+            "디스크 full",
+            "원인 모름 그냥 이상",
+        ] {
             let names: Vec<&str> = select_probes(Some(sym), false)
                 .iter()
                 .map(|(n, _)| *n)
@@ -1394,8 +1527,8 @@ mod tests {
             "proc_net 4821",
         ] {
             let ev = if line.contains("web1") { evidence } else { ev2 };
-            let (_, cmd) = resolve_followup_line(line, ev)
-                .unwrap_or_else(|e| panic!("{line} 거부됨: {e}"));
+            let (_, cmd) =
+                resolve_followup_line(line, ev).unwrap_or_else(|e| panic!("{line} 거부됨: {e}"));
             assert_eq!(classify(&cmd).level, RiskLevel::Safe, "{line}: {cmd}");
         }
         // 게이트 거부: 증거에 없는 인자(LLM 창작), charset 위반, 미등록 id,
@@ -1411,7 +1544,9 @@ mod tests {
         assert!(resolve_followup_line("docker_logs ../etc", evidence)
             .unwrap_err()
             .contains("charset"));
-        assert!(resolve_followup_line("rm", evidence).unwrap_err().contains("없는 id"));
+        assert!(resolve_followup_line("rm", evidence)
+            .unwrap_err()
+            .contains("없는 id"));
         assert!(resolve_followup_line("rm -rf /", evidence)
             .unwrap_err()
             .contains("형식 위반"));
@@ -1463,13 +1598,21 @@ mod tests {
         assert_eq!(f[0].severity, Severity::Warn);
         assert_eq!(f[0].probe_id, "disk");
         assert!(f[0].message.contains("/ 디스크 95%"), "{f:?}");
-        assert!(!f.iter().any(|x| x.message.contains("100%")), "의사 fs 제외 실패: {f:?}");
+        assert!(
+            !f.iter().any(|x| x.message.contains("100%")),
+            "의사 fs 제외 실패: {f:?}"
+        );
         // 회귀(리뷰 major fix): macOS df -h 네트워크 마운트(%iused='-')에서도 마운트 경로가 garbling 없이
         // 추출돼야 한다 — 선택 %(Capacity) 뒤에 낀 iused/ifree/- stray 컬럼을 건너뛰고 첫 절대경로부터.
-        let mac_net = "## disk\nOrbStack:/OrbStack 1.2Ti 1.1Ti 50Gi 96% 0 0 - /Users/jinwoo/OrbStack\n";
+        let mac_net =
+            "## disk\nOrbStack:/OrbStack 1.2Ti 1.1Ti 50Gi 96% 0 0 - /Users/jinwoo/OrbStack\n";
         let g = scan_findings(mac_net);
         assert_eq!(g.len(), 1, "{g:?}");
-        assert!(g[0].message.starts_with("/Users/jinwoo/OrbStack 디스크 96%"), "garbled mount: {g:?}");
+        assert!(
+            g[0].message
+                .starts_with("/Users/jinwoo/OrbStack 디스크 96%"),
+            "garbled mount: {g:?}"
+        );
     }
 
     #[test]
@@ -1485,7 +1628,11 @@ mod tests {
         let f = scan_findings(z);
         assert_eq!(f[0].severity, Severity::Warn);
         assert_eq!(f[0].probe_id, "proc_states");
-        assert!(f.iter().any(|x| x.message.contains("좀비") && x.message.contains("12개")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("좀비") && x.message.contains("12개")),
+            "{f:?}"
+        );
         // 소수 좀비(임계 미달)는 발화하지 않는다.
         assert!(scan_findings("## proc_states\n   3 Z\n").is_empty());
         // 실패 unit: unit 접미사 행만 카운트. 선행 불릿 마커(●)도 처리.
@@ -1494,7 +1641,11 @@ redis.service loaded failed failed KV\n";
         let f = scan_findings(fu);
         assert_eq!(f[0].severity, Severity::Warn);
         assert_eq!(f[0].probe_id, "failed_units");
-        assert!(f.iter().any(|x| x.message.contains("실패한 systemd 유닛 2개")), "{f:?}");
+        assert!(
+            f.iter()
+                .any(|x| x.message.contains("실패한 systemd 유닛 2개")),
+            "{f:?}"
+        );
         assert!(f[0].message.contains("nginx.service"));
     }
 
@@ -1512,16 +1663,26 @@ devfs 486 486 0 100% 842 0 100% /dev\n";
         assert!(f[0].message.contains("/ inode 95%"), "{f:?}");
         // 첫 %(Capacity)가 높아도 마지막 %(=%iused)가 낮으면 무발화 — last-% 사용을 증명(disk와 반대).
         let cap_high_inode_low = "## inodes\n/dev/disk3s6 100 95 5 95% 5 1000 2% /data\n";
-        assert!(scan_findings(cap_high_inode_low).is_empty(), "last-% 미사용: {:?}", scan_findings(cap_high_inode_low));
+        assert!(
+            scan_findings(cap_high_inode_low).is_empty(),
+            "last-% 미사용: {:?}",
+            scan_findings(cap_high_inode_low)
+        );
         // Linux df -i(단일 %): IUse% 100% → 발화.
-        assert!(scan_findings("## inodes\n/dev/sda1 6553600 6553000 600 100% /\n")[0]
-            .message
-            .contains("inode 100%"));
+        assert!(
+            scan_findings("## inodes\n/dev/sda1 6553600 6553000 600 100% /\n")[0]
+                .message
+                .contains("inode 100%")
+        );
         // 회귀(리뷰 major): macOS df -i 네트워크/fuse 마운트는 %iused가 '-'라 % 컬럼이 Capacity 하나뿐.
         // Capacity를 inode%로 오탐하면 안 됨 → 무발화(마지막 % 뒤가 경로가 아니므로 skip).
         let dash_iused =
             "## inodes\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n";
-        assert!(scan_findings(dash_iused).is_empty(), "dash %iused 오탐: {:?}", scan_findings(dash_iused));
+        assert!(
+            scan_findings(dash_iused).is_empty(),
+            "dash %iused 오탐: {:?}",
+            scan_findings(dash_iused)
+        );
 
         // fd: current/max >= 80% 발화(양 OS sysctl 포맷). 미파싱/저비율은 무발화(보수적).
         let f = scan_findings("## fd\nkern.num_files: 350000\nkern.maxfiles: 368640\n");
@@ -1529,9 +1690,11 @@ devfs 486 486 0 100% 842 0 100% /dev\n";
         assert_eq!(f[0].probe_id, "fd");
         assert!(f[0].message.contains("Too many open files"), "{f:?}");
         assert!(scan_findings("## fd\nkern.num_files: 14457\nkern.maxfiles: 368640\n").is_empty()); // 3%
-        assert!(scan_findings("## fd\nfs.file-nr = 900 0 1000\nfs.file-max = 1000\n")[0]
-            .message
-            .contains("90%"));
+        assert!(
+            scan_findings("## fd\nfs.file-nr = 900 0 1000\nfs.file-max = 1000\n")[0]
+                .message
+                .contains("90%")
+        );
         // Linux 실제(file-max 거대) → ~0% 무발화. max 누락 → 무발화.
         assert!(scan_findings(
             "## fd\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n"
@@ -1546,7 +1709,7 @@ devfs 486 486 0 100% 842 0 100% /dev\n";
         assert!(sf[0].message.contains("swap 87%"), "{sf:?}");
         assert!(scan_findings("## swap_usage\nSwap: 8.0G 1.0G 7.0G\n").is_empty()); // 12%
         assert!(scan_findings("## swap_usage\nSwap: 0B 0B 0B\n").is_empty()); // swap off(total=0)
-        // macOS vm.swapusage는 95%여도 무발화 — Linux-only 게이트.
+                                                                              // macOS vm.swapusage는 95%여도 무발화 — Linux-only 게이트.
         assert!(scan_findings(
             "## swap_usage\ntotal = 5120.00M  used = 4900.00M  free = 220.00M  (encrypted)\n"
         )
@@ -1559,7 +1722,11 @@ devfs 486 486 0 100% 842 0 100% /dev\n";
         // stdout 본문만 스캔하므로 오탐하지 않는다(정상 호스트=OOM 0건).
         let wrapped = "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\n\
 exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n";
-        assert!(scan_findings(wrapped).is_empty(), "command echo 오탐: {:?}", scan_findings(wrapped));
+        assert!(
+            scan_findings(wrapped).is_empty(),
+            "command echo 오탐: {:?}",
+            scan_findings(wrapped)
+        );
         // 래퍼 stdout에 실제 OOM 라인이 있으면 정상 발화.
         let real = "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\n\
 exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
@@ -1676,13 +1843,25 @@ tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\ntcp LISTEN 0 128 0.0.0.0:8080 0.0.0.0:*\n
 tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
 ## failed_units\ncommand: x\n--- stdout ---\n● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\n--- stderr ---\n\n";
         let f = scan_baseline_findings(old, new);
-        assert!(f.iter().any(|x| x.probe_id == "ports" && x.severity == Severity::Warn && x.message.contains("0.0.0.0:8080")), "{f:?}");
-        assert!(f.iter().any(|x| x.probe_id == "failed_units" && x.message.contains("redis.service")), "{f:?}");
+        assert!(
+            f.iter().any(|x| x.probe_id == "ports"
+                && x.severity == Severity::Warn
+                && x.message.contains("0.0.0.0:8080")),
+            "{f:?}"
+        );
+        assert!(
+            f.iter()
+                .any(|x| x.probe_id == "failed_units" && x.message.contains("redis.service")),
+            "{f:?}"
+        );
         // 기존 22 포트·nginx는 신규 아님 → 무발화.
         assert!(!f.iter().any(|x| x.message.contains("0.0.0.0:22")), "{f:?}");
         assert!(!f.iter().any(|x| x.message.contains("nginx")), "{f:?}");
         // ephemeral(>=32768) 신규 포트는 노이즈 컷으로 제외 → 무발화(단명 dev 리스너 회전 오탐 방지).
-        assert!(!f.iter().any(|x| x.message.contains("49484")), "ephemeral 미제외: {f:?}");
+        assert!(
+            !f.iter().any(|x| x.message.contains("49484")),
+            "ephemeral 미제외: {f:?}"
+        );
         // 동일 스냅샷 → 발견 0(노이즈 없음).
         assert!(scan_baseline_findings(new, new).is_empty());
         // peer 와일드카드(0.0.0.0:*)는 포트가 숫자 아니라 키에서 제외 → 오탐 없음.
@@ -1692,8 +1871,15 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         let mo = "## ports\n--- stdout ---\nrapportd 1169 u 15u IPv4 0xeac 0t0 TCP *:22 (LISTEN)\n--- stderr ---\n\n";
         let mn = "## ports\n--- stdout ---\nrapportd 1169 u 15u IPv4 0xeac 0t0 TCP *:22 (LISTEN)\nnode 9 u 5u IPv4 0xabc 0t0 TCP 127.0.0.1:3000 (LISTEN)\n--- stderr ---\n\n";
         let mf = scan_baseline_findings(mo, mn);
-        assert!(mf.iter().any(|x| x.message.contains("127.0.0.1:3000")), "{mf:?}");
-        assert_eq!(mf.len(), 1, "신규 1개만(pid 1169/device 0xabc 등 volatile은 키 아님): {mf:?}");
+        assert!(
+            mf.iter().any(|x| x.message.contains("127.0.0.1:3000")),
+            "{mf:?}"
+        );
+        assert_eq!(
+            mf.len(),
+            1,
+            "신규 1개만(pid 1169/device 0xabc 등 volatile은 키 아님): {mf:?}"
+        );
     }
 
     #[test]
@@ -1711,9 +1897,9 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
             .clone()
             .unwrap();
         assert_eq!(fu, "journal_unit nginx.service"); // 집계 메시지는 전부 나열하되 hint는 첫 unit.
-        // resolve_followup_line이 Ok를 반환한다는 것 자체가 4층 게이트(template id·whole-token·charset·
-        // risk_guard Safe)를 모두 통과했다는 증거 — 결정적이라 LLM 무관. 렌더 명령은 OS별(journalctl/dmesg)
-        // 이지만 둘 다 unit 인자를 담고 Safe다.
+                                                      // resolve_followup_line이 Ok를 반환한다는 것 자체가 4층 게이트(template id·whole-token·charset·
+                                                      // risk_guard Safe)를 모두 통과했다는 증거 — 결정적이라 LLM 무관. 렌더 명령은 OS별(journalctl/dmesg)
+                                                      // 이지만 둘 다 unit 인자를 담고 Safe다.
         let (_, cmd) = resolve_followup_line(&fu, ev).unwrap();
         assert!(cmd.contains("nginx.service"), "{cmd}");
         assert_eq!(classify(&cmd).level, RiskLevel::Safe);
@@ -1727,8 +1913,14 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         let tev = "## failed_units\ncommand: x\n--- stdout ---\n● getty@tty1.service loaded failed failed Getty\n--- stderr ---\n\n";
         let tf = scan_findings(tev);
         let ff = tf.iter().find(|x| x.probe_id == "failed_units").unwrap();
-        assert!(ff.message.contains("getty@tty1.service"), "발견은 표시: {tf:?}");
-        assert!(ff.suggested_followup.is_none(), "@ unit엔 hint 미부착: {tf:?}");
+        assert!(
+            ff.message.contains("getty@tty1.service"),
+            "발견은 표시: {tf:?}"
+        );
+        assert!(
+            ff.suggested_followup.is_none(),
+            "@ unit엔 hint 미부착: {tf:?}"
+        );
         // 렌더: hint가 별도 '→ 확인' 줄로 붙는다(render_line 한 줄 불변은 유지).
         let block = render_findings_block(&f);
         assert!(
@@ -1751,9 +1943,29 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
 ## disk\n/dev/sda1 100G 95G 5G 95% /\n",
         );
         let block = render_findings_block(&findings);
-        assert!(block.starts_with("## ⚠ 자동 발견 (결정적 임계 스캔)\n"), "{block}");
-        assert!(block.contains("🔴") && block.contains("OOM-killer"), "{block}");
-        assert!(block.contains("🟡") && block.contains("/ 디스크 95%"), "{block}");
+        assert!(
+            block.starts_with("## ⚠ 자동 발견 (결정적 임계 스캔)\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("🔴") && block.contains("OOM-killer"),
+            "{block}"
+        );
+        assert!(
+            block.contains("🟡") && block.contains("/ 디스크 95%"),
+            "{block}"
+        );
+        // (D1) 각 발견 줄에 신뢰도·출처 배지가 붙는다. 결정적 스캔은 전부 high·측정.
+        assert!(block.contains("[high · 측정]"), "신뢰도 배지 누락: {block}");
+    }
+
+    #[test]
+    fn grade_badge_reflects_confidence_and_source() {
+        // 결정적 임계 스캔 발견은 high 신뢰도 + 측정 출처.
+        let f = scan_findings("## disk\n/dev/sda1 100G 95G 5G 95% /\n");
+        assert_eq!(f[0].confidence, Confidence::High);
+        assert_eq!(f[0].source, SourceQuality::Measured);
+        assert_eq!(f[0].grade_badge(), "[high · 측정]");
     }
 
     #[test]
@@ -1767,11 +1979,28 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
             ("cpu 높음", &["vmstat_iowait", "cpu_count", "mac_thermal"]),
             ("메모리 누수", &["dmesg_oom"]),
             ("디스크 공간 부족", &["iostat_devices", "block_topology"]),
-            ("포트 연결 안 됨", &["listen_backlog", "conntrack_max", "kernel_limits", "dns_resolver"]),
-            ("프로세스가 죽음", &["failed_units", "journal_errors", "launchd_failed"]),
+            (
+                "포트 연결 안 됨",
+                &[
+                    "listen_backlog",
+                    "conntrack_max",
+                    "kernel_limits",
+                    "dns_resolver",
+                ],
+            ),
+            (
+                "프로세스가 죽음",
+                &["failed_units", "journal_errors", "launchd_failed"],
+            ),
             (
                 "원인 모름 그냥 이상",
-                &["failed_units", "reboot_history", "kernel_limits", "cpu_count", "cron_jobs"],
+                &[
+                    "failed_units",
+                    "reboot_history",
+                    "kernel_limits",
+                    "cpu_count",
+                    "cron_jobs",
+                ],
             ),
         ];
         for (sym, expect) in cases {
@@ -1781,7 +2010,11 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
                 assert!(names.contains(want), "sym={sym} 에 {want} 누락: {names:?}");
             }
             for (name, cmd) in &probes {
-                assert_eq!(classify(cmd).level, RiskLevel::Safe, "{name} not Safe: {cmd}");
+                assert_eq!(
+                    classify(cmd).level,
+                    RiskLevel::Safe,
+                    "{name} not Safe: {cmd}"
+                );
             }
         }
     }

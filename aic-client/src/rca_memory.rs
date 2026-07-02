@@ -18,7 +18,10 @@ use crate::rca::IncidentMeta;
 /// 보수적으로만(소문자화 + 연속 공백을 단일 공백으로 + trim) — 숫자/에러코드(5xx 등)는 의미가 있어 보존한다.
 /// record와 match가 같은 정규화를 거치므로 양쪽 키가 일치한다.
 fn normalize_event(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// aic RCA incident → sre-agent incident-memory 키 `(sensor, event, severity)`.
@@ -60,13 +63,91 @@ pub async fn match_incidents(mcp: &McpConfig, meta: &IncidentMeta, limit: u32) -
     sre_call(mcp, "__match_incidents", args).await
 }
 
+/// (C3) incident 없이 **증상 문자열만으로** 유사 과거 incident를 찾는다(읽기 전용 pull). `/diagnose`·
+/// `/local`의 finding 순간에 쓴다 — sensor는 incident와 동일 `aic-rca`, event는 정규화한 증상, severity는
+/// 미상(`unknown`). record와 동일한 normalize를 거쳐 키가 일치한다.
+pub async fn match_by_symptom(mcp: &McpConfig, symptom: &str, limit: u32) -> Option<String> {
+    let event = normalize_event(symptom);
+    if event.is_empty() {
+        return None;
+    }
+    let args =
+        json!({ "sensor": "aic-rca", "event": event, "severity": "unknown", "limit": limit });
+    sre_call(mcp, "__match_incidents", args).await
+}
+
 /// 이 incident 패턴에 권장되는 runbook을 sre-agent에 묻는다(읽기 전용 pull) — "무엇을 해야 하나".
 /// severity는 sre-agent의 runbook enum(debug/info/warn/error)이 RCA 라벨과 달라 생략하고, 원문 증상을 query로 넘긴다.
-pub async fn recommend_runbooks(mcp: &McpConfig, meta: &IncidentMeta, limit: u32) -> Option<String> {
+pub async fn recommend_runbooks(
+    mcp: &McpConfig,
+    meta: &IncidentMeta,
+    limit: u32,
+) -> Option<String> {
     let (sensor, event, _severity) = sre_keys(meta);
     let query = meta.symptom.clone().unwrap_or_else(|| meta.title.clone());
     let args = json!({ "sensor": sensor, "event": event, "query": query, "limit": limit });
     sre_call(mcp, "__recommend_runbooks", args).await
+}
+
+/// (M2) 센서별·시간창별 통계 이상 점수(z-score 상위 창)를 sre-agent에 묻는다(읽기 전용 pull).
+/// sre-agent `anomaly_scores` tool: `{ since_hours }`(기본 24). W4 web Watch 탭·CLI `aic rca anomaly`가 쓴다.
+pub async fn anomaly_scores(mcp: &McpConfig, since_hours: f64) -> Option<String> {
+    sre_call(
+        mcp,
+        "__anomaly_scores",
+        json!({ "since_hours": since_hours }),
+    )
+    .await
+}
+
+/// (M2) workload fingerprint 베이스라인 품질(센서별 확보 일수)을 sre-agent에 묻는다(읽기 전용 pull).
+/// sre-agent `fingerprint_status` tool: `{ baseline_days }`(기본 14).
+pub async fn fingerprint_status(mcp: &McpConfig, baseline_days: f64) -> Option<String> {
+    sre_call(
+        mcp,
+        "__fingerprint_status",
+        json!({ "baseline_days": baseline_days }),
+    )
+    .await
+}
+
+/// (M2) investigator가 스스로 찾은 최근 proactive finding 목록을 sre-agent에 묻는다(읽기 전용 pull).
+/// sre-agent `list_findings` tool: `{ since_hours, limit }`. C3(자동 힌트)·W4가 쓴다.
+pub async fn list_findings(mcp: &McpConfig, since_hours: f64, limit: u32) -> Option<String> {
+    sre_call(
+        mcp,
+        "__list_findings",
+        json!({ "since_hours": since_hours, "limit": limit }),
+    )
+    .await
+}
+
+/// (M2) 시간창을 timeline·요약·high-signal 이벤트·권장 runbook으로 재구성한다(읽기 전용 pull).
+/// sre-agent `incident_replay` tool은 **시간창 기반**(incident-id가 아님): `{ start?, end?, since_hours?,
+/// focus?, limit }`. incident에 앵커하려면 호출부가 incident의 시각을 start/end로 변환해 넘긴다.
+pub async fn incident_replay(
+    mcp: &McpConfig,
+    start: Option<String>,
+    end: Option<String>,
+    since_hours: Option<f64>,
+    focus: Option<String>,
+    limit: u32,
+) -> Option<String> {
+    let mut args = json!({ "limit": limit });
+    let obj = args.as_object_mut().expect("json object");
+    if let Some(s) = start {
+        obj.insert("start".into(), json!(s));
+    }
+    if let Some(e) = end {
+        obj.insert("end".into(), json!(e));
+    }
+    if let Some(h) = since_hours {
+        obj.insert("since_hours".into(), json!(h));
+    }
+    if let Some(f) = focus {
+        obj.insert("focus".into(), json!(f));
+    }
+    sre_call(mcp, "__incident_replay", args).await
 }
 
 /// 닫은 incident를 sre-agent 기억에 기록한다(핸드오프). 성공 시 `Some(응답 텍스트)`.
@@ -127,6 +208,9 @@ mod tests {
         assert_eq!(a, "redis oom kill");
         assert_eq!(a, b);
         // 숫자/에러코드는 의미가 있어 보존한다.
-        assert_eq!(sre_keys(&meta(Some("HTTP 5xx Spike"), None)).1, "http 5xx spike");
+        assert_eq!(
+            sre_keys(&meta(Some("HTTP 5xx Spike"), None)).1,
+            "http 5xx spike"
+        );
     }
 }
