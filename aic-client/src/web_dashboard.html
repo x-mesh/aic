@@ -574,6 +574,7 @@
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="serverlog" data-panel="serverlog" onclick="tab(this)">Server log</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="config" data-panel="config" onclick="tab(this)">Config</button>
   <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="external" data-panel="external" id="tab-external" hidden onclick="tab(this)">External</button>
+  <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="watch" data-panel="watch" id="tab-watch" hidden onclick="tab(this)">Watch</button>
 </nav>
 <main>
   <section id="resources" class="panel active" role="tabpanel">
@@ -723,6 +724,12 @@
     </div>
     <pre id="l-out" class="muted"></pre>
   </section>
+
+  <section id="watch" class="panel" role="tabpanel">
+    <div class="row"><button onclick="loadWatch()">새로고침</button>
+      <span class="muted">sre-agent 상시 감시 조회(읽기 전용) · anomaly / findings / fingerprint · 30s 캐시</span></div>
+    <div id="watch-out"><p class="muted">연결 후 새로고침하세요.</p></div>
+  </section>
 </main>
 
 <script>
@@ -779,6 +786,7 @@ function tab(btn) {
   if (btn.dataset.panel === "history") loadHistory();
   if (btn.dataset.panel === "webhooks") loadWebhooks();
   if (btn.dataset.panel === "serverlog") loadServerLog();
+  if (btn.dataset.panel === "watch") loadWatch();
   if (btn.dataset.panel === "config") loadConfig();
   HASH = { tab: btn.dataset.panel }; writeHash();   // #3: 탭 전환 시 sub-state 리셋
 }
@@ -818,6 +826,11 @@ async function connect() {
     const hasExt = (b.prometheus||[]).length || (b.loki||[]).length;
     document.getElementById("tab-external").hidden = !hasExt;
     if (hasExt) { fillBackends("m-backend", b.prometheus||[]); fillBackends("l-backend", b.loki||[]); }
+    // W4: sre-agent 조회 스냅샷이 available이면 Watch 탭을 드러낸다(미구성이면 숨김 유지).
+    try {
+      const w = await (await api("/web/watch")).json();
+      document.getElementById("tab-watch").hidden = !w.available;
+    } catch (e) {}
     fetchBannerData();                                    // #2 incident-now 배너 초기 + 12s 갱신
     if (bannerTimer) clearInterval(bannerTimer);
     bannerTimer = setInterval(fetchBannerData, 12000);
@@ -1807,6 +1820,26 @@ async function loadServerLog() {
         "</td><td class='muted'>" + esc(e.target || "") + "</td><td>" + esc(e.msg || "") + "</td></tr>";
     });
     out.innerHTML = h + "</table>"; reapplyFilter(out.id);
+  } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
+}
+// W4: sre-agent 조회 스냅샷(캐시). 미구성/조회 tool 없으면 안내만. 값은 sre-agent가 준 텍스트를 그대로 표시.
+async function loadWatch() {
+  if (!TOKEN) return; const out = document.getElementById("watch-out");
+  try {
+    const w = await (await api("/web/watch")).json();
+    if (!w.available) {
+      out.innerHTML = '<p class="muted">' + esc(w.status || "sre-agent 미연결") +
+        ' — [mcp] sre-agent를 구성하면 상시 감시 결과가 여기 표시됩니다.</p>';
+      return;
+    }
+    const age = w.ts ? bannerAge(w.ts) : "";
+    let h = '<p class="muted">sre-agent 스냅샷' + (age ? ' · ' + esc(age) : "") + ' (30s 캐시)</p>';
+    const sec = (title, body) => '<details class="sec" open><summary><strong>' + title + '</strong></summary><pre>' +
+      esc(body || "(없음)") + '</pre></details>';
+    h += sec("Anomaly scores", w.anomaly_scores);
+    h += sec("Findings", w.findings);
+    h += sec("Fingerprint status", w.fingerprint_status);
+    out.innerHTML = h;
   } catch (e) { out.innerHTML = '<p class="err">' + esc(e.message) + "</p>"; }
 }
 async function loadConfig() {
