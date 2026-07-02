@@ -50,8 +50,17 @@ impl WebhookAlert {
     }
 }
 
+/// 터미널 렌더 전에 제어문자(ANSI escape·C0/C1·DEL)를 제거한다. webhook alert 필드는 외부 alert
+/// payload에서 오므로, 그대로 터미널에 출력하면 escape sequence 주입(커서 조작·OSC 52 클립보드 등)이
+/// 가능하다. redaction은 secret/PII만 가리고 제어문자는 못 막으므로 여기서 별도로 없앤다(단일 라인 note라
+/// 개행/탭도 제거).
+pub(crate) fn strip_control(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// webhook-events.jsonl 한 줄(JSON)을 chat 유입용 alert로 파싱한다(pure — 단위 테스트 대상).
-/// actionable action(diagnosing/received)만 Some. 그 외 action·파싱 실패·비-객체는 None.
+/// actionable action(diagnosing/received)만 Some. 그 외 action·파싱 실패·비-객체는 None. 모든 자유
+/// 텍스트 필드는 `strip_control`을 통과해 터미널 escape 주입을 막는다(단일 choke point).
 pub(crate) fn parse_webhook_alert_line(line: &str) -> Option<WebhookAlert> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let action = v.get("action").and_then(|a| a.as_str())?.to_string();
@@ -63,16 +72,13 @@ pub(crate) fn parse_webhook_alert_line(line: &str) -> Option<WebhookAlert> {
         severity: v
             .get("severity")
             .and_then(|s| s.as_str())
-            .map(|s| s.to_string()),
-        alert: v
-            .get("alert")
-            .and_then(|a| a.as_str())
-            .map(|s| s.to_string()),
+            .map(strip_control),
+        alert: v.get("alert").and_then(|a| a.as_str()).map(strip_control),
         fingerprint: v
             .get("fingerprint")
             .and_then(|f| f.as_str())
-            .unwrap_or("")
-            .to_string(),
+            .map(strip_control)
+            .unwrap_or_default(),
     })
 }
 
@@ -102,11 +108,16 @@ fn read_new_alerts(path: &std::path::Path, offset: &mut u64) -> Vec<WebhookAlert
     if f.read_exact(&mut buf).is_err() {
         return Vec::new();
     }
-    let text = String::from_utf8_lossy(&buf);
-    // 마지막 줄이 개행으로 안 끝나면(부분 기록) 그 줄은 남기고 offset을 그 앞까지만 전진시킨다.
-    let consumed = text.rfind('\n').map(|i| i as u64 + 1).unwrap_or(0);
-    *offset += consumed;
-    text[..consumed as usize]
+    // offset은 **raw 바이트** 기준으로 전진시킨다. from_utf8_lossy는 잘못된 UTF-8을 U+FFFD(3바이트)로
+    // 치환해 문자열 인덱스가 원본 바이트 오프셋과 어긋나므로, 개행 위치는 원본 buf에서 찾는다(offset 드리프트
+    // 방지). 마지막 줄이 개행으로 안 끝나면(부분 기록) 그 줄은 남기고 그 앞까지만 전진시킨다.
+    let consumed = buf
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    *offset += consumed as u64;
+    String::from_utf8_lossy(&buf[..consumed])
         .lines()
         .filter_map(parse_webhook_alert_line)
         .collect()
@@ -209,6 +220,30 @@ mod tests {
         assert_eq!(got[0].fingerprint, "fp-new");
         // 다시 읽으면 새 줄 없음.
         assert!(read_new_alerts(&path, &mut offset).is_empty());
+    }
+
+    #[test]
+    fn strip_control_removes_ansi_and_newlines() {
+        // ANSI escape + 개행이 섞인 외부 alert 텍스트가 단일 라인 평문으로 정리된다(터미널 주입 방지).
+        assert_eq!(strip_control("a\x1b[31mred\x1b[0m\nb"), "a[31mred[0mb");
+        assert_eq!(strip_control("clean text"), "clean text");
+    }
+
+    #[test]
+    fn read_new_alerts_offset_matches_raw_bytes_on_invalid_utf8() {
+        // 잘못된 UTF-8이 섞여도 offset이 raw 바이트 기준으로 정확히 전진해야 한다(lossy 인덱스 드리프트 회귀).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("webhook-events.jsonl");
+        let mut bytes = br#"{"action":"received","alert":"x","fingerprint":"fp1"}"#.to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xff, 0xfe]); // 잘못된 UTF-8 부분 줄(개행 없음)
+        std::fs::write(&path, &bytes).unwrap();
+        let mut offset = 0u64;
+        let got = read_new_alerts(&path, &mut offset);
+        assert_eq!(got.len(), 1);
+        // offset은 첫 줄(개행 포함) 바이트 수까지만 — 잘못된 tail 2바이트는 소비 안 함.
+        let first_line_len = bytes.iter().position(|&b| b == b'\n').unwrap() as u64 + 1;
+        assert_eq!(offset, first_line_len);
     }
 
     #[test]

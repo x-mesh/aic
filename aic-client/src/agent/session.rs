@@ -2281,12 +2281,25 @@ fn gather_session_briefing() -> Option<String> {
 }
 
 /// webhook-events.jsonl을 읽어 최근 `window_hours` 안의 alert 수와 마지막 alert 요약을 센다.
-/// best-effort — 파일 부재/파싱 실패는 (0, None). 파일 크기 방어로 마지막 200줄만 본다.
+/// best-effort — 파일 부재/파싱 실패는 (0, None). **파일 끝에서 최대 256KiB만** 읽어(큰 로그에서 세션
+/// 시작 지연/OOM 방지) 마지막 200줄을 본다.
 fn webhook_briefing_counts(window_hours: i64) -> (usize, Option<String>) {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_CAP: u64 = 256 * 1024;
     let path = aic_common::paths::webhook_events_path();
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Ok(mut f) = std::fs::File::open(&path) else {
         return (0, None);
     };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(TAIL_CAP);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return (0, None);
+    }
+    let mut buf = Vec::new();
+    if f.read_to_end(&mut buf).is_err() {
+        return (0, None);
+    }
+    let content = String::from_utf8_lossy(&buf);
     let now = chrono::Utc::now().timestamp_millis();
     let cutoff = now - window_hours * 3600 * 1000;
     let lines: Vec<&str> = content.lines().rev().take(200).collect();
@@ -2311,13 +2324,17 @@ fn webhook_briefing_counts(window_hours: i64) -> (usize, Option<String>) {
         count += 1;
         if latest.is_none() {
             // rev 순회라 첫 매칭이 가장 최근. severity·alert를 짧게.
-            let sev = v
-                .get("severity")
-                .and_then(|s| s.as_str())
-                .unwrap_or("alert");
-            let alert = v.get("alert").and_then(|a| a.as_str()).unwrap_or("");
+            // 터미널 출력이므로 제어문자(ANSI escape 등)를 제거한다 — webhook 필드는 외부 payload 유래.
+            let sev = super::webhook_watch::strip_control(
+                v.get("severity")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("alert"),
+            );
+            let alert = super::webhook_watch::strip_control(
+                v.get("alert").and_then(|a| a.as_str()).unwrap_or(""),
+            );
             latest = Some(if alert.is_empty() {
-                sev.to_string()
+                sev
             } else {
                 format!("{sev} · {alert}")
             });

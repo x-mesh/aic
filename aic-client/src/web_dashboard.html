@@ -1390,11 +1390,12 @@ function updateBanner() {
   }
   const sm = BANNER_SUMMARY || {};
   const openN = sm.open_incidents || 0;
-  const inc = sm.latest_incident;
-  const worst = (inc && openN && inc.status !== "closed") ? inc.severity : null;
+  // 최악 open severity는 서버가 모든 open incident에서 계산해 준다(latest 한 건이 아님). SEV1/SEV2 → crit.
+  const worst = openN ? (sm.worst_open_severity || null) : null;
+  const worstLc = worst ? String(worst).toLowerCase() : "";
   if (sm.open_incidents != null) {
     segs.push(bannerSeg("incidents", openN + " open" + (worst ? " (" + String(worst).toUpperCase() + ")" : ""),
-      worst === "sev1" || worst === "sev2" ? "crit" : openN ? "warn" : "", "incidents"));
+      worstLc === "sev1" || worstLc === "sev2" ? "crit" : openN ? "warn" : "", "incidents"));
   }
   if (sm.recent_alerts_1h) {
     segs.push(bannerSeg("webhook", sm.recent_alerts_1h + " · 1h", "warn", "webhooks"));

@@ -93,12 +93,12 @@ impl OutboundAdapter for FileAdapter {
             .as_deref()
             .map(sanitize_token)
             .unwrap_or_else(|| "incident".to_string());
-        let base = format!("{stamp}-{fp}");
-        let json_path = self.dir.join(format!("{base}.json"));
-        let md_path = self.dir.join(format!("{base}.md"));
-        write_new(&json_path, json.as_bytes())?;
+        // 같은 초·같은 fingerprint(또는 fp=None으로 "incident" 상수)로 두 번 전송돼도 파일을 덮어쓰지
+        // 않도록 비어 있는 base를 찾는다(조용한 데이터 유실 방지).
+        let (json_path, md_path) = unique_pair(&self.dir, &format!("{stamp}-{fp}"));
+        write_0600(&json_path, json.as_bytes())?;
         // body_md는 이미 Redacted(평문 마스킹본).
-        write_new(&md_path, payload.body_md.as_str().as_bytes())?;
+        write_0600(&md_path, payload.body_md.as_str().as_bytes())?;
         Ok(DeliveryReceipt {
             target: self.name.clone(),
             bytes: json.len(),
@@ -107,9 +107,37 @@ impl OutboundAdapter for FileAdapter {
     }
 }
 
-/// 파일을 쓴다(부모 생성은 호출부). 0600 권한은 상위 dir 정책을 따른다 — 여기선 단순 쓰기.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+/// `{base}.json`이 비어 있으면 그대로, 있으면 `{base}-2`, `-3`… 으로 충돌을 피한 (json, md) 경로 쌍을
+/// 반환한다. 재전송이 기존 파일을 clobber하지 않게 한다.
+fn unique_pair(dir: &Path, base: &str) -> (PathBuf, PathBuf) {
+    let mut n = 1u32;
+    loop {
+        let stem = if n == 1 {
+            base.to_string()
+        } else {
+            format!("{base}-{n}")
+        };
+        let json = dir.join(format!("{stem}.json"));
+        if !json.exists() {
+            return (json, dir.join(format!("{stem}.md")));
+        }
+        n += 1;
+        if n > 1000 {
+            // 방어 상한 — 극단적으로 많으면 마지막 후보를 그냥 쓴다.
+            return (json, dir.join(format!("{stem}.md")));
+        }
+    }
+}
+
+/// 파일을 0600(소유자만 rw)으로 쓴다 — 내보낸 report는 redacted라도 incident 데이터라 타 사용자에게
+/// 노출하지 않는다(snapshot_store와 동일 정책). unix 외 플랫폼은 기본 권한.
+fn write_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     Ok(())
 }
 
@@ -234,6 +262,34 @@ mod tests {
         .unwrap();
         assert!(json.contains("[REDACTED:email]"));
         assert!(!json.contains("admin@corp.io"));
+    }
+
+    #[tokio::test]
+    async fn file_adapter_does_not_clobber_on_collision() {
+        // 같은 payload를 두 번 보내면(같은 초·fp=None → 같은 base) 덮어쓰지 않고 별도 파일로 남는다.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FileAdapter::new("file-local", dir.path());
+        let p = payload();
+        let r1 = adapter.deliver(&p).await.unwrap();
+        let r2 = adapter.deliver(&p).await.unwrap();
+        assert_ne!(r1.detail, r2.detail); // 서로 다른 파일 경로
+        let json_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .count();
+        assert_eq!(json_count, 2); // 2회 전송 → 2개 json(clobber 없음)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_adapter_writes_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = FileAdapter::new("file-local", dir.path());
+        let r = adapter.deliver(&payload()).await.unwrap();
+        let mode = std::fs::metadata(&r.detail).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600); // 소유자만 rw
     }
 
     #[tokio::test]
