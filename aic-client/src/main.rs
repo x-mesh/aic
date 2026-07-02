@@ -777,6 +777,44 @@ enum RcaOp {
         #[command(subcommand)]
         op: HypothesisOp,
     },
+    /// (M2) sre-agent의 통계 이상 점수(센서별·시간창별 z-score 상위)를 조회한다(읽기 전용 pull). [mcp] sre-agent 구성 필요.
+    Anomaly {
+        /// lookback 시간(기본 24).
+        #[arg(long, default_value_t = 24.0)]
+        since_hours: f64,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// (M2) sre-agent investigator가 스스로 찾은 최근 finding 목록을 조회한다(읽기 전용 pull). [mcp] sre-agent 구성 필요.
+    Findings {
+        /// lookback 시간(기본 168 = 1주).
+        #[arg(long, default_value_t = 168.0)]
+        since_hours: f64,
+        /// 최대 결과 수.
+        #[arg(long, default_value_t = 30)]
+        limit: u32,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// (M2) 시간창을 timeline·요약·high-signal 이벤트·runbook으로 재구성한다(읽기 전용 pull). [mcp] sre-agent 구성 필요.
+    Replay {
+        /// incident id 또는 prefix. 주면 그 incident의 생성~종료(또는 now) 시각으로 창을 앵커한다. 생략 시 since_hours 사용.
+        id: Option<String>,
+        /// incident 미지정 시 lookback 시간(기본 2).
+        #[arg(long, default_value_t = 2.0)]
+        since_hours: f64,
+        /// 텍스트 필터(cpu/memory/docker/repo 등).
+        #[arg(long)]
+        focus: Option<String>,
+        /// timeline 행 수 상한(기본 200).
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `aic rca hypothesis <op>` — 가설을 쌓고 evidence로 좁혀 probable cause에 수렴시킨다.
@@ -7547,8 +7585,7 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
         } => {
             // config는 한 번만 로드(실패해도 close는 진행). --remember 또는 [rca] auto_remember면 기록.
             let config = ConfigManager::load().ok();
-            let do_remember =
-                remember || config.as_ref().is_some_and(|c| c.rca.auto_remember);
+            let do_remember = remember || config.as_ref().is_some_and(|c| c.rca.auto_remember);
             // record 전에 resolve(전이가 id를 move하므로). transition은 그대로 수행하고,
             // 기록은 best-effort 핸드오프 — 실패해도 close 자체는 완료된 상태.
             let resolved = do_remember
@@ -7734,6 +7771,93 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 None => eprintln!(
                     "sre-agent 미구성([mcp] sre-agent) 또는 recommend_runbooks 없음 — 건너뜀"
                 ),
+            }
+        }
+        RcaOp::Anomaly { since_hours, json } => {
+            let config = ConfigManager::load()?;
+            match aic_client::rca_memory::anomaly_scores(&config.mcp, since_hours).await {
+                Some(out) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "since_hours": since_hours,
+                                "anomaly_scores": out,
+                            }))?
+                        );
+                    } else {
+                        println!("이상 점수(sre-agent, 최근 {since_hours}h):\n{out}");
+                    }
+                }
+                None => {
+                    eprintln!("sre-agent 미구성([mcp] sre-agent) 또는 anomaly_scores 없음 — 건너뜀")
+                }
+            }
+        }
+        RcaOp::Findings {
+            since_hours,
+            limit,
+            json,
+        } => {
+            let config = ConfigManager::load()?;
+            match aic_client::rca_memory::list_findings(&config.mcp, since_hours, limit).await {
+                Some(out) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "since_hours": since_hours,
+                                "findings": out,
+                            }))?
+                        );
+                    } else {
+                        println!("proactive finding(sre-agent, 최근 {since_hours}h):\n{out}");
+                    }
+                }
+                None => {
+                    eprintln!("sre-agent 미구성([mcp] sre-agent) 또는 list_findings 없음 — 건너뜀")
+                }
+            }
+        }
+        RcaOp::Replay {
+            id,
+            since_hours,
+            focus,
+            limit,
+            json,
+        } => {
+            let config = ConfigManager::load()?;
+            // incident를 주면 그 생성~종료(없으면 now) 시각으로 창을 앵커한다. 없으면 since_hours lookback.
+            let (start, end, sh) = match id.as_deref() {
+                Some(_) => {
+                    let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+                    let meta = aic_client::rca::load_meta(&resolved)?;
+                    let start = meta.created_at.to_rfc3339();
+                    let end = meta.closed_at.map(|c| c.to_rfc3339());
+                    (Some(start), end, None)
+                }
+                None => (None, None, Some(since_hours)),
+            };
+            match aic_client::rca_memory::incident_replay(&config.mcp, start, end, sh, focus, limit)
+                .await
+            {
+                Some(out) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "replay": out,
+                            }))?
+                        );
+                    } else {
+                        println!("시간창 재구성(sre-agent):\n{out}");
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "sre-agent 미구성([mcp] sre-agent) 또는 incident_replay 없음 — 건너뜀"
+                    )
+                }
             }
         }
     }
