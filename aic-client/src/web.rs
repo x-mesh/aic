@@ -2359,6 +2359,14 @@ async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
         .iter()
         .max_by_key(|i| i.updated_at)
         .map(incident_view);
+    // 배너 색은 **열린 incident 중 최악 severity**로 판단한다(latest 한 건이 아니라 — Sev1이 가장 심각,
+    // enum Ord가 Sev1을 먼저 정렬). open이 있는데 severity 미설정이면 None(배너는 open 수로 warn 처리).
+    let worst_open_severity = incidents
+        .iter()
+        .filter(|i| i.status == rca::IncidentStatus::Open)
+        .filter_map(|i| i.severity)
+        .min()
+        .map(|s| s.as_label());
 
     // webhook: 최근 1시간 alert 수 + 마지막 이벤트 시각.
     let wh_events: Vec<Value> = tail_lines(&aic_common::paths::webhook_events_path(), WEBHOOK_TAIL)
@@ -2376,14 +2384,17 @@ async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
     // webhook은 항상 도는 소스가 아니라, 파일이 없으면 stale이 아니라 "미수신"으로 present:false.
     let webhook_src = data_source_freshness("webhook", webhook_last_ts, now, i64::MAX);
     let sources = vec![local_src.clone(), webhook_src.clone()];
-    // all-clear는 수집이 살아있을 때(로컬 fresh)만 유효 — 죽은 채 초록 금지.
-    let local_fresh = local_src.get("stale").and_then(|v| v.as_bool()) == Some(false);
-    let all_clear = open_count == 0 && recent_alerts == 0 && local_fresh;
+    // all-clear는 로컬 수집이 **실제로 살아있을 때만**(present && !stale) 유효 — 수집이 아예 없거나(present:false)
+    // 멈춘(stale) 상태에서 초록 "이상 없음"을 세우면 수집 실패를 정상으로 위장하게 되므로 금지한다.
+    let local_live = local_src.get("present").and_then(|v| v.as_bool()) == Some(true)
+        && local_src.get("stale").and_then(|v| v.as_bool()) == Some(false);
+    let all_clear = open_count == 0 && recent_alerts == 0 && local_live;
 
     Json(json!({
         "now": now,
         "open_incidents": open_count,
         "latest_incident": latest_incident,
+        "worst_open_severity": worst_open_severity,
         "recent_alerts_1h": recent_alerts,
         "latest_event": latest_event,
         "sources": sources,
