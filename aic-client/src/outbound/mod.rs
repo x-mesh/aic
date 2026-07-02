@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use crate::rca::IncidentMeta;
 
+pub mod adapter;
+
 /// redaction을 **타입으로 강제**하는 마커. `Redacted`는 오직 [`Redacted::new`]로만 만들어지고, 그 생성자가
 /// `redaction::redact`를 통과시킨다. 따라서 `OutboundPayload`의 자유 텍스트 필드에 raw(미-redacted) 문자열이
 /// 들어가는 경로가 타입 시스템 상 존재하지 않는다 — redaction 우회 전송이 컴파일 단계에서 불가능하다.
