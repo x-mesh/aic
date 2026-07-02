@@ -433,11 +433,48 @@ impl AgentSession {
         }
     }
 
+    /// C2: 세션 시작 브리핑 — 열린 incident + 최근 24h webhook alert 요약을 1블록으로 낸다. 시작 시점이
+    /// 문제 인지의 첫 기회다. LLM 호출 없이 로컬 incident index + webhook store만 읽는다(비용 0). 보여줄
+    /// 것이 없으면 아무것도 출력하지 않는다.
+    async fn note_briefing_if_any(&self) {
+        if let Some(brief) = gather_session_briefing() {
+            self.out.note(&brief).await;
+        }
+    }
+
+    /// C3: finding→과거 사건 자동 힌트 — `/diagnose`·`/local`이 신호를 찾으면 sre-agent incident-memory에
+    /// 증상으로 유사 과거 사건을 조회해 "유사 과거 사건 있음 — `/rca similar`로 확인" 한 줄을 덧붙인다.
+    /// 2초 타임아웃으로 진단 출력을 지연시키지 않고, sre-agent 미구성/무응답이면 조용히 아무것도 안 한다.
+    /// (`/diagnose`는 사용자가 직접 부르므로 매 호출 힌트를 둔다 — 자동 반복 레인이 아니라 소음 위험이 낮다.)
+    async fn note_similar_hint(&self, symptom: Option<&str>) {
+        let cfg = match crate::config::ConfigManager::load() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let query = symptom.unwrap_or("generic health");
+        let fut = crate::rca_memory::match_by_symptom(&cfg.mcp, query, 3);
+        let matched = match tokio::time::timeout(std::time::Duration::from_secs(2), fut).await {
+            Ok(m) => m,
+            Err(_) => return, // 타임아웃 — 진단 출력을 막지 않는다
+        };
+        if let Some(text) = matched {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && trimmed != "[]" {
+                self.out
+                    .note(
+                        "  ↳ 유사 과거 사건이 있습니다 — `/rca similar`로 확인하세요 (sre-agent).",
+                    )
+                    .await;
+            }
+        }
+    }
+
     /// 기존 line-based REPL 루프(reedline/stdin). non-TTY·기본 경로. 출력은 stdout=답변/stderr=UI.
     async fn run_loop_direct(&mut self) -> anyhow::Result<()> {
         let mut reader = repl::LineReader::new();
         self.print_banner();
         self.note_no_llm_if_needed().await;
+        self.note_briefing_if_any().await;
 
         // status bar 샘플러 — TTY이고 opt-out 미설정일 때만 생성(비-TTY/파이프/CI는 None = 비용 0).
         let mut sampler = ui::statusbar_enabled().then(super::sys_sampler::SysSampler::new);
@@ -510,6 +547,7 @@ impl AgentSession {
             self.out.note(&banner).await;
         }
         self.note_no_llm_if_needed().await;
+        self.note_briefing_if_any().await;
 
         // 시작 시 1회 컨텍스트 토큰 표시(preface seed 후 — 보통 system 프롬프트만 있는 상태).
         self.out.send_ctx(self.estimate_tokens()).await;
@@ -1117,6 +1155,8 @@ impl AgentSession {
         let block = super::diagnose::render_findings_block(&findings);
         if !block.is_empty() {
             self.out.note(&format!("\n{}", block.trim_end())).await;
+            // C3: 신호가 있으면 sre-agent에 유사 과거 사건을 조회해 힌트 한 줄(미구성/무응답이면 무동작).
+            self.note_similar_hint(None).await;
             // prepend는 LLM 프롬프트 evidence용 — analyze 모드에서만(raw는 표시만 하고 곧 return).
             if do_analyze {
                 snapshot.insert_str(0, &format!("{block}\n"));
@@ -1309,6 +1349,8 @@ impl AgentSession {
         let block = super::diagnose::render_findings_block(&findings);
         if !block.is_empty() {
             self.out.note(&format!("\n{}", block.trim_end())).await;
+            // C3: 신호가 있으면 sre-agent에 유사 과거 사건을 조회해 힌트 한 줄(증상 기반, 미구성이면 무동작).
+            self.note_similar_hint(symptom).await;
             // prepend는 LLM 프롬프트 evidence용 — analyze 모드에서만(raw는 표시만 하고 곧 return).
             if do_analyze {
                 snapshot.insert_str(0, &format!("{block}\n"));
@@ -2218,6 +2260,110 @@ fn new_run_id() -> String {
     format!("{:08x}", (nanos as u64) & 0xffff_ffff)
 }
 
+/// C2: 로컬 incident index + webhook store를 읽어 세션 시작 브리핑 문자열을 만든다(파일 I/O; best-effort).
+/// 열린 incident도 최근 alert도 없으면 None. 실제 렌더는 `format_session_briefing`(pure)이 담당한다.
+fn gather_session_briefing() -> Option<String> {
+    let incidents = crate::rca::list_incidents().unwrap_or_default();
+    let open: Vec<(Option<String>, String)> = incidents
+        .iter()
+        .filter(|i| i.status == crate::rca::IncidentStatus::Open)
+        .map(|i| {
+            (
+                i.severity.map(|s| s.as_label().to_string()),
+                i.title.clone(),
+            )
+        })
+        .collect();
+
+    // 최근 24h webhook alert 수 + 마지막 alert 요약(파일 tail — 없으면 0/None).
+    let (recent_alerts, latest_alert) = webhook_briefing_counts(24);
+    format_session_briefing(&open, recent_alerts, latest_alert.as_deref())
+}
+
+/// webhook-events.jsonl을 읽어 최근 `window_hours` 안의 alert 수와 마지막 alert 요약을 센다.
+/// best-effort — 파일 부재/파싱 실패는 (0, None). 파일 크기 방어로 마지막 200줄만 본다.
+fn webhook_briefing_counts(window_hours: i64) -> (usize, Option<String>) {
+    let path = aic_common::paths::webhook_events_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return (0, None);
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let cutoff = now - window_hours * 3600 * 1000;
+    let lines: Vec<&str> = content.lines().rev().take(200).collect();
+    let mut count = 0usize;
+    let mut latest: Option<String> = None;
+    for line in lines.iter() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        // aicd는 ts를 RFC3339 문자열로 기록한다(숫자도 방어적으로 허용). 파싱 실패 줄은 건너뛴다.
+        let ts = match v.get("ts") {
+            Some(serde_json::Value::String(s)) => chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis()),
+            Some(serde_json::Value::Number(n)) => n.as_i64(),
+            _ => None,
+        };
+        let Some(ts) = ts else { continue };
+        if ts < cutoff {
+            continue;
+        }
+        count += 1;
+        if latest.is_none() {
+            // rev 순회라 첫 매칭이 가장 최근. severity·alert를 짧게.
+            let sev = v
+                .get("severity")
+                .and_then(|s| s.as_str())
+                .unwrap_or("alert");
+            let alert = v.get("alert").and_then(|a| a.as_str()).unwrap_or("");
+            latest = Some(if alert.is_empty() {
+                sev.to_string()
+            } else {
+                format!("{sev} · {alert}")
+            });
+        }
+    }
+    (count, latest)
+}
+
+/// C2: 브리핑 본문 조립(pure — 단위 테스트 대상). 열린 incident와 최근 alert가 모두 비면 None을
+/// 반환해 호출부가 아무것도 출력하지 않게 한다. incident는 최대 3건까지 나열한다.
+fn format_session_briefing(
+    open_incidents: &[(Option<String>, String)],
+    recent_alerts: usize,
+    latest_alert: Option<&str>,
+) -> Option<String> {
+    if open_incidents.is_empty() && recent_alerts == 0 {
+        return None;
+    }
+    let mut lines = vec!["📋 세션 브리핑".to_string()];
+    if open_incidents.is_empty() {
+        lines.push("• 열린 incident 없음".to_string());
+    } else {
+        lines.push(format!("• 열린 incident {}건:", open_incidents.len()));
+        for (sev, title) in open_incidents.iter().take(3) {
+            let tag = sev
+                .as_deref()
+                .map(|s| format!("[{s}] "))
+                .unwrap_or_default();
+            lines.push(format!("    - {tag}{title}"));
+        }
+        if open_incidents.len() > 3 {
+            lines.push(format!(
+                "    … 외 {}건 (`/rca` 로 확인)",
+                open_incidents.len() - 3
+            ));
+        }
+    }
+    if recent_alerts > 0 {
+        let tail = latest_alert
+            .map(|s| format!(" (최근: {s})"))
+            .unwrap_or_default();
+        lines.push(format!("• 최근 24h webhook alert {recent_alerts}건{tail}"));
+    }
+    Some(lines.join("\n"))
+}
+
 /// run_command 결과 문자열의 `command: <redacted>` 줄에서 표시용 command를 뽑는다.
 /// (이미 redacted된 출력에서만 추출 — secrets 원문 미보관.) 없으면 None.
 fn extract_command_line(output: &str) -> Option<String> {
@@ -2488,6 +2634,37 @@ mod tests {
         let id = new_run_id();
         assert_eq!(id.len(), 8);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn briefing_none_when_nothing_open_or_recent() {
+        // 열린 incident도 최근 alert도 없으면 브리핑 자체를 내지 않는다(빈 화면 오염 방지).
+        assert!(format_session_briefing(&[], 0, None).is_none());
+    }
+
+    #[test]
+    fn briefing_lists_open_incidents_and_alerts() {
+        let open = vec![
+            (Some("SEV2".to_string()), "checkout 5xx".to_string()),
+            (None, "무증상 관찰".to_string()),
+        ];
+        let s = format_session_briefing(&open, 3, Some("critical · disk full")).unwrap();
+        assert!(s.contains("열린 incident 2건"));
+        assert!(s.contains("[SEV2] checkout 5xx"));
+        assert!(s.contains("- 무증상 관찰")); // severity 없으면 태그 생략
+        assert!(s.contains("최근 24h webhook alert 3건"));
+        assert!(s.contains("critical · disk full"));
+    }
+
+    #[test]
+    fn briefing_caps_incident_list_at_three() {
+        let open: Vec<(Option<String>, String)> =
+            (0..5).map(|i| (None, format!("inc {i}"))).collect();
+        let s = format_session_briefing(&open, 0, None).unwrap();
+        assert!(s.contains("열린 incident 5건"));
+        assert!(s.contains("외 2건")); // 3건만 나열 + 나머지 카운트
+        assert!(s.contains("inc 0"));
+        assert!(!s.contains("inc 3")); // 4번째는 미표시
     }
 
     #[test]

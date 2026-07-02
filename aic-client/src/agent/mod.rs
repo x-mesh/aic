@@ -47,6 +47,7 @@ pub(crate) mod tool_record;
 pub mod tools;
 pub mod types;
 pub(crate) mod ui;
+pub(crate) mod webhook_watch;
 
 pub use sandbox::Sandbox;
 pub use session::AgentSession;

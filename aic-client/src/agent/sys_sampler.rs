@@ -233,7 +233,10 @@ impl SysMetrics {
         };
         // swap: 활성(total>0)이면 사용률 %, 아니면 off.
         let swap = if self.swap_total > 0 {
-            format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+            format!(
+                "swap {:.0}%",
+                self.swap_used as f64 * 100.0 / self.swap_total as f64
+            )
         } else {
             "swap off".to_string()
         };
@@ -282,7 +285,11 @@ impl SysMetrics {
         sev_high(ratio, LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
     }
     fn cpu_sev(&self) -> Severity {
-        sev_high(self.cpu_pct as f64, CPU_WARN_PCT as f64, CPU_CRIT_PCT as f64)
+        sev_high(
+            self.cpu_pct as f64,
+            CPU_WARN_PCT as f64,
+            CPU_CRIT_PCT as f64,
+        )
     }
     fn mem_sev(&self) -> Severity {
         sev_high(self.mem_pct(), MEM_WARN_PCT, MEM_CRIT_PCT)
@@ -307,7 +314,10 @@ impl SysMetrics {
     /// io 세그먼트는 처리량이라 임계 없음(항상 Normal). chat_tui가 단계별 색을 입혀 렌더한다.
     pub fn status_segments(&self) -> Vec<(String, Severity)> {
         let swap = if self.swap_total > 0 {
-            format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+            format!(
+                "swap {:.0}%",
+                self.swap_used as f64 * 100.0 / self.swap_total as f64
+            )
         } else {
             "swap off".to_string()
         };
@@ -384,7 +394,10 @@ impl SysMetrics {
                 "swap",
                 self.swap_sev(),
                 if self.swap_total > 0 {
-                    format!("swap {:.0}%", self.swap_used as f64 * 100.0 / self.swap_total as f64)
+                    format!(
+                        "swap {:.0}%",
+                        self.swap_used as f64 * 100.0 / self.swap_total as f64
+                    )
                 } else {
                     "swap off".to_string()
                 },
@@ -496,6 +509,43 @@ impl AlertTracker {
     }
 }
 
+/// D5: fingerprint-keyed 세션 noise gate. 같은 fingerprint는 `window` 안에서 **1회만** 통과시킨다.
+/// C1(webhook alert의 chat 유입)·C3(finding→과거 사건 자동 힌트)가 소음 억제 없이 들어가면 동일 알림
+/// 폭주가 도구를 못 쓰게 만든다 — 이 gate가 그 공통 rate limiter다. 상태는 세션 메모리에만 있고 디스크에
+/// 쓰지 않는다(stateless-pull 경계 안). `window`가 지나면 같은 fingerprint를 다시 1회 허용한다.
+pub(crate) struct NoiseGate {
+    window: Duration,
+    last_seen: std::collections::HashMap<String, Instant>,
+}
+
+impl NoiseGate {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            last_seen: std::collections::HashMap::new(),
+        }
+    }
+
+    /// fingerprint가 `window` 안에 이미 통과했으면 `false`(억제), 아니면 통과 시각을 기록하고 `true`.
+    /// 빈 fingerprint는 dedup 키가 될 수 없으므로 항상 통과시킨다(억제하지 않음).
+    pub fn allow(&mut self, fingerprint: &str, now: Instant) -> bool {
+        if fingerprint.is_empty() {
+            return true;
+        }
+        // 오래된 항목 정리(메모리 무한 증가 방지) — window의 2배 지난 키는 제거.
+        let window = self.window;
+        self.last_seen
+            .retain(|_, &mut t| now.duration_since(t) < window.saturating_mul(2));
+        match self.last_seen.get(fingerprint) {
+            Some(&t) if now.duration_since(t) < window => false,
+            _ => {
+                self.last_seen.insert(fingerprint.to_string(), now);
+                true
+            }
+        }
+    }
+}
+
 /// status bar 지표를 **전용 tokio task**에서 샘플해 watch 채널(latest-wins)로 publish한다.
 ///
 /// 핵심: blocking refresh(`disks.refresh`의 statvfs 등)를 `spawn_blocking`에서 돌려 호출자 task(=chat
@@ -599,7 +649,11 @@ impl TrendTracker {
 
     /// 새 표본을 관찰해 (disk 소진 ETA, sparkline 접미)를 반환한다. sparkline은 `(세그먼트 인덱스,
     /// " {스파크}{화살표}")` — 호출자가 해당 status 세그먼트에 붙이면 그 단계 색을 상속한다.
-    pub fn observe(&mut self, now: Instant, m: &SysMetrics) -> (Option<DiskEta>, Option<(usize, String)>) {
+    pub fn observe(
+        &mut self,
+        now: Instant,
+        m: &SysMetrics,
+    ) -> (Option<DiskEta>, Option<(usize, String)>) {
         let avail = m.disk_avail;
         // refill 감지(직전보다 256MiB 이상 증가) = 공간 회수 → 즉시 철회.
         let refilled = self
@@ -786,7 +840,11 @@ fn linear_fit(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     let slope = (n * sxy - sx * sy) / denom;
     let num = (n * sxy - sx * sy).powi(2);
     let den = denom * (n * syy - sy * sy);
-    let r2 = if den.abs() < f64::EPSILON { 0.0 } else { num / den };
+    let r2 = if den.abs() < f64::EPSILON {
+        0.0
+    } else {
+        num / den
+    };
     Some((slope, r2))
 }
 
@@ -877,6 +935,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn noise_gate_suppresses_repeat_within_window() {
+        let mut gate = NoiseGate::new(Duration::from_secs(300));
+        let t0 = Instant::now();
+        assert!(gate.allow("fp-a", t0)); // 첫 통과
+        assert!(!gate.allow("fp-a", t0 + Duration::from_secs(10))); // 창 안 재발 억제
+        assert!(gate.allow("fp-b", t0 + Duration::from_secs(10))); // 다른 fingerprint는 통과
+                                                                   // 창 경과 후 같은 fingerprint 다시 허용.
+        assert!(gate.allow("fp-a", t0 + Duration::from_secs(301)));
+    }
+
+    #[test]
+    fn noise_gate_always_allows_empty_fingerprint() {
+        let mut gate = NoiseGate::new(Duration::from_secs(300));
+        let t0 = Instant::now();
+        assert!(gate.allow("", t0));
+        assert!(gate.allow("", t0)); // 빈 키는 dedup 대상 아님 — 항상 통과
+    }
+
+    #[test]
     fn human_bytes_scales() {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(1024), "1.0K");
@@ -939,11 +1016,28 @@ mod tests {
         assert!(line.contains("disk n/a"), "{line}");
     }
 
-    fn metric(load1: f64, cpu: f32, cores: usize, mem_used: u64, mem_total: u64,
-              swap_used: u64, swap_total: u64, disk_avail: u64, disk_total: u64) -> SysMetrics {
+    fn metric(
+        load1: f64,
+        cpu: f32,
+        cores: usize,
+        mem_used: u64,
+        mem_total: u64,
+        swap_used: u64,
+        swap_total: u64,
+        disk_avail: u64,
+        disk_total: u64,
+    ) -> SysMetrics {
         SysMetrics {
-            load1, cpu_pct: cpu, cores, mem_used, mem_total, swap_used, swap_total,
-            disk_avail, disk_total, ..Default::default()
+            load1,
+            cpu_pct: cpu,
+            cores,
+            mem_used,
+            mem_total,
+            swap_used,
+            swap_total,
+            disk_avail,
+            disk_total,
+            ..Default::default()
         }
     }
 
@@ -952,7 +1046,13 @@ mod tests {
         let g = 1024 * 1024 * 1024;
         // 정상: 모든 지표 임계 미달 → 전부 Normal.
         let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
-        for s in [ok.load_sev(), ok.cpu_sev(), ok.mem_sev(), ok.swap_sev(), ok.disk_sev()] {
+        for s in [
+            ok.load_sev(),
+            ok.cpu_sev(),
+            ok.mem_sev(),
+            ok.swap_sev(),
+            ok.disk_sev(),
+        ] {
             assert_eq!(s, Severity::Normal);
         }
         // cpu warn(85~95), mem crit(>=97).
@@ -960,15 +1060,36 @@ mod tests {
         assert_eq!(m.cpu_sev(), Severity::Warn);
         assert_eq!(m.mem_sev(), Severity::Crit);
         // load: ratio>=2.0 → Crit (16 load / 8 cores = 2.0).
-        assert_eq!(metric(16.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(), Severity::Crit);
-        assert_eq!(metric(8.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(), Severity::Warn);
+        assert_eq!(
+            metric(16.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(),
+            Severity::Crit
+        );
+        assert_eq!(
+            metric(8.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).load_sev(),
+            Severity::Warn
+        );
         // disk: free bytes 절대 임계(<=1G crit, <=5G warn). %가 아니라 free라 macOS APFS 무관.
-        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 512 * 1024 * 1024, 999 * g).disk_sev(), Severity::Crit);
-        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 3 * g, 999 * g).disk_sev(), Severity::Warn);
-        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 999 * g).disk_sev(), Severity::Normal);
+        assert_eq!(
+            metric(0.0, 0.0, 8, 0, 1, 0, 0, 512 * 1024 * 1024, 999 * g).disk_sev(),
+            Severity::Crit
+        );
+        assert_eq!(
+            metric(0.0, 0.0, 8, 0, 1, 0, 0, 3 * g, 999 * g).disk_sev(),
+            Severity::Warn
+        );
+        assert_eq!(
+            metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 999 * g).disk_sev(),
+            Severity::Normal
+        );
         // disk/swap n/a(total 0)는 Normal(오탐 방지).
-        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 0, 0).disk_sev(), Severity::Normal);
-        assert_eq!(metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).swap_sev(), Severity::Normal);
+        assert_eq!(
+            metric(0.0, 0.0, 8, 0, 1, 0, 0, 0, 0).disk_sev(),
+            Severity::Normal
+        );
+        assert_eq!(
+            metric(0.0, 0.0, 8, 0, 1, 0, 0, 50 * g, 200 * g).swap_sev(),
+            Severity::Normal
+        );
     }
 
     #[test]
@@ -988,7 +1109,10 @@ mod tests {
         // 실제 시스템 호출 — 패닉 없이 수치를 반환하는지만 확인(값 범위는 환경 의존).
         let mut s = SysSampler::new();
         let m = s.sample();
-        assert!(m.mem_total > 0, "mem_total should be positive on a real host");
+        assert!(
+            m.mem_total > 0,
+            "mem_total should be positive on a real host"
+        );
     }
 
     #[test]
@@ -1032,7 +1156,11 @@ mod tests {
         let a = tr.observe(&cpu_crit, t0);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].severity, Severity::Crit);
-        assert!(a[0].message.contains("/diagnose"), "crit should hint /diagnose: {}", a[0].message);
+        assert!(
+            a[0].message.contains("/diagnose"),
+            "crit should hint /diagnose: {}",
+            a[0].message
+        );
     }
 
     // (경과초, 여유 GiB-단위 바이트) 점열 빌더 — replay-vector 가독성용.
@@ -1053,7 +1181,8 @@ mod tests {
             .collect();
         let p = pts(&samples);
         let avail_now = p.last().unwrap().1;
-        let secs = disk_eta_candidate(&p, avail_now).expect("clean linear decline should yield ETA");
+        let secs =
+            disk_eta_candidate(&p, avail_now).expect("clean linear decline should yield ETA");
         // (avail_now-1GiB)/rate. avail_now≈4GiB → (3GiB)/(2GiB/300s)=450s 근방.
         assert!(secs > 60.0 && secs < 7200.0, "secs={secs}");
         let _ = g;
@@ -1090,13 +1219,24 @@ mod tests {
                 (t, (4.0 + osc) * g)
             })
             .collect();
-        assert!(disk_eta_candidate(&saw, saw.last().unwrap().1).is_none(), "sawtooth");
+        assert!(
+            disk_eta_candidate(&saw, saw.last().unwrap().1).is_none(),
+            "sawtooth"
+        );
         // 평평: 일정 4GiB → slope≈0.
         let flat: Vec<(f64, f64)> = (0..=15).map(|i| (i as f64 * 20.0, 4.0 * g)).collect();
-        assert!(disk_eta_candidate(&flat, flat.last().unwrap().1).is_none(), "flat");
+        assert!(
+            disk_eta_candidate(&flat, flat.last().unwrap().1).is_none(),
+            "flat"
+        );
         // 짧은 윈도: span<300s & n<10 → None(깨끗한 하강이어도).
-        let short: Vec<(f64, f64)> = (0..5).map(|i| (i as f64 * 20.0, (5.0 - 0.2 * i as f64) * g)).collect();
-        assert!(disk_eta_candidate(&short, short.last().unwrap().1).is_none(), "short window");
+        let short: Vec<(f64, f64)> = (0..5)
+            .map(|i| (i as f64 * 20.0, (5.0 - 0.2 * i as f64) * g))
+            .collect();
+        assert!(
+            disk_eta_candidate(&short, short.last().unwrap().1).is_none(),
+            "short window"
+        );
     }
 
     #[test]
@@ -1116,16 +1256,29 @@ mod tests {
                 shown_at = Some(i);
             }
         }
-        assert!(shown_at.is_some(), "ETA should appear once enough clean-decline history accrues");
+        assert!(
+            shown_at.is_some(),
+            "ETA should appear once enough clean-decline history accrues"
+        );
         // 디바운스: 첫 in-gate 표본 즉시가 아니라 충분한 span(≥300s=15표본) 이후 + 2연속이라야 등장.
-        assert!(shown_at.unwrap() >= 15, "appeared too early: {:?}", shown_at);
+        assert!(
+            shown_at.unwrap() >= 15,
+            "appeared too early: {:?}",
+            shown_at
+        );
         // refill(>256MiB 급증) → 즉시 철회(여전히 Warn=5GiB이지만 회수 신호).
         let later = t0 + Duration::from_secs(500);
         let m_refill = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 5 * g, 200 * g);
-        assert!(tr.observe(later, &m_refill).0.is_none(), "refill must instantly retract the ETA");
+        assert!(
+            tr.observe(later, &m_refill).0.is_none(),
+            "refill must instantly retract the ETA"
+        );
         // Normal 복귀 → 계속 None.
         let m_norm = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
-        assert!(tr.observe(later + Duration::from_secs(20), &m_norm).0.is_none());
+        assert!(tr
+            .observe(later + Duration::from_secs(20), &m_norm)
+            .0
+            .is_none());
     }
 
     #[test]
@@ -1165,7 +1318,10 @@ mod tests {
         }
         let (idx, s) = spark.expect("sparkline after >=3 samples");
         assert_eq!(idx, SEG_CPU, "all-Normal should spark cpu by default");
-        assert!(s.contains('→') || s.contains('↑') || s.contains('↓'), "spark has an arrow: {s}");
+        assert!(
+            s.contains('→') || s.contains('↑') || s.contains('↓'),
+            "spark has an arrow: {s}"
+        );
         // mem crit(99%) → mem 세그먼트 선택.
         let mut tr = TrendTracker::new();
         let mut spark = None;
@@ -1173,7 +1329,11 @@ mod tests {
             let m = metric(1.0, 10.0, 8, 159 * g / 10, 16 * g, 0, 0, 50 * g, 200 * g); // mem 99%
             spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
         }
-        assert_eq!(spark.expect("spark").0, SEG_MEM, "mem crit should spark the mem segment");
+        assert_eq!(
+            spark.expect("spark").0,
+            SEG_MEM,
+            "mem crit should spark the mem segment"
+        );
     }
 
     #[test]
@@ -1185,10 +1345,15 @@ mod tests {
         let ok = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
         // Normal→Crit onset 발화.
         let a = tr.observe(&cpu_crit, t0);
-        assert!(a.iter().any(|x| x.kind == AlertKind::Onset && x.severity == Severity::Crit));
+        assert!(a
+            .iter()
+            .any(|x| x.kind == AlertKind::Onset && x.severity == Severity::Crit));
         // Crit→Normal 회복: 확인 한 줄(Normal severity → bell 없음).
         let a = tr.observe(&ok, t0 + Duration::from_secs(1));
-        let rec: Vec<_> = a.iter().filter(|x| x.kind == AlertKind::Recovered).collect();
+        let rec: Vec<_> = a
+            .iter()
+            .filter(|x| x.kind == AlertKind::Recovered)
+            .collect();
         assert_eq!(rec.len(), 1, "one recovery line on return to Normal");
         assert!(rec[0].message.contains("정상 회복"), "{}", rec[0].message);
         assert_eq!(rec[0].severity, Severity::Normal);
@@ -1247,7 +1412,10 @@ mod tests {
         // 돌므로 이 테스트(=호출자) task는 막히지 않는다. 타임아웃으로 무한 대기 방지.
         let (mut rx, handle) = spawn_sampler();
         // 초기값은 None(첫 sample 전).
-        assert!(rx.borrow().is_none(), "initial watch value should be None before first sample");
+        assert!(
+            rx.borrow().is_none(),
+            "initial watch value should be None before first sample"
+        );
         let got = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if rx.changed().await.is_err() {
@@ -1261,7 +1429,10 @@ mod tests {
         .await
         .expect("sampler should publish within 10s");
         let m = got.expect("first publish should carry Some(metrics)");
-        assert!(m.mem_total > 0, "published metrics should have a real mem_total");
+        assert!(
+            m.mem_total > 0,
+            "published metrics should have a real mem_total"
+        );
         // task 정리(수신자 drop만으로도 다음 cycle에 종료하나, 즉시 abort).
         handle.abort();
     }
