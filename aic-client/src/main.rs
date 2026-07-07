@@ -2075,15 +2075,18 @@ async fn handle_daemon_start(foreground: bool) {
 ///   (구조 정의만 하고 stdout으로 record JSON을 hint로 표시 — 사용자가 결과를 확인)
 /// - line cap 1000, byte cap 256 KiB. 초과 시 tail만 보존.
 async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
-    handle_run_with_origin(cmd, provider_override, None).await
+    handle_run_with_origin(cmd, provider_override, None, None).await
 }
 
 /// `aic run`의 본체. `original_exit_code`는 `aic capture-last`가 MetadataOnly record를
 /// 승격 재실행할 때 원본 실패 코드를 새 record에 보존하기 위해 전달한다.
+/// `command_label`은 record에 기록할 명령 문자열 override — capture-last가
+/// `$SHELL -c <cmd>`로 감싸 실행해도 record에는 원래 `<cmd>`가 남게 한다.
 async fn handle_run_with_origin(
     cmd: Vec<String>,
     provider_override: Option<String>,
     original_exit_code: Option<i32>,
+    command_label: Option<String>,
 ) {
     if cmd.is_empty() {
         eprintln!("{COL_RED}✗{COL_RESET} 실행할 명령이 없습니다 — `aic run -- <cmd...>`");
@@ -2218,7 +2221,7 @@ async fn handle_run_with_origin(
     let duration = chrono::Utc::now() - started_at;
     let record = aic_common::CommandRecord {
         id: aic_common::generate_record_id(),
-        command: Some(cmd.join(" ")),
+        command: Some(command_label.unwrap_or_else(|| cmd.join(" "))),
         exit_code,
         output_lines: collected.clone(),
         timestamp: chrono::Utc::now(),
@@ -2264,6 +2267,19 @@ async fn handle_run_with_origin(
         let client = UdsClient::new(sock);
         if let Err(e) = client.register_record(record.clone()).await {
             debug_log!("register_record 실패 (best-effort 무시): {e}");
+        }
+    }
+    // best-effort: aicd CommandRecordStore에도 세션 라우팅으로 등록 (Dual-Write의
+    // client 측 대응). central-store 빌드에서는 세션 소켓 ring이 dummy(cap=0)라
+    // 위 등록이 사실상 소실되므로, aicd 등록이 있어야 `aic history`와 central-store
+    // read cascade가 run record를 찾는다.
+    if let Some(session_id) = current_session_id_from_env() {
+        let aicd = UdsClient::new(aic_common::aicd_socket_path());
+        if let Err(e) = aicd
+            .register_record_for_session(&session_id, record.clone())
+            .await
+        {
+            debug_log!("aicd register_record_for_session 실패 (best-effort 무시): {e}");
         }
     }
     if record.exit_code != 0 {
@@ -6022,7 +6038,15 @@ async fn handle_capture_last(
             }
         }
         RiskLevel::Safe => {
-            if !yes && !confirm_yes_no("이 명령을 다시 실행할까요?") {
+            // Safe여도 `> file` 덮어쓰기 redirect가 있으면 재실행이 파일을 다시
+            // 덮어쓰므로 --yes를 무시하고 confirm을 강제한다.
+            let overwrite = aic_client::risk_guard::has_overwrite_redirect(cmd);
+            if overwrite {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 이 명령은 `>` redirect로 파일을 덮어씁니다 — 재실행 시 대상 파일이 다시 덮어써집니다."
+                );
+            }
+            if (!yes || overwrite) && !confirm_yes_no("이 명령을 다시 실행할까요?") {
                 eprintln!("{COL_DIM}취소됨{COL_RESET}");
                 return;
             }
@@ -6036,7 +6060,13 @@ async fn handle_capture_last(
         argv.first().map(String::as_str).unwrap_or("sh"),
         record.exit_code
     );
-    handle_run_with_origin(argv, provider_override, Some(record.exit_code)).await;
+    handle_run_with_origin(
+        argv,
+        provider_override,
+        Some(record.exit_code),
+        Some(cmd.to_string()),
+    )
+    .await;
 }
 
 async fn handle_fix(
