@@ -272,6 +272,8 @@ fn pty_record(id: &str, command: &str, exit_code: i32) -> CommandRecord {
         capture_mode: CaptureMode::Pty,
         capture_quality: CaptureQuality::FullOutput,
         output_metadata: None,
+        cwd: None,
+        duration_ms: None,
     }
 }
 

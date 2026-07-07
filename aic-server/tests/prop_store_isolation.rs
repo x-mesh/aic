@@ -90,6 +90,8 @@ fn arb_push_op() -> impl Strategy<Value = (SessionChoice, CommandRecord)> {
                         capture_mode,
                         capture_quality: CaptureQuality::FullOutput,
                         output_metadata: None,
+                        cwd: None,
+                        duration_ms: None,
                     };
                     (session, record)
                 },

@@ -94,7 +94,15 @@ pub async fn run(session: Option<String>, limit: usize, failed: bool, json: bool
         return;
     }
 
-    print_table(&session_id, &filtered);
+    // 세션 label(사용자 tag)은 best-effort로 registry에서 찾는다.
+    let label = client.list_sessions().await.ok().and_then(|sessions| {
+        sessions
+            .into_iter()
+            .find(|s| s.id == session_id)
+            .and_then(|s| s.label)
+    });
+
+    print_table(&session_id, label.as_deref(), &filtered);
 }
 
 /// 우선순위에 따라 session_id를 결정한다.
@@ -146,19 +154,44 @@ fn session_recency_key(info: &SessionInfo) -> DateTime<Utc> {
 }
 
 /// 표 형식으로 record를 출력한다 (main.rs의 기존 포맷과 유사).
-fn print_table(session_id: &str, records: &[CommandRecord]) {
+fn print_table(session_id: &str, label: Option<&str>, records: &[CommandRecord]) {
+    let label_part = label.map(|l| format!(" [{l}]")).unwrap_or_default();
     println!(
-        "{COL_BOLD}aic history{COL_RESET} {COL_DIM}(session={session_id}, {} record){COL_RESET}",
+        "{COL_BOLD}aic history{COL_RESET} {COL_DIM}(session={session_id}{label_part}, {} record){COL_RESET}",
         records.len()
     );
     for rec in records {
         let id = record_id_short(&rec.id);
         let when = format_rfc3339(rec.timestamp);
         let exit = format_exit_code(rec.exit_code);
+        let src = source_quality_label(rec);
+        let dur = duration_label(rec);
         let cmd = rec.command.as_deref().unwrap_or("(no command)");
         let cmd = truncate_command(cmd, 70);
-        println!("  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<20}{COL_RESET}  {cmd}");
+        let cwd_part = rec
+            .cwd
+            .as_deref()
+            .map(|c| format!("  {COL_DIM}({c}){COL_RESET}"))
+            .unwrap_or_default();
+        println!(
+            "  {COL_CYAN}{id:<8}{COL_RESET}  {exit}  {COL_DIM}{when:<20}{COL_RESET}  {COL_DIM}{src:<10}{COL_RESET}  {COL_DIM}{dur:>6}{COL_RESET}  {cmd}{cwd_part}"
+        );
     }
+}
+
+/// `source/quality` 결합 라벨 — 예: `pty/full`, `hook/meta`, `run/trunc`.
+fn source_quality_label(rec: &CommandRecord) -> String {
+    format!(
+        "{}/{}",
+        rec.capture_mode.short_label(),
+        rec.capture_quality.short_label()
+    )
+}
+
+fn duration_label(rec: &CommandRecord) -> String {
+    rec.duration_ms
+        .map(aic_common::format_duration_ms)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn record_id_short(id: &str) -> String {
@@ -204,9 +237,18 @@ pub(crate) fn render_table_plain(session_id: &str, records: &[CommandRecord]) ->
         } else {
             format!("✗{}", rec.exit_code)
         };
+        let src = source_quality_label(rec);
+        let dur = duration_label(rec);
         let cmd = rec.command.as_deref().unwrap_or("(no command)");
         let cmd = truncate_command(cmd, 70);
-        out.push_str(&format!("  {id:<8}  {exit_str:<4}  {when:<20}  {cmd}\n"));
+        let cwd_part = rec
+            .cwd
+            .as_deref()
+            .map(|c| format!("  ({c})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {id:<8}  {exit_str:<4}  {when:<20}  {src:<10}  {dur:>6}  {cmd}{cwd_part}\n"
+        ));
     }
     out
 }
@@ -267,6 +309,8 @@ mod tests {
             capture_mode: CaptureMode::Pty,
             capture_quality: CaptureQuality::FullOutput,
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         }
     }
 
@@ -339,9 +383,22 @@ mod tests {
         let out = render_table_plain("abcd1234", &records);
         let expected = "\
 aic history (session=abcd1234, 1 record)
-  11112222  ✓     1970-01-01T00:00:01Z  ls -la
+  11112222  ✓     1970-01-01T00:00:01Z  pty/full         -  ls -la
 ";
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn render_table_plain_shows_quality_source_duration_cwd() {
+        let mut rec = sample_record("aaaabbbbccccdddd", "cargo build", 101, 2_000);
+        rec.capture_mode = CaptureMode::Hook;
+        rec.capture_quality = CaptureQuality::MetadataOnly;
+        rec.cwd = Some("/tmp/proj".to_string());
+        rec.duration_ms = Some(1_300);
+        let out = render_table_plain("sess0001", &[rec]);
+        assert!(out.contains("hook/meta"), "source/quality label: {out}");
+        assert!(out.contains("1.3s"), "duration label: {out}");
+        assert!(out.contains("(/tmp/proj)"), "cwd suffix: {out}");
     }
 
     #[test]

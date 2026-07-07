@@ -2075,6 +2075,16 @@ async fn handle_daemon_start(foreground: bool) {
 ///   (구조 정의만 하고 stdout으로 record JSON을 hint로 표시 — 사용자가 결과를 확인)
 /// - line cap 1000, byte cap 256 KiB. 초과 시 tail만 보존.
 async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
+    handle_run_with_origin(cmd, provider_override, None).await
+}
+
+/// `aic run`의 본체. `original_exit_code`는 `aic capture-last`가 MetadataOnly record를
+/// 승격 재실행할 때 원본 실패 코드를 새 record에 보존하기 위해 전달한다.
+async fn handle_run_with_origin(
+    cmd: Vec<String>,
+    provider_override: Option<String>,
+    original_exit_code: Option<i32>,
+) {
     if cmd.is_empty() {
         eprintln!("{COL_RED}✗{COL_RESET} 실행할 명령이 없습니다 — `aic run -- <cmd...>`");
         std::process::exit(2);
@@ -2108,24 +2118,41 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
     let lines: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
     let truncated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stored_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // 잘리기 전 원본 크기 집계용 — 지금까지 "본 모든 바이트" 총량.
+    let seen_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let binary = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     async fn pump<R: tokio::io::AsyncRead + Unpin>(
         reader: R,
         sink: std::sync::Arc<tokio::sync::Mutex<std::collections::VecDeque<String>>>,
         truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        stored_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        seen_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        binary: std::sync::Arc<std::sync::atomic::AtomicBool>,
         write_to: bool, // true=stdout, false=stderr — 사용자에게는 그대로 echo
     ) {
         let mut br = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = br.next_line().await {
+        loop {
+            let line = match br.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(e) => {
+                    // non-UTF8 스트림은 line 디코딩에서 실패한다 → binary로 표시.
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        binary.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    break;
+                }
+            };
+            if line.contains('\0') {
+                binary.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             if write_to {
                 println!("{line}");
             } else {
                 eprintln!("{line}");
             }
             let line_bytes = line.len() as u64 + 1;
-            let cur = stored_bytes.fetch_add(line_bytes, std::sync::atomic::Ordering::Relaxed);
+            let cur = seen_bytes.fetch_add(line_bytes, std::sync::atomic::Ordering::Relaxed);
             let mut q = sink.lock().await;
             if cur + line_bytes > BYTE_CAP || q.len() >= LINE_CAP {
                 if !q.is_empty() {
@@ -2137,15 +2164,23 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
         }
     }
 
-    let lines_out = std::sync::Arc::clone(&lines);
-    let trunc_out = std::sync::Arc::clone(&truncated);
-    let bytes_out = std::sync::Arc::clone(&stored_bytes);
-    let stdout_task = tokio::spawn(pump(stdout, lines_out, trunc_out, bytes_out, true));
+    let stdout_task = tokio::spawn(pump(
+        stdout,
+        std::sync::Arc::clone(&lines),
+        std::sync::Arc::clone(&truncated),
+        std::sync::Arc::clone(&seen_bytes),
+        std::sync::Arc::clone(&binary),
+        true,
+    ));
 
-    let lines_err = std::sync::Arc::clone(&lines);
-    let trunc_err = std::sync::Arc::clone(&truncated);
-    let bytes_err = std::sync::Arc::clone(&stored_bytes);
-    let stderr_task = tokio::spawn(pump(stderr, lines_err, trunc_err, bytes_err, false));
+    let stderr_task = tokio::spawn(pump(
+        stderr,
+        std::sync::Arc::clone(&lines),
+        std::sync::Arc::clone(&truncated),
+        std::sync::Arc::clone(&seen_bytes),
+        std::sync::Arc::clone(&binary),
+        false,
+    ));
 
     let status = match child.wait().await {
         Ok(s) => s,
@@ -2170,10 +2205,17 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
         }
     });
 
-    let collected: Vec<String> = lines.lock().await.iter().cloned().collect();
-    let stored = stored_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let mut collected: Vec<String> = lines.lock().await.iter().cloned().collect();
+    let seen = seen_bytes.load(std::sync::atomic::Ordering::Relaxed);
     let was_truncated = truncated.load(std::sync::atomic::Ordering::Relaxed);
+    let is_binary = binary.load(std::sync::atomic::Ordering::Relaxed);
+    if is_binary {
+        // BinaryOmitted 계약: binary/non-UTF8 감지 시 본문은 저장하지 않는다.
+        collected.clear();
+    }
+    let stored: u64 = collected.iter().map(|l| l.len() as u64 + 1).sum();
 
+    let duration = chrono::Utc::now() - started_at;
     let record = aic_common::CommandRecord {
         id: aic_common::generate_record_id(),
         command: Some(cmd.join(" ")),
@@ -2181,33 +2223,35 @@ async fn handle_run(cmd: Vec<String>, provider_override: Option<String>) {
         output_lines: collected.clone(),
         timestamp: chrono::Utc::now(),
         capture_mode: aic_common::CaptureMode::ExplicitCapture,
-        capture_quality: if was_truncated {
+        capture_quality: if is_binary {
+            aic_common::CaptureQuality::BinaryOmitted
+        } else if was_truncated {
             aic_common::CaptureQuality::TruncatedOutput
         } else {
             aic_common::CaptureQuality::FullOutput
         },
         output_metadata: Some(aic_common::OutputMetadata {
-            original_bytes: None,
+            original_bytes: Some(seen),
             stored_bytes: stored,
             stored_lines: collected.len(),
             truncated: was_truncated,
-            binary: false,
+            binary: is_binary,
             sha256: None,
+            original_exit_code,
         }),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        duration_ms: duration.num_milliseconds().max(0).try_into().ok(),
     };
 
-    // duration은 trace 로그에만 — record schema에 duration 필드는 향후 확장.
-    let duration = chrono::Utc::now() - started_at;
     eprintln!(
-        "{COL_DIM}── aic run: exit={exit} lines={n} bytes={b} truncated={t} duration={d}ms ──{COL_RESET}",
+        "{COL_DIM}── aic run: exit={exit} lines={n} bytes={b} truncated={t} binary={bin} duration={d}ms ──{COL_RESET}",
         exit = record.exit_code,
         n = record.output_lines.len(),
-        b = record
-            .output_metadata
-            .as_ref()
-            .map(|m| m.stored_bytes)
-            .unwrap_or(0),
+        b = stored,
         t = was_truncated,
+        bin = is_binary,
         d = duration.num_milliseconds().max(0)
     );
 
@@ -4062,6 +4106,7 @@ fn registry_session_json(s: aic_common::SessionInfo) -> serde_json::Value {
         "attached_tty": s.attached_tty,
         "shell": s.shell,
         "cwd": s.cwd,
+        "label": s.label,
     })
 }
 
@@ -4238,9 +4283,14 @@ async fn handle_doctor_fix(dry_run: bool) {
     match hook_dir {
         Some(dir) => {
             println!("  {COL_DIM}↳{COL_RESET} hook 파일 위치: {}", dir.display());
+            let zsh_path = dir.join("hooks.zsh");
+            let bash_path = dir.join("hooks.bash");
+            println!(
+                "  {COL_YELLOW}→{COL_RESET} {} / {} 덮어쓰기 예정 (OSC 133 boundary hook)",
+                zsh_path.display(),
+                bash_path.display()
+            );
             if !dry_run {
-                let zsh_path = dir.join("hooks.zsh");
-                let bash_path = dir.join("hooks.bash");
                 // hooks.{zsh,bash}는 `# >>> aic hooks >>>` source 라인이 가리키는
                 // OSC 133 boundary hook이다. metadata hook(hook-events.*)이 아니라
                 // boundary generator를 써야 내용이 일치한다.
@@ -4254,18 +4304,19 @@ async fn handle_doctor_fix(dry_run: bool) {
                     Ok(()) => println!("  {COL_GREEN}✓{COL_RESET} hook 파일 재생성"),
                     Err(e) => println!("  {COL_RED}✗{COL_RESET} hook 재생성 실패: {e}"),
                 }
-            } else {
-                println!("  {COL_DIM}↳ (dry-run) zsh/bash hook 스크립트 덮어쓰기 예정{COL_RESET}");
             }
         }
         None => println!("  {COL_YELLOW}⚠{COL_RESET} HOME 경로를 알 수 없어 hook 재생성 건너뜀"),
     }
 
-    // 3. stale session artifacts는 aicd가 부팅 시 정리한다.
-    //    여기서는 사용자에게 안내만 — 별도 client-side cleanup은 단계 4의 prune이 커버.
-    println!("  {COL_DIM}↳ stale .sock/.pid 정리는 aicd 부팅 단계에서 자동 수행{COL_RESET}");
+    // 3. rc marker block 설치/갱신 — hook-events source 라인이 marker 블록 안에 있게 한다.
+    doctor_fix_rc_markers(dry_run);
 
-    // 4. registry inactive 1시간 초과 prune. dry-run이면 항상 안내만, 아니면 ping
+    // 4. stale session .sock/.pid 정리 — connect 실패한 소켓과 죽은 PID 파일 제거.
+    //    (aicd 부팅 시에도 정리되지만, aicd가 안 뜨는 환경을 위해 client-side로도 수행.)
+    doctor_fix_stale_artifacts(dry_run);
+
+    // 5. registry inactive 1시간 초과 prune. dry-run이면 항상 안내만, 아니면 ping
     //    재확인 후 실제 호출.
     if dry_run {
         println!("  {COL_DIM}↳ (dry-run) registry prune (--older-than-secs 3600) 예정{COL_RESET}");
@@ -4284,6 +4335,206 @@ async fn handle_doctor_fix(dry_run: bool) {
     }
 
     println!("{COL_DIM}완료. 자세한 진단은 `aic doctor`로 확인.{COL_RESET}");
+}
+
+/// doctor --fix 단계 3: rc 파일의 hook-events marker 블록 설치/갱신.
+///
+/// - rc 파일이 존재하는 셸(zsh/bash)만 대상 — 사용하지 않는 셸의 rc를 만들지 않는다.
+/// - `~/.aic/hook-events.{shell}` 스크립트가 없거나 stale하면 재작성한다.
+/// - rc 변경은 marker 블록(`RC_MARKER_BEGIN`/`END`) 안에서만 한다: 블록이 없으면
+///   append, 내용이 stale하면 블록 내부만 교체, END marker가 깨져 있으면 건드리지
+///   않고 경고만 낸다.
+/// - 모든 변경은 적용 전에 어떤 파일이 어떻게 바뀌는지 먼저 출력한다.
+fn doctor_fix_rc_markers(dry_run: bool) {
+    use aic_client::hook_install;
+
+    let Some(home) = dirs::home_dir() else {
+        println!("  {COL_YELLOW}⚠{COL_RESET} HOME 경로를 알 수 없어 rc marker 갱신 건너뜀");
+        return;
+    };
+    let aic_dir = home.join(".aic");
+
+    let shells: [(&str, &str, &str, String); 2] = [
+        (
+            "zsh",
+            ".zshrc",
+            "hook-events.zsh",
+            hook_install::zsh_hook_script(),
+        ),
+        (
+            "bash",
+            ".bashrc",
+            "hook-events.bash",
+            hook_install::bash_hook_script(),
+        ),
+    ];
+
+    for (shell, rc_filename, hook_filename, script) in shells {
+        let rc_path = home.join(rc_filename);
+        if !rc_path.exists() {
+            println!("  {COL_DIM}↳ {rc_filename} 없음 — {shell} rc marker 건너뜀{COL_RESET}");
+            continue;
+        }
+
+        // hook-events 스크립트 파일 ensure.
+        let hook_path = aic_dir.join(hook_filename);
+        let hook_stale = std::fs::read_to_string(&hook_path)
+            .map(|cur| cur != script)
+            .unwrap_or(true);
+        if hook_stale {
+            println!(
+                "  {COL_YELLOW}→{COL_RESET} {} 작성/갱신 예정 (version {})",
+                hook_path.display(),
+                hook_install::HOOK_VERSION
+            );
+            if !dry_run {
+                let write = std::fs::create_dir_all(&aic_dir)
+                    .and_then(|()| std::fs::write(&hook_path, &script));
+                match write {
+                    Ok(()) => println!("  {COL_GREEN}✓{COL_RESET} {} 갱신", hook_path.display()),
+                    Err(e) => {
+                        println!(
+                            "  {COL_RED}✗{COL_RESET} {} 쓰기 실패: {e}",
+                            hook_path.display()
+                        );
+                        continue;
+                    }
+                }
+            }
+        } else {
+            println!("  {COL_GREEN}✓{COL_RESET} {} 최신", hook_path.display());
+        }
+
+        // rc marker 블록 ensure — 블록 밖은 절대 수정하지 않는다.
+        let expected_inner = format!("source {}", hook_path.display());
+        let snippet = format!(
+            "{begin}\n{expected_inner}\n{end}\n",
+            begin = hook_install::RC_MARKER_BEGIN,
+            end = hook_install::RC_MARKER_END,
+        );
+        let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+
+        let new_content = match (
+            existing.find(hook_install::RC_MARKER_BEGIN),
+            existing.find(hook_install::RC_MARKER_END),
+        ) {
+            (None, _) => {
+                println!(
+                    "  {COL_YELLOW}→{COL_RESET} {} 에 marker 블록 추가 예정:\n\
+                     {COL_DIM}    {}\n    {expected_inner}\n    {}{COL_RESET}",
+                    rc_path.display(),
+                    hook_install::RC_MARKER_BEGIN,
+                    hook_install::RC_MARKER_END,
+                );
+                if existing.is_empty() {
+                    snippet
+                } else if existing.ends_with('\n') {
+                    format!("{existing}\n{snippet}")
+                } else {
+                    format!("{existing}\n\n{snippet}")
+                }
+            }
+            (Some(b), Some(e)) if b < e => {
+                let inner_start = b + hook_install::RC_MARKER_BEGIN.len();
+                let inner = existing[inner_start..e].trim();
+                if inner == expected_inner {
+                    println!(
+                        "  {COL_GREEN}✓{COL_RESET} {} marker 블록 최신",
+                        rc_path.display()
+                    );
+                    continue;
+                }
+                println!(
+                    "  {COL_YELLOW}→{COL_RESET} {} marker 블록 내부 갱신 예정:\n\
+                     {COL_DIM}    - {inner}\n    + {expected_inner}{COL_RESET}",
+                    rc_path.display(),
+                );
+                format!(
+                    "{}{}\n{}\n{}",
+                    &existing[..b],
+                    hook_install::RC_MARKER_BEGIN,
+                    expected_inner,
+                    &existing[e..]
+                )
+            }
+            _ => {
+                println!(
+                    "  {COL_YELLOW}⚠{COL_RESET} {} 의 marker 블록이 손상됨 (END 누락/역순) — 수동 확인 필요, 건너뜀",
+                    rc_path.display()
+                );
+                continue;
+            }
+        };
+
+        if dry_run {
+            continue;
+        }
+        match std::fs::write(&rc_path, new_content) {
+            Ok(()) => println!(
+                "  {COL_GREEN}✓{COL_RESET} {} marker 블록 갱신",
+                rc_path.display()
+            ),
+            Err(e) => println!(
+                "  {COL_RED}✗{COL_RESET} {} 쓰기 실패: {e}",
+                rc_path.display()
+            ),
+        }
+    }
+}
+
+/// doctor --fix 단계 4: stale 세션 socket/pid 정리 (client-side).
+///
+/// `session-*.sock`에 connect가 실패하면 stale로 판단해 socket과 짝이 되는
+/// `.pid` 파일을 지운다. 삭제 전에 대상 목록을 먼저 출력한다.
+fn doctor_fix_stale_artifacts(dry_run: bool) {
+    let sockets = aic_common::list_session_sockets();
+    let stale: Vec<std::path::PathBuf> = sockets
+        .into_iter()
+        .filter(|path| match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                false
+            }
+            Err(_) => true,
+        })
+        .collect();
+
+    if stale.is_empty() {
+        println!("  {COL_GREEN}✓{COL_RESET} stale 세션 socket 없음");
+        return;
+    }
+
+    for sock in &stale {
+        let pid_path = sock.with_extension("pid");
+        println!(
+            "  {COL_YELLOW}→{COL_RESET} stale socket 삭제 예정: {}{}",
+            sock.display(),
+            if pid_path.exists() {
+                format!(" (+ {})", pid_path.display())
+            } else {
+                String::new()
+            }
+        );
+        if dry_run {
+            continue;
+        }
+        match std::fs::remove_file(sock) {
+            Ok(()) => println!("  {COL_GREEN}✓{COL_RESET} {} 삭제", sock.display()),
+            Err(e) => {
+                println!("  {COL_RED}✗{COL_RESET} {} 삭제 실패: {e}", sock.display());
+                continue;
+            }
+        }
+        if pid_path.exists() {
+            match std::fs::remove_file(&pid_path) {
+                Ok(()) => println!("  {COL_GREEN}✓{COL_RESET} {} 삭제", pid_path.display()),
+                Err(e) => println!(
+                    "  {COL_RED}✗{COL_RESET} {} 삭제 실패: {e}",
+                    pid_path.display()
+                ),
+            }
+        }
+    }
 }
 
 /// `aic doctor --probe-tools` — opt-in tool-calling live probe (GA Gate G1-b).
@@ -5420,7 +5671,7 @@ async fn handle_sessions_interactive() {
     );
 
     println!(
-        "\nActions for {COL_CYAN}{id}{COL_RESET}: (s)tatus  (l)ast  (a)nalyze  (k)ill  (q)uit"
+        "\nActions for {COL_CYAN}{id}{COL_RESET}: (s)tatus  (l)ast  (a)nalyze  (k)ill  (p)rune-detached  (q)uit"
     );
     print!("> ");
     let _ = io::stdout().flush();
@@ -5508,6 +5759,35 @@ async fn handle_sessions_interactive() {
                 }
             }
             handle_session_stop(id).await;
+        }
+        "p" | "prune" => {
+            // 세션 단위가 아닌 registry 전체의 inactive 세션 정리 — 파괴적이므로 confirm.
+            let inactive_count = list
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.state,
+                        aic_common::SessionState::Detached
+                            | aic_common::SessionState::Stopping
+                            | aic_common::SessionState::Stopped
+                            | aic_common::SessionState::Failed
+                    )
+                })
+                .count();
+            print!(
+                "{COL_YELLOW}⚠{COL_RESET} 1시간 이상 지난 inactive 세션을 registry에서 정리합니다 \
+                 (현재 inactive {inactive_count}개). 계속할까요? [y/N] "
+            );
+            let _ = io::stdout().flush();
+            input.clear();
+            if stdin.lock().read_line(&mut input).is_err() {
+                return;
+            }
+            if !matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("{COL_DIM}취소됨{COL_RESET}");
+                return;
+            }
+            handle_session_prune(3600).await;
         }
         "q" | "quit" | "" => {}
         other => {
@@ -5638,14 +5918,7 @@ fn record_id_short(id: &str) -> &str {
 }
 
 fn capture_quality_short(q: aic_common::CaptureQuality) -> &'static str {
-    match q {
-        aic_common::CaptureQuality::FullOutput => "full",
-        aic_common::CaptureQuality::MetadataOnly => "meta",
-        aic_common::CaptureQuality::TruncatedOutput => "trunc",
-        aic_common::CaptureQuality::BinaryOmitted => "bin",
-        aic_common::CaptureQuality::RedactedOutput => "redact",
-        aic_common::CaptureQuality::Unknown => "?",
-    }
+    q.short_label()
 }
 
 fn format_exit_code(code: i32) -> String {
@@ -5759,10 +6032,11 @@ async fn handle_capture_last(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let argv = vec![shell, "-c".to_string(), cmd.to_string()];
     println!(
-        "{COL_DIM}re-running via {} -c …{COL_RESET}",
-        argv.first().map(String::as_str).unwrap_or("sh")
+        "{COL_DIM}re-running via {} -c … (원본 exit={} 는 새 record에 보존됨){COL_RESET}",
+        argv.first().map(String::as_str).unwrap_or("sh"),
+        record.exit_code
     );
-    handle_run(argv, provider_override).await;
+    handle_run_with_origin(argv, provider_override, Some(record.exit_code)).await;
 }
 
 async fn handle_fix(
@@ -6457,7 +6731,23 @@ async fn handle_last(json: bool, session: Option<String>) {
     println!("{COL_BOLD}aic last{COL_RESET}");
     println!("  id      : {COL_CYAN}{id_short}{COL_RESET}  ({})", rec.id);
     println!("  command : {cmd}");
-    println!("  exit    : {exit}  {COL_DIM}({quality}){COL_RESET}");
+    println!(
+        "  exit    : {exit}  {COL_DIM}({quality}, source={}){COL_RESET}",
+        rec.capture_mode.short_label()
+    );
+    if let Some(orig) = rec
+        .output_metadata
+        .as_ref()
+        .and_then(|m| m.original_exit_code)
+    {
+        println!("  origin  : exit {orig} {COL_DIM}(capture-last 재실행 전 원본){COL_RESET}");
+    }
+    if let Some(cwd) = rec.cwd.as_deref() {
+        println!("  cwd     : {cwd}");
+    }
+    if let Some(d) = rec.duration_ms {
+        println!("  duration: {}", aic_common::format_duration_ms(d));
+    }
     println!(
         "  when    : {when}  {COL_DIM}({}){COL_RESET}",
         rec.timestamp
@@ -6711,7 +7001,12 @@ async fn stdin_record_if_piped() -> anyhow::Result<Option<aic_common::CommandRec
             truncated,
             binary: false,
             sha256: None,
+            original_exit_code: None,
         }),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        duration_ms: None,
     }))
 }
 

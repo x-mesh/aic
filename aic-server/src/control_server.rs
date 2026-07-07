@@ -912,6 +912,8 @@ mod tests {
             capture_mode,
             capture_quality: aic_common::CaptureQuality::FullOutput,
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         }
     }
 
@@ -1317,6 +1319,8 @@ mod tests {
             capture_mode: CaptureMode::Pty,
             capture_quality: aic_common::CaptureQuality::FullOutput,
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         };
         let records = vec![rec(&["a", "b"]), rec(&["c", "d", "e"])];
 

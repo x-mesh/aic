@@ -91,15 +91,10 @@ impl CommandRecordStore {
             .pending
             .remove(&(session_id.to_string(), command_id.to_string()));
 
-        // cwd는 현재 CommandRecord에 직접 저장할 필드가 없어 trace 로그로만 흘린다.
-        // 향후 CommandRecord에 cwd/duration_ms 필드 추가 시 함께 저장.
         let (command, cwd) = match pending {
             Some(p) => (Some(p.command), p.cwd),
             None => (None, None),
         };
-        if cwd.is_some() || duration_ms > 0 {
-            tracing::debug!(session_id, command_id, ?cwd, duration_ms, "hook finish");
-        }
 
         let record = CommandRecord {
             id: String::new(), // push_inner가 auto-assign
@@ -110,6 +105,8 @@ impl CommandRecordStore {
             capture_mode: CaptureMode::Hook,
             capture_quality: CaptureQuality::MetadataOnly,
             output_metadata: None,
+            cwd: cwd.map(|p| p.to_string_lossy().into_owned()),
+            duration_ms: (duration_ms > 0).then_some(duration_ms),
         };
 
         let ring = g
@@ -268,6 +265,8 @@ mod tests {
             capture_mode: CaptureMode::Pty,
             capture_quality: CaptureQuality::FullOutput,
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         }
     }
 
@@ -281,6 +280,8 @@ mod tests {
             capture_mode: CaptureMode::ExplicitCapture,
             capture_quality: CaptureQuality::FullOutput,
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         }
     }
 
@@ -295,6 +296,9 @@ mod tests {
         assert_eq!(rec.exit_code, 0);
         assert_eq!(rec.capture_mode, CaptureMode::Hook);
         assert_eq!(rec.capture_quality, CaptureQuality::MetadataOnly);
+        // start 이벤트의 cwd와 finish 이벤트의 duration이 record로 옮겨진다.
+        assert_eq!(rec.cwd.as_deref(), Some("/tmp"));
+        assert_eq!(rec.duration_ms, Some(5));
         // Hook record 역시 push_inner를 통해 16-hex id를 받는다.
         assert_eq!(rec.id.len(), 16);
     }

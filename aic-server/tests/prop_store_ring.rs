@@ -50,6 +50,8 @@ fn arb_command_record() -> impl Strategy<Value = CommandRecord> {
                     capture_mode: CaptureMode::Pty,
                     capture_quality,
                     output_metadata: None,
+                    cwd: None,
+                    duration_ms: None,
                 }
             },
         )
