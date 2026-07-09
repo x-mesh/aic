@@ -61,6 +61,42 @@ pub enum CaptureQuality {
     Unknown,
 }
 
+impl CaptureMode {
+    /// history/last 등 목록 UI용 짧은 소스 라벨.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            CaptureMode::Pty => "pty",
+            CaptureMode::Hook => "hook",
+            CaptureMode::ExplicitCapture => "run",
+        }
+    }
+}
+
+impl CaptureQuality {
+    /// history/last 등 목록 UI용 짧은 품질 라벨.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            CaptureQuality::FullOutput => "full",
+            CaptureQuality::MetadataOnly => "meta",
+            CaptureQuality::RedactedOutput => "redact",
+            CaptureQuality::BinaryOmitted => "bin",
+            CaptureQuality::TruncatedOutput => "trunc",
+            CaptureQuality::Unknown => "?",
+        }
+    }
+}
+
+/// 목록 UI용 duration 포맷: `512ms`, `1.3s`, `2m03s`.
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1000)
+    }
+}
+
 /// 출력 본문에 대한 메타데이터. 본문이 일부/전부 잘렸거나 해시만 남는 경우에 채운다.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct OutputMetadata {
@@ -76,6 +112,10 @@ pub struct OutputMetadata {
     pub binary: bool,
     /// 본문 hash (생략된 binary 출력의 식별용)
     pub sha256: Option<String>,
+    /// 재실행 승격(`aic capture-last`) 시 승격 전 원본 레코드의 exit code.
+    /// 새 레코드의 `exit_code`는 재실행 결과이므로, 원래 실패 코드를 여기 보존한다.
+    #[serde(default)]
+    pub original_exit_code: Option<i32>,
 }
 
 /// 하나의 명령어 실행에 대한 레코드.
@@ -106,6 +146,12 @@ pub struct CommandRecord {
     /// 출력 본문 메타데이터. 본문 cap/redaction/binary 시에만 채운다.
     #[serde(default)]
     pub output_metadata: Option<OutputMetadata>,
+    /// 명령이 실행된 shell cwd (알 수 있는 경우). hook event 또는 explicit capture에서 채운다.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// 명령 실행 시간 (ms). hook event 또는 explicit capture에서 채운다.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 impl Default for CommandRecord {
@@ -120,6 +166,8 @@ impl Default for CommandRecord {
             capture_mode: CaptureMode::default(),
             capture_quality: CaptureQuality::default(),
             output_metadata: None,
+            cwd: None,
+            duration_ms: None,
         }
     }
 }
@@ -598,7 +646,10 @@ mod tests {
                 truncated: false,
                 binary: false,
                 sha256: None,
+                original_exit_code: None,
             }),
+            cwd: Some("/tmp".to_string()),
+            duration_ms: Some(42),
         };
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: CommandRecord = serde_json::from_str(&json).unwrap();
@@ -760,6 +811,56 @@ auto_diagnose = false
         let hybrid = capture_quality_hint(&rec, SessionCaptureMode::Hybrid).unwrap();
         let hook = capture_quality_hint(&rec, SessionCaptureMode::Hook).unwrap();
         assert_ne!(hybrid, hook, "hybrid 메시지는 hook 메시지와 달라야 한다");
+    }
+
+    #[test]
+    fn capture_quality_hint_truncated_and_binary() {
+        let trunc = CommandRecord {
+            capture_quality: CaptureQuality::TruncatedOutput,
+            ..Default::default()
+        };
+        let msg = capture_quality_hint(&trunc, SessionCaptureMode::Pty).unwrap();
+        assert!(msg.contains("일부만 저장"), "truncated hint: {msg}");
+
+        let bin = CommandRecord {
+            capture_quality: CaptureQuality::BinaryOmitted,
+            ..Default::default()
+        };
+        let msg = capture_quality_hint(&bin, SessionCaptureMode::Pty).unwrap();
+        assert!(msg.contains("binary"), "binary hint: {msg}");
+    }
+
+    #[test]
+    fn short_labels_are_stable() {
+        assert_eq!(CaptureMode::Pty.short_label(), "pty");
+        assert_eq!(CaptureMode::Hook.short_label(), "hook");
+        assert_eq!(CaptureMode::ExplicitCapture.short_label(), "run");
+        assert_eq!(CaptureQuality::FullOutput.short_label(), "full");
+        assert_eq!(CaptureQuality::MetadataOnly.short_label(), "meta");
+        assert_eq!(CaptureQuality::TruncatedOutput.short_label(), "trunc");
+        assert_eq!(CaptureQuality::BinaryOmitted.short_label(), "bin");
+    }
+
+    #[test]
+    fn format_duration_ms_ranges() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+        assert_eq!(format_duration_ms(1_300), "1.3s");
+        assert_eq!(format_duration_ms(59_949), "59.9s");
+        assert_eq!(format_duration_ms(123_000), "2m03s");
+    }
+
+    #[test]
+    fn command_record_legacy_json_defaults_new_fields() {
+        let legacy = r#"{
+            "command": "cargo build",
+            "exit_code": 1,
+            "output_lines": [],
+            "timestamp": "2026-01-01T00:00:00Z"
+        }"#;
+        let record: CommandRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.cwd, None);
+        assert_eq!(record.duration_ms, None);
     }
 
     #[test]

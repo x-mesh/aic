@@ -68,6 +68,11 @@ pub fn finish_hook(
     };
     let _ = std::fs::remove_file(&path);
 
+    let duration_ms = finished_at
+        .signed_duration_since(pending.started_at)
+        .num_milliseconds()
+        .try_into()
+        .ok();
     let record = CommandRecord {
         id: aic_common::generate_record_id(),
         command: Some(pending.command),
@@ -83,7 +88,10 @@ pub fn finish_hook(
             truncated: false,
             binary: false,
             sha256: None,
+            original_exit_code: None,
         }),
+        cwd: pending.cwd.map(|p| p.to_string_lossy().into_owned()),
+        duration_ms,
     };
     save_last(&record)?;
     Ok(Some(record))

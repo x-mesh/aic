@@ -65,6 +65,8 @@ fn pty_record_with_id(id: &str, tag: &str) -> CommandRecord {
         capture_mode: CaptureMode::Pty,
         capture_quality: CaptureQuality::FullOutput,
         output_metadata: None,
+        cwd: None,
+        duration_ms: None,
     }
 }
 
@@ -78,6 +80,8 @@ fn explicit_record_with_id(id: &str, tag: &str) -> CommandRecord {
         capture_mode: CaptureMode::ExplicitCapture,
         capture_quality: CaptureQuality::FullOutput,
         output_metadata: None,
+        cwd: None,
+        duration_ms: None,
     }
 }
 

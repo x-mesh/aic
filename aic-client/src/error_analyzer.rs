@@ -3,7 +3,7 @@
 //! `CommandRecord`의 에러 컨텍스트를 LLM 프롬프트로 구성하고,
 //! LLM 응답을 `AnalysisResult`로 파싱한다.
 
-use aic_common::{AnalysisResult, CommandRecord};
+use aic_common::{AnalysisResult, CaptureQuality, CommandRecord};
 
 pub struct ErrorAnalyzer;
 
@@ -259,6 +259,25 @@ impl ErrorAnalyzer {
             ""
         };
 
+        // capture 시점의 truncation/binary 상태를 LLM에 알린다 — OUTPUT이 전부가 아니라는
+        // 사실을 모르면 "에러 토큰이 없다"는 식의 단정적 오답이 나온다.
+        let capture_truncated = record.capture_quality == CaptureQuality::TruncatedOutput
+            || record.output_metadata.as_ref().is_some_and(|m| m.truncated);
+        let capture_binary = record.capture_quality == CaptureQuality::BinaryOmitted
+            || record.output_metadata.as_ref().is_some_and(|m| m.binary);
+        let capture_note = if capture_binary {
+            "\n# Important context\n\
+             The command produced binary/non-UTF8 output, so the captured body was omitted. \
+             OUTPUT is incomplete or empty by design — reason from COMMAND and EXIT_CODE, \
+             and phrase EXPLANATION as a hypothesis rather than a fact about OUTPUT.\n"
+        } else if capture_truncated {
+            "\n# Important context\n\
+             OUTPUT was truncated at capture time (line/byte cap) — earlier lines are missing. \
+             The first error may not be visible; avoid claiming an error token does not exist.\n"
+        } else {
+            ""
+        };
+
         let transcript_note = if output_looks_like_aic_transcript(&record.output_lines) {
             "\n# Important context\n\
              OUTPUT appears to include AIC's own UI/debug output or a previous assistant analysis. \
@@ -282,6 +301,7 @@ impl ErrorAnalyzer {
              {output_section}\n\
              {history_note}\
              {interrupt_note}\
+             {capture_note}\
              {transcript_note}\
              \n\
              # Internal reasoning (DO NOT print)\n\
@@ -1116,6 +1136,36 @@ mod tests {
         assert!(prompt.contains("line_59")); // 마지막은 보존
         assert!(prompt.contains("line_10")); // 50줄 윈도우 시작
         assert!(!prompt.contains("line_0\n")); // 가장 앞 라인은 잘림
+    }
+
+    #[test]
+    fn build_prompt_notes_capture_time_truncation() {
+        let mut record = make_record(Some("cargo build"), 1, vec!["error[E0308]"]);
+        record.capture_quality = CaptureQuality::TruncatedOutput;
+        let prompt = ErrorAnalyzer::build_prompt(&record, "korean");
+        assert!(
+            prompt.contains("truncated at capture time"),
+            "capture truncation note missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_notes_binary_omission() {
+        let mut record = make_record(Some("cat blob.bin"), 1, vec![]);
+        record.capture_quality = CaptureQuality::BinaryOmitted;
+        let prompt = ErrorAnalyzer::build_prompt(&record, "korean");
+        assert!(
+            prompt.contains("binary/non-UTF8"),
+            "binary note missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_no_capture_note_for_full_output() {
+        let record = make_record(Some("ls"), 1, vec!["err"]);
+        let prompt = ErrorAnalyzer::build_prompt(&record, "korean");
+        assert!(!prompt.contains("truncated at capture time"));
+        assert!(!prompt.contains("binary/non-UTF8"));
     }
 
     #[test]

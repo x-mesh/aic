@@ -76,6 +76,31 @@ impl UdsClient {
         }
     }
 
+    /// `aicd` Control_UDS의 CommandRecordStore에 세션 라우팅으로 record를 등록한다
+    /// (Phase 3.1 Dual-Write의 client 측 대응). `aic run`이 만든 ExplicitCapture
+    /// record를 aicd 기반 read path(`aic history`, central-store cascade)에서도
+    /// 찾을 수 있게 한다. aicd 미실행이면 `ServerNotRunning` — best-effort 무시 가능.
+    pub async fn register_record_for_session(
+        &self,
+        session_id: &str,
+        record: CommandRecord,
+    ) -> Result<(), AicError> {
+        match self
+            .send_request(IpcRequest::RegisterRecordForSession {
+                session_id: session_id.to_string(),
+                record,
+            })
+            .await?
+        {
+            IpcResponse::Pong => Ok(()),
+            IpcResponse::Error { message } => Err(AicError::UserMessage(message)),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// 세션 ring buffer에서 record id prefix로 시작하는 record를 모두 조회한다.
     /// `aic --record <prefix>`/`aic fix --record`/`aic learn --record`가 사용한다 —
     /// client가 200개를 가져와 필터링하던 비효율을 server-side filter로 대체한다.
