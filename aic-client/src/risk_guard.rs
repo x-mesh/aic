@@ -415,6 +415,12 @@ pub fn has_overwrite_redirect(command: &str) -> bool {
                         continue;
                     }
                     let target = command[i + 1..].trim_start();
+                    // fd duplication(`2>&1`, `>&2`)은 파일 덮어쓰기가 아니다 —
+                    // 대상이 `&`로 시작하면 파일 생성/덮어쓰기 없이 fd를 복제한다.
+                    if target.starts_with('&') {
+                        i += 1;
+                        continue;
+                    }
                     let target_first = target.split_whitespace().next().unwrap_or("");
                     let cleaned = target_first.trim_matches(|c| c == '\'' || c == '"');
                     if !cleaned.is_empty() && !is_harmless_device_sink(cleaned) {
@@ -1527,6 +1533,12 @@ mod tests {
         assert!(!has_overwrite_redirect("cmd > /dev/null"));
         assert!(!has_overwrite_redirect("echo '> not a redirect'"));
         assert!(!has_overwrite_redirect("ls -la"));
+        // fd duplication은 파일 덮어쓰기가 아니다 — confirm 강제 대상 아님.
+        assert!(!has_overwrite_redirect("make 2>&1"));
+        assert!(!has_overwrite_redirect("cmd >&2"));
+        assert!(!has_overwrite_redirect("build 2>&1 | tee log")); // stderr→stdout, 파이프는 별개
+        // fd dup 뒤에 실제 파일 overwrite가 있으면 여전히 감지.
+        assert!(has_overwrite_redirect("cmd 2>&1 > out.txt"));
     }
 
     #[test]

@@ -2097,7 +2097,7 @@ async fn handle_run_with_origin(
     const BYTE_CAP: u64 = 256 * 1024;
 
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
     let started_at = chrono::Utc::now();
     let mut child = match tokio::process::Command::new(&cmd[0])
@@ -2142,6 +2142,16 @@ async fn handle_run_with_origin(
                     // non-UTF8 스트림은 line 디코딩에서 실패한다 → binary로 표시.
                     if e.kind() == std::io::ErrorKind::InvalidData {
                         binary.store(true, std::sync::atomic::Ordering::Relaxed);
+                        // 라인 파싱은 멈추되 남은 바이트를 EOF까지 배수한다. 그러지
+                        // 않으면 reader가 사라져 자식이 가득 찬 파이프(~64KB)에 write하며
+                        // 블록되고, 먼저 await된 child.wait()가 영원히 반환되지 않는다.
+                        let mut reader = br.into_inner();
+                        let mut drain = [0u8; 8192];
+                        while let Ok(n) = reader.read(&mut drain).await {
+                            if n == 0 {
+                                break;
+                            }
+                        }
                     }
                     break;
                 }
@@ -4428,7 +4438,21 @@ fn doctor_fix_rc_markers(dry_run: bool) {
             begin = hook_install::RC_MARKER_BEGIN,
             end = hook_install::RC_MARKER_END,
         );
-        let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+        // read_to_string은 non-UTF8/권한 오류에서 Err를 낸다. unwrap_or_default로
+        // 빈 문자열로 뭉개면 아래 write가 기존 rc 전체를 marker 블록만 남기고
+        // 덮어써 사용자 설정이 소실된다 — 파일 부재(NotFound)만 빈 값으로 처리하고
+        // 그 외 읽기 실패는 이 rc를 건너뛴다.
+        let existing = match std::fs::read_to_string(&rc_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                println!(
+                    "  {COL_RED}✗{COL_RESET} {} 읽기 실패 — marker 블록 건너뜀 (덮어쓰기 방지): {e}",
+                    rc_path.display()
+                );
+                continue;
+            }
+        };
 
         let new_content = match (
             existing.find(hook_install::RC_MARKER_BEGIN),
