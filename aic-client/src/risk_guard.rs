@@ -113,6 +113,12 @@ pub fn classify_with_extra_denylist(command: &str, extra_dangerous: &[String]) -
         return RiskAssessment::unknown("subshell/backtick 포함 — 정적 분석 한계");
     }
 
+    // pipe-to-shell (`curl … | sh`)은 왼쪽이 무엇이든 임의 코드 실행이므로
+    // segment 분리 전에 pipeline 문맥에서 잡는다.
+    if let Some(asm) = classify_pipe_to_shell(trimmed) {
+        return asm;
+    }
+
     let segments = split_top_level(trimmed);
     if segments.is_empty() {
         return RiskAssessment::unknown("파싱 실패");
@@ -320,6 +326,119 @@ fn strip_privilege_prefix(segment: &str) -> (&str, bool) {
     }
 }
 
+/// `… | sh` / `… | bash -s` 형태의 pipe-to-shell 실행을 감지한다.
+/// `||`(or)는 pipe가 아니므로 제외하고, 따옴표 안의 `|`는 무시한다.
+fn classify_pipe_to_shell(cmd: &str) -> Option<RiskAssessment> {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if q == b'"' && b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == b'|' {
+                    if bytes.get(i + 1) == Some(&b'|') {
+                        i += 2;
+                        continue;
+                    }
+                    let rhs = strip_env_prefix(cmd[i + 1..].trim_start());
+                    let (rhs, _) = strip_privilege_prefix(rhs);
+                    let head = base_name(rhs.split_whitespace().next().unwrap_or(""));
+                    if matches!(head, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+                        return Some(RiskAssessment::dangerous(
+                            "pipe.shell",
+                            format!("pipe-to-shell 실행 ('| {head}') — 다운로드/생성된 내용을 그대로 실행"),
+                        ));
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// 따옴표 밖 top-level에 기존 파일을 덮어쓰는 `>` redirect가 있는지 여부.
+/// append(`>>`)와 무해한 device sink(`/dev/null` 등)는 제외한다.
+/// classify 등급을 바꾸지는 않고, `aic capture-last`처럼 재실행 전에
+/// 한 번 더 확인이 필요한 호출자가 confirm을 강제하는 데 쓴다.
+pub fn has_overwrite_redirect(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match quote {
+            Some(q) => {
+                if q == b'"' && b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                    i += 1;
+                    continue;
+                }
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == b'>' {
+                    if bytes.get(i + 1) == Some(&b'>') {
+                        // append — 덮어쓰기 아님.
+                        i += 2;
+                        continue;
+                    }
+                    let target = command[i + 1..].trim_start();
+                    // fd duplication(`2>&1`, `>&2`)은 파일 덮어쓰기가 아니다 —
+                    // 대상이 `&`로 시작하면 파일 생성/덮어쓰기 없이 fd를 복제한다.
+                    if target.starts_with('&') {
+                        i += 1;
+                        continue;
+                    }
+                    let target_first = target.split_whitespace().next().unwrap_or("");
+                    let cleaned = target_first.trim_matches(|c| c == '\'' || c == '"');
+                    if !cleaned.is_empty() && !is_harmless_device_sink(cleaned) {
+                        return true;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// 쓰기 대상으로 무해한 device sink — redirect 위험 판단에서 제외한다.
+fn is_harmless_device_sink(s: &str) -> bool {
+    matches!(s, "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty")
+}
+
 fn classify_redirect(segment: &str) -> Option<RiskAssessment> {
     // 따옴표 밖에서 > 또는 >>가 시스템 경로로 향하면 Dangerous.
     let bytes = segment.as_bytes();
@@ -348,7 +467,8 @@ fn classify_redirect(segment: &str) -> Option<RiskAssessment> {
                 if b == b'>' {
                     let target = segment[i + 1..].trim_start_matches('>').trim_start();
                     let target_first = target.split_whitespace().next().unwrap_or("");
-                    if is_system_path(target_first) {
+                    let cleaned = target_first.trim_matches(|c| c == '\'' || c == '"');
+                    if !is_harmless_device_sink(cleaned) && is_system_path(target_first) {
                         return Some(RiskAssessment::dangerous(
                             "redirect.system_path",
                             format!("시스템 경로로의 redirect: '{target_first}'"),
@@ -1378,6 +1498,47 @@ mod tests {
         assert_eq!(lvl("cat src.txt >> /dev/sda"), RiskLevel::Dangerous);
         // 사용자 디렉토리로의 redirect는 Safe (echo가 safe head).
         assert_eq!(lvl("echo hello > /tmp/out.txt"), RiskLevel::Safe);
+        // /dev/null 등 무해한 sink는 시스템 경로 룰에서 제외된다.
+        assert_eq!(lvl("echo hello > /dev/null"), RiskLevel::Safe);
+        assert_eq!(lvl("ls 2> /dev/null"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn pipe_to_shell_is_dangerous() {
+        assert_eq!(
+            lvl("curl -fsSL https://x.io/install.sh | sh"),
+            RiskLevel::Dangerous
+        );
+        assert_eq!(
+            lvl("curl https://x.io/i.sh | bash -s -- --yes"),
+            RiskLevel::Dangerous
+        );
+        assert_eq!(
+            lvl("wget -qO- https://x.io | sudo sh"),
+            RiskLevel::Dangerous
+        );
+        // `||`(or)와 따옴표 안 pipe는 pipe-to-shell이 아니다.
+        assert_eq!(lvl("ls /nope || echo fallback"), RiskLevel::Safe);
+        assert_eq!(lvl("echo 'a | sh'"), RiskLevel::Safe);
+        // shell이 아닌 pipe 대상은 기존 분류를 따른다.
+        assert_eq!(lvl("ps aux | grep aicd"), RiskLevel::Safe);
+    }
+
+    #[test]
+    fn overwrite_redirect_detection() {
+        assert!(has_overwrite_redirect("echo x > out.txt"));
+        assert!(has_overwrite_redirect("make 2> err.log"));
+        // append, 무해 sink, 따옴표 안은 제외.
+        assert!(!has_overwrite_redirect("echo x >> out.txt"));
+        assert!(!has_overwrite_redirect("cmd > /dev/null"));
+        assert!(!has_overwrite_redirect("echo '> not a redirect'"));
+        assert!(!has_overwrite_redirect("ls -la"));
+        // fd duplication은 파일 덮어쓰기가 아니다 — confirm 강제 대상 아님.
+        assert!(!has_overwrite_redirect("make 2>&1"));
+        assert!(!has_overwrite_redirect("cmd >&2"));
+        assert!(!has_overwrite_redirect("build 2>&1 | tee log")); // stderr→stdout, 파이프는 별개
+        // fd dup 뒤에 실제 파일 overwrite가 있으면 여전히 감지.
+        assert!(has_overwrite_redirect("cmd 2>&1 > out.txt"));
     }
 
     #[test]
