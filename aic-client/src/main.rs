@@ -2897,7 +2897,20 @@ fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
         hook = hook_path.display()
     );
 
-    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+    // read 실패(non-UTF8/권한)를 빈 값으로 뭉개면 아래 write가 기존 rc 전체를
+    // snippet만 남기고 덮어써 사용자 설정이 소실된다 — 파일 부재만 빈 값으로,
+    // 그 외 읽기 실패는 rc를 건드리지 않고 중단한다.
+    let existing = match std::fs::read_to_string(&rc_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} {} 읽기 실패 — rc를 수정하지 않고 중단 (덮어쓰기 방지): {e}",
+                rc_path.display()
+            );
+            std::process::exit(2);
+        }
+    };
     if existing.contains(MARKER_BEGIN) {
         println!(
             "{COL_GREEN}✔{COL_RESET} {hook} 생성/갱신",
@@ -3010,7 +3023,20 @@ fn install_hook_mode(shell_name: &str) {
         hook = hook_path.display(),
         end = hook_install::RC_MARKER_END,
     );
-    let existing = std::fs::read_to_string(&rc_path).unwrap_or_default();
+    // read 실패(non-UTF8/권한)를 빈 값으로 뭉개면 아래 write가 기존 rc 전체를
+    // snippet만 남기고 덮어써 사용자 설정이 소실된다 — 파일 부재만 빈 값으로,
+    // 그 외 읽기 실패는 rc를 건드리지 않고 중단한다.
+    let existing = match std::fs::read_to_string(&rc_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} {} 읽기 실패 — rc를 수정하지 않고 중단 (덮어쓰기 방지): {e}",
+                rc_path.display()
+            );
+            return;
+        }
+    };
     if existing.contains(hook_install::RC_MARKER_BEGIN) {
         println!(
             "{COL_DIM}↪ {} 에 hook-events 마커가 이미 있음 (skip){COL_RESET}",
