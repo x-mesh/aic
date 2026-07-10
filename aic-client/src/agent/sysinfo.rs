@@ -7,8 +7,20 @@
 //! 덧붙는다(미설치 노이즈 0 — `/diagnose`와 동일한 `docker_available` 게이팅).
 
 /// `/local`이 보여줄 기본 섹션 이름(자동완성·필터에도 사용).
+/// `mem_top_proc`는 RCA 강화 ③용 — L0 스냅샷이 프로세스별 rss를 품어야 auto-RCA가
+/// baseline 대비 "어느 프로세스가 자랐나"를 결정적으로 diff할 수 있다(`agent::proc_delta`).
 pub(crate) const LOCAL_SECTIONS: &[&str] = &[
-    "date", "host", "os", "uptime", "disk", "memory", "fd", "ip", "route", "ports",
+    "date",
+    "host",
+    "os",
+    "uptime",
+    "disk",
+    "memory",
+    "mem_top_proc",
+    "fd",
+    "ip",
+    "route",
+    "ports",
 ];
 
 /// docker 설치 호스트에서 기본 섹션 뒤에 덧붙는 docker 섹션(상태→리소스→디스크 순).
