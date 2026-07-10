@@ -1847,7 +1847,12 @@ impl AgentSession {
                 }) {
                     Ok((meta, events)) => {
                         self.active_rca_id = Some(meta.id.clone());
-                        self.out.note(&rca::render_timeline(&meta, &events)).await;
+                        // 주변 L0 스냅샷 조인(RCA 강화 ①) — store 미기록/실패면 evidence-only.
+                        let snapshots =
+                            crate::snapshot_store::load_snapshots().unwrap_or_default();
+                        self.out
+                            .note(&rca::render_timeline(&meta, &events, &snapshots))
+                            .await;
                     }
                     Err(e) => self.out.note(&format!("RCA timeline 조회 실패: {e}")).await,
                 }
