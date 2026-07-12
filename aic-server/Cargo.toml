@@ -45,6 +45,20 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hmac = "0.12"
 sha2 = "0.10"
 toml = "0.8"
+# SRE t6: OTLP host-metrics exporter.
+# - prost: OTLP metrics를 protobuf로 인코딩한다. opentelemetry-proto crate 대신 prost 직접 +
+#   손수 정의한 최소 메시지 subset을 쓴다 — opentelemetry-proto는 gen-tonic(-messages)이 tonic/
+#   grpc 스택을 끌어와 OTLP/HTTP push엔 과한 의존성이다. 우리는 Gauge + Resource attrs만 보내므로
+#   메시지 subset이 작고, prost는 이미 workspace 트리에 캐시된 표준 protobuf 라이브러리다.
+prost = "0.13"
+# host metrics 수집 — aic-client와 동일 버전/feature(system/disk/network). aic-server용 최소
+# 샘플러를 새로 작성하므로 aic-client에 의존하지 않는다(sys_sampler는 pub(crate)).
+sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
+# OTLP protobuf를 HTTP POST. aic-client와 동일한 reqwest 0.12(rustls-tls). protobuf bytes만 보내므로
+# json feature는 불필요. redirect는 기본값(collector는 보통 단일 endpoint).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# SRE t8: OTLP spool 드레인 backoff jitter. aic-common이 이미 rand 0.8을 쓰고 있어 동일 버전으로 맞춘다.
+rand = "0.8"
 
 [dev-dependencies]
 proptest = "1"
