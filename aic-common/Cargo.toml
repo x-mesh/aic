@@ -23,6 +23,9 @@ thiserror = "2"
 anyhow = "1"
 libc = "0.2"
 rand = "0.8"
+# secret·PII redaction(redaction.rs) 패턴 매칭. aic-client에서 옮겨오며 함께 이동 —
+# aic-server(OTLP exporter)도 동일 redaction을 공유한다.
+regex = "1"
 tracing = "0.1"
 # Attach frame 프로토콜 (aic-common/src/attach.rs) 에서 raw PTY byte slice 를
 # 소유권 이전 없이 전달하기 위해 사용한다. serde feature 는 의도적으로 끄고,
