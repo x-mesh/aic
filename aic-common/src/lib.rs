@@ -6,6 +6,9 @@ pub mod central_store_flag;
 pub mod error;
 pub mod ipc;
 pub mod paths;
+// LLM/텔레메트리 송신 직전 secret·PII 마스킹. aic-client(LLM prompt)와 aic-server
+// (OTLP exporter, SRE t6) 양쪽이 공유하므로 lean한 aic-common으로 옮겨 단일 원천으로 둔다.
+pub mod redaction;
 pub mod session;
 pub mod shell_hooks;
 
@@ -440,6 +443,91 @@ pub struct AicdConfig {
     /// webhook alert ingestion 설정.
     #[serde(default)]
     pub webhook: AicdWebhookConfig,
+    /// OTLP host-metrics exporter 설정 (SRE t6). 기본 비활성(opt-in).
+    #[serde(default)]
+    pub exporter: AicdExporterConfig,
+}
+
+/// aicd OTLP exporter 설정 (SRE t6: host metrics push / t7: events+connections push).
+///
+/// 기본 **비활성**이다. 활성화하면 aicd가 주기적으로 sysinfo 기반 host metrics(cpu/load/mem/
+/// swap/disk/net)를 수집해 OTLP protobuf로 인코딩한 뒤 `{endpoint}/v1/metrics`로 push한다.
+/// `events_enabled`/`connections_enabled`는 `enabled=true`일 때만 의미가 있으며(부모 게이트),
+/// 각각 command 종료 이벤트(OTLP Logs, `/v1/logs`)와 주기 connections/inventory 스냅샷(OTLP Logs,
+/// `/v1/logs`)을 독립적으로 껐다 켤 수 있다. 모든 송신 문자열 필드는 redaction을 거친다. token은
+/// 평문 또는 환경변수 `AIC_EXPORTER_TOKEN`로 주입한다(aicd는 keychain을 resolve하지 않는다 —
+/// webhook secret과 동일 관례).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AicdExporterConfig {
+    /// exporter 활성화 여부. 기본 false(opt-in). false면 코드 경로 완전 비활성(하위 플래그 무관).
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP HTTP collector base URL(예: `http://127.0.0.1:4318`). `/v1/metrics`·`/v1/logs`가
+    /// 각각 append된다. 미설정(빈 문자열)이면 enabled여도 exporter를 띄우지 않는다.
+    #[serde(default)]
+    pub endpoint: String,
+    /// `Authorization: Bearer <token>`용 토큰. 환경변수 `AIC_EXPORTER_TOKEN`가 우선한다.
+    /// 미설정 시 Authorization 헤더 없이 전송(localhost collector 등).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// 수집·push 주기(초). host metrics 전용. 기본 60초. 다른 config가 units 없는 `interval`을
+    /// 쓰지 않도록 repo 관례(`dedup_ttl_secs`/`connect_timeout_secs`)를 따라 `_secs` suffix로
+    /// 단위를 명시한다.
+    #[serde(default = "default_exporter_interval")]
+    pub interval_secs: u64,
+    /// command 종료 이벤트(CommandRecordStore tap → OTLP Logs) push 활성화 여부. 기본 true
+    /// (`enabled=true`로 껐다 켤 때 기본 동작 — host metrics만 원하면 명시적으로 false).
+    #[serde(default = "default_true")]
+    pub events_enabled: bool,
+    /// connections/inventory 주기 스냅샷(OTLP Logs) push 활성화 여부. 기본 true.
+    #[serde(default = "default_true")]
+    pub connections_enabled: bool,
+    /// connections/inventory 스냅샷 캡처 주기(초). host metrics `interval_secs`와 별개 — 스냅샷은
+    /// `aic` 바이너리를 spawn하는 비용이 있어 기본을 더 길게(60초) 둔다.
+    #[serde(default = "default_connections_interval")]
+    pub connections_interval_secs: u64,
+    /// 오프라인 spool(`~/.aic/otlp-spool/`, SRE t8) 총 용량 상한(bytes). collector가 다운된 동안
+    /// push 실패분을 여기 쌓아 두고 복구 후 드레인한다. 상한을 넘으면 가장 오래된 배치부터
+    /// 삭제(oldest drop)하며 카운터를 올린다(무한정 디스크를 먹지 않게). 기본 256MiB.
+    #[serde(default = "default_spool_max_bytes")]
+    pub spool_max_bytes: u64,
+    /// spool 드레인 시 한 번(host metrics tick)에 재전송을 시도할 최대 배치 수(SRE t8). 배치당
+    /// HTTP 요청 1개라 이 값이 곧 "collector 복구 직후 한 번에 몇 요청을 쏠지"의 속도 제한이다.
+    /// 기본 20 — 밀린 배치가 더 있으면 다음 tick에 이어서 드레인한다.
+    #[serde(default = "default_spool_drain_batch_limit")]
+    pub spool_drain_batch_limit: usize,
+}
+
+impl Default for AicdExporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            token: None,
+            interval_secs: default_exporter_interval(),
+            events_enabled: true,
+            connections_enabled: true,
+            connections_interval_secs: default_connections_interval(),
+            spool_max_bytes: default_spool_max_bytes(),
+            spool_drain_batch_limit: default_spool_drain_batch_limit(),
+        }
+    }
+}
+
+fn default_exporter_interval() -> u64 {
+    60
+}
+
+fn default_connections_interval() -> u64 {
+    60
+}
+
+fn default_spool_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_spool_drain_batch_limit() -> usize {
+    20
 }
 
 /// aicd webhook 리스너 설정 (Alertmanager/Grafana/PagerDuty/generic JSON 수신).
@@ -713,6 +801,130 @@ auto_diagnose = false
         assert_eq!(cfg.aicd.webhook.rate_limit_per_min, 30);
         assert_eq!(cfg.aicd.webhook.dedup_ttl_secs, 600);
         assert!(!cfg.aicd.webhook.auto_diagnose);
+    }
+
+    #[test]
+    fn aicd_exporter_defaults_disabled_when_absent() {
+        // [aicd.exporter] 섹션이 없으면 exporter는 비활성 default여야 한다(회귀 0).
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.aicd.exporter.enabled);
+        assert_eq!(cfg.aicd.exporter.interval_secs, 60);
+        assert!(cfg.aicd.exporter.endpoint.is_empty());
+        assert!(cfg.aicd.exporter.token.is_none());
+        // t7: events/connections 하위 플래그도 [aicd.exporter] 섹션 부재 시 안전한 기본값이어야 한다.
+        assert!(cfg.aicd.exporter.events_enabled, "events는 기본 활성(부모 게이트가 실제 gate)");
+        assert!(cfg.aicd.exporter.connections_enabled, "connections도 기본 활성(부모 게이트가 실제 gate)");
+        assert_eq!(cfg.aicd.exporter.connections_interval_secs, 60);
+        // t8: spool 기본값도 섹션 부재 시 안전한 기본으로 채워져야 한다.
+        assert_eq!(cfg.aicd.exporter.spool_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 20);
+    }
+
+    #[test]
+    fn aicd_exporter_events_connections_flags_default_true_when_absent_from_partial_section() {
+        // [aicd.exporter]는 있지만 events_enabled/connections_enabled/connections_interval_secs가
+        // 없는 레거시(t6 시점) config — 새 필드는 #[serde(default)]로 안전하게 채워져야 한다.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.exporter]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+interval_secs = 15
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.aicd.exporter.enabled);
+        assert_eq!(cfg.aicd.exporter.interval_secs, 15);
+        assert!(cfg.aicd.exporter.events_enabled);
+        assert!(cfg.aicd.exporter.connections_enabled);
+        assert_eq!(cfg.aicd.exporter.connections_interval_secs, 60);
+    }
+
+    #[test]
+    fn aicd_exporter_events_connections_flags_can_be_disabled_individually() {
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.exporter]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+events_enabled = false
+connections_enabled = false
+connections_interval_secs = 120
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.aicd.exporter.events_enabled);
+        assert!(!cfg.aicd.exporter.connections_enabled);
+        assert_eq!(cfg.aicd.exporter.connections_interval_secs, 120);
+    }
+
+    #[test]
+    fn aicd_exporter_section_parses() {
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.exporter]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+token = "otlp-token"
+interval_secs = 15
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.aicd.exporter.enabled);
+        assert_eq!(cfg.aicd.exporter.endpoint, "http://127.0.0.1:4318");
+        assert_eq!(cfg.aicd.exporter.token.as_deref(), Some("otlp-token"));
+        assert_eq!(cfg.aicd.exporter.interval_secs, 15);
+    }
+
+    #[test]
+    fn aicd_exporter_spool_fields_can_be_overridden() {
+        // t8: spool_max_bytes/spool_drain_batch_limit도 다른 exporter 필드와 동일하게 명시적으로
+        // 오버라이드 가능해야 한다.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.exporter]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+spool_max_bytes = 1048576
+spool_drain_batch_limit = 5
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.aicd.exporter.spool_max_bytes, 1_048_576);
+        assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 5);
     }
 
     #[test]
