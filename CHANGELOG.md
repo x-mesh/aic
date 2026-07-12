@@ -4,6 +4,63 @@
 
 ## [Unreleased]
 
+### Added
+- **aicd OTLP host-metrics exporter (opt-in, SRE t6)** — config `[aicd.exporter]`(`enabled`/`endpoint`/
+  `token`/`interval_secs`)를 켜면 aicd가 주기적으로 host metrics(cpu/load/mem/swap/disk·net i/o)를
+  sysinfo로 수집해 OTLP protobuf로 인코딩한 뒤 `{endpoint}/v1/metrics`(Content-Type
+  `application/x-protobuf`, 선택적 `Authorization: Bearer`)로 push한다. **기본 비활성**이며, 끄면 관련
+  task 자체가 뜨지 않아 기존 동작에 회귀가 없다. 전송하는 **모든 문자열 필드(hostname 포함)는
+  redaction을 거쳐** secret/PII가 collector로 새지 않는다. 실패 시 다음 주기까지 단순 skip한다
+  (spool/backoff·events tap은 후속 범위).
+- **aicd OTLP events/connections exporter (opt-in, SRE t7)** — 같은 `[aicd.exporter]`에 하위 플래그
+  `events_enabled`/`connections_enabled`/`connections_interval_secs`(각각 기본 true/true/60)를
+  추가했다. `enabled=true`일 때:
+  - **events**: `CommandRecordStore`에 broadcast tap을 달아, 세션 ring에 finished command record가
+    실제로 삽입될 때(dedup으로 skip된 push는 제외) OTLP LogRecord(scope=`aic.events`, exit_code≠0이면
+    severity=ERROR·아니면 INFO, attrs: `aic.record.id`/`aic.command.text`/`aic.command.exit_code`/
+    `aic.command.capture_quality`)로 인코딩해 실시간으로 `{endpoint}/v1/logs`에 push한다.
+  - **connections**: 기본 60초마다 `aic snapshot inventory --json`(신규 hidden CLI leaf)을 spawn해
+    LISTEN/ESTABLISHED 소켓(Linux `ss -tuna`, macOS `lsof -nP -iTCP -iUDP`)과 host IP를 얻어
+    OTLP LogRecord(scope=`aic.connections`, attrs: `network.transport`/`aic.connection.state`/
+    `network.local.address`/`network.local.port`/`network.peer.address`/`network.peer.port`)로 배치
+    push한다. resource에 `host.ip`도 갱신한다.
+  - **`aic.agent.ntp_offset_ms`**: host metrics에 조건부로 추가되는 Gauge — Linux 커널의
+    `adjtimex`(로컬 clock discipline 상태, **네트워크 NTP 질의 없음**)에서 얻을 수 있을 때만 보낸다.
+    macOS 등 non-Linux는 안전한 no-network local API가 없어 생략한다(과설계 금지 — 값이 빠질 뿐 나머지
+    host metrics는 그대로 나간다).
+  - events/connections 둘 다 host metrics와 동일하게 실패 시 재시도 없이 다음 이벤트/주기로 넘어간다
+    (spool/backoff는 t8 범위). **예외**: `network.*`/`host.ip` 값은 redaction을 건너뛴다 — 이
+    exporter의 목적 자체가 실제 IP 토폴로지를 보내는 것이라, 일반 redaction의 IPv4 패턴을 그대로
+    적용하면 모든 연결이 `[REDACTED:ipv4]`로 뭉개져 기능이 무의미해지기 때문이다(command text 등
+    "우연히 섞여든" 문자열은 계속 redact).
+- **aicd OTLP exporter 오프라인 spool/backoff (SRE t8)** — collector가 다운돼도 host metrics/
+  events/connections push 실패분을 유실 없이 버티도록 두 가지를 추가했다.
+  - **spool**: push 실패 시 이미 redact·인코딩된 protobuf 결과를 `~/.aic/otlp-spool/`(0700 권한)에
+    파일 단위 배치로 적재한다. 상한(config `spool_max_bytes`, 기본 256MiB)을 넘으면 가장 오래된
+    배치부터 삭제(oldest drop)하며 카운터를 올린다(`AIC_DEBUG` 로그). collector 복구 후 host
+    metrics task가 매 tick FIFO 순서로 드레인한다(배치당 HTTP 요청 1개, `spool_drain_batch_limit`
+    기본 20으로 속도 제한 — 밀린 만큼 한 번에 몰아치지 않음).
+  - **backoff**: 연속 실패마다 재시도 간격을 1s→2s→4s→...→60s(cap)+jitter로 늘려, 죽은 collector를
+    매 tick마다 두들기지 않는다. 성공하면 즉시 리셋. backoff 윈도 안에는 네트워크 시도 자체를
+    건너뛰고 새 데이터를 spool에만 쌓아 둔다(무유실).
+  - 세 exporter task가 spool 인스턴스 하나를 공유하지만, 드레인은 host metrics task만 담당한다
+    (`enabled=true`면 `events_enabled`/`connections_enabled`와 무관하게 항상 뜨는 유일한 task라
+    드레인 주체가 항상 존재함을 보장할 수 있어서다). events/connections는 자기 push 실패만 spool에
+    적재하고 backoff도 독립적으로 관리한다.
+
+### Changed
+- **redaction 로직을 `aic-common`으로 이동** — LLM prompt(aic-client)와 OTLP exporter(aic-server)가
+  동일한 secret/PII 마스킹을 공유하도록 `redaction` 모듈을 `aic-common`으로 옮겼다. 기존
+  `aic_client::redaction::{redact, RedactionReport}` API는 re-export로 그대로 유지되어 호출부 변경이
+  없다.
+
+### 결정 근거
+- OTLP protobuf 인코딩에 `opentelemetry-proto` 대신 **prost 직접 + 최소 메시지 subset**을 썼다.
+  opentelemetry-proto의 `gen-tonic(-messages)`는 tonic/grpc 스택을 끌어오는데, 우리는 OTLP/HTTP로
+  Gauge + resource attrs만 보내므로 과한 의존성이다. 필요한 message만 필드 번호까지 스펙과 맞춰
+  정의하고 encode/decode 왕복 테스트로 wire 유효성을 검증한다.
+- config 키는 repo 관례(`dedup_ttl_secs` 등 단위 suffix)를 따라 `interval_secs`로 명시했다.
+
 ## [0.27.0] - 2026-06-30
 
 ### Added

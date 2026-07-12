@@ -11,6 +11,11 @@
 //! 이유: scan_findings가 키로 삼는 dmesg_oom·swap_usage·proc_states·failed_units·inodes가 LOCAL_SECTIONS엔
 //! 없어, OOM(=Crit의 유일 신호)을 놓친다.
 //!
+//! 자원 증거에 더해 aicd가 살아 있으면 onset 직전 window의 터미널 명령([`terminal_evidence`])을
+//! Timeline 증거로 붙인다 — "무엇이 방금 실행됐나"는 스냅샷이 답 못 하는 RCA 1순위 질문.
+//!
+//! [`terminal_evidence`]: super::terminal_evidence
+//!
 //! opt-in(`AIC_AUTO_RCA`, 기본 off, L0-L2의 AIC_SNAPSHOT_RECORD와 **독립**) · best-effort · read-only Safe.
 //! 인시던트 dir 생성은 스냅샷 append보다 무거우므로 호출부(chat_tui onset)는 `spawn_blocking` detached로 돌려
 //! UI를 막지 않고, 전용 `AUTO_RCA_COOLDOWN`으로 Crit flap 시 인시던트 양산을 막는다.
@@ -81,11 +86,40 @@ pub(crate) fn capture_incident(crit_msgs: &[String]) -> anyhow::Result<Option<St
         &evidence,
         &["auto-rca", "snapshot"],
     )?;
+    // (c) Timeline = onset 직전 window의 터미널 명령(aicd 전 세션) — 자원 스냅샷이 답하지 못하는
+    // "무엇이 방금 실행됐나"를 채운다. aicd 미실행/기록 없음이면 조용히 생략(best-effort).
+    if let Some(body) = super::terminal_evidence::collect(chrono::Utc::now()) {
+        crate::rca::append_evidence(
+            &mut meta,
+            crate::rca::EvidenceKind::Timeline,
+            "terminal commands before onset",
+            "aicd command store",
+            &body,
+            &["auto-rca", "terminal"],
+        )?;
+    }
+    // (d) Diagnosis = baseline 대비 프로세스 rss 성장 리더보드(결정적, LLM 0) — "어느 프로세스가
+    // 자랐나"로 범인 후보를 좁힌다. baseline은 L0 store의 onset 120s+ 이전 최신 mem_top_proc
+    // 스냅샷(같은 순간의 alert 캡처는 이미 부푼 상태라 부적격). store 미기록·섹션 부재·성장 0이면 생략.
+    let snapshots = crate::snapshot_store::load_snapshots().unwrap_or_default();
+    if let Some(body) =
+        super::proc_delta::growth_evidence(&snapshots, &evidence, chrono::Utc::now())
+    {
+        crate::rca::append_evidence(
+            &mut meta,
+            crate::rca::EvidenceKind::Diagnosis,
+            "process rss growth since baseline",
+            "aic auto-rca",
+            &body,
+            &["auto-rca", "proc-delta"],
+        )?;
+    }
     Ok(Some(meta.id))
 }
 
 /// char 경계 안전 truncation(멀티바이트 분할 방지). 초과 시 말줄임표.
-fn truncate_chars(s: &str, max: usize) -> String {
+/// terminal_evidence의 명령 한 줄 truncation도 이 헬퍼를 공유한다.
+pub(crate) fn truncate_chars(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
         return s.to_string();
@@ -133,11 +167,15 @@ mod tests {
     }
 
     // HOME 격리 + env 직렬화(snapshot_store와 동일한 프로세스 전역 락 공유).
+    // AIC_AICD_SOCKET도 격리한다 — aicd 소켓은 `/tmp/aic-{uid}` 아래라 HOME 격리로는
+    // 안 가려져, 개발 머신에서 실제 aicd가 돌고 있으면 terminal 증거가 끼어들어
+    // evidence_count 단정이 비결정적이 된다. 기본은 tempdir 내 미존재 경로(= aicd 없음).
     struct HomeGuard {
         prev_home: Option<std::ffi::OsString>,
         prev_rca: Option<std::ffi::OsString>,
+        prev_sock: Option<std::ffi::OsString>,
         _lock: MutexGuard<'static, ()>,
-        _dir: TempDir,
+        dir: TempDir,
     }
     impl HomeGuard {
         fn set() -> Self {
@@ -147,14 +185,17 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let prev_home = std::env::var_os("HOME");
             let prev_rca = std::env::var_os("AIC_AUTO_RCA");
+            let prev_sock = std::env::var_os("AIC_AICD_SOCKET");
             unsafe {
                 std::env::set_var("HOME", dir.path());
+                std::env::set_var("AIC_AICD_SOCKET", dir.path().join("no-aicd.sock"));
             }
             Self {
                 prev_home,
                 prev_rca,
+                prev_sock,
                 _lock: lock,
-                _dir: dir,
+                dir,
             }
         }
     }
@@ -168,6 +209,10 @@ mod tests {
                 match self.prev_rca.take() {
                     Some(v) => std::env::set_var("AIC_AUTO_RCA", v),
                     None => std::env::remove_var("AIC_AUTO_RCA"),
+                }
+                match self.prev_sock.take() {
+                    Some(v) => std::env::set_var("AIC_AICD_SOCKET", v),
+                    None => std::env::remove_var("AIC_AICD_SOCKET"),
                 }
             }
         }
@@ -205,5 +250,90 @@ mod tests {
         let events = crate::rca::load_events(&id).unwrap();
         assert!(events.iter().any(|e| e.kind == crate::rca::EvidenceKind::Note
             && e.tags.iter().any(|t| t == "snapshot")));
+    }
+
+    #[test]
+    fn on_appends_terminal_timeline_when_aicd_reachable() {
+        // aicd(mock)가 살아 있고 window 내 명령이 있으면 Timeline 증거가 4번째로 붙는다.
+        let h = HomeGuard::set();
+        let sock = h.dir.path().join("mock-aicd.sock");
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "aaaa0001".to_string(),
+            vec![aic_common::CommandRecord {
+                command: Some("docker build -t big-image .".to_string()),
+                exit_code: 0,
+                timestamp: chrono::Utc::now() - chrono::Duration::seconds(60),
+                ..Default::default()
+            }],
+        );
+        let _mock = super::super::terminal_evidence::spawn_mock_aicd(
+            &sock,
+            vec![aic_common::SessionInfo {
+                id: "aaaa0001".to_string(),
+                pid: 1,
+                state: aic_common::SessionState::Attached,
+                created_at: chrono::Utc::now(),
+                last_seen_at: None,
+                last_command_at: None,
+                attached_tty: None,
+                shell: None,
+                cwd: None,
+                label: None,
+            }],
+            records,
+        );
+        unsafe {
+            std::env::set_var("AIC_AUTO_RCA", "1");
+            std::env::set_var("AIC_AICD_SOCKET", &sock);
+        }
+        let id = capture_incident(&["memory 98% critical".to_string()])
+            .unwrap()
+            .expect("on인데 인시던트 미생성");
+        let meta = crate::rca::load_meta(&id).unwrap();
+        assert_eq!(
+            meta.evidence_count, 4,
+            "lifecycle+findings+snapshot+terminal = 4건"
+        );
+        let events = crate::rca::load_events(&id).unwrap();
+        let timeline = events
+            .iter()
+            .find(|e| e.kind == crate::rca::EvidenceKind::Timeline)
+            .expect("terminal Timeline 증거");
+        assert!(timeline.tags.iter().any(|t| t == "terminal"));
+        assert!(timeline.body.contains("docker build -t big-image ."));
+    }
+
+    #[test]
+    fn on_appends_proc_delta_when_baseline_exists() {
+        // L0 store에 onset 이전 baseline이 있으면 프로세스 rss 성장 리더보드가 Diagnosis로 붙는다.
+        // baseline pid는 가짜라 현재 프로세스가 전부 (new)로 잡혀 리더보드가 반드시 생긴다.
+        let _h = HomeGuard::set();
+        let baseline = crate::snapshot_store::SnapshotRecord::new(
+            "periodic",
+            "## mem_top_proc\n  PID COMM RSS\n  999999 fake-proc 1024\n",
+            None,
+            None,
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+        );
+        crate::snapshot_store::append_snapshot(&baseline).unwrap();
+        unsafe {
+            std::env::set_var("AIC_AUTO_RCA", "1");
+        }
+        let id = capture_incident(&["memory 98% critical".to_string()])
+            .unwrap()
+            .expect("on인데 인시던트 미생성");
+        let meta = crate::rca::load_meta(&id).unwrap();
+        assert_eq!(
+            meta.evidence_count, 4,
+            "lifecycle+findings+snapshot+proc-delta = 4건"
+        );
+        let events = crate::rca::load_events(&id).unwrap();
+        let delta = events
+            .iter()
+            .find(|e| e.tags.iter().any(|t| t == "proc-delta"))
+            .expect("proc-delta Diagnosis 증거");
+        assert_eq!(delta.kind, crate::rca::EvidenceKind::Diagnosis);
+        assert!(delta.body.contains("(new)"), "가짜 baseline 대비 전부 new");
     }
 }
