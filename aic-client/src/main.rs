@@ -659,6 +659,16 @@ enum SnapshotOp {
     },
     /// 주기 캡처 타이머 unit을 unload + 제거한다.
     Uninstall,
+    /// (internal) connections/inventory JSON 스냅샷 — SRE t7: aicd OTLP connections exporter가
+    /// 주기 spawn하는 machine-readable 전용 leaf. 위의 `Capture`(opt-in 게이트가 걸린 전체 redacted
+    /// markdown 스냅샷 store)와는 무관한 별개 기능이라 이름을 분리했다. 사람이 직접 쓰는 명령이
+    /// 아니라 `--help`에서 숨긴다.
+    #[command(hide = true)]
+    Inventory {
+        /// machine-readable JSON 출력. 현재 유일 지원 포맷 — 미지정 시 사람용 요약만 stdout에 낸다.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1528,7 +1538,27 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
         SnapshotOp::Status { json } => handle_snapshot_status(json),
         SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
         SnapshotOp::Uninstall => handle_snapshot_uninstall(),
+        SnapshotOp::Inventory { json } => handle_snapshot_inventory(json),
     }
+}
+
+/// `aic snapshot inventory --json` — SRE t7: connections/inventory 스냅샷을 machine-readable
+/// JSON으로 stdout에 낸다. 실패하면(probe 명령 없음 등) exit 1(호출부인 aicd connections
+/// exporter가 실패로 인식해 이번 주기를 skip하도록).
+fn handle_snapshot_inventory(json: bool) -> anyhow::Result<()> {
+    let snapshot = aic_client::agent::net_inventory::capture()?;
+    if json {
+        println!("{}", serde_json::to_string(&snapshot)?);
+    } else {
+        println!(
+            "{} connections (host={}, os={})",
+            snapshot.connections.len(),
+            snapshot.host.name,
+            snapshot.host.os
+        );
+        eprintln!("machine-readable 출력은 --json 을 쓰세요.");
+    }
+    Ok(())
 }
 
 /// `aic web` — 읽기 전용 대시보드 기동. 토큰은 `--token` 또는 `AIC_WEB_TOKEN`이 반드시 있어야 한다

@@ -47,6 +47,9 @@ pub(crate) mod sys_sampler;
 pub(crate) mod sysinfo;
 // RCA 강화 ②: Crit onset 직전 window의 터미널 명령(aicd 전 세션)을 인시던트 Timeline 증거로.
 pub(crate) mod terminal_evidence;
+// SRE t7: connections/inventory JSON 스냅샷("aic snapshot inventory --json" hidden leaf) — aicd
+// OTLP connections exporter가 주기 spawn한다. main.rs(외부 크레이트 경로)가 capture()를 호출하므로 pub.
+pub mod net_inventory;
 pub(crate) mod tool_record;
 pub mod tools;
 pub mod types;
