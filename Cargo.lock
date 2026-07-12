@@ -71,6 +71,7 @@ dependencies = [
  "libc",
  "proptest",
  "rand 0.8.6",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -94,11 +95,14 @@ dependencies = [
  "libc",
  "portable-pty",
  "proptest",
+ "prost",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "strip-ansi-escapes",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1689,6 +1693,29 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
