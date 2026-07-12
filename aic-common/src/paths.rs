@@ -118,6 +118,20 @@ pub fn config_file_path() -> PathBuf {
     }
 }
 
+/// aicd OTLP exporter 오프라인 spool 디렉토리 (SRE t8). `~/.aic/otlp-spool/`.
+///
+/// 다른 aic 경로들과 달리 XDG 관례(`state_dir`/`config_file_path`) 대신 고정 `~/.aic` 하위를
+/// 쓴다 — t8 interface contract가 이 경로를 명시했고, spool은 세션 runtime도 XDG state도
+/// 아닌 "collector 다운 동안 버티는 로컬 디스크 버퍼"라는 별도 범주라 구분해 두는 편이 찾기
+/// 쉽다. 디렉토리는 `Spool::open`이 0700 권한으로 생성한다(다른 로컬 사용자가 spool된 —
+/// 이미 redact된 — protobuf payload를 못 읽게).
+pub fn otlp_spool_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".aic").join("otlp-spool")
+}
+
 /// shell hook start/end 사이의 임시 metadata 경로.
 pub fn local_hook_pending_path(session_id: &str, command_id: &str) -> PathBuf {
     let safe_session = sanitize_path_token(session_id);

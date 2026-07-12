@@ -653,11 +653,11 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
-    /// RCA evidence event를 시간순으로 출력한다.
+    /// RCA evidence event와 인시던트 전후의 L0 스냅샷을 한 시간축으로 병합 출력한다.
     Timeline {
         /// incident id 또는 prefix. 생략 시 최근 incident.
         id: Option<String>,
-        /// JSON 출력.
+        /// JSON 출력({incident, events, snapshots} — 스냅샷은 body 제외 요약).
         #[arg(long)]
         json: bool,
     },
@@ -938,6 +938,16 @@ enum SnapshotOp {
         #[arg(long)]
         ago: Option<String>,
         /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
+    /// (internal) connections/inventory JSON 스냅샷 — SRE t7: aicd OTLP connections exporter가
+    /// 주기 spawn하는 machine-readable 전용 leaf. 위의 `Capture`(opt-in 게이트가 걸린 전체 redacted
+    /// markdown 스냅샷 store)와는 무관한 별개 기능이라 이름을 분리했다. 사람이 직접 쓰는 명령이
+    /// 아니라 `--help`에서 숨긴다.
+    #[command(hide = true)]
+    Inventory {
+        /// machine-readable JSON 출력. 현재 유일 지원 포맷 — 미지정 시 사람용 요약만 stdout에 낸다.
         #[arg(long)]
         json: bool,
     },
@@ -1826,7 +1836,27 @@ fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
         SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
         SnapshotOp::Uninstall => handle_snapshot_uninstall(),
         SnapshotOp::Compare { ago, json } => handle_snapshot_compare(ago, json),
+        SnapshotOp::Inventory { json } => handle_snapshot_inventory(json),
     }
+}
+
+/// `aic snapshot inventory --json` — SRE t7: connections/inventory 스냅샷을 machine-readable
+/// JSON으로 stdout에 낸다. 실패하면(probe 명령 없음 등) exit 1(호출부인 aicd connections
+/// exporter가 실패로 인식해 이번 주기를 skip하도록).
+fn handle_snapshot_inventory(json: bool) -> anyhow::Result<()> {
+    let snapshot = aic_client::agent::net_inventory::capture()?;
+    if json {
+        println!("{}", serde_json::to_string(&snapshot)?);
+    } else {
+        println!(
+            "{} connections (host={}, os={})",
+            snapshot.connections.len(),
+            snapshot.host.name,
+            snapshot.host.os
+        );
+        eprintln!("machine-readable 출력은 --json 을 쓰세요.");
+    }
+    Ok(())
 }
 
 /// `aic web` — 읽기 전용 대시보드 기동. 토큰은 `--token` 또는 `AIC_WEB_TOKEN`이 반드시 있어야 한다
@@ -7658,10 +7688,35 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
             let resolved = aic_client::rca::resolve_id(id.as_deref())?;
             let meta = aic_client::rca::load_meta(&resolved)?;
             let events = aic_client::rca::load_events(&resolved)?;
+            // L0 snapshot store는 별개 silo — 읽기 실패/미기록이면 빈 목록으로 조인(best-effort).
+            let snapshots = aic_client::snapshot_store::load_snapshots().unwrap_or_default();
             if json {
-                println!("{}", serde_json::to_string_pretty(&events)?);
+                // 스냅샷은 body를 뺀 요약만 — 타임라인 JSON이 store 본문으로 비대해지지 않게.
+                let snaps: Vec<_> = aic_client::rca::snapshots_in_window(&meta, &snapshots)
+                    .into_iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "captured_at": s.captured_at,
+                            "kind": s.kind,
+                            "host": s.host,
+                            "cwd": s.cwd,
+                            "sections": s.sections,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "incident": meta,
+                        "events": events,
+                        "snapshots": snaps,
+                    }))?
+                );
             } else {
-                println!("{}", aic_client::rca::render_timeline(&meta, &events));
+                println!(
+                    "{}",
+                    aic_client::rca::render_timeline(&meta, &events, &snapshots)
+                );
             }
         }
         RcaOp::Mitigate { id, note, json } => {

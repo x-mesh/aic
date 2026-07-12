@@ -18,10 +18,16 @@
 use aic_common::{CaptureMode, CaptureQuality, CommandRecord};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 /// 각 세션이 보유하는 ring 크기 (record 단위).
 const PER_SESSION_CAPACITY: usize = 64;
+
+/// events tap(broadcast) 채널 용량. 여러 세션이 동시에 push해도 OTLP events exporter(t7)가
+/// 한 tick 내에 못 따라가는 상황을 흡수하는 여유분 — PER_SESSION_CAPACITY(64)의 수 배로 잡는다.
+/// 초과분은 구독자가 `RecvError::Lagged`로 받고 skip한다(store 자체 데이터 유실은 아님 — ring은
+/// 별개로 온전히 보존됨. tap만 lossy).
+const EVENTS_TAP_CAPACITY: usize = 256;
 
 /// 미완료 start record를 식별하기 위한 (session_id, command_id) → start info 임시 표.
 #[derive(Debug, Clone)]
@@ -46,14 +52,38 @@ struct Inner {
 ///
 /// 기존 `HookEventStore`를 승격한 이름으로, public API 시그니처와 동작은
 /// 동일하게 유지된다.
-#[derive(Clone, Default)]
+///
+/// t7: `events_tx`는 finished record가 ring에 **실제로 삽입될 때만**(dedup으로 skip된 push는
+/// 제외) fan-out하는 broadcast tap이다. OTLP events exporter가 구독해 command 종료를 실시간으로
+/// Logs로 내보낸다. 구독자가 없으면 `send`가 에러를 반환하지만 무시한다(에러 아님 — opt-in
+/// consumer 부재는 정상 상태).
+#[derive(Clone)]
 pub struct CommandRecordStore {
     inner: Arc<RwLock<Inner>>,
+    events_tx: broadcast::Sender<CommandRecord>,
+}
+
+impl Default for CommandRecordStore {
+    fn default() -> Self {
+        let (events_tx, _rx) = broadcast::channel(EVENTS_TAP_CAPACITY);
+        Self {
+            inner: Arc::new(RwLock::new(Inner::default())),
+            events_tx,
+        }
+    }
 }
 
 impl CommandRecordStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// finished record events tap을 구독한다. store push 지점(`push_inner`) 1곳에서만 send되며,
+    /// 실제로 ring에 삽입된 record만(dedup skip 제외) 여기로 흘러온다. 구독자가 여럿이어도 각자
+    /// 모든 이벤트를 독립적으로 받는다(broadcast 의미론). late subscribe 이전에 이미 push된
+    /// record는 받지 못한다(replay 없음 — tap은 실시간 스트림이지 store 아님).
+    pub fn subscribe(&self) -> broadcast::Receiver<CommandRecord> {
+        self.events_tx.subscribe()
     }
 
     /// 새 command 시작 이벤트를 기록한다. pending에 보관해 두고 finish를 기다린다.
@@ -113,7 +143,7 @@ impl CommandRecordStore {
             .finished
             .entry(session_id.to_string())
             .or_insert_with(|| VecDeque::with_capacity(PER_SESSION_CAPACITY));
-        push_inner(ring, record);
+        push_inner(ring, &self.events_tx, record);
     }
 
     /// 특정 세션의 마지막 record를 반환한다.
@@ -151,7 +181,7 @@ impl CommandRecordStore {
             .finished
             .entry(session_id.to_string())
             .or_insert_with(|| VecDeque::with_capacity(PER_SESSION_CAPACITY));
-        push_inner(ring, record);
+        push_inner(ring, &self.events_tx, record);
     }
 
     /// `aic run -- <cmd>` 처럼 명시 wrapper가 만든 record를 push한다.
@@ -167,7 +197,7 @@ impl CommandRecordStore {
             .finished
             .entry(session_id.to_string())
             .or_insert_with(|| VecDeque::with_capacity(PER_SESSION_CAPACITY));
-        push_inner(ring, record);
+        push_inner(ring, &self.events_tx, record);
     }
 
     /// 세션의 최근 `count`개 record를 시간순(oldest → newest)으로 반환한다.
@@ -232,12 +262,22 @@ impl CommandRecordStore {
 /// 통계적으로 없다 (R1.6). 지역적인 O(N) 선형 탐색이지만 N ≤ 64 (PER_SESSION_CAPACITY)
 /// 이므로 worst-case 비용도 무시 가능하다.
 ///
+/// t7: `events_tx`로 broadcast tap을 fan-out하는 **유일한** 지점이기도 하다 — 실제로 ring에
+/// 삽입되는 record만(dedup으로 skip되는 두 번째 push는 제외) tap에 실린다. 그래서 tap 소비자
+/// (OTLP events exporter)가 보는 스트림은 항상 각 세션 ring에 실제로 남은 record와 1:1로
+/// 대응하며, 유실/중복이 store 자체와 구조적으로 같은 지점에서 결정된다.
+///
 /// [`BoundaryOwnershipGate`]: crate::boundary_ownership_gate::BoundaryOwnershipGate
-fn push_inner(ring: &mut VecDeque<CommandRecord>, mut record: CommandRecord) {
+fn push_inner(
+    ring: &mut VecDeque<CommandRecord>,
+    events_tx: &broadcast::Sender<CommandRecord>,
+    mut record: CommandRecord,
+) {
     if record.id.is_empty() {
         record.id = aic_common::generate_record_id();
     } else if ring.iter().any(|existing| existing.id == record.id) {
         // 같은 id 가 이미 있으면 기존 record 를 유지하고 새 push 는 drop 한다 (R9.5).
+        // tap에도 보내지 않는다 — dedup된 push는 store에 존재하지 않는 이벤트다.
         tracing::trace!(
             id = %record.id,
             "CommandRecordStore dedup: 이미 존재하는 id 로 push — skip (R9.5)"
@@ -247,6 +287,8 @@ fn push_inner(ring: &mut VecDeque<CommandRecord>, mut record: CommandRecord) {
     if ring.len() == PER_SESSION_CAPACITY {
         ring.pop_front();
     }
+    // 구독자가 없으면 Err(SendError)를 반환하지만 이는 정상 상태(exporter가 off)라 무시한다.
+    let _ = events_tx.send(record.clone());
     ring.push_back(record);
 }
 
@@ -609,5 +651,104 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 5, "자동 부여된 id 집합에 중복이 있음");
+    }
+
+    // ── t7: events tap (broadcast) ──────────────────────────────────────
+
+    /// tap을 구독한 뒤 push한 record 수만큼 정확히 그대로 수신해야 한다(유실 없음). 순서도
+    /// push 순서와 같아야 한다(broadcast는 단일 producer면 FIFO 보장).
+    #[tokio::test]
+    async fn tap_receives_every_pushed_record_in_order_no_loss() {
+        let s = CommandRecordStore::new();
+        let mut rx = s.subscribe();
+
+        for i in 0..5 {
+            s.push_pty("s1", pty_record(&format!("id{i:02}"), &format!("cmd{i}")))
+                .await;
+        }
+
+        for i in 0..5 {
+            let ev = rx.try_recv().expect("tap이 record를 유실함");
+            assert_eq!(ev.command.as_deref(), Some(format!("cmd{i}").as_str()));
+        }
+        // 5개를 정확히 받았고 더는 없어야 한다(중복 없음).
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// dedup으로 skip된 두 번째 push는 tap에도 나타나지 않는다 — store에 실제로 없는 이벤트를
+    /// tap이 "중복 보고"하면 안 된다.
+    #[tokio::test]
+    async fn tap_does_not_emit_event_for_deduped_push() {
+        let s = CommandRecordStore::new();
+        let mut rx = s.subscribe();
+        let id = "aaaa111122223333".to_string();
+
+        s.push_pty("s1", pty_record(&id, "first")).await;
+        s.push_pty("s1", pty_record(&id, "second-should-be-dropped"))
+            .await;
+
+        let ev = rx.try_recv().expect("첫 push는 tap에 나와야 함");
+        assert_eq!(ev.command.as_deref(), Some("first"));
+        // 두 번째(dedup skip)는 tap에 없어야 한다 — 정확히 1건만 수신.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "dedup된 push가 tap에 잘못 나타남(중복)"
+        );
+    }
+
+    /// 여러 session에 걸친 push가 모두 하나의(store 전역) tap 스트림에 fan-in된다 — tap은
+    /// session 경계를 두지 않는다(exporter가 세션 무관하게 모든 command 이벤트를 본다).
+    #[tokio::test]
+    async fn tap_aggregates_events_across_sessions() {
+        let s = CommandRecordStore::new();
+        let mut rx = s.subscribe();
+
+        s.push_pty("a", pty_record("aaaa000000000001", "a-cmd"))
+            .await;
+        s.push_explicit("b", explicit_record("bbbb000000000001", "b-cmd"))
+            .await;
+
+        let mut seen: Vec<String> = vec![
+            rx.try_recv().unwrap().command.unwrap(),
+            rx.try_recv().unwrap().command.unwrap(),
+        ];
+        seen.sort();
+        assert_eq!(seen, vec!["a-cmd".to_string(), "b-cmd".to_string()]);
+    }
+
+    /// 구독자가 하나도 없어도(exporter off) push는 정상 동작해야 한다 — send 실패는 에러가
+    /// 아니라 조용히 무시되어야 한다(store 자체 동작에 영향 없음).
+    #[tokio::test]
+    async fn push_succeeds_with_no_tap_subscriber() {
+        let s = CommandRecordStore::new();
+        // subscribe()를 호출하지 않는다 — 구독자 0.
+        s.push_pty("s1", pty_record("cafe000000000001", "no-subscriber"))
+            .await;
+        assert_eq!(s.len("s1").await, 1);
+        assert_eq!(
+            s.last("s1").await.unwrap().command.as_deref(),
+            Some("no-subscriber")
+        );
+    }
+
+    /// 여러 구독자가 있으면 각자 독립적으로 전체 스트림을 받는다(broadcast 의미론 — 소비자 1이
+    /// consume해도 소비자 2는 영향받지 않음).
+    #[tokio::test]
+    async fn tap_supports_multiple_independent_subscribers() {
+        let s = CommandRecordStore::new();
+        let mut rx1 = s.subscribe();
+        let mut rx2 = s.subscribe();
+
+        s.push_pty("s1", pty_record("dddd000000000001", "shared"))
+            .await;
+
+        assert_eq!(rx1.try_recv().unwrap().command.as_deref(), Some("shared"));
+        assert_eq!(rx2.try_recv().unwrap().command.as_deref(), Some("shared"));
     }
 }
