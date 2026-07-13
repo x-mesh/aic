@@ -179,15 +179,9 @@ impl ExporterState {
         match self {
             ExporterState::Disabled => None,
             ExporterState::Ok => Some(("otlp ●".to_string(), Severity::Normal)),
-            ExporterState::DaemonDown => {
-                Some(("otlp aicd off".to_string(), Severity::Crit))
-            }
-            ExporterState::Backlogged(n) => {
-                Some((format!("otlp ⚠ {n}밀림"), Severity::Warn))
-            }
-            ExporterState::Dropping(n) => {
-                Some((format!("otlp ✕ {n}유실"), Severity::Crit))
-            }
+            ExporterState::DaemonDown => Some(("otlp aicd off".to_string(), Severity::Crit)),
+            ExporterState::Backlogged(n) => Some((format!("otlp ⚠ {n}밀림"), Severity::Warn)),
+            ExporterState::Dropping(n) => Some((format!("otlp ✕ {n}유실"), Severity::Crit)),
         }
     }
 }
@@ -1111,6 +1105,9 @@ mod tests {
         assert!(line.contains("disk n/a"), "{line}");
     }
 
+    // 테스트 픽스처 빌더 — `SysMetrics`의 필드를 그대로 나열하는 게 목적이라 인자가 많다.
+    // 여기서 struct로 묶으면 "무엇을 조합해 넣었는지"가 호출부에서 오히려 안 보인다.
+    #[allow(clippy::too_many_arguments)]
     fn metric(
         load1: f64,
         cpu: f32,
@@ -1243,7 +1240,10 @@ mod tests {
 
         // aicd는 살아있지만 exporter가 꺼짐.
         let off = ExporterStatus::default();
-        assert_eq!(ExporterState::from_status(Some(off)), ExporterState::Disabled);
+        assert_eq!(
+            ExporterState::from_status(Some(off)),
+            ExporterState::Disabled
+        );
 
         let base = ExporterStatus {
             enabled: true,

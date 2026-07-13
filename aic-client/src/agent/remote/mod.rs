@@ -154,7 +154,9 @@ pub fn classify_ssh_result(
         // 추정되는 duration일 때만 unreachable로 결론낸다.
 
         // 1) host key 불일치(critical) — 항상 최우선
-        if lower.contains("host key") && (lower.contains("changed") || lower.contains("verification failed")) {
+        if lower.contains("host key")
+            && (lower.contains("changed") || lower.contains("verification failed"))
+        {
             return HostStatus::HostKeyMismatch;
         }
         // 2) ProxyJump 경로 실패
@@ -162,8 +164,10 @@ pub fn classify_ssh_result(
             return HostStatus::ProxyFail;
         }
         // 3) 인증 실패 (BatchMode 차단)
-        if lower.contains("permission denied") || lower.contains("publickey")
-            || lower.contains("gssapi") || lower.contains("kerberos")
+        if lower.contains("permission denied")
+            || lower.contains("publickey")
+            || lower.contains("gssapi")
+            || lower.contains("kerberos")
             || lower.contains("keyboard-interactive")
             || lower.contains("too many authentication failures")
         {
@@ -178,8 +182,10 @@ pub fn classify_ssh_result(
             return HostStatus::Unreachable;
         }
         // 6) connect 단계 일반 실패
-        if lower.contains("connect to host") || lower.contains("connection refused")
-            || lower.contains("no route to host") || lower.contains("network is unreachable")
+        if lower.contains("connect to host")
+            || lower.contains("connection refused")
+            || lower.contains("no route to host")
+            || lower.contains("network is unreachable")
             || lower.contains("name or service not known")
         {
             return HostStatus::Unreachable;
@@ -220,11 +226,7 @@ pub fn shell_escape(s: &str) -> String {
 /// 트리거는 RFC-005 §5.2 — (a) connection latency UX 병목, (b) OpenSSH 미설치 환경.
 #[allow(async_fn_in_trait)] // MVP는 dyn 사용 안 함. 1.1에서 dyn 필요해지면 async-trait 도입.
 pub trait RemoteExecutor: Send + Sync {
-    async fn exec(
-        &self,
-        host: &super::hosts::HostEntry,
-        cmd: &RemoteCommand,
-    ) -> RemoteResult;
+    async fn exec(&self, host: &super::hosts::HostEntry, cmd: &RemoteCommand) -> RemoteResult;
 }
 
 // ── 단위 테스트 (실제 ssh 호출 없이 검증 가능한 순수 함수만) ─────────────────
@@ -256,7 +258,10 @@ mod tests {
     fn shell_escape_handles_history_expansion_char() {
         // csh `!` history는 single-quote 내부에선 비활성(non-interactive sh 호환).
         // 사용자는 비-sh 셸 호스트에 대해 remote_shell_wrap=true 옵션을 쓴다.
-        assert_eq!(shell_escape("find / -name '!secret'"), r#"'find / -name '\''!secret'\'''"#);
+        assert_eq!(
+            shell_escape("find / -name '!secret'"),
+            r#"'find / -name '\''!secret'\'''"#
+        );
     }
 
     #[test]
@@ -280,7 +285,12 @@ mod tests {
     fn classify_connect_timeout_unreachable() {
         // duration ≤ connect_timeout(+500ms) 범위에서 exit 255 → Unreachable
         assert_eq!(
-            classify_ssh_result(255, "ssh: connect to host 10.0.0.1 port 22: Connection refused", 9_800, 10_000),
+            classify_ssh_result(
+                255,
+                "ssh: connect to host 10.0.0.1 port 22: Connection refused",
+                9_800,
+                10_000
+            ),
             HostStatus::Unreachable
         );
     }
@@ -288,7 +298,12 @@ mod tests {
     #[test]
     fn classify_proxy_jump_failure() {
         assert_eq!(
-            classify_ssh_result(255, "ssh: Could not resolve jump host bastion-main", 9_500, 10_000),
+            classify_ssh_result(
+                255,
+                "ssh: Could not resolve jump host bastion-main",
+                9_500,
+                10_000
+            ),
             HostStatus::ProxyFail
         );
     }
@@ -330,7 +345,12 @@ mod tests {
     #[test]
     fn classify_channel_open_failure() {
         assert_eq!(
-            classify_ssh_result(255, "channel 0: open failed: administratively prohibited", 15_000, 10_000),
+            classify_ssh_result(
+                255,
+                "channel 0: open failed: administratively prohibited",
+                15_000,
+                10_000
+            ),
             HostStatus::RemoteErr
         );
     }
