@@ -16,6 +16,13 @@
 //! 관측, Datadog agent류 네트워크 모니터링과 동일 성격). key는 고정 상수라 redact해도 no-op이지만
 //! 경로 통일을 위해 key는 계속 [`redact_str`]를 거친다 — value만 예외([`attr_addr`] 참고).
 //! 숫자 필드(exit_code/port 등)는 애초에 secret이 아니므로 redaction 대상이 아니다.
+//!
+//! `aic.connection.process`는 **이 예외에 해당하지 않는다** — [`redact_str`]를 그대로 통과한다.
+//! `ss -p`/lsof COMMAND가 주는 건 실행 파일 이름이지 argv가 아니라(= secret이 실제로 섞이는
+//! 커맨드라인 인자가 애초에 안 들어온다) 유입 위험이 없고, 반대로 redaction 패턴이 프로세스명을
+//! 오탐할 여지도 없다(`ipv4` 패턴조차 4개 숫자 옥텟을 요구해 `com.docker.backend`/`python3.11`은
+//! 안 걸린다). 양쪽 위험이 모두 0이라 두 번째 예외를 만들 이유가 없다 — 대신 오탐 0을 못박는
+//! 회귀 테스트를 둔다(`connections_process_names_survive_redaction`).
 
 use prost::Message as _;
 
@@ -41,6 +48,31 @@ pub struct CommandEvent<'a> {
     pub capture_quality: &'a str,
 }
 
+/// 상태 전이 하나 — `aic.changes` scope LogRecord로 인코딩할 입력.
+///
+/// **wire contract**: attr 이름은 rca `otlp/decode.rs`의 디코더와 정확히 일치해야 한다.
+/// 값이 없으면 attr 자체를 생략한다(빈 문자열 금지) — 수신측이 "안 보냈다"와 "빈 값이다"를
+/// 구분할 수 있어야 하기 때문이다.
+pub struct ChangeEntry<'a> {
+    /// `listen` | `process` (예약: service|kernel|deploy|package|config|container)
+    pub change_type: &'a str,
+    /// 바뀐 대상: `nginx:4231` | `tcp/:8080`
+    pub subject: &'a str,
+    /// `start` | `exit` | `rss_spike` | `churn` | `baseline`
+    pub action: &'a str,
+    /// 전이 전/후 상태. 프로세스면 rss 바이트 문자열, 모르면 `None` → attr 생략.
+    pub prev_state: Option<&'a str>,
+    pub new_state: Option<&'a str>,
+    /// `observed` | `inferred` | `degraded`
+    pub confidence: &'a str,
+    /// 출처: `collector:sysinfo`
+    pub source: &'a str,
+    /// 소스측 idempotency 키 — 재전송을 ReplacingMergeTree가 흡수한다.
+    pub record_id: &'a str,
+    /// 사람/LLM이 읽는 한 줄. LogRecord body로 나간다.
+    pub summary: &'a str,
+}
+
 /// listen/established 소켓 하나 — `aic.connections` scope LogRecord로 인코딩할 입력.
 pub struct ConnectionEntry<'a> {
     pub protocol: &'a str,
@@ -49,6 +81,11 @@ pub struct ConnectionEntry<'a> {
     pub local_port: u16,
     pub peer_addr: Option<&'a str>,
     pub peer_port: Option<u16>,
+    /// 소켓 소유 프로세스명. 권한 부족 등으로 모르면 `None` → attr 자체를 생략한다.
+    pub process: Option<&'a str>,
+    /// `"listen"`|`"inbound"`|`"outbound"` (aic-client가 파생한 값을 그대로 통과시킨다).
+    /// `None`이면 attr을 생략해 수신측이 state/peer 기반 폴백 파생을 하게 둔다.
+    pub direction: Option<&'a str>,
 }
 
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
@@ -155,6 +192,14 @@ pub fn encode_connections(
             if let Some(pp) = c.peer_port {
                 attributes.push(attr_int("network.peer.port", pp as i64));
             }
+            // 모르면 attr을 **아예 붙이지 않는다** — 빈 문자열을 보내는 것보다 명시적이고, 수신측
+            // (rca)은 attr 부재 시 state/peer로 방향을 폴백 파생하도록 이미 되어 있다.
+            if let Some(d) = c.direction.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("aic.connection.direction", d));
+            }
+            if let Some(p) = c.process.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("aic.connection.process", p));
+            }
             let body_text = format!("{} {}", c.protocol, c.state);
             LogRecord {
                 time_unix_nano,
@@ -169,6 +214,56 @@ pub fn encode_connections(
         })
         .collect();
     build_request(resource, "aic.connections", service_version, log_records)
+}
+
+/// `entries`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.changes`)로 배치 인코딩한다.
+///
+/// severity는 전이의 성격을 따른다: rss 급증은 WARN(주목할 만한 이상), 나머지(start/exit/churn/
+/// baseline)는 INFO(정상적인 생명주기). 프로세스명은 redaction 예외가 아니라 [`redact_str`]를
+/// 그대로 통과한다 — comm은 실행 파일 이름이지 argv가 아니라 secret이 섞일 여지가 없다
+/// (모듈 doc 참고).
+pub fn encode_changes(
+    entries: &[ChangeEntry<'_>],
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+    time_unix_nano: u64,
+) -> Vec<u8> {
+    let log_records = entries
+        .iter()
+        .map(|c| {
+            let mut attributes = vec![
+                attr_str("aic.change.type", c.change_type),
+                attr_str("aic.change.subject", c.subject),
+                attr_str("aic.change.action", c.action),
+                attr_str("aic.change.confidence", c.confidence),
+                attr_str("aic.change.source", c.source),
+                attr_str("aic.change.record_id", c.record_id),
+            ];
+            // 모르는 상태는 attr을 생략한다 — 수신측이 "안 보냈다"와 "빈 값이다"를 구분해야 한다.
+            if let Some(p) = c.prev_state.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("aic.change.prev_state", p));
+            }
+            if let Some(n) = c.new_state.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("aic.change.new_state", n));
+            }
+            let severity = if c.action == "rss_spike" {
+                SEVERITY_WARN
+            } else {
+                SEVERITY_INFO
+            };
+            LogRecord {
+                time_unix_nano,
+                observed_time_unix_nano: time_unix_nano,
+                severity_number: severity,
+                severity_text: redact_str(if severity == SEVERITY_WARN { "WARN" } else { "INFO" }),
+                body: Some(string_value(&redact_str(c.summary))),
+                attributes,
+                dropped_attributes_count: 0,
+                flags: 0,
+            }
+        })
+        .collect();
+    build_request(resource, "aic.changes", service_version, log_records)
 }
 
 /// 공통 조립 — resource(+host.ip 선택) + scope + log_records → protobuf bytes.
@@ -446,6 +541,8 @@ mod tests {
                 local_port: 22,
                 peer_addr: None,
                 peer_port: None,
+                process: Some("sshd"),
+                direction: Some("listen"),
             },
             ConnectionEntry {
                 protocol: "tcp",
@@ -454,6 +551,8 @@ mod tests {
                 local_port: 22,
                 peer_addr: Some("192.168.1.10"),
                 peer_port: Some(54321),
+                process: Some("sshd"),
+                direction: Some("inbound"),
             },
         ];
         let bytes = encode_connections(&entries, &resource(Some("192.168.1.5")), "0.24.0", 100);
@@ -476,6 +575,159 @@ mod tests {
         assert!(estab_attrs.iter().any(|kv| kv.key == "network.peer.port"));
     }
 
+    /// direction/process가 wire에 실려야 rca가 폴백 파생("LISTEN 아니면 무조건 outbound")을 쓰지
+    /// 않는다 — 그 폴백에서는 `inbound`가 절대 나오지 않는다.
+    #[test]
+    fn connections_carry_direction_and_process_attrs() {
+        let entries = vec![ConnectionEntry {
+            protocol: "tcp",
+            state: "ESTABLISHED",
+            local_addr: "192.168.1.5",
+            local_port: 22,
+            peer_addr: Some("192.168.1.10"),
+            peer_port: Some(54321),
+            process: Some("sshd"),
+            direction: Some("inbound"),
+        }];
+        let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(
+            matches!(get("aic.connection.direction"), Some(AnyValueOneof::StringValue(v)) if v == "inbound")
+        );
+        assert!(
+            matches!(get("aic.connection.process"), Some(AnyValueOneof::StringValue(v)) if v == "sshd")
+        );
+    }
+
+    /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
+    /// 파생을 돈다. 빈 문자열을 보내면 그 폴백 경로가 애매해진다.
+    #[test]
+    fn connections_omit_direction_and_process_when_unknown() {
+        let entries = vec![ConnectionEntry {
+            protocol: "tcp",
+            state: "LISTEN",
+            local_addr: "0.0.0.0",
+            local_port: 22,
+            peer_addr: None,
+            peer_port: None,
+            process: None,
+            direction: None,
+        }];
+        let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        assert!(!attrs.iter().any(|kv| kv.key == "aic.connection.direction"));
+        assert!(!attrs.iter().any(|kv| kv.key == "aic.connection.process"));
+    }
+
+    // ── changes (scope=aic.changes) ──────────────────────────────────
+
+    /// wire contract: 이 attr 이름들은 rca `otlp/decode.rs`의 디코더와 **정확히** 일치해야 한다.
+    /// 하나라도 어긋나면 변경 이벤트가 조용히 기본값으로 떨어진다.
+    #[test]
+    fn changes_carry_the_wire_contract_attrs() {
+        let entries = vec![ChangeEntry {
+            change_type: "process",
+            subject: "nginx:4231",
+            action: "exit",
+            prev_state: Some("134217728"),
+            new_state: None,
+            confidence: "observed",
+            source: "collector:sysinfo",
+            record_id: "abc123",
+            summary: "nginx(4231) 종료",
+        }];
+        let bytes = encode_changes(&entries, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let scope_logs = &req.resource_logs[0].scope_logs[0];
+        assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.changes");
+
+        let attrs = &scope_logs.log_records[0].attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(matches!(get("aic.change.type"), Some(AnyValueOneof::StringValue(v)) if v == "process"));
+        assert!(matches!(get("aic.change.subject"), Some(AnyValueOneof::StringValue(v)) if v == "nginx:4231"));
+        assert!(matches!(get("aic.change.action"), Some(AnyValueOneof::StringValue(v)) if v == "exit"));
+        assert!(matches!(get("aic.change.confidence"), Some(AnyValueOneof::StringValue(v)) if v == "observed"));
+        assert!(matches!(get("aic.change.source"), Some(AnyValueOneof::StringValue(v)) if v == "collector:sysinfo"));
+        assert!(matches!(get("aic.change.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "abc123"));
+        assert!(matches!(get("aic.change.prev_state"), Some(AnyValueOneof::StringValue(v)) if v == "134217728"));
+        // new_state=None → attr 자체가 없어야 한다 (빈 문자열이 아니라).
+        assert!(!attrs.iter().any(|kv| kv.key == "aic.change.new_state"));
+    }
+
+    #[test]
+    fn changes_map_rss_spike_to_warn_and_the_rest_to_info() {
+        let mk = |action: &'static str| ChangeEntry {
+            change_type: "process",
+            subject: "java:900",
+            action,
+            prev_state: None,
+            new_state: None,
+            confidence: "observed",
+            source: "collector:sysinfo",
+            record_id: "r1",
+            summary: "s",
+        };
+        for (action, expected) in [
+            ("rss_spike", SEVERITY_WARN),
+            ("start", SEVERITY_INFO),
+            ("exit", SEVERITY_INFO),
+            ("baseline", SEVERITY_INFO),
+        ] {
+            let bytes = encode_changes(&[mk(action)], &resource(None), "0.24.0", 1);
+            let req = ExportLogsServiceRequest::decode(bytes.as_slice()).unwrap();
+            assert_eq!(
+                req.resource_logs[0].scope_logs[0].log_records[0].severity_number, expected,
+                "action={action}"
+            );
+        }
+    }
+
+    #[test]
+    fn changes_batch_handles_empty_entries() {
+        let bytes = encode_changes(&[], &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf even when empty");
+        assert!(req.resource_logs[0].scope_logs[0].log_records.is_empty());
+    }
+
+    /// 프로세스명은 redaction 예외가 아니라 [`redact_str`]를 그대로 통과한다(모듈 doc). 통과해도
+    /// 뭉개지지 않는다는 걸 못박아, 나중에 누가 redaction에 일반 hex/base64 엔트로피 룰을 추가했을
+    /// 때 프로세스명이 `[REDACTED:...]`가 되는 회귀를 잡는다.
+    #[test]
+    fn connections_process_names_survive_redaction() {
+        for name in ["postgres", "com.docker.backend", "Google Chrome Helper", "python3.11"] {
+            let entries = vec![ConnectionEntry {
+                protocol: "tcp",
+                state: "ESTABLISHED",
+                local_addr: "10.0.0.5",
+                local_port: 8080,
+                peer_addr: Some("203.0.113.7"),
+                peer_port: Some(443),
+                process: Some(name),
+                direction: Some("outbound"),
+            }];
+            let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
+            assert!(
+                contains(&bytes, name.as_bytes()),
+                "프로세스명 {name:?}이 redaction에 오탐되어 뭉개짐"
+            );
+        }
+    }
+
     #[test]
     fn connections_batch_handles_empty_entries() {
         let bytes = encode_connections(&[], &resource(None), "0.24.0", 1);
@@ -495,6 +747,8 @@ mod tests {
             local_port: 8080,
             peer_addr: Some("203.0.113.7"),
             peer_port: Some(443),
+            process: None,
+            direction: Some("outbound"),
         }];
         let bytes = encode_connections(&entries, &resource(Some("192.168.1.5")), "0.24.0", 1);
         assert!(

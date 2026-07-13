@@ -34,6 +34,11 @@ pub struct ResourceAttrs {
     pub host_name: String,
     pub host_id: String,
     pub os_type: String,
+    /// OTel resource semconv `host.arch` — `aarch64`, `x86_64`.
+    pub arch: String,
+    /// OTel resource semconv `os.description` — "macOS 15.1", "Ubuntu 22.04".
+    /// 커널/배포판을 못 읽으면 빈 문자열(수신측이 기존 값을 보존한다).
+    pub os_desc: String,
 }
 
 /// 한 번 수집한 host metrics 스냅샷(resource + gauge point 목록).
@@ -51,6 +56,8 @@ pub struct HostSampler {
     host_name: String,
     host_id: String,
     os_type: String,
+    arch: String,
+    os_desc: String,
 }
 
 impl HostSampler {
@@ -66,6 +73,8 @@ impl HostSampler {
             last: Instant::now(),
             host_id: host_id(&host_name),
             os_type: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            os_desc: System::long_os_version().unwrap_or_default(),
             host_name,
         }
     }
@@ -289,6 +298,8 @@ impl HostSampler {
                 host_name: self.host_name.clone(),
                 host_id: self.host_id.clone(),
                 os_type: self.os_type.clone(),
+                arch: self.arch.clone(),
+                os_desc: self.os_desc.clone(),
             },
             points,
         }

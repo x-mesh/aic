@@ -30,6 +30,7 @@
 
 mod agent;
 mod backoff;
+mod changes;
 mod connections;
 mod encode;
 mod events;
@@ -40,6 +41,7 @@ mod ntp;
 mod spool;
 
 pub use agent::{serve_agent, AgentConfig};
+pub use changes::{serve_changes, ChangesConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;

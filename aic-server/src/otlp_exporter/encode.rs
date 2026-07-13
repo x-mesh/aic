@@ -33,6 +33,11 @@ pub fn encode_metrics(sample: &HostSample, service_version: &str, now_unix_nano:
         attr("host.name", &sample.resource.host_name),
         attr("host.id", &sample.resource.host_id),
         attr("os.type", &sample.resource.os_type),
+        // OTel resource semconv. 코어 수/총 메모리는 여기 없다 — 그건 resource가
+        // 아니라 메트릭(system.cpu.logical.count / system.memory.limit)의 자리라
+        // 이미 그렇게 보내고 있고, 수신측이 거기서 인벤토리를 채운다.
+        attr("host.arch", &sample.resource.arch),
+        attr("os.description", &sample.resource.os_desc),
         attr("service.name", SERVICE_NAME),
         attr("service.version", service_version),
     ];
@@ -248,6 +253,8 @@ mod tests {
                 host_name: host_name.to_string(),
                 host_id: host_id.to_string(),
                 os_type: os_type.to_string(),
+                arch: "aarch64".to_string(),
+                os_desc: "macOS 15.1".to_string(),
             },
             points: vec![
                 MetricPoint {
@@ -371,5 +378,33 @@ mod tests {
             panic!("host.id는 string value여야 함");
         };
         assert!(v.contains("[REDACTED:aws_key]"), "host.id가 redact되지 않음: {v}");
+    }
+
+    /// rca의 `hosts` 인벤토리(호스트 상세 화면의 OS/아키텍처)가 이 두 attr에서 나온다.
+    /// 빠지면 화면에 "—"가 뜬다.
+    ///
+    /// 코어 수/총 메모리는 **여기 없다** — OTel semconv상 그건 resource가 아니라 메트릭
+    /// (`system.cpu.logical.count` / `system.memory.limit`)의 자리이고, 이미 그렇게 보내고
+    /// 있어서 수신측이 거기서 파생한다. 같은 값을 두 번 보내지 않는다.
+    #[test]
+    fn resource_carries_arch_and_os_description_for_the_host_inventory() {
+        let sample = sample_with_resource("web-1", "id-1", "macos");
+        let bytes = encode_metrics(&sample, "0.24.0", 1);
+        let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+        let attrs = &req.resource_metrics[0].resource.as_ref().unwrap().attributes;
+
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(matches!(get("host.arch"), Some(AnyValueOneof::StringValue(v)) if v == "aarch64"));
+        assert!(
+            matches!(get("os.description"), Some(AnyValueOneof::StringValue(v)) if v == "macOS 15.1")
+        );
+        assert!(get("host.cpu.count").is_none(), "코어 수는 메트릭의 자리다");
+        assert!(get("host.memory.total").is_none(), "총 메모리는 메트릭의 자리다");
     }
 }
