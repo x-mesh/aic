@@ -16,7 +16,7 @@ pub use error::AicError;
 pub use ipc::{
     decode_frame, encode_frame, AgentEvent, DaemonVersion, ExporterStatus, IpcRequest, IpcResponse,
     MetricsSnapshot, AGENT_KIND_FINDING_CREATED, AGENT_KIND_RISK_DENIED,
-    AGENT_KIND_TOOL_RUN_COMMAND,
+    AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 pub use paths::{
     aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
