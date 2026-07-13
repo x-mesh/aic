@@ -17,6 +17,14 @@ pub(crate) struct SysSampler {
     disks: Disks,
     networks: Networks,
     last: Instant,
+    /// **직전 sample()이 cpu를 refresh한 시각.** `None`이면 이전 샘플이 아예 없다 — cpu%는 직전
+    /// 스냅샷과의 **델타**라 비교할 이전 상태가 없으면 값이 성립하지 않는다. 그래서 첫 샘플은
+    /// **경과 시간과 무관하게** 무효다(`None`이 그 사실을 구조로 표현한다).
+    ///
+    /// 시각을 따로 드는 이유: `last`(i/o delta 기준)는 sample() **끝**에 갱신되므로 그 elapsed는
+    /// cpu refresh 간격이 아니라 disk/net refresh 시간까지 포함한 값이다. 느린 statfs 하나면
+    /// "cpu 간격이 충분했다"고 **잘못** 판정한다. cpu 판정은 cpu refresh 시점끼리 재야 한다.
+    prev_cpu_refresh: Option<Instant>,
     /// exporter 상태 캐시 + 마지막 조회 시각. status bar는 자주 갱신되는데 매번 aicd에 IPC를
     /// 걸 이유가 없다 — 이 값은 초 단위로만 변한다.
     exporter_cache: (ExporterState, Instant),
@@ -135,9 +143,13 @@ pub(crate) struct SysMetrics {
     /// OTLP exporter가 지금 서버에 닿고 있는지. exporter는 aicd 안에서 조용히 돌기 때문에,
     /// 이걸 보여주지 않으면 사용자는 "나가고 있다"고 믿을 뿐 확인할 방법이 없다.
     pub exporter: ExporterState,
-    /// **이 스냅샷의 `cpu_pct`를 믿어도 되는가.** cpu%는 sysinfo가 직전 refresh와의 델타로 계산하므로,
-    /// 직전 refresh와의 간격이 `MINIMUM_CPU_UPDATE_INTERVAL`(200ms)보다 짧으면 값이 갱신되지 않아
-    /// **0(거짓값)** 이 나온다. `SysSampler::new()` 직후의 첫 `sample()`이 정확히 그 상황이다(elapsed≈0).
+    /// **이 스냅샷의 `cpu_pct`를 믿어도 되는가.** cpu%는 순간값이 아니라 sysinfo가 **직전 스냅샷과의
+    /// 델타**로 계산하는 값이다. 따라서 무효인 근본 이유는 "시간이 짧아서"가 아니라 **비교할 이전
+    /// 상태가 없어서**다 — sampler의 첫 `sample()`이 정확히 그 경우고, 앞선 disk/net refresh가 아무리
+    /// 오래 걸려도 달라지지 않는다(`SysSampler::prev_cpu_refresh`가 이를 구조로 표현한다). 여기에 더해
+    /// 이전 샘플과의 간격이 `MINIMUM_CPU_UPDATE_INTERVAL`(200ms) 미만이면 sysinfo가 값을 갱신하지 않아
+    /// 직전 값이 반복되므로 그것도 무효로 본다.
+    ///
     /// 오염 여부를 아는 유일한 지점이 sampler이므로 여기서 판정해 스냅샷에 실어 보낸다 — 소비자
     /// (`/record now`의 지표 요약 등)는 이 값이 false면 cpu를 **버려야 한다**(0을 진짜 값인 척 보내면 안 됨).
     /// load/mem/swap/disk는 순간값이라 첫 샘플에서도 정확하므로 이 플래그는 cpu에만 해당한다.
@@ -217,6 +229,9 @@ impl SysSampler {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
+            // 아직 어떤 sample()도 cpu를 refresh하지 않았다 = 델타의 기준이 없다. 첫 sample()의 cpu는
+            // 여기서 이미 무효로 결정된다(시간을 얼마나 흘려보내든 바뀌지 않는다).
+            prev_cpu_refresh: None,
             // 첫 sample()에서 곧바로 조회하도록, 캐시는 만료된 상태로 시작한다.
             exporter_cache: (
                 ExporterState::Disabled,
@@ -239,17 +254,23 @@ impl SysSampler {
     pub fn sample(&mut self) -> SysMetrics {
         // 조립부에서 self를 다시 빌리지 않도록 먼저 계산해 둔다(캐시 주기 안이면 IPC 없음).
         let exporter = self.exporter_state();
+        // cpu 유효성 판정 — **refresh 직전에**, 직전 샘플의 cpu refresh 시각과만 비교한다.
+        // (1) 이전 샘플이 없으면(`None`) 델타의 기준이 없으므로 **무조건 무효**. 첫 샘플은 시간이
+        //     얼마나 흘렀든(느린 statfs로 수백 ms가 지났어도) 여기서 걸린다 — 구조적 차단.
+        // (2) 이전 샘플이 있어도 간격이 MINIMUM_CPU_UPDATE_INTERVAL(200ms) 미만이면 sysinfo가 값을
+        //     갱신하지 않으므로(직전 값 반복) 신뢰하지 않는다 — 보조 조건.
+        let cpu_valid = self
+            .prev_cpu_refresh
+            .is_some_and(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         self.sys.refresh_cpu_usage();
+        // 다음 샘플이 잴 기준점. **refresh 직후**에 찍어야 이후의 disk/net refresh 시간이 섞이지 않는다.
+        self.prev_cpu_refresh = Some(Instant::now());
         self.sys.refresh_memory();
         self.disks.refresh(false);
         self.networks.refresh(false);
-        let since_last = self.last.elapsed();
-        // cpu%는 sysinfo 내부 델타(직전 refresh 대비)라 간격이 MINIMUM_CPU_UPDATE_INTERVAL(200ms)보다
-        // 짧으면 갱신되지 않고 0이 나온다 — new() 직후 첫 sample()이 바로 그 경우(elapsed≈0)다. 오염
-        // 여부를 여기서 판정해 스냅샷에 실어 보낸다(소비자가 cpu를 버릴 수 있게).
-        let cpu_valid = since_last >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
-        // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
-        let elapsed = since_last.as_secs_f64().max(0.001);
+        // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음). i/o delta 전용 — cpu 판정과는
+        // 기준이 다르다(위 참고: `last`는 sample() 끝에 갱신돼 refresh 시간까지 포함한다).
+        let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
             let u = d.usage();
             (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
@@ -1062,25 +1083,46 @@ mod tests {
         assert!(gate.allow("", t0)); // 빈 키는 dedup 대상 아님 — 항상 통과
     }
 
-    /// cold-start 방어의 핵심 불변식: **첫 sample()의 cpu는 무효**(elapsed≈0 < 200ms라 sysinfo가
-    /// cpu 델타를 갱신하지 못한다), 워밍업 간격을 두고 다시 샘플하면 유효.
-    /// 이 머신의 실제 cpu 부하는 단언하지 않는다 — 검증 대상은 "간격 → 유효성" 규칙뿐이다.
+    /// cold-start 방어의 핵심 불변식: **첫 sample()의 cpu는 무조건 무효**. 비교할 이전 스냅샷이
+    /// 없어서지 시간이 짧아서가 아니므로, 벽시계와 무관하게 결정적으로 성립한다.
     #[test]
-    fn first_sample_marks_cpu_invalid_and_warmed_sample_valid() {
+    fn first_sample_cpu_is_invalid_regardless_of_elapsed_time() {
         let mut s = SysSampler::new();
+        // 시간 기반 판정이라면 여기서 valid로 뒤집힌다(느린 statfs가 만드는 상황과 동일).
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL * 2);
         let first = s.sample();
         assert!(
             !first.cpu_valid,
-            "new() 직후 첫 sample()의 cpu는 오염(elapsed≈0) — 무효여야 한다"
+            "첫 sample()은 델타의 기준이 없다 — 시간이 얼마나 흘렀든 cpu는 무효여야 한다"
         );
         assert!(first.sampled_at.is_some(), "샘플 시각은 항상 기록된다");
-        // MINIMUM_CPU_UPDATE_INTERVAL 이상 지난 뒤의 샘플은 델타가 성립하므로 유효.
+    }
+
+    /// 워밍업 이후(이전 샘플 존재 + 간격 충족)의 샘플은 유효. sleep은 하한만 보장하면 되므로
+    /// 부하가 걸려 더 오래 자도 결론이 뒤집히지 않는다(단조 — flaky하지 않음).
+    /// 이 머신의 실제 cpu 부하는 단언하지 않는다 — 검증 대상은 유효성 규칙뿐이다.
+    #[test]
+    fn warmed_sample_cpu_is_valid() {
+        let mut s = SysSampler::new();
+        let _first = s.sample(); // 델타 기준 확보(이 샘플 자체는 무효)
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
         let second = s.sample();
         assert!(
             second.cpu_valid,
-            "워밍업 간격({:?}) 후의 샘플은 cpu가 유효해야 한다",
+            "이전 샘플이 있고 간격({:?})을 채웠으면 cpu가 유효해야 한다",
             sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+        );
+    }
+
+    /// 보조 조건: 이전 샘플이 있어도 간격이 200ms 미만이면 sysinfo가 값을 갱신하지 않으므로 무효.
+    #[test]
+    fn resample_within_min_interval_is_invalid() {
+        let mut s = SysSampler::new();
+        let _first = s.sample();
+        let immediate = s.sample(); // 간격 ≈ 0
+        assert!(
+            !immediate.cpu_valid,
+            "MINIMUM_CPU_UPDATE_INTERVAL 안의 재샘플은 값이 갱신되지 않는다 — 무효여야 한다"
         );
     }
 
