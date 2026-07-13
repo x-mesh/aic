@@ -153,7 +153,10 @@ pub async fn serve_connections(
 
 /// `aic_bin snapshot inventory --json`을 spawn해 stdout을 [`InventorySnapshot`]으로 파싱한다.
 /// timeout 초과, spawn 실패, non-zero exit, 출력 상한 초과, JSON 파싱 실패 모두 `Err`.
-async fn capture_inventory(aic_bin: &std::path::Path, timeout: Duration) -> anyhow::Result<InventorySnapshot> {
+async fn capture_inventory(
+    aic_bin: &std::path::Path,
+    timeout: Duration,
+) -> anyhow::Result<InventorySnapshot> {
     let mut cmd = tokio::process::Command::new(aic_bin);
     cmd.args(["snapshot", "inventory", "--json"])
         .stdin(std::process::Stdio::null())
@@ -163,7 +166,12 @@ async fn capture_inventory(aic_bin: &std::path::Path, timeout: Duration) -> anyh
     let child = cmd.spawn()?;
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .map_err(|_| anyhow::anyhow!("aic snapshot inventory가 {}초 내에 끝나지 않음", timeout.as_secs()))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "aic snapshot inventory가 {}초 내에 끝나지 않음",
+                timeout.as_secs()
+            )
+        })??;
 
     if !output.status.success() {
         anyhow::bail!("aic snapshot inventory가 {} 로 종료", output.status);
@@ -234,13 +242,46 @@ mod tests {
         path
     }
 
+    /// `ETXTBSY`("Text file busy")인가.
+    fn is_text_file_busy(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<std::io::Error>()
+            .and_then(|io| io.raw_os_error())
+            == Some(libc::ETXTBSY)
+    }
+
+    /// [`capture_inventory`]를 ETXTBSY에 한해 짧게 재시도한다.
+    ///
+    /// 리눅스에서만 나는 멀티스레드 exec 레이스다(rust-lang/rust#114554): 이 테스트가 방금 쓴
+    /// `fake-aic`를 exec하는 순간, **다른 테스트 스레드가 fork한 자식**이 아직 그 파일의 write-fd를
+    /// 상속해 들고 있으면(CLOEXEC은 exec 시점에야 닫힌다) 커널이 `ETXTBSY`로 exec을 거부한다.
+    /// 그 자식이 자기 exec을 끝내면 fd가 닫히고 우리 exec이 통과하므로, 잠깐 기다렸다 다시 건다.
+    ///
+    /// **프로덕션 경로에는 없는 문제다** — 실제 `aic` 바이너리는 방금 쓴 파일이 아니다. 그래서
+    /// [`capture_inventory`] 자체는 건드리지 않고 테스트에서만 감싼다.
+    async fn capture_inventory_retrying(
+        bin: &std::path::Path,
+        timeout: Duration,
+    ) -> anyhow::Result<InventorySnapshot> {
+        for _ in 0..50 {
+            match capture_inventory(bin, timeout).await {
+                Err(e) if is_text_file_busy(&e) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => return other,
+            }
+        }
+        capture_inventory(bin, timeout).await
+    }
+
     #[tokio::test]
     async fn capture_inventory_parses_valid_json_output() {
         let dir = tempfile::tempdir().unwrap();
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"LISTEN","local_addr":"0.0.0.0","local_port":22,"peer_addr":null,"peer_port":null}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = capture_inventory_retrying(&bin, Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(snapshot.host.name, "web-1");
         assert_eq!(snapshot.host.id, "host-abc123");
         assert_eq!(snapshot.host.ip.as_deref(), Some("10.0.0.5"));
@@ -254,7 +295,9 @@ mod tests {
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"ESTAB","local_addr":"192.168.1.5","local_port":22,"peer_addr":"192.168.1.10","peer_port":54321,"process":"sshd","direction":"inbound"}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = capture_inventory_retrying(&bin, Duration::from_secs(5))
+            .await
+            .unwrap();
         let c = &snapshot.connections[0];
         assert_eq!(c.process.as_deref(), Some("sshd"));
         assert_eq!(c.direction.as_deref(), Some("inbound"));
@@ -268,7 +311,9 @@ mod tests {
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"LISTEN","local_addr":"0.0.0.0","local_port":22,"peer_addr":null,"peer_port":null}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = capture_inventory_retrying(&bin, Duration::from_secs(5))
+            .await
+            .unwrap();
         let c = &snapshot.connections[0];
         assert_eq!(c.process, None);
         assert_eq!(c.direction, None);
@@ -278,7 +323,9 @@ mod tests {
     async fn capture_inventory_errors_on_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "exit 1");
-        let err = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap_err();
+        let err = capture_inventory_retrying(&bin, Duration::from_secs(5))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("종료"), "err={err}");
     }
 
@@ -286,14 +333,16 @@ mod tests {
     async fn capture_inventory_errors_on_malformed_json() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "echo 'not json'");
-        assert!(capture_inventory(&bin, Duration::from_secs(5)).await.is_err());
+        assert!(capture_inventory_retrying(&bin, Duration::from_secs(5))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn capture_inventory_times_out_on_hung_process() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "sleep 30");
-        let err = capture_inventory(&bin, Duration::from_millis(100))
+        let err = capture_inventory_retrying(&bin, Duration::from_millis(100))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("끝나지 않음"), "err={err}");
@@ -302,6 +351,8 @@ mod tests {
     #[tokio::test]
     async fn capture_inventory_errors_on_spawn_failure() {
         let missing = std::path::PathBuf::from("/definitely/does/not/exist/aic");
-        assert!(capture_inventory(&missing, Duration::from_secs(5)).await.is_err());
+        assert!(capture_inventory(&missing, Duration::from_secs(5))
+            .await
+            .is_err());
     }
 }
