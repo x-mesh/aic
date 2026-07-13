@@ -6,12 +6,9 @@
 > **체크포인트(재시작 복구)** 와 **에이전트측 볼륨 안전장치**를 1급 요구사항으로 둔다.
 > 수신 측(rca)은 `events`가 아닌 **신규 `logs` 테이블**에 저장한다.
 
-- 상태: **구현 완료 (송신부) — 단, [§6.4](#64-배치--batch_max_bytes가-없으면-수신-측이-배치를-거부한다--미구현)와
-  [§6.6](#66-4xx는-재시도하지-않는다--poison-batch가-spool-전체를-멈춘다--미구현)이 남았다. 이 둘을 넣기 전에
-  `logs_enabled = true`로 켜면 안 된다.** 앱 로그 배치 하나가 그 호스트의 **텔레메트리 전체**를
-  멈출 수 있다(§6.6).
-  **수신 측(rca-server)도 미구현** — §8의 후속 티켓을 처리하기 전까지 보낸 로그는 100% 버려진다.
-- 작성일: 2026-07-13 / 개정: 2026-07-14 (수신 측 실측에서 §6.4·§6.6 결함 발견 — 두 절 신설)
+- 상태: **송신부 구현 완료** — §6.4(`batch_max_bytes`)와 §6.6(4xx 비재시도)까지 t13·t14로 반영됐다.
+  **수신 측(rca-server)은 미구현** — §8의 후속 티켓을 처리하기 전까지 보낸 로그는 100% 버려진다.
+- 작성일: 2026-07-13 / 개정: 2026-07-14 (수신 측 실측에서 §6.4·§6.6 결함 발견 → t13·t14로 수정)
 - 대상 바이너리: `aicd` (crate `aic-server`), 설정은 `aic-common`
 - 범위: 로그 **수집·전송**. 로그 기반 알림 규칙·이상탐지는 비목표(중앙 rca 몫).
 - 관련 문서:
@@ -386,7 +383,7 @@ spool 디스크가 먼저 터진다.**
 > 중앙에서 구분할 수 없다. (`tests/log_collection_e2e.rs::dropped_lines_appear_in_metrics_as_aic_log_dropped`가
 > 이 배선을 wire에서 검증한다.)
 
-### 6.4 배치 — **`batch_max_bytes`가 없으면 수신 측이 배치를 거부한다** ⚠ 미구현
+### 6.4 배치 — `batch_max_bytes` (t13)
 
 라인당 HTTP 요청은 금물. `batch_max_lines = 500` **또는** `batch_max_ms = 2000` 중 **먼저 도달하는
 쪽**에서 flush. 타이머는 **첫 라인이 버퍼에 들어온 시점부터** 잰다 — 버퍼가 비어 있는 동안은
@@ -438,7 +435,7 @@ Promtail) 중 **oldest-drop을 하는 구현이 하나도 없었다.** oldest를
 쿼터는 기존 `spool_max_bytes`(256MiB)에서 **파생**한다(하위호환) — `spool_metrics_max_bytes` /
 `spool_logs_max_bytes` / `spool_app_logs_max_bytes`로 개별 override 가능.
 
-### 6.6 4xx는 재시도하지 않는다 — **poison batch가 spool 전체를 멈춘다** ⚠ 미구현
+### 6.6 4xx는 재시도하지 않는다 — poison batch 방지 (t14)
 
 > **§6.5의 kind별 쿼터로는 이걸 막을 수 없다.** 쿼터는 "누가 누굴 evict하는가"를 가르지만,
 > poison batch는 **evict되지 않고 드레인 큐의 머리에 남는 문제**다. 다른 축이다.
@@ -516,7 +513,7 @@ logs_enabled = false         # 기본 false — opt-in. 다른 하위 플래그(
 min_severity = "WARN"        # 외부 소스 기본. aic self는 INFO(§6.1이 소스별로 처리)
 max_lines_per_sec = 1000     # 서비스당 토큰버킷
 batch_max_lines = 500
-batch_max_bytes = 4194304    # 4 MiB. ⚠ 미구현(§6.4) — 없으면 최악 31 MiB 배치가 413을 받는다
+batch_max_bytes = 4194304    # 4 MiB — 수신 측 상한(8 MiB)의 절반(§6.4)
 batch_max_ms = 2000
 max_services = 50            # 토큰버킷 맵 상한(카디널리티 방어)
 
@@ -630,8 +627,8 @@ SETTINGS ttl_only_drop_parts = 1;
 | t10 | **container** 수집기 (`FileTail` 재사용) | 컨테이너 재생성 시 중복 0, 깨진 라인 격리 |
 | t11 | `aic-client` subscriber + `PushLogLines` IPC + `atexit` flush | `log_sink_integration.rs` |
 | **t12** | **config 배선 + `aicd_main` 조건부 spawn + 배선 부채 해소** | `log_collection_e2e.rs` — self/IPC/드롭이 wire에 도달 |
-| **t13** ⚠ | **`batch_max_bytes`(§6.4)** — 라인 수·바이트·시간 중 먼저 도달하는 것에서 flush | 64 KiB 라인 500개를 넣고 flush된 배치가 4 MiB 이하인지 |
-| **t14** ⚠ | **4xx 비재시도(§6.6)** — `push`가 재시도 가능 여부를 반환, drain이 영구 실패를 건너뛰고 삭제 + 카운트 | 413을 뱉는 mock collector에 배치를 물리고, **뒤의 metrics 배치가 정상 드레인되는지** |
+| **t13** | **`batch_max_bytes`(§6.4)** — 라인 수·바이트·시간 중 먼저 도달하는 것에서 flush | 64 KiB 라인 500개를 넣고 flush된 배치가 4 MiB 이하인지 |
+| **t14** | **4xx 비재시도(§6.6)** — `push`가 재시도 가능 여부를 반환, drain이 영구 실패를 건너뛰고 삭제 + 카운트 | 413을 뱉는 mock collector에 배치를 물리고, **뒤의 metrics 배치가 정상 드레인되는지** |
 
 > **t13·t14는 아직 안 됐다.** 둘 다 수신 측 실측에서 드러난 결함이고(§6.4·§6.6), **`logs_enabled`를
 > 켜기 전에 끝나야 한다.** t14의 검증이 핵심이다 — "앱 로그 배치가 막혀도 **다른 시그널은 흘러야

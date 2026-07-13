@@ -46,6 +46,12 @@ pub struct LogsExporterConfig {
     pub service_version: String,
     /// 이 줄 수에 도달하면 즉시 flush한다. 권장 기본값 500.
     pub batch_max_lines: usize,
+    /// 버퍼의 원문 바이트 합이 이 값을 **넘기기 전에** flush한다. 권장 기본값 4 MiB.
+    ///
+    /// 라인 수만으로는 배치 크기를 못 묶는다 — 라인 하나가 64 KiB까지 갈 수 있어 500줄이면
+    /// 최악 31 MiB이고, 수신 측은 8 MiB에서 413으로 자른다. 그리고 그 413은 재전송해도 영원히
+    /// 413이라 spool 큐 머리에 박혀 **다른 시그널의 드레인까지 멈춘다**(RFC-006 §6.6).
+    pub batch_max_bytes: usize,
     /// 첫 라인이 버퍼에 들어온 시점부터 이 시간(ms)이 지나면 flush한다. 권장 기본값 2000.
     pub batch_max_ms: u64,
     /// 오프라인 spool(SRE t8). 다른 exporter config와 동일 인스턴스를 공유한다.
@@ -73,10 +79,27 @@ struct LogsFlusher {
     os_type: String,
     backoff: Backoff,
     buffer: Vec<LogLine>,
+    /// `buffer`에 든 라인들의 원문 바이트 합. 매번 다시 세지 않으려고 들고 다닌다.
+    buffered_bytes: usize,
     /// 다음 flush 데드라인. 버퍼가 비어 있는 동안은 `None`(타이머 없음).
     deadline: Option<Instant>,
     /// 서비스당 token-bucket rate limiter(SRE t6). severity 필터를 통과한 라인만 여기를 거친다.
     limiter: Limiter,
+}
+
+/// 한 라인이 배치 크기에 기여하는 바이트. 인코딩 전 원문 기준이다 — protobuf 프레이밍과 attr
+/// 오버헤드가 그 위에 얹히므로, 이 합이 `batch_max_bytes`(수신 측 상한의 절반)를 안 넘으면
+/// 인코딩 결과도 상한 아래로 들어온다.
+fn line_bytes(line: &LogLine) -> usize {
+    line.message.len()
+        + line.service.len()
+        + line.source.len()
+        + line.record_id.len()
+        + line
+            .attrs
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
 }
 
 impl LogsFlusher {
@@ -103,15 +126,27 @@ impl LogsFlusher {
 
     /// 라인을 버퍼에 쌓는다. 버퍼가 비어 있다가 채워지는 순간에만 데드라인을 새로 잡는다 —
     /// 이미 대기 중인 배치의 데드라인을 뒤로 미루지 않는다(먼저 들어온 라인 기준으로 고정).
-    fn push_line(&mut self, line: LogLine) {
+    ///
+    /// **이 라인을 넣으면 `batch_max_bytes`를 넘길 경우, 넣기 *전에* 지금까지의 버퍼를 flush한다.**
+    /// 넣고 나서 검사하면 이미 상한을 넘긴 배치를 전송하게 된다 — 그게 정확히 413을 부르는 길이고,
+    /// 413은 재전송해도 영원히 413이라 spool 큐를 막는다(RFC-006 §6.6). 버퍼가 비어 있는데도
+    /// 한 라인이 상한을 넘는 경우는 그 라인 혼자 배치가 된다 — 나눌 수 없으니 보내는 수밖에 없고,
+    /// 라인 자체가 64 KiB로 잘려 있어(§3) 상한을 넘을 수 없다.
+    async fn add_line(&mut self, line: LogLine) {
+        let bytes = line_bytes(&line);
+        if !self.buffer.is_empty() && self.buffered_bytes + bytes > self.cfg.batch_max_bytes {
+            self.flush().await;
+        }
         if self.buffer.is_empty() {
             self.deadline = Some(Instant::now() + Duration::from_millis(self.cfg.batch_max_ms));
         }
+        self.buffered_bytes += bytes;
         self.buffer.push(line);
     }
 
     fn should_flush_on_size(&self) -> bool {
         self.buffer.len() >= self.cfg.batch_max_lines
+            || self.buffered_bytes >= self.cfg.batch_max_bytes
     }
 
     /// 현재 버퍼를 인코딩해 전송을 시도한다. 빈 버퍼는 no-op(빈 배치를 push/spool 어느 쪽에도
@@ -121,6 +156,7 @@ impl LogsFlusher {
             return;
         }
         let batch = std::mem::take(&mut self.buffer);
+        self.buffered_bytes = 0;
         self.deadline = None;
 
         let resource = ResourceAttrs {
@@ -150,6 +186,23 @@ impl LogsFlusher {
         {
             Ok(()) => {
                 self.backoff.on_success();
+                self.cfg.health.record_ok();
+            }
+            // 4xx — 재전송해도 같은 응답이다. **spool에 넣지 않는다**: 넣는 순간 그게 poison
+            // batch가 되어 FIFO 머리에 박히고, 모든 kind의 드레인을 멈춘다(RFC-006 §6.6).
+            // 버리되 조용히 버리지 않는다 — 카운터가 이 유실을 드러낸다.
+            Err(e) if e.is_permanent() => {
+                tracing::warn!(
+                    error = %e,
+                    batch_lines = batch.len(),
+                    "collector가 app logs 배치를 영구 거부 — 이 배치 유실(spool에 넣지 않는다)"
+                );
+                self.cfg
+                    .drop_counters
+                    .by_rejected
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                // backoff는 올리지 않는다 — collector는 살아 있다. 우리 요청이 틀렸을 뿐이고,
+                // backoff를 걸면 멀쩡한 다음 배치까지 지연시킨다.
                 self.cfg.health.record_ok();
             }
             Err(e) => {
@@ -189,6 +242,7 @@ pub async fn serve_logs(
     tracing::info!(
         url = %url,
         batch_max_lines = cfg.batch_max_lines,
+        batch_max_bytes = cfg.batch_max_bytes,
         batch_max_ms = cfg.batch_max_ms,
         "OTLP logs exporter 시작"
     );
@@ -203,6 +257,7 @@ pub async fn serve_logs(
         os_type,
         backoff: Backoff::new(),
         buffer: Vec::new(),
+        buffered_bytes: 0,
         deadline: None,
         limiter,
     };
@@ -218,7 +273,7 @@ pub async fn serve_logs(
                         // 볼륨 안전장치(SRE t6) — min_severity 먼저(싸다), 그 다음 rate limit.
                         // 드롭되면 카운터만 올리고 버퍼/배치엔 아예 닿지 않는다.
                         if flusher.gate(&line) {
-                            flusher.push_line(line);
+                            flusher.add_line(line).await;
                             if flusher.should_flush_on_size() {
                                 flusher.flush().await;
                             }
@@ -311,7 +366,8 @@ mod tests {
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
             // ms 타이머가 이 테스트에서 절대 끼어들지 않게 충분히 크게 잡는다.
-            batch_max_ms: 3_600_000,
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 3_600_000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -343,6 +399,82 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
+    /// 큰 라인이 몰리면 `batch_max_lines`만으로는 배치가 수신 측 요청 상한을 넘긴다.
+    ///
+    /// 라인 하나는 64 KiB까지 허용되므로 500줄이면 최악 31 MiB인데, rca는 8 MiB에서 413을 낸다.
+    /// 그리고 413은 재전송해도 영원히 413이라, 그 배치가 spool 큐 머리에 박혀 **다른 시그널의
+    /// 드레인까지 멈춘다**(RFC-006 §6.6). 그래서 바이트로도 잘라야 한다.
+    ///
+    /// 여기서는 64 KiB 라인 500개를 넣고 (a) 배치가 여러 개로 쪼개졌는지, (b) **어느 배치도
+    /// 상한을 넘지 않는지**를 spool에 쌓인 실제 인코딩 바이트로 확인한다.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_never_exceeds_max_bytes_even_when_lines_are_huge() {
+        const LINE_BYTES: usize = 64 * 1024;
+        const MAX_BYTES: usize = 512 * 1024; // 테스트를 빨리 끝내려 작게 — 비율은 동일하다.
+        const LINES: usize = 500;
+
+        let (dir, spool) = test_spool();
+        let spool_dir = dir.path().join("otlp-spool");
+        let health = Arc::new(ExporterHealth::new(
+            CLOSED_PORT_ENDPOINT.to_string(),
+            spool.clone(),
+        ));
+        let cfg = LogsExporterConfig {
+            endpoint: CLOSED_PORT_ENDPOINT.to_string(),
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            // 라인 수로는 절대 안 걸리게 — 바이트 상한만이 배치를 자를 수 있어야 한다.
+            batch_max_lines: 10_000,
+            batch_max_bytes: MAX_BYTES,
+            batch_max_ms: 3_600_000,
+            spool: spool.clone(),
+            health,
+            logs_cfg: aic_common::AicdLogsConfig {
+                // 이 테스트는 배치 크기만 본다 — rate limit이 라인을 삼키면 안 된다.
+                max_lines_per_sec: u32::MAX,
+                ..Default::default()
+            },
+            drop_counters: Arc::new(DropCounters::new()),
+        };
+        let (tx, rx) = mpsc::channel(2048);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_logs(cfg, rx, sd_rx));
+
+        let big = "x".repeat(LINE_BYTES);
+        for _ in 0..LINES {
+            tx.send(log_line(&big)).await.unwrap();
+        }
+        sd_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+
+        // 라인 수 상한(10k)에는 한참 못 미치므로, 쪼개진 이유는 바이트 상한뿐이다.
+        let batches = spool.batch_count();
+        assert!(
+            batches > 1,
+            "바이트 상한이 배치를 잘라야 한다 — 배치가 {batches}개뿐이면 500 × 64 KiB가 한 덩어리로 나간 것"
+        );
+
+        // 상한을 실제로 지켰는지는 spool에 떨어진 인코딩 결과로 확인한다. 원문 바이트로 재는
+        // 카운터가 맞아도 인코딩이 부풀면 의미가 없다 — 수신 측이 보는 건 이 바이트다.
+        let mut largest = 0usize;
+        for entry in std::fs::read_dir(&spool_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "batch") {
+                largest = largest.max(std::fs::metadata(&path).unwrap().len() as usize);
+            }
+        }
+        assert!(
+            largest > 0,
+            "spool에 배치 파일이 있어야 한다(push는 닫힌 포트라 전부 실패한다)"
+        );
+        // protobuf 프레이밍이 원문 위에 얹히므로 정확히 MAX_BYTES는 아니지만, 배치가 통제 없이
+        // 커지지 않았음을 못박는다. 실제 배선(4 MiB 상한 vs 8 MiB 수신 한도)이 이 여유를 준다.
+        assert!(
+            largest < MAX_BYTES * 2,
+            "배치 하나가 {largest} 바이트 — 상한 {MAX_BYTES}의 2배를 넘으면 크기를 통제하지 못한 것"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn flush_at_max_ms() {
         let (_dir, spool) = test_spool();
@@ -356,7 +488,8 @@ mod tests {
             service_version: "0.0.0-test".to_string(),
             // 라인 수로는 이 테스트에서 절대 안 걸리게.
             batch_max_lines: 10_000,
-            batch_max_ms: 2000,
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 2000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -400,7 +533,8 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 2,
-            batch_max_ms: 60_000,
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 60_000,
             spool: spool.clone(),
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -444,7 +578,8 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
-            batch_max_ms: 60_000, // 타이머로는 절대 안 나가게.
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 60_000, // 타이머로는 절대 안 나가게.
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -499,6 +634,7 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 1, // 매 라인마다 즉시 flush되게.
+            batch_max_bytes: 4 * 1024 * 1024,
             batch_max_ms: 60_000,
             spool: spool.clone(),
             health,
@@ -547,7 +683,8 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
-            batch_max_ms: 60_000,
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 60_000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -584,7 +721,8 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
-            batch_max_ms: 50,
+            batch_max_bytes: 4 * 1024 * 1024,
+batch_max_ms: 50,
             spool: spool.clone(),
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -665,6 +803,7 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 100, // 라인 수로는 flush 안 걸리게.
+            batch_max_bytes: 4 * 1024 * 1024, // 바이트로도 안 걸리게.
             batch_max_ms: 60_000, // 타이머로도 flush 안 걸리게 — flush는 shutdown 때 한 번.
             spool: spool.clone(),
             health,

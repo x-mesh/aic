@@ -84,6 +84,7 @@ async fn self_log_does_not_recurse_under_push_failure() {
         service_version: "0.0.0-test".to_string(),
         // 라인마다 즉시 flush → push 시도 → 503 실패 → tracing::warn!("push 실패") 유도.
         batch_max_lines: 1,
+        batch_max_bytes: 4 * 1024 * 1024,
         batch_max_ms: 60_000,
         spool: spool.clone(),
         health,

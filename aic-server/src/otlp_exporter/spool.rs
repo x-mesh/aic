@@ -106,8 +106,12 @@ const TMP_EXT: &str = "tmp";
 pub struct DrainReport {
     /// 이번 호출에서 성공적으로 재전송+삭제한 배치 수.
     pub drained: usize,
-    /// 도중에 재전송 실패가 있었는지(있었다면 그 지점에서 즉시 멈춘다 — FIFO 순서 보존 + 어차피
-    /// collector가 다운이면 뒤 배치도 실패할 것이므로).
+    /// collector가 **영구 거부**(4xx)해서 버린 배치 수. 재전송해도 결과가 같으므로 큐에 남기지
+    /// 않는다 — 남기면 그 배치가 FIFO 머리에서 모든 kind의 드레인을 막는다(RFC-006 §6.6).
+    /// 유실이므로 조용히 넘어가지 않고 여기로 올린다.
+    pub rejected: usize,
+    /// 도중에 **일시** 실패가 있었는지(있었다면 그 지점에서 즉시 멈춘다 — FIFO 순서 보존 + 어차피
+    /// collector가 다운이면 뒤 배치도 실패할 것이므로). 영구 거부는 여기 해당하지 않는다.
     pub failed: bool,
 }
 
@@ -223,14 +227,25 @@ impl Spool {
         Ok(())
     }
 
-    /// FIFO 순서로 최대 `limit`개 배치를 `sender`로 재전송 시도한다. 성공한 배치만 삭제한다.
-    /// `sender`는 (signal kind, body)를 받아 실제 HTTP push를 수행하는 호출부 콜백 —
-    /// endpoint URL 선택(`/v1/metrics` vs `/v1/logs`)은 kind를 보고 호출부가 결정한다. 전역 FIFO
-    /// 순서는 kind와 무관하게 seq(파일명 접두사) 오름차순 그대로다.
+    /// FIFO 순서로 최대 `limit`개 배치를 `sender`로 재전송 시도한다. 전역 FIFO 순서는 kind와
+    /// 무관하게 seq(파일명 접두사) 오름차순 그대로다 — `sender`는 (signal kind, body)를 받아 실제
+    /// HTTP push를 수행하는 호출부 콜백이고, endpoint URL 선택(`/v1/metrics` vs `/v1/logs`)은
+    /// kind를 보고 호출부가 결정한다.
+    ///
+    /// 배치의 운명은 셋 중 하나다:
+    ///
+    /// - **성공** → 삭제하고 다음으로.
+    /// - **[`PushError::Permanent`]**(4xx) → **삭제하고 다음으로.** 재전송해도 결과가 같은 배치다.
+    ///   지우지 않으면 이 배치가 FIFO 머리에 영구히 박히고, spool은 모든 kind가 한 큐를 공유하므로
+    ///   **metrics·events·agent·changes까지 전부 드레인이 멈춘다**(RFC-006 §6.6). 손상된 배치 파일을
+    ///   이미 같은 이유로 건너뛰고 삭제하는데(아래), 4xx는 정확히 같은 부류다 — 몇 번을 보내도
+    ///   성공하지 않는 배치.
+    /// - **[`PushError::Transient`]**(5xx·타임아웃·커넥션 실패) → **남겨두고 즉시 중단.** collector가
+    ///   다운이면 뒤 배치도 실패할 테니 FIFO 순서를 지키며 다음 tick을 기다린다.
     pub async fn drain<F, Fut>(&self, limit: usize, mut sender: F) -> DrainReport
     where
         F: FnMut(SignalKind, Vec<u8>) -> Fut,
-        Fut: Future<Output = anyhow::Result<()>>,
+        Fut: Future<Output = Result<(), super::PushError>>,
     {
         let mut files = match self.list_batch_files() {
             Ok(f) => f,
@@ -238,6 +253,7 @@ impl Spool {
                 tracing::warn!(error = %e, "otlp spool 디렉토리 읽기 실패 — 이번 드레인 skip");
                 return DrainReport {
                     drained: 0,
+                    rejected: 0,
                     failed: true,
                 };
             }
@@ -245,6 +261,7 @@ impl Spool {
         files.sort();
 
         let mut drained = 0usize;
+        let mut rejected = 0usize;
         for path in files.into_iter().take(limit) {
             let (kind, body) = match read_batch(&path) {
                 Ok(pair) => pair,
@@ -263,9 +280,23 @@ impl Spool {
                     self.remove_and_untrack(&path, Some(kind));
                     drained += 1;
                 }
+                Err(e) if e.is_permanent() => {
+                    // 손상 배치와 같은 처리 — 지우지 않으면 큐 전체가 여기서 멈춘다.
+                    // 조용히 버리지 않는다: 카운터로 올리고 warn을 남긴다.
+                    tracing::warn!(
+                        path = %path.display(),
+                        kind = ?kind,
+                        error = %e,
+                        "collector가 배치를 영구 거부 — 건너뛰고 삭제(재전송해도 같은 응답)"
+                    );
+                    self.dropped[kind.index()].fetch_add(1, Ordering::Relaxed);
+                    self.remove_and_untrack(&path, Some(kind));
+                    rejected += 1;
+                }
                 Err(_) => {
                     return DrainReport {
                         drained,
+                        rejected,
                         failed: true,
                     }
                 }
@@ -273,6 +304,7 @@ impl Spool {
         }
         DrainReport {
             drained,
+            rejected,
             failed: false,
         }
     }
@@ -628,7 +660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_stops_at_first_failure_preserving_order() {
+    async fn drain_stops_at_first_transient_failure_preserving_order() {
         let (_dir, spool) = tmp_spool(1024 * 1024);
         for i in 0..5u8 {
             spool.append(SignalKind::Metrics, &[i]).unwrap();
@@ -643,7 +675,7 @@ mod tests {
                     if this_attempt <= 2 {
                         Ok(())
                     } else {
-                        anyhow::bail!("collector down")
+                        Err(super::super::PushError::Transient("collector down".into()))
                     }
                 }
             })
@@ -651,10 +683,62 @@ mod tests {
 
         assert_eq!(report.drained, 2, "처음 2개는 성공, 3번째에서 멈춰야 함");
         assert!(report.failed);
+        assert_eq!(report.rejected, 0, "일시 실패는 거부가 아니다");
         assert_eq!(
             spool.batch_count(),
             3,
-            "실패한 배치부터는 그대로 남아 다음 드레인에 재시도됨"
+            "일시 실패한 배치부터는 그대로 남아 다음 드레인에 재시도됨"
+        );
+    }
+
+    /// 영구 거부(4xx)당한 배치는 **큐에서 빠져야 한다.**
+    ///
+    /// 남겨두면 FIFO 머리에 영원히 박힌다 — 재전송해도 같은 4xx라서다. 그리고 spool은 모든
+    /// kind가 한 큐를 공유하므로, 앱 로그 배치 하나가 그 뒤의 **metrics·events까지 전부**
+    /// 드레인을 멈춘다(RFC-006 §6.6). 이 테스트가 지키는 게 정확히 그 불변식이다:
+    /// **거부된 배치 뒤의 다른 시그널이 계속 흘러야 한다.**
+    #[tokio::test]
+    async fn a_permanently_rejected_batch_is_dropped_and_does_not_block_other_signals() {
+        let (_dir, spool) = tmp_spool(1024 * 1024);
+        // 큐 머리에 앱 로그(거부당할 배치), 그 뒤에 다른 시그널들.
+        spool.append(SignalKind::AppLogs, b"poison").unwrap();
+        spool.append(SignalKind::Metrics, b"m1").unwrap();
+        spool.append(SignalKind::Logs, b"e1").unwrap();
+
+        let sent = std::sync::Mutex::new(Vec::new());
+        let report = spool
+            .drain(10, |kind, body| {
+                let permanent = body == b"poison";
+                sent.lock().unwrap().push(kind);
+                async move {
+                    if permanent {
+                        // 413 — 배치가 수신 측 본문 상한을 넘었다. 몇 번을 보내도 같다.
+                        Err(super::super::PushError::Permanent(
+                            "collector가 413 Payload Too Large 응답".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(report.rejected, 1, "거부된 배치가 카운트돼야 한다");
+        assert_eq!(report.drained, 2, "거부 배치 뒤의 두 시그널이 흘러야 한다");
+        assert!(
+            !report.failed,
+            "영구 거부는 드레인 실패가 아니다 — 큐는 계속 흐른다"
+        );
+        assert_eq!(spool.batch_count(), 0, "거부된 배치도 큐에서 사라져야 한다");
+        assert_eq!(
+            spool.dropped_count(SignalKind::AppLogs),
+            1,
+            "유실을 조용히 넘기지 않고 드롭 카운터로 드러내야 한다"
+        );
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![SignalKind::AppLogs, SignalKind::Metrics, SignalKind::Logs],
+            "거부 배치에서 멈추지 않고 뒤의 배치를 전부 시도해야 한다"
         );
     }
 

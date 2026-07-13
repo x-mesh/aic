@@ -36,12 +36,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - `by_spool_quota`: spool `AppLogs` 쿼터 초과. `Spool`이 이미 `dropped_count`로 세고 있으므로
 ///   여기 별도 로직을 두지 않고, 메트릭을 만들 때 `Spool::dropped_count(SignalKind::AppLogs)`
 ///   값을 그대로 복사해 넣는다(스냅샷 시점에 read-through).
+/// - `by_rejected`: collector가 배치를 **영구 거부**(4xx)해서 버린 라인 수. 재전송해도 결과가
+///   같으므로 spool에 넣지 않고 버린다 — 넣으면 그 배치가 FIFO 머리에서 모든 kind의 드레인을
+///   막는다(RFC-006 §6.6). **이 카운터가 그 유실을 드러내는 유일한 창구다.** 0이 아니면 송신
+///   측이 수신 측 계약을 위반하고 있다는 뜻이다(배치가 너무 크거나, 토큰이 죽었거나, 스키마가
+///   갈렸거나).
 #[derive(Debug, Default)]
 pub struct DropCounters {
     pub by_severity: AtomicU64,
     pub by_rate_limit: AtomicU64,
     pub by_channel_full: AtomicU64,
     pub by_spool_quota: AtomicU64,
+    pub by_rejected: AtomicU64,
 }
 
 impl DropCounters {
@@ -52,12 +58,13 @@ impl DropCounters {
     /// `(reason, count)` 스냅샷 — `encode_metrics`가 `aic.log.dropped` 게이지 data point를
     /// 만드는 데 쓴다. 사유별로 별도 data point를 만들되, 서비스 태그는 붙이지 않는다
     /// (카디널리티 방어 — 이 태스크 계약 §3).
-    pub fn snapshot(&self) -> [(&'static str, u64); 4] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 5] {
         [
             ("severity", self.by_severity.load(Ordering::Relaxed)),
             ("rate_limit", self.by_rate_limit.load(Ordering::Relaxed)),
             ("channel_full", self.by_channel_full.load(Ordering::Relaxed)),
             ("spool_quota", self.by_spool_quota.load(Ordering::Relaxed)),
+            ("rejected", self.by_rejected.load(Ordering::Relaxed)),
         ]
     }
 }

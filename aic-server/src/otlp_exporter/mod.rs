@@ -210,13 +210,59 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
     Ok(())
 }
 
-/// OTLP protobuf 본문을 collector로 POST한다. 2xx가 아니면 에러.
+/// push 실패를 **재시도할 가치가 있는가**로 가른다.
+///
+/// 이 구분이 없으면 4xx가 poison batch가 된다. spool의 `drain`은 실패한 배치를 지우지 않고
+/// FIFO 머리에 남겨두는데(뒤 배치도 어차피 실패할 테니 순서를 지키는 게 맞다), 413·400은
+/// **재전송해도 영원히 같은 응답**이다. 그러면 그 배치가 큐를 영구히 막고 — spool은 모든 kind가
+/// 한 FIFO를 공유하므로 — metrics·events·agent·changes까지 **전부 드레인이 멈춘다**
+/// (RFC-006 §6.6).
+///
+/// `drain`은 이미 **손상된 배치 파일**을 "무한 재시도를 막기 위해 건너뛰고 삭제"한다. 4xx는
+/// 정확히 같은 부류다 — 몇 번을 보내도 성공하지 않는 배치. 같은 처리를 받는다.
+#[derive(Debug)]
+pub enum PushError {
+    /// 4xx — 요청 자체가 수신 측 계약을 위반했다. 재전송은 의미가 없다.
+    ///
+    /// 401도 여기 넣는다. 토큰을 고치면 성공할 수도 있지만 그건 **재시작을 동반**하고, 그때까지
+    /// 401 배치가 큐를 막는 것보다는 버리는 편이 낫다 — 드롭 카운터가 그 사실을 드러낸다.
+    Permanent(String),
+    /// 5xx · 타임아웃 · 커넥션 실패 — collector가 돌아오면 성공할 수 있다.
+    Transient(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::Permanent(m) => write!(f, "{m} (영구 실패 — 재시도 안 함)"),
+            PushError::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl PushError {
+    fn is_permanent(&self) -> bool {
+        matches!(self, PushError::Permanent(_))
+    }
+}
+
+/// HTTP 응답을 [`PushError`]로 분류한다. `push`/`push_logs`가 공유한다.
+fn classify(status: reqwest::StatusCode) -> PushError {
+    let msg = format!("collector가 {status} 응답");
+    if status.is_client_error() {
+        PushError::Permanent(msg)
+    } else {
+        PushError::Transient(msg)
+    }
+}
+
+/// OTLP protobuf 본문을 collector로 POST한다. 2xx가 아니면 [`PushError`].
 async fn push(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
     body: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> Result<(), PushError> {
     let mut req = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
@@ -224,10 +270,14 @@ async fn push(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req.send().await?;
+    // 네트워크·타임아웃 오류는 collector가 돌아오면 성공할 수 있다 — 일시 실패다.
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| PushError::Transient(e.to_string()))?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("collector가 {status} 응답");
+        return Err(classify(status));
     }
     Ok(())
 }
@@ -251,7 +301,7 @@ async fn push_logs(
     url: &str,
     token: Option<&str>,
     body: Vec<u8>,
-) -> anyhow::Result<()> {
+) -> Result<(), PushError> {
     let mut req = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
@@ -259,10 +309,13 @@ async fn push_logs(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req.send().await?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| PushError::Transient(e.to_string()))?;
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("collector가 {status} 응답");
+        return Err(classify(status));
     }
     Ok(())
 }
