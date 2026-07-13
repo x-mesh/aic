@@ -12,6 +12,7 @@
 use aic_common::{
     aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
 };
+use aic_server::agent_event_bus::AgentEventBus;
 use aic_server::attach_server::AttachServer;
 use aic_server::command_record_store::CommandRecordStore;
 use aic_server::control_server::{spawn_reconcile_loop, ControlContext, ControlServer};
@@ -94,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
     // t7: events exporter가 tap을 구독하려면 ControlContext로 move되기 전에 clone해 둬야 한다.
     let events_record_store = record_store.clone();
     let metrics = Arc::new(aic_server::metrics::AicdMetrics::new());
+    // agent exporter도 같은 이유로 bus를 미리 clone해 둔다 — ControlContext가 소유권을 가져간다.
+    let agent_bus = AgentEventBus::new();
+    let exporter_agent_bus = agent_bus.clone();
 
     // Attach_UDS (R5.1, R5.2) — aic-session 이 PTY bytes 를 중앙으로 보내는 경로.
     // Control_UDS 와는 완전히 분리된 소켓이며, SessionProcessorPool + CommandRecordStore
@@ -118,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         record_store,
         registry_path: Some(registry_path.clone()),
         metrics,
+        agent_bus,
     };
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
@@ -197,6 +202,25 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // OTLP agent exporter (opt-in, [aicd.exporter] enabled=true + agent_enabled=true).
+    // AgentEventBus tap을 구독해 chat/agent 행위를 실시간으로 push한다. events와 같은 push 기반
+    // 구조지만, 소스가 store가 아니라 bus라 별도 task로 둔다.
+    let agent_handle = match load_agent_config(
+        exporter_agent_bus,
+        exporter_section.clone(),
+        exporter_spool.clone(),
+    ) {
+        Some(cfg) => {
+            let ag_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::serve_agent(cfg, ag_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP agent exporter 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
     server.serve(control_ctx).await;
 
     // Control 루프가 빠져나오면 attach 루프도 동일 notify 로 이미 깨어난 상태.
@@ -215,6 +239,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = connections_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = agent_handle {
         let _ = h.await;
     }
 
@@ -352,6 +379,33 @@ fn load_events_config(
 /// `[aicd.exporter]`(이미 파싱된 섹션)와 공유 spool로부터 OTLP connections exporter 설정을 만든다
 /// (exporter 전체 enabled + `connections_enabled` 둘 다 true + endpoint 유효 + spool 준비 완료일
 /// 때만 Some).
+/// `[aicd.exporter]`와 공유 spool로부터 OTLP agent exporter 설정을 만든다(exporter 전체
+/// enabled + `agent_enabled` 둘 다 true + endpoint 유효 + spool 준비 완료일 때만 Some).
+/// `bus`는 호출부가 미리 clone해 넘긴 tap — ControlContext가 원본 소유권을 가져가기 때문이다.
+fn load_agent_config(
+    bus: AgentEventBus,
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+) -> Option<aic_server::otlp_exporter::AgentConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.agent_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — agent exporter 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::AgentConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        bus,
+        spool,
+    })
+}
+
 fn load_connections_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,

@@ -27,8 +27,9 @@ fn redact_str(s: &str) -> String {
 /// resource `service.name` — 중앙 collector가 aic 데몬이 보낸 텔레메트리임을 구분하는 키.
 const SERVICE_NAME: &str = "aicd";
 
-/// OTLP SeverityNumber(logs.proto) — 우리가 쓰는 두 값만 상수화한다.
+/// OTLP SeverityNumber(logs.proto) — 우리가 쓰는 세 값만 상수화한다.
 const SEVERITY_INFO: i32 = 9;
+const SEVERITY_WARN: i32 = 13;
 const SEVERITY_ERROR: i32 = 17;
 
 /// command 종료 이벤트 하나 — `aic.events` scope LogRecord로 인코딩할 입력.
@@ -57,6 +58,45 @@ pub struct ResourceAttrs<'a> {
     pub host_id: &'a str,
     pub os_type: &'a str,
     pub host_ip: Option<&'a str>,
+}
+
+/// 하나의 chat/agent 행위를 `ExportLogsServiceRequest`로 인코딩한다(scope=`aic.agent`).
+///
+/// 셸 명령(`aic.events`)과 **다른 scope**로 보낸다 — 수신 측이 "사람이 친 명령"과 "agent가 한
+/// 행위"를 테이블/쿼리 단계에서 구분할 수 있어야 하기 때문이다. 같은 scope에 섞으면 attrs를
+/// 일일이 뒤져야 구분된다.
+///
+/// `severity`는 문자열로 받아 OTLP SeverityNumber로 매핑한다. 미지의 값은 INFO로 떨어뜨린다 —
+/// 알 수 없는 심각도 때문에 이벤트 자체를 버리는 것보다, 낮게 보고 흘리는 편이 낫다.
+pub fn encode_agent_event(
+    ev: &aic_common::AgentEvent,
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+    time_unix_nano: u64,
+) -> Vec<u8> {
+    let (severity_number, severity_text) = match ev.severity.to_ascii_uppercase().as_str() {
+        "ERROR" => (SEVERITY_ERROR, "ERROR"),
+        "WARN" | "WARNING" => (SEVERITY_WARN, "WARN"),
+        _ => (SEVERITY_INFO, "INFO"),
+    };
+
+    let mut attributes = vec![attr_str("aic.agent.kind", &ev.kind)];
+    // 부가 속성은 `aic.agent.*` 아래로 모아, 수신 측이 prefix 하나로 agent 속성을 걸러낼 수 있게 한다.
+    for (k, v) in &ev.attrs {
+        attributes.push(attr_str(&format!("aic.agent.{k}"), v));
+    }
+
+    let log_record = LogRecord {
+        time_unix_nano,
+        observed_time_unix_nano: time_unix_nano,
+        severity_number,
+        severity_text: redact_str(severity_text),
+        body: Some(string_value(&ev.summary)),
+        attributes,
+        dropped_attributes_count: 0,
+        flags: 0,
+    };
+    build_request(resource, "aic.agent", service_version, vec![log_record])
 }
 
 /// 하나의 `CommandEvent`를 `ExportLogsServiceRequest` protobuf 바이트로 인코딩한다(scope=`aic.events`).

@@ -28,6 +28,7 @@
 //! events/connections가 쌓아 둔 항목도 포함해 항상 드레인 주체가 존재함을 보장할 수 있다. 세 task가
 //! 각자 드레인하면 같은 spool 디렉토리를 동시에 스캔/삭제하며 경합할 수 있어 단일 주체로 좁혔다.
 
+mod agent;
 mod backoff;
 mod connections;
 mod encode;
@@ -37,6 +38,7 @@ mod logs_proto;
 mod ntp;
 mod spool;
 
+pub use agent::{serve_agent, AgentConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
 pub use events::{serve_events, EventsConfig};
 pub use spool::{Spool, SignalKind};

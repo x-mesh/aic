@@ -48,6 +48,29 @@
     드레인 주체가 항상 존재함을 보장할 수 있어서다). events/connections는 자기 push 실패만 spool에
     적재하고 backoff도 독립적으로 관리한다.
 
+- **chat/agent 행위 exporter (opt-in, OTLP `aic.agent` scope)** — chat에서 일어난 **주목할 만한
+  행위**를 aicd로 넘겨 collector로 push한다. 하위 플래그 `[aicd.exporter] agent_enabled`(기본 true,
+  부모 `enabled`가 실제 게이트)로 끌 수 있다. 보내는 것은 세 종류뿐이다:
+  - `tool.run_command` — agent가 셸 명령을 **실행**했다(시스템을 바꿨을 수 있는 유일한 도구).
+    명령어·exit_code·duration·cwd만 싣고 **출력 본문은 보내지 않는다**. exit≠0이면 severity=ERROR.
+  - `risk.denied` — risk_guard가 명령을 **차단**했다(Dangerous/Unknown 등급, 또는 샌드박스 검증
+    실패). 실행되지 않았어도 위험한 시도가 있었다는 신호라 항상 WARN으로 보낸다.
+  - `finding.created` — 진단이 finding을 만들었다. Crit=ERROR / Warn=WARN으로 매핑한다.
+
+  chat 대화·LLM prompt/response·읽기 도구(read_file/grep/glob) 실행은 **보내지 않는다** — RCA에
+  쓸모없는 노이즈다. 전송 문자열은 프로세스 경계를 넘기 전에 redaction을 거친다.
+
+  구조는 shell hook이 command를 넘기는 것과 같다: chat은 단명 프로세스라 collector 연결·spool·
+  backoff를 직접 들 수 없으므로, 행위를 IPC(`IpcRequest::AgentEvent`)로 aicd에 넘기고 상주 데몬의
+  exporter가 무유실 전송을 책임진다. aicd 미실행이면 chat 쪽은 조용히 skip한다(정상 경로).
+- **host metrics 항목 확대 (13종 → 26종)** — 기존 cpu/mem/swap/fs/disk-io/net-io에 더해:
+  `system.cpu.load_average.5m`·`.15m`(1m과 함께 봐야 "치솟는 중"과 "계속 높음"이 구분된다),
+  `system.cpu.logical.count`(load를 코어 수로 정규화해야 호스트 간 비교가 된다),
+  `system.memory.available`(캐시는 회수 가능하므로 OOM 여유는 used가 아니라 이 값),
+  `system.swap.utilization`, `system.filesystem.usage`·`.utilization`,
+  `system.network.packets.receive`·`.transmit`(bytes만으로는 작은 패킷 폭주가 안 보인다),
+  `system.network.errors.receive`·`.transmit`(평소 0이라 0이 아닌 순간 자체가 신호),
+  `system.process.count`, `system.uptime`. 전부 기존과 같이 순간값 Gauge다.
 - **`aic daemon status`가 실행 중인 aicd의 버전을 표시** — IPC에 `GetVersion`을 추가해, 디스크의
   binary가 아니라 **지금 도는 프로세스**에 직접 빌드 identity(version/commit/build_info)를 묻는다.
   이 CLI와 다른 빌드가 돌고 있으면 경고와 함께 `aic daemon restart`를 안내한다. `GetVersion`을 모르는

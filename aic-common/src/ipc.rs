@@ -148,7 +148,42 @@ pub enum IpcRequest {
         finished_at: chrono::DateTime<chrono::Utc>,
         duration_ms: u64,
     },
+    /// chat/agent에서 일어난 **주목할 만한 행위**를 aicd로 보낸다 (OTLP `aic.agent` scope).
+    ///
+    /// chat은 단명하는 `aic-client` 프로세스라 collector 연결·spool·backoff를 직접 들 수 없다.
+    /// 그래서 `_hook-event`가 command를 aicd로 넘기는 것과 같은 구조로, 행위를 aicd에 넘기고
+    /// 상주 데몬의 exporter가 무유실 전송을 책임진다.
+    ///
+    /// 모든 행위를 보내지 않는다 — 시스템을 **바꾼** 행위(`tool.run_command`)와 **위험 신호**
+    /// (`risk.denied`, `finding.created`)만 보낸다. 읽기 도구(read_file/grep/glob)까지 실으면
+    /// 노이즈만 커지고 RCA에 쓸모가 없다.
+    AgentEvent(AgentEvent),
 }
+
+/// chat/agent의 한 행위. `kind`가 문자열이라 새 행위를 추가해도 IPC 스키마가 바뀌지 않는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    /// 행위 종류 — [`AGENT_KIND_TOOL_RUN_COMMAND`] 등. OTLP attr `aic.agent.kind`가 된다.
+    pub kind: String,
+    /// 사람이 읽을 요약. LogRecord body가 된다 (예: 실행한 명령, 차단 사유, finding 제목).
+    /// **호출부가 redaction을 마친 문자열을 넘긴다** — 인코딩 단계에서 한 번 더 redact되지만
+    /// (idempotent), 원본이 데몬 경계를 넘지 않게 하는 게 1차 방어선이다.
+    pub summary: String,
+    /// ERROR / WARN / INFO. 미지의 값은 인코딩 시 INFO로 떨어진다.
+    pub severity: String,
+    /// 부가 속성 — `aic.agent.*` prefix로 OTLP attr에 실린다 (예: exit_code, tool, rule).
+    #[serde(default)]
+    pub attrs: std::collections::BTreeMap<String, String>,
+    /// 행위 발생 시각.
+    pub ts: chrono::DateTime<chrono::Utc>,
+}
+
+/// agent가 셸 명령을 실행했다 — 시스템을 바꿨을 수 있는 유일한 도구라 항상 보낸다.
+pub const AGENT_KIND_TOOL_RUN_COMMAND: &str = "tool.run_command";
+/// risk_guard가 명령을 차단했다 — 위험한 시도가 있었다는 보안 신호.
+pub const AGENT_KIND_RISK_DENIED: &str = "risk.denied";
+/// 진단이 finding을 만들었다 — severity를 가진 사건의 시작점.
+pub const AGENT_KIND_FINDING_CREATED: &str = "finding.created";
 
 /// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

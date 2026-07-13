@@ -139,6 +139,12 @@ pub fn execute_with_corr(
                 corr,
                 &assessment,
             );
+            // 위험한 시도가 있었다는 신호 자체가 서버에서 봐야 할 사건이다 — 실행되지 않았어도.
+            crate::agent_event::risk_denied(
+                command,
+                &format!("{:?}", assessment.level),
+                assessment.rule,
+            );
             eprintln!(
                 "{} {}",
                 paint("▌", "31"),
@@ -313,6 +319,8 @@ fn run_and_format(
             "run_command_blocked_validation",
             json!({ "corr": corr, "command": redact_line(command), "cwd": cwd_display, "reason": reason }),
         );
+        // 샌드박스 위반도 차단이다 — risk_guard 등급 차단과 같은 신호로 취급한다.
+        crate::agent_event::risk_denied(command, "ValidationFailed", Some(&reason));
         eprintln!(
             "{} {}",
             paint("▌", "31"),
@@ -330,6 +338,14 @@ fn run_and_format(
     let outcome = spawn_with_timeout(command, cwd, timeout)?;
     let duration_ms = start.elapsed().as_millis();
     let truncated_any = outcome.stdout_truncated || outcome.stderr_truncated;
+    // agent가 시스템을 바꿨을 수 있는 유일한 지점 — 실행된 명령만 여기 도달한다(차단/거부는
+    // 위에서 이미 걸러졌다). 출력 본문은 보내지 않고 명령·exit·소요시간만 넘긴다.
+    crate::agent_event::tool_run_command(
+        command,
+        outcome.exit_code,
+        duration_ms as u64,
+        cwd_display,
+    );
     // 실행 완료 요약 — 상세 카드(AIC_DEBUG/AIC_VERBOSE)일 때만. 기본은 조용히.
     if detail_cards_enabled() {
         card_line(&format!(

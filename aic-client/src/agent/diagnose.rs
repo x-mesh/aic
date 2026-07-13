@@ -286,6 +286,9 @@ pub async fn run_headless_diagnose_opts(
     // 결정적 임계 스캔 — LLM 호출 0으로 확실한 위반(디스크 full·OOM kill·좀비·실패 unit)을 추출해
     // evidence 상단에 고정한다. dispatcher가 없어도(오프라인/--no-analyze) 동작하는 유일 신호.
     let auto_findings = scan_findings(&evidence);
+    // finding은 severity를 가진 사건의 시작점이라 서버로 넘긴다. `scan_findings` 자체는 순수
+    // 함수로 두고(테스트가 매 호출마다 IPC를 시도하지 않도록) 여기 호출부에서 발화한다.
+    emit_findings(&auto_findings);
     let block = render_findings_block(&auto_findings);
     if !block.is_empty() {
         evidence.insert_str(0, &format!("{block}\n"));
@@ -1113,6 +1116,20 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
         );
     }
     findings
+}
+
+/// 스캔된 finding을 aicd(OTLP `aic.agent`)로 넘긴다. aicd 미실행/exporter 비활성이면 조용히
+/// 버려진다. `Severity`(Normal/Warn/Crit)를 OTLP severity 표기로 매핑한다 — Crit은 이미 벌어진
+/// 사고(OOM kill 등)라 ERROR, 임계 위반은 WARN이다.
+fn emit_findings(findings: &[Finding]) {
+    for f in findings {
+        let severity = match f.severity {
+            Severity::Crit => "ERROR",
+            Severity::Warn => "WARN",
+            Severity::Normal => "INFO",
+        };
+        crate::agent_event::finding_created(&f.probe_id, severity, &f.message);
+    }
 }
 
 /// 결정적 발견 목록을 evidence 상단·사용자 표시용 `## ⚠ 자동 발견` 블록으로 렌더한다(순수).

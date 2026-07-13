@@ -1,3 +1,4 @@
+pub mod agent_event_bus;
 pub mod aicd_autostart;
 pub mod aicd_client;
 pub mod attach_client;

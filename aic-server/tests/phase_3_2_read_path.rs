@@ -203,6 +203,7 @@ impl AicdHarness {
             record_store: CommandRecordStore::new(),
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),
+            agent_bus: aic_server::agent_event_bus::AgentEventBus::new(),
         };
         let ctx_clone = ctx.clone();
         let handle = tokio::spawn(async move { server.serve(ctx_clone).await });
