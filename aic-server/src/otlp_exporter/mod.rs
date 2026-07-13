@@ -35,6 +35,7 @@ mod connections;
 mod encode;
 mod events;
 mod health;
+mod host_extra;
 mod host_metrics;
 mod logs_proto;
 mod ntp;
