@@ -594,6 +594,14 @@ pub struct AicdExporterConfig {
     /// 기본 20 — 밀린 배치가 더 있으면 다음 tick에 이어서 드레인한다.
     #[serde(default = "default_spool_drain_batch_limit")]
     pub spool_drain_batch_limit: usize,
+    /// 프로세스 생명주기 변경 이벤트(start/exit/rss 급증)를 scope=`aic.changes`로 보낼지.
+    /// 부모 게이트(`enabled`)가 꺼져 있으면 이 값과 무관하게 task 자체가 뜨지 않는다.
+    #[serde(default = "default_true")]
+    pub changes_enabled: bool,
+    /// 프로세스 스냅샷 tick 주기. 이 간격 안에 떴다 사라진 프로세스는 놓친다 —
+    /// connections(60초)보다 짧게 잡는 이유가 그것이다.
+    #[serde(default = "default_changes_interval")]
+    pub changes_interval_secs: u64,
 }
 
 impl Default for AicdExporterConfig {
@@ -609,6 +617,8 @@ impl Default for AicdExporterConfig {
             connections_interval_secs: default_connections_interval(),
             spool_max_bytes: default_spool_max_bytes(),
             spool_drain_batch_limit: default_spool_drain_batch_limit(),
+            changes_enabled: true,
+            changes_interval_secs: default_changes_interval(),
         }
     }
 }
@@ -619,6 +629,10 @@ fn default_exporter_interval() -> u64 {
 
 fn default_connections_interval() -> u64 {
     60
+}
+
+fn default_changes_interval() -> u64 {
+    30
 }
 
 fn default_spool_max_bytes() -> u64 {
@@ -931,6 +945,12 @@ method = "prompt_marker"
         // t8: spool 기본값도 섹션 부재 시 안전한 기본으로 채워져야 한다.
         assert_eq!(cfg.aicd.exporter.spool_max_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 20);
+        // changes: 프로세스 생명주기 전이. 부모 게이트가 실제 gate이므로 기본 활성.
+        assert!(cfg.aicd.exporter.changes_enabled, "changes도 기본 활성(부모 게이트가 실제 gate)");
+        assert_eq!(
+            cfg.aicd.exporter.changes_interval_secs, 30,
+            "connections(60s)보다 짧아야 짧게 살다 간 프로세스를 덜 놓친다"
+        );
     }
 
     #[test]

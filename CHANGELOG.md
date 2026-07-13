@@ -5,6 +5,21 @@
 ## [Unreleased]
 
 ### Added
+- **connections에 방향(`direction`)과 프로세스명(`process`) 추가** — `aic.connections` LogRecord에
+  `aic.connection.direction`(`listen`|`inbound`|`outbound`)과 `aic.connection.process` attr이 붙는다.
+  수집 명령이 Linux는 `ss -tuna` → **`ss -tunap`**, macOS는 `lsof -nP -iTCP -iUDP` →
+  **`lsof -nP +c 0 -iTCP -iUDP`**로 바뀌었다(각각 프로세스 정보 획득, COMMAND truncate 해제).
+  - **방향은 스냅샷 전체를 보고 파생한다** — peer 없는 소켓의 `(protocol, local_port)` 집합이 이
+    호스트의 서비스 포트고, peer가 있는 소켓의 local_port가 거기 속하면 우리가 accept한 `inbound`,
+    아니면 우리가 건 `outbound`다. `state` 문자열이 아니라 peer 유무로 판정하므로 LISTEN 상태가
+    없는 UDP도 올바르게 분류된다. 이전까지 수신측(rca)은 "LISTEN이 아니면 무조건 outbound"로 추론할
+    수밖에 없어 **`inbound`가 한 건도 생기지 않았다.**
+  - **알려진 제약(Linux)**: `ss -p`는 타 사용자 소유 소켓의 프로세스를 읽으려면 root/CAP_SYS_PTRACE가
+    필요한데 aicd는 user unit이라, sshd/nginx 같은 root 데몬 소켓은 **프로세스명이 빈 채로 나간다**
+    (수집 실패가 아니라 정상 경로 — 해당 attr을 생략한다). **방향 판정은 이 권한과 무관하게 항상
+    정확하다** — `ss`는 권한 없이도 전역 소켓 *목록*은 다 보여주기 때문이다. macOS는 lsof가
+    user-scoped라 반환된 행에는 프로세스명이 모두 채워진다.
+  - 두 attr 모두 값이 없으면 **생략**되므로, 구 버전 수신측/발신측과 섞여도 회귀가 없다.
 - **aicd OTLP host-metrics exporter (opt-in, SRE t6)** — config `[aicd.exporter]`(`enabled`/`endpoint`/
   `token`/`interval_secs`)를 켜면 aicd가 주기적으로 host metrics(cpu/load/mem/swap/disk·net i/o)를
   sysinfo로 수집해 OTLP protobuf로 인코딩한 뒤 `{endpoint}/v1/metrics`(Content-Type
