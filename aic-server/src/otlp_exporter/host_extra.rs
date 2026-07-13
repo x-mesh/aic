@@ -782,6 +782,9 @@ mod tests {
         );
     }
 
+    // compressor_points/KernelPageSize는 macOS 전용 심볼이라 Linux에서는 존재하지 않는다
+    // (cfg 없이 두면 Linux에서 E0433/E0425로 테스트 빌드가 깨진다 — 실제로 깨뜨렸다).
+    #[cfg(target_os = "macos")]
     #[test]
     fn compressor_points_omits_ratio_when_nothing_is_compressed() {
         // 압축 미사용(compressor_page_count == 0)은 **정상 상태**다 — 방금 부팅했거나 메모리가
@@ -797,6 +800,9 @@ mod tests {
         );
     }
 
+    // compressor_points/KernelPageSize는 macOS 전용 심볼이라 Linux에서는 존재하지 않는다
+    // (cfg 없이 두면 Linux에서 E0433/E0425로 테스트 빌드가 깨진다 — 실제로 깨뜨렸다).
+    #[cfg(target_os = "macos")]
     #[test]
     fn compressor_points_computes_bytes_and_ratio() {
         // 압축 활성: 2 페이지가 압축돼 있고, 압축 전 논리 크기로는 5 페이지였다 → ratio 2.5.
@@ -813,6 +819,9 @@ mod tests {
         );
     }
 
+    // compressor_points/KernelPageSize는 macOS 전용 심볼이라 Linux에서는 존재하지 않는다
+    // (cfg 없이 두면 Linux에서 E0433/E0425로 테스트 빌드가 깨진다 — 실제로 깨뜨렸다).
+    #[cfg(target_os = "macos")]
     #[test]
     fn compressor_points_ratio_is_at_least_one_by_definition() {
         // 압축 후 물리 페이지 수 <= 압축 전 논리 페이지 수이므로 ratio는 항상 1.0 이상이다.
@@ -824,6 +833,9 @@ mod tests {
         );
     }
 
+    // compressor_points/KernelPageSize는 macOS 전용 심볼이라 Linux에서는 존재하지 않는다
+    // (cfg 없이 두면 Linux에서 E0433/E0425로 테스트 빌드가 깨진다 — 실제로 깨뜨렸다).
+    #[cfg(target_os = "macos")]
     #[test]
     fn compressor_points_omits_rate_without_baseline() {
         // 첫 sample: 직전 값이 없어 delta를 못 내므로 rate를 생략한다(0으로 보내지 않는다 —
