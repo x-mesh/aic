@@ -64,7 +64,8 @@ impl AicdMetrics {
 
     /// CommandRecordStore push 1건을 카운트 (R14.1).
     pub fn inc_central_store_push(&self) {
-        self.central_store_push_total.fetch_add(1, Ordering::Relaxed);
+        self.central_store_push_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// 현재까지의 `central_store_push_total` 값.
@@ -80,11 +81,11 @@ impl AicdMetrics {
     /// Attach_UDS 연결 1건 종료 — gauge 감소. 0 underflow는 방지.
     pub fn dec_attach_connection(&self) {
         // fetch_update으로 saturating 감소. attach_connections는 gauge라 음수가 의미 없음.
-        let _ = self.attach_connections.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |v| Some(v.saturating_sub(1)),
-        );
+        let _ = self
+            .attach_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     /// 현재 활성 Attach_UDS 연결 수.
@@ -325,9 +326,11 @@ mod tests {
         m.inc_attach_reconnect();
         m.inc_attach_reconnect();
 
-        let mut snap = MetricsSnapshot::default();
-        snap.uptime_secs = 42;
-        snap.pid = 12345;
+        let mut snap = MetricsSnapshot {
+            uptime_secs: 42,
+            pid: 12345,
+            ..Default::default()
+        };
         m.fill_snapshot(&mut snap);
 
         assert_eq!(snap.dropped_bytes, 512);

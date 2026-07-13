@@ -21,13 +21,18 @@ use crate::agent::remote::path_guard::{check_path, PathCheck};
 
 /// 내장 허용 program — 모두 read-only 진단 명령. 추가는 user whitelist로.
 pub const BUILTIN_PROGRAMS: &[&str] = &[
-    "ps", "df", "free", "uptime", "cat", "journalctl", "ls", "find",
+    "ps",
+    "df",
+    "free",
+    "uptime",
+    "cat",
+    "journalctl",
+    "ls",
+    "find",
 ];
 
 /// shell 메타문자 — args에 포함되면 즉시 거부(원격 셸 재해석 차단, S1 보강).
-const SHELL_METACHARS: &[char] = &[
-    ';', '&', '|', '$', '<', '>', '`', '\\', '\n', '\r',
-];
+const SHELL_METACHARS: &[char] = &[';', '&', '|', '$', '<', '>', '`', '\\', '\n', '\r'];
 
 /// user whitelist 디스크 표현.
 #[derive(Debug, Default, Deserialize)]
@@ -67,10 +72,9 @@ impl Whitelist {
         }
         let mut user_path = None;
         if path.exists() {
-            let s = fs::read_to_string(path)
-                .with_context(|| format!("read {}", path.display()))?;
-            let doc: WhitelistToml = toml::from_str(&s)
-                .with_context(|| format!("parse {}", path.display()))?;
+            let s = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+            let doc: WhitelistToml =
+                toml::from_str(&s).with_context(|| format!("parse {}", path.display()))?;
             for up in doc.programs {
                 programs.insert(up.name, up.allowed_args);
             }
@@ -173,7 +177,7 @@ mod tests {
         let wl = Whitelist::load_from(&PathBuf::from("/nonexistent")).unwrap();
         for meta in &[";", "&", "|", "$", "<", ">", "`"] {
             let arg = format!("foo{meta}bar");
-            let r = wl.check("ls", &[arg.clone()]);
+            let r = wl.check("ls", std::slice::from_ref(&arg));
             assert!(
                 matches!(r, CheckResult::Blocked { .. }),
                 "metachar '{meta}' must block"

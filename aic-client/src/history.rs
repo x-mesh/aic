@@ -484,6 +484,9 @@ aic history (session=abcd1234, 1 record)
         }
     }
 
+    // env_guard()는 테스트 전체 구간(await 포함) 동안 AIC_SESSION_ID 접근을 직렬화하려는
+    // 의도로 만든 가드다 — await 동안 계속 들고 있는 게 목적이라 await_holding_lock을 allow.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_session_id_uses_explicit_when_provided() {
         let _g = env_guard();
@@ -495,6 +498,7 @@ aic history (session=abcd1234, 1 record)
         assert_eq!(id, "deadbeef");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_session_id_uses_env_when_explicit_missing() {
         let _g = env_guard();
@@ -506,6 +510,7 @@ aic history (session=abcd1234, 1 record)
         std::env::remove_var("AIC_SESSION_ID");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_session_id_falls_back_to_registry_most_recent() {
         let _g = env_guard();
@@ -522,6 +527,7 @@ aic history (session=abcd1234, 1 record)
         assert_eq!(id, "newsess2");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_session_id_errors_when_no_sessions_available() {
         let _g = env_guard();
@@ -532,6 +538,7 @@ aic history (session=abcd1234, 1 record)
         assert!(err.contains("활성 세션"), "actual: {err}");
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_session_id_propagates_list_sessions_error() {
         let _g = env_guard();
