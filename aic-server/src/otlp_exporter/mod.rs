@@ -44,6 +44,7 @@ mod host_extra;
 mod host_metrics;
 mod logs_proto;
 mod ntp;
+mod proc;
 mod spool;
 
 pub use agent::{serve_agent, AgentConfig};

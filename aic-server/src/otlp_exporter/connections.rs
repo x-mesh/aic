@@ -33,7 +33,10 @@ use super::{SignalKind, Spool};
 /// HTTP 요청 타임아웃 — 다른 exporter task와 동일 값.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `aic snapshot inventory --json` stdout 상한. 정상 환경에서 연결 수백 개도 이 한도를 훨씬
-/// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다(OOM/무한 출력 방어).
+/// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다.
+///
+/// 상한은 [`super::proc::run_capped`]가 **스트리밍으로 읽으면서** 강제한다(전부 버퍼링한 뒤 길이를
+/// 재면 방어가 아니라 사후 확인이다 — 무한 출력이 검사에 도달하기 전에 메모리를 먹는다).
 const MAX_INVENTORY_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 /// connections exporter 실행 설정.
@@ -153,27 +156,28 @@ pub async fn serve_connections(
 
 /// `aic_bin snapshot inventory --json`을 spawn해 stdout을 [`InventorySnapshot`]으로 파싱한다.
 /// timeout 초과, spawn 실패, non-zero exit, 출력 상한 초과, JSON 파싱 실패 모두 `Err`.
-async fn capture_inventory(aic_bin: &std::path::Path, timeout: Duration) -> anyhow::Result<InventorySnapshot> {
+///
+/// spawn/timeout/exit/상한 4중 방어는 [`super::proc::run_capped`]가 담당한다 — orphan 프로세스
+/// 방지(`kill_on_drop` + 명시적 kill)와 스트리밍 상한이 거기 있다. 예전에는 여기서 직접
+/// `wait_with_output()`을 timeout으로 감쌌는데, 그러면 (1) timeout 시 future만 drop되고 spawn된
+/// `aic`는 살아남아 주기마다 orphan이 쌓이고 (2) 상한 검사가 전체 버퍼링 **뒤에** 와서 실제
+/// 메모리 방어가 되지 못했다. 두 문제 모두 docker exporter와 동일해 공용 헬퍼로 묶었다.
+async fn capture_inventory(
+    aic_bin: &std::path::Path,
+    timeout: Duration,
+) -> anyhow::Result<InventorySnapshot> {
     let mut cmd = tokio::process::Command::new(aic_bin);
-    cmd.args(["snapshot", "inventory", "--json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+    cmd.args(["snapshot", "inventory", "--json"]);
 
-    let child = cmd.spawn()?;
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("aic snapshot inventory가 {}초 내에 끝나지 않음", timeout.as_secs()))??;
+    let stdout = super::proc::run_capped(
+        cmd,
+        timeout,
+        MAX_INVENTORY_OUTPUT_BYTES,
+        "aic snapshot inventory",
+    )
+    .await?;
 
-    if !output.status.success() {
-        anyhow::bail!("aic snapshot inventory가 {} 로 종료", output.status);
-    }
-    if output.stdout.len() > MAX_INVENTORY_OUTPUT_BYTES {
-        anyhow::bail!(
-            "aic snapshot inventory 출력이 상한({MAX_INVENTORY_OUTPUT_BYTES} bytes)을 초과함 — 신뢰할 수 없는 출력으로 간주"
-        );
-    }
-    let snapshot: InventorySnapshot = serde_json::from_slice(&output.stdout)?;
+    let snapshot: InventorySnapshot = serde_json::from_slice(&stdout)?;
     Ok(snapshot)
 }
 
@@ -223,6 +227,8 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    use super::super::proc::testutil::{is_text_file_busy, retry_busy};
+
     /// stdout에 고정 JSON을 출력하는 실행 가능한 shell 스크립트를 만든다(실제 `aic` 바이너리
     /// 없이 spawn+timeout+parse 파이프라인 전체를 결정적으로 검증하기 위한 test double).
     fn fake_aic_bin(dir: &tempfile::TempDir, script: &str) -> std::path::PathBuf {
@@ -240,7 +246,9 @@ mod tests {
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"LISTEN","local_addr":"0.0.0.0","local_port":22,"peer_addr":null,"peer_port":null}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap();
         assert_eq!(snapshot.host.name, "web-1");
         assert_eq!(snapshot.host.id, "host-abc123");
         assert_eq!(snapshot.host.ip.as_deref(), Some("10.0.0.5"));
@@ -254,7 +262,9 @@ mod tests {
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"ESTAB","local_addr":"192.168.1.5","local_port":22,"peer_addr":"192.168.1.10","peer_port":54321,"process":"sshd","direction":"inbound"}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap();
         let c = &snapshot.connections[0];
         assert_eq!(c.process.as_deref(), Some("sshd"));
         assert_eq!(c.direction.as_deref(), Some("inbound"));
@@ -268,7 +278,9 @@ mod tests {
         let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"LISTEN","local_addr":"0.0.0.0","local_port":22,"peer_addr":null,"peer_port":null}]}"#;
         let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
 
-        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let snapshot = retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap();
         let c = &snapshot.connections[0];
         assert_eq!(c.process, None);
         assert_eq!(c.direction, None);
@@ -278,7 +290,9 @@ mod tests {
     async fn capture_inventory_errors_on_nonzero_exit() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "exit 1");
-        let err = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap_err();
+        let err = retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("종료"), "err={err}");
     }
 
@@ -286,14 +300,16 @@ mod tests {
     async fn capture_inventory_errors_on_malformed_json() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "echo 'not json'");
-        assert!(capture_inventory(&bin, Duration::from_secs(5)).await.is_err());
+        assert!(retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn capture_inventory_times_out_on_hung_process() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_aic_bin(&dir, "sleep 30");
-        let err = capture_inventory(&bin, Duration::from_millis(100))
+        let err = retry_busy(|| capture_inventory(&bin, Duration::from_millis(100)))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("끝나지 않음"), "err={err}");
@@ -303,5 +319,37 @@ mod tests {
     async fn capture_inventory_errors_on_spawn_failure() {
         let missing = std::path::PathBuf::from("/definitely/does/not/exist/aic");
         assert!(capture_inventory(&missing, Duration::from_secs(5)).await.is_err());
+    }
+
+    /// **회귀 가드**: timeout 시 spawn된 `aic`가 실제로 죽어야 한다. 예전 구현은 `wait_with_output()`
+    /// 을 timeout으로 감싸기만 해서, 만료 시 future만 drop되고 자식은 살아남았다 — 60초마다 도는
+    /// exporter라 `aic`가 hang하면 orphan이 매 tick 누적됐다(재시도 전략은 `super::proc::testutil`).
+    #[tokio::test]
+    async fn capture_inventory_timeout_kills_the_child_process() {
+        use super::super::proc::testutil::{alive, hang_script, read_pid, GRACES};
+
+        for grace in GRACES {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let bin = fake_aic_bin(&dir, &hang_script(&pidfile));
+
+            let err = capture_inventory(&bin, grace).await.unwrap_err();
+            // 스크립트 exec race(ETXTBSY) — 자식이 아예 안 떴다. 다시 시도한다.
+            if is_text_file_busy(&err) {
+                continue;
+            }
+            assert!(err.to_string().contains("끝나지 않음"), "err={err}");
+
+            // pid가 없으면 자식이 기동 전이었다 — 단정하지 않고 더 긴 grace로 재시도(공허 통과 방지).
+            let Some(pid) = read_pid(&pidfile) else {
+                continue;
+            };
+            assert!(
+                !alive(pid),
+                "timeout 후에도 aic(pid={pid})가 살아 있다 — orphan 누수"
+            );
+            return;
+        }
+        panic!("자식이 한 번도 기동하지 못해 orphan 여부를 검증하지 못했다");
     }
 }

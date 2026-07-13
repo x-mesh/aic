@@ -10,7 +10,8 @@
 //! **패턴은 [`connections`](super::connections)를 따른다**: spawn 실패/timeout/non-zero exit/
 //! 출력 상한 초과 4중 방어 + 실패 시 push/spool/backoff와 무관하게 다음 주기까지 조용히 skip.
 //! host metrics tick(60초, in-process sysinfo)을 외부 프로세스 spawn이 막지 않도록 독립 tokio
-//! task로 뜬다(aicd_main.rs).
+//! task로 뜬다(aicd_main.rs). 4중 방어는 두 exporter가 공유하는 [`super::proc::run_capped`]에
+//! 모여 있다 — orphan 프로세스 방지와 스트리밍 출력 상한이 거기서 보장된다.
 //!
 //! **파싱만은 다르다**: `docker system df --format json`의 출력은 JSON 배열이 아니라
 //! **NDJSON**(줄당 객체 하나)이다. `connections.rs`처럼 `serde_json::from_slice(전체)`를 쓰면
@@ -43,7 +44,11 @@ use super::{SignalKind, Spool};
 /// HTTP 요청 타임아웃 — 다른 exporter task와 동일 값.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `docker system df --format json` stdout 상한. 정상 출력은 카테고리 4줄뿐이라 이 한도를 훨씬
-/// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다(OOM/무한 출력 방어).
+/// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다.
+///
+/// 상한은 [`super::proc::run_capped`]가 **스트리밍으로 읽으면서** 강제하므로 실제로 메모리를
+/// 묶는다(출력을 전부 버퍼링한 뒤 길이를 재는 건 방어가 아니라 사후 확인이다 — 그렇게 짜면 무한
+/// 출력이 검사에 도달하기 전에 이미 메모리를 먹는다).
 const MAX_DF_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// docker exporter 실행 설정.
@@ -159,41 +164,24 @@ pub async fn serve_docker(
 }
 
 /// `docker_bin system df --format json`을 spawn해 stdout을 NDJSON 라인 단위로 파싱한다.
+///
 /// spawn 실패(미설치)/timeout(hang)/non-zero exit(데몬 다운·권한 없음 모두 동일 경로)/출력 상한
-/// 초과는 `Err`(이번 주기 전체 skip). 개별 라인의 JSON 파싱 실패는 [`parse_ndjson_lines`]가 그
-/// 라인만 건너뛴다 — 전부 실패하면 여기서 `Err`로 승격해 이번 주기를 skip한다.
+/// 초과 4중 방어는 [`super::proc::run_capped`]가 담당한다 — orphan 프로세스 방지(`kill_on_drop` +
+/// 명시적 kill)와 **스트리밍 상한**(버퍼링 후 사후 확인이 아니라 읽는 도중 차단)이 거기 있다.
+///
+/// 개별 라인의 JSON 파싱 실패는 [`parse_ndjson_lines`]가 그 라인만 건너뛴다 — 전부 실패하면
+/// 여기서 `Err`로 승격해 이번 주기를 skip한다.
 async fn capture_docker_df(
     docker_bin: &std::path::Path,
     timeout: Duration,
 ) -> anyhow::Result<Vec<DfLine>> {
     let mut cmd = tokio::process::Command::new(docker_bin);
-    cmd.args(["system", "df", "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+    cmd.args(["system", "df", "--format", "json"]);
 
-    let child = cmd.spawn()?;
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "docker system df가 {}초 내에 끝나지 않음",
-                timeout.as_secs()
-            )
-        })??;
+    let stdout =
+        super::proc::run_capped(cmd, timeout, MAX_DF_OUTPUT_BYTES, "docker system df").await?;
 
-    if !output.status.success() {
-        // 데몬 다운("failed to connect to the docker API at ...")과 권한 없음 모두 non-zero exit로
-        // 나온다 — 둘을 구분할 필요가 없으므로(둘 다 "이번 주기 skip") 별도 분기하지 않는다.
-        anyhow::bail!("docker system df가 {} 로 종료", output.status);
-    }
-    if output.stdout.len() > MAX_DF_OUTPUT_BYTES {
-        anyhow::bail!(
-            "docker system df 출력이 상한({MAX_DF_OUTPUT_BYTES} bytes)을 초과함 — 신뢰할 수 없는 출력으로 간주"
-        );
-    }
-
-    let lines = parse_ndjson_lines(&output.stdout);
+    let lines = parse_ndjson_lines(&stdout);
     if lines.is_empty() {
         anyhow::bail!("docker system df 출력에서 파싱 가능한 라인이 하나도 없음");
     }
@@ -517,6 +505,8 @@ mod tests {
 
     // ── capture_docker_df: spawn/timeout/exit/파싱 4중 방어 ────────────────────
 
+    use super::super::proc::testutil::{is_text_file_busy, retry_busy};
+
     #[tokio::test]
     async fn capture_docker_df_parses_real_ndjson_output_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
@@ -548,7 +538,7 @@ mod tests {
     async fn capture_docker_df_times_out_on_hung_process() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_docker_bin(&dir, "sleep 30");
-        let err = capture_docker_df(&bin, Duration::from_millis(100))
+        let err = retry_busy(|| capture_docker_df(&bin, Duration::from_millis(100)))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("끝나지 않음"), "err={err}");
@@ -566,9 +556,66 @@ mod tests {
     async fn capture_docker_df_errors_when_every_line_fails_to_parse() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_docker_bin(&dir, "echo 'not json at all'");
-        assert!(capture_docker_df(&bin, Duration::from_secs(5))
-            .await
-            .is_err());
+        assert!(
+            retry_busy(|| capture_docker_df(&bin, Duration::from_secs(5)))
+                .await
+                .is_err()
+        );
+    }
+
+    /// **회귀 가드**: timeout 시 spawn된 `docker`가 실제로 죽어야 한다. `tokio::time::timeout`은
+    /// future만 drop할 뿐 자식 프로세스를 죽이지 않는다 — aicd는 상주 데몬이고 이 task는 60초마다
+    /// 도니, docker가 hang하는 환경이면 orphan이 매 tick 쌓인다. 플래그가 켜졌는지가 아니라
+    /// **프로세스가 사라졌는지**를 확인한다(재시도 전략은 `super::proc::testutil` 참고).
+    #[tokio::test]
+    async fn capture_docker_df_timeout_kills_the_child_process() {
+        use super::super::proc::testutil::{alive, hang_script, read_pid, GRACES};
+
+        for grace in GRACES {
+            let dir = tempfile::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let bin = fake_docker_bin(&dir, &hang_script(&pidfile));
+
+            let err = capture_docker_df(&bin, grace).await.unwrap_err();
+            // 스크립트 exec race(ETXTBSY) — 자식이 아예 안 떴다. 다시 시도한다.
+            if is_text_file_busy(&err) {
+                continue;
+            }
+            assert!(err.to_string().contains("끝나지 않음"), "err={err}");
+
+            // pid가 없으면 자식이 기동 전이었다 — 죽일 자식이 없었으니 단정하지 않는다(공허 통과 방지).
+            let Some(pid) = read_pid(&pidfile) else {
+                continue;
+            };
+            assert!(
+                !alive(pid),
+                "timeout 후에도 docker(pid={pid})가 살아 있다 — orphan 누수"
+            );
+            return;
+        }
+        panic!("자식이 한 번도 기동하지 못해 orphan 여부를 검증하지 못했다");
+    }
+
+    /// **회귀 가드**: 무한 출력은 전부 버퍼링되기 전에 스트리밍 도중 끊긴다. 사후 확인 방식
+    /// (`wait_with_output()` 후 길이 검사)이라면 이 테스트는 끝나지 않거나 OOM으로 죽는다.
+    #[tokio::test]
+    async fn capture_docker_df_cuts_off_unbounded_output_mid_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_docker_bin(
+            &dir,
+            "while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done",
+        );
+
+        // 바깥 timeout을 안쪽보다 넉넉히 줘야 "상한 때문에 끊겼다"와 "timeout이라 끊겼다"가 구분된다.
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            retry_busy(|| capture_docker_df(&bin, Duration::from_secs(15))),
+        )
+        .await
+        .expect("상한이 스트리밍으로 강제되지 않아 무한 출력에 매달렸다")
+        .unwrap_err();
+
+        assert!(err.to_string().contains("상한"), "err={err}");
     }
 
     // ── serve_docker: 캡처 실패가 task를 죽이지 않고, 다른 signal이 공유하는 health/spool도 오염하지 않는다 ──
