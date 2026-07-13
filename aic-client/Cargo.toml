@@ -69,6 +69,10 @@ ansi-to-tui = "7"
 # RFC-004 step 4b: ChatLoop의 async 키 입력(EventStream) — ratatui 0.29와 동일한 0.28.1에 event-stream
 # feature만 더한다(feature unification, 중복 crate 없음). tokio select!로 키 vs status tick vs 출력 통합.
 crossterm = { version = "0.28", features = ["event-stream"] }
+# RFC-006 t11: aic-client 최초의 tracing subscriber(지금까지는 facade만 있어 tracing:: 매크로가
+# no-op이었다). registry+Layer만 쓰고(fmt/json 출력 없음 — aicd처럼 파일에 쓰지 않는다),
+# 커스텀 Layer(log_sink::ClientLogLayer)가 이벤트를 버퍼에 모아 aicd로 IPC 전송한다.
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 proptest = "1"

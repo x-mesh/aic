@@ -13,22 +13,36 @@
 use prost::Message as _;
 
 use super::host_metrics::{HostSample, MetricValue};
+use super::logs::DropCounters;
 
 /// InstrumentationScope name — 이 metric을 낸 주체. resource `service.name`과 동일하게 aicd.
 const SCOPE_NAME: &str = "aicd";
 /// resource `service.name` — 중앙 collector가 aic 데몬이 보낸 텔레메트리임을 구분하는 키.
 const SERVICE_NAME: &str = "aicd";
+/// 로그 드롭 카운터 게이지 이름(SRE t6 §6 — "버린 사실을 aic.log.dropped 카운터 이벤트로
+/// 주기 push"). 서비스별 태그는 붙이지 않는다(카디널리티 방어 — 태스크 계약) — `reason`
+/// 태그만으로 severity/rate_limit/channel_full/spool_quota를 구분한다.
+const LOG_DROPPED_METRIC_NAME: &str = "aic.log.dropped";
 
 /// 송신 직전 secret/PII 마스킹. 모든 문자열 필드가 이 함수를 거친다(invariant).
 fn redact_str(s: &str) -> String {
     aic_common::redaction::redact(s).0
 }
 
-/// `HostSample`을 OTLP `ExportMetricsServiceRequest` protobuf 바이트로 인코딩한다.
+/// `HostSample`(+ 로그 드롭 카운터)을 OTLP `ExportMetricsServiceRequest` protobuf 바이트로
+/// 인코딩한다.
 ///
 /// `now_unix_nano`는 각 data point의 `time_unix_nano`로 쓰인다(호출부에서 sample 시각을 넘겨
 /// 테스트가 결정적이게 한다). 모든 문자열은 `redact_str`를 통과한 뒤 인코딩된다.
-pub fn encode_metrics(sample: &HostSample, service_version: &str, now_unix_nano: u64) -> Vec<u8> {
+///
+/// `drop_counters`는 순수 시스템 지표(`HostSample`)와 관심사가 달라 별도 인자로 받는다(SRE
+/// t6) — `HostSampler`에 로그 드롭 개념을 섞지 않기 위한 최소 변경.
+pub fn encode_metrics(
+    sample: &HostSample,
+    service_version: &str,
+    now_unix_nano: u64,
+    drop_counters: &DropCounters,
+) -> Vec<u8> {
     let resource_attrs = vec![
         attr("host.name", &sample.resource.host_name),
         attr("host.id", &sample.resource.host_id),
@@ -58,7 +72,7 @@ pub fn encode_metrics(sample: &HostSample, service_version: &str, now_unix_nano:
         .collect::<Vec<_>>();
 
     // metric 하나당 gauge data point 하나. name/unit은 상수지만 redact를 거쳐 경로를 단일화한다.
-    let metrics = sample
+    let mut metrics: Vec<Metric> = sample
         .points
         .iter()
         .zip(data_points)
@@ -71,6 +85,28 @@ pub fn encode_metrics(sample: &HostSample, service_version: &str, now_unix_nano:
             })),
         })
         .collect();
+
+    // 로그 드롭 카운터 — 사유(reason)별 data point 하나씩, 서비스 태그는 붙이지 않는다
+    // (카디널리티 방어). 폭주 중에도 새 LogLine을 만들지 않는 불변식과 짝을 이루는 관측 경로.
+    let drop_data_points = drop_counters
+        .snapshot()
+        .into_iter()
+        .map(|(reason, count)| NumberDataPoint {
+            attributes: vec![attr("reason", reason)],
+            start_time_unix_nano: 0,
+            time_unix_nano: now_unix_nano,
+            value: Some(NumberValue::AsInt(count as i64)),
+            flags: 0,
+        })
+        .collect::<Vec<_>>();
+    metrics.push(Metric {
+        name: redact_str(LOG_DROPPED_METRIC_NAME),
+        description: String::new(),
+        unit: redact_str("1"),
+        data: Some(MetricData::Gauge(Gauge {
+            data_points: drop_data_points,
+        })),
+    });
 
     let request = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
@@ -246,6 +282,7 @@ pub enum AnyValueOneof {
 mod tests {
     use super::*;
     use crate::otlp_exporter::host_metrics::{MetricPoint, ResourceAttrs};
+    use std::sync::atomic::Ordering;
 
     fn sample_with_resource(host_name: &str, host_id: &str, os_type: &str) -> HostSample {
         HostSample {
@@ -284,12 +321,13 @@ mod tests {
             "admin@corp.internal",
             "Bearer abcDEF123ghiJKL456mnoPQR789",
         ];
-        let sample = sample_with_resource(
-            &format!("host-{}", secrets[0]),
-            secrets[1],
-            secrets[2],
+        let sample = sample_with_resource(&format!("host-{}", secrets[0]), secrets[1], secrets[2]);
+        let bytes = encode_metrics(
+            &sample,
+            "0.24.0",
+            1_700_000_000_000_000_000,
+            &DropCounters::default(),
         );
-        let bytes = encode_metrics(&sample, "0.24.0", 1_700_000_000_000_000_000);
 
         // 원문 secret은 wire에 절대 남지 않는다.
         for s in secrets {
@@ -306,16 +344,16 @@ mod tests {
     #[test]
     fn redaction_holds_for_each_secret_kind_in_hostname() {
         let cases: &[&str] = &[
-            "AKIAIOSFODNN7EXAMPLE",                          // aws_key
-            "ghp_AbC123XyZ789DeF456GhI012JkL345MnO678",      // github_token
-            "user@example.com",                              // email
-            "010-1234-5678",                                 // kr_phone
-            "192.168.10.20",                                 // ipv4
-            "postgres://app:s3cr3tPass@db:5432/orders",      // conn_string
+            "AKIAIOSFODNN7EXAMPLE",                     // aws_key
+            "ghp_AbC123XyZ789DeF456GhI012JkL345MnO678", // github_token
+            "user@example.com",                         // email
+            "010-1234-5678",                            // kr_phone
+            "192.168.10.20",                            // ipv4
+            "postgres://app:s3cr3tPass@db:5432/orders", // conn_string
         ];
         for secret in cases {
             let sample = sample_with_resource(secret, "id", "linux");
-            let bytes = encode_metrics(&sample, "0.24.0", 1);
+            let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
             assert!(
                 !contains(&bytes, secret.as_bytes()),
                 "'{secret}' 종류가 redact되지 않고 유출됨"
@@ -327,14 +365,18 @@ mod tests {
     #[test]
     fn encodes_valid_otlp_request_roundtrip() {
         let sample = sample_with_resource("web-1", "id-abc", "linux");
-        let bytes = encode_metrics(&sample, "9.9.9", 42);
+        let bytes = encode_metrics(&sample, "9.9.9", 42, &DropCounters::default());
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
 
         assert_eq!(req.resource_metrics.len(), 1);
         let rm = &req.resource_metrics[0];
         let resource = rm.resource.as_ref().unwrap();
         // resource attribute 5종이 모두 존재(host.name/host.id/os.type/service.name/service.version).
-        let keys: Vec<&str> = resource.attributes.iter().map(|kv| kv.key.as_str()).collect();
+        let keys: Vec<&str> = resource
+            .attributes
+            .iter()
+            .map(|kv| kv.key.as_str())
+            .collect();
         for expected in [
             "host.name",
             "host.id",
@@ -347,7 +389,8 @@ mod tests {
 
         let sm = &rm.scope_metrics[0];
         assert_eq!(sm.scope.as_ref().unwrap().name, "aicd");
-        assert_eq!(sm.metrics.len(), 2);
+        // sample의 host metric 2개 + SRE t6 `aic.log.dropped` 게이지 1개 = 3.
+        assert_eq!(sm.metrics.len(), 3);
         assert_eq!(sm.metrics[0].name, "system.cpu.utilization");
 
         // 첫 metric의 gauge double 값 0.42가 왕복 후에도 보존된다.
@@ -370,14 +413,21 @@ mod tests {
     #[test]
     fn resource_attr_value_is_redacted_and_readable() {
         let sample = sample_with_resource("clean-host", "AKIAIOSFODNN7EXAMPLE", "linux");
-        let bytes = encode_metrics(&sample, "0.24.0", 1);
+        let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
-        let attrs = &req.resource_metrics[0].resource.as_ref().unwrap().attributes;
+        let attrs = &req.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
         let host_id = attrs.iter().find(|kv| kv.key == "host.id").unwrap();
         let Some(AnyValueOneof::StringValue(v)) = &host_id.value.as_ref().unwrap().value else {
             panic!("host.id는 string value여야 함");
         };
-        assert!(v.contains("[REDACTED:aws_key]"), "host.id가 redact되지 않음: {v}");
+        assert!(
+            v.contains("[REDACTED:aws_key]"),
+            "host.id가 redact되지 않음: {v}"
+        );
     }
 
     /// rca의 `hosts` 인벤토리(호스트 상세 화면의 OS/아키텍처)가 이 두 attr에서 나온다.
@@ -389,9 +439,13 @@ mod tests {
     #[test]
     fn resource_carries_arch_and_os_description_for_the_host_inventory() {
         let sample = sample_with_resource("web-1", "id-1", "macos");
-        let bytes = encode_metrics(&sample, "0.24.0", 1);
+        let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
-        let attrs = &req.resource_metrics[0].resource.as_ref().unwrap().attributes;
+        let attrs = &req.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
 
         let get = |k: &str| {
             attrs
@@ -405,6 +459,73 @@ mod tests {
             matches!(get("os.description"), Some(AnyValueOneof::StringValue(v)) if v == "macOS 15.1")
         );
         assert!(get("host.cpu.count").is_none(), "코어 수는 메트릭의 자리다");
-        assert!(get("host.memory.total").is_none(), "총 메모리는 메트릭의 자리다");
+        assert!(
+            get("host.memory.total").is_none(),
+            "총 메모리는 메트릭의 자리다"
+        );
+    }
+
+    /// SRE t6 DoD 6: `encode_metrics` 출력을 prost로 디코딩해 `aic.log.dropped` 게이지와 사유별
+    /// data point(reason 태그)가 실제로 실려 있는지 확인한다. 서비스 태그는 붙지 않아야 한다
+    /// (카디널리티 방어).
+    #[test]
+    fn dropped_counter_appears_in_encode_metrics() {
+        let sample = sample_with_resource("web-1", "id-1", "linux");
+        let counters = DropCounters::default();
+        counters.by_severity.fetch_add(11, Ordering::Relaxed);
+        counters.by_rate_limit.fetch_add(22, Ordering::Relaxed);
+        counters.by_channel_full.fetch_add(33, Ordering::Relaxed);
+        counters.by_spool_quota.fetch_add(44, Ordering::Relaxed);
+
+        let bytes = encode_metrics(&sample, "0.24.0", 1, &counters);
+        let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
+        let sm = &req.resource_metrics[0].scope_metrics[0];
+
+        let dropped_metric = sm
+            .metrics
+            .iter()
+            .find(|m| m.name == LOG_DROPPED_METRIC_NAME)
+            .expect("aic.log.dropped 게이지가 metrics scope에 있어야 함");
+
+        let MetricData::Gauge(gauge) = dropped_metric.data.as_ref().unwrap();
+        assert_eq!(
+            gauge.data_points.len(),
+            4,
+            "사유 4종(severity/rate_limit/channel_full/spool_quota)"
+        );
+
+        let by_reason: std::collections::HashMap<String, i64> = gauge
+            .data_points
+            .iter()
+            .map(|dp| {
+                let reason = dp
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "reason")
+                    .and_then(|kv| kv.value.clone())
+                    .and_then(|v| v.value);
+                let Some(AnyValueOneof::StringValue(reason)) = reason else {
+                    panic!("data point에 reason 태그가 있어야 함");
+                };
+                let NumberValue::AsInt(v) = dp.value.as_ref().unwrap() else {
+                    panic!("드롭 카운터는 정수 게이지여야 함");
+                };
+                (reason, *v)
+            })
+            .collect();
+
+        assert_eq!(by_reason.get("severity"), Some(&11));
+        assert_eq!(by_reason.get("rate_limit"), Some(&22));
+        assert_eq!(by_reason.get("channel_full"), Some(&33));
+        assert_eq!(by_reason.get("spool_quota"), Some(&44));
+
+        // 서비스 태그는 붙지 않는다 — reason 하나뿐이어야 한다(카디널리티 방어).
+        for dp in &gauge.data_points {
+            assert_eq!(
+                dp.attributes.len(),
+                1,
+                "reason 태그만 있어야 함(서비스 태그 없음)"
+            );
+        }
     }
 }

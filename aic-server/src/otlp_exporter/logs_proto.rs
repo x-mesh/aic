@@ -34,10 +34,14 @@ fn redact_str(s: &str) -> String {
 /// resource `service.name` — 중앙 collector가 aic 데몬이 보낸 텔레메트리임을 구분하는 키.
 const SERVICE_NAME: &str = "aicd";
 
-/// OTLP SeverityNumber(logs.proto) — 우리가 쓰는 세 값만 상수화한다.
+/// OTLP SeverityNumber(logs.proto) — 우리가 쓰는 값만 상수화한다.
+const SEVERITY_DEBUG: i32 = 5;
 const SEVERITY_INFO: i32 = 9;
 const SEVERITY_WARN: i32 = 13;
 const SEVERITY_ERROR: i32 = 17;
+
+/// [`encode_log_line`]의 라인 길이 상한 — 초과분은 truncate하고 `aic.log.truncated=true`를 붙인다.
+const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
 
 /// command 종료 이벤트 하나 — `aic.events` scope LogRecord로 인코딩할 입력.
 pub struct CommandEvent<'a> {
@@ -255,7 +259,11 @@ pub fn encode_changes(
                 time_unix_nano,
                 observed_time_unix_nano: time_unix_nano,
                 severity_number: severity,
-                severity_text: redact_str(if severity == SEVERITY_WARN { "WARN" } else { "INFO" }),
+                severity_text: redact_str(if severity == SEVERITY_WARN {
+                    "WARN"
+                } else {
+                    "INFO"
+                }),
                 body: Some(string_value(&redact_str(c.summary))),
                 attributes,
                 dropped_attributes_count: 0,
@@ -264,6 +272,82 @@ pub fn encode_changes(
         })
         .collect();
     build_request(resource, "aic.changes", service_version, log_records)
+}
+
+/// `lines`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.logs`)로 배치 인코딩한다(SRE R2:
+/// journald/container/file/aic self 4종 로그 소스 공용 인코더).
+///
+/// `encode_agent_event`류(전달받은 `time_unix_nano` 파라미터를 쓰는 기존 4개 scope)와 달리, 여기는
+/// **`line.ts`를 그대로 wire의 `time_unix_nano`로 쓴다** — 로그는 발생 시각이 곧 의미이기 때문이다
+/// (수집 시각이 아니다). 라인이 [`MAX_LOG_LINE_BYTES`]를 넘으면 UTF-8 문자 경계에서 truncate하고
+/// `aic.log.truncated=true` attr을 붙인다 — 버리는 대신 잘라서라도 보낸다.
+pub fn encode_log_line(
+    lines: &[aic_common::LogLine],
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+) -> Vec<u8> {
+    let log_records = lines
+        .iter()
+        .map(|line| {
+            let (severity_number, severity_text) = match line.severity.to_ascii_uppercase().as_str()
+            {
+                "ERROR" => (SEVERITY_ERROR, "ERROR"),
+                "WARN" | "WARNING" => (SEVERITY_WARN, "WARN"),
+                "DEBUG" => (SEVERITY_DEBUG, "DEBUG"),
+                _ => (SEVERITY_INFO, "INFO"),
+            };
+
+            let (body_text, truncated) = truncate_to_bytes(&line.message, MAX_LOG_LINE_BYTES);
+
+            let mut attributes = vec![
+                attr_str("aic.log.source", &line.source),
+                attr_str("aic.log.service", &line.service),
+                attr_str("aic.log.record_id", &line.record_id),
+            ];
+            // 나머지 attrs는 `aic.log.*` prefix 아래로 모아, 수신 측이 prefix 하나로 로그
+            // 부가속성을 걸러낼 수 있게 한다(`encode_agent_event`의 `aic.agent.*` 관례와 동일).
+            for (k, v) in &line.attrs {
+                attributes.push(attr_str(&format!("aic.log.{k}"), v));
+            }
+            if truncated {
+                attributes.push(attr_str("aic.log.truncated", "true"));
+            }
+
+            let time_unix_nano = unix_nanos(line.ts);
+            LogRecord {
+                time_unix_nano,
+                observed_time_unix_nano: time_unix_nano,
+                severity_number,
+                severity_text: redact_str(severity_text),
+                body: Some(string_value(&body_text)),
+                attributes,
+                dropped_attributes_count: 0,
+                flags: 0,
+            }
+        })
+        .collect();
+    build_request(resource, "aic.logs", service_version, log_records)
+}
+
+/// `DateTime<Utc>` → unix epoch 나노초. epoch 이전/오버플로 등 비정상 값은 0으로 방어한다
+/// (`aic-server::otlp_exporter::unix_nanos_now`의 SystemTime 버전과 동일한 방어 관례).
+fn unix_nanos(ts: chrono::DateTime<chrono::Utc>) -> u64 {
+    ts.timestamp_nanos_opt()
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// `s`가 `max_bytes`를 넘으면 가장 가까운 UTF-8 문자 경계에서 truncate한다.
+/// 반환값: `(잘린 문자열, truncate 발생 여부)`.
+fn truncate_to_bytes(s: &str, max_bytes: usize) -> (String, bool) {
+    if s.len() <= max_bytes {
+        return (s.to_string(), false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (s[..end].to_string(), true)
 }
 
 /// 공통 조립 — resource(+host.ip 선택) + scope + log_records → protobuf bytes.
@@ -447,6 +531,7 @@ pub enum AnyValueOneof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
     fn resource<'a>(host_ip: Option<&'a str>) -> ResourceAttrs<'a> {
         ResourceAttrs {
@@ -475,7 +560,14 @@ mod tests {
         assert_eq!(lr.severity_number, SEVERITY_INFO);
         assert_eq!(lr.severity_text, "INFO");
         assert_eq!(lr.time_unix_nano, 42);
-        assert_eq!(req.resource_logs[0].scope_logs[0].scope.as_ref().unwrap().name, "aic.events");
+        assert_eq!(
+            req.resource_logs[0].scope_logs[0]
+                .scope
+                .as_ref()
+                .unwrap()
+                .name,
+            "aic.events"
+        );
 
         let failing = CommandEvent {
             id: "aaaa1111bbbb2222",
@@ -508,10 +600,19 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
                 .and_then(|v| v.value)
         };
-        assert!(matches!(get("aic.record.id"), Some(AnyValueOneof::StringValue(v)) if v == "1234567890abcdef"));
-        assert!(matches!(get("aic.command.text"), Some(AnyValueOneof::StringValue(v)) if v == "cargo test"));
-        assert!(matches!(get("aic.command.exit_code"), Some(AnyValueOneof::IntValue(2))));
-        assert!(matches!(get("aic.command.capture_quality"), Some(AnyValueOneof::StringValue(v)) if v == "TruncatedOutput"));
+        assert!(
+            matches!(get("aic.record.id"), Some(AnyValueOneof::StringValue(v)) if v == "1234567890abcdef")
+        );
+        assert!(
+            matches!(get("aic.command.text"), Some(AnyValueOneof::StringValue(v)) if v == "cargo test")
+        );
+        assert!(matches!(
+            get("aic.command.exit_code"),
+            Some(AnyValueOneof::IntValue(2))
+        ));
+        assert!(
+            matches!(get("aic.command.capture_quality"), Some(AnyValueOneof::StringValue(v)) if v == "TruncatedOutput")
+        );
     }
 
     /// invariant: command text에 섞인 secret은 wire에 원문으로 남지 않는다.
@@ -568,10 +669,14 @@ mod tests {
 
         // LISTEN 항목은 peer attrs가 없어야 한다.
         let listen_attrs = &scope_logs.log_records[0].attributes;
-        assert!(!listen_attrs.iter().any(|kv| kv.key == "network.peer.address"));
+        assert!(!listen_attrs
+            .iter()
+            .any(|kv| kv.key == "network.peer.address"));
         // ESTABLISHED 항목은 peer attrs가 있어야 한다.
         let estab_attrs = &scope_logs.log_records[1].attributes;
-        assert!(estab_attrs.iter().any(|kv| kv.key == "network.peer.address"));
+        assert!(estab_attrs
+            .iter()
+            .any(|kv| kv.key == "network.peer.address"));
         assert!(estab_attrs.iter().any(|kv| kv.key == "network.peer.port"));
     }
 
@@ -658,13 +763,27 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
                 .and_then(|v| v.value)
         };
-        assert!(matches!(get("aic.change.type"), Some(AnyValueOneof::StringValue(v)) if v == "process"));
-        assert!(matches!(get("aic.change.subject"), Some(AnyValueOneof::StringValue(v)) if v == "nginx:4231"));
-        assert!(matches!(get("aic.change.action"), Some(AnyValueOneof::StringValue(v)) if v == "exit"));
-        assert!(matches!(get("aic.change.confidence"), Some(AnyValueOneof::StringValue(v)) if v == "observed"));
-        assert!(matches!(get("aic.change.source"), Some(AnyValueOneof::StringValue(v)) if v == "collector:sysinfo"));
-        assert!(matches!(get("aic.change.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "abc123"));
-        assert!(matches!(get("aic.change.prev_state"), Some(AnyValueOneof::StringValue(v)) if v == "134217728"));
+        assert!(
+            matches!(get("aic.change.type"), Some(AnyValueOneof::StringValue(v)) if v == "process")
+        );
+        assert!(
+            matches!(get("aic.change.subject"), Some(AnyValueOneof::StringValue(v)) if v == "nginx:4231")
+        );
+        assert!(
+            matches!(get("aic.change.action"), Some(AnyValueOneof::StringValue(v)) if v == "exit")
+        );
+        assert!(
+            matches!(get("aic.change.confidence"), Some(AnyValueOneof::StringValue(v)) if v == "observed")
+        );
+        assert!(
+            matches!(get("aic.change.source"), Some(AnyValueOneof::StringValue(v)) if v == "collector:sysinfo")
+        );
+        assert!(
+            matches!(get("aic.change.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "abc123")
+        );
+        assert!(
+            matches!(get("aic.change.prev_state"), Some(AnyValueOneof::StringValue(v)) if v == "134217728")
+        );
         // new_state=None → attr 자체가 없어야 한다 (빈 문자열이 아니라).
         assert!(!attrs.iter().any(|kv| kv.key == "aic.change.new_state"));
     }
@@ -700,7 +819,8 @@ mod tests {
     #[test]
     fn changes_batch_handles_empty_entries() {
         let bytes = encode_changes(&[], &resource(None), "0.24.0", 1);
-        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf even when empty");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("valid protobuf even when empty");
         assert!(req.resource_logs[0].scope_logs[0].log_records.is_empty());
     }
 
@@ -709,7 +829,12 @@ mod tests {
     /// 때 프로세스명이 `[REDACTED:...]`가 되는 회귀를 잡는다.
     #[test]
     fn connections_process_names_survive_redaction() {
-        for name in ["postgres", "com.docker.backend", "Google Chrome Helper", "python3.11"] {
+        for name in [
+            "postgres",
+            "com.docker.backend",
+            "Google Chrome Helper",
+            "python3.11",
+        ] {
             let entries = vec![ConnectionEntry {
                 protocol: "tcp",
                 state: "ESTABLISHED",
@@ -731,7 +856,8 @@ mod tests {
     #[test]
     fn connections_batch_handles_empty_entries() {
         let bytes = encode_connections(&[], &resource(None), "0.24.0", 1);
-        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf even when empty");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("valid protobuf even when empty");
         assert!(req.resource_logs[0].scope_logs[0].log_records.is_empty());
     }
 
@@ -764,5 +890,136 @@ mod tests {
             !contains(&bytes, b"[REDACTED:ipv4]"),
             "network address 필드에 IPv4 redaction이 잘못 적용됨"
         );
+    }
+
+    // ── log_line (scope=aic.logs, SRE R2) ────────────────────────────
+
+    fn log_line(
+        severity: &str,
+        message: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> aic_common::LogLine {
+        let mut attrs = std::collections::BTreeMap::new();
+        attrs.insert("unit".to_string(), "sshd.service".to_string());
+        aic_common::LogLine {
+            source: "journald".to_string(),
+            service: "sshd".to_string(),
+            severity: severity.to_string(),
+            message: message.to_string(),
+            attrs,
+            ts,
+            record_id: "cursor-abc123".to_string(),
+        }
+    }
+
+    /// round-trip: scope=aic.logs, severity ERROR/WARN/INFO/DEBUG가 각각 17/13/9/5로 매핑되고,
+    /// time_unix_nano가 (unix_nanos_now가 아니라) `line.ts`의 나노초와 일치하며, source/service/
+    /// record_id attr이 실린다.
+    #[test]
+    fn encode_log_line_roundtrips_and_maps_severity_including_debug() {
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).unwrap();
+        let expected_nanos = ts.timestamp_nanos_opt().unwrap() as u64;
+        for (severity, expected) in [
+            ("ERROR", SEVERITY_ERROR),
+            ("WARN", SEVERITY_WARN),
+            ("INFO", SEVERITY_INFO),
+            ("DEBUG", SEVERITY_DEBUG),
+            ("unknown-severity", SEVERITY_INFO),
+        ] {
+            let lines = vec![log_line(severity, "sshd started", ts)];
+            let bytes = encode_log_line(&lines, &resource(None), "0.24.0");
+            let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+            let scope_logs = &req.resource_logs[0].scope_logs[0];
+            assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.logs");
+            let lr = &scope_logs.log_records[0];
+            assert_eq!(lr.severity_number, expected, "severity={severity}");
+            assert_eq!(lr.time_unix_nano, expected_nanos);
+            assert_eq!(lr.observed_time_unix_nano, expected_nanos);
+
+            let attrs = &lr.attributes;
+            let get = |k: &str| {
+                attrs
+                    .iter()
+                    .find(|kv| kv.key == k)
+                    .and_then(|kv| kv.value.clone())
+                    .and_then(|v| v.value)
+            };
+            assert!(
+                matches!(get("aic.log.source"), Some(AnyValueOneof::StringValue(v)) if v == "journald")
+            );
+            assert!(
+                matches!(get("aic.log.service"), Some(AnyValueOneof::StringValue(v)) if v == "sshd")
+            );
+            assert!(
+                matches!(get("aic.log.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "cursor-abc123")
+            );
+            assert!(
+                matches!(get("aic.log.unit"), Some(AnyValueOneof::StringValue(v)) if v == "sshd.service"),
+                "attrs의 나머지 키가 aic.log.* prefix로 실려야 함"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_log_line_handles_empty_message() {
+        let ts = Utc::now();
+        let lines = vec![log_line("INFO", "", ts)];
+        let bytes = encode_log_line(&lines, &resource(None), "0.24.0");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("valid protobuf even with empty body");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(
+            lr.body.as_ref().unwrap().value,
+            Some(AnyValueOneof::StringValue(String::new()))
+        );
+    }
+
+    /// 1MB 단일 라인은 64KiB로 truncate되고 `aic.log.truncated=true`가 붙어야 한다.
+    #[test]
+    fn encode_log_line_truncates_oversized_lines() {
+        let huge = "a".repeat(1024 * 1024);
+        let ts = Utc::now();
+        let lines = vec![log_line("INFO", &huge, ts)];
+        let bytes = encode_log_line(&lines, &resource(None), "0.24.0");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+        let body = match lr.body.as_ref().unwrap().value.as_ref().unwrap() {
+            AnyValueOneof::StringValue(s) => s.clone(),
+            _ => panic!("body가 string이 아님"),
+        };
+        assert_eq!(body.len(), MAX_LOG_LINE_BYTES, "64KiB로 잘려야 함");
+
+        let attrs = &lr.attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(
+            matches!(get("aic.log.truncated"), Some(AnyValueOneof::StringValue(v)) if v == "true")
+        );
+    }
+
+    /// journald의 non-UTF8 필드는 호출부에서 lossy 변환돼 들어온다 — 멀티바이트 문자가 truncate
+    /// 경계 근처에 걸려도 char boundary가 아닌 지점에서 slicing해 panic하면 안 된다.
+    #[test]
+    fn encode_log_line_truncation_does_not_panic_on_multibyte_boundary() {
+        // "가"는 UTF-8로 3바이트 — MAX_LOG_LINE_BYTES(65536, 3의 배수가 아님)에 딱 걸치게 반복해
+        // truncate 경계가 문자 중간에 떨어지는 경우를 강제로 만든다.
+        let message: String = "가".repeat(30000); // 90000 bytes > 64KiB
+        let ts = Utc::now();
+        let lines = vec![log_line("DEBUG", &message, ts)];
+        // panic 없이 인코딩 + 디코딩이 끝나야 하고, 잘린 body는 여전히 유효한 UTF-8이어야 한다.
+        let bytes = encode_log_line(&lines, &resource(None), "0.24.0");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+        let body = match lr.body.as_ref().unwrap().value.as_ref().unwrap() {
+            AnyValueOneof::StringValue(s) => s.clone(),
+            _ => panic!("body가 string이 아님"),
+        };
+        assert!(body.len() <= MAX_LOG_LINE_BYTES);
+        assert!(body.is_char_boundary(body.len()));
     }
 }

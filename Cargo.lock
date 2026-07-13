@@ -56,6 +56,7 @@ dependencies = [
  "tokio-test",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "tui-textarea",
  "unicode-width 0.2.0",
  "wiremock",

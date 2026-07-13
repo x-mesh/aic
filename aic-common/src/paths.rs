@@ -132,6 +132,18 @@ pub fn otlp_spool_dir() -> PathBuf {
     home.join(".aic").join("otlp-spool")
 }
 
+/// aicd 로그 수집기(journald/file/container) 체크포인트 디렉토리 (RFC-006). `~/.aic/log-checkpoints/`.
+///
+/// `otlp_spool_dir`과 동일한 이유로 XDG 관례 대신 고정 `~/.aic` 하위를 쓴다 — 이 디렉토리는
+/// 세션 runtime도 XDG state도 아닌 "재시작 후 이어 읽기 위한 로컬 커서 저장소"라는 별도
+/// 범주다. 디렉토리는 `CheckpointStore::open`이 0700 권한으로 생성한다.
+pub fn log_checkpoint_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"));
+    home.join(".aic").join("log-checkpoints")
+}
+
 /// shell hook start/end 사이의 임시 metadata 경로.
 pub fn local_hook_pending_path(session_id: &str, command_id: &str) -> PathBuf {
     let safe_session = sanitize_path_token(session_id);

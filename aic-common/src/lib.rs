@@ -33,7 +33,7 @@ pub use shell_hooks::generate_shell_hooks;
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 // ── CommandRecord ──────────────────────────────────────────────
@@ -537,6 +537,10 @@ pub struct AicdConfig {
     /// OTLP host-metrics exporter 설정 (SRE t6). 기본 비활성(opt-in).
     #[serde(default)]
     pub exporter: AicdExporterConfig,
+    /// `[aicd.logs]` 섹션 — journald/container/file/aic self 로그 수집 설정(SRE R2).
+    /// 섹션 부재 시 모든 하위 수집기가 off로 떨어진다(각 sub-config의 `enabled` 기본값이 false).
+    #[serde(default)]
+    pub logs: AicdLogsConfig,
 }
 
 /// aicd OTLP exporter 설정 (SRE t6: host metrics push / t7: events+connections push).
@@ -602,6 +606,12 @@ pub struct AicdExporterConfig {
     /// connections(60초)보다 짧게 잡는 이유가 그것이다.
     #[serde(default = "default_changes_interval")]
     pub changes_interval_secs: u64,
+    /// 4종 로그 소스(journald/container/file/aic self) push 활성화 여부(SRE R2). 기본 **false**
+    /// — 다른 하위 플래그(events/connections/agent/changes)는 부모 게이트가 켜지면 기본 true지만,
+    /// 로그는 볼륨 리스크(초당 수백~수천 라인)가 있어 명시적 opt-in으로 둔다. 실제 수집 대상은
+    /// `AicdConfig::logs`(`[aicd.logs]`)에서 소스별로 세분 설정한다.
+    #[serde(default)]
+    pub logs_enabled: bool,
 }
 
 impl Default for AicdExporterConfig {
@@ -619,6 +629,7 @@ impl Default for AicdExporterConfig {
             spool_drain_batch_limit: default_spool_drain_batch_limit(),
             changes_enabled: true,
             changes_interval_secs: default_changes_interval(),
+            logs_enabled: false,
         }
     }
 }
@@ -641,6 +652,180 @@ fn default_spool_max_bytes() -> u64 {
 
 fn default_spool_drain_batch_limit() -> usize {
     20
+}
+
+// ── LogLine / SpoolQuotas / AicdLogsConfig (SRE R2: log collection) ───────
+
+/// 4종 로그 소스(journald / container / file / aic self)의 정규 스키마. 소스별 수집기가 이
+/// 타입으로 정규화한 뒤 `aic-server::otlp_exporter::logs_proto::encode_log_line`으로 넘긴다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// `"journald"` | `"container"` | `"file"` | `"aic"`
+    pub source: String,
+    /// systemd unit / 컨테이너명 / 파일 라벨 / 컴포넌트명
+    pub service: String,
+    /// `"ERROR"` | `"WARN"` | `"INFO"` | `"DEBUG"`
+    pub severity: String,
+    /// 원문 한 줄. **호출부가 redact()를 마친 문자열을 넘긴다**(agent_event와 동일 관례 — 원본이
+    /// 데몬 경계를 넘지 않는 게 1차 방어선).
+    pub message: String,
+    pub attrs: BTreeMap<String, String>,
+    /// 로그가 **발생한** 시각. 수집 시각이 아니다.
+    pub ts: chrono::DateTime<chrono::Utc>,
+    /// 멱등키. 소스별 자연키 우선(journald=`__CURSOR`, file=`fingerprint:offset`).
+    pub record_id: String,
+}
+
+/// spool(`~/.aic/otlp-spool/`)의 SignalKind별 용량 쿼터. 기존 `spool_max_bytes`(단일 상한)에서
+/// 파생한다 — 로그가 볼륨상 metrics/events보다 훨씬 커질 수 있어, 하나가 spool을 통째로 먹고
+/// 다른 신호를 밀어내는 걸 막는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpoolQuotas {
+    pub metrics: u64,
+    pub logs: u64,
+    pub app_logs: u64,
+}
+
+impl SpoolQuotas {
+    /// `spool_max_bytes`에서 metrics 25% / logs 25% / app_logs 50%로 파생한다(하위호환 기본 분배).
+    /// `metrics`/`logs`/`app_logs` override가 `Some`이면 파생값 대신 그 값이 이긴다.
+    pub fn from_spool_max_bytes(
+        spool_max_bytes: u64,
+        metrics_override: Option<u64>,
+        logs_override: Option<u64>,
+        app_logs_override: Option<u64>,
+    ) -> Self {
+        Self {
+            metrics: metrics_override.unwrap_or(spool_max_bytes / 4),
+            logs: logs_override.unwrap_or(spool_max_bytes / 4),
+            app_logs: app_logs_override.unwrap_or(spool_max_bytes / 2),
+        }
+    }
+}
+
+/// aicd `[aicd.logs]` 섹션(SRE R2) — journald/container/file/aic self 로그 수집기 설정.
+///
+/// 섹션 자체가 config.toml에 없으면 전부 기본값으로 떨어지고, 각 소스 sub-config의 `enabled`
+/// 기본값이 false라 **모든 수집기가 off**다. 부모 게이트는 `AicdExporterConfig::logs_enabled`
+/// (기본 false) — 그게 꺼져 있으면 이 섹션 값과 무관하게 로그 push 자체가 뜨지 않는다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AicdLogsConfig {
+    /// 이 severity 미만은 버린다. `"ERROR"` | `"WARN"` | `"INFO"` | `"DEBUG"`. 기본 `"INFO"`.
+    #[serde(default = "default_log_min_severity")]
+    pub min_severity: String,
+    /// 초당 최대 라인 수(token-bucket, 전체 소스 합산). 초과분은 drop + 카운터. 기본 1000.
+    #[serde(default = "default_log_max_lines_per_sec")]
+    pub max_lines_per_sec: u32,
+    /// 배치 최대 라인 수 — 이 수만큼 모이면 즉시 flush. 기본 500.
+    #[serde(default = "default_log_batch_max_lines")]
+    pub batch_max_lines: usize,
+    /// 배치 최대 대기 시간(ms) — 라인 수가 안 차도 이 시간이 지나면 flush. 기본 2000.
+    #[serde(default = "default_log_batch_max_ms")]
+    pub batch_max_ms: u64,
+    /// 동시에 추적 가능한 최대 service(unit/container/file label) 수. 기본 200.
+    #[serde(default = "default_log_max_services")]
+    pub max_services: usize,
+    /// journald(`journalctl`) 수집기 설정.
+    #[serde(default)]
+    pub journald: AicdJournaldLogConfig,
+    /// 컨테이너(docker/podman) 로그 수집기 설정.
+    #[serde(default)]
+    pub container: AicdContainerLogConfig,
+    /// 파일 tail 대상 목록(`[[aicd.logs.files]]` 배열-of-테이블). 비어 있으면 파일 수집이 없다 —
+    /// 이 필드는 개별 `enabled` 플래그가 필요 없다(빈 배열 자체가 off를 뜻한다).
+    #[serde(default)]
+    pub files: Vec<AicdFileLogEntry>,
+    /// aic/aicd 자체 로그(tracing) 수집기 설정. `self`는 예약어라 필드명은 `self_`,
+    /// TOML/JSON 상 키는 `self`로 직렬화한다.
+    #[serde(default, rename = "self")]
+    pub self_: AicdSelfLogConfig,
+    /// 서비스명 → 개별 override(전역 설정을 서비스 단위로 덮어씀). key = `service` 필드와 매칭.
+    #[serde(default)]
+    pub services: HashMap<String, AicdLogServiceOverride>,
+}
+
+impl Default for AicdLogsConfig {
+    fn default() -> Self {
+        Self {
+            min_severity: default_log_min_severity(),
+            max_lines_per_sec: default_log_max_lines_per_sec(),
+            batch_max_lines: default_log_batch_max_lines(),
+            batch_max_ms: default_log_batch_max_ms(),
+            max_services: default_log_max_services(),
+            journald: AicdJournaldLogConfig::default(),
+            container: AicdContainerLogConfig::default(),
+            files: Vec::new(),
+            self_: AicdSelfLogConfig::default(),
+            services: HashMap::new(),
+        }
+    }
+}
+
+fn default_log_min_severity() -> String {
+    "INFO".to_string()
+}
+
+fn default_log_max_lines_per_sec() -> u32 {
+    1000
+}
+
+fn default_log_batch_max_lines() -> usize {
+    500
+}
+
+fn default_log_batch_max_ms() -> u64 {
+    2000
+}
+
+fn default_log_max_services() -> usize {
+    200
+}
+
+/// journald 수집기 하위 설정. 기본 비활성.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AicdJournaldLogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 추적할 systemd unit 이름 목록. 비어 있으면 전체(단, `max_services` 상한 적용).
+    #[serde(default)]
+    pub units: Vec<String>,
+}
+
+/// 컨테이너 로그 수집기 하위 설정. 기본 비활성.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AicdContainerLogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 추적할 컨테이너명/라벨 패턴. 비어 있으면 전체.
+    #[serde(default)]
+    pub containers: Vec<String>,
+}
+
+/// 파일 tail 대상 하나. `[[aicd.logs.files]]` 배열-of-테이블의 원소 하나에 대응한다.
+///
+/// `label`은 체크포인트 키(`file/<label>`)와 `LogLine::service`에 쓰이고,
+/// `[aicd.logs.services.<label>]` override와도 이 값으로 매칭된다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AicdFileLogEntry {
+    pub label: String,
+    /// tail할 로그 파일 경로.
+    pub path: String,
+}
+
+/// aic/aicd 자체 로그 수집기 하위 설정. 기본 비활성.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AicdSelfLogConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// 서비스명 단위 override. `None` 필드는 전역 `AicdLogsConfig` 값을 그대로 쓴다.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AicdLogServiceOverride {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub min_severity: Option<String>,
 }
 
 /// aicd webhook 리스너 설정 (Alertmanager/Grafana/PagerDuty/generic JSON 수신).
@@ -939,18 +1124,108 @@ method = "prompt_marker"
         assert!(cfg.aicd.exporter.endpoint.is_empty());
         assert!(cfg.aicd.exporter.token.is_none());
         // t7: events/connections 하위 플래그도 [aicd.exporter] 섹션 부재 시 안전한 기본값이어야 한다.
-        assert!(cfg.aicd.exporter.events_enabled, "events는 기본 활성(부모 게이트가 실제 gate)");
-        assert!(cfg.aicd.exporter.connections_enabled, "connections도 기본 활성(부모 게이트가 실제 gate)");
+        assert!(
+            cfg.aicd.exporter.events_enabled,
+            "events는 기본 활성(부모 게이트가 실제 gate)"
+        );
+        assert!(
+            cfg.aicd.exporter.connections_enabled,
+            "connections도 기본 활성(부모 게이트가 실제 gate)"
+        );
         assert_eq!(cfg.aicd.exporter.connections_interval_secs, 60);
         // t8: spool 기본값도 섹션 부재 시 안전한 기본으로 채워져야 한다.
         assert_eq!(cfg.aicd.exporter.spool_max_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 20);
         // changes: 프로세스 생명주기 전이. 부모 게이트가 실제 gate이므로 기본 활성.
-        assert!(cfg.aicd.exporter.changes_enabled, "changes도 기본 활성(부모 게이트가 실제 gate)");
+        assert!(
+            cfg.aicd.exporter.changes_enabled,
+            "changes도 기본 활성(부모 게이트가 실제 gate)"
+        );
         assert_eq!(
             cfg.aicd.exporter.changes_interval_secs, 30,
             "connections(60s)보다 짧아야 짧게 살다 간 프로세스를 덜 놓친다"
         );
+    }
+
+    #[test]
+    fn aicd_logs_section_absent_defaults_everything_off() {
+        // t12 DoD 1: [aicd.logs] 섹션이 없으면 모든 하위 수집기가 off로 떨어져야 한다(회귀 0).
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.aicd.exporter.logs_enabled, "logs는 기본 opt-in(false)");
+        assert!(!cfg.aicd.logs.journald.enabled);
+        assert!(!cfg.aicd.logs.container.enabled);
+        assert!(cfg.aicd.logs.files.is_empty());
+        assert!(!cfg.aicd.logs.self_.enabled);
+        assert_eq!(cfg.aicd.logs.min_severity, "INFO");
+        assert_eq!(cfg.aicd.logs.max_lines_per_sec, 1000);
+        assert_eq!(cfg.aicd.logs.batch_max_lines, 500);
+        assert_eq!(cfg.aicd.logs.batch_max_ms, 2000);
+        assert_eq!(cfg.aicd.logs.max_services, 200);
+    }
+
+    #[test]
+    fn aicd_logs_section_parses_full_example() {
+        // RFC-006 §config에 실린 예시 config.toml 형태를 그대로 파싱한다 — 특히
+        // `[[aicd.logs.files]]` 배열-of-테이블(label+path) 스키마가 핵심 검증 대상.
+        let toml_str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+
+[aicd.exporter]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+logs_enabled = true
+
+[aicd.logs]
+min_severity = "WARN"
+max_lines_per_sec = 1000
+batch_max_lines = 500
+batch_max_ms = 2000
+max_services = 50
+
+[aicd.logs.journald]
+enabled = false
+units = []
+
+[aicd.logs.container]
+enabled = false
+
+[[aicd.logs.files]]
+label = "nginx-error"
+path = "/var/log/nginx/error.log"
+
+[aicd.logs.self]
+enabled = true
+
+[aicd.logs.services.nginx-error]
+min_severity = "INFO"
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.aicd.exporter.logs_enabled);
+        assert_eq!(cfg.aicd.logs.min_severity, "WARN");
+        assert_eq!(cfg.aicd.logs.max_services, 50);
+        assert!(!cfg.aicd.logs.journald.enabled);
+        assert!(!cfg.aicd.logs.container.enabled);
+        assert!(cfg.aicd.logs.self_.enabled);
+        assert_eq!(cfg.aicd.logs.files.len(), 1);
+        assert_eq!(cfg.aicd.logs.files[0].label, "nginx-error");
+        assert_eq!(cfg.aicd.logs.files[0].path, "/var/log/nginx/error.log");
+        let ovr = cfg.aicd.logs.services.get("nginx-error").unwrap();
+        assert_eq!(ovr.min_severity.as_deref(), Some("INFO"));
     }
 
     #[test]

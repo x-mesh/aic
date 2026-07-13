@@ -212,6 +212,7 @@ mod tests {
             metrics: Arc::new(crate::metrics::AicdMetrics::new()),
             agent_bus: crate::agent_event_bus::AgentEventBus::new(),
             exporter_health: None,
+            logs_tx: None,
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 

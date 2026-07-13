@@ -70,6 +70,10 @@ fn debug_color() -> bool {
 }
 
 /// 단순 디버그 정보 라인 — `[debug +0.001s] <message>` (TTY+색상 시 흐린 회색).
+///
+/// `log_sink`(RFC-006 t11)의 `tracing::` 파이프라인과는 의도적으로 통합하지 않고 공존한다 —
+/// 이건 `AIC_DEBUG`로 켜는 사람이 그 자리에서 즉시 읽는 로컬 stderr 출력이고, `tracing::`은
+/// aicd를 거쳐 OTLP collector로 나가는 중앙 관측 채널이다. 근거는 `log_sink` 모듈 doc 참고.
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if is_debug_mode() {
@@ -1196,6 +1200,21 @@ enum ConfigOp {
 
 #[tokio::main]
 async fn main() {
+    // aic-client 최초의 tracing subscriber(RFC-006 t11) — 이전엔 tracing 이 facade뿐이라
+    // tracing:: 매크로가 no-op이었다. debug_log!(아래)와는 별개 경로로 공존한다(모듈 doc 참고).
+    aic_client::log_sink::init();
+
+    // RFC-006 t11 통합테스트 전용 훅. `log_sink`의 atexit 기반 종료 flush는 main.rs 안의
+    // 실제 `std::process::exit()` 경로(40여 곳)에서도 반드시 도는지를 검증해야 하는데,
+    // 기존 서브커맨드들은 필요한 tracing 이벤트를 세션/aicd 상태와 무관하게 결정적으로
+    // 만들어내지 않는다. 그래서 CLI 파싱 이전에, 이 env var가 설정된 경우에만 이벤트 하나를
+    // 남기고 즉시 종료한다 — 미설정 시(일반 실행)엔 이 블록이 전혀 실행되지 않아 프로덕션
+    // 경로에 영향이 없다.
+    if std::env::var_os("AIC_TEST_LOG_SINK_EMIT").is_some() {
+        tracing::warn!("aic-client log_sink 통합테스트 이벤트");
+        std::process::exit(0);
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
