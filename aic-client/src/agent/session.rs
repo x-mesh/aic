@@ -1560,17 +1560,19 @@ impl AgentSession {
     ///    (Direct는 자체 루프가 프롬프트 직전에 이미 채워 뒀다).
     /// 2) 캐시가 **쓸 수 있으면**(`metrics_cache_usable`) 그대로 반환한다 — status bar가 이미 워밍업한
     ///    값이라 cpu가 정확하고, 사용자가 화면에서 본 숫자와 기록에 남는 숫자가 일치한다.
-    /// 3) 아니면 즉석 `SysSampler`로 폴백한다. 이 스냅샷의 cpu는 **구조적으로 무효**다(cold-start —
-    ///    `SysSampler::new()` 직후 sample()은 elapsed≈0이라 sysinfo가 cpu 델타를 못 낸다). mem/disk/load는
-    ///    순간값이라 폴백에서도 정확하다.
+    /// 3) 아니면 즉석 `SysSampler`로 폴백한다. 갓 만든 sampler의 첫 `sample()`이므로 cpu는 **구조적으로
+    ///    무효**다(델타의 기준이 되는 이전 스냅샷이 없다 — `SysSampler::prev_cpu_refresh` 참고).
+    ///    mem/disk/load는 순간값이라 폴백에서도 정확하다.
     ///
-    /// 반환값 둘째 요소 = "cpu를 믿어도 되는가"이며 항상 반환 스냅샷의 `cpu_valid`와 같다(호출부 편의).
-    /// **false면 호출부(OTLP attr 조립)는 cpu_utilization을 생략해야 한다** — 0을 진짜 값인 척 보내면 안 된다.
+    /// **cpu를 믿어도 되는지는 반환 스냅샷의 `cpu_valid`가 말한다** — 별도 플래그를 따로 반환하지 않는다.
+    /// 두 값을 나눠 들고 다니면 어긋날 여지가 생기고(하드코딩된 `false`가 스냅샷과 불일치), 애초에 중복이다.
+    /// **`cpu_valid`가 false면 호출부(OTLP attr 조립)는 cpu_utilization을 생략해야 한다** — 0을 진짜 값인 척
+    /// 보내면 안 된다.
     ///
-    /// 캐시를 "무조건 유효"로 보지 않는 이유는 두 가지다(게이트 지적):
-    /// - **첫 샘플 오염**: direct 루프와 sampler task 모두 생성 직후 첫 `sample()`을 캐시에 넣는데, 그 샘플의
-    ///   cpu는 위 cold-start와 **정확히 같은 오염값**이다. 이제 sampler가 스냅샷에 `cpu_valid=false`를 실어
-    ///   보내므로 여기서 걸러진다(안 걸렀다면 이 함수가 막겠다던 상황을 그대로 통과시켰을 것이다).
+    /// 캐시를 "있으니 유효"로 보지 않는 이유는 두 가지다(게이트 지적):
+    /// - **첫 샘플 오염**: direct 루프와 sampler task 모두 생성 직후 첫 `sample()`을 캐시에 넣는데, 그 샘플은
+    ///   cpu 델타의 기준이 없어 오염값이다. sampler가 `cpu_valid=false`를 실어 보내므로 여기서 걸러진다
+    ///   (안 걸렀다면 이 함수가 막겠다던 상황을 그대로 통과시켰을 것이다).
     /// - **낡음**: status bar가 갱신되지 않은 채 시간이 흐르면(sampler task 정지, 프롬프트에서 장시간 대기)
     ///   그 값은 더 이상 "지금"이 아니다 — `METRICS_FRESH_WINDOW`를 넘기면 캐시를 버리고 즉석 샘플로
     ///   내려간다(cpu는 잃지만 mem/disk/load는 진짜 현재값이다 — "지금 이 순간"의 의미를 지키는 쪽).
@@ -1578,7 +1580,7 @@ impl AgentSession {
     /// t2 시점엔 아직 호출부가 없다(OTLP로 실제 전송해 `/record now`에 붙이는 건 t3) — 소스만 준비해
     /// 둔다. 테스트가 불변식을 검증하므로 `dead_code`는 여기서만 허용한다.
     #[allow(dead_code)]
-    pub(crate) fn record_metrics_summary(&mut self) -> (super::sys_sampler::SysMetrics, bool) {
+    pub(crate) fn record_metrics_summary(&mut self) -> super::sys_sampler::SysMetrics {
         if let Some(rx) = &self.metrics_rx {
             if let Some(m) = rx.borrow().clone() {
                 self.last_metrics = Some(m);
@@ -1586,13 +1588,10 @@ impl AgentSession {
         }
         let now = std::time::Instant::now();
         match &self.last_metrics {
-            Some(m) if metrics_cache_usable(m, now) => (m.clone(), true),
-            // 캐시 없음 · 첫 샘플(cpu 오염) · 낡음 → 즉석 샘플. sample()이 cpu_valid=false를 스스로 채운다.
-            _ => {
-                let m = super::sys_sampler::SysSampler::new().sample();
-                debug_assert!(!m.cpu_valid, "cold-start 폴백 샘플의 cpu는 무효여야 한다");
-                (m, false)
-            }
+            Some(m) if metrics_cache_usable(m, now) => m.clone(),
+            // 캐시 없음 · 첫 샘플(cpu 오염) · 낡음 → 즉석 샘플. 갓 만든 sampler의 첫 sample()이므로
+            // cpu_valid는 sample()이 스스로 false로 채운다(여기서 하드코딩하지 않는다).
+            _ => super::sys_sampler::SysSampler::new().sample(),
         }
     }
 
@@ -3014,9 +3013,9 @@ mod tests {
         // 유효하다고 보고한다 — 즉석 재샘플링을 하지 않는다.
         let (mut session, _dir) = test_session();
         session.last_metrics = Some(warm_metrics(42.0));
-        let (m, cpu_valid) = session.record_metrics_summary();
+        let m = session.record_metrics_summary();
         assert_eq!(m.cpu_pct, 42.0);
-        assert!(cpu_valid, "워밍업된 캐시 경로는 cpu가 유효해야 한다");
+        assert!(m.cpu_valid, "워밍업된 캐시 경로는 cpu가 유효해야 한다");
     }
 
     #[test]
@@ -3027,9 +3026,9 @@ mod tests {
         session.last_metrics = Some(warm_metrics(1.0));
         let (_tx, rx) = tokio::sync::watch::channel(Some(warm_metrics(77.0)));
         session.metrics_rx = Some(rx);
-        let (m, cpu_valid) = session.record_metrics_summary();
+        let m = session.record_metrics_summary();
         assert_eq!(m.cpu_pct, 77.0, "채널의 최신값이 우선해야 한다");
-        assert!(cpu_valid);
+        assert!(m.cpu_valid);
         assert_eq!(
             session.last_metrics.as_ref().map(|m| m.cpu_pct),
             Some(77.0),
@@ -3045,7 +3044,7 @@ mod tests {
         let (mut session, _dir) = test_session();
         assert!(session.last_metrics.is_none());
         assert!(session.metrics_rx.is_none());
-        let (_m, cpu_valid) = session.record_metrics_summary();
+        let cpu_valid = session.record_metrics_summary().cpu_valid;
         assert!(!cpu_valid, "폴백 경로는 cpu를 무효로 표시해야 한다");
     }
 
@@ -3061,7 +3060,7 @@ mod tests {
             sampled_at: Some(std::time::Instant::now()), // 신선하지만 오염됨
             ..Default::default()
         });
-        let (_m, cpu_valid) = session.record_metrics_summary();
+        let cpu_valid = session.record_metrics_summary().cpu_valid;
         assert!(
             !cpu_valid,
             "첫 샘플(cold-start)이 캐시에 있어도 cpu는 무효로 보고돼야 한다"
@@ -3079,7 +3078,7 @@ mod tests {
             ..Default::default()
         }));
         session.metrics_rx = Some(rx);
-        let (_m, cpu_valid) = session.record_metrics_summary();
+        let cpu_valid = session.record_metrics_summary().cpu_valid;
         assert!(
             !cpu_valid,
             "sampler task의 첫 publish(cold-start)도 무효로 보고돼야 한다"
