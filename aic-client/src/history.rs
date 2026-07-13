@@ -259,6 +259,11 @@ pub(crate) fn render_json(records: &[CommandRecord]) -> String {
 }
 
 #[cfg(test)]
+// `env_guard()`가 반환하는 `MutexGuard`를 `.await` 너머로 들고 있는 건 **의도한 동작**이다 —
+// AIC_SESSION_ID는 프로세스-글로벌 상태라, 그 락이 테스트 본문 전체(비동기 구간 포함)를 덮어야
+// 병렬 실행 시 서로 간섭하지 않는다. 락을 await 전에 놓으면 직렬화가 깨져 애초의 목적을 잃는다.
+// 테스트는 단일 스레드 런타임에서 짧게 돌고 데드락 위험이 없으므로 async Mutex로 바꾸지 않는다.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use aic_common::{
