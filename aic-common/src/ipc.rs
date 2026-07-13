@@ -1,6 +1,6 @@
 //! IPC 프로토콜 타입 및 Length-prefixed framing 유틸리티
 
-use crate::{CommandRecord, SessionInfo};
+use crate::{CommandRecord, LogLine, SessionInfo};
 use serde::{Deserialize, Serialize};
 
 // ── IPC Request / Response ─────────────────────────────────────
@@ -164,6 +164,15 @@ pub enum IpcRequest {
     /// 확인할 방법이 없다 — push가 계속 실패해도 aicd 로그에만 남는다. chat status bar가 이걸
     /// 주기적으로 물어 "지금 나가고 있다/밀리고 있다"를 눈에 보이게 한다.
     GetExporterStatus,
+    /// `aic-client`(chat 등)의 자체 tracing 로그를 aicd로 흘려보낸다 (RFC-006 t11).
+    ///
+    /// `aic-client`는 `AgentEvent`와 같은 이유로 단명 프로세스라 OTLP exporter를 직접 들 수
+    /// 없다 — 그래서 주기(2s) 또는 종료 시점(`libc::atexit`)에 버퍼를 모아 aicd로 넘기고,
+    /// 상주 데몬의 exporter가 무유실 전송을 책임진다. `aicd` control plane 전용이라
+    /// `aic-session`은 이 variant를 거부한다.
+    PushLogLines {
+        lines: Vec<LogLine>,
+    },
 }
 
 /// chat/agent의 한 행위. `kind`가 문자열이라 새 행위를 추가해도 IPC 스키마가 바뀌지 않는다.
@@ -406,6 +415,23 @@ mod tests {
         assert_eq!(req, deserialized);
     }
 
+    #[test]
+    fn ipc_request_push_log_lines_roundtrip() {
+        let line = LogLine {
+            source: "aic".to_string(),
+            service: "aic-client".to_string(),
+            severity: "INFO".to_string(),
+            message: "hello".to_string(),
+            attrs: std::collections::BTreeMap::new(),
+            ts: Utc::now(),
+            record_id: "log:deadbeef".to_string(),
+        };
+        let req = IpcRequest::PushLogLines { lines: vec![line] };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, deserialized);
+    }
+
     // ── IpcResponse 직렬화 ─────────────────────────────────────
 
     #[test]
@@ -604,6 +630,30 @@ mod tests {
             })
     }
 
+    /// `PushLogLines` proptest 전략. `record_id`/`message`는 임의 문자열이고
+    /// `attrs`는 빈 map으로 고정한다(BTreeMap 임의 생성은 roundtrip 검증에 필요하지 않음).
+    fn arb_log_line() -> impl Strategy<Value = LogLine> {
+        (
+            "[a-z]{1,16}",
+            "[a-z-]{1,16}",
+            "(ERROR|WARN|INFO|DEBUG)",
+            "[a-zA-Z0-9 ]{0,64}",
+            0i64..4_102_444_800_000i64,
+            "[a-z0-9:]{1,32}",
+        )
+            .prop_map(
+                |(source, service, severity, message, ts_millis, record_id)| LogLine {
+                    source,
+                    service,
+                    severity,
+                    message,
+                    attrs: std::collections::BTreeMap::new(),
+                    ts: chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default(),
+                    record_id,
+                },
+            )
+    }
+
     fn arb_ipc_request() -> impl Strategy<Value = IpcRequest> {
         prop_oneof![
             Just(IpcRequest::GetLastCommand),
@@ -636,10 +686,7 @@ mod tests {
                 IpcRequest::FindRecordByPrefixForSession { id, prefix }
             }),
             "[0-9a-f]{1,8}".prop_map(|id| IpcRequest::StopSession { id }),
-            (
-                "[0-9a-f]{1,8}",
-                proptest::option::of("[a-zA-Z0-9_-]{1,32}"),
-            )
+            ("[0-9a-f]{1,8}", proptest::option::of("[a-zA-Z0-9_-]{1,32}"),)
                 .prop_map(|(id, label)| IpcRequest::TagSession { id, label }),
             arb_command_record().prop_map(IpcRequest::RegisterRecord),
             ("[0-9a-f]{1,8}", arb_command_record()).prop_map(|(session_id, record)| {
@@ -682,6 +729,8 @@ mod tests {
                         duration_ms: dur,
                     }
                 }),
+            proptest::collection::vec(arb_log_line(), 0..8)
+                .prop_map(|lines| IpcRequest::PushLogLines { lines }),
         ]
     }
 

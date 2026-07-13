@@ -9,21 +9,28 @@
 //! 의도적으로 비범위:
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
-use aic_common::{
-    aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
-};
+use aic_common::{aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path};
+use aic_common::{AicdExporterConfig, AicdLogsConfig, AppConfig, LogLine};
 use aic_server::agent_event_bus::AgentEventBus;
 use aic_server::attach_server::AttachServer;
 use aic_server::command_record_store::CommandRecordStore;
 use aic_server::control_server::{spawn_reconcile_loop, ControlContext, ControlServer};
 use aic_server::lock::DaemonLock;
+use aic_server::otlp_exporter::logs::checkpoint::CheckpointStore;
+use aic_server::otlp_exporter::logs::container::{
+    ContainerCollectorConfig, ContainerParseCounters,
+};
+use aic_server::otlp_exporter::logs::file::FileTail;
+use aic_server::otlp_exporter::logs::journald::JournaldCollectorConfig;
+use aic_server::otlp_exporter::logs::{serve_logs, DropCounters, LogsExporterConfig};
 use aic_server::otlp_exporter::Spool as OtlpSpool;
 use aic_server::session_processor_pool::SessionProcessorPool;
 use aic_server::session_registry::SessionRegistry;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// aicd CLI.
 #[derive(Debug, Parser)]
@@ -43,7 +50,31 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let _telemetry = aic_server::telemetry::init()?;
+
+    // RFC-006 로그 수집기 — self-log layer는 tracing subscriber를 단 한 번(전역 `.init()`)만
+    // 등록할 수 있어, 뒤에서 `read_exporter_section`/`read_logs_config`(경고 로깅 포함, 의도적으로
+    // telemetry 초기화 이후에 호출한다)로 다시 읽기 전에 "로그 채널을 만들지/self 수집기를 붙일지"
+    // 를 미리 알아야 한다. 그래서 `precheck_logs_gate`가 조용히(경고 없이) 같은 config.toml을
+    // 한 번 더 파싱해 두 게이트만 뽑는다 — 실패하면 항상 off(로그는 기본 opt-in이므로 안전한
+    // 폴백). 여기서 만든 채널은 이후 ControlContext.logs_tx / serve_logs / 각 수집기가 그대로
+    // 재사용한다(같은 채널 하나를 여러 producer가 공유).
+    let logs_precheck = precheck_logs_gate();
+    let (logs_tx, logs_rx): (
+        Option<mpsc::Sender<LogLine>>,
+        Option<mpsc::Receiver<LogLine>>,
+    ) = if logs_precheck.parent_enabled {
+        let (tx, rx) = mpsc::channel(LOGS_CHANNEL_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let self_log_tx = if logs_precheck.self_enabled {
+        logs_tx.clone()
+    } else {
+        None
+    };
+
+    let _telemetry = aic_server::telemetry::init_with_logs(self_log_tx)?;
     tracing::info!(
         pid = std::process::id(),
         foreground = cli.foreground,
@@ -123,6 +154,13 @@ async fn main() -> anyhow::Result<()> {
     // 읽었다).
     let exporter_section = read_exporter_section();
     let exporter_spool = open_exporter_spool(exporter_section.as_ref());
+    // [aicd.logs] 섹션(SRE R2/RFC-006). 섹션이 없거나 config 자체를 못 읽어도 항상
+    // `AicdLogsConfig::default()`가 나온다(하위 수집기 전부 off) — Option을 쓰지 않는 이유는
+    // exporter_section과 달리 이 값 자체에 이미 "완전 비활성"을 표현하는 안전한 기본이 있어서다.
+    let logs_section = read_logs_config();
+    // logs exporter(`serve_logs`)와 metrics exporter(`serve`)가 `aic.log.dropped` 카운터를
+    // 공유해야 metrics 쪽 게이지가 실제 드롭을 반영한다(t6가 남긴 배선 부채 — 안 그러면 항상 0).
+    let log_drop_counters = Arc::new(DropCounters::new());
     // 네 exporter task가 공유하는 전송 건강 카운터. chat status bar가 `GetExporterStatus`로 읽어
     // "지금 서버로 나가고 있나"를 사람 눈에 보이게 한다. exporter가 비활성이면 None이고, IPC는
     // `enabled: false`를 돌려준다(꺼짐과 실패는 사용자에게 전혀 다른 상태다).
@@ -144,6 +182,10 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         agent_bus,
         exporter_health: exporter_health.clone(),
+        // t12: logs exporter가 배선되어 채널이 생겼으면(`logs_precheck.parent_enabled`) 그 Sender를
+        // 그대로 공유한다 — `aic-client`의 `PushLogLines`가 이 채널을 통해 serve_logs까지 흐른다.
+        // 로그가 off(기본)면 `None` 그대로라 기존 동작(수신은 하되 조용히 버림)과 동일하다.
+        logs_tx: logs_tx.clone(),
     };
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
@@ -174,7 +216,12 @@ async fn main() -> anyhow::Result<()> {
     // shutdown watch를 공유한다(webhook과 같은 패턴). off면 아래 config가 None이라 task 자체가
     // 뜨지 않아 코드 경로가 완전히 비활성이다(기존 동작 회귀 0). t8: spool의 유일한 드레인 주체
     // (enabled=true면 반드시 뜨는 유일한 task라서 — otlp_exporter 모듈 doc 참고).
-    let exporter_handle = match load_exporter_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
+    let exporter_handle = match load_exporter_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+        log_drop_counters.clone(),
+    ) {
         Some(cfg) => {
             let ex_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -189,7 +236,12 @@ async fn main() -> anyhow::Result<()> {
     // SRE t7: OTLP events exporter (opt-in, [aicd.exporter] enabled=true + events_enabled=true).
     // CommandRecordStore tap을 구독해 finished command record를 실시간으로 push한다. host
     // metrics(exporter_handle)와 독립적으로 켜고 끌 수 있어 별도 task로 뜬다.
-    let events_handle = match load_events_config(events_record_store, exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
+    let events_handle = match load_events_config(
+        events_record_store,
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
         Some(cfg) => {
             let ev_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -203,11 +255,17 @@ async fn main() -> anyhow::Result<()> {
 
     // SRE t7: OTLP connections exporter (opt-in, [aicd.exporter] enabled=true +
     // connections_enabled=true). 주기적으로 `aic snapshot inventory --json`을 spawn한다.
-    let connections_handle = match load_connections_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
+    let connections_handle = match load_connections_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
         Some(cfg) => {
             let conn_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
-                if let Err(e) = aic_server::otlp_exporter::serve_connections(cfg, conn_shutdown).await {
+                if let Err(e) =
+                    aic_server::otlp_exporter::serve_connections(cfg, conn_shutdown).await
+                {
                     tracing::warn!(error = %e, "OTLP connections exporter 종료(에러)");
                 }
             }))
@@ -217,7 +275,11 @@ async fn main() -> anyhow::Result<()> {
 
     // OTLP changes exporter (opt-in, [aicd.exporter] enabled=true + changes_enabled=true).
     // 프로세스 테이블을 주기적으로 스냅샷해 직전 tick과 diff → start/exit/rss_spike 전이만 push한다.
-    let changes_handle = match load_changes_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
+    let changes_handle = match load_changes_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
         Some(cfg) => {
             let ch_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -249,6 +311,135 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // ── RFC-006: aicd 로그 수집기(opt-in, [aicd.exporter] enabled=true + logs_enabled=true) ──
+    //
+    // 부모 게이트가 꺼져 있으면(기본) `logs_tx`/`logs_rx`가 이미 `None`이라 아래 매치들이 전부
+    // `None`으로 떨어지고, serve_logs도 journald/container/file 수집기도 뜨지 않는다 — 기존
+    // 5개 exporter task와 동일한 "조건부 spawn" 패턴이다. journald는 이 함수 호출 자체는
+    // 플랫폼 무관이지만 `run_journald_collector`가 non-Linux에서 즉시 no-op으로 반환한다
+    // (`journald.rs` 모듈 doc — "Linux 전용").
+    let logs_exporter_cfg = load_logs_exporter_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+        logs_section.clone(),
+        log_drop_counters.clone(),
+    );
+    let logs_handle = match (logs_exporter_cfg, logs_rx) {
+        (Some(cfg), Some(rx)) => {
+            let lg_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = serve_logs(cfg, rx, lg_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP logs exporter 종료(에러)");
+                }
+            }))
+        }
+        _ => None,
+    };
+
+    // 수집기(journald/container/file) 전용 체크포인트 저장소. logs_tx가 있을 때만(=로그가 켜져
+    // 있을 때만) 연다 — 디렉토리를 못 열면(권한 등) 수집기 셋 다 비활성화한다(체크포인트 없이
+    // 파일/journald tail을 시작하면 재시작마다 어디까지 읽었는지 알 수 없다).
+    let log_checkpoint_store = if logs_tx.is_some() {
+        match CheckpointStore::open(aic_common::paths::log_checkpoint_dir()) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "로그 체크포인트 디렉토리 열기 실패 — journald/container/file 수집기 비활성화"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let log_host = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
+
+    let journald_handle = match (logs_tx.clone(), log_checkpoint_store.clone()) {
+        (Some(tx), Some(cp)) if logs_section.journald.enabled => {
+            let jd_shutdown = shutdown.subscribe();
+            let jd_cfg = JournaldCollectorConfig {
+                host: log_host.clone(),
+                ..Default::default()
+            };
+            let jd_drop = log_drop_counters.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::logs::journald::run_journald_collector(
+                    jd_cfg,
+                    tx,
+                    jd_drop,
+                    cp,
+                    jd_shutdown,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "journald 수집기 종료(에러)");
+                }
+            }))
+        }
+        _ => None,
+    };
+
+    let container_handle = match (logs_tx.clone(), log_checkpoint_store.clone()) {
+        (Some(tx), Some(cp)) if logs_section.container.enabled => {
+            let ct_shutdown = shutdown.subscribe();
+            let ct_cfg = ContainerCollectorConfig {
+                host: log_host.clone(),
+                ..Default::default()
+            };
+            let ct_drop = log_drop_counters.clone();
+            let parse_counters = Arc::new(ContainerParseCounters::new());
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::logs::container::run_container_collector(
+                    ct_cfg,
+                    tx,
+                    cp,
+                    ct_drop,
+                    parse_counters,
+                    ct_shutdown,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "container 수집기 종료(에러)");
+                }
+            }))
+        }
+        _ => None,
+    };
+
+    let file_handle = match (logs_tx.clone(), log_checkpoint_store.clone()) {
+        (Some(tx), Some(cp)) if !logs_section.files.is_empty() => {
+            let tails: Vec<FileTail> = logs_section
+                .files
+                .iter()
+                .map(|entry| {
+                    FileTail::new(
+                        PathBuf::from(&entry.path),
+                        entry.label.clone(),
+                        log_host.clone(),
+                    )
+                })
+                .collect();
+            let fl_shutdown = shutdown.subscribe();
+            let fl_drop = log_drop_counters.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::logs::file::serve_files(
+                    tails,
+                    tx,
+                    cp,
+                    fl_drop,
+                    fl_shutdown,
+                )
+                .await
+                {
+                    tracing::warn!(error = %e, "파일 tail 수집기 종료(에러)");
+                }
+            }))
+        }
+        _ => None,
+    };
+
     server.serve(control_ctx).await;
 
     // Control 루프가 빠져나오면 attach 루프도 동일 notify 로 이미 깨어난 상태.
@@ -273,6 +464,19 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = changes_handle {
+        let _ = h.await;
+    }
+    // RFC-006 로그 수집기도 동일 shutdown watch를 구독하므로 graceful 종료된다.
+    if let Some(h) = logs_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = journald_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = container_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = file_handle {
         let _ = h.await;
     }
 
@@ -323,6 +527,103 @@ fn read_exporter_section() -> Option<aic_common::AicdExporterConfig> {
     Some(app.aicd.exporter)
 }
 
+/// logs 채널/self-log layer를 만들지 결정하기 위한 최소 게이트. `main()` 맨 앞
+/// (`telemetry::init_with_logs` 호출 전)에서만 쓰인다 — 그 시점엔 아직 tracing subscriber가
+/// 없어 `tracing::warn!`을 호출해도 아무 데도 기록되지 않으므로, 이 함수는 의도적으로 경고
+/// 로깅을 하지 않는다(뒤에서 `read_exporter_section`/`read_logs_config`가 같은 파일을 한 번 더
+/// 읽으며 경고를 남긴다 — 그때는 subscriber가 이미 준비되어 있다).
+struct LogsPrecheck {
+    /// 로그 채널(`logs_tx`/`logs_rx`)을 만들지. `[aicd.exporter]`의 `enabled && logs_enabled &&
+    /// endpoint 유효`.
+    parent_enabled: bool,
+    /// self-log layer(aicd 자신의 tracing 이벤트)까지 채널에 붙일지.
+    /// `parent_enabled && [aicd.logs.self].enabled`.
+    self_enabled: bool,
+}
+
+fn precheck_logs_gate() -> LogsPrecheck {
+    let off = LogsPrecheck {
+        parent_enabled: false,
+        self_enabled: false,
+    };
+    let path = aic_common::paths::config_file_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return off;
+    };
+    let Ok(app) = toml::from_str::<AppConfig>(&content) else {
+        return off;
+    };
+    logs_precheck_from_config(&app)
+}
+
+/// `precheck_logs_gate`의 순수 부분 — 이미 파싱된 `AppConfig`에서 두 게이트만 뽑는다. 파일
+/// I/O가 없어 단위 테스트가 결정적이다.
+fn logs_precheck_from_config(app: &AppConfig) -> LogsPrecheck {
+    let ex = &app.aicd.exporter;
+    let parent_enabled = ex.enabled && ex.logs_enabled && !ex.endpoint.trim().is_empty();
+    let self_enabled = parent_enabled && app.aicd.logs.self_.enabled;
+    LogsPrecheck {
+        parent_enabled,
+        self_enabled,
+    }
+}
+
+/// config.toml `[aicd.logs]` 섹션을 읽는다. 파일이 없거나 파싱에 실패해도 `AicdLogsConfig`의
+/// `#[serde(default)]` 필드들이 전부 "off"로 떨어지므로(각 수집기 하위 설정의 `enabled` 기본이
+/// false), `read_exporter_section`과 달리 `Option`이 아니라 값 자체를 반환한다 — 실패와 "섹션
+/// 없음"을 호출부가 구분할 필요가 없다(둘 다 "수집기 0개"로 수렴).
+fn read_logs_config() -> AicdLogsConfig {
+    let path = aic_common::paths::config_file_path();
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return AicdLogsConfig::default();
+    };
+    match toml::from_str::<AppConfig>(&content) {
+        Ok(app) => app.aicd.logs,
+        Err(e) => {
+            tracing::warn!(error = %e, "config 파싱 실패 — 로그 수집기 전부 비활성");
+            AicdLogsConfig::default()
+        }
+    }
+}
+
+/// logs 채널(`mpsc::channel::<LogLine>`) 용량. `max_lines_per_sec` 기본값(1000)의 몇 배를 버퍼로
+/// 두어, batch flush(`batch_max_ms` 기본 2000ms) 사이 순간 버스트를 흡수한다 — 채널이 가득 차면
+/// `DropCounters::by_channel_full`만 오르고 수집기는 막히지 않는다(모듈 doc 불변식).
+const LOGS_CHANNEL_CAPACITY: usize = 8192;
+
+/// `[aicd.exporter]`(enabled+logs_enabled+endpoint 유효)와 공유 spool/health, `[aicd.logs]`
+/// 설정으로부터 logs exporter 설정을 만든다. 다른 `load_*_config` 헬퍼와 동일한 게이트 패턴.
+fn load_logs_exporter_config(
+    ex: Option<AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    logs_cfg: AicdLogsConfig,
+    drop_counters: Arc<DropCounters>,
+) -> Option<LogsExporterConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.logs_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — logs exporter 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(LogsExporterConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        batch_max_lines: logs_cfg.batch_max_lines,
+        batch_max_ms: logs_cfg.batch_max_ms,
+        spool,
+        health,
+        logs_cfg,
+        drop_counters,
+    })
+}
+
 /// `[aicd.exporter]`가 활성(enabled+endpoint 유효)이면 오프라인 spool(t8, `~/.aic/otlp-spool/`)을
 /// 열어 세 exporter task가 공유할 `Arc`로 반환한다. 디렉토리를 못 열면(권한 등) spool 없이 exporter
 /// 전체를 비활성 처리한다 — spool 없는 "즉시 skip" 폴백 모드는 따로 두지 않는다(무유실 보장이
@@ -333,7 +634,11 @@ fn open_exporter_spool(ex: Option<&aic_common::AicdExporterConfig>) -> Option<Ar
     if !ex.enabled || ex.endpoint.trim().is_empty() {
         return None;
     }
-    match OtlpSpool::open(aic_common::paths::otlp_spool_dir(), ex.spool_max_bytes) {
+    // R3: SpoolQuotas는 spool_max_bytes(기존 단일 상한)에서 metrics 25% / logs 25% / app_logs
+    // 50%로 파생한다(하위호환 기본 분배) — 소스별 override는 아직 config 표면에 없다.
+    let quotas =
+        aic_common::SpoolQuotas::from_spool_max_bytes(ex.spool_max_bytes, None, None, None);
+    match OtlpSpool::open(aic_common::paths::otlp_spool_dir(), quotas) {
         Ok(spool) => Some(Arc::new(spool)),
         Err(e) => {
             tracing::warn!(error = %e, "OTLP spool 디렉토리 열기 실패 — exporter 전체 비활성");
@@ -350,6 +655,7 @@ fn load_exporter_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    drop_counters: Arc<DropCounters>,
 ) -> Option<aic_server::otlp_exporter::ExporterConfig> {
     let ex = ex?;
     if !ex.enabled {
@@ -370,6 +676,9 @@ fn load_exporter_config(
         spool,
         drain_batch_limit: ex.spool_drain_batch_limit,
         health,
+        // t12: 호출부(main)가 logs exporter(`serve_logs`)와 공유하는 동일 `Arc`를 넘긴다 — 두
+        // task의 카운터가 합쳐져야 `aic.log.dropped` 게이지가 실제 드롭을 반영한다.
+        drop_counters,
     })
 }
 
@@ -501,4 +810,191 @@ fn load_changes_config(
         spool,
         health,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml_str: &str) -> AppConfig {
+        toml::from_str(toml_str).expect("valid AppConfig toml")
+    }
+
+    const BASE: &str = r#"
+[llm]
+default_provider = "openai"
+
+[server]
+max_buffer_lines = 500
+[server.boundary_strategy]
+method = "prompt_marker"
+"#;
+
+    /// DoD 1: `[aicd.logs]` 섹션이 없는 config → 두 게이트 모두 off.
+    #[test]
+    fn logs_precheck_off_when_section_absent() {
+        let app = parse(BASE);
+        let gate = logs_precheck_from_config(&app);
+        assert!(!gate.parent_enabled);
+        assert!(!gate.self_enabled);
+    }
+
+    /// `[aicd.exporter]`가 있어도 `logs_enabled`가 false(기본)면 여전히 off.
+    #[test]
+    fn logs_precheck_off_when_logs_enabled_false() {
+        let toml_str = format!(
+            "{BASE}\n[aicd.exporter]\nenabled = true\nendpoint = \"http://127.0.0.1:4318\"\n"
+        );
+        let app = parse(&toml_str);
+        let gate = logs_precheck_from_config(&app);
+        assert!(!gate.parent_enabled, "logs_enabled 기본값(false)이므로 off");
+        assert!(!gate.self_enabled);
+    }
+
+    /// DoD 2 시나리오: `logs_enabled = true` + `[aicd.logs.self] enabled = true` → 둘 다 on.
+    #[test]
+    fn logs_precheck_on_when_logs_and_self_enabled() {
+        let toml_str = format!(
+            "{BASE}\n\
+             [aicd.exporter]\n\
+             enabled = true\n\
+             endpoint = \"http://127.0.0.1:4318\"\n\
+             logs_enabled = true\n\
+             \n\
+             [aicd.logs.self]\n\
+             enabled = true\n"
+        );
+        let app = parse(&toml_str);
+        let gate = logs_precheck_from_config(&app);
+        assert!(gate.parent_enabled);
+        assert!(gate.self_enabled);
+    }
+
+    /// 부모는 켜졌지만 self는 안 켜졌으면 채널은 만들되 self-log layer는 안 붙는다.
+    #[test]
+    fn logs_precheck_parent_on_self_off_when_self_not_enabled() {
+        let toml_str = format!(
+            "{BASE}\n[aicd.exporter]\nenabled = true\nendpoint = \"http://127.0.0.1:4318\"\nlogs_enabled = true\n"
+        );
+        let app = parse(&toml_str);
+        let gate = logs_precheck_from_config(&app);
+        assert!(gate.parent_enabled);
+        assert!(
+            !gate.self_enabled,
+            "[aicd.logs.self] enabled 기본값은 false"
+        );
+    }
+
+    /// endpoint가 비어 있으면 exporter.enabled/logs_enabled가 true여도 off(다른 exporter task와
+    /// 동일한 "endpoint 유효" 게이트).
+    #[test]
+    fn logs_precheck_off_when_endpoint_empty() {
+        let toml_str = format!("{BASE}\n[aicd.exporter]\nenabled = true\nlogs_enabled = true\n");
+        let app = parse(&toml_str);
+        let gate = logs_precheck_from_config(&app);
+        assert!(!gate.parent_enabled);
+    }
+
+    fn test_spool() -> (tempfile::TempDir, Arc<OtlpSpool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = aic_common::SpoolQuotas {
+            metrics: 1024 * 1024,
+            logs: 1024 * 1024,
+            app_logs: 1024 * 1024,
+        };
+        let spool = OtlpSpool::open(dir.path().join("otlp-spool"), quotas).unwrap();
+        (dir, Arc::new(spool))
+    }
+
+    fn test_health(spool: Arc<OtlpSpool>) -> Arc<aic_server::otlp_exporter::ExporterHealth> {
+        Arc::new(aic_server::otlp_exporter::ExporterHealth::new(
+            "http://127.0.0.1:4318".to_string(),
+            spool,
+        ))
+    }
+
+    /// `[aicd.exporter]` 섹션 자체가 없으면(`None`) logs exporter config도 없다.
+    #[test]
+    fn load_logs_exporter_config_none_when_section_absent() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let cfg = load_logs_exporter_config(
+            None,
+            Some(spool),
+            Some(health),
+            AicdLogsConfig::default(),
+            Arc::new(DropCounters::new()),
+        );
+        assert!(cfg.is_none());
+    }
+
+    /// `logs_enabled = false`(기본)면 exporter 전체가 enabled여도 logs exporter는 안 만든다.
+    #[test]
+    fn load_logs_exporter_config_none_when_logs_enabled_false() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        assert!(!ex.logs_enabled, "logs_enabled 기본값은 false여야 함");
+        let cfg = load_logs_exporter_config(
+            Some(ex),
+            Some(spool),
+            Some(health),
+            AicdLogsConfig::default(),
+            Arc::new(DropCounters::new()),
+        );
+        assert!(cfg.is_none());
+    }
+
+    /// 게이트를 모두 통과하면 `batch_max_lines`/`batch_max_ms`가 `[aicd.logs]` 값을 그대로
+    /// 반영한 `LogsExporterConfig`가 나온다.
+    #[test]
+    fn load_logs_exporter_config_builds_when_gates_pass() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            logs_enabled: true,
+            ..AicdExporterConfig::default()
+        };
+        let logs_cfg = AicdLogsConfig {
+            batch_max_lines: 42,
+            batch_max_ms: 999,
+            ..Default::default()
+        };
+        let cfg = load_logs_exporter_config(
+            Some(ex),
+            Some(spool),
+            Some(health),
+            logs_cfg,
+            Arc::new(DropCounters::new()),
+        )
+        .expect("게이트 통과 시 Some이어야 함");
+        assert_eq!(cfg.batch_max_lines, 42);
+        assert_eq!(cfg.batch_max_ms, 999);
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:4318");
+    }
+
+    /// spool이 없으면(다른 exporter와 동일 게이트) endpoint/enabled가 맞아도 None.
+    #[test]
+    fn load_logs_exporter_config_none_when_spool_missing() {
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            logs_enabled: true,
+            ..AicdExporterConfig::default()
+        };
+        let cfg = load_logs_exporter_config(
+            Some(ex),
+            None,
+            None,
+            AicdLogsConfig::default(),
+            Arc::new(DropCounters::new()),
+        );
+        assert!(cfg.is_none());
+    }
 }

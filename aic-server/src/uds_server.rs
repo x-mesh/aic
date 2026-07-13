@@ -248,7 +248,9 @@ async fn handle_client(
 
     // JSON 역직렬화 — unknown variant 등은 client에 graceful Error 응답
     let response = match serde_json::from_slice::<IpcRequest>(&payload_buf) {
-        Ok(request) => process_request(request, &buffer, current_mode, attach_metrics.as_deref()).await,
+        Ok(request) => {
+            process_request(request, &buffer, current_mode, attach_metrics.as_deref()).await
+        }
         Err(e) => {
             tracing::debug!(error = %e, "IpcRequest 역직렬화 실패");
             IpcResponse::Error {
@@ -391,6 +393,7 @@ async fn process_request(
         IpcRequest::ListSessions
         | IpcRequest::AgentEvent(_)
         | IpcRequest::GetExporterStatus
+        | IpcRequest::PushLogLines { .. }
         | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)
@@ -474,8 +477,13 @@ mod tests {
     #[tokio::test]
     async fn process_get_last_command_empty_buffer() {
         let buffer = Arc::new(RwLock::new(RingBuffer::new(100)));
-        let resp =
-            process_request(IpcRequest::GetLastCommand, &buffer, UdsServerMode::FullLocal, None).await;
+        let resp = process_request(
+            IpcRequest::GetLastCommand,
+            &buffer,
+            UdsServerMode::FullLocal,
+            None,
+        )
+        .await;
         match resp {
             IpcResponse::Error { message } => {
                 // Phase 3.5: FullLocal 라도 data plane 제거. Phase ≤ 3.4: "저장된 명령어가 없습니다".
@@ -492,8 +500,13 @@ mod tests {
     #[tokio::test]
     async fn process_get_last_command_with_record() {
         let buffer = make_buffer_with_record();
-        let resp =
-            process_request(IpcRequest::GetLastCommand, &buffer, UdsServerMode::FullLocal, None).await;
+        let resp = process_request(
+            IpcRequest::GetLastCommand,
+            &buffer,
+            UdsServerMode::FullLocal,
+            None,
+        )
+        .await;
         match resp {
             IpcResponse::CommandData(record) => {
                 assert_eq!(record.command, Some("cargo test".to_string()));
@@ -599,7 +612,13 @@ mod tests {
     #[tokio::test]
     async fn ping_only_mode_allows_get_metrics_with_empty_buffer() {
         let buffer = Arc::new(RwLock::new(RingBuffer::new(0)));
-        let resp = process_request(IpcRequest::GetMetrics, &buffer, UdsServerMode::PingOnly, None).await;
+        let resp = process_request(
+            IpcRequest::GetMetrics,
+            &buffer,
+            UdsServerMode::PingOnly,
+            None,
+        )
+        .await;
         match resp {
             IpcResponse::Metrics(snap) => {
                 assert_eq!(snap.rb_used, 0);

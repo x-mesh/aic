@@ -11,12 +11,12 @@ use crate::agent_event_bus::AgentEventBus;
 use crate::command_record_store::CommandRecordStore;
 use crate::metrics::AicdMetrics;
 use crate::session_registry::SessionRegistry;
-use aic_common::{encode_frame, CaptureMode, CommandRecord, IpcRequest, IpcResponse};
+use aic_common::{encode_frame, CaptureMode, CommandRecord, IpcRequest, IpcResponse, LogLine};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 const STALE_ACTIVE_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 
@@ -44,6 +44,14 @@ pub struct ControlContext {
     /// OTLP exporter 전송 건강. exporter가 비활성이면 `None` — `GetExporterStatus`는 그때
     /// `enabled: false`를 돌려준다("꺼짐"과 "켜졌는데 실패 중"은 다른 상태다).
     pub exporter_health: Option<Arc<crate::otlp_exporter::ExporterHealth>>,
+    /// `aic-client`가 `PushLogLines`로 넘긴 자체 로그를 흘려보낼 채널(RFC-006 t11).
+    ///
+    /// logs exporter(`otlp_exporter::logs::serve_logs`)가 아직 `aicd_main`에 배선되지
+    /// 않아(t12가 배선 예정) 지금은 `None`이다 — 그래도 IPC 수신 경로 자체는 여기서 갖춰
+    /// 두어, 채널이 준비되는 순간 바로 흐르게 한다. `Some`이 되면 `try_send`로 넣는다
+    /// (가득 차면 조용히 drop — self_layer.rs의 재귀 방지 원칙과 동일하게 여기서도
+    /// `tracing::` 매크로를 호출해 실패를 로깅하지 않는다).
+    pub logs_tx: Option<mpsc::Sender<LogLine>>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -164,6 +172,20 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             // 이미 담당한다. exporter가 꺼져 있으면 구독자가 없어 조용히 버려진다.
             tracing::debug!(kind = %ev.kind, severity = %ev.severity, "agent event 수신");
             ctx.agent_bus.publish(ev);
+            IpcResponse::Pong
+        }
+        IpcRequest::PushLogLines { lines } => {
+            if let Some(tx) = &ctx.logs_tx {
+                for line in lines {
+                    // 채널이 가득 차면 조용히 버린다 — self_layer.rs와 같은 이유로 여기서
+                    // `tracing::` 매크로를 호출해 실패를 로깅하지 않는다(폭주 중 로그를 더
+                    // 만들면 상황이 악화된다). t12가 exporter를 배선하기 전까지는
+                    // `logs_tx`가 `None`이라 이 루프 자체가 아예 돌지 않는다.
+                    let _ = tx.try_send(line);
+                }
+            }
+            // aic-client의 flush는 fire-and-forget이라 실패해도 재시도하지 않는다 —
+            // 채널 유무와 무관하게 항상 성공으로 응답한다.
             IpcResponse::Pong
         }
         IpcRequest::ListSessions => {
@@ -498,6 +520,8 @@ mod tests {
             agent_bus: AgentEventBus::new(),
             // exporter 미구성 — GetExporterStatus는 `enabled: false`를 돌려준다.
             exporter_health: None,
+            // 아직 배선 전(t12) — PushLogLines 핸들러가 no-op으로 Pong만 응답하는지 검증.
+            logs_tx: None,
         }
     }
 
@@ -835,11 +859,7 @@ mod tests {
         // Phase 3 이후 GetLastCommand는 hook routing 안내 에러를, session data 조회 request들은
         // 기존 "aicd는 세션 데이터" 에러를 반환한다. GetMetrics는 aicd metric 스냅샷이라 별도
         // 경로(아래 `get_metrics_returns_aicd_snapshot` 참조)로 처리된다.
-        let resp = process_control_request(
-            IpcRequest::GetRecentLines { count: 10 },
-            &ctx(),
-        )
-        .await;
+        let resp = process_control_request(IpcRequest::GetRecentLines { count: 10 }, &ctx()).await;
         match resp {
             IpcResponse::Error { message } => {
                 assert!(message.contains("aicd는 세션 데이터"), "actual: {message}");
@@ -970,7 +990,10 @@ mod tests {
 
     // ── Phase 3.1 Task 1.5: RegisterRecordForSession 라우팅 ───────────────
 
-    fn make_record(capture_mode: aic_common::CaptureMode, command: &str) -> aic_common::CommandRecord {
+    fn make_record(
+        capture_mode: aic_common::CaptureMode,
+        command: &str,
+    ) -> aic_common::CommandRecord {
         aic_common::CommandRecord {
             id: String::new(),
             command: Some(command.to_string()),
@@ -1024,7 +1047,10 @@ mod tests {
 
         let recs = c.record_store.recent("sess-exp", 10).await;
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].capture_mode, aic_common::CaptureMode::ExplicitCapture);
+        assert_eq!(
+            recs[0].capture_mode,
+            aic_common::CaptureMode::ExplicitCapture
+        );
         assert_eq!(recs[0].command.as_deref(), Some("aic run ls"));
         assert_eq!(c.metrics.central_store_push_total(), 1);
     }

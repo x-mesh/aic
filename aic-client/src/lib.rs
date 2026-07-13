@@ -15,6 +15,7 @@ pub mod hook_install;
 pub mod keychain;
 pub mod llm_dispatcher;
 pub mod local_record;
+pub mod log_sink;
 pub mod outbound;
 pub mod project_context;
 pub mod rca;

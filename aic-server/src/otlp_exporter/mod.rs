@@ -32,11 +32,15 @@ mod agent;
 mod backoff;
 mod changes;
 mod connections;
-mod encode;
+// `encode`/`logs_proto`는 OTLP wire 스키마(protobuf message subset) 정의다. 통합 테스트
+// (`tests/`)가 mock collector가 받은 본문을 **디코딩해서** 검증하려면 이 스키마가 필요하다 —
+// 바이트 substring 매칭만으로는 "aic.log.dropped가 0보다 크다" 같은 값 단언을 할 수 없다.
+pub mod encode;
 mod events;
 mod health;
 mod host_metrics;
-mod logs_proto;
+pub mod logs;
+pub mod logs_proto;
 mod ntp;
 mod spool;
 
@@ -45,7 +49,8 @@ pub use changes::{serve_changes, ChangesConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;
-pub use spool::{Spool, SignalKind};
+pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
+pub use spool::{SignalKind, Spool};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,6 +75,11 @@ pub struct ExporterConfig {
     pub drain_batch_limit: usize,
     /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
     pub health: Arc<ExporterHealth>,
+    /// 로그 드롭 사유별 카운터(SRE t6 볼륨 안전장치) — 매 tick마다 `encode::encode_metrics`가
+    /// `aic.log.dropped` 게이지로 스냅샷을 실어 보낸다. logs exporter(`serve_logs`)가 아직
+    /// aicd_main에 배선되지 않은 동안은 항상 0이다 — 그게 배선되면 **동일 `Arc`**를
+    /// `LogsExporterConfig::drop_counters`에도 넘겨야 두 task의 카운터가 하나로 합쳐진다.
+    pub drop_counters: Arc<DropCounters>,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
@@ -117,7 +127,18 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
                 };
                 sampler = returned;
 
-                let body = encode::encode_metrics(&sample, &cfg.service_version, unix_nanos_now());
+                // by_spool_quota는 Spool이 이미 세고 있다(AppLogs 쿼터 초과 drop) — 여기서 다시
+                // 세지 않고, 매 tick마다 최신 값을 read-through로 복사해 넣는다.
+                cfg.drop_counters
+                    .by_spool_quota
+                    .store(cfg.spool.dropped_count(SignalKind::AppLogs), std::sync::atomic::Ordering::Relaxed);
+
+                let body = encode::encode_metrics(
+                    &sample,
+                    &cfg.service_version,
+                    unix_nanos_now(),
+                    &cfg.drop_counters,
+                );
 
                 if !backoff.ready() {
                     // backoff 윈도 안 — collector가 여전히 다운됐다고 보고 네트워크 시도(드레인·
@@ -142,6 +163,9 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
                             match kind {
                                 SignalKind::Metrics => push(client, url, token, batch_body).await,
                                 SignalKind::Logs => push_logs(client, logs_endpoint, token, batch_body).await,
+                                // AppLogs도 엔드포인트는 Logs와 동일(`/v1/logs`) — 갈리는 건 spool
+                                // 쿼터뿐이다(R3, spool.rs 모듈 doc 참고).
+                                SignalKind::AppLogs => push_logs(client, logs_endpoint, token, batch_body).await,
                             }
                         }
                     })

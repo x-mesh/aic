@@ -1,8 +1,13 @@
 //! tracing subscriber 초기화 + panic hook.
 //!
-//! 두 layer:
+//! 세 layer:
 //! - stderr (compact format) — `AIC_LOG` env-filter 적용 (default = info)
 //! - file (JSON format) — `~/.local/state/aic/server.log`, daily rotate, max 7일 보존
+//! - self-log (opt-in, RFC-006 t7) — aicd 자신의 `tracing` 이벤트를 OTLP 로그 파이프라인으로
+//!   흘린다. 로그 채널(`tx`)이 없으면(opt-out) 아예 붙지 않는다. [`otlp_exporter::logs::self_layer`]
+//!   문서에 적힌 재귀 위험 때문에 반드시 per-layer `filter_fn`으로 [`is_loop_target`]을 적용한다 —
+//!   전역 `EnvFilter`로 대체하면 stderr/file 등 다른 layer까지 그 이벤트를 잃는다
+//!   (opentelemetry-rust issue #1682와 동일한 함정).
 //!
 //! prompt/response 본문은 절대 span에 포함하지 않는다 (hash + token count만 허용).
 //! 디렉토리 권한 0700, 파일은 tracing-appender가 0644로 쓰므로 사후 0600 chmod.
@@ -10,17 +15,30 @@
 use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
+
+use crate::otlp_exporter::logs::self_layer::{is_loop_target, SelfLogLayer};
 
 /// telemetry 가드. drop 시 background flush.
 pub struct TelemetryGuard {
     _file_guard: WorkerGuard,
 }
 
-/// tracing subscriber를 초기화한다. main 시작 직후 1회만 호출.
+/// tracing subscriber를 초기화한다. main 시작 직후 1회만 호출. self-log layer 없이 stderr+file만
+/// 붙는다(RFC-006 t7 이전과 동일한 동작) — 로그 수집을 쓰는 `aicd`는 [`init_with_logs`]를 쓴다.
 pub fn init() -> anyhow::Result<TelemetryGuard> {
+    init_with_logs(None)
+}
+
+/// [`init`]과 동일하되, `self_log_tx`가 `Some`이면 aicd 자신의 `tracing` 이벤트를 그 채널로 흘리는
+/// self-log layer를 추가로 붙인다. `None`이면(로그 수집 opt-out) self-log layer 자체를 등록하지
+/// 않는다 — 코드 경로가 완전히 비활성화된다.
+pub fn init_with_logs(
+    self_log_tx: Option<tokio::sync::mpsc::Sender<aic_common::LogLine>>,
+) -> anyhow::Result<TelemetryGuard> {
     let log_dir = log_dir();
     std::fs::create_dir_all(&log_dir)?;
     apply_dir_perm_0700(&log_dir);
@@ -50,9 +68,14 @@ pub fn init() -> anyhow::Result<TelemetryGuard> {
         .json()
         .with_filter(file_env_filter);
 
+    // self-log layer는 반드시 per-layer filter로 붙인다(EnvFilter 금지 — 위 module doc 참고).
+    let self_log_layer = self_log_tx
+        .map(|tx| SelfLogLayer::new(tx).with_filter(filter_fn(|md| !is_loop_target(md.target()))));
+
     tracing_subscriber::registry()
         .with(stderr_layer)
         .with(file_layer)
+        .with(self_log_layer)
         .init();
 
     install_panic_hook();
