@@ -374,6 +374,56 @@ fn systemctl_user_disable_now() -> Result<()> {
     Ok(())
 }
 
+/// 자동 시작 unit이 설치되어 있으면 그 매니저(launchd/systemd)에게 재시작을 맡긴다.
+///
+/// unit이 없으면 `Ok(false)` — 호출부가 직접 shutdown → start를 해야 한다는 뜻이다.
+///
+/// **왜 매니저를 거치는가**: unit에는 `KeepAlive`(launchd) / `Restart=on-failure`
+/// (systemd)가 걸려 있다. 우리가 데몬을 죽이면 매니저가 곧바로 자기 판단으로 다시
+/// 띄우기 때문에, 그 사이에 CLI가 직접 `aicd`를 spawn하면 두 기동이 경쟁하고 진 쪽이
+/// singleton PID lock에 걸려 실패한다. 매니저에게 재시작을 시키면 죽이고 띄우는 일이
+/// 한 주체 안에서 순서대로 일어난다.
+pub fn restart_via_unit() -> Result<bool> {
+    let Some(unit) = current_unit_path() else {
+        return Ok(false);
+    };
+    if !unit.exists() {
+        return Ok(false);
+    }
+    match detect_platform() {
+        Platform::Macos => {
+            let uid = unsafe { libc::getuid() };
+            let target = format!("gui/{uid}/{LAUNCHD_LABEL}");
+            // `kickstart -k`: 돌고 있으면 죽이고 다시 띄운다. 안 돌고 있으면 그냥 띄운다.
+            let out = Command::new("launchctl")
+                .args(["kickstart", "-k", &target])
+                .output()
+                .with_context(|| "launchctl kickstart 실행 실패")?;
+            if !out.status.success() {
+                return Err(anyhow!(
+                    "launchctl kickstart -k {target} 실패: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(true)
+        }
+        Platform::Linux => {
+            let out = Command::new("systemctl")
+                .args(["--user", "restart", SYSTEMD_UNIT])
+                .output()
+                .with_context(|| "systemctl --user restart 실행 실패")?;
+            if !out.status.success() {
+                return Err(anyhow!(
+                    "systemctl --user restart {SYSTEMD_UNIT} 실패: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Ok(true)
+        }
+        Platform::Unsupported => Ok(false),
+    }
+}
+
 /// 현재 설치 상태(파일 존재 여부)만 빠르게 확인한다. `aic daemon status`에서 사용.
 pub fn current_unit_path() -> Option<PathBuf> {
     match detect_platform() {

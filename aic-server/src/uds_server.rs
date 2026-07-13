@@ -381,6 +381,13 @@ async fn process_request(
             IpcResponse::Pong
         }
         IpcRequest::Ping => IpcResponse::Pong,
+        // Ping과 마찬가지로 양 데몬 모두에서 의미가 있다 — aic-session도 자기 빌드로
+        // 답한다(구버전 세션 데몬이 남아 도는 경우를 같은 방식으로 확인할 수 있게).
+        IpcRequest::GetVersion => IpcResponse::Version(aic_common::DaemonVersion {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: env!("AIC_BUILD_COMMIT").to_string(),
+            build_info: env!("AIC_BUILD_INFO").to_string(),
+        }),
         IpcRequest::ListSessions
         | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown

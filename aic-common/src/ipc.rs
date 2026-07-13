@@ -90,6 +90,14 @@ pub enum IpcRequest {
     },
     Ping,
     GetMetrics,
+    /// 실행 중인 데몬 바이너리의 빌드 identity를 요청한다.
+    ///
+    /// `make install`/`aic update`는 디스크의 binary만 교체하므로, 재시작 전까지는
+    /// **구버전 aicd가 그대로 돈다**. 디스크를 stat해서는 이걸 알 수 없어(경로가 같다)
+    /// 실행 중인 프로세스에 직접 묻는다. 이 variant를 모르는 구버전 데몬은
+    /// `Error { message: "unknown request: ..." }`로 graceful 응답하므로, 그 응답
+    /// 자체가 "GetVersion 이전 빌드가 돌고 있다"는 신호가 된다.
+    GetVersion,
     /// `aicd`에 등록된 세션 목록을 요청한다 (Phase 1.2~1.3).
     ListSessions,
     /// 오래된 inactive(detached/stopping/stopped/failed) 세션을 registry에서 제거한다.
@@ -156,9 +164,30 @@ pub enum IpcResponse {
     PrunedSessions {
         count: usize,
     },
+    /// `GetVersion` 응답 — 응답한 데몬 **프로세스**의 빌드 identity.
+    Version(DaemonVersion),
     Error {
         message: String,
     },
+}
+
+/// 실행 중인 데몬 바이너리의 빌드 identity (`GetVersion` 응답).
+///
+/// 세 필드 모두 데몬이 자기 build.rs가 주입한 값을 그대로 싣는다 — 디스크의 binary가
+/// 아니라 **지금 메모리에서 도는 코드**의 정체다. client는 이걸 자기 값과 비교해
+/// 설치 후 재시작을 빠뜨린 skew를 잡아낸다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonVersion {
+    /// `CARGO_PKG_VERSION`.
+    pub version: String,
+    /// `AIC_BUILD_COMMIT` — short hash(`*` suffix=dirty). git 밖 빌드(릴리스 tarball,
+    /// crates.io)는 빈 문자열이라, 비교 시 이 경우는 version만으로 판정해야 한다.
+    #[serde(default)]
+    pub commit: String,
+    /// `AIC_BUILD_INFO` — `--version`이 출력하는 완성 문자열(빌드 시각 포함).
+    /// 표시 전용 — 빌드 시각이 섞여 있어 동일성 판정에는 쓰지 않는다.
+    #[serde(default)]
+    pub build_info: String,
 }
 
 /// 데몬 metric 스냅샷 (`aic top`/`aic-session metrics` 응답용).
