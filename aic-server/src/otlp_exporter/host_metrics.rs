@@ -83,12 +83,15 @@ impl HostSampler {
     pub fn sample(&mut self) -> HostSample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        // 프로세스 수만 필요하므로 `ProcessRefreshKind::nothing()`으로 목록만 갱신한다 —
-        // cpu/메모리까지 프로세스별로 채우면 60초 주기라도 불필요하게 비싸다.
+        // 프로세스 수 + top RSS 계산에 memory()가 필요해 `.with_memory()`를 켠다. 이 머신(프로세스
+        // ~990개) 실측으로는 nothing() 8.1~15.4ms vs with_memory() 14.1~20.8ms — 차이가 프로세스당
+        // syscall 1회(`proc_pidinfo(PROC_PIDTASKINFO)`) 추가분이고, 재측정하면 순서가 뒤바뀔 만큼
+        // 회차 간 노이즈에 묻힌다. 프로세스 열거(`proc_listpids`) 자체가 이미 지배적 비용이라
+        // 60초 주기에서 유의미한 부담이 아니다.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing(),
+            ProcessRefreshKind::nothing().with_memory(),
         );
         self.disks.refresh(false);
         self.networks.refresh(false);
@@ -105,7 +108,10 @@ impl HostSampler {
             (acc.0 + data.received(), acc.1 + data.transmitted())
         });
         let (rx_pkts, tx_pkts) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
-            (acc.0 + d.packets_received(), acc.1 + d.packets_transmitted())
+            (
+                acc.0 + d.packets_received(),
+                acc.1 + d.packets_transmitted(),
+            )
         });
         let (rx_errs, tx_errs) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
             (
@@ -133,6 +139,11 @@ impl HostSampler {
         let swap_total = self.sys.total_swap();
         let load = System::load_average();
         let proc_count = self.sys.processes().len();
+        // 최대 RSS 프로세스의 값만 낸다. 이름/PID는 attr로 넣지 않는다 — 이 머신 고유 프로세스명이
+        // 623종이라 cardinality 폭탄이고, 수신측(rca-server) 읽기 경로가 전부 `WHERE host=? AND
+        // metric=?` + `avg(value)`라 attrs 필터/GROUP BY가 없어 차원을 넣으면 평균으로 뭉개진다.
+        // "범인이 누구인가"는 changes exporter의 rss_spike가 이미 다룬다.
+        let top_process_rss = max_rss(self.sys.processes().values().map(|p| p.memory()));
         let uptime = System::uptime();
         // filesystem은 available/limit만으로도 used를 유도할 수 있지만, 대시보드가 매번
         // 빼기를 하지 않도록 usage/utilization을 직접 낸다(디스크 full이 가장 흔한 사고 원인).
@@ -281,6 +292,15 @@ impl HostSampler {
             },
         ];
 
+        // 무차원 스칼라 1개만 낸다(불변식: 이름/PID attr 금지). 프로세스 목록이 비면 생략한다.
+        if let Some(rss) = top_process_rss {
+            points.push(MetricPoint {
+                name: "aic.system.memory.top_process.usage",
+                unit: "By",
+                value: MetricValue::Int(rss as i64),
+            });
+        }
+
         // t7: 로컬 커널 clock discipline(adjtimex, Linux 전용)에서 얻을 수 있을 때만 추가한다.
         // 네트워크로 NTP 서버에 질의하지 않는다(과설계 금지 — sntp round-trip 없음). 측정
         // 불가(비Linux, 커널이 unsync 보고 등)면 그냥 생략한다 — 이 metric만 없을 뿐 host metrics
@@ -304,6 +324,12 @@ impl HostSampler {
             points,
         }
     }
+}
+
+/// 프로세스 RSS 목록 중 최댓값. 프로세스 목록이 비면 `None` — 호출부는 이때 point를 생략해야 한다
+/// (`unwrap()` 금지, 불변식). 순수 함수로 분리해 sysinfo 없이 픽스처로 검증한다.
+fn max_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
+    memories.into_iter().max()
 }
 
 /// used/total 비율(0..1). total==0(측정 실패)이면 0.
@@ -345,16 +371,13 @@ mod tests {
         assert!(!sample.resource.host_name.is_empty());
         assert!(!sample.resource.os_type.is_empty());
         // host metrics 26종(cpu 5 + mem 4 + swap 3 + fs 4 + disk io 2 + net io/packets/errors 6 +
-        // process 1 + uptime 1). ntp_offset_ms는 측정 가능할 때만 27번째로 붙는다(Linux + 커널이
-        // sync 상태 보고할 때만 — 26/27 둘 다 유효하다).
+        // process 1 + uptime 1)이 항상 나가고, top_process.usage(프로세스 목록 비었을 때만 생략)와
+        // ntp_offset_ms(Linux + 커널 sync 상태일 때만)가 각각 선택적으로 붙는다 — 26~28 모두 유효.
         assert!(
-            sample.points.len() == 26 || sample.points.len() == 27,
-            "host metrics 점수는 26(ntp 미측정) 또는 27(ntp 측정됨)여야 함, got {}",
+            (26..=28).contains(&sample.points.len()),
+            "host metrics 점수는 26~28이어야 함, got {}",
             sample.points.len()
         );
-        if sample.points.len() == 27 {
-            assert_eq!(sample.points[26].name, "aic.agent.ntp_offset_ms");
-        }
         // utilization 계열은 항상 0..1 범위.
         for p in &sample.points {
             if p.name.ends_with(".utilization") {
@@ -415,6 +438,38 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn top_process_usage_is_positive_and_dimensionless() {
+        // 자기 자신이 돌고 있으므로 프로세스 목록은 항상 비어있지 않다 — process_count_and_uptime_are_plausible
+        // 과 동일 전제. AC3: top_process.usage는 0보다 크고, By 단위 스칼라 하나여야 한다(이름/PID
+        // attr 없음 — MetricPoint 자체가 attrs 필드를 두지 않으므로 구조적으로 보장됨, encode.rs 참고).
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        let found = sample
+            .points
+            .iter()
+            .find(|p| p.name == "aic.system.memory.top_process.usage");
+        let p = found.expect("프로세스 목록이 비어있지 않으므로 top_process point가 있어야 함");
+        assert_eq!(p.unit, "By");
+        match p.value {
+            MetricValue::Int(v) => assert!(v > 0, "top_process.usage가 0 이하: {v}"),
+            MetricValue::Double(_) => panic!("top_process.usage는 Int(By)여야 함"),
+        }
+    }
+
+    #[test]
+    fn max_rss_picks_maximum_not_average() {
+        // 순수 함수 불변식: 평균이 아니라 최댓값을 골라야 한다(수신측 avg(value)와 혼동 방지 문서화).
+        assert_eq!(max_rss([100u64, 300, 200]), Some(300));
+        assert_eq!(max_rss([50u64]), Some(50));
+    }
+
+    #[test]
+    fn max_rss_of_empty_process_list_is_none() {
+        // 불변식 1: 프로세스 목록이 비면 None — 호출부가 unwrap 없이 point를 생략할 수 있어야 한다.
+        assert_eq!(max_rss(std::iter::empty()), None);
     }
 
     #[test]
