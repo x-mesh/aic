@@ -1554,18 +1554,30 @@ impl AgentSession {
         }
     }
 
-    /// "지금 이 순간"(`/record now`)의 지표 요약 소스(t2). `None`이면 **지표 없이** 메모만 기록한다.
+    /// "지금 이 순간"(`/record now`)의 지표 요약 소스(t2). **캐시가 유일한 소스다** — 쓸 수 있는 캐시가
+    /// 없으면 `None`, 즉 **지표 없이 메모만 기록**한다.
     ///
     /// 1) TUI 경로면 chat_tui의 지표 watch 채널에서 최신값을 당겨 `last_metrics`를 갱신한다
     ///    (Direct는 자체 루프가 프롬프트 직전에 이미 채워 뒀다).
     /// 2) 캐시가 **쓸 수 있으면**(`metrics_cache_usable`) 그대로 반환한다 — status bar가 이미 워밍업한
     ///    값이라 cpu가 정확하고, 사용자가 화면에서 본 숫자와 기록에 남는 숫자가 일치한다.
-    /// 3) 아니면 폴백 샘플(`sample_fresh_blocking`)을 뜬다.
+    ///
+    /// **왜 즉석 샘플로 폴백하지 않는가**(설계 결정 — 한때 넣었다가 걷어냈다):
+    /// 캐시가 없거나 낡은 경우는 둘 중 하나다. (a) status bar 비활성(비-TTY·CLI 경로), (b) **sampler가
+    /// hung mount의 statfs에 걸려 멈춤**. 호출 시점에 이 둘을 구분할 방법이 없는데, (b)에서 즉석 샘플은
+    /// 같은 statfs를 다시 부른다. `spawn_blocking`으로 격리해도 **취소가 불가능하다** — `tokio::time::timeout`은
+    /// 기다리기를 포기할 뿐 클로저를 멈추지 못하므로, 걸린 스레드가 blocking pool에 영구히 pin되고
+    /// `/record now`를 칠 때마다 하나씩 쌓여 결국 pool(기본 512)이 고갈된다. 동시 실행 수를 제한해도
+    /// 고갈을 늦출 뿐 없애지 못한다. 즉 **런타임을 막는 문제를 옮길 수는 있어도 제거할 수는 없다**.
+    ///
+    /// 그리고 폴백이 없어도 잃는 게 거의 없다: `/record now`의 본질은 **사람이 남기는 메모**이고 지표는
+    /// 부가 정보인데, host metrics는 이미 60초 주기로 서버에 나가고 있어 **타임스탬프로 조인하면 그 시점의
+    /// 지표는 서버에 있다**. 도구를 멈출 위험을 감수하면서 지표를 채울 이유가 없다.
     ///
     /// **cpu를 믿어도 되는지는 반환 스냅샷의 `cpu_valid`가 말한다** — 별도 플래그를 따로 반환하지 않는다.
-    /// 두 값을 나눠 들고 다니면 어긋날 여지가 생기고, 애초에 중복이다. **`cpu_valid`가 false면
-    /// 호출부(OTLP attr 조립)는 cpu_utilization을 생략해야 한다** — 그 값은 0이 아니라 부팅 이후 누적
-    /// 평균이라(sys_sampler 실측) 그럴싸하게 틀렸고, 그대로 기록되면 아무도 눈치채지 못한다.
+    /// 두 값을 나눠 들고 다니면 어긋날 여지가 생기고, 애초에 중복이다. (지금은 `metrics_cache_usable`이
+    /// `cpu_valid=false`인 캐시를 아예 거부하므로 반환되는 스냅샷은 항상 `cpu_valid=true`이지만, 그 사실을
+    /// 호출부가 가정하게 두지 않는다 — 판정은 언제나 스냅샷 자신이 들고 다닌다.)
     ///
     /// 캐시를 "있으니 유효"로 보지 않는 이유는 두 가지다:
     /// - **오염된 샘플이 캐시에 들어온다**: sampler가 간격 부족으로 갱신하지 못한 cpu(`cpu_valid=false`)도
@@ -1573,45 +1585,20 @@ impl AgentSession {
     /// - **낡음**: status bar가 갱신되지 않은 채 시간이 흐르면(sampler task 정지, 프롬프트에서 장시간 대기)
     ///   그 값은 더 이상 "지금"이 아니다 — `METRICS_FRESH_WINDOW`를 넘기면 캐시를 버린다.
     ///
-    /// **폴백은 blocking pool에서 돈다**(`spawn_blocking`) + `METRICS_FALLBACK_TIMEOUT` 안에 못 오면 포기한다.
-    /// 이유가 중요하다: 캐시가 낡는 대표적 원인이 **sampler task가 hung mount의 statfs에 걸린 것**인데,
-    /// 그 상황에서 폴백이 async 런타임 스레드에서 같은 statfs를 다시 부르면 **런타임 전체가 멈춘다**(인과가
-    /// 순환한다). blocking pool로 격리하면 런타임은 살고, 타임아웃까지 두면 `/record now` 자체가 영원히
-    /// 매달리지 않는다. **`/record now`는 메모가 본질이고 지표는 부가 정보다** — 지표를 채우려고 도구를
-    /// 멈출 이유가 없으므로, 못 뜨면 `None`(지표 없음)으로 기록한다.
-    ///
     /// t2 시점엔 아직 호출부가 없다(OTLP로 실제 전송해 `/record now`에 붙이는 건 t3) — 소스만 준비해
     /// 둔다. 테스트가 불변식을 검증하므로 `dead_code`는 여기서만 허용한다.
     #[allow(dead_code)]
-    pub(crate) async fn record_metrics_summary(
-        &mut self,
-    ) -> Option<super::sys_sampler::SysMetrics> {
+    pub(crate) fn record_metrics_summary(&mut self) -> Option<super::sys_sampler::SysMetrics> {
         if let Some(rx) = &self.metrics_rx {
             if let Some(m) = rx.borrow().clone() {
                 self.last_metrics = Some(m);
             }
         }
         let now = std::time::Instant::now();
-        if let Some(m) = &self.last_metrics {
-            if metrics_cache_usable(m, now) {
-                return Some(m.clone());
-            }
-        }
-        // 캐시 없음 · cpu 오염 · 낡음 → 폴백. UI/런타임을 막지 않는다(위 doc 참고).
-        let sample = tokio::task::spawn_blocking(sample_fresh_blocking);
-        match tokio::time::timeout(METRICS_FALLBACK_TIMEOUT, sample).await {
-            Ok(Ok(m)) => Some(m),
-            // 타임아웃(hung statfs 등)·panic → 지표 없이 메모만 기록한다. blocking task는 스스로 끝나며
-            // 결과는 버려진다(취소할 수단이 없다 — 대신 우리가 기다리지 않는다).
-            Ok(Err(e)) => {
-                adbg!("지표 폴백 샘플 task 실패: {e}");
-                None
-            }
-            Err(_) => {
-                adbg!("지표 폴백 샘플 타임아웃 — 지표 없이 기록한다");
-                None
-            }
-        }
+        self.last_metrics
+            .as_ref()
+            .filter(|m| metrics_cache_usable(m, now))
+            .cloned()
     }
 
     /// `/compare` — 고정 Safe probe로 현재 시스템 스냅샷을 만들고 직전 baseline과 diff(LLM 미호출).
@@ -2348,25 +2335,6 @@ fn env_local_no_analyze() -> bool {
 /// 진짜 현재의 mem/disk/load를 남기는 편이 `/record now`의 의미에 맞다.
 const METRICS_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// 지표 폴백 샘플의 제한 시간. 이 안에 못 뜨면 지표 없이(`None`) 메모만 기록한다. 폴백이 발동하는
-/// 대표적 상황이 **sampler가 hung mount의 statfs에 걸린 것**이라, 상한이 없으면 `/record now`가 영원히
-/// 매달린다. 정상 경로는 델타 확보용 대기(200ms) + 샘플(sub-ms~ms)이므로 2초면 넉넉하다.
-const METRICS_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// 폴백 지표 1회 샘플 — **blocking pool 전용**(statfs·동기 IPC를 포함해 수십~수백 ms를 태운다).
-///
-/// `MINIMUM_CPU_UPDATE_INTERVAL`만큼 자고 **두 번째** 샘플을 쓴다: 첫 샘플은 `new()`의 기준선 refresh와
-/// 간격이 0이라 cpu가 갱신되지 않고 부팅 이후 누적 평균이 남는다(sys_sampler 실측 20.94% vs 실제 ~45%).
-/// 200ms를 자면 진짜 구간 사용률을 얻는다 — 폴백에서도 cpu를 **버리지 않고 살릴 수 있다**. 이 대기는
-/// blocking pool에서만 일어나므로 async 런타임을 막지 않고, `/record now`는 이미 probe 수집에 수 초를
-/// 쓰므로 200ms는 체감되지 않는다.
-fn sample_fresh_blocking() -> super::sys_sampler::SysMetrics {
-    let mut sampler = super::sys_sampler::SysSampler::new();
-    let _baseline = sampler.sample(); // 기준선(이 스냅샷의 cpu는 무효 — 버린다)
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    sampler.sample()
-}
-
 /// 캐시된 지표를 `/record now`의 지표 요약으로 **그대로 써도 되는가**(순수 함수 — `now` 주입으로
 /// 벽시계·머신 상태 비의존 테스트 가능). 두 조건을 모두 만족해야 한다:
 /// 1. `cpu_valid` — 첫 샘플(cold-start)이면 sampler가 false로 표시했다. 이걸 거르지 않으면 이 방어가
@@ -3041,58 +3009,37 @@ mod tests {
         }
     }
 
-    // t2: `record_metrics_summary` 불변식.
-    // 이 머신의 실제 cpu/mem 값을 단언하지 않는다 — 캐시 우선순위·거부·폴백 전환만 검증한다
-    // (이 프로젝트에서 "머신 상태 의존 단언"이 이미 3번 사고 난 규칙).
-
-    /// 실제 cpu%로는 절대 나올 수 없는 sentinel(0..100 범위 밖). 반환된 스냅샷이 **캐시 그것인지
-    /// 폴백으로 새로 뜬 것인지**를 구분하는 데 쓴다 — 이게 없으면 "거부됐다"를 검증할 수 없다
-    /// (거부해도 안 해도 cpu_valid=false라 플래그만으로는 오탐 통과한다 — 게이트 지적).
-    const SENTINEL_CPU: f32 = 123.5;
+    // t2: `record_metrics_summary` 불변식. **캐시가 유일한 소스다**(폴백 없음) — 쓸 수 있으면 Some,
+    // 아니면 None(지표 없이 메모만 기록). 이 머신의 실제 cpu/mem 값은 단언하지 않는다.
 
     /// 오염된(=sysinfo가 갱신하지 못한) 캐시 스냅샷. 신선하지만 cpu는 못 믿는다.
     fn polluted_metrics() -> super::super::sys_sampler::SysMetrics {
         super::super::sys_sampler::SysMetrics {
-            cpu_pct: SENTINEL_CPU,
+            cpu_pct: 20.94, // 부팅 이후 누적 평균(실측) — 0이 아니라 그럴싸하게 틀린 값이다
             cpu_valid: false,
             sampled_at: Some(std::time::Instant::now()),
             ..Default::default()
         }
     }
 
-    /// 반환 스냅샷이 **캐시가 아니라 폴백**임을 증명한다 — sentinel이 사라졌고 샘플 시각도 새로 찍혔다.
-    fn assert_is_fallback_not_cache(
-        m: &super::super::sys_sampler::SysMetrics,
-        cached_at: Option<std::time::Instant>,
-    ) {
-        assert_ne!(
-            m.cpu_pct, SENTINEL_CPU,
-            "캐시가 거부되지 않고 그대로 반환됐다"
-        );
-        assert_ne!(
-            m.sampled_at, cached_at,
-            "폴백이라면 샘플 시각이 새로 찍혀야 한다"
-        );
-    }
-
-    #[tokio::test]
-    async fn record_metrics_summary_uses_direct_loop_cache_when_present() {
-        // 불변식 1: 워밍업된 last_metrics(Direct 루프가 채움)가 있으면 그 값을 그대로 쓴다 — 재샘플링 없음.
+    #[test]
+    fn record_metrics_summary_uses_direct_loop_cache_when_present() {
+        // 불변식 1: 워밍업된 last_metrics(Direct 루프가 채움)가 있으면 그 값을 그대로 쓴다.
         let (mut session, _dir) = test_session();
         session.last_metrics = Some(warm_metrics(42.0));
-        let m = session.record_metrics_summary().await.expect("캐시 히트");
+        let m = session.record_metrics_summary().expect("캐시 히트");
         assert_eq!(m.cpu_pct, 42.0);
         assert!(m.cpu_valid, "워밍업된 캐시 경로는 cpu가 유효해야 한다");
     }
 
-    #[tokio::test]
-    async fn record_metrics_summary_prefers_tui_channel_over_stale_cache() {
+    #[test]
+    fn record_metrics_summary_prefers_tui_channel_over_stale_cache() {
         // 불변식 2: TUI 채널에 새 값이 있으면 그걸로 last_metrics를 갱신한다 — 오래된 값에 머물지 않는다.
         let (mut session, _dir) = test_session();
         session.last_metrics = Some(warm_metrics(1.0));
         let (_tx, rx) = tokio::sync::watch::channel(Some(warm_metrics(77.0)));
         session.metrics_rx = Some(rx);
-        let m = session.record_metrics_summary().await.expect("채널 히트");
+        let m = session.record_metrics_summary().expect("채널 히트");
         assert_eq!(m.cpu_pct, 77.0, "채널의 최신값이 우선해야 한다");
         assert_eq!(
             session.last_metrics.as_ref().map(|m| m.cpu_pct),
@@ -3101,63 +3048,59 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn record_metrics_summary_falls_back_to_warmed_sample_when_cache_absent() {
-        // 불변식 3: 캐시도 채널도 없으면(status bar 비활성) 폴백 샘플을 뜬다. 폴백은 델타 간격을 확보하고
-        // 두 번째 샘플을 쓰므로 **cpu도 유효하다**(무효 표시 후 버리는 게 아니라 살려 낸다).
-        // cpu_pct 실측값(이 머신 상태)은 단언하지 않는다 — 단언 대상은 유효성 규칙뿐이다.
+    #[test]
+    fn record_metrics_summary_is_none_without_cache() {
+        // 불변식 3: 캐시도 채널도 없으면(status bar 비활성 — 비-TTY·CLI) **지표 없음**을 낸다.
+        // 즉석 샘플로 폴백하지 않는다: 캐시가 없는 이유가 "sampler가 hung statfs에 걸려서"일 수 있는데
+        // 호출 시점에 그걸 구분할 수 없고, spawn_blocking은 취소가 안 돼 스레드가 영구히 pin된다.
         let (mut session, _dir) = test_session();
         assert!(session.last_metrics.is_none() && session.metrics_rx.is_none());
-        let m = session.record_metrics_summary().await.expect("폴백 샘플");
-        assert!(m.sampled_at.is_some(), "폴백도 실제로 샘플한 스냅샷이다");
         assert!(
-            m.cpu_valid,
-            "폴백은 MINIMUM_CPU_UPDATE_INTERVAL을 확보하고 두 번째 샘플을 쓰므로 cpu가 유효하다"
+            session.record_metrics_summary().is_none(),
+            "캐시가 없으면 지표 없이(None) 메모만 기록한다 — 즉석 샘플 금지"
         );
     }
 
-    #[tokio::test]
-    async fn record_metrics_summary_rejects_polluted_cache_and_resamples() {
-        // 불변식 4: cpu가 오염된(cpu_valid=false) 캐시는 **거부하고 폴백으로 다시 뜬다**.
-        // 플래그만 보면 거부 여부를 구분할 수 없으므로(거부해도 안 해도 false) sentinel로 스냅샷의
-        // 정체를 확인한다 — 캐시를 그대로 돌려주면 sentinel이 살아남아 FAIL한다.
+    #[test]
+    fn record_metrics_summary_rejects_polluted_cache() {
+        // 불변식 4: cpu가 오염된(cpu_valid=false) 캐시는 거부한다 → None.
         let (mut session, _dir) = test_session();
-        let cached = polluted_metrics();
-        let cached_at = cached.sampled_at;
-        session.last_metrics = Some(cached);
-        let m = session.record_metrics_summary().await.expect("폴백 샘플");
-        assert_is_fallback_not_cache(&m, cached_at);
+        session.last_metrics = Some(polluted_metrics());
+        assert!(
+            session.record_metrics_summary().is_none(),
+            "오염된 cpu를 가진 캐시는 거부돼야 한다(그 값을 진짜인 척 기록하면 안 된다)"
+        );
     }
 
-    #[tokio::test]
-    async fn record_metrics_summary_rejects_polluted_sample_from_tui_channel() {
+    #[test]
+    fn record_metrics_summary_rejects_polluted_sample_from_tui_channel() {
         // 불변식 4의 TUI 짝 — sampler task가 publish한 오염 샘플도 채널 경로에서 거부돼야 한다.
         let (mut session, _dir) = test_session();
-        let published = polluted_metrics();
-        let published_at = published.sampled_at;
-        let (_tx, rx) = tokio::sync::watch::channel(Some(published));
+        let (_tx, rx) = tokio::sync::watch::channel(Some(polluted_metrics()));
         session.metrics_rx = Some(rx);
-        let m = session.record_metrics_summary().await.expect("폴백 샘플");
-        assert_is_fallback_not_cache(&m, published_at);
+        assert!(
+            session.record_metrics_summary().is_none(),
+            "sampler의 오염 publish도 거부돼야 한다"
+        );
     }
 
-    #[tokio::test]
-    async fn record_metrics_summary_rejects_stale_cache_and_resamples() {
-        // 불변식 5: cpu가 유효해도 창(METRICS_FRESH_WINDOW)을 넘긴 캐시는 "지금"이 아니다 — 거부하고 다시 뜬다.
+    #[test]
+    fn record_metrics_summary_rejects_stale_cache() {
+        // 불변식 5: cpu가 유효해도 창(METRICS_FRESH_WINDOW)을 넘긴 캐시는 "지금"이 아니다 → 거부.
         let (mut session, _dir) = test_session();
-        let stale = super::super::sys_sampler::SysMetrics {
-            cpu_pct: SENTINEL_CPU,
+        session.last_metrics = Some(super::super::sys_sampler::SysMetrics {
+            cpu_pct: 42.0,
             cpu_valid: true, // 오염은 아니지만
             // 창을 넘긴 과거 시각. checked_sub은 부팅 직후 saturate될 수 있어 실패 시 None(=나이 미상,
-            // 역시 거부 대상)으로 떨어뜨린다 — 어느 쪽이든 "거부"라는 결론은 같다.
+            // 역시 거부 대상)으로 떨어진다 — 어느 쪽이든 "거부"라는 결론은 같다.
             sampled_at: std::time::Instant::now()
                 .checked_sub(METRICS_FRESH_WINDOW + std::time::Duration::from_secs(1)),
             ..Default::default()
-        };
-        let stale_at = stale.sampled_at;
-        session.last_metrics = Some(stale);
-        let m = session.record_metrics_summary().await.expect("폴백 샘플");
-        assert_is_fallback_not_cache(&m, stale_at);
+        });
+        assert!(
+            session.record_metrics_summary().is_none(),
+            "낡은 캐시를 '지금 이 순간'으로 기록하면 안 된다"
+        );
     }
 
     // `metrics_cache_usable` 순수 게이트 — now 주입이라 벽시계·머신 상태에 의존하지 않는다.

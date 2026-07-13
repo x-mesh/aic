@@ -364,10 +364,10 @@ impl SysMetrics {
         let disk = self.disk_label();
         let clock = chrono::Local::now().format("%H:%M:%S").to_string();
         let line = format!(
-            "{} · load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
+            "{} · load {:.2} · {} · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
             clock,
             self.load1,
-            self.cpu_pct,
+            self.cpu_label(),
             mem_pct,
             human_bytes(self.mem_used),
             human_bytes(self.mem_total),
@@ -393,6 +393,20 @@ impl SysMetrics {
         }
     }
 
+    /// cpu 세그먼트 텍스트 — status_line·status_segments·alert_states 공용(같은 토큰 보장).
+    ///
+    /// **`cpu_valid=false`면 숫자를 보여주지 않고 `cpu --%`로 낸다.** 그 값은 0이 아니라 부팅 이후 누적
+    /// 평균이라(실측 20.94%, 같은 시점 실제 ~45%) 그럴싸하게 틀렸다 — 기록 경로에서 버리는 값을 표시
+    /// 경로에서 진짜인 척 보여줄 이유가 없다. **같은 값이 같은 이유로 거짓이다.** 첫 tick에서만 잠깐
+    /// 나타나고 다음 샘플부터 실제 숫자가 채워진다.
+    fn cpu_label(&self) -> String {
+        if self.cpu_valid {
+            format!("cpu {:.0}%", self.cpu_pct)
+        } else {
+            "cpu --%".to_string()
+        }
+    }
+
     /// disk 세그먼트 텍스트 — 여유 용량 + (있으면) 소진 ETA 접미. status_line·status_segments 공용이라
     /// 둘이 항상 같은 토큰을 보여준다(divergence 방지). 사용률 %는 macOS APFS 부정확이라 free만 쓴다.
     fn disk_label(&self) -> String {
@@ -410,7 +424,13 @@ impl SysMetrics {
         let ratio = self.load1 / self.cores.max(1) as f64;
         sev_high(ratio, LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
     }
+    /// cpu 단계 — **믿을 수 없는 값(`cpu_valid=false`)으로는 판정하지 않는다**(Normal 취급).
+    /// 그 값은 부팅 이후 누적 평균이라, 오래 바빴던 호스트에서는 그것만으로 임계를 넘겨 **첫 tick에
+    /// 거짓 경보**를 낼 수 있다(AlertTracker도 `cpu_sev`를 그대로 쓴다). 색·알림·기록이 한 판정을 공유한다.
     fn cpu_sev(&self) -> Severity {
+        if !self.cpu_valid {
+            return Severity::Normal;
+        }
         sev_high(
             self.cpu_pct as f64,
             CPU_WARN_PCT as f64,
@@ -450,7 +470,7 @@ impl SysMetrics {
         let disk = self.disk_label();
         let mut segs = vec![
             (format!("load {:.2}", self.load1), self.load_sev()),
-            (format!("cpu {:.0}%", self.cpu_pct), self.cpu_sev()),
+            (self.cpu_label(), self.cpu_sev()),
             (
                 format!(
                     "mem {:.0}% ({}/{})",
@@ -509,7 +529,7 @@ impl SysMetrics {
     fn alert_states(&self) -> [(&'static str, Severity, String); ALERT_RESOURCES] {
         [
             ("load", self.load_sev(), format!("load {:.2}", self.load1)),
-            ("cpu", self.cpu_sev(), format!("cpu {:.0}%", self.cpu_pct)),
+            ("cpu", self.cpu_sev(), self.cpu_label()),
             ("mem", self.mem_sev(), {
                 let mut s = format!(
                     "mem {:.0}% ({}/{})",
@@ -747,7 +767,10 @@ const DISK_TREND_DELTA: f64 = 64.0 * 1024.0 * 1024.0;
 #[derive(Clone, Copy)]
 struct TrendSample {
     t: Instant,
-    cpu_pct: f32,
+    /// 이 표본의 cpu% — **믿을 수 있을 때만** `Some`. 무효(`SysMetrics::cpu_valid=false`)한 값은 부팅 이후
+    /// 누적 평균이라 sparkline 막대·화살표를 그대로 오염시킨다. 표시·임계·기록 경로에서 버리는 값을
+    /// 추세 그래프에만 남길 이유가 없으므로 여기서도 배제한다(`None`은 sparkline이 건너뛴다).
+    cpu_pct: Option<f32>,
     mem_pct: f64,
     disk_avail: u64,
 }
@@ -797,7 +820,7 @@ impl TrendTracker {
         // ring push + window trim(시간 기준). armed 여부와 무관하게 쌓아 이력을 확보한다.
         self.ring.push(TrendSample {
             t: now,
-            cpu_pct: m.cpu_pct,
+            cpu_pct: m.cpu_valid.then_some(m.cpu_pct),
             mem_pct: m.mem_pct(),
             disk_avail: avail,
         });
@@ -878,8 +901,17 @@ impl TrendTracker {
         let vals: Vec<f64> = match chosen.0 {
             SEG_MEM => tail.iter().map(|s| s.mem_pct).collect(),
             SEG_DISK => tail.iter().map(|s| s.disk_avail as f64).collect(),
-            _ => tail.iter().map(|s| s.cpu_pct as f64).collect(),
+            // cpu는 무효 표본(None)을 건너뛴다 — 부팅 누적 평균이 막대·화살표를 왜곡하지 않게.
+            _ => tail
+                .iter()
+                .filter_map(|s| s.cpu_pct)
+                .map(f64::from)
+                .collect(),
         };
+        // 무효 표본을 걸러 낸 뒤 남은 점이 너무 적으면(첫 tick 직후) 아직 추세를 그리지 않는다.
+        if vals.len() < 3 {
+            return None;
+        }
         let (lo, hi, arrow_thr, flat_below) = match chosen.0 {
             SEG_DISK => {
                 let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1129,6 +1161,55 @@ mod tests {
         );
     }
 
+    /// 무효 cpu는 **표시 경로에서도** 숫자를 내지 않는다 — 기록 경로에서 버리는 값을 화면에서만
+    /// 진짜인 척 보여줄 이유가 없다(같은 값이 같은 이유로 거짓이다). status_line·status_segments가
+    /// 같은 토큰(`cpu --%`)을 쓰는지도 함께 확인한다.
+    #[test]
+    fn invalid_cpu_is_rendered_as_unknown_not_a_number() {
+        let m = SysMetrics {
+            cpu_pct: 20.94, // 부팅 이후 누적 평균(실측) — 그럴싸하지만 거짓
+            cpu_valid: false,
+            cores: 8,
+            ..Default::default()
+        };
+        let line = m.status_line();
+        assert!(line.contains("cpu --%"), "{line}");
+        assert!(
+            !line.contains("cpu 21%"),
+            "거짓 숫자를 표시하면 안 된다: {line}"
+        );
+        let seg = m
+            .status_segments()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("cpu"))
+            .expect("cpu 세그먼트");
+        assert_eq!(seg.0, "cpu --%", "status_line과 같은 토큰이어야 한다");
+    }
+
+    /// 무효 cpu로는 **임계 판정도 하지 않는다**(Normal). 부팅 누적 평균이 높은 호스트에서 첫 tick에
+    /// 거짓 경보가 나가는 것을 막는다 — AlertTracker가 `cpu_sev`를 그대로 쓰기 때문이다.
+    #[test]
+    fn invalid_cpu_never_triggers_severity_or_alert() {
+        let m = SysMetrics {
+            cpu_pct: 99.0, // 유효했다면 Crit이었을 값
+            cpu_valid: false,
+            cores: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            m.cpu_sev(),
+            Severity::Normal,
+            "믿을 수 없는 값으로 판정하지 않는다"
+        );
+        // AlertTracker도 같은 판정을 공유하므로 첫 관찰에서 cpu 알림이 나오지 않는다.
+        let mut tracker = AlertTracker::new();
+        let alerts = tracker.observe(&m, Instant::now());
+        assert!(
+            !alerts.iter().any(|a| a.message.contains("cpu")),
+            "무효 cpu로 경보를 내면 안 된다"
+        );
+    }
+
     /// `Default`의 안전 기본값 — 출처를 모르는 스냅샷은 cpu를 신뢰하지 않고(false), 나이도 모른다(None).
     #[test]
     fn default_metrics_are_untrusted() {
@@ -1162,6 +1243,7 @@ mod tests {
             disk_write_bps: 512 * 1024,
             net_rx_bps: 3 * 1024 * 1024,
             net_tx_bps: 256 * 1024,
+            cpu_valid: true, // 워밍업된 실제 샘플 — 숫자가 표시돼야 한다
             ..Default::default()
         };
         let line = m.status_line();
@@ -1224,6 +1306,9 @@ mod tests {
             swap_total,
             disk_avail,
             disk_total,
+            // 이 헬퍼가 흉내 내는 것은 **워밍업된 실제 샘플**이다 — cpu 숫자·임계·sparkline을 검증하려면
+            // 그 cpu가 유효해야 한다(무효 스냅샷의 cpu는 표시도 판정도 되지 않는 게 계약이다).
+            cpu_valid: true,
             ..Default::default()
         }
     }
@@ -1579,6 +1664,33 @@ mod tests {
         assert_eq!(trend_arrow(10.0, 20.0, 3.0), '↑');
         assert_eq!(trend_arrow(20.0, 10.0, 3.0), '↓');
         assert_eq!(trend_arrow(10.0, 11.0, 3.0), '→'); // 임계 이하 변화는 정체.
+    }
+
+    /// sparkline ring도 무효 cpu 표본을 배제한다 — 부팅 누적 평균이 막대·화살표를 왜곡하지 않게.
+    /// 표시·임계·기록에서 버리는 값을 추세 그래프에만 남길 이유가 없다(같은 값, 같은 이유).
+    #[test]
+    fn sparkline_skips_invalid_cpu_samples() {
+        let t0 = Instant::now();
+        let g = 1024 * 1024 * 1024;
+        let mut tr = TrendTracker::new();
+        // 무효 cpu 표본만 5개 — cpu 유효 표본이 3개 미만이라 cpu sparkline은 그려지지 않는다.
+        let mut spark = None;
+        for i in 0..5u64 {
+            let mut m = metric(1.0, 20.94, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            m.cpu_valid = false;
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        assert!(
+            spark.is_none(),
+            "무효 cpu 표본만으로는 cpu sparkline을 그리지 않는다"
+        );
+        // 유효 표본이 3개 쌓이면 그때부터 그린다.
+        for i in 5..8u64 {
+            let m = metric(1.0, 50.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        let (idx, _) = spark.expect("유효 표본 3개 이후엔 sparkline이 나온다");
+        assert_eq!(idx, SEG_CPU);
     }
 
     #[test]
