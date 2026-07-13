@@ -7,7 +7,8 @@
 //! 단일 stage. LLM 송신 전 1회 적용. 응답에는 적용 X.
 //! Anthropic key를 OpenAI key보다 먼저 매칭한다 (sk-ant- prefix 충돌 방지).
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,26 +29,48 @@ impl RedactionReport {
 /// secret으로 간주할 최소 Shannon entropy (bits/char). 정형화된 short string의 false positive를 줄인다.
 const SECRET_ENTROPY_MIN: f64 = 3.0;
 
+/// `patterns()`와 **같은 순서·같은 인덱스**로 컴파일된 RegexSet pre-filter.
+/// 단일 DFA 패스로 매치 후보가 없으면 순차 `replace_all` 패스 전체를 건너뛴다.
+fn pattern_set() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        RegexSet::new(patterns().iter().map(|(_, r, _)| r.as_str())).expect("RegexSet 컴파일 실패")
+    })
+}
+
 /// 입력 텍스트에서 secret/PII를 `[REDACTED:kind]`로 마스킹하고 보고서를 반환한다.
 pub fn redact(text: &str) -> (String, RedactionReport) {
-    let mut current = text.to_string();
     let mut counts: Vec<(String, usize)> = Vec::new();
 
-    for (name, regex, is_secret) in patterns().iter() {
+    // RegexSet pre-filter: 매치 후보가 전혀 없으면 replace_all 11회를 전부 건너뛰고
+    // to_string() 1회만으로 조기 반환한다 (Cow::Borrowed 강제 할당 방지).
+    let hits = pattern_set().matches(text);
+    if !hits.matched_any() {
+        return (text.to_string(), RedactionReport { counts });
+    }
+
+    let pats = patterns();
+    let mut current = text.to_string();
+    for idx in hits.iter() {
+        // idx는 오름차순으로 순회되므로 patterns() 선언 순서(기존 우선순위)가 보존된다.
+        let (name, regex, is_secret) = &pats[idx];
         let mut count = 0usize;
         let placeholder = format!("[REDACTED:{name}]");
-        current = regex
-            .replace_all(&current, |caps: &regex::Captures| {
-                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                // secret은 entropy 보조 검증 — 너무 단조롭면 false positive로 간주, 원본 유지
-                if *is_secret && shannon_entropy(matched) < SECRET_ENTROPY_MIN {
-                    matched.to_string()
-                } else {
-                    count += 1;
-                    placeholder.clone()
-                }
-            })
-            .into_owned();
+        match regex.replace_all(&current, |caps: &regex::Captures| {
+            let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+            // secret은 entropy 보조 검증 — 너무 단조롭면 false positive로 간주, 원본 유지
+            if *is_secret && shannon_entropy(matched) < SECRET_ENTROPY_MIN {
+                matched.to_string()
+            } else {
+                count += 1;
+                placeholder.clone()
+            }
+        }) {
+            // 매치가 없으면 replace_all이 Cow::Borrowed를 반환한다 — 이 경우
+            // current를 갱신하지 않아 불필요한 문자열 복사를 피한다.
+            Cow::Borrowed(_) => {}
+            Cow::Owned(s) => current = s,
+        }
         if count > 0 {
             counts.push(((*name).to_string(), count));
         }
@@ -140,9 +163,39 @@ fn patterns() -> &'static Vec<(&'static str, Regex, bool)> {
     })
 }
 
+/// `redact()`의 최적화 이전 구현 — RegexSet pre-filter 없이 11개 regex를
+/// 무조건 순차 `replace_all` 한다. differential proptest의 oracle로만 쓴다.
+#[cfg(test)]
+fn redact_legacy(text: &str) -> (String, RedactionReport) {
+    let mut current = text.to_string();
+    let mut counts: Vec<(String, usize)> = Vec::new();
+
+    for (name, regex, is_secret) in patterns().iter() {
+        let mut count = 0usize;
+        let placeholder = format!("[REDACTED:{name}]");
+        current = regex
+            .replace_all(&current, |caps: &regex::Captures| {
+                let matched = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                if *is_secret && shannon_entropy(matched) < SECRET_ENTROPY_MIN {
+                    matched.to_string()
+                } else {
+                    count += 1;
+                    placeholder.clone()
+                }
+            })
+            .into_owned();
+        if count > 0 {
+            counts.push(((*name).to_string(), count));
+        }
+    }
+
+    (current, RedactionReport { counts })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── Secret 5종 (TP) ───────────────────────────────────────
 
@@ -359,5 +412,40 @@ mod tests {
         // PII는 entropy와 무관 — 정형화된 짧은 패턴이 그대로 redact
         let (out, _) = redact("test@a.bc");
         assert!(out.contains("[REDACTED:email]"));
+    }
+
+    // ── RegexSet pre-filter ───────────────────────────────────
+
+    #[test]
+    fn regexset_indices_align_with_patterns() {
+        let set = pattern_set();
+        let pats = patterns();
+        assert_eq!(set.len(), pats.len());
+        for (i, p) in set.patterns().iter().enumerate() {
+            assert_eq!(p.as_str(), pats[i].1.as_str(), "index {i} mismatch");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn redact_matches_legacy(s in ".{0,400}") {
+            let (fast, _) = redact(&s);
+            let (legacy, _) = redact_legacy(&s);
+            prop_assert_eq!(fast, legacy);
+        }
+    }
+
+    #[test]
+    fn stress_pathological_input_completes_quickly() {
+        // 중첩 수량자를 자극하는 100k자 pathological 입력 — catastrophic backtracking이면
+        // 100ms를 훌쩍 넘긴다. RegexSet(DFA 기반)은 선형 시간이어야 한다.
+        let input = "a".repeat(50_000) + "01" + &"2".repeat(50_000);
+        let start = std::time::Instant::now();
+        let (_out, _r) = redact(&input);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 100,
+            "redact took {elapsed:?}, expected < 100ms"
+        );
     }
 }
