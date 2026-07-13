@@ -215,6 +215,20 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // OTLP changes exporter (opt-in, [aicd.exporter] enabled=true + changes_enabled=true).
+    // 프로세스 테이블을 주기적으로 스냅샷해 직전 tick과 diff → start/exit/rss_spike 전이만 push한다.
+    let changes_handle = match load_changes_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
+        Some(cfg) => {
+            let ch_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::serve_changes(cfg, ch_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP changes exporter 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
     // OTLP agent exporter (opt-in, [aicd.exporter] enabled=true + agent_enabled=true).
     // AgentEventBus tap을 구독해 chat/agent 행위를 실시간으로 push한다. events와 같은 push 기반
     // 구조지만, 소스가 store가 아니라 bus라 별도 task로 둔다.
@@ -256,6 +270,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = agent_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = changes_handle {
         let _ = h.await;
     }
 
@@ -452,6 +469,35 @@ fn load_connections_config(
         interval: std::time::Duration::from_secs(ex.connections_interval_secs.max(1)),
         aic_bin: resolve_aic_bin(),
         timeout: std::time::Duration::from_secs(15),
+        spool,
+        health,
+    })
+}
+
+/// changes exporter 설정 로더. connections와 동일한 게이트(부모 `enabled` + 자기 플래그 +
+/// endpoint)를 통과해야 task가 뜬다. `aic` 바이너리를 spawn하지 않으므로 `aic_bin`/`timeout`이
+/// 없다 — 프로세스 테이블은 aicd가 sysinfo로 직접 읽는다.
+fn load_changes_config(
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+) -> Option<aic_server::otlp_exporter::ChangesConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.changes_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — changes exporter 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::ChangesConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        interval: std::time::Duration::from_secs(ex.changes_interval_secs.max(1)),
         spool,
         health,
     })
