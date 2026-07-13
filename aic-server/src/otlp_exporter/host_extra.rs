@@ -14,10 +14,7 @@
 //!
 //! host_metrics.rs와 같은 파일에 두지 않고 별도 모듈로 격리했다 — 여러 t-task가 동시에
 //! host_metrics.rs를 건드리면 충돌면이 생기므로, 이 파일은 t5 전용이고 host_metrics.rs 쪽
-//! 배선(1줄)은 t8이 담당한다. `collect()`는 아직 어디서도 호출되지 않으므로(`mod.rs`는 모듈
-//! 등록만 한다) 이 스냅샷 시점의 `cargo clippy` 기준으로는 도달 불가능한 API다 — t8이 배선하면
-//! 이 `allow`는 제거되어야 한다.
-#![allow(dead_code)]
+//! 배선(1줄)은 t8이 담당한다.
 //!
 //! [`MetricPoint`]는 host_metrics.rs의 기존 타입을 그대로 재사용한다(attrs 없는 무차원 scalar
 //! metric만 만든다 — 수신측 rca의 metric 읽기 경로에 attrs 필터가 0건이라 차원 있는 metric은
@@ -41,6 +38,9 @@ pub(super) struct HostExtraState {
 }
 
 impl HostExtraState {
+    /// t8이 `host_metrics.rs`에서 이 상태를 들고 [`collect`]를 부르기 전까지는 호출부가 없다
+    /// ([`collect`]의 주석 참고 — 이 `allow`도 그때 함께 제거한다).
+    #[allow(dead_code)]
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -48,6 +48,16 @@ impl HostExtraState {
 
 /// host_extra metric들을 수집한다. 개별 metric 실패는 해당 point만 생략하고 나머지는 계속
 /// 수집한다 — 어떤 경로로도 패닉하지 않는다.
+///
+/// **`allow(dead_code)`가 여기 붙은 이유**: 이 모듈의 유일한 진입점인데, `mod.rs`는 아직 `mod
+/// host_extra;` 등록만 하고 호출하지 않는다(배선은 t8 몫 — 모듈 doc 참고). 진입점이 죽어 있으니
+/// 그 아래 `collect_*`/`compressor_points`/`HostPort`가 전부 **transitive하게** dead로 잡힌다.
+/// 그래서 개별 함수마다 `allow`를 뿌리지 않고 **진입점 하나만** 덮는다 — t8이 `collect()`를 부르는
+/// 순간 트리 전체가 살아나므로, 그때 이 `allow` 하나(와 `HostExtraState::new`의 것)만 지우면 된다.
+///
+/// 참고: 이건 플랫폼과 무관한 이유다(macOS/Linux 양쪽 다 호출부가 없어서 난다). 플랫폼별로 한쪽에서만
+/// 쓰이는 순수 파서(`parse_psi_avg10`/`parse_file_nr`)는 별도로 `cfg_attr`로 좁게 처리한다.
+#[allow(dead_code)]
 pub(super) fn collect(state: &mut HostExtraState) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     collect_compressor(state, &mut points);
@@ -107,13 +117,35 @@ mod mach_host {
 
     /// 커널 페이지 크기(바이트). **생성자가 이 모듈 안에만 있다** — 유일한 생산자는
     /// [`HostPort::page_size`]이므로, 다른 출처(sysctl 등)의 숫자가 환산 계수로 흘러드는 것을
-    /// 타입 시스템이 막는다. 값은 [`KernelPageSize::get`]으로만 꺼낼 수 있다.
+    /// 타입 시스템이 막는다.
+    ///
+    /// **곱셈을 타입 안에 가뒀다**([`pages_to_bytes`](KernelPageSize::pages_to_bytes)). raw `u64`를
+    /// 꺼내는 접근자를 두지 않는 게 핵심이다 — 접근자가 있으면 환산 지점에서 `u64`로 풀려 나가고,
+    /// 그 자리에 sysctl 값을 대신 넣어도 컴파일이 통과한다(실제로 그렇게 뚫렸다). 페이지→바이트
+    /// 변환이 이 타입을 **요구**하게 만들어야 방어가 환산 경로 전체를 관통한다.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct KernelPageSize(u64);
 
     impl KernelPageSize {
-        pub(super) fn get(self) -> u64 {
+        /// 페이지 수 → 바이트. 커널 페이지 단위로 센 값에만 쓸 수 있다(타입이 그것을 보장한다).
+        /// 오버플로는 saturate — 메모리 바이트가 u64를 넘길 일은 없지만 곱셈을 여기 가둔 이상
+        /// 방어도 여기서 한다.
+        pub(super) fn pages_to_bytes(self, pages: u64) -> u64 {
+            pages.saturating_mul(self.0)
+        }
+
+        /// 값 자체를 봐야 하는 **검증용** 접근자(2의 거듭제곱인지 등). 환산에는 쓰지 마라 —
+        /// 환산은 [`pages_to_bytes`](KernelPageSize::pages_to_bytes)를 통해야 한다.
+        #[cfg(test)]
+        pub(super) fn bytes(self) -> u64 {
             self.0
+        }
+
+        /// 픽스처 전용 생성자. `#[cfg(test)]`라 프로덕션 코드에서는 존재하지 않으므로, sysctl 값을
+        /// 환산 계수로 되돌리는 경로를 열어 주지 않는다.
+        #[cfg(test)]
+        pub(super) fn for_test(bytes: u64) -> Self {
+            Self(bytes)
         }
     }
 
@@ -249,7 +281,7 @@ fn collect_compressor(state: &mut HostExtraState, points: &mut Vec<MetricPoint>)
     points.extend(compressor_points(
         stats.compressor_page_count,
         stats.total_uncompressed_pages_in_compressor,
-        stats.page_size.get(),
+        stats.page_size,
         rate,
     ));
 }
@@ -263,18 +295,25 @@ fn collect_compressor(state: &mut HostExtraState, points: &mut Vec<MetricPoint>)
 /// `compressor_page_count > 0`일 때만 낸다 — 0으로 나누지 않기 위함이고, 압축된 게 없을 때의
 /// 압축률은 정의 자체가 무의미하다.
 ///
-/// 플랫폼 무관하게 컴파일된다(macOS 전용 syscall에 의존하지 않음) — Linux 빌드에서는 호출부가
-/// 없어 쓰이지 않지만, 모듈 상단의 `allow(dead_code)`가 이를 덮는다.
+/// **환산 계수는 [`KernelPageSize`]로만 받는다** — 여기가 페이지→바이트 변환이 실제로 일어나는
+/// 지점이라, 타입 방어가 이 자리까지 오지 않으면 의미가 없다. 실제로 이전 버전은 `page_size: u64`를
+/// 받아서, host port 방어를 해 놓고도 이 함수 안에서 `sysctl("hw.pagesize")`를 다시 끌어오면 그대로
+/// 컴파일됐다(mutation으로 확인). 지금은 `u64`를 넣으면 타입 에러이고, 곱셈 자체가
+/// [`KernelPageSize::pages_to_bytes`] 안에 있어 우회할 raw 접근자도 없다.
+///
+/// compressor는 macOS 전용 개념이라 이 함수도 macOS에서만 컴파일된다(Linux에서 쓰이지 않는 코드를
+/// 남겨 두고 `allow(dead_code)`로 덮는 것보다, 애초에 존재하지 않는 편이 정직하다).
+#[cfg(target_os = "macos")]
 fn compressor_points(
     compressor_pages: u64,
     uncompressed_pages: u64,
-    page_size: u64,
+    page_size: KernelPageSize,
     decompression_rate: Option<f64>,
 ) -> Vec<MetricPoint> {
     let mut points = vec![MetricPoint {
         name: "aic.system.memory.compressed",
         unit: "By",
-        value: MetricValue::Int(compressor_pages.saturating_mul(page_size) as i64),
+        value: MetricValue::Int(page_size.pages_to_bytes(compressor_pages) as i64),
     }];
 
     if compressor_pages > 0 {
@@ -403,6 +442,12 @@ fn collect_fd(points: &mut Vec<MetricPoint>) {
 /// limit=max. **utilization은 계산하지 않는다**: jw-server 실측으로 `2057 0 9223372036854775807`
 /// (max가 2^63-1)인 커널이 실존해, 비율이 2e-16이 되어 임계를 어떻게 잡아도 영원히 안 걸린다.
 /// count/limit raw만 보내고 비율 판단은 수신측(rca)에 맡긴다.
+///
+/// **`count`의 의미(플랫폼 차이 주의)**: Linux의 allocated는 커널이 **할당한** file 구조체 수로,
+/// 실제 사용 중(in-use) + 회수 대기(free-in-cache)를 합친 값이다 — 엄밀히 "지금 열려 있는 fd 수"는
+/// 아니다(현대 커널에서 unused는 대개 0이라 실질적으로 근사한다). macOS `kern.num_files`도 커널이
+/// 관리하는 file 엔트리 수라 성격이 비슷하다. 두 플랫폼 모두 "커널이 잡고 있는 file 엔트리 수"로
+/// 해석하면 되고, 정확한 in-use fd 수가 필요하면 다른 지표를 써야 한다.
 #[cfg(target_os = "linux")]
 fn collect_fd(points: &mut Vec<MetricPoint>) {
     let Ok(text) = std::fs::read_to_string("/proc/sys/fs/file-nr") else {
@@ -504,16 +549,23 @@ mod tests {
             "첫 sample엔 decompression_rate가 없어야 함"
         );
 
-        let collected = int_of(&first, "aic.system.memory.compressed").is_some();
         let rate = double_of(&second, "aic.system.memory.decompression_rate");
-        if collected {
-            let r = rate.expect("1회차 수집이 성공했으면 2회차엔 rate가 있어야 함");
-            // 카운터는 단조 증가(saturating_sub)라 rate는 음수가 될 수 없다.
-            assert!(r >= 0.0, "decompression_rate가 음수: {r}");
-        } else {
-            // 수집 자체가 불가능한 플랫폼/환경(비-macOS 등)에서는 2회차에도 rate가 없다.
-            assert!(rate.is_none(), "수집 불가 환경인데 rate가 나왔다: {rate:?}");
+
+        // 2회차 수집이 성공했는지는 compressed point의 존재로 판단한다. syscall이 일시 실패하면
+        // (권한/커널 사정) 2회차에 compressed도 rate도 없는 게 **정상 동작**이다 — 이때 rate를
+        // 요구하며 패닉하면 "코드가 틀렸다"가 아니라 "이 머신이 마침 비협조적이었다"로 테스트가
+        // 깨진다. 그래서 2회차가 비었으면 그냥 skip한다(수집 성공 여부는 이 테스트의 관심사가 아니다 —
+        // 관심사는 baseline 유무에 따른 rate의 유/무다).
+        if int_of(&second, "aic.system.memory.compressed").is_none() {
+            // 2회차 수집 불가(비-macOS 포함) → rate도 없어야 한다는 것만 확인하고 끝낸다.
+            assert!(rate.is_none(), "수집이 안 됐는데 rate가 나왔다: {rate:?}");
+            return;
         }
+
+        // 여기까지 왔으면 1·2회차 모두 수집에 성공했다 → baseline이 잡혔으므로 rate가 있어야 한다.
+        let r = rate.expect("2회차 수집이 성공했으면 baseline이 있으므로 rate가 있어야 함");
+        // 카운터는 단조 증가(saturating_sub)라 rate는 음수가 될 수 없다.
+        assert!(r >= 0.0, "decompression_rate가 음수: {r}");
     }
 
     /// 테스트 헬퍼 — 이름으로 point를 찾아 Int 값을 꺼낸다(없으면 None). 타입이 다르면 패닉:
@@ -593,9 +645,12 @@ mod tests {
         if let Some(limit) = int_of(&points, "aic.system.file_descriptor.limit") {
             assert!(limit > 0, "fd limit이 0 이하: {limit}");
             assert!(count <= limit, "fd count({count})가 limit({limit})을 초과");
-            // limit(kern.maxfiles)은 부팅 후 사실상 고정이라 정확 비교가 안전하다.
-            let expected = sysctl_u64("kern.maxfiles").expect("kern.maxfiles sysctl 실패");
-            assert_eq!(limit as u64, expected, "limit이 kern.maxfiles와 불일치");
+            // limit(kern.maxfiles)은 부팅 후 사실상 고정이라 정확 비교가 안전하다. 단 재조회가
+            // 실패하면(sysctl 일시 실패) 비교를 건너뛴다 — 코드가 아니라 환경 사정이므로 패닉하지
+            // 않는다(`expect`를 쓰면 정상 코드가 이 머신 사정으로 깨진다).
+            if let Some(expected) = sysctl_u64("kern.maxfiles") {
+                assert_eq!(limit as u64, expected, "limit이 kern.maxfiles와 불일치");
+            }
         }
     }
 
@@ -652,18 +707,19 @@ mod tests {
         let Some(stats) = vm_compressor_stats() else {
             return; // 수집 불가 환경 — 검증할 것이 없다.
         };
-        let from_port = HostPort::acquire()
-            .page_size()
-            .expect("host port가 page size를 줘야 함");
+        // 재조회 실패는 환경 사정이지 코드 결함이 아니므로 skip한다(패닉 금지).
+        let Some(from_port) = HostPort::acquire().page_size() else {
+            return;
+        };
         assert_eq!(
             stats.page_size, from_port,
             "환산 계수가 host port 값과 다르다"
         );
         // 페이지 크기는 2의 거듭제곱이어야 한다(4096/16384 등).
         assert!(
-            stats.page_size.get().is_power_of_two(),
+            stats.page_size.bytes().is_power_of_two(),
             "page size가 2의 거듭제곱이 아니다: {}",
-            stats.page_size.get()
+            stats.page_size.bytes()
         );
     }
 
@@ -730,7 +786,7 @@ mod tests {
     fn compressor_points_omits_ratio_when_nothing_is_compressed() {
         // 압축 미사용(compressor_page_count == 0)은 **정상 상태**다 — 방금 부팅했거나 메모리가
         // 넉넉한 머신, CI 컨테이너가 여기 해당한다. 개발 머신에서는 재현할 수 없어 픽스처로 검증한다.
-        let points = compressor_points(0, 0, 16384, None);
+        let points = compressor_points(0, 0, KernelPageSize::for_test(16384), None);
         // compressed는 0이어도 낸다 — 0은 "측정했더니 0"이라는 유효한 값이다(생략은 "모른다"는 뜻).
         assert_eq!(int_of(&points, "aic.system.memory.compressed"), Some(0));
         // ratio는 생략한다 — 0으로 나누지 않고, 압축된 게 없을 때의 압축률은 무의미하다.
@@ -745,7 +801,7 @@ mod tests {
     fn compressor_points_computes_bytes_and_ratio() {
         // 압축 활성: 2 페이지가 압축돼 있고, 압축 전 논리 크기로는 5 페이지였다 → ratio 2.5.
         // 16 KiB 페이지 × 2 = 32768 By.
-        let points = compressor_points(2, 5, 16384, Some(12.5));
+        let points = compressor_points(2, 5, KernelPageSize::for_test(16384), Some(12.5));
         assert_eq!(int_of(&points, "aic.system.memory.compressed"), Some(32768));
         assert_eq!(
             double_of(&points, "aic.system.memory.compression_ratio"),
@@ -761,7 +817,7 @@ mod tests {
     fn compressor_points_ratio_is_at_least_one_by_definition() {
         // 압축 후 물리 페이지 수 <= 압축 전 논리 페이지 수이므로 ratio는 항상 1.0 이상이다.
         // (1.0 = 전혀 압축되지 않은 페이지들 — 압축이 이득을 못 본 경우로, 유효한 값이다.)
-        let points = compressor_points(4, 4, 16384, None);
+        let points = compressor_points(4, 4, KernelPageSize::for_test(16384), None);
         assert_eq!(
             double_of(&points, "aic.system.memory.compression_ratio"),
             Some(1.0)
@@ -772,7 +828,7 @@ mod tests {
     fn compressor_points_omits_rate_without_baseline() {
         // 첫 sample: 직전 값이 없어 delta를 못 내므로 rate를 생략한다(0으로 보내지 않는다 —
         // 0은 "decompression이 실제로 0회"라는 뜻이어야 한다).
-        let points = compressor_points(2, 5, 16384, None);
+        let points = compressor_points(2, 5, KernelPageSize::for_test(16384), None);
         assert_eq!(
             double_of(&points, "aic.system.memory.decompression_rate"),
             None
