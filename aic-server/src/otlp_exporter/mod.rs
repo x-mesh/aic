@@ -33,6 +33,7 @@ mod backoff;
 mod connections;
 mod encode;
 mod events;
+mod health;
 mod host_metrics;
 mod logs_proto;
 mod ntp;
@@ -41,6 +42,7 @@ mod spool;
 pub use agent::{serve_agent, AgentConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
 pub use events::{serve_events, EventsConfig};
+pub use health::ExporterHealth;
 pub use spool::{Spool, SignalKind};
 
 use std::sync::Arc;
@@ -64,6 +66,8 @@ pub struct ExporterConfig {
     pub spool: Arc<Spool>,
     /// 드레인 한 tick당 최대 배치 수(속도 제한). config `[aicd.exporter].spool_drain_batch_limit`.
     pub drain_batch_limit: usize,
+    /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
+    pub health: Arc<ExporterHealth>,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
@@ -162,8 +166,10 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
 
                 if tick_failed {
                     backoff.on_failure();
+                    cfg.health.record_fail();
                 } else {
                     backoff.on_success();
+                    cfg.health.record_ok();
                 }
             }
             changed = shutdown.changed() => {

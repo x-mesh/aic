@@ -1121,7 +1121,10 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
 /// 스캔된 finding을 aicd(OTLP `aic.agent`)로 넘긴다. aicd 미실행/exporter 비활성이면 조용히
 /// 버려진다. `Severity`(Normal/Warn/Crit)를 OTLP severity 표기로 매핑한다 — Crit은 이미 벌어진
 /// 사고(OOM kill 등)라 ERROR, 임계 위반은 WARN이다.
-fn emit_findings(findings: &[Finding]) {
+///
+/// `scan_findings`는 순수 함수로 두고(테스트가 매 호출마다 IPC를 시도하지 않도록) 스캔 **호출부**가
+/// 이걸 부른다. 호출부는 셋이다 — headless `aic diagnose`, chat `/local`, chat `/diagnose`.
+pub(crate) fn emit_findings(findings: &[Finding]) {
     for f in findings {
         let severity = match f.severity {
             Severity::Crit => "ERROR",

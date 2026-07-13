@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aic_server::otlp_exporter::{serve, ExporterConfig, SignalKind, Spool};
+use aic_server::otlp_exporter::{serve, ExporterConfig, ExporterHealth, SignalKind, Spool};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -67,6 +67,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
     spool.append(SignalKind::Logs, b"preexisting-logs-batch").unwrap();
 
     let (sd_tx, sd_rx) = watch::channel(false);
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
     let cfg = ExporterConfig {
         endpoint: format!("http://{addr}"),
         token: None,
@@ -74,6 +75,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         service_version: "9.9.9".to_string(),
         spool: spool.clone(),
         drain_batch_limit: 50,
+        health,
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 

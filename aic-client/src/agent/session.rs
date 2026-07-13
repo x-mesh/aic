@@ -1152,6 +1152,7 @@ impl AgentSession {
         // 결정적 임계 스캔 — /local 기본 섹션(disk 등)의 임계 위반을 LLM 무관하게 즉시 표면화한다.
         // 사용자에게 표시하고, analyze면 분석 프롬프트 evidence 상단에도 prepend한다(/diagnose와 동일).
         let findings = super::diagnose::scan_findings(&snapshot);
+        super::diagnose::emit_findings(&findings);
         let block = super::diagnose::render_findings_block(&findings);
         if !block.is_empty() {
             self.out.note(&format!("\n{}", block.trim_end())).await;
@@ -1346,6 +1347,7 @@ impl AgentSession {
         // 결정적 임계 스캔(LLM 무관 즉시 신호) — 대화형에도 노출(headless와 동등). 발견을 사용자에게
         // 표시하고, analyze면 LLM evidence 상단에도 prepend해 진단을 그 신호 위에서 시작하게 한다.
         let findings = super::diagnose::scan_findings(&snapshot);
+        super::diagnose::emit_findings(&findings);
         let block = super::diagnose::render_findings_block(&findings);
         if !block.is_empty() {
             self.out.note(&format!("\n{}", block.trim_end())).await;
