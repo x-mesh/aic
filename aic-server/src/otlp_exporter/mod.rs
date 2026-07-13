@@ -16,9 +16,13 @@
 //! t7 추가분: [`events`](events)는 `CommandRecordStore`의 tap(broadcast)을 구독해 command 종료를
 //! OTLP Logs로, [`connections`](connections)는 주기적으로 `aic snapshot inventory --json`을
 //! spawn해 얻은 connections/inventory 스냅샷을 OTLP Logs로 각각 `{endpoint}/v1/logs`에 push한다.
-//! 두 task 모두 host metrics task(`serve`)와 동일하게 독립 tokio task로 떠서 같은 shutdown watch를
-//! 공유한다(aicd_main.rs). 각각 config `[aicd.exporter]`의 `events_enabled`/`connections_enabled`로
-//! 개별 on/off된다.
+//! [`docker`](docker)는 주기적으로 `docker system df --format json`을 spawn해 얻은 이미지/컨테이너/
+//! 볼륨/빌드 캐시 디스크 사용량을 OTLP **Metrics**로 `{endpoint}/v1/metrics`에 push한다(로그가
+//! 아니라 스칼라 게이지라 host metrics와 같은 `/v1/metrics` 경로를 쓴다). 세 task 모두 host
+//! metrics task(`serve`)와 동일하게 독립 tokio task로 떠서 같은 shutdown watch를 공유한다
+//! (aicd_main.rs). 각각 config `[aicd.exporter]`의
+//! `events_enabled`/`connections_enabled`/`docker_enabled`로 개별 on/off된다(`docker_enabled`만
+//! 기본 false — docker.rs 모듈 doc 참고).
 //!
 //! t8 추가분(오프라인 durability): 세 task 모두 push 실패 시 [`spool::Spool`]에 인코딩 결과를
 //! 그대로 적재한다(`Arc<Spool>`을 세 Config가 공유 — 상한/드레인 상태를 하나로 일관되게 추적하기
@@ -32,6 +36,7 @@ mod agent;
 mod backoff;
 mod changes;
 mod connections;
+mod docker;
 mod encode;
 mod events;
 mod health;
@@ -44,6 +49,7 @@ mod spool;
 pub use agent::{serve_agent, AgentConfig};
 pub use changes::{serve_changes, ChangesConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
+pub use docker::{serve_docker, DockerConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;
 pub use spool::{Spool, SignalKind};

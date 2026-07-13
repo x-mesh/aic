@@ -543,11 +543,13 @@ pub struct AicdConfig {
 ///
 /// 기본 **비활성**이다. 활성화하면 aicd가 주기적으로 sysinfo 기반 host metrics(cpu/load/mem/
 /// swap/disk/net)를 수집해 OTLP protobuf로 인코딩한 뒤 `{endpoint}/v1/metrics`로 push한다.
-/// `events_enabled`/`connections_enabled`는 `enabled=true`일 때만 의미가 있으며(부모 게이트),
-/// 각각 command 종료 이벤트(OTLP Logs, `/v1/logs`)와 주기 connections/inventory 스냅샷(OTLP Logs,
-/// `/v1/logs`)을 독립적으로 껐다 켤 수 있다. 모든 송신 문자열 필드는 redaction을 거친다. token은
-/// 평문 또는 환경변수 `AIC_EXPORTER_TOKEN`로 주입한다(aicd는 keychain을 resolve하지 않는다 —
-/// webhook secret과 동일 관례).
+/// `events_enabled`/`connections_enabled`/`docker_enabled`는 `enabled=true`일 때만 의미가
+/// 있으며(부모 게이트), 각각 command 종료 이벤트(OTLP Logs, `/v1/logs`), 주기 connections/
+/// inventory 스냅샷(OTLP Logs, `/v1/logs`), docker 디스크 사용량(OTLP Metrics, `/v1/metrics`)을
+/// 독립적으로 껐다 켤 수 있다. `docker_enabled`만 부모 게이트가 켜져도 기본 false다(외부 `docker`
+/// CLI 의존 — 필드 자체 doc 참고). 모든 송신 문자열 필드는 redaction을 거친다. token은 평문 또는
+/// 환경변수 `AIC_EXPORTER_TOKEN`로 주입한다(aicd는 keychain을 resolve하지 않는다 — webhook
+/// secret과 동일 관례).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AicdExporterConfig {
     /// exporter 활성화 여부. 기본 false(opt-in). false면 코드 경로 완전 비활성(하위 플래그 무관).
@@ -602,6 +604,18 @@ pub struct AicdExporterConfig {
     /// connections(60초)보다 짧게 잡는 이유가 그것이다.
     #[serde(default = "default_changes_interval")]
     pub changes_interval_secs: u64,
+    /// `docker system df --format json`로 이미지/컨테이너/볼륨/빌드 캐시 디스크 사용량(OTLP
+    /// Metrics, `/v1/metrics`)을 push할지. **기본 false** — 다른 `*_enabled` 플래그(기본 true)와
+    /// 달리 부모 게이트(`enabled`)가 켜져도 opt-in이다. 이 exporter만 유일하게 외부 CLI(`docker`)
+    /// 설치를 전제하기 때문이다(나머지는 `aic` 자체 spawn 또는 in-process sysinfo/tap이라 항상
+    /// 가용). Docker 없는 호스트에서 자동으로 켜지면 매 tick spawn 실패 WARN만 쌓인다 — 명시적
+    /// opt-in으로 그 노이즈를 막는다.
+    #[serde(default)]
+    pub docker_enabled: bool,
+    /// docker 디스크 사용량 캡처 주기(초). `docker` 바이너리를 spawn하는 비용이 있어 host metrics
+    /// interval_secs와 별개로 둔다(connections_interval_secs와 동일 이유). 기본 60초.
+    #[serde(default = "default_docker_interval")]
+    pub docker_interval_secs: u64,
 }
 
 impl Default for AicdExporterConfig {
@@ -619,6 +633,8 @@ impl Default for AicdExporterConfig {
             spool_drain_batch_limit: default_spool_drain_batch_limit(),
             changes_enabled: true,
             changes_interval_secs: default_changes_interval(),
+            docker_enabled: false,
+            docker_interval_secs: default_docker_interval(),
         }
     }
 }
@@ -633,6 +649,10 @@ fn default_connections_interval() -> u64 {
 
 fn default_changes_interval() -> u64 {
     30
+}
+
+fn default_docker_interval() -> u64 {
+    60
 }
 
 fn default_spool_max_bytes() -> u64 {
