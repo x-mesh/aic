@@ -60,75 +60,145 @@ pub(super) fn collect(state: &mut HostExtraState) -> Vec<MetricPoint> {
 // macOS: memory compressor (host_statistics64/HOST_VM_INFO64)
 // ---------------------------------------------------------------------------------------------
 
-/// `host_statistics64(HOST_VM_INFO64)`에서 뽑아 쓰는 필드만 담은 최소 구조체.
+/// `host_statistics64(HOST_VM_INFO64)`에서 뽑아 쓰는 필드 + 그 페이지 수를 바이트로 환산할 때
+/// 쓸 페이지 크기. **page_size를 같은 구조체에 담는 게 핵심이다** — 아래 `vm_compressor_stats`가
+/// 통계와 페이지 크기를 **같은 host port**에서 한꺼번에 얻어 단위 불일치를 구조적으로 차단한다
+/// (자세한 근거는 [`HostPort::page_size`] doc 참고).
 #[cfg(target_os = "macos")]
 struct VmCompressorStats {
-    /// 압축기(compressor) 안에 있는 페이지 수.
+    /// 압축기(compressor) 안에 있는 페이지 수. **커널 페이지** 단위다.
     compressor_page_count: u64,
     /// 압축기 안 페이지들을 압축 전(원본) 크기로 환산한 페이지 수 — `compressor_page_count`와의
     /// 비율이 compression_ratio다.
     total_uncompressed_pages_in_compressor: u64,
     /// 부팅 이후 누적 decompression 횟수(카운터) — 초당 rate로 환산하려면 delta가 필요하다.
     decompressions: u64,
+    /// 위 페이지 수들과 **같은 host port**에서 얻은 커널 페이지 크기. [`KernelPageSize`] 타입이라
+    /// sysctl 등 다른 출처의 `u64`는 여기 들어올 수 없다(컴파일 에러).
+    page_size: KernelPageSize,
 }
 
-// libc는 `mach_port_deallocate` 바인딩을 노출하지 않는다(0.2.186 기준 — `mach2` crate로 옮겨졌다).
-// 새 의존성을 추가하지 말라는 지침이 있으므로 직접 선언한다. 심볼은 libSystem에 있어 macOS에서
-// 항상 링크되므로 `-lmach` 같은 추가 링크 플래그가 필요 없다.
 #[cfg(target_os = "macos")]
-extern "C" {
-    fn mach_port_deallocate(
-        task: libc::mach_port_t,
-        name: libc::mach_port_t,
-    ) -> libc::kern_return_t;
-}
+use mach_host::{HostPort, KernelPageSize};
 
-/// `mach_host_self()`가 반환한 host port send right의 RAII 소유권.
+/// mach host port와 커널 페이지 크기를 감싸는 **비공개 모듈**.
 ///
-/// **왜 필요한가(누수 버그)**: `mach_host_self()`는 호출할 때마다 send right의 user reference를
-/// 하나 올린다 — 이름(포트 번호)은 같지만 uref가 계속 증가한다. aicd는 상주 데몬이고 이 코드는
-/// 60초마다 호출되므로, 반납하지 않으면 프로세스 수명 내내 uref가 단조 증가한다(하루 1440회).
-/// 참고로 `sysinfo`는 `System::new()`에서 **딱 한 번** 얻어 들고 있어 누수가 없다 — 우리는 주기
-/// 호출이라 그 전략을 쓸 수 없고, 대신 매번 반납해야 한다.
-///
-/// **누수가 없다는 보장**: 획득은 [`HostPort::acquire`] 한 곳에서만 일어나고, 반납은 [`Drop`]에
-/// 있다. Rust는 스코프를 벗어나는 **모든** 경로(정상 반환, `?`/early return, 패닉 unwind)에서
-/// `drop`을 호출하므로, 아래 `vm_compressor_stats`의 `rc != KERN_SUCCESS` early return에서도
-/// 반드시 반납된다. 필드를 밖으로 꺼내 쓰지 못하게 raw 값은 `as_raw()`로만 빌려준다(가드가 살아
-/// 있는 동안만 유효). 이 불변식은 `host_port_send_right_is_not_leaked` 테스트가
-/// `mach_port_get_refs`로 uref를 직접 읽어 회귀 검증한다.
+/// 별도 모듈로 가둔 이유는 [`KernelPageSize`]의 내부 필드를 이 모듈 밖에서 **구성할 수 없게**
+/// 만들기 위해서다. 그 결과 "환산 계수는 host port에서만 나온다"가 주석의 약속이 아니라 **컴파일러가
+/// 강제하는 규칙**이 된다 — `sysctl_u64("hw.pagesize")`가 돌려주는 `u64`는 `KernelPageSize`가
+/// 아니므로 환산 계수 자리에 넣으면 타입 에러다(자세한 사고 경위는 [`HostPort::page_size`] 참고).
 #[cfg(target_os = "macos")]
-struct HostPort(libc::mach_port_t);
+mod mach_host {
+    // libc는 `mach_port_deallocate`/`host_page_size` 바인딩을 노출하지 않는다(0.2.186 기준 — mach
+    // 계열은 `mach2` crate로 옮겨졌다). 새 의존성을 추가하지 말라는 지침이 있으므로 직접 선언한다.
+    // 두 심볼 모두 libSystem에 있어 macOS에서 항상 링크되므로 추가 링크 플래그가 필요 없다.
+    extern "C" {
+        fn mach_port_deallocate(
+            task: libc::mach_port_t,
+            name: libc::mach_port_t,
+        ) -> libc::kern_return_t;
 
-#[cfg(target_os = "macos")]
-impl HostPort {
-    /// `libc::mach_host_self`가 deprecated(대안 `mach2` crate) 표시지만, 새 의존성 금지 지침에
-    /// 따라 의도적으로 계속 쓴다 — 바인딩 자체는 유효하다.
-    #[allow(deprecated)]
-    fn acquire() -> Self {
-        // 특별 권한이 필요 없는 host name port — 부작용 없는 순수 조회용이다.
-        Self(unsafe { libc::mach_host_self() })
+        /// `<mach/mach_init.h>`: `kern_return_t host_page_size(host_t, vm_size_t *)`.
+        fn host_page_size(
+            host: libc::host_t,
+            out_page_size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
     }
 
-    fn as_raw(&self) -> libc::mach_port_t {
-        self.0
-    }
-}
+    /// 커널 페이지 크기(바이트). **생성자가 이 모듈 안에만 있다** — 유일한 생산자는
+    /// [`HostPort::page_size`]이므로, 다른 출처(sysctl 등)의 숫자가 환산 계수로 흘러드는 것을
+    /// 타입 시스템이 막는다. 값은 [`KernelPageSize::get`]으로만 꺼낼 수 있다.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct KernelPageSize(u64);
 
-#[cfg(target_os = "macos")]
-impl Drop for HostPort {
-    #[allow(deprecated)]
-    fn drop(&mut self) {
-        // 반납 실패는 복구할 방법도, 의미 있는 대응도 없다(이미 유효하지 않은 포트라는 뜻).
-        // 패닉 금지 원칙에 따라 무시한다 — Drop에서 패닉하면 unwind 중 abort로 이어질 수 있다.
-        unsafe {
-            let _ = mach_port_deallocate(libc::mach_task_self(), self.0);
+    impl KernelPageSize {
+        pub(super) fn get(self) -> u64 {
+            self.0
+        }
+    }
+
+    /// `mach_host_self()`가 반환한 host port send right의 RAII 소유권.
+    ///
+    /// **왜 필요한가(누수 버그)**: `mach_host_self()`는 호출할 때마다 send right의 user reference를
+    /// 하나 올린다 — 이름(포트 번호)은 같지만 uref가 계속 증가한다. aicd는 상주 데몬이고 이 코드는
+    /// 60초마다 호출되므로, 반납하지 않으면 프로세스 수명 내내 uref가 단조 증가한다(하루 1440회).
+    /// 참고로 `sysinfo`는 `System::new()`에서 **딱 한 번** 얻어 들고 있어 누수가 없다 — 우리는 주기
+    /// 호출이라 그 전략을 쓸 수 없고, 대신 매번 반납해야 한다.
+    ///
+    /// **누수가 없다는 보장**: 획득은 [`HostPort::acquire`] 한 곳에서만 일어나고, 반납은 [`Drop`]에
+    /// 있다. Rust는 스코프를 벗어나는 **모든** 경로(정상 반환, `?`/early return, 패닉 unwind)에서
+    /// `drop`을 호출하므로, `vm_compressor_stats`의 `rc != KERN_SUCCESS` early return에서도 반드시
+    /// 반납된다. 필드를 밖으로 꺼내 쓰지 못하게 raw 값은 `as_raw()`로만 빌려준다(가드가 살아 있는
+    /// 동안만 유효). 이 불변식은 `host_port_send_right_is_not_leaked` 테스트가 `mach_port_get_refs`로
+    /// uref를 직접 읽어 회귀 검증한다.
+    pub(super) struct HostPort(libc::mach_port_t);
+
+    impl HostPort {
+        /// `libc::mach_host_self`가 deprecated(대안 `mach2` crate) 표시지만, 새 의존성 금지 지침에
+        /// 따라 의도적으로 계속 쓴다 — 바인딩 자체는 유효하다.
+        #[allow(deprecated)]
+        pub(super) fn acquire() -> Self {
+            // 특별 권한이 필요 없는 host name port — 부작용 없는 순수 조회용이다.
+            Self(unsafe { libc::mach_host_self() })
+        }
+
+        pub(super) fn as_raw(&self) -> libc::mach_port_t {
+            self.0
+        }
+
+        /// 이 host port가 보고하는 **커널 페이지 크기**. 실패하면 `None`.
+        ///
+        /// **`sysctlbyname("hw.pagesize")`를 쓰면 안 된다(실제 버그였다).** `host_statistics64`가
+        /// 세는 `compressor_page_count`는 **커널 페이지** 단위인데, `hw.pagesize`는 **호출하는
+        /// 프로세스의** 페이지 크기를 보고한다. 평소엔 같지만 Rosetta 하의 x86_64 프로세스에서
+        /// 갈라진다 — 이 머신(Apple Silicon)에서 같은 C 프로그램을 두 아키텍처로 빌드해 실측했다:
+        ///
+        /// ```text
+        ///                        native arm64   x86_64 (Rosetta)
+        ///   hw.pagesize              16384          4096     ← 갈라진다
+        ///   vm_page_size             16384          4096     ← 갈라진다 (프로세스 페이지)
+        ///   host_page_size()         16384         16384     ← 불변 (커널 페이지)
+        ///   vm_kernel_page_size      16384         16384     ← 불변
+        ///   compressed 환산          17.88 GiB   4.49(hw) / 17.96(host) GiB
+        /// ```
+        ///
+        /// 즉 `hw.pagesize`로 환산하면 Rosetta에서 실제의 **1/4로 과소보고**된다(17.9 → 4.5 GiB).
+        /// 이 모듈의 존재 이유가 "압축 메모리를 서버에 정확히 보이게 하는 것"이라, 환산 계수가
+        /// 틀리면 지표가 거짓이 되고 임계에 안 걸려 우리가 고치려던 사고를 그대로 다시 놓친다.
+        ///
+        /// **단위 일치의 근거**: `host_page_size`는 `host_statistics64`와 **같은 host port**(`self.0`)
+        /// 에 질의한다. 페이지 수를 센 주체와 페이지 크기를 보고하는 주체가 동일한 커널 객체이므로
+        /// 단위가 어긋날 수 없다 — 실측이 아니라 구조에서 나오는 보장이다.
+        ///
+        /// **되돌림 방지**: 네이티브 arm64에서는 `hw.pagesize`도 16384라 *어떤 단위 테스트도* 두
+        /// 출처를 구분하지 못한다(Rosetta에서만 갈라지므로). 그래서 테스트 대신 **타입**으로 막았다 —
+        /// [`KernelPageSize`]는 이 모듈 안에서만 만들 수 있고 그 유일한 생산자가 이 함수다. sysctl로
+        /// 되돌리려면 `u64`를 환산 계수 자리에 넣어야 하는데 그건 컴파일되지 않는다.
+        pub(super) fn page_size(&self) -> Option<KernelPageSize> {
+            let mut size: libc::vm_size_t = 0;
+            let rc = unsafe { host_page_size(self.0, &mut size) };
+            (rc == libc::KERN_SUCCESS && size > 0).then_some(KernelPageSize(size as u64))
+        }
+    }
+
+    impl Drop for HostPort {
+        #[allow(deprecated)]
+        fn drop(&mut self) {
+            // 반납 실패는 복구할 방법도, 의미 있는 대응도 없다(이미 유효하지 않은 포트라는 뜻).
+            // 패닉 금지 원칙에 따라 무시한다 — Drop에서 패닉하면 unwind 중 abort로 이어질 수 있다.
+            unsafe {
+                let _ = mach_port_deallocate(libc::mach_task_self(), self.0);
+            }
         }
     }
 }
 
 /// `host_statistics64(HOST_VM_INFO64)` 호출 — 실측 466ns. 실패(권한/커널 이상)면 `None`이라
 /// compressor 3종 전체를 생략한다(부분적으로 신뢰 못 할 구조체를 쓰는 것보다 안전).
+///
+/// 통계와 페이지 크기를 **하나의 host port에서 함께** 얻는다 — 이게 단위 불일치를 막는 구조적
+/// 장치다([`HostPort::page_size`] doc의 Rosetta 실측 참고). 페이지 크기를 별도 sysctl에서 가져오면
+/// 두 값의 출처가 갈라져 Rosetta에서 1/4로 과소보고된다.
 #[cfg(target_os = "macos")]
 fn vm_compressor_stats() -> Option<VmCompressorStats> {
     // 가드가 스코프 끝(성공/실패 무관)에서 send right를 반납한다 — HostPort doc의 누수 보장 참고.
@@ -147,20 +217,23 @@ fn vm_compressor_stats() -> Option<VmCompressorStats> {
     if rc != libc::KERN_SUCCESS {
         return None; // 여기서도 `host`의 Drop이 돌아 반납된다.
     }
+    // 페이지 수를 센 그 포트에 페이지 크기를 묻는다. 못 얻으면 환산이 불가능하므로 compressor
+    // 전체를 생략한다 — 틀린 계수로 거짓 값을 내느니 point를 빼는 게 낫다(모듈 doc의 실패 원칙).
+    let page_size = host.page_size()?;
+
     Some(VmCompressorStats {
         compressor_page_count: stats.compressor_page_count as u64,
         total_uncompressed_pages_in_compressor: stats.total_uncompressed_pages_in_compressor,
         decompressions: stats.decompressions,
+        page_size,
     })
 }
 
 #[cfg(target_os = "macos")]
 fn collect_compressor(state: &mut HostExtraState, points: &mut Vec<MetricPoint>) {
     let Some(stats) = vm_compressor_stats() else {
-        return; // host_statistics64 실패 — compressor 3종 생략, 나머지 metric은 정상 수집.
-    };
-    let Some(page_size) = sysctl_u64("hw.pagesize") else {
-        return; // page size 없이는 페이지 수를 바이트로 환산할 수 없다.
+        // host_statistics64 또는 host_page_size 실패 — compressor 3종 생략, 나머지는 정상 수집.
+        return;
     };
 
     // decompressions는 누적 카운터라 직전 sample과의 delta/elapsed로 초당 환산해야 의미가 있다.
@@ -176,7 +249,7 @@ fn collect_compressor(state: &mut HostExtraState, points: &mut Vec<MetricPoint>)
     points.extend(compressor_points(
         stats.compressor_page_count,
         stats.total_uncompressed_pages_in_compressor,
-        page_size,
+        stats.page_size.get(),
         rate,
     ));
 }
@@ -528,15 +601,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_pressure_level_is_one_of_known_values() {
-        // 값 자체(1/2/4 중 무엇인지)는 머신 상태에 달렸다 — 어느 것이든 유효하다. 검증하는 건
-        // "커널이 정의한 집합 밖의 값을 그대로 흘려보내지 않는가"라는 불변식이다.
+    fn macos_pressure_level_is_read_as_a_positive_int() {
+        // 알려진 레벨은 1(normal)/2(warn)/4(critical)이지만, **화이트리스트로 단언하지 않는다**:
+        // 그건 우리 코드가 아니라 커널의 사실을 단언하는 것이라, 커널이 레벨을 추가하면 코드가
+        // 멀쩡한데도 테스트가 깨진다(테스트 실패는 "코드가 틀렸다"여야 한다). 수집 코드도 같은
+        // 이유로 모르는 값을 뭉개거나 버리지 않고 그대로 통과시킨다 — 해석은 수신측 몫이다.
+        //
+        // 대신 우리 코드의 불변식을 본다: (a) Int로 낸다(int_of가 타입 위반 시 패닉),
+        // (b) 값이 양수다 — sysctl_u64의 8바이트 버퍼로 4바이트 OID를 읽는 트릭이 깨지면
+        // 0이나 쓰레기값이 나오므로, 이건 실제로 우리 코드를 검증한다.
         let mut state = HostExtraState::new();
         let points = collect(&mut state);
         if let Some(v) = int_of(&points, "aic.system.memory.pressure.level") {
             assert!(
-                v == 1 || v == 2 || v == 4,
-                "알려지지 않은 pressure level: {v}"
+                v > 0,
+                "pressure level이 양수가 아니다(sysctl 읽기 오류 의심): {v}"
             );
         }
     }
@@ -556,6 +635,36 @@ mod tests {
         // Linux 전용 이름이 macOS에서 새어 나오지 않는지도 함께 고정한다.
         assert!(!names.contains(&"aic.system.memory.pressure.some"));
         assert!(!names.contains(&"aic.system.memory.pressure.full"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compressor_page_size_comes_from_the_host_port() {
+        // 환산 계수는 `host_statistics64`와 **같은 host port**에서 와야 한다(Rosetta에서 hw.pagesize는
+        // 4096, 커널 페이지는 16384라 compressed가 1/4로 과소보고된다 — HostPort::page_size의 실측표).
+        //
+        // ⚠ 이 테스트가 **증명하지 못하는 것**: 네이티브 arm64에서는 hw.pagesize도 16384라, 출처를
+        // 바꿔치기해도 값이 같아 어떤 단언으로도 구분되지 않는다(실제로 mutation을 넣어 확인했다 —
+        // 통과해 버린다). Rosetta를 단위 테스트에서 재현하는 건 flaky한 환경 테스트가 되므로 하지
+        // 않는다. 그래서 되돌림 방지는 **타입**이 맡는다: KernelPageSize는 mach_host 모듈 안에서만
+        // 생성 가능하고 유일한 생산자가 HostPort::page_size라, sysctl로 되돌리면 **컴파일이 깨진다**.
+        // 이 테스트는 그 타입 규칙 위에서 값이 온전한지(양수·2의 거듭제곱)만 확인하는 보조 장치다.
+        let Some(stats) = vm_compressor_stats() else {
+            return; // 수집 불가 환경 — 검증할 것이 없다.
+        };
+        let from_port = HostPort::acquire()
+            .page_size()
+            .expect("host port가 page size를 줘야 함");
+        assert_eq!(
+            stats.page_size, from_port,
+            "환산 계수가 host port 값과 다르다"
+        );
+        // 페이지 크기는 2의 거듭제곱이어야 한다(4096/16384 등).
+        assert!(
+            stats.page_size.get().is_power_of_two(),
+            "page size가 2의 거듭제곱이 아니다: {}",
+            stats.page_size.get()
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -692,7 +801,10 @@ full avg10=3.21 avg60=1.00 avg300=0.50 total=1\n";
 
     #[test]
     fn parse_file_nr_reads_allocated_and_max() {
-        // 정상 macOS류(현실적인 max).
+        // `/proc/sys/fs/file-nr`은 **Linux 전용**이다(macOS는 sysctl kern.num_files를 쓴다).
+        // 첫 픽스처는 jw-server 실측값 — max가 2^63-1(사실상 무제한)이라 utilization을 내면
+        // 비율이 2e-16이 되어 임계에 영원히 안 걸린다. 이게 count/limit raw만 보내는 이유다
+        // (collect_fd doc 참고). 두 번째는 max가 현실적인 값으로 설정된 커널.
         assert_eq!(
             parse_file_nr("2057 0 9223372036854775807\n"),
             Some((2057, 9223372036854775807))
