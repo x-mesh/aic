@@ -102,6 +102,7 @@ fn logs_exporter_config(
         service_version: "0.0.0-test".to_string(),
         // 라인 하나가 들어오면 즉시 flush — 테스트가 타이머를 기다리지 않게 한다.
         batch_max_lines: 1,
+        batch_max_bytes: 4 * 1024 * 1024,
         batch_max_ms: 60_000,
         spool,
         health,
@@ -323,6 +324,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         token: None,
         service_version: "0.0.0-test".to_string(),
         batch_max_lines: 1,
+        batch_max_bytes: 4 * 1024 * 1024,
         batch_max_ms: 60_000,
         spool: spool.clone(),
         health: health.clone(),

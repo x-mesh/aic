@@ -719,6 +719,16 @@ pub struct AicdLogsConfig {
     /// 배치 최대 라인 수 — 이 수만큼 모이면 즉시 flush. 기본 500.
     #[serde(default = "default_log_batch_max_lines")]
     pub batch_max_lines: usize,
+    /// 배치 최대 바이트 — 이 크기를 넘기기 **전에** flush한다. 기본 4 MiB.
+    ///
+    /// 라인 수만으로 자르면 배치가 수신 측 요청 상한을 넘길 수 있다. 라인 하나는 최대
+    /// `MAX_LOG_LINE_BYTES`(64 KiB)까지 허용되므로 `batch_max_lines`가 500이면 최악 31 MiB이고,
+    /// rca의 `MAX_BODY_BYTES`는 8 MiB다 — 초과분은 디코드에 닿기도 전에 413으로 거부된다.
+    /// 그리고 413은 재전송해도 영원히 413이라, 그 배치가 spool 큐 머리에 박혀 **다른 시그널까지
+    /// 전부 드레인을 멈춘다**(RFC-006 §6.6). 기본값을 수신 측 상한의 절반으로 둬 protobuf
+    /// 오버헤드를 감안한다.
+    #[serde(default = "default_log_batch_max_bytes")]
+    pub batch_max_bytes: usize,
     /// 배치 최대 대기 시간(ms) — 라인 수가 안 차도 이 시간이 지나면 flush. 기본 2000.
     #[serde(default = "default_log_batch_max_ms")]
     pub batch_max_ms: u64,
@@ -750,6 +760,7 @@ impl Default for AicdLogsConfig {
             min_severity: default_log_min_severity(),
             max_lines_per_sec: default_log_max_lines_per_sec(),
             batch_max_lines: default_log_batch_max_lines(),
+            batch_max_bytes: default_log_batch_max_bytes(),
             batch_max_ms: default_log_batch_max_ms(),
             max_services: default_log_max_services(),
             journald: AicdJournaldLogConfig::default(),
@@ -771,6 +782,12 @@ fn default_log_max_lines_per_sec() -> u32 {
 
 fn default_log_batch_max_lines() -> usize {
     500
+}
+
+/// 4 MiB — rca `MAX_BODY_BYTES`(8 MiB)의 절반. protobuf 프레이밍과 attr 오버헤드가 원문 바이트
+/// 위에 얹히므로 상한을 그대로 쓰지 않는다.
+fn default_log_batch_max_bytes() -> usize {
+    4 * 1024 * 1024
 }
 
 fn default_log_batch_max_ms() -> u64 {

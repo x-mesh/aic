@@ -616,6 +616,7 @@ fn load_logs_exporter_config(
         token,
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         batch_max_lines: logs_cfg.batch_max_lines,
+        batch_max_bytes: logs_cfg.batch_max_bytes,
         batch_max_ms: logs_cfg.batch_max_ms,
         spool,
         health,
