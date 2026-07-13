@@ -22,13 +22,17 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use aic_common::{
-    encode_frame, AgentEvent, IpcRequest, AGENT_KIND_FINDING_CREATED, AGENT_KIND_RISK_DENIED,
-    AGENT_KIND_TOOL_RUN_COMMAND,
+    encode_frame, AgentEvent, IpcRequest, IpcResponse, AGENT_KIND_FINDING_CREATED,
+    AGENT_KIND_RISK_DENIED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 
 /// 소켓 연결/송신/응답 대기 상한. chat 흐름을 막지 않도록 짧게 잡는다 — aicd는 로컬 UDS라
 /// 정상 상황에서 밀리초 단위로 끝난다.
 const IO_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// 응답 본문 상한 — 우리가 읽는 응답(Pong/ExporterStatus)은 수백 바이트다. 손상된 길이
+/// 헤더가 거대한 할당으로 이어지지 않게 막는다.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// agent가 셸 명령을 실행했다. 시스템을 바꿨을 수 있는 유일한 도구라 항상 보낸다.
 /// 차단된 명령은 여기가 아니라 [`risk_denied`]로 간다.
@@ -65,6 +69,19 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
     emit(AGENT_KIND_FINDING_CREATED, message, severity, attrs);
 }
 
+/// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
+///
+/// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
+/// 응답이 timeout됐다. `Some(status)`의 `enabled: false`는 "aicd는 살아있지만 exporter가 꺼져
+/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다.
+pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
+    match query(&IpcRequest::GetExporterStatus) {
+        Ok(IpcResponse::ExporterStatus(s)) => Some(s),
+        // 구버전 aicd는 unknown request를 graceful Error로 답한다 → 조회 불가로 취급.
+        _ => None,
+    }
+}
+
 /// 한 행위를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태).
 fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
     let ev = AgentEvent {
@@ -88,7 +105,14 @@ fn redact(s: &str) -> String {
     crate::redaction::redact(s).0
 }
 
+/// 요청을 보내고 응답을 무시한다(fire-and-forget). 응답을 **읽기는** 한다 — 곧바로 끊으면
+/// aicd 쪽에 "클라이언트 조기 종료" 경고가 남기 때문이다.
 fn send(req: &IpcRequest) -> std::io::Result<()> {
+    query(req).map(|_| ())
+}
+
+/// 요청을 보내고 응답을 파싱해 돌려준다. 프레임은 length-prefixed JSON(`encode_frame`).
+fn query(req: &IpcRequest) -> std::io::Result<IpcResponse> {
     let payload = serde_json::to_vec(req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut stream = UnixStream::connect(aic_common::aicd_socket_path())?;
@@ -96,11 +120,21 @@ fn send(req: &IpcRequest) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.write_all(&encode_frame(&payload))?;
     stream.flush()?;
-    // 응답(Pong)을 읽어 서버가 프레임을 소비할 시간을 준다 — 곧바로 끊으면 aicd 쪽에
-    // "클라이언트 조기 종료" 경고가 남는다. 내용은 쓰지 않으므로 실패해도 무시한다.
-    let mut buf = [0u8; 64];
-    let _ = stream.read(&mut buf);
-    Ok(())
+
+    // 4바이트 길이 헤더 → 본문. 상한을 두어 손상된 헤더가 거대한 할당으로 이어지지 않게 한다.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("응답이 너무 큼: {len} bytes"),
+        ));
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 #[cfg(test)]

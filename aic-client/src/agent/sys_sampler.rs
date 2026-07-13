@@ -17,7 +17,14 @@ pub(crate) struct SysSampler {
     disks: Disks,
     networks: Networks,
     last: Instant,
+    /// exporter 상태 캐시 + 마지막 조회 시각. status bar는 자주 갱신되는데 매번 aicd에 IPC를
+    /// 걸 이유가 없다 — 이 값은 초 단위로만 변한다.
+    exporter_cache: (ExporterState, Instant),
 }
+
+/// exporter 상태를 aicd에 다시 물어보는 최소 간격. status bar 갱신 빈도와 무관하게 이 주기로만
+/// 조회한다.
+const EXPORTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// status bar 지표의 임계 단계 — 정상(dim) → 경고(주황) → 위험(빨강). status bar 컬러링용.
 /// 변형 선언 순서(Normal < Warn < Crit)가 곧 심각도 순서다 — `Ord`로 `overall_severity`가
@@ -125,6 +132,64 @@ pub(crate) struct SysMetrics {
     /// metric sparkline(C2) — `(status_segments 세그먼트 인덱스, " ▁▂▇↑" 접미)`. task의 `TrendTracker`가
     /// 가장 심각한 metric(cpu/mem/disk)에 대해 채운다. status_segments가 해당 세그먼트에 붙인다.
     pub trend_spark: Option<(usize, String)>,
+    /// OTLP exporter가 지금 서버에 닿고 있는지. exporter는 aicd 안에서 조용히 돌기 때문에,
+    /// 이걸 보여주지 않으면 사용자는 "나가고 있다"고 믿을 뿐 확인할 방법이 없다.
+    pub exporter: ExporterState,
+}
+
+/// status bar가 보여줄 exporter 상태. IPC 응답을 사람이 볼 4가지 상태로 접은 것이다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum ExporterState {
+    /// aicd에 물어보지 못했다 — 미실행이거나 `GetExporterStatus` 이전 구버전. 어느 쪽이든
+    /// **데이터가 나가지 않고 있다**는 뜻이라 사용자에게 알려야 한다.
+    DaemonDown,
+    /// aicd는 살아있지만 exporter가 꺼져 있다(config에서 안 켰다). 안 쓰는 기능이므로 status
+    /// bar에 표시하지 않는다 — 켜지도 않은 것을 계속 띄우면 노이즈다.
+    #[default]
+    Disabled,
+    /// 정상 전송 중.
+    Ok,
+    /// 전송에 실패해 spool에 밀려 있다(밀린 배치 수). collector에 못 닿고 있다는 뜻.
+    Backlogged(u64),
+    /// spool 상한을 넘겨 **실제로 버렸다**(버린 배치 수). 데이터가 유실됐다.
+    Dropping(u64),
+}
+
+impl ExporterState {
+    /// IPC 응답을 status bar용 상태로 접는다. `None`(조회 실패)은 곧 데몬이 없다는 뜻이다.
+    fn from_status(status: Option<aic_common::ExporterStatus>) -> Self {
+        let Some(s) = status else {
+            return ExporterState::DaemonDown;
+        };
+        if !s.enabled {
+            return ExporterState::Disabled;
+        }
+        // 유실이 실제로 일어났다면 그게 가장 나쁜 소식이다 — 밀림보다 먼저 알린다.
+        if s.spool_dropped > 0 {
+            return ExporterState::Dropping(s.spool_dropped);
+        }
+        if s.spool_batches > 0 {
+            return ExporterState::Backlogged(s.spool_batches);
+        }
+        ExporterState::Ok
+    }
+
+    /// (라벨, 심각도). `Disabled`는 표시하지 않으므로 `None`.
+    fn segment(self) -> Option<(String, Severity)> {
+        match self {
+            ExporterState::Disabled => None,
+            ExporterState::Ok => Some(("otlp ●".to_string(), Severity::Normal)),
+            ExporterState::DaemonDown => {
+                Some(("otlp aicd off".to_string(), Severity::Crit))
+            }
+            ExporterState::Backlogged(n) => {
+                Some((format!("otlp ⚠ {n}밀림"), Severity::Warn))
+            }
+            ExporterState::Dropping(n) => {
+                Some((format!("otlp ✕ {n}유실"), Severity::Crit))
+            }
+        }
+    }
 }
 
 /// disk 여유 소진 예측(C2) — CRIT(1GiB)까지 남은 시간의 버킷 라벨. status bar disk 세그먼트에 dim
@@ -145,11 +210,28 @@ impl SysSampler {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
+            // 첫 sample()에서 곧바로 조회하도록, 캐시는 만료된 상태로 시작한다.
+            exporter_cache: (
+                ExporterState::Disabled,
+                Instant::now() - EXPORTER_POLL_INTERVAL,
+            ),
         }
+    }
+
+    /// exporter 상태를 캐시 주기에 맞춰 조회한다. aicd 미실행이면 connect가 즉시 실패하므로
+    /// 이 경로는 싸다.
+    fn exporter_state(&mut self) -> ExporterState {
+        if self.exporter_cache.1.elapsed() >= EXPORTER_POLL_INTERVAL {
+            let state = ExporterState::from_status(crate::agent_event::exporter_status());
+            self.exporter_cache = (state, Instant::now());
+        }
+        self.exporter_cache.0
     }
 
     /// 현재 지표를 샘플한다. disk/net i/o는 직전 sample 이후 delta를 경과시간으로 나눠 bytes/s로 환산.
     pub fn sample(&mut self) -> SysMetrics {
+        // 조립부에서 self를 다시 빌리지 않도록 먼저 계산해 둔다(캐시 주기 안이면 IPC 없음).
+        let exporter = self.exporter_state();
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
         self.disks.refresh(false);
@@ -198,6 +280,7 @@ impl SysSampler {
             // 직전 덮어쓴다.
             disk_eta: None,
             trend_spark: None,
+            exporter,
         };
         // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
         // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
@@ -242,7 +325,7 @@ impl SysMetrics {
         };
         let disk = self.disk_label();
         let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-        format!(
+        let line = format!(
             "{} · load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
             clock,
             self.load1,
@@ -256,7 +339,12 @@ impl SysMetrics {
             human_bytes(self.disk_write_bps),
             human_bytes(self.net_tx_bps),
             human_bytes(self.net_rx_bps),
-        )
+        );
+        // exporter 상태(꺼져 있으면 생략) — status_segments와 같은 정보를 같은 자리에 둔다.
+        match self.exporter.segment() {
+            Some((label, _)) => format!("{line} · {label}"),
+            None => line,
+        }
     }
 
     fn mem_pct(&self) -> f64 {
@@ -346,10 +434,17 @@ impl SysMetrics {
             ),
         ];
         // sparkline(C2)을 대상 세그먼트에 접미 — 그 세그먼트 단계 색을 상속한다(standalone 무색 없음).
+        // exporter 세그먼트보다 **먼저** 붙인다: trend_spark의 인덱스는 위 고정 목록 기준이라,
+        // 뒤에 세그먼트를 추가해도 인덱스가 밀리지 않게 하기 위함이다.
         if let Some((idx, suffix)) = &self.trend_spark {
             if let Some(seg) = segs.get_mut(*idx) {
                 seg.0.push_str(suffix);
             }
+        }
+        // exporter 상태는 맨 뒤에 — 시스템 지표가 아니라 "내 텔레메트리가 나가고 있나"라는
+        // 다른 질문에 대한 답이다. config에서 안 켠 경우(Disabled)는 표시하지 않는다.
+        if let Some(seg) = self.exporter.segment() {
+            segs.push(seg);
         }
         segs
     }
@@ -1098,10 +1193,96 @@ mod tests {
         let m = metric(1.0, 99.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
         let segs = m.status_segments();
         // 세그먼트 6개(load/cpu/mem/swap/disk/io), 텍스트는 status_line과 동일 토큰.
+        // exporter는 기본 Disabled라 세그먼트를 만들지 않는다(안 켠 기능은 표시하지 않는다).
         assert_eq!(segs.len(), 6);
         assert!(segs[1].0.starts_with("cpu "));
         assert_eq!(segs[1].1, Severity::Crit); // cpu 99% >= 95
         assert_eq!(segs[5].1, Severity::Normal); // io는 임계 없음
+    }
+
+    /// exporter 상태별로 status bar에 무엇이 뜨는지 고정한다. 이 표시가 곧 "내 데이터가
+    /// 나가고 있나"에 대한 유일한 답이라, 라벨과 심각도가 흔들리면 안 된다.
+    #[test]
+    fn exporter_segment_reflects_state() {
+        let g = 1024 * 1024 * 1024;
+        let with = |st: ExporterState| {
+            let mut m = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            m.exporter = st;
+            m
+        };
+
+        // 꺼져 있으면 아예 표시하지 않는다.
+        assert_eq!(with(ExporterState::Disabled).status_segments().len(), 6);
+
+        // 정상 — 조용한 Normal 표시.
+        let segs = with(ExporterState::Ok).status_segments();
+        assert_eq!(segs.len(), 7);
+        assert_eq!(segs[6], ("otlp ●".to_string(), Severity::Normal));
+
+        // aicd가 없으면 데이터가 전혀 나가지 않는다 — 가장 강한 경고.
+        let segs = with(ExporterState::DaemonDown).status_segments();
+        assert_eq!(segs[6].1, Severity::Crit);
+        assert!(segs[6].0.contains("aicd off"));
+
+        // 밀림 — collector에 못 닿는 중(아직 유실은 아님).
+        let segs = with(ExporterState::Backlogged(12)).status_segments();
+        assert_eq!(segs[6].1, Severity::Warn);
+        assert!(segs[6].0.contains("12"));
+
+        // 유실 — 이미 버려진 데이터가 있다. 밀림보다 심각.
+        let segs = with(ExporterState::Dropping(3)).status_segments();
+        assert_eq!(segs[6].1, Severity::Crit);
+        assert!(segs[6].0.contains('3'));
+    }
+
+    #[test]
+    fn exporter_state_folds_ipc_status() {
+        use aic_common::ExporterStatus;
+        // 조회 실패(aicd 미실행/구버전) = 데이터가 안 나가는 중.
+        assert_eq!(ExporterState::from_status(None), ExporterState::DaemonDown);
+
+        // aicd는 살아있지만 exporter가 꺼짐.
+        let off = ExporterStatus::default();
+        assert_eq!(ExporterState::from_status(Some(off)), ExporterState::Disabled);
+
+        let base = ExporterStatus {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(base.clone())),
+            ExporterState::Ok
+        );
+
+        // 유실이 있으면 밀림보다 유실을 먼저 알린다 — 더 나쁜 소식이 우선이다.
+        let both = ExporterStatus {
+            spool_batches: 5,
+            spool_dropped: 2,
+            ..base.clone()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(both)),
+            ExporterState::Dropping(2)
+        );
+
+        let backlogged = ExporterStatus {
+            spool_batches: 5,
+            ..base
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(backlogged)),
+            ExporterState::Backlogged(5)
+        );
+    }
+
+    #[test]
+    fn status_line_appends_exporter_when_enabled() {
+        let g = 1024 * 1024 * 1024;
+        let mut m = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        // 꺼져 있으면 줄 끝에 아무것도 붙지 않는다.
+        assert!(!m.status_line().contains("otlp"));
+        m.exporter = ExporterState::DaemonDown;
+        assert!(m.status_line().ends_with("otlp aicd off"));
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aic_server::otlp_exporter::{serve, ExporterConfig, Spool};
+use aic_server::otlp_exporter::{serve, ExporterConfig, ExporterHealth, Spool};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -63,6 +63,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
     // exporter task 기동 — 짧은 주기로 곧 첫 push가 오게 한다.
     let (sd_tx, sd_rx) = watch::channel(false);
     let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
     let cfg = ExporterConfig {
         endpoint: format!("http://{addr}"),
         token: Some("test-token".to_string()),
@@ -70,6 +71,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         service_version: "9.9.9".to_string(),
         spool,
         drain_batch_limit: 20,
+        health,
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 
@@ -119,6 +121,7 @@ async fn exporter_without_token_sends_no_auth_header() {
 
     let (sd_tx, sd_rx) = watch::channel(false);
     let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
     let cfg = ExporterConfig {
         endpoint: format!("http://{addr}"),
         token: None,
@@ -126,6 +129,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         service_version: "9.9.9".to_string(),
         spool,
         drain_batch_limit: 20,
+        health,
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 

@@ -158,6 +158,12 @@ pub enum IpcRequest {
     /// (`risk.denied`, `finding.created`)만 보낸다. 읽기 도구(read_file/grep/glob)까지 실으면
     /// 노이즈만 커지고 RCA에 쓸모가 없다.
     AgentEvent(AgentEvent),
+    /// OTLP exporter가 실제로 collector에 닿고 있는지 묻는다.
+    ///
+    /// exporter는 aicd 안에서 조용히 돌기 때문에, chat을 쓰는 사람은 자기 행위가 서버로 나가는지
+    /// 확인할 방법이 없다 — push가 계속 실패해도 aicd 로그에만 남는다. chat status bar가 이걸
+    /// 주기적으로 물어 "지금 나가고 있다/밀리고 있다"를 눈에 보이게 한다.
+    GetExporterStatus,
 }
 
 /// chat/agent의 한 행위. `kind`가 문자열이라 새 행위를 추가해도 IPC 스키마가 바뀌지 않는다.
@@ -201,9 +207,36 @@ pub enum IpcResponse {
     },
     /// `GetVersion` 응답 — 응답한 데몬 **프로세스**의 빌드 identity.
     Version(DaemonVersion),
+    /// `GetExporterStatus` 응답. exporter가 꺼져 있으면 `enabled: false`인 기본값이 온다 —
+    /// "꺼짐"과 "켜졌는데 실패 중"은 사용자에게 전혀 다른 상태라 응답 자체를 생략하지 않는다.
+    ExporterStatus(ExporterStatus),
     Error {
         message: String,
     },
+}
+
+/// OTLP exporter의 전송 건강 상태.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ExporterStatus {
+    /// exporter task가 떠 있는지. false면 나머지 필드는 의미 없다(config off 또는 endpoint 미설정).
+    pub enabled: bool,
+    /// collector base URL(표시용).
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub push_ok_total: u64,
+    #[serde(default)]
+    pub push_fail_total: u64,
+    /// 마지막 push 성공 후 경과 초. `None`이면 **한 번도 성공한 적 없음** — "방금 성공(0초)"과
+    /// 구분되어야 하므로 0으로 뭉개지 않는다.
+    #[serde(default)]
+    pub last_ok_secs_ago: Option<u64>,
+    /// 전송 못 하고 spool에 밀려 있는 배치 수. 0이 아니면 collector에 못 닿고 있다는 뜻이다.
+    #[serde(default)]
+    pub spool_batches: u64,
+    /// spool 용량 상한을 넘겨 **버린** 배치 수. 0이 아니면 데이터가 실제로 유실됐다.
+    #[serde(default)]
+    pub spool_dropped: u64,
 }
 
 /// 실행 중인 데몬 바이너리의 빌드 identity (`GetVersion` 응답).

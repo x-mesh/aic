@@ -116,6 +116,26 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!(path = %attach_sock_path.display(), "aicd attach 소켓 바인드");
 
+    // SRE t6/t7/t8: OTLP exporter 3종(host metrics/events/connections) 모두 같은 `[aicd.exporter]`
+    // 섹션을 읽고, enabled+endpoint 유효할 때 같은 오프라인 spool(t8, `~/.aic/otlp-spool/`)을
+    // `Arc`로 공유한다 — 파일 스캔·상한 추적을 한 곳에서 일관되게 하기 위함(otlp_exporter 모듈
+    // doc 참고). 섹션을 한 번만 읽어 세 load_*_config에 넘긴다(이전엔 함수마다 파일을 따로
+    // 읽었다).
+    let exporter_section = read_exporter_section();
+    let exporter_spool = open_exporter_spool(exporter_section.as_ref());
+    // 네 exporter task가 공유하는 전송 건강 카운터. chat status bar가 `GetExporterStatus`로 읽어
+    // "지금 서버로 나가고 있나"를 사람 눈에 보이게 한다. exporter가 비활성이면 None이고, IPC는
+    // `enabled: false`를 돌려준다(꺼짐과 실패는 사용자에게 전혀 다른 상태다).
+    let exporter_health = exporter_spool.as_ref().map(|spool| {
+        Arc::new(aic_server::otlp_exporter::ExporterHealth::new(
+            exporter_section
+                .as_ref()
+                .map(|ex| ex.endpoint.clone())
+                .unwrap_or_default(),
+            spool.clone(),
+        ))
+    });
+
     let control_ctx = ControlContext {
         shutdown: shutdown.clone(),
         registry: registry.clone(),
@@ -123,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         registry_path: Some(registry_path.clone()),
         metrics,
         agent_bus,
+        exporter_health: exporter_health.clone(),
     };
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
@@ -149,19 +170,11 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // SRE t6/t7/t8: OTLP exporter 3종(host metrics/events/connections) 모두 같은 `[aicd.exporter]`
-    // 섹션을 읽고, enabled+endpoint 유효할 때 같은 오프라인 spool(t8, `~/.aic/otlp-spool/`)을
-    // `Arc`로 공유한다 — 파일 스캔·상한 추적을 한 곳에서 일관되게 하기 위함(otlp_exporter 모듈
-    // doc 참고). 섹션을 한 번만 읽어 세 load_*_config에 넘긴다(이전엔 함수마다 파일을 따로
-    // 읽었다).
-    let exporter_section = read_exporter_section();
-    let exporter_spool = open_exporter_spool(exporter_section.as_ref());
-
     // SRE t6: OTLP host-metrics exporter (opt-in). 별도 task로 주기 수집→push 루프를 띄우고 동일
     // shutdown watch를 공유한다(webhook과 같은 패턴). off면 아래 config가 None이라 task 자체가
     // 뜨지 않아 코드 경로가 완전히 비활성이다(기존 동작 회귀 0). t8: spool의 유일한 드레인 주체
     // (enabled=true면 반드시 뜨는 유일한 task라서 — otlp_exporter 모듈 doc 참고).
-    let exporter_handle = match load_exporter_config(exporter_section.clone(), exporter_spool.clone()) {
+    let exporter_handle = match load_exporter_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
         Some(cfg) => {
             let ex_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -176,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     // SRE t7: OTLP events exporter (opt-in, [aicd.exporter] enabled=true + events_enabled=true).
     // CommandRecordStore tap을 구독해 finished command record를 실시간으로 push한다. host
     // metrics(exporter_handle)와 독립적으로 켜고 끌 수 있어 별도 task로 뜬다.
-    let events_handle = match load_events_config(events_record_store, exporter_section.clone(), exporter_spool.clone()) {
+    let events_handle = match load_events_config(events_record_store, exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
         Some(cfg) => {
             let ev_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -190,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
 
     // SRE t7: OTLP connections exporter (opt-in, [aicd.exporter] enabled=true +
     // connections_enabled=true). 주기적으로 `aic snapshot inventory --json`을 spawn한다.
-    let connections_handle = match load_connections_config(exporter_section.clone(), exporter_spool.clone()) {
+    let connections_handle = match load_connections_config(exporter_section.clone(), exporter_spool.clone(), exporter_health.clone()) {
         Some(cfg) => {
             let conn_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
@@ -209,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
         exporter_agent_bus,
         exporter_section.clone(),
         exporter_spool.clone(),
+        exporter_health.clone(),
     ) {
         Some(cfg) => {
             let ag_shutdown = shutdown.subscribe();
@@ -318,6 +332,7 @@ fn open_exporter_spool(ex: Option<&aic_common::AicdExporterConfig>) -> Option<Ar
 fn load_exporter_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
 ) -> Option<aic_server::otlp_exporter::ExporterConfig> {
     let ex = ex?;
     if !ex.enabled {
@@ -328,6 +343,7 @@ fn load_exporter_config(
         return None;
     }
     let spool = spool?; // open_exporter_spool이 이미 같은 조건으로 시도 — 실패했으면 여기도 비활성.
+    let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::ExporterConfig {
         endpoint: ex.endpoint,
@@ -336,6 +352,7 @@ fn load_exporter_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         spool,
         drain_batch_limit: ex.spool_drain_batch_limit,
+        health,
     })
 }
 
@@ -356,6 +373,7 @@ fn load_events_config(
     store: CommandRecordStore,
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
 ) -> Option<aic_server::otlp_exporter::EventsConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.events_enabled {
@@ -366,6 +384,7 @@ fn load_events_config(
         return None;
     }
     let spool = spool?;
+    let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::EventsConfig {
         endpoint: ex.endpoint,
@@ -373,6 +392,7 @@ fn load_events_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         store,
         spool,
+        health,
     })
 }
 
@@ -386,6 +406,7 @@ fn load_agent_config(
     bus: AgentEventBus,
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
 ) -> Option<aic_server::otlp_exporter::AgentConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.agent_enabled {
@@ -396,6 +417,7 @@ fn load_agent_config(
         return None;
     }
     let spool = spool?;
+    let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::AgentConfig {
         endpoint: ex.endpoint,
@@ -403,12 +425,14 @@ fn load_agent_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         bus,
         spool,
+        health,
     })
 }
 
 fn load_connections_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
 ) -> Option<aic_server::otlp_exporter::ConnectionsConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.connections_enabled {
@@ -419,6 +443,7 @@ fn load_connections_config(
         return None;
     }
     let spool = spool?;
+    let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::ConnectionsConfig {
         endpoint: ex.endpoint,
@@ -428,5 +453,6 @@ fn load_connections_config(
         aic_bin: resolve_aic_bin(),
         timeout: std::time::Duration::from_secs(15),
         spool,
+        health,
     })
 }

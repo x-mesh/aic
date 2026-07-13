@@ -390,6 +390,7 @@ async fn process_request(
         }),
         IpcRequest::ListSessions
         | IpcRequest::AgentEvent(_)
+        | IpcRequest::GetExporterStatus
         | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)

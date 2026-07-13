@@ -41,6 +41,9 @@ pub struct ControlContext {
     /// chat/agent 행위를 OTLP agent exporter로 fan-out하는 tap. exporter가 비활성이면
     /// 구독자가 없어 publish는 조용히 버려진다 — chat 쪽은 그걸 알 필요가 없다.
     pub agent_bus: AgentEventBus,
+    /// OTLP exporter 전송 건강. exporter가 비활성이면 `None` — `GetExporterStatus`는 그때
+    /// `enabled: false`를 돌려준다("꺼짐"과 "켜졌는데 실패 중"은 다른 상태다).
+    pub exporter_health: Option<Arc<crate::otlp_exporter::ExporterHealth>>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -148,6 +151,14 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             commit: env!("AIC_BUILD_COMMIT").to_string(),
             build_info: env!("AIC_BUILD_INFO").to_string(),
         }),
+        IpcRequest::GetExporterStatus => IpcResponse::ExporterStatus(
+            ctx.exporter_health
+                .as_ref()
+                .map(|h| h.snapshot())
+                // exporter 비활성 — 기본값(enabled: false). 응답을 생략하지 않는 이유는
+                // 호출부가 "꺼짐"을 "조회 실패"와 구분해야 하기 때문이다.
+                .unwrap_or_default(),
+        ),
         IpcRequest::AgentEvent(ev) => {
             // 저장하지 않고 tap으로 흘리기만 한다 — 로컬 기록은 chat 쪽 audit/tool_record가
             // 이미 담당한다. exporter가 꺼져 있으면 구독자가 없어 조용히 버려진다.
@@ -485,6 +496,8 @@ mod tests {
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),
             agent_bus: AgentEventBus::new(),
+            // exporter 미구성 — GetExporterStatus는 `enabled: false`를 돌려준다.
+            exporter_health: None,
         }
     }
 

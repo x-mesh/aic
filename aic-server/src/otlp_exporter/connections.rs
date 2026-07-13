@@ -53,6 +53,8 @@ pub struct ConnectionsConfig {
     pub timeout: Duration,
     /// 오프라인 spool(SRE t8). host metrics/events config와 동일 인스턴스를 공유한다.
     pub spool: Arc<Spool>,
+    /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
+    pub health: Arc<super::ExporterHealth>,
 }
 
 /// connections exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
@@ -117,13 +119,17 @@ pub async fn serve_connections(
                         }
 
                         match super::push_logs(&client, &url, cfg.token.as_deref(), body.clone()).await {
-                            Ok(()) => backoff.on_success(),
+                            Ok(()) => {
+                                backoff.on_success();
+                                cfg.health.record_ok();
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, "OTLP connections push 실패 — spool에 적재");
                                 if let Err(e2) = cfg.spool.append(SignalKind::Logs, &body) {
                                     tracing::warn!(error = %e2, "OTLP connections spool append 실패 — 이 스냅샷 유실");
                                 }
                                 backoff.on_failure();
+                                cfg.health.record_fail();
                             }
                         }
                     }

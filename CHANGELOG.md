@@ -48,6 +48,21 @@
     드레인 주체가 항상 존재함을 보장할 수 있어서다). events/connections는 자기 push 실패만 spool에
     적재하고 backoff도 독립적으로 관리한다.
 
+- **chat status bar에 exporter 상태 표시** — exporter는 aicd 안에서 조용히 돌기 때문에, 전송이
+  실패해도 aicd 로그에만 WARN이 남고 chat을 쓰는 사람은 "내 데이터가 서버로 나가고 있다"고 **믿을
+  뿐 확인할 방법이 없었다**(실제로 exporter 없는 구버전 aicd가 도는 동안 아무도 눈치채지 못한
+  사고가 있었다). 이제 status bar 맨 뒤에 한 칸이 붙는다:
+  - `otlp ●` (dim) — 정상 전송 중
+  - `otlp aicd off` (빨강) — aicd 미실행 또는 `GetExporterStatus` 이전 구버전. **데이터가 전혀
+    나가지 않고 있다**는 뜻이다.
+  - `otlp ⚠ N밀림` (주황) — push 실패로 spool에 N개 배치가 밀려 있다(collector에 못 닿는 중).
+  - `otlp ✕ N유실` (빨강) — spool 상한을 넘겨 N개를 실제로 버렸다. 밀림보다 먼저 알린다.
+
+  config에서 exporter를 안 켠 경우에는 **아무것도 표시하지 않는다** — 안 쓰는 기능을 계속 띄우면
+  노이즈다. 상태는 aicd에 `GetExporterStatus`로 묻고 2초 캐시를 둔다(status bar 갱신 빈도와 무관하게
+  IPC는 그 주기로만 나간다). 네 exporter task(host metrics/events/connections/agent)가 전송 성패
+  카운터를 공유하므로, 어느 signal이 실패했는지가 아니라 "이 호스트의 텔레메트리가 서버에 닿고
+  있나"를 한 칸으로 답한다.
 - **chat/agent 행위 exporter (opt-in, OTLP `aic.agent` scope)** — chat에서 일어난 **주목할 만한
   행위**를 aicd로 넘겨 collector로 push한다. 하위 플래그 `[aicd.exporter] agent_enabled`(기본 true,
   부모 `enabled`가 실제 게이트)로 끌 수 있다. 보내는 것은 세 종류뿐이다:
