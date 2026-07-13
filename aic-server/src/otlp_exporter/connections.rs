@@ -96,6 +96,8 @@ pub async fn serve_connections(
                                 local_port: c.local_port,
                                 peer_addr: c.peer_addr.as_deref(),
                                 peer_port: c.peer_port,
+                                process: c.process.as_deref(),
+                                direction: c.direction.as_deref(),
                             })
                             .collect();
                         let resource = ResourceAttrs {
@@ -204,6 +206,15 @@ struct RawConnection {
     local_port: u16,
     peer_addr: Option<String>,
     peer_port: Option<u16>,
+    /// 소켓 소유 프로세스명. `Option`+`default`라 이 필드를 모르는 **구 `aic` 바이너리**와의 버전
+    /// skew에도 스냅샷 전체가 실패하지 않는다(반대 방향인 신 client + 구 server는
+    /// `deny_unknown_fields`가 없어 이미 안전하다).
+    #[serde(default)]
+    process: Option<String>,
+    /// `"listen"`|`"inbound"`|`"outbound"` — aic-client가 스냅샷 전체를 보고 파생한 값을 그대로
+    /// 통과시킨다. 여기서 재해석하지 않는다: 판정에 필요한 문맥은 client만 갖고 있다.
+    #[serde(default)]
+    direction: Option<String>,
 }
 
 #[cfg(test)]
@@ -235,6 +246,32 @@ mod tests {
         assert_eq!(snapshot.host.ip.as_deref(), Some("10.0.0.5"));
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(snapshot.connections[0].local_port, 22);
+    }
+
+    #[tokio::test]
+    async fn capture_inventory_parses_process_and_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"ESTAB","local_addr":"192.168.1.5","local_port":22,"peer_addr":"192.168.1.10","peer_port":54321,"process":"sshd","direction":"inbound"}]}"#;
+        let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
+
+        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let c = &snapshot.connections[0];
+        assert_eq!(c.process.as_deref(), Some("sshd"));
+        assert_eq!(c.direction.as_deref(), Some("inbound"));
+    }
+
+    /// 구 `aic` 바이너리(process/direction 필드가 없는 스냅샷)와의 버전 skew에서도 파싱이 실패하지
+    /// 않아야 한다 — 필드가 빠지면 `None`이 되고, exporter는 attr을 생략해 rca가 폴백 파생을 돈다.
+    #[tokio::test]
+    async fn capture_inventory_accepts_snapshot_without_process_and_direction() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"LISTEN","local_addr":"0.0.0.0","local_port":22,"peer_addr":null,"peer_port":null}]}"#;
+        let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
+
+        let snapshot = capture_inventory(&bin, Duration::from_secs(5)).await.unwrap();
+        let c = &snapshot.connections[0];
+        assert_eq!(c.process, None);
+        assert_eq!(c.direction, None);
     }
 
     #[tokio::test]
