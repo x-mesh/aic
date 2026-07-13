@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::Spool;
+use super::{SignalKind, Spool};
 
 /// exporter 전송 카운터 + spool 참조. 모든 필드는 lock-free다(push 경로에 락을 넣지 않는다).
 #[derive(Debug)]
@@ -41,8 +41,7 @@ impl ExporterHealth {
     /// push 1건 성공. 마지막 성공 시각도 갱신한다.
     pub fn record_ok(&self) {
         self.push_ok_total.fetch_add(1, Ordering::Relaxed);
-        self.last_ok_unix
-            .store(unix_now_secs(), Ordering::Relaxed);
+        self.last_ok_unix.store(unix_now_secs(), Ordering::Relaxed);
     }
 
     /// push 1건 실패(spool에 적재됨).
@@ -62,7 +61,12 @@ impl ExporterHealth {
             // 상태라, 0초로 뭉개지 않는다.
             last_ok_secs_ago: (last_ok > 0).then(|| unix_now_secs().saturating_sub(last_ok)),
             spool_batches: self.spool.batch_count() as u64,
-            spool_dropped: self.spool.dropped_count(),
+            // R3: SignalKind별로 쿼터/드랍 카운터가 나뉘었지만, chat status bar가 알고 싶은 건
+            // "데이터가 실제로 유실됐는가" 하나이지 어느 kind에서 드랍됐는지가 아니다 — 셋을 합산.
+            spool_dropped: [SignalKind::Metrics, SignalKind::Logs, SignalKind::AppLogs]
+                .into_iter()
+                .map(|k| self.spool.dropped_count(k))
+                .sum(),
         }
     }
 }
@@ -80,7 +84,12 @@ mod tests {
 
     fn health() -> ExporterHealth {
         let dir = tempfile::tempdir().unwrap();
-        let spool = Arc::new(Spool::open(dir.path().to_path_buf(), 1024 * 1024).unwrap());
+        let quotas = aic_common::SpoolQuotas {
+            metrics: 1024 * 1024,
+            logs: 1024 * 1024,
+            app_logs: 1024 * 1024,
+        };
+        let spool = Arc::new(Spool::open(dir.path().to_path_buf(), quotas).unwrap());
         // tempdir이 drop되면 경로가 사라지지만, batch_count는 실패 시 0을 돌려주므로 테스트에
         // 지장이 없다. 카운터 동작만 검증한다.
         std::mem::forget(dir);

@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aic_server::otlp_exporter::{serve, ExporterConfig, ExporterHealth, SignalKind, Spool};
+use aic_server::otlp_exporter::{
+    serve, DropCounters, ExporterConfig, ExporterHealth, SignalKind, Spool,
+};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -49,7 +51,11 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
     let up = Arc::new(AtomicBool::new(false)); // "중앙 다운" 상태로 시작.
     let (metrics_tx, mut metrics_rx) = mpsc::channel::<Vec<u8>>(256);
     let (logs_tx, mut logs_rx) = mpsc::channel::<Vec<u8>>(256);
-    let state = MockState { up: up.clone(), metrics_tx, logs_tx };
+    let state = MockState {
+        up: up.clone(),
+        metrics_tx,
+        logs_tx,
+    };
     let app = Router::new()
         .route("/v1/metrics", post(metrics_handler))
         .route("/v1/logs", post(logs_handler))
@@ -59,12 +65,19 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
     });
 
     let dir = tempfile::tempdir().unwrap();
-    let spool = Arc::new(Spool::open(dir.path().join("otlp-spool"), 16 * 1024 * 1024).unwrap());
+    let quotas = aic_common::SpoolQuotas {
+        metrics: 16 * 1024 * 1024,
+        logs: 16 * 1024 * 1024,
+        app_logs: 16 * 1024 * 1024,
+    };
+    let spool = Arc::new(Spool::open(dir.path().join("otlp-spool"), quotas).unwrap());
 
     // 다운 구간 시작 전 이미 spool에 남아 있던 배치(예: 이전 aicd 실행에서 events/connections
     // task가 push 실패로 적재해 둔 것)를 하나 심어 둔다 — 드레인이 host metrics 자기 배치뿐 아니라
     // logs 태그 배치도 올바른 endpoint(`/v1/logs`)로 재전송하는지 같이 검증한다.
-    spool.append(SignalKind::Logs, b"preexisting-logs-batch").unwrap();
+    spool
+        .append(SignalKind::Logs, b"preexisting-logs-batch")
+        .unwrap();
 
     let (sd_tx, sd_rx) = watch::channel(false);
     let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
@@ -76,6 +89,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         spool: spool.clone(),
         drain_batch_limit: 50,
         health,
+        drop_counters: Arc::new(DropCounters::new()),
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 
@@ -97,7 +111,11 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // 다운 구간 동안 쌓인 배치가 전부 드레인되어 spool이 비어야 한다 — 무유실의 핵심 단언.
-    assert_eq!(spool.batch_count(), 0, "복구 후엔 spool이 완전히 비어야 함(무유실)");
+    assert_eq!(
+        spool.batch_count(),
+        0,
+        "복구 후엔 spool이 완전히 비어야 함(무유실)"
+    );
 
     let mut received_logs = Vec::new();
     while let Ok(body) = logs_rx.try_recv() {
