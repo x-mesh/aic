@@ -217,7 +217,7 @@ fn cap(mut transitions: Vec<Transition>) -> Vec<Transition> {
     if transitions.len() <= TOP_N {
         return transitions;
     }
-    transitions.sort_by(|a, b| b.weight.cmp(&a.weight));
+    transitions.sort_by_key(|t| std::cmp::Reverse(t.weight));
     let dropped = transitions.split_off(TOP_N);
     let starts = dropped.iter().filter(|t| t.action == "start").count();
     let exits = dropped.iter().filter(|t| t.action == "exit").count();
@@ -226,7 +226,10 @@ fn cap(mut transitions: Vec<Transition>) -> Vec<Transition> {
         action: "churn",
         prev_state: None,
         new_state: Some(dropped.len().to_string()),
-        summary: format!("그 외 프로세스 전이 {}건 (start {starts}, exit {exits})", dropped.len()),
+        summary: format!(
+            "그 외 프로세스 전이 {}건 (start {starts}, exit {exits})",
+            dropped.len()
+        ),
         weight: 0,
     });
     transitions
@@ -383,7 +386,10 @@ mod tests {
     }
 
     fn map(items: &[(u32, &str, u64)]) -> HashMap<u32, ProcSnap> {
-        items.iter().map(|(pid, n, r)| (*pid, snap(n, *r))).collect()
+        items
+            .iter()
+            .map(|(pid, n, r)| (*pid, snap(n, *r)))
+            .collect()
     }
 
     const MIB: u64 = 1024 * 1024;
@@ -413,14 +419,23 @@ mod tests {
         assert!(out.is_empty(), "작은 프로세스의 2배 증가는 spike가 아니다");
 
         // 절대량은 크지만 배수가 작다(1000MB→1050MB) → 자연스러운 등락, spike 아님.
-        let out = diff(&map(&[(1, "big", 1000 * MIB)]), &map(&[(1, "big", 1050 * MIB)]));
+        let out = diff(
+            &map(&[(1, "big", 1000 * MIB)]),
+            &map(&[(1, "big", 1050 * MIB)]),
+        );
         assert!(out.is_empty(), "큰 프로세스의 완만한 증가는 spike가 아니다");
 
         // 둘 다 충족(100MB→300MB) → spike.
-        let out = diff(&map(&[(1, "java", 100 * MIB)]), &map(&[(1, "java", 300 * MIB)]));
+        let out = diff(
+            &map(&[(1, "java", 100 * MIB)]),
+            &map(&[(1, "java", 300 * MIB)]),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].action, "rss_spike");
-        assert_eq!(out[0].prev_state.as_deref(), Some((100 * MIB).to_string().as_str()));
+        assert_eq!(
+            out[0].prev_state.as_deref(),
+            Some((100 * MIB).to_string().as_str())
+        );
     }
 
     #[test]
@@ -431,8 +446,12 @@ mod tests {
         let out = diff(&prev, &current);
 
         assert_eq!(out.len(), 2, "재사용된 pid는 exit + start 두 전이다");
-        assert!(out.iter().any(|t| t.action == "exit" && t.subject == "old:1"));
-        assert!(out.iter().any(|t| t.action == "start" && t.subject == "new:1"));
+        assert!(out
+            .iter()
+            .any(|t| t.action == "exit" && t.subject == "old:1"));
+        assert!(out
+            .iter()
+            .any(|t| t.action == "start" && t.subject == "new:1"));
         assert!(
             !out.iter().any(|t| t.action == "rss_spike"),
             "pid 재사용을 rss_spike로 오인하면 안 된다"

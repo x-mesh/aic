@@ -179,15 +179,9 @@ impl ExporterState {
         match self {
             ExporterState::Disabled => None,
             ExporterState::Ok => Some(("otlp ●".to_string(), Severity::Normal)),
-            ExporterState::DaemonDown => {
-                Some(("otlp aicd off".to_string(), Severity::Crit))
-            }
-            ExporterState::Backlogged(n) => {
-                Some((format!("otlp ⚠ {n}밀림"), Severity::Warn))
-            }
-            ExporterState::Dropping(n) => {
-                Some((format!("otlp ✕ {n}유실"), Severity::Crit))
-            }
+            ExporterState::DaemonDown => Some(("otlp aicd off".to_string(), Severity::Crit)),
+            ExporterState::Backlogged(n) => Some((format!("otlp ⚠ {n}밀림"), Severity::Warn)),
+            ExporterState::Dropping(n) => Some((format!("otlp ✕ {n}유실"), Severity::Crit)),
         }
     }
 }
@@ -1111,6 +1105,9 @@ mod tests {
         assert!(line.contains("disk n/a"), "{line}");
     }
 
+    // 테스트 전용 헬퍼 — 필드를 다 실어 나르다 보니 인자가 많다. 로직이 아니라
+    // 시그니처만의 문제라 clippy 임계치(7)만 넘어서므로 allow로 표시한다.
+    #[allow(clippy::too_many_arguments)]
     fn metric(
         load1: f64,
         cpu: f32,
@@ -1243,7 +1240,10 @@ mod tests {
 
         // aicd는 살아있지만 exporter가 꺼짐.
         let off = ExporterStatus::default();
-        assert_eq!(ExporterState::from_status(Some(off)), ExporterState::Disabled);
+        assert_eq!(
+            ExporterState::from_status(Some(off)),
+            ExporterState::Disabled
+        );
 
         let base = ExporterStatus {
             enabled: true,

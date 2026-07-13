@@ -111,10 +111,9 @@ impl LocalCascade {
                 },
             )
             .await;
-            match resp {
-                Some(IpcResponse::CommandData(r)) => return Some(r),
-                // connection 실패(None) 또는 Error/기타 응답 → (2) 로 폴백 (R4.3)
-                _ => {}
+            // connection 실패(None) 또는 Error/기타 응답 → (2) 로 폴백 (R4.3)
+            if let Some(IpcResponse::CommandData(r)) = resp {
+                return Some(r);
             }
         }
         let resp = send_request_opt(&self.session_sock, &IpcRequest::GetLastCommand).await;
@@ -141,12 +140,7 @@ impl LocalCascade {
             }
             // 연결 실패 또는 Error → 세션 폴백
         }
-        match send_request_opt(
-            &self.session_sock,
-            &IpcRequest::GetRecentCommands { count },
-        )
-        .await
-        {
+        match send_request_opt(&self.session_sock, &IpcRequest::GetRecentCommands { count }).await {
             Some(IpcResponse::CommandRecords(records)) => records,
             _ => Vec::new(),
         }
@@ -319,12 +313,7 @@ async fn scenario_a_flag_on_aicd_has_record_cascade_uses_aicd() {
     // aicd store 에는 두 개의 record 를 넣고, session socket 에는 같은 session_id
     // 에 다른 record 를 넣어 두어 cascade 가 실수로 session 을 쓰면 차이가 드러나게 한다.
     push_record_to_aicd(&aicd.sock_path, "sess-a", pty_record("aaaa0001", "ls", 0)).await;
-    push_record_to_aicd(
-        &aicd.sock_path,
-        "sess-a",
-        pty_record("aaaa0002", "pwd", 0),
-    )
-    .await;
+    push_record_to_aicd(&aicd.sock_path, "sess-a", pty_record("aaaa0002", "pwd", 0)).await;
 
     session
         .push(pty_record("ffff9999", "session-should-not-be-used", 99))
@@ -385,7 +374,10 @@ async fn scenario_b_flag_on_aicd_empty_session_fallback_for_last() {
     );
 
     // last: aicd → Error("hook metadata record를 찾을 수 없습니다") → session 폴백 → record 획득
-    let last = cascade.get_last_command().await.expect("session 폴백으로 Some");
+    let last = cascade
+        .get_last_command()
+        .await
+        .expect("session 폴백으로 Some");
     assert_eq!(
         last.command.as_deref(),
         Some("echo fallback"),
@@ -424,12 +416,7 @@ async fn scenario_c_flag_on_aicd_down_falls_back_to_session() {
     session.push(expected_last.clone()).await;
     session.push(expected_tail.clone()).await;
 
-    let cascade = LocalCascade::new(
-        "sess-c",
-        true,
-        aicd_sock,
-        session.sock_path.clone(),
-    );
+    let cascade = LocalCascade::new("sess-c", true, aicd_sock, session.sock_path.clone());
 
     // last: aicd 연결 실패 → session 폴백 → 가장 마지막 record.
     let last = cascade
