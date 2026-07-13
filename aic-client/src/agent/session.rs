@@ -264,8 +264,11 @@ pub struct AgentSession {
     /// status bar가 마지막으로 샘플한 지표 캐시 — "지금 이 순간"(`/record now`) 요약의 1차 소스(t2).
     /// `SysSampler::new()` 직후 `sample()`은 elapsed≈0이라 cpu_pct가 거짓 0으로 나오는 cold-start
     /// 오염이 있다(cpu%는 sysinfo 내부 델타 기반). 이미 워밍업된 이 캐시를 쓰면 정확하고, 덤으로
-    /// 사용자가 화면에서 본 status bar 숫자와 기록에 남는 숫자가 일치한다. `record_metrics_summary`가
-    /// 읽고, None이면 즉석 `SysSampler`로 폴백한다.
+    /// 사용자가 화면에서 본 status bar 숫자와 기록에 남는 숫자가 일치한다.
+    ///
+    /// 주의: **여기 담긴 값이 항상 워밍업된 것은 아니다** — 두 갱신 루프 모두 sampler 생성 직후의
+    /// **첫 샘플**(=오염값)도 이 캐시에 넣는다. 그래서 신뢰 판정을 캐시 유무로 하지 않고 스냅샷 자신의
+    /// `cpu_valid`/`sampled_at`으로 한다(`metrics_cache_usable`).
     last_metrics: Option<super::sys_sampler::SysMetrics>,
     /// TUI 경로에서 chat_tui의 status bar 샘플러 task가 최신 지표를 계속 밀어넣는 watch 채널(t2).
     /// `run_loop_tui`에서만 채워진다 — Direct는 이 채널 없이 자체 루프가 `last_metrics`를 직접 채운다.
@@ -1551,18 +1554,26 @@ impl AgentSession {
         }
     }
 
-    /// "지금 이 순간"(`/record now`)의 지표 요약 소스(t2). 우선순위:
-    /// 1) TUI 경로면 chat_tui의 지표 watch 채널에서 최신값을 당겨 `last_metrics`를 갱신한다
-    ///    (Direct는 자체 루프가 이미 채워 뒀으므로 그대로 둔다).
-    /// 2) `last_metrics`가 있으면 그대로 반환 — status bar가 이미 워밍업한 값이라 정확하고,
-    ///    사용자가 화면에서 본 숫자와 기록에 남는 숫자가 일치한다.
-    /// 3) 그래도 없으면(status bar 비활성 — off/non-TTY/CLI 경로) 즉석 `SysSampler`로 폴백한다.
+    /// "지금 이 순간"(`/record now`)의 지표 요약 소스(t2).
     ///
-    /// 반환값 두 번째 요소는 "cpu가 유효한가"다. `SysSampler::new()` 직후 `sample()`은 elapsed≈0이라
-    /// cpu_pct가 거짓 0으로 나오는 cold-start 오염이 있다(cpu%는 sysinfo 내부 델타 기반이라 최소 한 번의
-    /// 이전 refresh가 필요 — mem/disk/load는 순간값이라 영향 없음). 캐시 경로(1·2)는 이미 워밍업됐으므로
-    /// 항상 유효하고, 즉석 폴백(3)만 무효 — 호출부(OTLP attr 조립)는 false면 cpu_utilization을 생략해
-    /// 0을 진짜 값인 척 보내면 안 된다.
+    /// 1) TUI 경로면 chat_tui의 지표 watch 채널에서 최신값을 당겨 `last_metrics`를 갱신한다
+    ///    (Direct는 자체 루프가 프롬프트 직전에 이미 채워 뒀다).
+    /// 2) 캐시가 **쓸 수 있으면**(`metrics_cache_usable`) 그대로 반환한다 — status bar가 이미 워밍업한
+    ///    값이라 cpu가 정확하고, 사용자가 화면에서 본 숫자와 기록에 남는 숫자가 일치한다.
+    /// 3) 아니면 즉석 `SysSampler`로 폴백한다. 이 스냅샷의 cpu는 **구조적으로 무효**다(cold-start —
+    ///    `SysSampler::new()` 직후 sample()은 elapsed≈0이라 sysinfo가 cpu 델타를 못 낸다). mem/disk/load는
+    ///    순간값이라 폴백에서도 정확하다.
+    ///
+    /// 반환값 둘째 요소 = "cpu를 믿어도 되는가"이며 항상 반환 스냅샷의 `cpu_valid`와 같다(호출부 편의).
+    /// **false면 호출부(OTLP attr 조립)는 cpu_utilization을 생략해야 한다** — 0을 진짜 값인 척 보내면 안 된다.
+    ///
+    /// 캐시를 "무조건 유효"로 보지 않는 이유는 두 가지다(게이트 지적):
+    /// - **첫 샘플 오염**: direct 루프와 sampler task 모두 생성 직후 첫 `sample()`을 캐시에 넣는데, 그 샘플의
+    ///   cpu는 위 cold-start와 **정확히 같은 오염값**이다. 이제 sampler가 스냅샷에 `cpu_valid=false`를 실어
+    ///   보내므로 여기서 걸러진다(안 걸렀다면 이 함수가 막겠다던 상황을 그대로 통과시켰을 것이다).
+    /// - **낡음**: status bar가 갱신되지 않은 채 시간이 흐르면(sampler task 정지, 프롬프트에서 장시간 대기)
+    ///   그 값은 더 이상 "지금"이 아니다 — `METRICS_FRESH_WINDOW`를 넘기면 캐시를 버리고 즉석 샘플로
+    ///   내려간다(cpu는 잃지만 mem/disk/load는 진짜 현재값이다 — "지금 이 순간"의 의미를 지키는 쪽).
     ///
     /// t2 시점엔 아직 호출부가 없다(OTLP로 실제 전송해 `/record now`에 붙이는 건 t3) — 소스만 준비해
     /// 둔다. 테스트가 불변식을 검증하므로 `dead_code`는 여기서만 허용한다.
@@ -1573,9 +1584,15 @@ impl AgentSession {
                 self.last_metrics = Some(m);
             }
         }
-        match self.last_metrics.clone() {
-            Some(m) => (m, true),
-            None => (super::sys_sampler::SysSampler::new().sample(), false),
+        let now = std::time::Instant::now();
+        match &self.last_metrics {
+            Some(m) if metrics_cache_usable(m, now) => (m.clone(), true),
+            // 캐시 없음 · 첫 샘플(cpu 오염) · 낡음 → 즉석 샘플. sample()이 cpu_valid=false를 스스로 채운다.
+            _ => {
+                let m = super::sys_sampler::SysSampler::new().sample();
+                debug_assert!(!m.cpu_valid, "cold-start 폴백 샘플의 cpu는 무효여야 한다");
+                (m, false)
+            }
         }
     }
 
@@ -2303,6 +2320,27 @@ fn env_local_no_analyze() -> bool {
         .unwrap_or(false)
 }
 
+/// status bar 지표 캐시를 "지금 이 순간"으로 인정할 최대 나이(t2).
+///
+/// 근거: TUI sampler의 갱신 주기는 Normal 5s / Warn·Crit 2s다(`sys_sampler::CADENCE_*`). 30s면 정상
+/// 주기의 **6틱**이라, 이보다 낡았다는 것은 sampler가 정상 동작 중이 아니라는 뜻이다(hung mount에서
+/// statfs가 멈추면 single-flight 구조상 publish도 멈춘다). Direct는 프롬프트 직전에 샘플하므로 이 창이
+/// 곧 "사용자가 프롬프트를 보고 명령을 입력하기까지의 시간"이고, 30s는 그 대부분을 덮는다.
+/// 넘어가면 캐시를 버리고 즉석 샘플로 내려간다 — 낡은 cpu를 "지금"이라고 기록하느니, cpu를 포기하고
+/// 진짜 현재의 mem/disk/load를 남기는 편이 `/record now`의 의미에 맞다.
+const METRICS_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 캐시된 지표를 `/record now`의 지표 요약으로 **그대로 써도 되는가**(순수 함수 — `now` 주입으로
+/// 벽시계·머신 상태 비의존 테스트 가능). 두 조건을 모두 만족해야 한다:
+/// 1. `cpu_valid` — 첫 샘플(cold-start)이면 sampler가 false로 표시했다. 이걸 거르지 않으면 이 방어가
+///    막겠다고 한 바로 그 오염값을 통과시킨다.
+/// 2. 신선함 — `sampled_at`이 `METRICS_FRESH_WINDOW` 안. 나이 미상(`None`)은 신선하다고 볼 수 없다.
+fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Instant) -> bool {
+    m.cpu_valid
+        && m.sampled_at
+            .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
+}
+
 /// 세션 correlation id(run). 시계열 nanos 하위 32비트를 8자리 hex로 — 로그 추적용
 /// (충돌 내성보다 가독성 우선, 외부 dependency 없이 생성).
 fn new_run_id() -> String {
@@ -2919,7 +2957,9 @@ mod tests {
     }
 
     /// 테스트 전용 최소 `AgentSession` 생성 헬퍼 — network 없이 결정적으로 구성한다.
-    fn test_session() -> AgentSession {
+    /// `TempDir`을 **함께 반환**한다: 지역 변수로 두면 헬퍼 종료 시 drop되어 임시 디렉터리가 지워지고
+    /// `Sandbox`가 존재하지 않는 경로를 가리킨다(테스트가 "우연히" 통과할 뿐). 호출부가 살려 둬야 한다.
+    fn test_session() -> (AgentSession, tempfile::TempDir) {
         use crate::llm_dispatcher::LlmDispatcher;
         use aic_common::LlmConfig;
         use std::collections::HashMap;
@@ -2934,45 +2974,58 @@ mod tests {
             request_timeout_secs: 30,
         };
         let dispatcher = LlmDispatcher::from_config(cfg);
-        AgentSession::new(
+        let session = AgentSession::new(
             dispatcher,
             sb,
             CommandRecord::default(),
             "english".to_string(),
-        )
+        );
+        (session, dir)
     }
 
-    // t2: `record_metrics_summary`(last_metrics 캐시 소스) 불변식 3종.
+    #[test]
+    fn test_session_keeps_sandbox_root_alive() {
+        // 헬퍼가 TempDir을 반환하지 않으면 함수 종료 시 임시 디렉터리가 지워져 Sandbox가 존재하지 않는
+        // 경로를 가리킨다(테스트는 그걸 안 만지니 "우연히" 통과한다). 수명 계약을 여기서 못 박는다.
+        let (session, _dir) = test_session();
+        assert!(
+            session.sandbox.root().exists(),
+            "test_session이 살아있는 동안 sandbox root가 존재해야 한다"
+        );
+    }
+
+    /// 워밍업된(=status bar가 이미 여러 tick 돌린) 스냅샷을 흉내 낸다 — cpu 유효 + 방금 샘플됨.
+    fn warm_metrics(cpu_pct: f32) -> super::super::sys_sampler::SysMetrics {
+        super::super::sys_sampler::SysMetrics {
+            cpu_pct,
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        }
+    }
+
+    // t2: `record_metrics_summary`(last_metrics 캐시 소스) 불변식.
     // 이 머신의 실제 cpu/mem 값을 단언하지 않는다 — 캐시 우선순위·폴백 전환·cpu 유효성 플래그만 검증한다
     // (이 프로젝트에서 "머신 상태 의존 단언"이 이미 3번 사고 난 규칙).
 
     #[test]
     fn record_metrics_summary_uses_direct_loop_cache_when_present() {
-        // 불변식 1: last_metrics(Direct 루프가 채움)가 있으면 그 값을 그대로 쓰고 cpu가 유효하다고
-        // 보고한다 — 즉석 재샘플링을 하지 않는다.
-        let mut session = test_session();
-        session.last_metrics = Some(super::super::sys_sampler::SysMetrics {
-            cpu_pct: 42.0,
-            ..Default::default()
-        });
+        // 불변식 1: 워밍업된 last_metrics(Direct 루프가 채움)가 있으면 그 값을 그대로 쓰고 cpu가
+        // 유효하다고 보고한다 — 즉석 재샘플링을 하지 않는다.
+        let (mut session, _dir) = test_session();
+        session.last_metrics = Some(warm_metrics(42.0));
         let (m, cpu_valid) = session.record_metrics_summary();
         assert_eq!(m.cpu_pct, 42.0);
-        assert!(cpu_valid, "캐시 경로는 cpu가 유효해야 한다");
+        assert!(cpu_valid, "워밍업된 캐시 경로는 cpu가 유효해야 한다");
     }
 
     #[test]
     fn record_metrics_summary_prefers_tui_channel_over_stale_cache() {
         // 불변식 2: TUI 경로(metrics_rx)에 새 값이 있으면 그걸로 last_metrics를 갱신한다 — 오래된
         // last_metrics에 머물지 않는다.
-        let mut session = test_session();
-        session.last_metrics = Some(super::super::sys_sampler::SysMetrics {
-            cpu_pct: 1.0,
-            ..Default::default()
-        });
-        let (_tx, rx) = tokio::sync::watch::channel(Some(super::super::sys_sampler::SysMetrics {
-            cpu_pct: 77.0,
-            ..Default::default()
-        }));
+        let (mut session, _dir) = test_session();
+        session.last_metrics = Some(warm_metrics(1.0));
+        let (_tx, rx) = tokio::sync::watch::channel(Some(warm_metrics(77.0)));
         session.metrics_rx = Some(rx);
         let (m, cpu_valid) = session.record_metrics_summary();
         assert_eq!(m.cpu_pct, 77.0, "채널의 최신값이 우선해야 한다");
@@ -2989,11 +3042,91 @@ mod tests {
         // 불변식 3: 캐시(last_metrics)도 채널(metrics_rx)도 없으면(status bar 비활성) 즉석 SysSampler로
         // 폴백하되, cold-start(SysSampler::new() 직후 sample())로 오염된 cpu는 무효라고 표시해야 한다.
         // cpu_pct 실측값(이 머신 상태)은 단언하지 않는다 — 단언 대상은 오직 "유효성 플래그"뿐이다.
-        let mut session = test_session();
+        let (mut session, _dir) = test_session();
         assert!(session.last_metrics.is_none());
         assert!(session.metrics_rx.is_none());
         let (_m, cpu_valid) = session.record_metrics_summary();
         assert!(!cpu_valid, "폴백 경로는 cpu를 무효로 표시해야 한다");
+    }
+
+    #[test]
+    fn record_metrics_summary_rejects_cold_start_first_sample_in_cache() {
+        // 불변식 4(게이트 지적): direct 루프와 sampler task는 **생성 직후 첫 샘플**도 캐시에 넣는다.
+        // 그 샘플의 cpu는 이 함수가 막겠다고 한 바로 그 cold-start 오염값이다 — 캐시에 있다는 이유로
+        // valid를 보고하면 방어가 뚫린다. cpu_valid=false인 캐시는 반드시 무효로 보고돼야 한다.
+        let (mut session, _dir) = test_session();
+        session.last_metrics = Some(super::super::sys_sampler::SysMetrics {
+            cpu_pct: 0.0, // sysinfo가 델타를 못 내 0으로 나온 거짓값
+            cpu_valid: false,
+            sampled_at: Some(std::time::Instant::now()), // 신선하지만 오염됨
+            ..Default::default()
+        });
+        let (_m, cpu_valid) = session.record_metrics_summary();
+        assert!(
+            !cpu_valid,
+            "첫 샘플(cold-start)이 캐시에 있어도 cpu는 무효로 보고돼야 한다"
+        );
+    }
+
+    #[test]
+    fn record_metrics_summary_rejects_cold_start_first_sample_from_tui_channel() {
+        // 불변식 4의 TUI 짝 — spawn_sampler의 첫 publish도 오염값이라 채널 경로에서도 막혀야 한다.
+        let (mut session, _dir) = test_session();
+        let (_tx, rx) = tokio::sync::watch::channel(Some(super::super::sys_sampler::SysMetrics {
+            cpu_pct: 0.0,
+            cpu_valid: false,
+            sampled_at: Some(std::time::Instant::now()),
+            ..Default::default()
+        }));
+        session.metrics_rx = Some(rx);
+        let (_m, cpu_valid) = session.record_metrics_summary();
+        assert!(
+            !cpu_valid,
+            "sampler task의 첫 publish(cold-start)도 무효로 보고돼야 한다"
+        );
+    }
+
+    // `metrics_cache_usable` 순수 게이트 — now 주입이라 벽시계·머신 상태에 의존하지 않는다.
+
+    #[test]
+    fn metrics_cache_usable_accepts_fresh_warm_sample() {
+        let t0 = std::time::Instant::now();
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(t0),
+            ..Default::default()
+        };
+        // 창 안(경계 직전)이면 쓸 수 있다.
+        assert!(metrics_cache_usable(
+            &m,
+            t0 + METRICS_FRESH_WINDOW - std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn metrics_cache_usable_rejects_stale_and_cold_and_undated() {
+        let t0 = std::time::Instant::now();
+        let warm = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(t0),
+            ..Default::default()
+        };
+        // 낡음: 창을 넘기면 더 이상 "지금"이 아니다(경계 포함 — `<` 비교).
+        assert!(!metrics_cache_usable(&warm, t0 + METRICS_FRESH_WINDOW));
+        // cold-start: 신선해도 cpu가 오염됐으면 쓸 수 없다.
+        let cold = super::super::sys_sampler::SysMetrics {
+            cpu_valid: false,
+            sampled_at: Some(t0),
+            ..Default::default()
+        };
+        assert!(!metrics_cache_usable(&cold, t0));
+        // 나이 미상(Default): 신선하다고 주장할 수 없다.
+        let undated = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: None,
+            ..Default::default()
+        };
+        assert!(!metrics_cache_usable(&undated, t0));
     }
 
     #[tokio::test]

@@ -135,6 +135,19 @@ pub(crate) struct SysMetrics {
     /// OTLP exporter가 지금 서버에 닿고 있는지. exporter는 aicd 안에서 조용히 돌기 때문에,
     /// 이걸 보여주지 않으면 사용자는 "나가고 있다"고 믿을 뿐 확인할 방법이 없다.
     pub exporter: ExporterState,
+    /// **이 스냅샷의 `cpu_pct`를 믿어도 되는가.** cpu%는 sysinfo가 직전 refresh와의 델타로 계산하므로,
+    /// 직전 refresh와의 간격이 `MINIMUM_CPU_UPDATE_INTERVAL`(200ms)보다 짧으면 값이 갱신되지 않아
+    /// **0(거짓값)** 이 나온다. `SysSampler::new()` 직후의 첫 `sample()`이 정확히 그 상황이다(elapsed≈0).
+    /// 오염 여부를 아는 유일한 지점이 sampler이므로 여기서 판정해 스냅샷에 실어 보낸다 — 소비자
+    /// (`/record now`의 지표 요약 등)는 이 값이 false면 cpu를 **버려야 한다**(0을 진짜 값인 척 보내면 안 됨).
+    /// load/mem/swap/disk는 순간값이라 첫 샘플에서도 정확하므로 이 플래그는 cpu에만 해당한다.
+    /// `Default`가 false인 것도 의도다 — 출처를 모르는 스냅샷의 cpu는 신뢰하지 않는 쪽이 안전하다.
+    pub cpu_valid: bool,
+    /// 이 스냅샷을 샘플한 시각. "지금 이 순간"을 요구하는 소비자(`/record now`)가 **캐시의 나이**를
+    /// 판정하는 데 쓴다 — status bar가 오래 갱신되지 않았다면(sampler task 정지·프롬프트에서 장시간
+    /// 대기) 그 값은 더 이상 "지금"이 아니다. `Default`가 `None`(=나이 미상)인 것도 의도다: 나이를
+    /// 모르는 스냅샷은 신선하다고 주장할 수 없다.
+    pub sampled_at: Option<Instant>,
 }
 
 /// status bar가 보여줄 exporter 상태. IPC 응답을 사람이 볼 4가지 상태로 접은 것이다.
@@ -230,8 +243,13 @@ impl SysSampler {
         self.sys.refresh_memory();
         self.disks.refresh(false);
         self.networks.refresh(false);
+        let since_last = self.last.elapsed();
+        // cpu%는 sysinfo 내부 델타(직전 refresh 대비)라 간격이 MINIMUM_CPU_UPDATE_INTERVAL(200ms)보다
+        // 짧으면 갱신되지 않고 0이 나온다 — new() 직후 첫 sample()이 바로 그 경우(elapsed≈0)다. 오염
+        // 여부를 여기서 판정해 스냅샷에 실어 보낸다(소비자가 cpu를 버릴 수 있게).
+        let cpu_valid = since_last >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
         // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
-        let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
+        let elapsed = since_last.as_secs_f64().max(0.001);
         let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
             let u = d.usage();
             (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
@@ -275,6 +293,8 @@ impl SysSampler {
             disk_eta: None,
             trend_spark: None,
             exporter,
+            cpu_valid,
+            sampled_at: Some(self.last),
         };
         // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
         // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
@@ -1040,6 +1060,36 @@ mod tests {
         let t0 = Instant::now();
         assert!(gate.allow("", t0));
         assert!(gate.allow("", t0)); // 빈 키는 dedup 대상 아님 — 항상 통과
+    }
+
+    /// cold-start 방어의 핵심 불변식: **첫 sample()의 cpu는 무효**(elapsed≈0 < 200ms라 sysinfo가
+    /// cpu 델타를 갱신하지 못한다), 워밍업 간격을 두고 다시 샘플하면 유효.
+    /// 이 머신의 실제 cpu 부하는 단언하지 않는다 — 검증 대상은 "간격 → 유효성" 규칙뿐이다.
+    #[test]
+    fn first_sample_marks_cpu_invalid_and_warmed_sample_valid() {
+        let mut s = SysSampler::new();
+        let first = s.sample();
+        assert!(
+            !first.cpu_valid,
+            "new() 직후 첫 sample()의 cpu는 오염(elapsed≈0) — 무효여야 한다"
+        );
+        assert!(first.sampled_at.is_some(), "샘플 시각은 항상 기록된다");
+        // MINIMUM_CPU_UPDATE_INTERVAL 이상 지난 뒤의 샘플은 델타가 성립하므로 유효.
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let second = s.sample();
+        assert!(
+            second.cpu_valid,
+            "워밍업 간격({:?}) 후의 샘플은 cpu가 유효해야 한다",
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+        );
+    }
+
+    /// `Default`의 안전 기본값 — 출처를 모르는 스냅샷은 cpu를 신뢰하지 않고(false), 나이도 모른다(None).
+    #[test]
+    fn default_metrics_are_untrusted() {
+        let m = SysMetrics::default();
+        assert!(!m.cpu_valid);
+        assert!(m.sampled_at.is_none());
     }
 
     #[test]
