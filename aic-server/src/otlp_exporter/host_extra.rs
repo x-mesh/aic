@@ -5,8 +5,12 @@
 //! 10 GiB RAM에 압축해 우겨넣고(compression_ratio 2.38) 버티는 중이었다. swap이 0이라 어떤
 //! 임계에도 안 걸리고, `memory.compressed`가 애초에 수집 항목에 없어서 서버에 그 사실이
 //! 존재조차 하지 않았다 — 임계를 낮춰도 안 남는다, 문제는 수집 범위였다. 그래서 여기서
-//! (1) macOS memory compressor 3종, (2) 플랫폼 무관 memory pressure(임계를 하나로 걸 수 있는
-//! 유일한 축), (3) file descriptor count/limit을 추가로 수집한다.
+//! (1) macOS memory compressor 3종, (2) memory pressure, (3) file descriptor count/limit을
+//! 추가로 수집한다.
+//!
+//! memory pressure는 **플랫폼별로 이름을 분리**한다(macOS `.level` 이산값 vs Linux `.some`/`.full`
+//! 연속 비율). 초기 설계의 "플랫폼 무관 단일 임계" 전제는 사실이 아니어서 철회했다 — 자세한 이유는
+//! 아래 memory pressure 섹션 주석에 있다.
 //!
 //! host_metrics.rs와 같은 파일에 두지 않고 별도 모듈로 격리했다 — 여러 t-task가 동시에
 //! host_metrics.rs를 건드리면 충돌면이 생기므로, 이 파일은 t5 전용이고 host_metrics.rs 쪽
@@ -68,26 +72,80 @@ struct VmCompressorStats {
     decompressions: u64,
 }
 
-/// `host_statistics64(HOST_VM_INFO64)` 호출 — 실측 466ns. 실패(비-macOS 커널 이상/권한)면
-/// `None`이라 compressor 3종 전체를 생략한다(부분적으로 신뢰 못 할 구조체를 쓰는 것보다 안전).
-// `libc::mach_host_self`가 deprecated(대안: `mach2` crate) 표시돼 있지만, 새 의존성을 추가하지
-// 말라는 지침(이미 있는 libc만 쓴다) 때문에 의도적으로 그대로 쓴다 — 바인딩 자체는 여전히 유효.
+// libc는 `mach_port_deallocate` 바인딩을 노출하지 않는다(0.2.186 기준 — `mach2` crate로 옮겨졌다).
+// 새 의존성을 추가하지 말라는 지침이 있으므로 직접 선언한다. 심볼은 libSystem에 있어 macOS에서
+// 항상 링크되므로 `-lmach` 같은 추가 링크 플래그가 필요 없다.
 #[cfg(target_os = "macos")]
-#[allow(deprecated)]
+extern "C" {
+    fn mach_port_deallocate(
+        task: libc::mach_port_t,
+        name: libc::mach_port_t,
+    ) -> libc::kern_return_t;
+}
+
+/// `mach_host_self()`가 반환한 host port send right의 RAII 소유권.
+///
+/// **왜 필요한가(누수 버그)**: `mach_host_self()`는 호출할 때마다 send right의 user reference를
+/// 하나 올린다 — 이름(포트 번호)은 같지만 uref가 계속 증가한다. aicd는 상주 데몬이고 이 코드는
+/// 60초마다 호출되므로, 반납하지 않으면 프로세스 수명 내내 uref가 단조 증가한다(하루 1440회).
+/// 참고로 `sysinfo`는 `System::new()`에서 **딱 한 번** 얻어 들고 있어 누수가 없다 — 우리는 주기
+/// 호출이라 그 전략을 쓸 수 없고, 대신 매번 반납해야 한다.
+///
+/// **누수가 없다는 보장**: 획득은 [`HostPort::acquire`] 한 곳에서만 일어나고, 반납은 [`Drop`]에
+/// 있다. Rust는 스코프를 벗어나는 **모든** 경로(정상 반환, `?`/early return, 패닉 unwind)에서
+/// `drop`을 호출하므로, 아래 `vm_compressor_stats`의 `rc != KERN_SUCCESS` early return에서도
+/// 반드시 반납된다. 필드를 밖으로 꺼내 쓰지 못하게 raw 값은 `as_raw()`로만 빌려준다(가드가 살아
+/// 있는 동안만 유효). 이 불변식은 `host_port_send_right_is_not_leaked` 테스트가
+/// `mach_port_get_refs`로 uref를 직접 읽어 회귀 검증한다.
+#[cfg(target_os = "macos")]
+struct HostPort(libc::mach_port_t);
+
+#[cfg(target_os = "macos")]
+impl HostPort {
+    /// `libc::mach_host_self`가 deprecated(대안 `mach2` crate) 표시지만, 새 의존성 금지 지침에
+    /// 따라 의도적으로 계속 쓴다 — 바인딩 자체는 유효하다.
+    #[allow(deprecated)]
+    fn acquire() -> Self {
+        // 특별 권한이 필요 없는 host name port — 부작용 없는 순수 조회용이다.
+        Self(unsafe { libc::mach_host_self() })
+    }
+
+    fn as_raw(&self) -> libc::mach_port_t {
+        self.0
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for HostPort {
+    #[allow(deprecated)]
+    fn drop(&mut self) {
+        // 반납 실패는 복구할 방법도, 의미 있는 대응도 없다(이미 유효하지 않은 포트라는 뜻).
+        // 패닉 금지 원칙에 따라 무시한다 — Drop에서 패닉하면 unwind 중 abort로 이어질 수 있다.
+        unsafe {
+            let _ = mach_port_deallocate(libc::mach_task_self(), self.0);
+        }
+    }
+}
+
+/// `host_statistics64(HOST_VM_INFO64)` 호출 — 실측 466ns. 실패(권한/커널 이상)면 `None`이라
+/// compressor 3종 전체를 생략한다(부분적으로 신뢰 못 할 구조체를 쓰는 것보다 안전).
+#[cfg(target_os = "macos")]
 fn vm_compressor_stats() -> Option<VmCompressorStats> {
-    // `modes`류 부작용 없는 순수 조회 — mach_host_self()는 특별 권한이 필요 없는 host 포트다.
+    // 가드가 스코프 끝(성공/실패 무관)에서 send right를 반납한다 — HostPort doc의 누수 보장 참고.
+    let host = HostPort::acquire();
+
     let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
     let mut count = libc::HOST_VM_INFO64_COUNT;
     let rc = unsafe {
         libc::host_statistics64(
-            libc::mach_host_self(),
+            host.as_raw(),
             libc::HOST_VM_INFO64,
             &mut stats as *mut libc::vm_statistics64 as libc::host_info64_t,
             &mut count,
         )
     };
     if rc != libc::KERN_SUCCESS {
-        return None;
+        return None; // 여기서도 `host`의 Drop이 돌아 반납된다.
     }
     Some(VmCompressorStats {
         compressor_page_count: stats.compressor_page_count as u64,
@@ -171,16 +229,32 @@ fn collect_compressor(_state: &mut HostExtraState, _points: &mut Vec<MetricPoint
 }
 
 // ---------------------------------------------------------------------------------------------
-// memory pressure — 플랫폼 무관하게 임계를 하나로 걸 수 있는 유일한 축.
+// memory pressure — 플랫폼별로 **이름을 명시적으로 분리한다**.
+//
+// 처음 설계는 "pressure가 플랫폼 무관하게 임계를 하나로 걸 수 있는 유일한 축"이라고 봤으나,
+// 그건 사실이 아니어서 철회했다. 두 플랫폼이 측정하는 대상이 근본적으로 다르다:
+//
+//   macOS: aic.system.memory.pressure.level  = 1 | 2 | 4     이산 레벨 (커널의 판정)
+//   Linux: aic.system.memory.pressure.some   = 0.0 ~ 1.0     연속 비율 (정체된 시간의 몫)
+//          aic.system.memory.pressure.full   = 0.0 ~ 1.0
+//
+// 이름·타입·스케일이 전부 다르므로 같은 임계를 걸 수 없다. macOS의 "warn"(2)과 Linux의 "10초 중
+// 50% 정체"를 같은 0~1 축으로 매핑하면 서로 다른 두 현상을 같다고 주장하는 셈이라 **거짓**이다.
+// 그래서 억지 통일 대신 정직하게 분리했다 — 임계는 수신측(rca)이 `host.os.type`으로 분기해 건다.
+//
+// ⚠ 다음 사람에게: "이름이 왜 다르지, 통일하자"고 되돌리지 마라. 위 이유 때문에 **의도적**이다.
+// 통일하려면 두 지표를 같은 의미로 만들 방법부터 찾아야 하는데, 커널의 이산 판정과 정체 시간의
+// 연속 비율 사이에는 그런 변환이 존재하지 않는다.
 // ---------------------------------------------------------------------------------------------
 
-/// macOS: `kern.memorystatus_vm_pressure_level` — 1(normal)/2(warn)/4(critical) 단일 값이라
-/// `.some`/`.full` 구분이 없다. 그래서 macOS에서는 `aic.system.memory.pressure` 하나만 낸다.
+/// macOS: `kern.memorystatus_vm_pressure_level` — 1(normal)/2(warn)/4(critical)의 이산 레벨이다.
+/// 커널이 이미 판정을 내려 준 값이라 Linux PSI 같은 `.some`/`.full`(정체 시간 비율) 구분이 없다.
+/// 그래서 이름을 `.level`로 명시해 Linux의 연속 비율 지표와 **혼동되지 않게** 한다(위 섹션 주석).
 #[cfg(target_os = "macos")]
 fn collect_pressure(points: &mut Vec<MetricPoint>) {
     if let Some(level) = sysctl_u64("kern.memorystatus_vm_pressure_level") {
         points.push(MetricPoint {
-            name: "aic.system.memory.pressure",
+            name: "aic.system.memory.pressure.level",
             unit: "1",
             value: MetricValue::Int(level as i64),
         });
@@ -459,12 +533,88 @@ mod tests {
         // "커널이 정의한 집합 밖의 값을 그대로 흘려보내지 않는가"라는 불변식이다.
         let mut state = HostExtraState::new();
         let points = collect(&mut state);
-        if let Some(v) = int_of(&points, "aic.system.memory.pressure") {
+        if let Some(v) = int_of(&points, "aic.system.memory.pressure.level") {
             assert!(
                 v == 1 || v == 2 || v == 4,
                 "알려지지 않은 pressure level: {v}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pressure_metric_is_named_level_not_bare_pressure() {
+        // 이름 회귀 방지: Linux의 `.some`/`.full`(연속 비율)과 혼동되지 않도록 macOS는 `.level`
+        // (이산값)로 명시한다. 통일 시도가 되돌아오면 여기서 잡힌다(모듈 상단 주석의 근거 참고).
+        let mut state = HostExtraState::new();
+        let points = collect(&mut state);
+        let names: Vec<&str> = points.iter().map(|p| p.name).collect();
+        assert!(
+            !names.contains(&"aic.system.memory.pressure"),
+            "`.level` 접미사 없는 이름을 내면 안 된다(Linux 연속 비율과 혼동): {names:?}"
+        );
+        // Linux 전용 이름이 macOS에서 새어 나오지 않는지도 함께 고정한다.
+        assert!(!names.contains(&"aic.system.memory.pressure.some"));
+        assert!(!names.contains(&"aic.system.memory.pressure.full"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_port_send_right_is_not_leaked() {
+        // 회귀 방지(high): `mach_host_self()`는 호출마다 send right의 user reference를 올린다.
+        // RAII 가드(HostPort)가 Drop에서 반납하지 않으면 uref가 호출 횟수만큼 단조 증가하고,
+        // 60초 주기의 상주 데몬(aicd)에서 무한히 샌다. uref를 직접 읽어 그 불변식을 검증한다.
+        extern "C" {
+            fn mach_port_get_refs(
+                task: libc::mach_port_t,
+                name: libc::mach_port_t,
+                right: u32,
+                refs: *mut u32,
+            ) -> libc::kern_return_t;
+        }
+        const MACH_PORT_RIGHT_SEND: u32 = 0;
+
+        #[allow(deprecated)]
+        fn send_refs() -> Option<u32> {
+            // 측정 자체를 위해 얻은 포트도 가드로 감싸 즉시 반납한다(측정이 측정을 오염시키지 않게).
+            let port = HostPort::acquire();
+            let mut refs: u32 = 0;
+            let rc = unsafe {
+                mach_port_get_refs(
+                    libc::mach_task_self(),
+                    port.as_raw(),
+                    MACH_PORT_RIGHT_SEND,
+                    &mut refs,
+                )
+            };
+            (rc == libc::KERN_SUCCESS).then_some(refs)
+        }
+
+        let Some(before) = send_refs() else {
+            return; // uref를 읽을 수 없는 환경 — 검증 불가이므로 조용히 통과(패닉 금지).
+        };
+
+        // 누수가 있으면 uref가 호출 횟수(N)만큼 늘어난다. N을 크게 잡아 "호출 수에 비례해 증가"를
+        // 노이즈와 확실히 구분한다.
+        const N: usize = 200;
+        for _ in 0..N {
+            let _ = vm_compressor_stats();
+        }
+
+        let Some(after) = send_refs() else { return };
+
+        // 정확 일치를 요구하지 않는 이유: 이 테스트 바이너리의 다른 테스트가 **병렬 스레드**에서
+        // sysinfo `System::new()`를 만들면 host port uref가 영구적으로 +1씩 늘어난다(sysinfo는
+        // 한 번 얻어 들고 있는 설계라 정상 동작이다). 그 노이즈는 많아야 수 개인 반면, 누수는
+        // +200이므로 넉넉한 허용치로도 확실히 갈린다. 검증하는 불변식은 "uref 증가가 호출 횟수에
+        // 비례하지 않는다"이다.
+        const TOLERANCE: u32 = 20;
+        let grew = after.saturating_sub(before);
+        assert!(
+            grew <= TOLERANCE,
+            "host port send right 누수: {N}회 호출에 uref가 {before} → {after} (+{grew})로 증가. \
+             HostPort의 Drop(mach_port_deallocate)이 빠졌는지 확인해라."
+        );
     }
 
     #[test]
