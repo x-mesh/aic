@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aic_server::otlp_exporter::{serve, ExporterConfig, ExporterHealth, Spool};
+use aic_server::otlp_exporter::{serve, DropCounters, ExporterConfig, ExporterHealth, Spool};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -21,7 +21,12 @@ use tokio::sync::{mpsc, watch};
 /// 삭제되어 spool이 파일을 못 쓴다 — 호출부가 `_dir`을 테스트 스코프 끝까지 들고 있어야 한다.
 fn test_spool() -> (tempfile::TempDir, Arc<Spool>) {
     let dir = tempfile::tempdir().unwrap();
-    let spool = Spool::open(dir.path().join("otlp-spool"), 16 * 1024 * 1024).unwrap();
+    let quotas = aic_common::SpoolQuotas {
+        metrics: 16 * 1024 * 1024,
+        logs: 16 * 1024 * 1024,
+        app_logs: 16 * 1024 * 1024,
+    };
+    let spool = Spool::open(dir.path().join("otlp-spool"), quotas).unwrap();
     (dir, Arc::new(spool))
 }
 
@@ -33,8 +38,17 @@ struct Captured {
     body: Vec<u8>,
 }
 
-async fn collect(State(tx): State<mpsc::Sender<Captured>>, headers: HeaderMap, body: Bytes) -> StatusCode {
-    let header_str = |k: &header::HeaderName| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+async fn collect(
+    State(tx): State<mpsc::Sender<Captured>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let header_str = |k: &header::HeaderName| {
+        headers
+            .get(k)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
     let _ = tx
         .send(Captured {
             content_type: header_str(&header::CONTENT_TYPE),
@@ -55,7 +69,9 @@ async fn exporter_pushes_valid_otlp_to_collector() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut rx) = mpsc::channel::<Captured>(8);
-    let app = Router::new().route("/v1/metrics", post(collect)).with_state(tx);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -72,6 +88,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         spool,
         drain_batch_limit: 20,
         health,
+        drop_counters: Arc::new(DropCounters::new()),
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 
@@ -114,7 +131,9 @@ async fn exporter_without_token_sends_no_auth_header() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut rx) = mpsc::channel::<Captured>(8);
-    let app = Router::new().route("/v1/metrics", post(collect)).with_state(tx);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -130,6 +149,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         spool,
         drain_batch_limit: 20,
         health,
+        drop_counters: Arc::new(DropCounters::new()),
     };
     let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
 
