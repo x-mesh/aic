@@ -1274,8 +1274,10 @@ fn strip_ansi(s: &str) -> String {
 
 /// metrics watch 채널 폴링 결과 — chat_loop의 select! arm이 채널 상태를 분기하는 데 쓴다.
 enum MetricsPoll {
-    /// 새 지표 도착(첫 sample 이후엔 항상 이 변형).
-    New(SysMetrics),
+    /// 새 지표 도착(첫 sample 이후엔 항상 이 변형). `SysMetrics`가 다른 변형(무데이터)보다 훨씬 커
+    /// enum 전체가 그 크기로 부풀지 않도록 Box에 담는다 — 지표 도착은 수 초에 한 번이라 할당 비용은
+    /// 무시할 수준이다(clippy::large_enum_variant).
+    New(Box<SysMetrics>),
     /// 채널이 변경됐으나 값이 아직 None(이론상 첫 sample 전 — 무시).
     Empty,
     /// 채널이 닫힘(sampler task 종료) — arm을 비활성화해 busy-loop를 막는다.
@@ -1867,7 +1869,7 @@ async fn chat_loop(
                 match metrics_rx.as_mut() {
                     Some(rx) => match rx.changed().await {
                         Ok(()) => match rx.borrow_and_update().clone() {
-                            Some(m) => MetricsPoll::New(m),
+                            Some(m) => MetricsPoll::New(Box::new(m)),
                             None => MetricsPoll::Empty,
                         },
                         Err(_) => MetricsPoll::Closed,
@@ -1879,10 +1881,11 @@ async fn chat_loop(
                     MetricsPoll::New(m) => {
                         status = format!("· {}", m.status_line());
                         status_segs = Some(m.status_segments());
-                        // t2: session의 `last_metrics` 캐시로도 밀어보낸다 — status bar가 이미 워밍업한
-                        // 값이라 cold-start cpu_pct 오염 없이 `/record now`가 그대로 재사용할 수 있다.
-                        // 구독자(session)가 없어도(Direct 경로) send 실패는 무시(best-effort).
-                        let _ = metrics_tx.send(Some(m.clone()));
+                        // t2: session의 `last_metrics` 캐시로도 밀어보낸다 — `/record now`가 이 값을 재사용해
+                        // status bar와 같은 숫자를 기록한다. **첫 publish는 sampler의 첫 sample이라 cpu가
+                        // 오염돼 있다**(elapsed≈0) — 그 사실은 스냅샷의 `cpu_valid=false`가 실어 나르므로
+                        // session이 걸러낸다. 구독자가 없어도 send 실패는 무시(best-effort).
+                        let _ = metrics_tx.send(Some((*m).clone()));
                         // edge-triggered alert(C1): 악화 전이를 ambient Note로 로그에 직접 push한다.
                         // Note는 표시 전용 — LLM 컨텍스트엔 안 들어가고 turn을 시작하지도 않는다(§C1).
                         if let Some(tracker) = alert_tracker.as_mut() {
