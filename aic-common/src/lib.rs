@@ -14,7 +14,8 @@ pub mod shell_hooks;
 
 pub use error::AicError;
 pub use ipc::{
-    decode_frame, encode_frame, DaemonVersion, IpcRequest, IpcResponse, MetricsSnapshot,
+    decode_frame, encode_frame, AgentEvent, DaemonVersion, IpcRequest, IpcResponse, MetricsSnapshot,
+    AGENT_KIND_FINDING_CREATED, AGENT_KIND_RISK_DENIED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 pub use paths::{
     aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
@@ -571,6 +572,13 @@ pub struct AicdExporterConfig {
     /// connections/inventory 주기 스냅샷(OTLP Logs) push 활성화 여부. 기본 true.
     #[serde(default = "default_true")]
     pub connections_enabled: bool,
+    /// chat/agent 행위(OTLP Logs, scope=`aic.agent`) push 활성화 여부. 기본 true.
+    ///
+    /// 보내는 것은 시스템을 **바꾼** 행위와 **위험 신호**뿐이다(`tool.run_command`,
+    /// `risk.denied`, `finding.created`). chat 대화 내용·LLM prompt/response는 보내지 않는다 —
+    /// 그건 애초에 aicd로 넘어오지도 않는다.
+    #[serde(default = "default_true")]
+    pub agent_enabled: bool,
     /// connections/inventory 스냅샷 캡처 주기(초). host metrics `interval_secs`와 별개 — 스냅샷은
     /// `aic` 바이너리를 spawn하는 비용이 있어 기본을 더 길게(60초) 둔다.
     #[serde(default = "default_connections_interval")]
@@ -596,6 +604,7 @@ impl Default for AicdExporterConfig {
             interval_secs: default_exporter_interval(),
             events_enabled: true,
             connections_enabled: true,
+            agent_enabled: true,
             connections_interval_secs: default_connections_interval(),
             spool_max_bytes: default_spool_max_bytes(),
             spool_drain_batch_limit: default_spool_drain_batch_limit(),

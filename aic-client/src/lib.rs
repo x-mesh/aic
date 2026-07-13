@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod agent_event;
 pub mod audit;
 pub mod auto_brancher;
 pub mod cache;

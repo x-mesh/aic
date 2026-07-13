@@ -210,6 +210,7 @@ mod tests {
             record_store: crate::command_record_store::CommandRecordStore::new(),
             registry_path: None,
             metrics: Arc::new(crate::metrics::AicdMetrics::new()),
+            agent_bus: crate::agent_event_bus::AgentEventBus::new(),
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 

@@ -389,6 +389,7 @@ async fn process_request(
             build_info: env!("AIC_BUILD_INFO").to_string(),
         }),
         IpcRequest::ListSessions
+        | IpcRequest::AgentEvent(_)
         | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)

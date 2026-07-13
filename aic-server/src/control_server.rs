@@ -7,6 +7,7 @@
 //! Phase 1 sub-step 1: 최소 동작 — `Ping → Pong`만 처리한다. 이후 sub-step에서
 //! `ListSessions`, `GetMetrics`, `Shutdown` 등을 단계적으로 추가한다.
 
+use crate::agent_event_bus::AgentEventBus;
 use crate::command_record_store::CommandRecordStore;
 use crate::metrics::AicdMetrics;
 use crate::session_registry::SessionRegistry;
@@ -37,6 +38,9 @@ pub struct ControlContext {
     /// Phase 3.1: `RegisterRecordForSession` 등 central store 경로 metric을 증가시킨다.
     /// `Arc`로 공유해 이후 `AttachServer`/`SessionProcessorPool`과 동일 counter를 참조한다.
     pub metrics: Arc<AicdMetrics>,
+    /// chat/agent 행위를 OTLP agent exporter로 fan-out하는 tap. exporter가 비활성이면
+    /// 구독자가 없어 publish는 조용히 버려진다 — chat 쪽은 그걸 알 필요가 없다.
+    pub agent_bus: AgentEventBus,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -144,6 +148,13 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             commit: env!("AIC_BUILD_COMMIT").to_string(),
             build_info: env!("AIC_BUILD_INFO").to_string(),
         }),
+        IpcRequest::AgentEvent(ev) => {
+            // 저장하지 않고 tap으로 흘리기만 한다 — 로컬 기록은 chat 쪽 audit/tool_record가
+            // 이미 담당한다. exporter가 꺼져 있으면 구독자가 없어 조용히 버려진다.
+            tracing::debug!(kind = %ev.kind, severity = %ev.severity, "agent event 수신");
+            ctx.agent_bus.publish(ev);
+            IpcResponse::Pong
+        }
         IpcRequest::ListSessions => {
             reconcile_stale_sessions(ctx).await;
             IpcResponse::Sessions(ctx.registry.list().await)
@@ -473,7 +484,46 @@ mod tests {
             record_store: CommandRecordStore::new(),
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),
+            agent_bus: AgentEventBus::new(),
         }
+    }
+
+    fn agent_event(kind: &str) -> aic_common::AgentEvent {
+        aic_common::AgentEvent {
+            kind: kind.to_string(),
+            summary: "rm -rf /tmp/x".to_string(),
+            severity: "INFO".to_string(),
+            attrs: std::collections::BTreeMap::new(),
+            ts: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_event_is_fanned_out_to_tap() {
+        let c = ctx();
+        let mut rx = c.agent_bus.subscribe();
+        let resp = process_control_request(
+            IpcRequest::AgentEvent(agent_event(aic_common::AGENT_KIND_TOOL_RUN_COMMAND)),
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
+        let got = rx.try_recv().expect("tap으로 fan-out되어야 함");
+        assert_eq!(got.kind, aic_common::AGENT_KIND_TOOL_RUN_COMMAND);
+        assert_eq!(got.summary, "rm -rf /tmp/x");
+    }
+
+    #[tokio::test]
+    async fn agent_event_without_subscriber_still_succeeds() {
+        // exporter 비활성(구독자 0) — chat 쪽이 그걸 모른 채 보내도 정상 응답해야 한다.
+        let c = ctx();
+        assert_eq!(c.agent_bus.receiver_count(), 0);
+        let resp = process_control_request(
+            IpcRequest::AgentEvent(agent_event(aic_common::AGENT_KIND_RISK_DENIED)),
+            &c,
+        )
+        .await;
+        assert_eq!(resp, IpcResponse::Pong);
     }
 
     fn sample_info(id: &str) -> aic_common::SessionInfo {

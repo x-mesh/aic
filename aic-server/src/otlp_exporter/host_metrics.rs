@@ -5,13 +5,14 @@
 //! sys_sampler와 동일한 원칙을 따른다: disk/net i/o는 누적 카운터의 delta라 `Disks`/`Networks`
 //! 인스턴스를 세션 내내 **재사용**해야 정확하다(매번 새로 만들면 0). 따라서 샘플러는 상태를 든다.
 //!
-//! 이번 범위는 host metrics(cpu/load/mem/swap/disk/net)뿐이다. events tap/connections(t7),
-//! cumulative Sum 온도계·spool/backoff(t8)는 후속. 그래서 모든 지표를 순간값(Gauge)으로 낸다 —
-//! 우리가 계산하는 i/o rate도 이미 "직전 sample 이후 bytes/s"라 순간값 의미가 맞다.
+//! 수집 항목은 cpu(사용률·load 1/5/15m·코어 수), memory(usage/limit/available/utilization),
+//! swap(usage/limit/utilization), filesystem(usage/available/limit/utilization), disk i/o,
+//! network(bytes·packets·errors), process 수, uptime이다. 모든 지표를 순간값(Gauge)으로 낸다 —
+//! 우리가 계산하는 i/o·packets·errors rate도 이미 "직전 sample 이후 초당"이라 순간값 의미가 맞다.
 
 use std::time::Instant;
 
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 한 metric data point — 이름·단위·값. OTLP Gauge 하나로 인코딩된다.
 pub struct MetricPoint {
@@ -73,6 +74,13 @@ impl HostSampler {
     pub fn sample(&mut self) -> HostSample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
+        // 프로세스 수만 필요하므로 `ProcessRefreshKind::nothing()`으로 목록만 갱신한다 —
+        // cpu/메모리까지 프로세스별로 채우면 60초 주기라도 불필요하게 비싸다.
+        self.sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
         self.disks.refresh(false);
         self.networks.refresh(false);
         // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
@@ -82,8 +90,19 @@ impl HostSampler {
             let u = d.usage();
             (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
         });
+        // received()/packets_received()/errors_on_received()는 모두 직전 refresh 이후의 delta다
+        // (누적값은 total_* 계열). 그래서 elapsed로 나누면 그대로 초당 rate가 된다.
         let (rx, tx) = self.networks.iter().fold((0u64, 0u64), |acc, (_, data)| {
             (acc.0 + data.received(), acc.1 + data.transmitted())
+        });
+        let (rx_pkts, tx_pkts) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
+            (acc.0 + d.packets_received(), acc.1 + d.packets_transmitted())
+        });
+        let (rx_errs, tx_errs) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
+            (
+                acc.0 + d.errors_on_received(),
+                acc.1 + d.errors_on_transmitted(),
+            )
         });
         // root fs("/") 기준 용량 — 디스크 full을 가장 직접적으로 드러낸다. 못 찾으면 첫 디스크로 폴백.
         let root = self
@@ -97,11 +116,18 @@ impl HostSampler {
             .unwrap_or((0, 0));
 
         let cpu_pct = self.sys.global_cpu_usage() as f64;
+        let cpu_count = self.sys.cpus().len();
         let mem_used = self.sys.used_memory();
         let mem_total = self.sys.total_memory();
+        let mem_avail = self.sys.available_memory();
         let swap_used = self.sys.used_swap();
         let swap_total = self.sys.total_swap();
-        let load1 = System::load_average().one;
+        let load = System::load_average();
+        let proc_count = self.sys.processes().len();
+        let uptime = System::uptime();
+        // filesystem은 available/limit만으로도 used를 유도할 수 있지만, 대시보드가 매번
+        // 빼기를 하지 않도록 usage/utilization을 직접 낸다(디스크 full이 가장 흔한 사고 원인).
+        let disk_used = disk_total.saturating_sub(disk_avail);
 
         self.last = Instant::now();
 
@@ -115,12 +141,35 @@ impl HostSampler {
             MetricPoint {
                 name: "system.cpu.load_average.1m",
                 unit: "1",
-                value: MetricValue::Double(load1),
+                value: MetricValue::Double(load.one),
+            },
+            // 5m/15m은 1m과 함께 봐야 "치솟는 중"과 "계속 높음"이 구분된다.
+            MetricPoint {
+                name: "system.cpu.load_average.5m",
+                unit: "1",
+                value: MetricValue::Double(load.five),
+            },
+            MetricPoint {
+                name: "system.cpu.load_average.15m",
+                unit: "1",
+                value: MetricValue::Double(load.fifteen),
+            },
+            // load를 코어 수로 정규화해야 다른 호스트와 비교할 수 있다.
+            MetricPoint {
+                name: "system.cpu.logical.count",
+                unit: "{cpu}",
+                value: MetricValue::Int(cpu_count as i64),
             },
             MetricPoint {
                 name: "system.memory.usage",
                 unit: "By",
                 value: MetricValue::Int(mem_used as i64),
+            },
+            // available은 used와 다르다 — 캐시/버퍼는 회수 가능하므로, OOM 여유를 보려면 이 값이다.
+            MetricPoint {
+                name: "system.memory.available",
+                unit: "By",
+                value: MetricValue::Int(mem_avail as i64),
             },
             MetricPoint {
                 name: "system.memory.limit",
@@ -142,6 +191,12 @@ impl HostSampler {
                 unit: "By",
                 value: MetricValue::Int(swap_total as i64),
             },
+            // swap이 차기 시작하면 메모리 압박의 직접 신호다 — 비율로 봐야 임계치를 걸 수 있다.
+            MetricPoint {
+                name: "system.swap.utilization",
+                unit: "1",
+                value: MetricValue::Double(ratio(swap_used, swap_total)),
+            },
             MetricPoint {
                 name: "system.filesystem.available",
                 unit: "By",
@@ -151,6 +206,16 @@ impl HostSampler {
                 name: "system.filesystem.limit",
                 unit: "By",
                 value: MetricValue::Int(disk_total as i64),
+            },
+            MetricPoint {
+                name: "system.filesystem.usage",
+                unit: "By",
+                value: MetricValue::Int(disk_used as i64),
+            },
+            MetricPoint {
+                name: "system.filesystem.utilization",
+                unit: "1",
+                value: MetricValue::Double(ratio(disk_used, disk_total)),
             },
             MetricPoint {
                 name: "system.disk.io.read",
@@ -171,6 +236,39 @@ impl HostSampler {
                 name: "system.network.io.transmit",
                 unit: "By/s",
                 value: MetricValue::Int((tx as f64 / elapsed) as i64),
+            },
+            // bytes만으로는 "작은 패킷 폭주"(SYN flood, retransmit storm)가 안 보인다.
+            MetricPoint {
+                name: "system.network.packets.receive",
+                unit: "{packets}/s",
+                value: MetricValue::Int((rx_pkts as f64 / elapsed) as i64),
+            },
+            MetricPoint {
+                name: "system.network.packets.transmit",
+                unit: "{packets}/s",
+                value: MetricValue::Int((tx_pkts as f64 / elapsed) as i64),
+            },
+            // errors는 평소 0이라, 0이 아니게 되는 순간 자체가 신호다(NIC/케이블/드라이버).
+            MetricPoint {
+                name: "system.network.errors.receive",
+                unit: "{errors}/s",
+                value: MetricValue::Int((rx_errs as f64 / elapsed) as i64),
+            },
+            MetricPoint {
+                name: "system.network.errors.transmit",
+                unit: "{errors}/s",
+                value: MetricValue::Int((tx_errs as f64 / elapsed) as i64),
+            },
+            // 프로세스 폭증(fork bomb, 좀비 누적)과 재부팅 여부는 RCA의 기본 질문이다.
+            MetricPoint {
+                name: "system.process.count",
+                unit: "{processes}",
+                value: MetricValue::Int(proc_count as i64),
+            },
+            MetricPoint {
+                name: "system.uptime",
+                unit: "s",
+                value: MetricValue::Int(uptime as i64),
             },
         ];
 
@@ -235,23 +333,75 @@ mod tests {
         let sample = s.sample();
         assert!(!sample.resource.host_name.is_empty());
         assert!(!sample.resource.os_type.is_empty());
-        // host metrics 13종(cpu 2 + mem 3 + swap 2 + fs 2 + disk io 2 + net io 2) + t7 ntp_offset_ms는
-        // 측정 가능할 때만 14번째로 붙는다(Linux + 커널이 sync 상태 보고할 때만 — 이 머신/CI 환경에
-        // 따라 13 또는 14 둘 다 유효하다. 값 자체를 강제하지 않는다).
+        // host metrics 26종(cpu 5 + mem 4 + swap 3 + fs 4 + disk io 2 + net io/packets/errors 6 +
+        // process 1 + uptime 1). ntp_offset_ms는 측정 가능할 때만 27번째로 붙는다(Linux + 커널이
+        // sync 상태 보고할 때만 — 26/27 둘 다 유효하다).
         assert!(
-            sample.points.len() == 13 || sample.points.len() == 14,
-            "host metrics 점수는 13(ntp 미측정) 또는 14(ntp 측정됨)여야 함, got {}",
+            sample.points.len() == 26 || sample.points.len() == 27,
+            "host metrics 점수는 26(ntp 미측정) 또는 27(ntp 측정됨)여야 함, got {}",
             sample.points.len()
         );
-        if sample.points.len() == 14 {
-            assert_eq!(sample.points[13].name, "aic.agent.ntp_offset_ms");
+        if sample.points.len() == 27 {
+            assert_eq!(sample.points[26].name, "aic.agent.ntp_offset_ms");
         }
-        // utilization은 항상 0..1 범위.
+        // utilization 계열은 항상 0..1 범위.
         for p in &sample.points {
-            if p.name == "system.cpu.utilization" || p.name == "system.memory.utilization" {
+            if p.name.ends_with(".utilization") {
                 if let MetricValue::Double(v) = p.value {
                     assert!((0.0..=1.0).contains(&v), "{} out of range: {v}", p.name);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn metric_names_are_unique() {
+        // 이름이 겹치면 collector에서 서로를 덮어쓴다 — 항목을 늘릴 때 가장 쉬운 실수라 고정한다.
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        let mut names: Vec<&str> = sample.points.iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "metric 이름 중복: {names:?}");
+    }
+
+    #[test]
+    fn newly_added_metrics_are_present() {
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        let names: Vec<&str> = sample.points.iter().map(|p| p.name).collect();
+        for expected in [
+            "system.cpu.load_average.5m",
+            "system.cpu.load_average.15m",
+            "system.cpu.logical.count",
+            "system.memory.available",
+            "system.swap.utilization",
+            "system.filesystem.usage",
+            "system.filesystem.utilization",
+            "system.network.packets.receive",
+            "system.network.packets.transmit",
+            "system.network.errors.receive",
+            "system.network.errors.transmit",
+            "system.process.count",
+            "system.uptime",
+        ] {
+            assert!(names.contains(&expected), "{expected} 누락");
+        }
+    }
+
+    #[test]
+    fn process_count_and_uptime_are_plausible() {
+        // 자기 자신이 돌고 있으므로 프로세스는 최소 1개, uptime은 0보다 크다.
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        for p in &sample.points {
+            match (p.name, &p.value) {
+                ("system.process.count", MetricValue::Int(v)) => {
+                    assert!(*v >= 1, "process count가 0: {v}")
+                }
+                ("system.uptime", MetricValue::Int(v)) => assert!(*v > 0, "uptime이 0: {v}"),
+                _ => {}
             }
         }
     }
