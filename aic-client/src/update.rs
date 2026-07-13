@@ -494,7 +494,19 @@ pub struct UpdateOptions {
     pub pinned: Option<String>,
 }
 
-pub async fn run(opts: UpdateOptions) -> Result<()> {
+/// update가 디스크의 binary를 실제로 건드렸는지.
+///
+/// 호출부는 이걸로 "aicd를 재시작해야 하는가"를 판단한다 — binary만 갈아끼우면
+/// 이미 떠 있는 데몬은 옛 코드로 계속 돌기 때문이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// binary가 교체되었다(Manual), 또는 외부 매니저가 교체했을 수 있다(Brew).
+    Replaced,
+    /// binary는 그대로다 — `--check`, 이미 최신, cargo 설치(자동 교체 거부).
+    Unchanged,
+}
+
+pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
     let install = detect_install()?;
     let current = current_version();
 
@@ -516,7 +528,7 @@ pub async fn run(opts: UpdateOptions) -> Result<()> {
                     "up-to-date: v{current} (latest {t}, source {})",
                     install.source.label()
                 );
-                Ok(())
+                Ok(Outcome::Unchanged)
             }
             Some(t) => {
                 println!("update available: {}", format_plan(current, t));
@@ -531,7 +543,7 @@ pub async fn run(opts: UpdateOptions) -> Result<()> {
                     "최신 버전 확인 실패 (네트워크) — source {}, `{hint}`로 확인하세요.",
                     install.source.label()
                 );
-                Ok(())
+                Ok(Outcome::Unchanged)
             }
         };
     }
@@ -553,14 +565,16 @@ pub async fn run(opts: UpdateOptions) -> Result<()> {
         matches!(target.as_deref(), Some(t) if compare_semver(current, t) >= 0) && !opts.force;
     if up_to_date {
         println!("이미 최신입니다 — 강제 재설치는 --force.");
-        return Ok(());
+        return Ok(Outcome::Unchanged);
     }
 
     match install.source {
-        Source::Brew => run_brew_upgrade(),
-        Source::Cargo => print_cargo_hint(),
+        Source::Brew => run_brew_upgrade().map(|()| Outcome::Replaced),
+        Source::Cargo => print_cargo_hint().map(|()| Outcome::Unchanged),
         // Manual은 위에서 target이 Some임이 보장된다(None이면 fetch_latest_tag가 이미 중단).
-        Source::Manual => run_manual_upgrade(&install, target.as_deref().unwrap()).await,
+        Source::Manual => run_manual_upgrade(&install, target.as_deref().unwrap())
+            .await
+            .map(|()| Outcome::Replaced),
     }
 }
 
@@ -617,10 +631,8 @@ async fn run_manual_upgrade(install: &Install, tag: &str) -> Result<()> {
     }
 
     println!("updated to {tag}");
-    println!(
-        "💡 aicd가 실행 중이라면 새 버전을 적용하려면 한 번 재시작하세요:\n   \
-         aic daemon restart"
-    );
+    // 재시작은 호출부가 Outcome::Replaced를 보고 자동으로 수행한다 — 안내만 하면
+    // 사용자가 빠뜨렸을 때 구버전 aicd가 조용히 계속 돈다.
     Ok(())
 }
 

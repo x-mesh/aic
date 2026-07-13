@@ -223,6 +223,23 @@ impl UdsClient {
         }
     }
 
+    /// 실행 중인 데몬 **프로세스**의 빌드 identity 조회.
+    ///
+    /// `Ok(None)`은 "데몬은 살아 있는데 `GetVersion`을 모른다" — 즉 이 요청이 생기기
+    /// 이전 빌드가 돌고 있다는 뜻이다(구버전 데몬은 unknown request를 graceful
+    /// `Error`로 응답한다). 호출부는 이 경우를 "구버전이 도는 중"으로 다뤄야 하며,
+    /// 연결 자체가 실패한 경우(`Err`)와 구분해야 한다.
+    pub async fn get_version(&self) -> Result<Option<aic_common::DaemonVersion>, AicError> {
+        match self.send_request(IpcRequest::GetVersion).await? {
+            IpcResponse::Version(v) => Ok(Some(v)),
+            IpcResponse::Error { .. } => Ok(None),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// 데몬 metric snapshot 조회.
     pub async fn get_metrics(&self) -> Result<aic_common::MetricsSnapshot, AicError> {
         match self.send_request(IpcRequest::GetMetrics).await? {

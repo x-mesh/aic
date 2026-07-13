@@ -13,7 +13,9 @@ pub mod session;
 pub mod shell_hooks;
 
 pub use error::AicError;
-pub use ipc::{decode_frame, encode_frame, IpcRequest, IpcResponse, MetricsSnapshot};
+pub use ipc::{
+    decode_frame, encode_frame, DaemonVersion, IpcRequest, IpcResponse, MetricsSnapshot,
+};
 pub use paths::{
     aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
     default_socket_path, extract_session_id, list_session_sockets, local_command_record_path,

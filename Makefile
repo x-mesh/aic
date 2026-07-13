@@ -164,12 +164,16 @@ run-config: build
 
 # ─── 설치 ───────────────────────────────────────────────────
 
+# binary 교체만으로는 부족하다 — 이미 떠 있는 aicd는 자기 메모리의 옛 코드로 계속 돌기
+# 때문에, 재시작해야 방금 설치한 binary가 실제로 적용된다. `--if-running`이라 aicd가
+# 꺼져 있으면 아무것도 하지 않는다(설치가 데몬을 새로 띄우는 부작용은 없다).
 .PHONY: install
 install:
 	@mkdir -p "$(BINDIR)"
 	cargo install --path aic-server --root "$(PREFIX)"
 	cargo install --path aic-client --root "$(PREFIX)"
 	@echo "설치 경로: $(BINDIR)"
+	@"$(BINDIR)/aic" daemon restart --if-running
 
 .PHONY: uninstall
 uninstall:

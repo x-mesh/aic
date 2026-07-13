@@ -5,6 +5,7 @@ pub mod cache;
 pub mod chat_registry;
 pub mod config;
 pub mod daemon_install;
+pub mod daemon_version;
 pub mod doctor;
 pub mod error_analyzer;
 pub mod feedback;

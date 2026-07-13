@@ -1023,7 +1023,15 @@ enum DaemonOp {
     /// aicd에 graceful Shutdown을 요청한다.
     Stop,
     /// aicd를 재시작한다 (stop → socket 해제 대기 → start). 미실행이면 그냥 start.
-    Restart,
+    ///
+    /// 자동 시작 unit이 설치되어 있으면 launchd/systemd에 재시작을 맡긴다.
+    /// 새로 설치한 binary는 재시작해야 실제로 적용된다.
+    Restart {
+        /// aicd가 이미 실행 중일 때만 재시작한다 (미실행이면 아무것도 하지 않음).
+        /// 설치 스크립트가 데몬을 새로 띄우는 부작용 없이 구버전만 교체할 때 쓴다.
+        #[arg(long)]
+        if_running: bool,
+    },
     /// 부팅 시 자동 시작용 OS unit을 설치한다 (macOS launchd / Linux systemd --user).
     Install {
         /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
@@ -1269,7 +1277,7 @@ async fn main() {
             DaemonOp::Status => handle_daemon_status().await,
             DaemonOp::Start { foreground } => handle_daemon_start(foreground).await,
             DaemonOp::Stop => handle_daemon_stop().await,
-            DaemonOp::Restart => handle_daemon_restart().await,
+            DaemonOp::Restart { if_running } => handle_daemon_restart(if_running).await,
             DaemonOp::Install { no_load } => handle_daemon_install(no_load),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
@@ -1406,15 +1414,23 @@ async fn main() {
             DebugOp::Bundle => handle_debug_bundle().await,
         },
         Some(Commands::Update { check, force, to }) => {
-            if let Err(e) = aic_client::update::run(aic_client::update::UpdateOptions {
+            match aic_client::update::run(aic_client::update::UpdateOptions {
                 check,
                 force,
                 pinned: to,
             })
             .await
             {
-                eprintln!("aic update 실패: {e}");
-                std::process::exit(1);
+                // binary를 갈아끼웠으면 이미 떠 있는 aicd는 아직 옛 코드로 돈다.
+                // 여기서 재시작까지 해야 update가 실제로 적용된다 (안내만 하면 빠뜨린다).
+                Ok(aic_client::update::Outcome::Replaced) => {
+                    handle_daemon_restart(true).await;
+                }
+                Ok(aic_client::update::Outcome::Unchanged) => {}
+                Err(e) => {
+                    eprintln!("aic update 실패: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         None => {
@@ -1728,6 +1744,7 @@ async fn handle_daemon_status() {
                 .and_then(|c| c.lines().next().map(|s| s.trim().to_string()));
             let pid_label = pid.as_deref().unwrap_or("unknown");
             println!("  status: {COL_GREEN}running{COL_RESET} (pid {pid_label})");
+            print_daemon_version(&client).await;
             // 등록된 세션 수 함께 표시
             match client.list_sessions().await {
                 Ok(sessions) => println!("  sessions: {}", sessions.len()),
@@ -1753,6 +1770,52 @@ async fn handle_daemon_status() {
         println!("  autostart: {label}");
         if installed {
             println!("    {COL_DIM}unit: {}{COL_RESET}", unit.display());
+        }
+    }
+}
+
+/// 실행 중인 aicd의 빌드를 이 CLI의 빌드와 대조해 출력한다.
+///
+/// 디스크의 binary가 아니라 **프로세스**에 직접 묻는다 — `make install`/`aic update`는
+/// 디스크만 바꾸므로, 재시작을 빠뜨리면 두 값이 갈라진 채로 남는다. 그 상태에서는
+/// config에 새로 켠 기능이 조용히 무시되므로, 여기서 눈에 띄게 경고한다.
+async fn print_daemon_version(client: &UdsClient) {
+    use aic_client::daemon_version::{self, Skew};
+
+    let running = match client.get_version().await {
+        Ok(v) => v,
+        Err(e) => {
+            println!("  version: {COL_YELLOW}조회 실패{COL_RESET} ({e})");
+            return;
+        }
+    };
+
+    let skew = daemon_version::classify(running.as_ref());
+    let label = match &running {
+        // build_info는 --version과 같은 완성 문자열(커밋·브랜치·빌드 시각 포함).
+        Some(v) if !v.build_info.is_empty() => v.build_info.clone(),
+        Some(v) => v.version.clone(),
+        None => "unknown".to_string(),
+    };
+
+    match skew {
+        Skew::Current => println!("  version: {label}"),
+        Skew::Stale | Skew::Legacy => {
+            println!("  version: {COL_YELLOW}{label}{COL_RESET}");
+            if skew == Skew::Legacy {
+                println!(
+                    "    {COL_DIM}버전을 응답하지 않는 구버전 aicd입니다 (GetVersion 이전 빌드).{COL_RESET}"
+                );
+            }
+            println!(
+                "    {COL_YELLOW}⚠{COL_RESET} 실행 중인 aicd가 이 CLI와 다른 빌드입니다 \
+                 (CLI: {cli}).",
+                cli = daemon_version::CLI_BUILD_INFO
+            );
+            println!(
+                "      {COL_DIM}설치된 새 binary는 재시작해야 적용됩니다:{COL_RESET} \
+                 {COL_BOLD}aic daemon restart{COL_RESET}"
+            );
         }
     }
 }
@@ -2625,11 +2688,35 @@ async fn handle_daemon_stop() {
 /// old aicd가 socket을 완전히 놓을 때까지 기다리지 않으면 `handle_daemon_start`가
 /// 아직 응답하는 old daemon을 보고 "이미 실행 중"으로 no-op 하므로, ping이 죽을
 /// 때까지 폴링한 뒤 start 한다. 미실행이면 stop을 건너뛰고 곧장 start.
-async fn handle_daemon_restart() {
+async fn handle_daemon_restart(if_running: bool) {
     let sock = aic_common::aicd_socket_path();
     let client = UdsClient::new(sock.clone());
 
     let was_running = matches!(client.ping().await, Ok(true));
+
+    // `--if-running`: 설치 스크립트(make install / aic update)용. 설치가 데몬을 새로
+    // 띄우는 부작용을 내지 않으면서, 이미 돌고 있던 구버전만 새 binary로 갈아끼운다.
+    if if_running && !was_running {
+        println!("{COL_DIM}aicd가 실행 중이 아닙니다 — 재시작 skip{COL_RESET}");
+        return;
+    }
+
+    // 자동 시작 unit이 관리 중이면 매니저에게 맡긴다 — 우리가 죽이면 KeepAlive가
+    // 곧바로 되살리기 때문에, 직접 spawn하면 두 기동이 PID lock을 두고 경쟁한다.
+    match aic_client::daemon_install::restart_via_unit() {
+        Ok(true) => {
+            println!("{COL_GREEN}✓{COL_RESET} aicd 재시작 (autostart unit 경유)");
+            wait_for_daemon_up(&client).await;
+            return;
+        }
+        Ok(false) => {} // unit 미설치 — 아래 수동 경로로.
+        Err(e) => {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} unit 경유 재시작 실패 ({e}) — 직접 재시작을 시도합니다."
+            );
+        }
+    }
+
     if was_running {
         match client.shutdown().await {
             Ok(()) => println!("{COL_GREEN}✓{COL_RESET} aicd Shutdown 요청 전송"),
@@ -2663,6 +2750,29 @@ async fn handle_daemon_restart() {
     }
 
     handle_daemon_start(false).await;
+}
+
+/// unit 매니저에 재시작을 맡긴 뒤, 새 aicd가 socket을 다시 잡을 때까지 기다린다.
+/// 재시작 직후엔 잠깐 socket이 비어 있어, 곧바로 이어지는 status/ping이 "stopped"로
+/// 보이는 것을 막는다.
+async fn wait_for_daemon_up(client: &UdsClient) {
+    const MAX_WAIT_MS: u64 = 5000;
+    const POLL_MS: u64 = 100;
+    let mut waited = 0u64;
+    loop {
+        if matches!(client.ping().await, Ok(true)) {
+            return;
+        }
+        if waited >= MAX_WAIT_MS {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} aicd가 {MAX_WAIT_MS}ms 내에 올라오지 않았습니다 — \
+                 {COL_BOLD}aic daemon status{COL_RESET}로 확인하세요."
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+        waited += POLL_MS;
+    }
 }
 
 /// `aic top [--interval N]`: ratatui 라이브 TUI. 비-TTY는 status --watch로 fallback.

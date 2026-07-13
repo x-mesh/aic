@@ -48,6 +48,24 @@
     드레인 주체가 항상 존재함을 보장할 수 있어서다). events/connections는 자기 push 실패만 spool에
     적재하고 backoff도 독립적으로 관리한다.
 
+- **`aic daemon status`가 실행 중인 aicd의 버전을 표시** — IPC에 `GetVersion`을 추가해, 디스크의
+  binary가 아니라 **지금 도는 프로세스**에 직접 빌드 identity(version/commit/build_info)를 묻는다.
+  이 CLI와 다른 빌드가 돌고 있으면 경고와 함께 `aic daemon restart`를 안내한다. `GetVersion`을 모르는
+  구버전 데몬은 graceful `Error`로 응답하므로, 그 응답 자체를 "구버전이 돌고 있다"는 신호로 삼는다
+  (`version: unknown`). `aic-session`도 같은 요청에 자기 빌드로 답한다.
+
+### Fixed
+- **`make install` / `aic update` 후 구버전 aicd가 계속 도는 문제** — 두 경로 모두 세 binary를
+  교체하지만 이미 떠 있는 aicd는 자기 메모리의 옛 코드로 계속 돌아, 재시작 전까지는 새로 추가된
+  기능(예: OTLP exporter)이 config에 켜져 있어도 조용히 동작하지 않았다. 경로가 같아 `stat`으로는
+  구분되지 않고, 미출시 빌드는 semver까지 같을 수 있어 `--version` 비교로도 잡히지 않는다. 이제
+  `make install`은 설치 후 `aic daemon restart --if-running`을 호출하고, `aic update`는 binary를
+  실제로 교체했을 때(`Outcome::Replaced`) 재시작까지 수행한다. 자동 시작 unit이 설치되어 있으면
+  launchd(`launchctl kickstart -k`)/systemd(`systemctl --user restart`)에 재시작을 맡긴다 —
+  `KeepAlive`/`Restart=on-failure`가 걸려 있어 우리가 직접 죽이고 띄우면 매니저의 재기동과 singleton
+  PID lock을 두고 경쟁하기 때문이다. `--if-running`은 aicd가 꺼져 있으면 아무것도 하지 않아, 설치가
+  데몬을 새로 띄우는 부작용을 만들지 않는다.
+
 ### Changed
 - **redaction 로직을 `aic-common`으로 이동** — LLM prompt(aic-client)와 OTLP exporter(aic-server)가
   동일한 secret/PII 마스킹을 공유하도록 `redaction` 모듈을 `aic-common`으로 옮겼다. 기존

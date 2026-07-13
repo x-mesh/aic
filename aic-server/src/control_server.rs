@@ -139,6 +139,11 @@ async fn handle_client(mut stream: UnixStream, ctx: ControlContext) -> anyhow::R
 async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> IpcResponse {
     match request {
         IpcRequest::Ping => IpcResponse::Pong,
+        IpcRequest::GetVersion => IpcResponse::Version(aic_common::DaemonVersion {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            commit: env!("AIC_BUILD_COMMIT").to_string(),
+            build_info: env!("AIC_BUILD_INFO").to_string(),
+        }),
         IpcRequest::ListSessions => {
             reconcile_stale_sessions(ctx).await;
             IpcResponse::Sessions(ctx.registry.list().await)
