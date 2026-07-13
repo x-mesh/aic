@@ -6,9 +6,12 @@
 > **체크포인트(재시작 복구)** 와 **에이전트측 볼륨 안전장치**를 1급 요구사항으로 둔다.
 > 수신 측(rca)은 `events`가 아닌 **신규 `logs` 테이블**에 저장한다.
 
-- 상태: **구현 완료 (송신부)** — aicd 측 수집·배치·전송·안전장치·config 배선까지 완료.
-  **수신 측(rca-server)은 미구현** — §8의 후속 티켓을 처리하기 전까지 보낸 로그는 100% 버려진다.
-- 작성일: 2026-07-13 / 개정: 2026-07-13 (구현 결과 반영)
+- 상태: **구현 완료 (송신부) — 단, [§6.4](#64-배치--batch_max_bytes가-없으면-수신-측이-배치를-거부한다--미구현)와
+  [§6.6](#66-4xx는-재시도하지-않는다--poison-batch가-spool-전체를-멈춘다--미구현)이 남았다. 이 둘을 넣기 전에
+  `logs_enabled = true`로 켜면 안 된다.** 앱 로그 배치 하나가 그 호스트의 **텔레메트리 전체**를
+  멈출 수 있다(§6.6).
+  **수신 측(rca-server)도 미구현** — §8의 후속 티켓을 처리하기 전까지 보낸 로그는 100% 버려진다.
+- 작성일: 2026-07-13 / 개정: 2026-07-14 (수신 측 실측에서 §6.4·§6.6 결함 발견 — 두 절 신설)
 - 대상 바이너리: `aicd` (crate `aic-server`), 설정은 `aic-common`
 - 범위: 로그 **수집·전송**. 로그 기반 알림 규칙·이상탐지는 비목표(중앙 rca 몫).
 - 관련 문서:
@@ -383,11 +386,32 @@ spool 디스크가 먼저 터진다.**
 > 중앙에서 구분할 수 없다. (`tests/log_collection_e2e.rs::dropped_lines_appear_in_metrics_as_aic_log_dropped`가
 > 이 배선을 wire에서 검증한다.)
 
-### 6.4 배치
+### 6.4 배치 — **`batch_max_bytes`가 없으면 수신 측이 배치를 거부한다** ⚠ 미구현
 
 라인당 HTTP 요청은 금물. `batch_max_lines = 500` **또는** `batch_max_ms = 2000` 중 **먼저 도달하는
 쪽**에서 flush. 타이머는 **첫 라인이 버퍼에 들어온 시점부터** 잰다 — 버퍼가 비어 있는 동안은
 데드라인 자체가 없어, 빈 버퍼에서 매 2초 깨어나 아무것도 안 하는 낭비가 없다.
+
+> **⚠ 현재 구현에는 바이트 상한이 없다. 이건 버그다.** 수신 측(rca)에서 실측하며 드러났다.
+
+```
+batch_max_lines           500
+MAX_LOG_LINE_BYTES        64 KiB      (§3 — 초과 라인은 자르되 버리진 않는다)
+────────────────────────────────────
+최악 배치                  500 × 64 KiB = 31 MiB
+rca MAX_BODY_BYTES        8 MiB       (rca-server/src/otlp/mod.rs:43)
+                          → 413. 디코드에 닿기도 전에 body-limit 레이어가 거부한다.
+```
+
+**배치가 라인 수로만 잘리기 때문**이다. 자바 스택 트레이스나 JSON 덤프가 몰려 라인당 평균이
+16 KiB만 돼도 500줄에서 8 MiB를 넘는다. 파일·컨테이너 수집기는 **임의의 앱 로그**를 읽으므로
+이건 이론적 상황이 아니다.
+
+그리고 413은 **§6.6의 poison batch로 이어진다** — 거기가 진짜 피해가 나는 지점이다.
+
+**조치**: `batch_max_bytes = 4 MiB`(수신 측 상한의 절반) 추가. 라인 수 · 바이트 · 시간 중
+**가장 먼저 도달하는 것**에서 flush한다. 인코딩 전 원문 바이트로 세되, protobuf 오버헤드를 감안해
+상한을 수신 측의 절반으로 잡는다.
 
 ### 6.5 spool 쿼터 — **`SignalKind::AppLogs`(tag=2) 신설로 확정** (초안의 "검토한다" 종결)
 
@@ -414,9 +438,64 @@ Promtail) 중 **oldest-drop을 하는 구현이 하나도 없었다.** oldest를
 쿼터는 기존 `spool_max_bytes`(256MiB)에서 **파생**한다(하위호환) — `spool_metrics_max_bytes` /
 `spool_logs_max_bytes` / `spool_app_logs_max_bytes`로 개별 override 가능.
 
----
+### 6.6 4xx는 재시도하지 않는다 — **poison batch가 spool 전체를 멈춘다** ⚠ 미구현
 
-## 7. 설정
+> **§6.5의 kind별 쿼터로는 이걸 막을 수 없다.** 쿼터는 "누가 누굴 evict하는가"를 가르지만,
+> poison batch는 **evict되지 않고 드레인 큐의 머리에 남는 문제**다. 다른 축이다.
+
+`drain()`은 **모든 kind의 배치 파일을 한 FIFO로 섞어 돌고**(`list_batch_files()` → `sort()`),
+**첫 실패에서 즉시 반환한다**:
+
+```rust
+// spool.rs — drain 루프
+Err(_) => return DrainReport { drained, failed: true }   // ← 건너뛰지 않는다
+```
+
+여기에 §6.4의 413이 만나면:
+
+1. 8 MiB 초과 배치가 413을 받는다 → spool에 적재된다
+2. drain이 그 배치에 닿는다 → **또 413** (몇 번을 보내도 크기는 그대로다 — **영구 실패**다)
+3. `failed: true`로 즉시 반환. backoff가 늘어나고, 다음 tick에 **또 같은 배치부터** 시작
+4. **그 배치가 FIFO 머리에 영원히 박힌다.** 뒤에 쌓인 metrics · events · agent · changes ·
+   connections가 **전부 함께 드레인 정지**한다 (드레인 주체는 host metrics task 하나뿐 — §4)
+
+**앱 로그 배치 하나가 그 호스트의 텔레메트리 전체를 죽인다.** `AppLogs` 쿼터를 아무리 잘 갈라도
+소용없다 — 쿼터는 그 배치를 **지우지 않기 때문**이다.
+
+#### 코드에 이미 정답의 선례가 있다
+
+`drain()`은 **손상된 배치**를 이렇게 다룬다:
+
+```rust
+// 손상/부분 write된 배치 — 무한 재시도를 막기 위해 건너뛰고 삭제한다.
+self.remove_and_untrack(&path, kind_hint);
+continue;
+```
+
+**413도 정확히 같은 부류다** — 무한 재시도해도 절대 성공하지 않는 배치. 그런데 이 처리가
+**HTTP 영구 실패에는 적용되지 않는다.** 파일이 깨진 것만 영구 실패로 보고, 내용이 수신 측
+계약을 위반한 것은 일시 실패로 오인한다.
+
+#### 조치
+
+`push`/`push_logs`가 **재시도 가능 여부**를 구분해 반환한다:
+
+| 응답 | 분류 | drain의 처리 |
+|---|---|---|
+| 2xx | 성공 | 삭제 |
+| **4xx** (413 / 400 / 401 / 404) | **영구 실패** | **건너뛰고 삭제 + `DropCounters` 증가.** 손상 배치와 동일 |
+| 5xx · 타임아웃 · 커넥션 오류 | 일시 실패 | 지금처럼 `failed: true`로 반환 (재시도) |
+
+- **401은 논쟁의 여지가 있다** — 토큰을 고치면 성공할 수도 있다. 하지만 토큰 교체는 **재시작을
+  동반**하고, 그때까지 401 배치가 큐를 막는 것보다는 버리는 게 낫다. 드롭 카운터가 그 사실을
+  드러낸다.
+- **드롭은 반드시 카운터로 노출한다**(§6.3의 규약). 조용히 버리면 §6.4의 버그가 다시 숨는다.
+
+#### 왜 둘 다 필요한가
+
+`batch_max_bytes`(§6.4)만 넣으면 **이 특정 413**은 사라진다. 하지만 poison batch를 만드는 원인은
+그것 하나가 아니다 — 수신 측이 스키마를 바꿔 400을 뱉거나, 토큰이 만료돼 401이 나면 **같은 방식으로
+spool이 멈춘다.** §6.4는 알려진 구멍 하나를 막고, **§6.6은 그 부류 전체를 막는다.**
 
 ```toml
 [aicd.exporter]
@@ -437,6 +516,7 @@ logs_enabled = false         # 기본 false — opt-in. 다른 하위 플래그(
 min_severity = "WARN"        # 외부 소스 기본. aic self는 INFO(§6.1이 소스별로 처리)
 max_lines_per_sec = 1000     # 서비스당 토큰버킷
 batch_max_lines = 500
+batch_max_bytes = 4194304    # 4 MiB. ⚠ 미구현(§6.4) — 없으면 최악 31 MiB 배치가 413을 받는다
 batch_max_ms = 2000
 max_services = 50            # 토큰버킷 맵 상한(카디널리티 방어)
 
@@ -492,13 +572,12 @@ CREATE TABLE logs (
     service    LowCardinality(String),
     severity   LowCardinality(String),
     message    String CODEC(ZSTD(3)),
-    -- ILIKE는 tokenbf skip index를 타지 못한다(rca에서 EXPLAIN indexes=1로 실측:
-    -- LIKE는 idx를 쓰고 ILIKE는 드롭된다). 검색을 이 소문자 사본에 고정해야
-    -- 로그 규모에서 풀스캔을 면한다.
+    -- ILIKE는 skip index를 아예 못 탄다. 검색을 이 소문자 사본 + LIKE로 고정한다.
     message_lc String MATERIALIZED lower(message) CODEC(ZSTD(3)),
     attrs      Map(LowCardinality(String), String),
     record_id  String,
-    INDEX idx_msg message_lc TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4
+    -- ngrambf다. tokenbf가 아니다 — 아래 실측 참고.
+    INDEX idx_msg message_lc TYPE ngrambf_v1(3, 65536, 3, 0) GRANULARITY 4
 )
 ENGINE = ReplacingMergeTree
 PARTITION BY toYYYYMMDD(ts)
@@ -507,7 +586,28 @@ TTL toDateTime(ts) + INTERVAL 7 DAY
 SETTINGS ttl_only_drop_parts = 1;
 ```
 
-3. **Explorer는 로그를 events와 섞지 않는다.** 별도 화면 또는 소스 전환 UI.
+**인덱스 실측 (rca, 2026-07-14 — 50만 행 / 62 granule, 1행에만 있는 희귀 토큰 검색):**
+
+| 인덱스 | 질의 | 스캔 granule |
+|---|---|---|
+| `tokenbf_v1` | `hasToken(message_lc, 'rareword')` | **4 / 62** ✅ |
+| `tokenbf_v1` | `message_lc LIKE '%rareword%'` | **62 / 62** ❌ |
+| `ngrambf_v1(3, …)` | `message_lc LIKE '%rareword%'` | **4 / 62** ✅ |
+| `ngrambf_v1(3, …)` | `message_lc LIKE '%areword%'` (단어 중간) | **4 / 62** ✅ |
+
+**`tokenbf_v1`은 `hasToken`에만 프루닝하고 `LIKE`에는 아무것도 안 한다.** 이 문서의 이전 개정판이
+"LIKE는 idx를 쓴다"고 적었던 건 **`EXPLAIN`에 인덱스 *이름*이 뜨는 것만 보고 granule 수를 안 본
+오독**이었다. 이름은 뜨는데 62/62를 스캔한다. `hasToken`은 **완전 토큰만** 매치하므로
+"`oomkill`이 든 줄을 찾아줘" 같은 실제 검색을 못 한다. → **`ngrambf_v1`**. 디스크 비용은 동일했다.
+
+3. **severity는 `severity_number`가 아니라 `severity_text`에서 읽는다.** rca의 기존 `event_row`
+   (events/sessions/agent가 공유하는 유일한 빌더)가 이미 그렇게 한다. 송신부도 `severity_text`에
+   `"ERROR"`/`"WARN"`/`"INFO"`/`"DEBUG"`를 실어 보낸다(§3) — 숫자를 문자열로 되돌릴 이유가 없고,
+   그렇게 하면 같은 정보에 진실이 두 개 생긴다.
+
+4. **Explorer는 로그를 events와 섞지 않는다.** 별도 화면 또는 소스 전환 UI.
+
+> 수신 측 상세 설계는 rca 레포의 **`docs/PRD-aic-logs-ingestion.md`**에 있다.
 
 ---
 
@@ -530,6 +630,12 @@ SETTINGS ttl_only_drop_parts = 1;
 | t10 | **container** 수집기 (`FileTail` 재사용) | 컨테이너 재생성 시 중복 0, 깨진 라인 격리 |
 | t11 | `aic-client` subscriber + `PushLogLines` IPC + `atexit` flush | `log_sink_integration.rs` |
 | **t12** | **config 배선 + `aicd_main` 조건부 spawn + 배선 부채 해소** | `log_collection_e2e.rs` — self/IPC/드롭이 wire에 도달 |
+| **t13** ⚠ | **`batch_max_bytes`(§6.4)** — 라인 수·바이트·시간 중 먼저 도달하는 것에서 flush | 64 KiB 라인 500개를 넣고 flush된 배치가 4 MiB 이하인지 |
+| **t14** ⚠ | **4xx 비재시도(§6.6)** — `push`가 재시도 가능 여부를 반환, drain이 영구 실패를 건너뛰고 삭제 + 카운트 | 413을 뱉는 mock collector에 배치를 물리고, **뒤의 metrics 배치가 정상 드레인되는지** |
+
+> **t13·t14는 아직 안 됐다.** 둘 다 수신 측 실측에서 드러난 결함이고(§6.4·§6.6), **`logs_enabled`를
+> 켜기 전에 끝나야 한다.** t14의 검증이 핵심이다 — "앱 로그 배치가 막혀도 **다른 시그널은 흘러야
+> 한다**"가 이 두 티켓의 존재 이유 전부다.
 
 ---
 
