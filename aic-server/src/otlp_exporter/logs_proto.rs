@@ -105,11 +105,22 @@ pub struct ResourceAttrs<'a> {
 ///
 /// `severity`는 문자열로 받아 OTLP SeverityNumber로 매핑한다. 미지의 값은 INFO로 떨어뜨린다 —
 /// 알 수 없는 심각도 때문에 이벤트 자체를 버리는 것보다, 낮게 보고 흘리는 편이 낫다.
+///
+/// **두 시각을 따로 받는다** — OTLP LogRecord의 `time_unix_nano`와 `observed_time_unix_nano`는
+/// 의미가 다르다:
+/// - `event_time_unix_nano`: 행위가 **실제로 일어난** 시각(= `AgentEvent.ts`).
+/// - `observed_time_unix_nano`: aicd가 그것을 **관측한** 시각(= 인코딩 시점의 now).
+///
+/// 둘을 같은 값으로 뭉개면 "aicd가 언제 봤나"가 사라져, spool에 쌓였다 나중에 드레인된 이벤트
+/// (aicd가 죽어 있다 살아난 구간)를 구분할 수 없다. 그 구분이 `observed_time`의 존재 이유다.
+/// 다른 인코더(`encode_connections`/`encode_changes`)가 시각을 하나만 받는 이유는 그쪽이 주기
+/// 캡처라 발생=관측 시각이 원래 같기 때문이다(각 함수 doc 참고).
 pub fn encode_agent_event(
     ev: &aic_common::AgentEvent,
     resource: &ResourceAttrs<'_>,
     service_version: &str,
-    time_unix_nano: u64,
+    event_time_unix_nano: u64,
+    observed_time_unix_nano: u64,
 ) -> Vec<u8> {
     let (severity_number, severity_text) = match ev.severity.to_ascii_uppercase().as_str() {
         "ERROR" => (SEVERITY_ERROR, "ERROR"),
@@ -124,8 +135,8 @@ pub fn encode_agent_event(
     }
 
     let log_record = LogRecord {
-        time_unix_nano,
-        observed_time_unix_nano: time_unix_nano,
+        time_unix_nano: event_time_unix_nano,
+        observed_time_unix_nano,
         severity_number,
         severity_text: redact_str(severity_text),
         body: Some(string_value(&ev.summary)),
@@ -137,6 +148,11 @@ pub fn encode_agent_event(
 }
 
 /// 하나의 `CommandEvent`를 `ExportLogsServiceRequest` protobuf 바이트로 인코딩한다(scope=`aic.events`).
+///
+/// 시각을 하나만 받는다 — 현재 호출부(`events.rs`)가 명령 완료 시각(`CommandRecord.timestamp`)이
+/// 아니라 push 시각을 넘기고 있어 발생/관측 시각을 나눌 대상 자체가 없다. `encode_agent_event`와
+/// 같은 클래스의 개선 여지지만, 고치려면 `CommandEvent`에 발생 시각 필드를 추가하고 `events.rs`를
+/// 함께 바꿔야 해서 이 태스크(agent 시각 보존) 범위를 벗어난다 — 별도 태스크로 다룬다.
 pub fn encode_command_event(
     ev: &CommandEvent<'_>,
     resource: &ResourceAttrs<'_>,
@@ -171,6 +187,9 @@ pub fn encode_command_event(
 /// `entries`를 한 번의 `ExportLogsServiceRequest`(LogRecord 여러 개, scope=`aic.connections`)로
 /// 배치 인코딩한다. 빈 slice면 빈 log_records를 담은 유효 요청을 만든다(호출부가 empty check로
 /// 건너뛰는 걸 선호하지만, 인코딩 자체는 항상 유효해야 한다).
+///
+/// 시각을 하나만 받아 발생/관측 시각에 같은 값을 채우는 게 **여기선 맞다** — 소켓 스냅샷은 주기
+/// 캡처라 "그 순간 관측한 상태"가 곧 이벤트 자체다(별도의 발생 시각이 존재하지 않는다).
 pub fn encode_connections(
     entries: &[ConnectionEntry<'_>],
     resource: &ResourceAttrs<'_>,
@@ -222,6 +241,9 @@ pub fn encode_connections(
 /// baseline)는 INFO(정상적인 생명주기). 프로세스명은 redaction 예외가 아니라 [`redact_str`]를
 /// 그대로 통과한다 — comm은 실행 파일 이름이지 argv가 아니라 secret이 섞일 여지가 없다
 /// (모듈 doc 참고).
+///
+/// 시각을 하나만 받는다 — 전이는 두 tick 샘플의 **차분**으로 검출하므로 "실제로 언제 일어났는지"는
+/// 애초에 알 수 없고(직전 tick~이번 tick 사이 어딘가), 우리가 아는 건 검출=관측 시각뿐이다.
 pub fn encode_changes(
     entries: &[ChangeEntry<'_>],
     resource: &ResourceAttrs<'_>,
@@ -255,7 +277,11 @@ pub fn encode_changes(
                 time_unix_nano,
                 observed_time_unix_nano: time_unix_nano,
                 severity_number: severity,
-                severity_text: redact_str(if severity == SEVERITY_WARN { "WARN" } else { "INFO" }),
+                severity_text: redact_str(if severity == SEVERITY_WARN {
+                    "WARN"
+                } else {
+                    "INFO"
+                }),
                 body: Some(string_value(&redact_str(c.summary))),
                 attributes,
                 dropped_attributes_count: 0,
@@ -475,7 +501,14 @@ mod tests {
         assert_eq!(lr.severity_number, SEVERITY_INFO);
         assert_eq!(lr.severity_text, "INFO");
         assert_eq!(lr.time_unix_nano, 42);
-        assert_eq!(req.resource_logs[0].scope_logs[0].scope.as_ref().unwrap().name, "aic.events");
+        assert_eq!(
+            req.resource_logs[0].scope_logs[0]
+                .scope
+                .as_ref()
+                .unwrap()
+                .name,
+            "aic.events"
+        );
 
         let failing = CommandEvent {
             id: "aaaa1111bbbb2222",
@@ -508,10 +541,19 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
                 .and_then(|v| v.value)
         };
-        assert!(matches!(get("aic.record.id"), Some(AnyValueOneof::StringValue(v)) if v == "1234567890abcdef"));
-        assert!(matches!(get("aic.command.text"), Some(AnyValueOneof::StringValue(v)) if v == "cargo test"));
-        assert!(matches!(get("aic.command.exit_code"), Some(AnyValueOneof::IntValue(2))));
-        assert!(matches!(get("aic.command.capture_quality"), Some(AnyValueOneof::StringValue(v)) if v == "TruncatedOutput"));
+        assert!(
+            matches!(get("aic.record.id"), Some(AnyValueOneof::StringValue(v)) if v == "1234567890abcdef")
+        );
+        assert!(
+            matches!(get("aic.command.text"), Some(AnyValueOneof::StringValue(v)) if v == "cargo test")
+        );
+        assert!(matches!(
+            get("aic.command.exit_code"),
+            Some(AnyValueOneof::IntValue(2))
+        ));
+        assert!(
+            matches!(get("aic.command.capture_quality"), Some(AnyValueOneof::StringValue(v)) if v == "TruncatedOutput")
+        );
     }
 
     /// invariant: command text에 섞인 secret은 wire에 원문으로 남지 않는다.
@@ -568,10 +610,14 @@ mod tests {
 
         // LISTEN 항목은 peer attrs가 없어야 한다.
         let listen_attrs = &scope_logs.log_records[0].attributes;
-        assert!(!listen_attrs.iter().any(|kv| kv.key == "network.peer.address"));
+        assert!(!listen_attrs
+            .iter()
+            .any(|kv| kv.key == "network.peer.address"));
         // ESTABLISHED 항목은 peer attrs가 있어야 한다.
         let estab_attrs = &scope_logs.log_records[1].attributes;
-        assert!(estab_attrs.iter().any(|kv| kv.key == "network.peer.address"));
+        assert!(estab_attrs
+            .iter()
+            .any(|kv| kv.key == "network.peer.address"));
         assert!(estab_attrs.iter().any(|kv| kv.key == "network.peer.port"));
     }
 
@@ -658,13 +704,27 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
                 .and_then(|v| v.value)
         };
-        assert!(matches!(get("aic.change.type"), Some(AnyValueOneof::StringValue(v)) if v == "process"));
-        assert!(matches!(get("aic.change.subject"), Some(AnyValueOneof::StringValue(v)) if v == "nginx:4231"));
-        assert!(matches!(get("aic.change.action"), Some(AnyValueOneof::StringValue(v)) if v == "exit"));
-        assert!(matches!(get("aic.change.confidence"), Some(AnyValueOneof::StringValue(v)) if v == "observed"));
-        assert!(matches!(get("aic.change.source"), Some(AnyValueOneof::StringValue(v)) if v == "collector:sysinfo"));
-        assert!(matches!(get("aic.change.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "abc123"));
-        assert!(matches!(get("aic.change.prev_state"), Some(AnyValueOneof::StringValue(v)) if v == "134217728"));
+        assert!(
+            matches!(get("aic.change.type"), Some(AnyValueOneof::StringValue(v)) if v == "process")
+        );
+        assert!(
+            matches!(get("aic.change.subject"), Some(AnyValueOneof::StringValue(v)) if v == "nginx:4231")
+        );
+        assert!(
+            matches!(get("aic.change.action"), Some(AnyValueOneof::StringValue(v)) if v == "exit")
+        );
+        assert!(
+            matches!(get("aic.change.confidence"), Some(AnyValueOneof::StringValue(v)) if v == "observed")
+        );
+        assert!(
+            matches!(get("aic.change.source"), Some(AnyValueOneof::StringValue(v)) if v == "collector:sysinfo")
+        );
+        assert!(
+            matches!(get("aic.change.record_id"), Some(AnyValueOneof::StringValue(v)) if v == "abc123")
+        );
+        assert!(
+            matches!(get("aic.change.prev_state"), Some(AnyValueOneof::StringValue(v)) if v == "134217728")
+        );
         // new_state=None → attr 자체가 없어야 한다 (빈 문자열이 아니라).
         assert!(!attrs.iter().any(|kv| kv.key == "aic.change.new_state"));
     }
@@ -700,7 +760,8 @@ mod tests {
     #[test]
     fn changes_batch_handles_empty_entries() {
         let bytes = encode_changes(&[], &resource(None), "0.24.0", 1);
-        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf even when empty");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("valid protobuf even when empty");
         assert!(req.resource_logs[0].scope_logs[0].log_records.is_empty());
     }
 
@@ -709,7 +770,12 @@ mod tests {
     /// 때 프로세스명이 `[REDACTED:...]`가 되는 회귀를 잡는다.
     #[test]
     fn connections_process_names_survive_redaction() {
-        for name in ["postgres", "com.docker.backend", "Google Chrome Helper", "python3.11"] {
+        for name in [
+            "postgres",
+            "com.docker.backend",
+            "Google Chrome Helper",
+            "python3.11",
+        ] {
             let entries = vec![ConnectionEntry {
                 protocol: "tcp",
                 state: "ESTABLISHED",
@@ -731,7 +797,8 @@ mod tests {
     #[test]
     fn connections_batch_handles_empty_entries() {
         let bytes = encode_connections(&[], &resource(None), "0.24.0", 1);
-        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf even when empty");
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice())
+            .expect("valid protobuf even when empty");
         assert!(req.resource_logs[0].scope_logs[0].log_records.is_empty());
     }
 
