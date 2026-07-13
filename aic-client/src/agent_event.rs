@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use aic_common::{
     encode_frame, AgentEvent, IpcRequest, IpcResponse, AGENT_KIND_FINDING_CREATED,
-    AGENT_KIND_RISK_DENIED, AGENT_KIND_TOOL_RUN_COMMAND,
+    AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 
 /// 소켓 연결/송신/응답 대기 상한. chat 흐름을 막지 않도록 짧게 잡는다 — aicd는 로컬 UDS라
@@ -69,6 +69,15 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
     emit(AGENT_KIND_FINDING_CREATED, message, severity, attrs);
 }
 
+/// 사람이 "지금 이 순간을 남긴다"고 판단해 기록한다 — 임계에 안 걸려도 사람이 이상하다고
+/// 느낀 순간을 남기는 경로. `severity`는 항상 INFO(사건이 아니라 사람의 관찰 기록이다).
+///
+/// **`attrs` 키에 `exit_code`/`cwd`/`duration_ms`를 쓰지 마라** — 서버의 `EVENT_MAPPED_KEYS`가
+/// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
+pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) {
+    emit(AGENT_KIND_SNAPSHOT_RECORDED, memo, "INFO", attrs);
+}
+
 /// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
 ///
 /// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
@@ -82,9 +91,14 @@ pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
     }
 }
 
-/// 한 행위를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태).
-fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
-    let ev = AgentEvent {
+/// `AgentEvent`를 만든다(redaction 포함) — 순수 함수라 네트워크 없이 단독 테스트 가능하다.
+fn build_event(
+    kind: &str,
+    summary: &str,
+    severity: &str,
+    attrs: BTreeMap<String, String>,
+) -> AgentEvent {
+    AgentEvent {
         kind: kind.to_string(),
         summary: redact(summary),
         severity: severity.to_string(),
@@ -93,7 +107,12 @@ fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, Strin
             .map(|(k, v)| (k, redact(&v)))
             .collect::<BTreeMap<_, _>>(),
         ts: chrono::Utc::now(),
-    };
+    }
+}
+
+/// 한 행위를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태).
+fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
+    let ev = build_event(kind, summary, severity, attrs);
     // 실패는 무시한다 — aicd 미실행은 정상 상태이고, 텔레메트리가 chat을 방해해선 안 된다.
     // (audit/rca_memory 등 다른 best-effort 경로와 같은 관례: lib 모듈은 조용히 실패한다.)
     let _ = send(&IpcRequest::AgentEvent(ev));
@@ -148,6 +167,47 @@ mod tests {
         tool_run_command("echo hi", Some(0), 12, "/tmp");
         risk_denied("rm -rf /", "Dangerous", Some("builtin_denylist"));
         finding_created("disk_full", "WARN", "/ 사용률 95%");
+        snapshot_recorded(
+            "cpu sys 26%, idle 67% — 커널 모드 비율이 높음",
+            BTreeMap::new(),
+        );
+    }
+
+    #[test]
+    fn snapshot_recorded_builds_agent_event_with_expected_kind() {
+        // snapshot_recorded()가 만드는 AgentEvent가 kind="snapshot.recorded"/severity="INFO"인지
+        // 확인한다. emit()은 곧바로 IPC로 보내버려 값을 가로챌 수 없으므로, 같은 구성 로직인
+        // build_event()로 직접 검증한다(emit()도 내부적으로 build_event()를 쓴다).
+        let mut attrs = BTreeMap::new();
+        attrs.insert("memo_source".to_string(), "manual".to_string());
+        let ev = build_event(
+            AGENT_KIND_SNAPSHOT_RECORDED,
+            "이상하게 느려짐",
+            "INFO",
+            attrs,
+        );
+
+        assert_eq!(ev.kind, "snapshot.recorded");
+        assert_eq!(ev.severity, "INFO");
+        assert_eq!(ev.summary, "이상하게 느려짐");
+        assert_eq!(ev.attrs.get("memo_source"), Some(&"manual".to_string()));
+    }
+
+    #[test]
+    fn snapshot_recorded_attrs_are_redacted() {
+        // snapshot_recorded()로 넘긴 attrs 값도 emit()과 같은 redaction을 거쳐야 한다.
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "note".to_string(),
+            "export AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE".to_string(),
+        );
+        let ev = build_event(AGENT_KIND_SNAPSHOT_RECORDED, "memo", "INFO", attrs);
+
+        let masked = ev.attrs.get("note").expect("note attr 존재");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "attrs 값이 마스킹되지 않음: {masked}"
+        );
     }
 
     #[test]

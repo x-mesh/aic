@@ -190,6 +190,8 @@ pub const AGENT_KIND_TOOL_RUN_COMMAND: &str = "tool.run_command";
 pub const AGENT_KIND_RISK_DENIED: &str = "risk.denied";
 /// 진단이 finding을 만들었다 — severity를 가진 사건의 시작점.
 pub const AGENT_KIND_FINDING_CREATED: &str = "finding.created";
+/// 사람이 "지금 이 순간을 남긴다"고 판단해 기록했다 — 임계가 못 잡는 것을 사람이 잡는 경로.
+pub const AGENT_KIND_SNAPSHOT_RECORDED: &str = "snapshot.recorded";
 
 /// 데몬 → 클라이언트 응답 메시지 (externally tagged JSON).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
