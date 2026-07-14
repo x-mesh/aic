@@ -1542,6 +1542,7 @@ mod tests {
             kind: kind.to_string(),
             sections: sections.iter().map(|s| s.to_string()).collect(),
             body: "## sec\nbody".to_string(),
+            memo: None,
         }
     }
 

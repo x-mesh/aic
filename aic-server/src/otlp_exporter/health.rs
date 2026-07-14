@@ -21,14 +21,15 @@ pub struct ExporterHealth {
     push_fail_total: AtomicU64,
     /// 마지막 push 성공 시각(unix seconds). 0이면 "성공한 적 없음".
     last_ok_unix: AtomicU64,
-    /// agent exporter task(`serve_agent`)가 실제로 떠 있는지. **config 플래그가 아니라 "task가
-    /// spawn됐는가"**를 담는다 — `agent_enabled=true`여도 endpoint 미설정·spool 실패로 task가 안
-    /// 뜰 수 있고, 그 경우 이벤트는 똑같이 버려지기 때문이다. 사람이 알아야 하는 건 설정값이
-    /// 아니라 **지금 내 이벤트를 받아 갈 구독자가 있느냐**다.
+    /// agent exporter task(`serve_agent`)가 **지금 살아있는지**. config 플래그가 아니라 실제 생존
+    /// 여부를 담는다 — `agent_enabled=true`여도 endpoint 미설정·spool 실패로 task가 안 뜨거나,
+    /// 떴다가 죽을 수 있고, 그 경우 이벤트는 똑같이 버려지기 때문이다. 사람이 알아야 하는 건
+    /// 설정값이 아니라 **지금 내 이벤트를 받아 갈 구독자가 있느냐**다.
     ///
-    /// 이 객체는 task들보다 **먼저** 만들어지므로(aicd_main), 값은 spawn 직후
-    /// [`set_agent_live`](Self::set_agent_live)로 채워진다. 그때까지는 false(=아직 구독자 없음)로,
-    /// 사실과 어긋나지 않는다.
+    /// **"떴다"가 아니라 "살아있다"**임에 유의: spawn 여부만 새기면 단방향 래치가 되어, task가
+    /// 죽은 뒤에도 영원히 "살아있음"으로 남는다. 그래서 값은 task 안의 RAII 가드
+    /// ([`AgentLiveGuard`])가 켜고, 종료(정상·에러·panic) 시 Drop이 반드시 끈다.
+    /// 초기값 false(=아직 구독자 없음)도 사실과 어긋나지 않는다.
     agent_live: AtomicBool,
     /// 오프라인 spool — 밀린 배치 수/버린 수를 여기서 읽는다.
     spool: Arc<Spool>,
@@ -48,7 +49,12 @@ impl ExporterHealth {
         }
     }
 
-    /// agent exporter task의 기동 여부를 기록한다(aicd_main이 spawn 직후 1회 호출).
+    /// agent exporter task의 생존 여부를 기록한다.
+    ///
+    /// **단방향 래치가 아니다** — 반드시 `false`로 되돌아갈 수 있어야 한다. "떴다"와 "살아있다"는
+    /// 다른 명제다: `serve_agent`가 endpoint 오류·spool 실패·panic으로 죽으면 구독자는 사라지는데,
+    /// 켜진 채로 남으면 `/record now`가 그 뒤로도 영원히 "잘 기록됐다"고 보고한다. 그래서 task 종료
+    /// 시 반드시 꺼지도록 [`AgentLiveGuard`]로 감싸 쓴다.
     pub fn set_agent_live(&self, live: bool) {
         self.agent_live.store(live, Ordering::Relaxed);
     }
@@ -88,6 +94,32 @@ impl ExporterHealth {
     }
 }
 
+/// agent exporter task의 **생존 구간**을 표시하는 RAII 가드.
+///
+/// 생성 시 `agent_live=true`, drop 시 `false`. task 안에서 들고 있으면 정상 종료·에러 종료·panic
+/// (unwind) 어느 경로로 나가든 Drop이 실행되므로, "떴다가 죽었는데 살아있다고 보고"하는 창이 없다.
+///
+/// **왜 `JoinHandle::is_finished()`가 아닌가**: health를 읽는 쪽(`GetExporterStatus` 핸들러)은
+/// handle을 들고 있지 않다 — `ExporterHealth`만 `Arc`로 공유한다. 상태를 읽는 지점에서 확인할 수
+/// 있어야 하므로, 살아있음을 health 자신에 새기는 가드가 맞다.
+pub struct AgentLiveGuard {
+    health: Arc<ExporterHealth>,
+}
+
+impl AgentLiveGuard {
+    /// 가드를 만들며 즉시 "살아있음"으로 표시한다.
+    pub fn new(health: Arc<ExporterHealth>) -> Self {
+        health.set_agent_live(true);
+        Self { health }
+    }
+}
+
+impl Drop for AgentLiveGuard {
+    fn drop(&mut self) {
+        self.health.set_agent_live(false);
+    }
+}
+
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -121,6 +153,43 @@ mod tests {
         assert_eq!(s.push_fail_total, 0);
         // 성공한 적 없음은 None — "방금 성공(0초 전)"과 구분되어야 한다.
         assert_eq!(s.last_ok_secs_ago, None);
+    }
+
+    #[test]
+    fn agent_live_guard_clears_liveness_on_every_exit_including_panic() {
+        // **단방향 래치 회귀 테스트**: "떴다"는 "살아있다"가 아니다. serve_agent가 endpoint 오류·
+        // spool 실패·panic으로 죽으면 구독자는 사라지는데, agent_live가 켜진 채 남으면
+        // `/record now`가 그 뒤로 영원히 "잘 기록됐다"(Delivered)고 조용한 성공을 보고한다.
+        let h = Arc::new(health());
+        assert_eq!(h.snapshot().agent_enabled, Some(false), "초기값은 미기동");
+
+        // 정상 종료: 가드가 scope를 벗어나면 꺼진다.
+        {
+            let _live = AgentLiveGuard::new(h.clone());
+            assert_eq!(
+                h.snapshot().agent_enabled,
+                Some(true),
+                "가드가 살아있는 동안은 켜져 있어야"
+            );
+        }
+        assert_eq!(
+            h.snapshot().agent_enabled,
+            Some(false),
+            "task가 끝났는데 살아있다고 보고한다(단방향 래치)"
+        );
+
+        // panic 경로: unwind에서도 Drop이 돌아 꺼져야 한다(exporter task의 panic이 정확히 이 경우다).
+        let h2 = h.clone();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _live = AgentLiveGuard::new(h2);
+            panic!("exporter task가 죽었다");
+        }));
+        assert!(res.is_err(), "panic이 나야 하는 테스트");
+        assert_eq!(
+            h.snapshot().agent_enabled,
+            Some(false),
+            "panic으로 죽었는데 살아있다고 보고한다"
+        );
     }
 
     #[test]

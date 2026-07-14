@@ -2050,39 +2050,44 @@ fn handle_snapshot_capture(kind: &str, force: bool) -> anyhow::Result<()> {
 /// 순간인데, 거기서 메모까지 버리면 기능이 정작 필요할 때 죽는다. 다만 로컬 실패는 **exit 1**로
 /// 표면화한다 — cron/스크립트가 반쪽 성공을 완전한 성공으로 오인하면 안 된다.
 fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
-    // 로컬 캡처 결과를 **먼저 붙잡아만 두고** 즉시 return하지 않는다 — Err로 빠져나가면 메모가
-    // 통째로 사라진다(위 doc 참고).
-    let local = aic_client::agent::snapshot_capture::capture_forced("manual");
-    let local_ok = matches!(local, Ok(Some(_)));
-    match &local {
-        Ok(Some(path)) => {
-            println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
-        }
-        Ok(None) => {
-            // capture_forced는 게이트를 우회하므로 이론상 오지 않지만, 방어적으로 안내만.
-            eprintln!("{COL_DIM}스냅샷이 기록되지 않았습니다.{COL_RESET}");
-        }
-        Err(e) => {
-            eprintln!("{COL_YELLOW}!{COL_RESET} 스냅샷 캡처 실패: {e}");
-        }
+    // 저장/전송이 **같은 sanitize를 지나야** 로컬과 원격의 메모가 어긋나지 않는다(제어문자 제거 +
+    // 64KiB 절단). 잘렸으면 말해 준다 — 예전엔 아무 표시 없이 잘려서 뒤가 사라진 줄도 몰랐다.
+    let (memo_text, truncated) = aic_client::agent_event::sanitize_memo(memo);
+    if truncated {
+        eprintln!(
+            "{COL_YELLOW}!{COL_RESET} 메모가 너무 길어 {}KiB에서 잘렸습니다\
+             (뒷부분은 저장·전송되지 않습니다).",
+            aic_client::agent_event::MEMO_MAX_BYTES / 1024
+        );
     }
+    let memo_opt = (!memo_text.trim().is_empty()).then_some(memo_text.as_str());
+
+    // 로컬 캡처 결과를 **먼저 붙잡아만 두고** 즉시 return하지 않는다 — Err로 빠져나가면 메모가
+    // 통째로 사라진다(위 doc 참고). 메모는 스냅샷 레코드 **안에** 저장된다(이게 본체다).
+    let local = aic_client::agent::snapshot_capture::capture_forced_with_memo("manual", memo_opt);
+    let local_ok = matches!(local, Ok(Some(_)));
+    if let Ok(Some(path)) = &local {
+        println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
+    }
+    // 실패 경로는 여기서 출력하지 않는다 — 아래 exit 1 에러가 같은 내용을 그대로 내보내므로,
+    // 여기서도 찍으면 **같은 에러가 stderr에 두 번** 나온다.
 
     let mut attrs = std::collections::BTreeMap::new();
     attrs.insert("note_source".to_string(), "cli".to_string());
     // 반환값이 곧 **사후 결과**다 — 보내기 전 probe로 성공을 단언하지 않는다. 로컬/원격 두 결과를
     // 각각 사실대로 보고한다. 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
-    let outcome = aic_client::agent_event::snapshot_recorded(memo, attrs);
+    let outcome = aic_client::agent_event::snapshot_recorded(&memo_text, attrs);
     if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, outcome) {
         eprintln!("{COL_DIM}{notice}{COL_RESET}");
     }
 
-    // 로컬 저장 실패는 exit 1(메모는 이미 보냈다 — 유실 없음). **`Ok(None)`도 실패다**: 스냅샷이
-    // 기록되지 않았는데 exit 0을 내면, stderr를 읽지 않고 exit code만 보는 cron/스크립트가 반쪽
-    // 성공을 완전한 성공으로 오인한다(`Err`를 exit 1로 만든 것과 같은 취지).
+    // 로컬 저장 실패는 exit 1(메모는 이미 보냈다). **`Ok(None)`도 실패다**: 스냅샷이 기록되지
+    // 않았는데 exit 0을 내면, stderr를 읽지 않고 exit code만 보는 cron/스크립트가 반쪽 성공을
+    // 완전한 성공으로 오인한다(`Err`를 exit 1로 만든 것과 같은 취지).
     match local {
         Ok(Some(_)) => Ok(()),
         Ok(None) => Err(anyhow::anyhow!(
-            "스냅샷이 기록되지 않았습니다 — 로컬 스냅샷 없이 메모만 전송되었습니다."
+            "스냅샷이 기록되지 않았습니다 — 메모가 로컬에 저장되지 않았습니다."
         )),
         Err(e) => Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}")),
     }

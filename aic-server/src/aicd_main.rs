@@ -459,21 +459,11 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
-    // agent exporter가 **실제로 이벤트를 받아 갈 수 있는지**를 health에 새긴다 —
-    // `GetExporterStatus`로 chat이 읽어간다.
-    //
-    // config 플래그(`agent_enabled`)가 아니라 이 결과를 싣는 이유: 플래그가 켜져 있어도 endpoint
-    // 미설정·spool 실패면 task가 안 뜨고, 그때 chat이 보낸 agent 이벤트는 구독자가 없어 조용히
-    // 버려진다. 사람이 알아야 하는 건 "설정을 켰나"가 아니라 "지금 받아 갈 구독자가 있나"다.
-    //
-    // `agent_handle.is_some()`이 곧 "구독자 있음"인 근거: 구독(`bus.subscribe()`)은 task 안이
-    // 아니라 `load_agent_config`가 **spawn 전에** 성립시킨다(그 함수 doc 참고). 따라서 handle이
-    // 있으면 receiver는 이미 채널에 붙어 있고, task가 아직 첫 `recv()`를 돌리기 전에 publish된
-    // 이벤트도 버퍼에 보존된다 — spawn~구독 사이의 유실 창이 존재하지 않는다.
-    // serve() **전에** 새기므로 어떤 IPC 응답도 이 값을 못 본 채 나가지 않는다.
-    if let Some(health) = exporter_health.as_ref() {
-        health.set_agent_live(agent_handle.is_some());
-    }
+    // agent exporter의 **생존 여부**(`agent_live`)는 여기서 세팅하지 않는다 — `serve_agent`가
+    // 자기 안에서 RAII 가드(`AgentLiveGuard`)로 켜고, 어떤 이유로든 종료하면(정상·에러·panic)
+    // drop되며 끈다. 여기서 `set_agent_live(true)`를 하면 **단방향 래치**가 되어, task가 즉시
+    // 죽어도 상태는 영원히 "살아있음"으로 남고 `/record now`가 조용한 성공을 보고한다.
+    // (spawn 여부만 아는 이 자리는 "떴다"는 알아도 "살아있다"는 모른다.)
 
     server.serve(control_ctx).await;
 

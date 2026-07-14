@@ -40,6 +40,17 @@ pub struct SnapshotRecord {
     pub sections: Vec<String>,
     /// redacted 스냅샷 본문.
     pub body: String,
+    /// 사람이 남긴 관찰 메모(`/record now <메모>`, `aic snapshot record --memo`). 없으면 `None`.
+    ///
+    /// **왜 로컬에 저장하는가**: 이 기능의 본질은 **메모**다 — 임계 스캔이 원리상 못 잡는 "지금 이게
+    /// 이상하다"를 사람이 직접 남기는 경로다. 그런데 메모가 OTLP 이벤트로**만** 나가면, aicd가 꺼져
+    /// 있을 때(우리 문서상 **정상 상태**다) 그 관찰이 통째로 사라진다. 스냅샷은 저장되는데 정작
+    /// 사람이 남긴 말은 어디에도 없는 것이다. 원격은 부가이지 본체가 아니므로, 메모는 로컬 레코드에
+    /// 함께 남긴다.
+    ///
+    /// 하위 호환: 기존 레코드엔 이 필드가 없다 → `#[serde(default)]`로 `None`이 된다.
+    #[serde(default)]
+    pub memo: Option<String>,
 }
 
 impl SnapshotRecord {
@@ -52,11 +63,28 @@ impl SnapshotRecord {
         cwd: Option<String>,
         now: DateTime<Utc>,
     ) -> Self {
+        Self::with_memo(kind, body, host, cwd, now, None)
+    }
+
+    /// [`Self::new`] + 사람이 남긴 메모(`/record now <메모>`). memo도 body/host/cwd와 **동일하게
+    /// redact**한다 — 사람이 메모에 secret을 적어 넣을 수 있고(F14), at-rest 평문으로 남으면 미래
+    /// reader(bundle/diff/LLM)로 그대로 샌다.
+    pub fn with_memo(
+        kind: &str,
+        body: &str,
+        host: Option<String>,
+        cwd: Option<String>,
+        now: DateTime<Utc>,
+        memo: Option<&str>,
+    ) -> Self {
         // body뿐 아니라 host/cwd도 저장 직전 redact — 경로/호스트명에 든 민감 토큰(IP/이메일/secret 패턴)이
         // 평문으로 at-rest 저장돼 미래 reader(bundle/diff/LLM)로 새는 것을 막는다(body와 동일 보장).
         let body = crate::redaction::redact(body).0;
         let host = host.map(|h| crate::redaction::redact(&h).0);
         let cwd = cwd.map(|c| crate::redaction::redact(&c).0);
+        let memo = memo
+            .map(|m| crate::redaction::redact(m).0)
+            .filter(|m| !m.trim().is_empty());
         let sections = body
             .lines()
             .filter_map(|l| l.strip_prefix("## ").map(|n| n.trim().to_string()))
@@ -69,6 +97,7 @@ impl SnapshotRecord {
             kind: kind.to_string(),
             sections,
             body,
+            memo,
         }
     }
 }
@@ -502,6 +531,36 @@ mod tests {
             .expect("락 해제 후에도 append 미완료");
         t.join().unwrap();
         assert_eq!(load_snapshots().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn old_records_without_memo_field_still_load() {
+        // 하위 호환: 기존 레코드엔 `memo` 필드가 없다. 그 줄이 파싱 실패로 통째 유실되면(load가
+        // 깨진 라인을 건너뛰므로) 과거 스냅샷이 조용히 사라진다 — `#[serde(default)]`로 None이 된다.
+        let _h = HomeGuard::set();
+        fs::create_dir_all(snapshots_dir()).unwrap();
+        let path = snapshots_dir().join(SNAPSHOTS_FILE);
+        // 구버전 aic가 쓴 레코드 — `memo` 키가 **아예 없다**(있는데 null인 것과 다르다).
+        let old_line = serde_json::json!({
+            "schema_version": 1,
+            "captured_at": "2023-11-14T22:13:20Z",
+            "host": null,
+            "cwd": "/tmp/x",
+            "kind": "local",
+            "sections": ["host"],
+            "body": "## host\nh\n",
+        })
+        .to_string();
+        assert!(
+            !old_line.contains("memo"),
+            "픽스처에 memo 키가 있으면 안 된다"
+        );
+        fs::write(&path, format!("{old_line}\n")).unwrap();
+
+        let loaded = load_snapshots().unwrap();
+        assert_eq!(loaded.len(), 1, "구버전 레코드가 유실됐다");
+        assert_eq!(loaded[0].kind, "local");
+        assert_eq!(loaded[0].memo, None, "필드 없는 구버전은 메모 없음이어야");
     }
 
     #[test]

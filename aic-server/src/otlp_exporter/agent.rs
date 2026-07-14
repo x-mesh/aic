@@ -51,6 +51,15 @@ pub async fn serve_agent(
     cfg: AgentConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    // **살아있는 동안만** health에 agent_live=true를 새긴다. 이 함수가 어떤 경로로 나가든
+    // (정상 종료·`?` 에러 전파·panic) 가드가 drop되며 false로 되돌린다 — "떴다"를 "살아있다"로
+    // 착각해 죽은 뒤에도 `/record now`가 성공을 보고하는 것을 막는다.
+    //
+    // **client 빌드보다 먼저** 만든다: 아래 `?`가 곧바로 에러를 던져도 그 순간 이미 가드가 있어야
+    // (그리고 drop되어야) 상태가 사실과 어긋나지 않는다. 구독(rx)은 이미 부모가 spawn 전에
+    // 성립시켰으므로, 이 시점부터 "구독자 있음 == agent_live"가 일치한다.
+    let _live = super::health::AgentLiveGuard::new(cfg.health.clone());
+
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::logs_url(&cfg.endpoint);
     // 구독은 **부모가 spawn 전에** 이미 끝냈다(AgentConfig::rx 참고) — 여기서 subscribe하면
