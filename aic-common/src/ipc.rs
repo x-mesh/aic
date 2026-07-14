@@ -247,6 +247,18 @@ pub struct ExporterStatus {
     /// "켜짐"으로 읽으면 진짜 유실을 놓친다. 호출부가 둘을 나눠 판단하게 둔다.
     #[serde(default)]
     pub agent_enabled: Option<bool>,
+    /// **config에서 agent exporter를 켜 두었는가**(`[aicd.exporter] agent_enabled`).
+    ///
+    /// [`Self::agent_enabled`](=실제로 살아있는가)와 **다른 축이다**. 둘을 합쳐야 사용자에게 맞는
+    /// 조치를 안내할 수 있다:
+    /// - `configured=false` → "설정이 꺼져 있다" → `agent_enabled = true`로 켜라.
+    /// - `configured=true` + `live=false` → "설정은 켰는데 **뜨지 못했다**"(endpoint 오류·spool 실패·
+    ///   task 사망) → **aicd 로그를 봐라**. 이때 "설정을 켜라"고 안내하면 이미 켜 둔 사용자가
+    ///   시키는 대로 해도 안 고쳐진다(오진).
+    ///
+    /// `None` = 모름(이 필드를 모르는 구버전 aicd).
+    #[serde(default)]
+    pub agent_configured: Option<bool>,
     /// collector base URL(표시용).
     #[serde(default)]
     pub endpoint: String,
@@ -379,6 +391,27 @@ mod tests {
             s.agent_enabled, None,
             "필드 없는 구버전 응답은 '모름'이어야 한다(꺼짐이 아니다)"
         );
+        assert_eq!(
+            s.agent_configured, None,
+            "구버전은 config 축도 모른다 — 모름이어야 한다"
+        );
+    }
+
+    #[test]
+    fn exporter_status_separates_configured_from_live() {
+        // 두 축은 독립이다: "설정은 켰는데 뜨지 못했다"(configured=true, live=false)를 표현할 수
+        // 있어야 클라이언트가 "설정을 켜라"는 오진 대신 "aicd 로그를 보라"고 안내한다.
+        let s = ExporterStatus {
+            enabled: true,
+            agent_enabled: Some(false),
+            agent_configured: Some(true),
+            ..Default::default()
+        };
+        let back: ExporterStatus =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.agent_enabled, Some(false));
+        assert_eq!(back.agent_configured, Some(true));
+        assert_eq!(back, s);
     }
 
     #[test]

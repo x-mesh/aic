@@ -314,6 +314,12 @@ async fn main() -> anyhow::Result<()> {
     // OTLP agent exporter (opt-in, [aicd.exporter] enabled=true + agent_enabled=true).
     // AgentEventBus tap을 구독해 chat/agent 행위를 실시간으로 push한다. events와 같은 push 기반
     // 구조지만, 소스가 store가 아니라 bus라 별도 task로 둔다.
+    //
+    // config 플래그를 health에 먼저 새긴다 — chat이 "설정이 꺼짐"과 "설정은 켰는데 뜨지 못함"을
+    // 구분해 안내하려면 **두 축 모두** 필요하다(후자에 "설정을 켜라"고 하면 오진이다).
+    if let (Some(health), Some(ex)) = (exporter_health.as_ref(), exporter_section.as_ref()) {
+        health.set_agent_configured(ex.enabled && ex.agent_enabled);
+    }
     let agent_handle = match load_agent_config(
         exporter_agent_bus,
         exporter_section.clone(),
@@ -321,6 +327,14 @@ async fn main() -> anyhow::Result<()> {
         exporter_health.clone(),
     ) {
         Some(cfg) => {
+            // **구독은 이미 성립했다**(load_agent_config가 spawn 전에 subscribe한다). 구독이 성립한
+            // 순간이 곧 "이 이벤트는 버려지지 않는다"가 참이 되는 시점이므로, **spawn 전에** 살아있음을
+            // 새긴다. task가 켜게 두면 spawn~task 시작 사이가 거짓 false인 창이 되어, 멀쩡히 전달될
+            // 메모를 "유실"로 오보한다(그 창은 aicd 기동 직후 = chat이 붙는 시점과 겹친다).
+            // 끄는 건 task 안의 AgentLiveGuard가 종료 시 맡는다(죽으면 false로 되돌아간다).
+            if let Some(health) = exporter_health.as_ref() {
+                health.set_agent_live(true);
+            }
             let ag_shutdown = shutdown.subscribe();
             Some(tokio::spawn(async move {
                 if let Err(e) = aic_server::otlp_exporter::serve_agent(cfg, ag_shutdown).await {
@@ -459,11 +473,9 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
-    // agent exporter의 **생존 여부**(`agent_live`)는 여기서 세팅하지 않는다 — `serve_agent`가
-    // 자기 안에서 RAII 가드(`AgentLiveGuard`)로 켜고, 어떤 이유로든 종료하면(정상·에러·panic)
-    // drop되며 끈다. 여기서 `set_agent_live(true)`를 하면 **단방향 래치**가 되어, task가 즉시
-    // 죽어도 상태는 영원히 "살아있음"으로 남고 `/record now`가 조용한 성공을 보고한다.
-    // (spawn 여부만 아는 이 자리는 "떴다"는 알아도 "살아있다"는 모른다.)
+    // agent exporter의 생존(`agent_live`)은 **위에서 spawn 전에 켰다**(구독이 성립한 시점이 곧
+    // "이벤트가 버려지지 않는다"가 참이 되는 시점이다). 끄는 건 task 안의 `AgentLiveGuard`가
+    // 종료(정상·에러·panic) 시 맡는다 — 켜기와 끄기의 주체를 나눠야 유실 창도, 단방향 래치도 없다.
 
     server.serve(control_ctx).await;
 
