@@ -82,6 +82,8 @@ pub struct HostSampler {
     os_type: String,
     arch: String,
     os_desc: String,
+    // t8: host_extra(memory compressor/pressure/fd, t5)의 decompression_rate delta 상태.
+    extra: super::host_extra::HostExtraState,
 }
 
 impl HostSampler {
@@ -109,6 +111,7 @@ impl HostSampler {
             arch: std::env::consts::ARCH.to_string(),
             os_desc: System::long_os_version().unwrap_or_default(),
             host_name,
+            extra: super::host_extra::HostExtraState::new(),
         }
     }
 
@@ -348,6 +351,10 @@ impl HostSampler {
             });
         }
 
+        // t8: host_extra(memory compressor/pressure/fd, t5) 배선. 실패는 개별 point 생략으로
+        // 처리되므로(host_extra.rs 모듈 doc) 여기서 추가로 방어할 게 없다.
+        points.extend(super::host_extra::collect(&mut self.extra));
+
         HostSample {
             resource: ResourceAttrs {
                 host_name: self.host_name.clone(),
@@ -430,10 +437,15 @@ mod tests {
         assert!(!sample.resource.os_type.is_empty());
         // host metrics 26종(cpu 5 + mem 4 + swap 3 + fs 4 + disk io 2 + net io/packets/errors 6 +
         // process 1 + uptime 1)이 항상 나가고, top_process.usage(프로세스 목록 비었을 때만 생략)와
-        // ntp_offset_ms(Linux + 커널 sync 상태일 때만)가 각각 선택적으로 붙는다 — 26~28 모두 유효.
+        // ntp_offset_ms(Linux + 커널 sync 상태일 때만)가 각각 선택적으로 붙는다(26~28).
+        // t8: host_extra(t5) 배선분이 여기에 더해진다 — macOS는 compressor(0~3) + pressure.level(0~1)
+        // + fd count/limit(0~2)로 최대 6종, Linux는 pressure.some/full(0~2) + fd count/limit(0~2)로
+        // 최대 4종, 둘 다 최소 0종(sysctl/procfs 읽기 실패 시 전부 생략 가능). 그래서 상한을
+        // 28+6=34까지 넉넉히 잡는다 — 특정 머신의 우연한 상태(어떤 point가 정확히 몇 개 나오는지)를
+        // 요구하지 않는다(3번째 반복 사고 규칙).
         assert!(
-            (26..=28).contains(&sample.points.len()),
-            "host metrics 점수는 26~28이어야 함, got {}",
+            (26..=34).contains(&sample.points.len()),
+            "host metrics 점수는 26~34여야 함, got {}",
             sample.points.len()
         );
         // utilization 계열은 항상 0..1 범위.
@@ -443,6 +455,34 @@ mod tests {
                     assert!((0.0..=1.0).contains(&v), "{} out of range: {v}", p.name);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sample_includes_host_extra_metrics() {
+        // 배선 회귀 방지(t8): `host_extra::collect`가 이 머신에서 낼 수 있는 이름들이 `sample()`
+        // 출력에도 나타나야 한다 — `points.extend(host_extra::collect(...))` 줄이 빠지면 이 테스트가
+        // FAILED한다(mutation check로 실제 확인함). 두 호출은 같은 순간이 아니므로 **값**은 비교하지
+        // 않고 **이름 집합**만 비교한다(decompression_rate처럼 1회차엔 없는 값도 있어 완전 일치는
+        // 요구하지 않는다).
+        //
+        // 이 환경(sysctl/procfs 전부 실패)에서 host_extra가 아무것도 못 내면 비교할 것이 없으므로
+        // skip한다 — "이 머신의 현재 상태"를 요구하지 않는다(repo 반복 사고 규칙 3번).
+        let mut extra_state = super::super::host_extra::HostExtraState::new();
+        let direct = super::super::host_extra::collect(&mut extra_state);
+        if direct.is_empty() {
+            return;
+        }
+
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        let names: std::collections::HashSet<&str> = sample.points.iter().map(|p| p.name).collect();
+        for p in &direct {
+            assert!(
+                names.contains(p.name),
+                "host_extra 배선 누락: {} 이 HostSampler::sample()에 없다",
+                p.name
+            );
         }
     }
 
