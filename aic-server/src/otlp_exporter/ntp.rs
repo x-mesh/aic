@@ -43,7 +43,13 @@ pub(super) fn ntp_offset_ms() -> Option<f64> {
     // 않고 조회만** 한다 — 이 함수가 부작용 없는 순수 read임을 보장하는 핵심 불변식이다.
     let mut buf: libc::timex = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::ntp_adjtime(&mut buf) };
-    interpret(ret, buf.offset as i64)
+    // `buf.offset`의 실제 타입(`c_long`/`c_longlong`)은 아키텍처마다 폭이 다르다 — 64bit
+    // Linux(x86_64 등)에서는 이미 `i64`라 이 캐스트가 no-op으로 보여 clippy가
+    // unnecessary_cast로 잡지만, 32bit non-time64 커널에서는 `i32`→`i64` 확장이 실제로
+    // 필요하다. 폭에 안전한 단일 표현을 위해 캐스트를 유지하고 이 경고만 allow한다.
+    #[allow(clippy::unnecessary_cast)]
+    let offset_usec = buf.offset as i64;
+    interpret(ret, offset_usec)
 }
 
 /// macOS 등 비-Linux는 안전한 no-network local API가 없어 생략한다(모듈 doc 참조).

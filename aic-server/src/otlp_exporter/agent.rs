@@ -53,6 +53,9 @@ pub async fn serve_agent(
     let host_id = super::host_metrics::host_id(&host_name);
     let os_type = std::env::consts::OS.to_string();
     let mut backoff = Backoff::new();
+    // ts 폴백 경고를 처음 한 번만 WARN으로 올린다(이후는 DEBUG) — 시계가 어긋난 호스트에선 모든
+    // 이벤트가 폴백을 타므로, 그대로 두면 로그가 폭주한다. 정상 경로에선 아예 찍히지 않는다.
+    let mut ts_fallback_warned = false;
 
     tracing::info!(url = %url, "OTLP agent exporter 시작");
 
@@ -70,11 +73,31 @@ pub async fn serve_agent(
                             os_type: &os_type,
                             host_ip: None,
                         };
+                        // observed = aicd가 이 행위를 관측(수신·인코딩)한 시각, event = 행위가
+                        // 실제로 일어난 시각. 둘을 분리해야 spool에 쌓였다 드레인된 이벤트를
+                        // 수신 측이 구분할 수 있다.
+                        let observed_ns = super::unix_nanos_now();
+                        let (event_ns, fallback) = agent_event_time_unix_nano(ev.ts, observed_ns);
+                        if let Some(reason) = fallback {
+                            if ts_fallback_warned {
+                                tracing::debug!(reason, ts = %ev.ts, kind = %ev.kind, "AgentEvent.ts 폴백(중복 경고 억제)");
+                            } else {
+                                ts_fallback_warned = true;
+                                tracing::warn!(
+                                    reason,
+                                    ts = %ev.ts,
+                                    observed_ns,
+                                    kind = %ev.kind,
+                                    "AgentEvent.ts가 비정상 — 관측 시각으로 대체한다(이후 동일 경고는 debug로만)"
+                                );
+                            }
+                        }
                         let body = logs_proto::encode_agent_event(
                             &ev,
                             &resource,
                             &cfg.service_version,
-                            super::unix_nanos_now(),
+                            event_ns,
+                            observed_ns,
                         );
 
                         if !backoff.ready() {
@@ -115,4 +138,138 @@ pub async fn serve_agent(
     }
     tracing::info!("OTLP agent exporter 종료");
     Ok(())
+}
+
+/// LogRecord `time_unix_nano`(= 이벤트 발생 시각)로 쓸 값을 고른다. **"사람이 순간을 남긴다"**는
+/// 의미상 관측/push 시각(`now`)이 아니라 행위가 실제로 일어난 시각(`ts` = `AgentEvent.ts`)을
+/// 쓴다 — aicd가 밀리거나 tap이 지연돼도 기록에는 원래 순간이 남아야 한다.
+/// (`observed_time_unix_nano`는 이 함수와 무관하게 항상 `now`다 — 호출부 참고.)
+///
+/// `ts`가 epoch 0 이하이거나(비정상 초기값), chrono 표현 범위를 벗어나거나(연도 대략
+/// 1677~2262 밖 — `timestamp_nanos_opt()`가 `None`), `now`보다 미래(시계 skew 방어)면 `now`로
+/// 폴백한다: 미래 시각이나 epoch 0을 그대로 collector에 보내지 않기 위한 불변식이다.
+///
+/// 폴백이 일어나면 그 사유를 `Some(reason)`으로 함께 돌려준다 — 조용히 삼키면 시계 skew나 버그를
+/// 영영 모른다. 로깅은 호출부가 한다(폭주 억제를 위해 첫 1회만 WARN).
+fn agent_event_time_unix_nano(
+    ts: chrono::DateTime<chrono::Utc>,
+    now: u64,
+) -> (u64, Option<&'static str>) {
+    match ts.timestamp_nanos_opt() {
+        None => (now, Some("out_of_range")),
+        Some(nanos) if nanos <= 0 => (now, Some("non_positive")),
+        Some(nanos) => {
+            let nanos = nanos as u64;
+            if nanos <= now {
+                (nanos, None)
+            } else {
+                (now, Some("future"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message as _;
+    use std::collections::BTreeMap;
+
+    fn event_with_ts(ts: chrono::DateTime<chrono::Utc>) -> aic_common::AgentEvent {
+        aic_common::AgentEvent {
+            kind: "tool.run_command".to_string(),
+            summary: "ls -la".to_string(),
+            severity: "INFO".to_string(),
+            attrs: BTreeMap::new(),
+            ts,
+        }
+    }
+
+    // ts를 고정값으로 넣고 그 값이 그대로(변환 없이) 나오는지 본다 — now()와 비교하지 않는
+    // 결정적 검증. `NOW`는 ts보다 한참 뒤의 임의 고정 시각이라 "미래 시각 폴백" 분기를 타지
+    // 않는다.
+    const PAST_TS_NANOS: i64 = 1_700_000_000_000_000_000; // 2023-11-14 UTC 근방
+    const NOW_NANOS: u64 = 1_800_000_000_000_000_000; // 2027-01 근방, PAST_TS_NANOS보다 미래
+
+    #[test]
+    fn valid_ts_is_used_as_is_not_now() {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(PAST_TS_NANOS);
+        let (got, fallback) = agent_event_time_unix_nano(ts, NOW_NANOS);
+        assert_eq!(got, PAST_TS_NANOS as u64);
+        assert_ne!(
+            got, NOW_NANOS,
+            "now()로 대체되면 안 된다 — ts가 그대로 나와야 한다"
+        );
+        assert!(fallback.is_none(), "정상 경로에선 폴백 사유가 없어야 한다");
+    }
+
+    #[test]
+    fn epoch_zero_ts_falls_back_to_now() {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(0);
+        let (got, fallback) = agent_event_time_unix_nano(ts, NOW_NANOS);
+        assert_eq!(got, NOW_NANOS);
+        assert_eq!(fallback, Some("non_positive"));
+    }
+
+    #[test]
+    fn future_ts_falls_back_to_now() {
+        // ts가 now보다 미래면(시계 skew) 그대로 보내지 않고 now로 폴백한다.
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(NOW_NANOS as i64 + 1);
+        let (got, fallback) = agent_event_time_unix_nano(ts, NOW_NANOS);
+        assert_eq!(got, NOW_NANOS);
+        assert_eq!(fallback, Some("future"));
+    }
+
+    /// LogRecord의 두 시각이 **서로 다른 출처**에서 오는지 encode 결과(protobuf)까지 디코드해
+    /// end-to-end로 확인한다: `time_unix_nano` = 행위 발생 시각(`AgentEvent.ts`),
+    /// `observed_time_unix_nano` = aicd가 관측한 시각(now). 둘이 같아지면(뭉개지면) FAILED다.
+    #[test]
+    fn encoded_log_record_separates_event_time_from_observed_time() {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(PAST_TS_NANOS);
+        let ev = event_with_ts(ts);
+        let resource = ResourceAttrs {
+            host_name: "web-1",
+            host_id: "id-abc",
+            os_type: "linux",
+            host_ip: None,
+        };
+        let (event_ns, _) = agent_event_time_unix_nano(ev.ts, NOW_NANOS);
+        let body = logs_proto::encode_agent_event(&ev, &resource, "0.24.0", event_ns, NOW_NANOS);
+
+        let req =
+            logs_proto::ExportLogsServiceRequest::decode(body.as_slice()).expect("valid protobuf");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+
+        // 발생 시각은 ts에서 온다.
+        assert_eq!(lr.time_unix_nano, PAST_TS_NANOS as u64);
+        // 관측 시각은 now에서 온다.
+        assert_eq!(lr.observed_time_unix_nano, NOW_NANOS);
+        // 그리고 둘은 분리되어 있다 — 같은 값이면 "언제 관측했나"가 사라진다(spool 드레인 구분 불가).
+        assert_ne!(
+            lr.time_unix_nano, lr.observed_time_unix_nano,
+            "event time과 observed time을 같은 값으로 뭉개면 안 된다"
+        );
+    }
+
+    /// 폴백 경로에서는 두 시각이 **같아지는 게 맞다** — ts를 못 믿어 관측 시각으로 대체했으므로
+    /// 발생 시각도 관측 시각이다. 위 테스트의 `assert_ne!`가 폴백까지 금지하는 게 아님을 못박는다.
+    #[test]
+    fn fallback_makes_both_times_the_observed_time() {
+        let ev = event_with_ts(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(0));
+        let resource = ResourceAttrs {
+            host_name: "web-1",
+            host_id: "id-abc",
+            os_type: "linux",
+            host_ip: None,
+        };
+        let (event_ns, fallback) = agent_event_time_unix_nano(ev.ts, NOW_NANOS);
+        assert!(fallback.is_some());
+        let body = logs_proto::encode_agent_event(&ev, &resource, "0.24.0", event_ns, NOW_NANOS);
+
+        let req =
+            logs_proto::ExportLogsServiceRequest::decode(body.as_slice()).expect("valid protobuf");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(lr.time_unix_nano, NOW_NANOS);
+        assert_eq!(lr.observed_time_unix_nano, NOW_NANOS);
+    }
 }

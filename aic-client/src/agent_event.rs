@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use aic_common::{
     encode_frame, AgentEvent, IpcRequest, IpcResponse, AGENT_KIND_FINDING_CREATED,
-    AGENT_KIND_RISK_DENIED, AGENT_KIND_TOOL_RUN_COMMAND,
+    AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 
 /// 소켓 연결/송신/응답 대기 상한. chat 흐름을 막지 않도록 짧게 잡는다 — aicd는 로컬 UDS라
@@ -69,6 +69,21 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
     emit(AGENT_KIND_FINDING_CREATED, message, severity, attrs);
 }
 
+/// 사람이 "지금 이 순간을 남긴다"고 판단해 기록한다 — 임계에 안 걸려도 사람이 이상하다고
+/// 느낀 순간을 남기는 경로. severity는 항상 INFO(사건이 아니라 사람의 관찰 기록이다).
+///
+/// **`attrs` 키에 `exit_code`/`cwd`/`duration_ms`를 쓰지 마라** — 서버의 `EVENT_MAPPED_KEYS`가
+/// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
+pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) {
+    dispatch(snapshot_event(memo, attrs));
+}
+
+/// `snapshot_recorded`가 보낼 이벤트를 만든다. kind/severity를 **인자로 받지 않고 본문에
+/// 고정**한다 — 그래야 테스트가 이 두 값을 주입하지 않고 결과만 검증할 수 있다(회귀를 실제로 잡는다).
+fn snapshot_event(memo: &str, attrs: BTreeMap<String, String>) -> AgentEvent {
+    build_event(AGENT_KIND_SNAPSHOT_RECORDED, memo, "INFO", attrs)
+}
+
 /// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
 ///
 /// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
@@ -82,9 +97,14 @@ pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
     }
 }
 
-/// 한 행위를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태).
-fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
-    let ev = AgentEvent {
+/// `AgentEvent`를 만든다(summary/attrs 값 redaction 포함). 순수 함수라 네트워크 없이 검증 가능하다.
+fn build_event(
+    kind: &str,
+    summary: &str,
+    severity: &str,
+    attrs: BTreeMap<String, String>,
+) -> AgentEvent {
+    AgentEvent {
         kind: kind.to_string(),
         summary: redact(summary),
         severity: severity.to_string(),
@@ -93,10 +113,18 @@ fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, Strin
             .map(|(k, v)| (k, redact(&v)))
             .collect::<BTreeMap<_, _>>(),
         ts: chrono::Utc::now(),
-    };
-    // 실패는 무시한다 — aicd 미실행은 정상 상태이고, 텔레메트리가 chat을 방해해선 안 된다.
-    // (audit/rca_memory 등 다른 best-effort 경로와 같은 관례: lib 모듈은 조용히 실패한다.)
+    }
+}
+
+/// 만들어진 이벤트를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태이고,
+/// 텔레메트리가 chat을 방해해선 안 된다 — audit/rca_memory 등 다른 best-effort 경로와 같은 관례).
+fn dispatch(ev: AgentEvent) {
     let _ = send(&IpcRequest::AgentEvent(ev));
+}
+
+/// 한 행위를 aicd로 보낸다(build + dispatch).
+fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
+    dispatch(build_event(kind, summary, severity, attrs));
 }
 
 /// 송신 대상 문자열을 마스킹한다. `redaction::redact`는 idempotent라 이미 redact된 입력에
@@ -148,6 +176,56 @@ mod tests {
         tool_run_command("echo hi", Some(0), 12, "/tmp");
         risk_denied("rm -rf /", "Dangerous", Some("builtin_denylist"));
         finding_created("disk_full", "WARN", "/ 사용률 95%");
+        snapshot_recorded(
+            "cpu sys 26%, idle 67% — 커널 모드 비율이 높음",
+            BTreeMap::new(),
+        );
+    }
+
+    #[test]
+    fn snapshot_event_kind_and_severity_come_from_the_function_body() {
+        // kind/severity를 테스트가 주입하지 않는다 — snapshot_event()가 본문에 고정한 값을
+        // 그대로 검증한다. 누가 kind를 다른 상수로 바꾸거나 severity를 WARN으로 바꾸면 실패한다.
+        let ev = snapshot_event("이상하게 느려짐", BTreeMap::new());
+
+        assert_eq!(ev.kind, "snapshot.recorded");
+        assert_eq!(
+            ev.severity, "INFO",
+            "사람의 관찰 기록이라 사건 severity를 달지 않는다"
+        );
+        assert_eq!(ev.summary, "이상하게 느려짐");
+    }
+
+    #[test]
+    fn snapshot_event_carries_caller_attrs() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("memo_source".to_string(), "manual".to_string());
+        let ev = snapshot_event("memo", attrs);
+
+        assert_eq!(ev.attrs.get("memo_source"), Some(&"manual".to_string()));
+    }
+
+    #[test]
+    fn snapshot_event_redacts_summary_and_attrs() {
+        // snapshot_recorded() 경로가 실제로 redaction을 거치는지 본다 — summary와 attrs 값 양쪽.
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let mut attrs = BTreeMap::new();
+        attrs.insert(
+            "note".to_string(),
+            format!("export AWS_SECRET_ACCESS_KEY={secret}"),
+        );
+        let ev = snapshot_event(&format!("키가 노출됨: {secret}"), attrs);
+
+        assert!(
+            !ev.summary.contains(secret),
+            "summary가 마스킹되지 않음: {}",
+            ev.summary
+        );
+        let masked = ev.attrs.get("note").expect("note attr 존재");
+        assert!(
+            !masked.contains(secret),
+            "attrs 값이 마스킹되지 않음: {masked}"
+        );
     }
 
     #[test]

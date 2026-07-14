@@ -37,11 +37,16 @@ fn redact_str(s: &str) -> String {
 ///
 /// `drop_counters`는 순수 시스템 지표(`HostSample`)와 관심사가 달라 별도 인자로 받는다(SRE
 /// t6) — `HostSampler`에 로그 드롭 개념을 섞지 않기 위한 최소 변경.
+///
+/// **`None`이면 `aic.log.dropped` 게이지를 아예 붙이지 않는다.** metrics를 내보내는 task가
+/// 둘(host metrics `serve`, docker exporter)인데 둘 다 이 게이지를 실으면 **같은 메트릭이
+/// 서로 다른 값으로 중복 발행**된다 — docker task는 로그 드롭을 알지 못하므로 0을 보내고,
+/// 수신 측에서는 어느 쪽이 진실인지 알 수 없다. 로그 드롭은 **host metrics task만** 보고한다.
 pub fn encode_metrics(
     sample: &HostSample,
     service_version: &str,
     now_unix_nano: u64,
-    drop_counters: &DropCounters,
+    drop_counters: Option<&DropCounters>,
 ) -> Vec<u8> {
     let resource_attrs = vec![
         attr("host.name", &sample.resource.host_name),
@@ -88,25 +93,28 @@ pub fn encode_metrics(
 
     // 로그 드롭 카운터 — 사유(reason)별 data point 하나씩, 서비스 태그는 붙이지 않는다
     // (카디널리티 방어). 폭주 중에도 새 LogLine을 만들지 않는 불변식과 짝을 이루는 관측 경로.
-    let drop_data_points = drop_counters
-        .snapshot()
-        .into_iter()
-        .map(|(reason, count)| NumberDataPoint {
-            attributes: vec![attr("reason", reason)],
-            start_time_unix_nano: 0,
-            time_unix_nano: now_unix_nano,
-            value: Some(NumberValue::AsInt(count as i64)),
-            flags: 0,
-        })
-        .collect::<Vec<_>>();
-    metrics.push(Metric {
-        name: redact_str(LOG_DROPPED_METRIC_NAME),
-        description: String::new(),
-        unit: redact_str("1"),
-        data: Some(MetricData::Gauge(Gauge {
-            data_points: drop_data_points,
-        })),
-    });
+    // 카운터를 모르는 task(docker exporter)는 None을 넘겨 이 게이지를 아예 싣지 않는다.
+    if let Some(counters) = drop_counters {
+        let drop_data_points = counters
+            .snapshot()
+            .into_iter()
+            .map(|(reason, count)| NumberDataPoint {
+                attributes: vec![attr("reason", reason)],
+                start_time_unix_nano: 0,
+                time_unix_nano: now_unix_nano,
+                value: Some(NumberValue::AsInt(count as i64)),
+                flags: 0,
+            })
+            .collect::<Vec<_>>();
+        metrics.push(Metric {
+            name: redact_str(LOG_DROPPED_METRIC_NAME),
+            description: String::new(),
+            unit: redact_str("1"),
+            data: Some(MetricData::Gauge(Gauge {
+                data_points: drop_data_points,
+            })),
+        });
+    }
 
     let request = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
@@ -326,7 +334,7 @@ mod tests {
             &sample,
             "0.24.0",
             1_700_000_000_000_000_000,
-            &DropCounters::default(),
+            Some(&DropCounters::default()),
         );
 
         // 원문 secret은 wire에 절대 남지 않는다.
@@ -353,7 +361,7 @@ mod tests {
         ];
         for secret in cases {
             let sample = sample_with_resource(secret, "id", "linux");
-            let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
+            let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
             assert!(
                 !contains(&bytes, secret.as_bytes()),
                 "'{secret}' 종류가 redact되지 않고 유출됨"
@@ -365,7 +373,7 @@ mod tests {
     #[test]
     fn encodes_valid_otlp_request_roundtrip() {
         let sample = sample_with_resource("web-1", "id-abc", "linux");
-        let bytes = encode_metrics(&sample, "9.9.9", 42, &DropCounters::default());
+        let bytes = encode_metrics(&sample, "9.9.9", 42, Some(&DropCounters::default()));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
 
         assert_eq!(req.resource_metrics.len(), 1);
@@ -413,7 +421,7 @@ mod tests {
     #[test]
     fn resource_attr_value_is_redacted_and_readable() {
         let sample = sample_with_resource("clean-host", "AKIAIOSFODNN7EXAMPLE", "linux");
-        let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let attrs = &req.resource_metrics[0]
             .resource
@@ -439,7 +447,7 @@ mod tests {
     #[test]
     fn resource_carries_arch_and_os_description_for_the_host_inventory() {
         let sample = sample_with_resource("web-1", "id-1", "macos");
-        let bytes = encode_metrics(&sample, "0.24.0", 1, &DropCounters::default());
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let attrs = &req.resource_metrics[0]
             .resource
@@ -480,7 +488,7 @@ mod tests {
         // 로그를 아무도 못 본다 — poison batch 방어의 유일한 가시화 수단이다.
         counters.by_rejected.fetch_add(55, Ordering::Relaxed);
 
-        let bytes = encode_metrics(&sample, "0.24.0", 1, &counters);
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&counters));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let sm = &req.resource_metrics[0].scope_metrics[0];
 

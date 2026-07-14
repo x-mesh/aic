@@ -79,8 +79,16 @@ mod tests {
         assert_eq!(Backoff::delay_for(4), Duration::from_secs(8));
         assert_eq!(Backoff::delay_for(5), Duration::from_secs(16));
         assert_eq!(Backoff::delay_for(6), Duration::from_secs(32));
-        assert_eq!(Backoff::delay_for(7), Duration::from_secs(60), "60s에서 cap");
-        assert_eq!(Backoff::delay_for(20), Duration::from_secs(60), "cap 이후로도 60s 유지");
+        assert_eq!(
+            Backoff::delay_for(7),
+            Duration::from_secs(60),
+            "60s에서 cap"
+        );
+        assert_eq!(
+            Backoff::delay_for(20),
+            Duration::from_secs(60),
+            "cap 이후로도 60s 유지"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -123,6 +131,9 @@ mod tests {
         let mut backoff = Backoff::new();
         backoff.on_failure();
         tokio::time::advance(Duration::from_millis(200)).await;
-        assert!(!backoff.ready(), "base delay(1s)보다 먼저 ready가 되면 안 됨");
+        assert!(
+            !backoff.ready(),
+            "base delay(1s)보다 먼저 ready가 되면 안 됨"
+        );
     }
 }

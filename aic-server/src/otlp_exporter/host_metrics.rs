@@ -7,8 +7,32 @@
 //!
 //! 수집 항목은 cpu(사용률·load 1/5/15m·코어 수), memory(usage/limit/available/utilization),
 //! swap(usage/limit/utilization), filesystem(usage/available/limit/utilization), disk i/o,
-//! network(bytes·packets·errors), process 수, uptime이다. 모든 지표를 순간값(Gauge)으로 낸다 —
-//! 우리가 계산하는 i/o·packets·errors rate도 이미 "직전 sample 이후 초당"이라 순간값 의미가 맞다.
+//! network(bytes·packets·errors), process 수, top 프로세스 RSS, uptime이다. 모든 지표를
+//! 순간값(Gauge)으로 낸다 — 우리가 계산하는 i/o·packets·errors rate도 이미 "직전 sample 이후
+//! 초당"이라 순간값 의미가 맞다.
+//!
+//! # top 프로세스 RSS의 가시 범위 (실측 결과 — 재조사하지 말 것)
+//!
+//! `aic.system.memory.top_process.usage`는 **aicd가 RSS를 읽을 수 있는 프로세스 중** 최대값이다.
+//! "시스템 전체의 최대"가 아니다. aicd는 사용자 권한(비루트)으로 도는데, 플랫폼별로 이렇게 갈린다:
+//!
+//! - **Linux: 제약 없음.** `/proc/<pid>/statm`이 world-readable이라 비루트도 다른 uid(root 포함)
+//!   프로세스의 RSS를 전부 읽는다. 실측(jw-server): root로 돌렸을 때와 `nobody`(uid 65534)로
+//!   돌렸을 때의 최대 프로세스가 동일했다(uid 0 소유 python, 1.92 GiB). zero-RSS 207개는 권한
+//!   문제가 아니라 **커널 스레드**(RSS가 실제로 0)다 — root로 돌려도 똑같이 207개다.
+//! - **macOS: 다른 uid 프로세스가 안 보인다.** RSS를 주는 `proc_pidinfo(PROC_PIDTASKINFO)`가
+//!   same-uid 또는 root를 요구해서, 실패하면 sysinfo가 **0으로 보고**한다. 실측(이 머신, 비루트):
+//!   프로세스 1085개 중 **329개(30%)가 RSS 0**이었고, 그 329개는 `user_id()`조차 못 읽는
+//!   집합과 정확히 일치했다(= 권한 실패지 진짜 0이 아니다). `ps`가 다른 uid의 RSS를 보여주는
+//!   것은 `/bin/ps`가 **setuid root**이기 때문이다(`-rwsr-xr-x root wheel`) — 비루트 바이너리에는
+//!   같은 경로가 없으므로 root 없이 정확한 전체 최대를 얻을 방법은 없다.
+//!
+//! 그래서 macOS에서는 시스템 소유(root/`_windowserver` 등) 프로세스가 진짜 최대일 경우 과소
+//! 집계된다. 이 사실을 조용히 두지 않으려고 두 가지를 한다: (1) 비루트 macOS면 시작 시 warn 로그를
+//! 한 번 남긴다, (2) 읽을 수 있는 최대가 0이면(=전부 읽기 실패) point 자체를 **생략**한다 —
+//! 0을 내보내면 "아무도 메모리를 안 쓴다"는 거짓 신호가 되기 때문이다.
+//! (참고: 이 머신에서 못 보는 것 중 가장 큰 프로세스는 `mds_stores` 375 MiB로, 보이는 최대인
+//! `OrbStack Helper` 8.6 GiB에 한참 못 미친다 — 지금은 값이 맞지만 그건 이 머신 상태의 우연이다.)
 
 use std::time::Instant;
 
@@ -65,6 +89,15 @@ impl HostSampler {
         let mut sys = System::new();
         sys.refresh_cpu_usage();
         sys.refresh_memory();
+        // 가시 범위가 좁다는 사실을 조용히 두지 않는다(모듈 doc 참고). 샘플러는 프로세스당 한 번만
+        // 생성되므로 이 warn도 한 번만 나간다 — 60초마다 로그를 더럽히지 않는다.
+        if rss_scope_is_partial() {
+            tracing::warn!(
+                "aicd가 비루트라 다른 uid 소유 프로세스의 RSS를 읽을 수 없다(macOS) — \
+                 aic.system.memory.top_process.usage는 읽을 수 있는 프로세스 중 최대값이며 \
+                 시스템 소유 프로세스가 진짜 최대이면 과소 집계된다"
+            );
+        }
         let host_name = System::host_name().unwrap_or_else(|| "unknown".to_string());
         Self {
             sys,
@@ -83,12 +116,15 @@ impl HostSampler {
     pub fn sample(&mut self) -> HostSample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        // 프로세스 수만 필요하므로 `ProcessRefreshKind::nothing()`으로 목록만 갱신한다 —
-        // cpu/메모리까지 프로세스별로 채우면 60초 주기라도 불필요하게 비싸다.
+        // 프로세스 수 + top RSS 계산에 memory()가 필요해 `.with_memory()`를 켠다. 이 머신(프로세스
+        // ~990개) 실측으로는 nothing() 8.1~15.4ms vs with_memory() 14.1~20.8ms — 차이가 프로세스당
+        // syscall 1회(`proc_pidinfo(PROC_PIDTASKINFO)`) 추가분이고, 재측정하면 순서가 뒤바뀔 만큼
+        // 회차 간 노이즈에 묻힌다. 프로세스 열거(`proc_listpids`) 자체가 이미 지배적 비용이라
+        // 60초 주기에서 유의미한 부담이 아니다.
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing(),
+            ProcessRefreshKind::nothing().with_memory(),
         );
         self.disks.refresh(false);
         self.networks.refresh(false);
@@ -105,7 +141,10 @@ impl HostSampler {
             (acc.0 + data.received(), acc.1 + data.transmitted())
         });
         let (rx_pkts, tx_pkts) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
-            (acc.0 + d.packets_received(), acc.1 + d.packets_transmitted())
+            (
+                acc.0 + d.packets_received(),
+                acc.1 + d.packets_transmitted(),
+            )
         });
         let (rx_errs, tx_errs) = self.networks.iter().fold((0u64, 0u64), |acc, (_, d)| {
             (
@@ -133,6 +172,12 @@ impl HostSampler {
         let swap_total = self.sys.total_swap();
         let load = System::load_average();
         let proc_count = self.sys.processes().len();
+        // 최대 RSS 프로세스의 값만 낸다. 이름/PID는 attr로 넣지 않는다 — 이 머신 고유 프로세스명이
+        // 623종이라 cardinality 폭탄이고, 수신측(rca-server) 읽기 경로가 전부 `WHERE host=? AND
+        // metric=?` + `avg(value)`라 attrs 필터/GROUP BY가 없어 차원을 넣으면 평균으로 뭉개진다.
+        // "범인이 누구인가"는 changes exporter의 rss_spike가 이미 다룬다.
+        // 가시 범위(비루트 macOS는 same-uid만)는 모듈 doc 참고.
+        let top_rss = top_process_rss(self.sys.processes().values().map(|p| p.memory()));
         let uptime = System::uptime();
         // filesystem은 available/limit만으로도 used를 유도할 수 있지만, 대시보드가 매번
         // 빼기를 하지 않도록 usage/utilization을 직접 낸다(디스크 full이 가장 흔한 사고 원인).
@@ -281,6 +326,16 @@ impl HostSampler {
             },
         ];
 
+        // 무차원 스칼라 1개만 낸다(불변식: 이름/PID attr 금지). 프로세스 목록이 비거나 읽을 수 있는
+        // 최대가 0이면(=전부 읽기 실패) 생략한다.
+        if let Some(rss) = top_rss {
+            points.push(MetricPoint {
+                name: "aic.system.memory.top_process.usage",
+                unit: "By",
+                value: MetricValue::Int(rss as i64),
+            });
+        }
+
         // t7: 로컬 커널 clock discipline(adjtimex, Linux 전용)에서 얻을 수 있을 때만 추가한다.
         // 네트워크로 NTP 서버에 질의하지 않는다(과설계 금지 — sntp round-trip 없음). 측정
         // 불가(비Linux, 커널이 unsync 보고 등)면 그냥 생략한다 — 이 metric만 없을 뿐 host metrics
@@ -304,6 +359,35 @@ impl HostSampler {
             points,
         }
     }
+}
+
+/// 프로세스 RSS 목록에서 `top_process.usage`로 낼 값. 순수 함수로 분리해 sysinfo 없이 픽스처로
+/// 결정적 검증을 한다.
+///
+/// `None`을 반환하는 두 경우 모두 호출부는 point를 **생략**해야 한다(`unwrap()` 금지, 불변식):
+/// 1. 프로세스 목록이 비었다.
+/// 2. 최댓값이 0이다 — 읽을 수 있는 프로세스가 하나도 없다는 뜻이다(모듈 doc의 macOS 권한 제약).
+///    0을 그대로 내보내면 "아무도 메모리를 안 쓴다"는 **거짓 신호**가 된다. 읽기 실패한 프로세스는
+///    0으로 보고되므로 max에서 자연히 무시된다 — 0이 최대라는 건 전부 실패했다는 것뿐이다.
+fn top_process_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
+    memories.into_iter().max().filter(|&v| v > 0)
+}
+
+/// aicd가 일부 프로세스의 RSS를 못 읽는 상태인가(= `top_process.usage`가 과소 집계될 수 있는가).
+///
+/// macOS에서 RSS를 주는 `proc_pidinfo(PROC_PIDTASKINFO)`는 same-uid 또는 root를 요구한다 —
+/// 비루트면 다른 uid 프로세스가 전부 0으로 보고된다(실측 근거는 모듈 doc). Linux는 `/proc/<pid>/statm`이
+/// world-readable이라 비루트도 전량 읽히므로 항상 `false`다.
+#[cfg(target_os = "macos")]
+fn rss_scope_is_partial() -> bool {
+    // SAFETY: `geteuid`는 실패하지 않고 부작용도 없다(POSIX).
+    unsafe { libc::geteuid() != 0 }
+}
+
+/// Linux 등: 권한에 의한 RSS 사각지대가 없다(모듈 doc의 jw-server 실측).
+#[cfg(not(target_os = "macos"))]
+fn rss_scope_is_partial() -> bool {
+    false
 }
 
 /// used/total 비율(0..1). total==0(측정 실패)이면 0.
@@ -345,16 +429,13 @@ mod tests {
         assert!(!sample.resource.host_name.is_empty());
         assert!(!sample.resource.os_type.is_empty());
         // host metrics 26종(cpu 5 + mem 4 + swap 3 + fs 4 + disk io 2 + net io/packets/errors 6 +
-        // process 1 + uptime 1). ntp_offset_ms는 측정 가능할 때만 27번째로 붙는다(Linux + 커널이
-        // sync 상태 보고할 때만 — 26/27 둘 다 유효하다).
+        // process 1 + uptime 1)이 항상 나가고, top_process.usage(프로세스 목록 비었을 때만 생략)와
+        // ntp_offset_ms(Linux + 커널 sync 상태일 때만)가 각각 선택적으로 붙는다 — 26~28 모두 유효.
         assert!(
-            sample.points.len() == 26 || sample.points.len() == 27,
-            "host metrics 점수는 26(ntp 미측정) 또는 27(ntp 측정됨)여야 함, got {}",
+            (26..=28).contains(&sample.points.len()),
+            "host metrics 점수는 26~28이어야 함, got {}",
             sample.points.len()
         );
-        if sample.points.len() == 27 {
-            assert_eq!(sample.points[26].name, "aic.agent.ntp_offset_ms");
-        }
         // utilization 계열은 항상 0..1 범위.
         for p in &sample.points {
             if p.name.ends_with(".utilization") {
@@ -415,6 +496,53 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn top_process_usage_is_positive_and_dimensionless() {
+        // 자기 자신이 돌고 있으므로 프로세스 목록은 항상 비어있지 않다 — process_count_and_uptime_are_plausible
+        // 과 동일 전제. AC3: top_process.usage는 0보다 크고, By 단위 스칼라 하나여야 한다(이름/PID
+        // attr 없음 — MetricPoint 자체가 attrs 필드를 두지 않으므로 구조적으로 보장됨, encode.rs 참고).
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        let found = sample
+            .points
+            .iter()
+            .find(|p| p.name == "aic.system.memory.top_process.usage");
+        let p = found.expect("프로세스 목록이 비어있지 않으므로 top_process point가 있어야 함");
+        assert_eq!(p.unit, "By");
+        match p.value {
+            MetricValue::Int(v) => assert!(v > 0, "top_process.usage가 0 이하: {v}"),
+            MetricValue::Double(_) => panic!("top_process.usage는 Int(By)여야 함"),
+        }
+    }
+
+    #[test]
+    fn top_process_rss_picks_maximum_not_average() {
+        // 순수 함수 불변식: 평균이 아니라 최댓값을 골라야 한다(수신측 avg(value)와 혼동 방지).
+        assert_eq!(top_process_rss([100u64, 300, 200]), Some(300));
+        assert_eq!(top_process_rss([50u64]), Some(50));
+    }
+
+    #[test]
+    fn top_process_rss_of_empty_process_list_is_none() {
+        // 불변식 1: 프로세스 목록이 비면 None — 호출부가 unwrap 없이 point를 생략할 수 있어야 한다.
+        assert_eq!(top_process_rss(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn top_process_rss_ignores_unreadable_zero_processes() {
+        // macOS 비루트에서 읽기 실패한 프로세스는 0으로 보고된다(모듈 doc). 0들이 섞여 있어도
+        // 최댓값은 읽을 수 있었던 프로세스에서 나와야 한다 — 0이 결과를 오염시키면 안 된다.
+        assert_eq!(top_process_rss([0u64, 0, 4096, 0, 2048]), Some(4096));
+    }
+
+    #[test]
+    fn top_process_rss_is_none_when_every_process_is_unreadable() {
+        // 전부 읽기 실패(모두 0)면 "최대 RSS가 0"이 아니라 "아는 게 없다"이다 — 0을 내보내면
+        // "아무도 메모리를 안 쓴다"는 거짓 신호가 되므로 point를 생략해야 한다.
+        assert_eq!(top_process_rss([0u64, 0, 0]), None);
+        assert_eq!(top_process_rss([0u64]), None);
     }
 
     #[test]

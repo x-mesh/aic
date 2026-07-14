@@ -17,6 +17,15 @@ pub(crate) struct SysSampler {
     disks: Disks,
     networks: Networks,
     last: Instant,
+    /// **마지막으로 cpu를 refresh한 시각** — `new()`의 기준선 refresh를 포함한다. cpu%는 직전 refresh와의
+    /// **델타**이므로, 유효성의 기준은 "몇 번째 샘플인가"가 아니라 **"직전 refresh와 얼마나 벌어졌나"**다.
+    /// `new()`가 이미 `refresh_cpu_usage()`로 기준선을 잡으므로 **첫 `sample()`도 간격만 충분하면 유효**하다
+    /// (실측: new() 후 250ms 지연한 첫 샘플 43.97% ≈ 워밍업된 샘플 47.50%, 즉시 샘플만 20.94%로 동떨어짐).
+    ///
+    /// 시각을 `last`와 따로 드는 이유: `last`(i/o delta 기준)는 sample() **끝**에 갱신되므로 그 elapsed에는
+    /// disk/net refresh 시간이 섞인다. 느린 statfs 하나면 "cpu 간격이 충분했다"고 **잘못** 판정한다 —
+    /// cpu 판정은 반드시 cpu refresh 시점끼리 재야 한다.
+    last_cpu_refresh: Instant,
     /// exporter 상태 캐시 + 마지막 조회 시각. status bar는 자주 갱신되는데 매번 aicd에 IPC를
     /// 걸 이유가 없다 — 이 값은 초 단위로만 변한다.
     exporter_cache: (ExporterState, Instant),
@@ -135,6 +144,27 @@ pub(crate) struct SysMetrics {
     /// OTLP exporter가 지금 서버에 닿고 있는지. exporter는 aicd 안에서 조용히 돌기 때문에,
     /// 이걸 보여주지 않으면 사용자는 "나가고 있다"고 믿을 뿐 확인할 방법이 없다.
     pub exporter: ExporterState,
+    /// **이 스냅샷의 `cpu_pct`를 믿어도 되는가.** cpu%는 순간값이 아니라 sysinfo가 **직전 refresh와의
+    /// 델타**로 계산하는 값이다. 따라서 유효성의 기준은 **직전 cpu refresh와의 간격**이 하나뿐이다 —
+    /// `MINIMUM_CPU_UPDATE_INTERVAL`(200ms) 미만이면 sysinfo가 값을 갱신하지 않아 직전 값이 그대로 남는다.
+    ///
+    /// 그 값은 **0이 아니다**. `SysSampler::new()` 직후 즉시 sample()하면 부팅 이후 누적 평균이 나온다
+    /// (이 머신 실측: 20.94% — 같은 시점의 실제 구간 사용률은 ~45%였다). 0이면 눈에 띄기라도 하지만
+    /// 이건 **그럴싸하게 틀린 값**이라 그대로 기록되면 아무도 눈치채지 못한다. 그래서 버려야 한다.
+    ///
+    /// "첫 샘플이냐"는 기준이 **아니다** — `new()`가 이미 `refresh_cpu_usage()`로 기준선을 잡으므로,
+    /// 간격만 충분하면 첫 샘플의 cpu도 유효하다(실측: new() 후 250ms 지연한 첫 샘플 43.97%).
+    ///
+    /// 오염 여부를 아는 유일한 지점이 sampler이므로 여기서 판정해 스냅샷에 실어 보낸다 — 소비자
+    /// (`/record now`의 지표 요약 등)는 이 값이 false면 cpu를 **버려야 한다**(0을 진짜 값인 척 보내면 안 됨).
+    /// load/mem/swap/disk는 순간값이라 첫 샘플에서도 정확하므로 이 플래그는 cpu에만 해당한다.
+    /// `Default`가 false인 것도 의도다 — 출처를 모르는 스냅샷의 cpu는 신뢰하지 않는 쪽이 안전하다.
+    pub cpu_valid: bool,
+    /// 이 스냅샷을 샘플한 시각. "지금 이 순간"을 요구하는 소비자(`/record now`)가 **캐시의 나이**를
+    /// 판정하는 데 쓴다 — status bar가 오래 갱신되지 않았다면(sampler task 정지·프롬프트에서 장시간
+    /// 대기) 그 값은 더 이상 "지금"이 아니다. `Default`가 `None`(=나이 미상)인 것도 의도다: 나이를
+    /// 모르는 스냅샷은 신선하다고 주장할 수 없다.
+    pub sampled_at: Option<Instant>,
 }
 
 /// status bar가 보여줄 exporter 상태. IPC 응답을 사람이 볼 4가지 상태로 접은 것이다.
@@ -204,6 +234,9 @@ impl SysSampler {
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
+            // 위 refresh_cpu_usage()가 델타의 **기준선**이다 — 그 시각을 기록해 둔다. 덕분에 첫 sample()도
+            // 간격만 충분하면 유효한 cpu를 낸다(첫 샘플이라고 버리지 않는다 — 멀쩡한 값을 버리는 과교정).
+            last_cpu_refresh: Instant::now(),
             // 첫 sample()에서 곧바로 조회하도록, 캐시는 만료된 상태로 시작한다.
             exporter_cache: (
                 ExporterState::Disabled,
@@ -226,11 +259,20 @@ impl SysSampler {
     pub fn sample(&mut self) -> SysMetrics {
         // 조립부에서 self를 다시 빌리지 않도록 먼저 계산해 둔다(캐시 주기 안이면 IPC 없음).
         let exporter = self.exporter_state();
+        // cpu 유효성 판정 — **refresh 직전에**, 직전 cpu refresh 시각과만 비교한다. 기준은 단 하나:
+        // 간격이 MINIMUM_CPU_UPDATE_INTERVAL(200ms) 이상인가. 미만이면 sysinfo가 값을 갱신하지 않아
+        // 직전 값이 그대로 남는다 — `new()` 직후 즉시 sample()이면 그 값은 **부팅 이후 누적 평균**이다
+        // (실측 20.94% vs 실제 구간 ~45%). 0이 아니라 "그럴싸하게 틀린" 값이라 더 위험하다.
+        // 첫 샘플이냐 아니냐는 기준이 아니다 — new()가 이미 기준선을 잡았으므로 간격만 충분하면 유효하다.
+        let cpu_valid = self.last_cpu_refresh.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
         self.sys.refresh_cpu_usage();
+        // 다음 샘플이 잴 기준점. **refresh 직후**에 찍어야 이후의 disk/net refresh 시간이 섞이지 않는다.
+        self.last_cpu_refresh = Instant::now();
         self.sys.refresh_memory();
         self.disks.refresh(false);
         self.networks.refresh(false);
-        // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
+        // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음). i/o delta 전용 — cpu 판정과는
+        // 기준이 다르다(위 참고: `last`는 sample() 끝에 갱신돼 refresh 시간까지 포함한다).
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
         let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
             let u = d.usage();
@@ -275,6 +317,8 @@ impl SysSampler {
             disk_eta: None,
             trend_spark: None,
             exporter,
+            cpu_valid,
+            sampled_at: Some(self.last),
         };
         // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
         // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
@@ -320,10 +364,10 @@ impl SysMetrics {
         let disk = self.disk_label();
         let clock = chrono::Local::now().format("%H:%M:%S").to_string();
         let line = format!(
-            "{} · load {:.2} · cpu {:.0}% · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
+            "{} · load {:.2} · {} · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
             clock,
             self.load1,
-            self.cpu_pct,
+            self.cpu_label(),
             mem_pct,
             human_bytes(self.mem_used),
             human_bytes(self.mem_total),
@@ -349,6 +393,20 @@ impl SysMetrics {
         }
     }
 
+    /// cpu 세그먼트 텍스트 — status_line·status_segments·alert_states 공용(같은 토큰 보장).
+    ///
+    /// **`cpu_valid=false`면 숫자를 보여주지 않고 `cpu --%`로 낸다.** 그 값은 0이 아니라 부팅 이후 누적
+    /// 평균이라(실측 20.94%, 같은 시점 실제 ~45%) 그럴싸하게 틀렸다 — 기록 경로에서 버리는 값을 표시
+    /// 경로에서 진짜인 척 보여줄 이유가 없다. **같은 값이 같은 이유로 거짓이다.** 첫 tick에서만 잠깐
+    /// 나타나고 다음 샘플부터 실제 숫자가 채워진다.
+    fn cpu_label(&self) -> String {
+        if self.cpu_valid {
+            format!("cpu {:.0}%", self.cpu_pct)
+        } else {
+            "cpu --%".to_string()
+        }
+    }
+
     /// disk 세그먼트 텍스트 — 여유 용량 + (있으면) 소진 ETA 접미. status_line·status_segments 공용이라
     /// 둘이 항상 같은 토큰을 보여준다(divergence 방지). 사용률 %는 macOS APFS 부정확이라 free만 쓴다.
     fn disk_label(&self) -> String {
@@ -366,7 +424,13 @@ impl SysMetrics {
         let ratio = self.load1 / self.cores.max(1) as f64;
         sev_high(ratio, LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
     }
+    /// cpu 단계 — **믿을 수 없는 값(`cpu_valid=false`)으로는 판정하지 않는다**(Normal 취급).
+    /// 그 값은 부팅 이후 누적 평균이라, 오래 바빴던 호스트에서는 그것만으로 임계를 넘겨 **첫 tick에
+    /// 거짓 경보**를 낼 수 있다(AlertTracker도 `cpu_sev`를 그대로 쓴다). 색·알림·기록이 한 판정을 공유한다.
     fn cpu_sev(&self) -> Severity {
+        if !self.cpu_valid {
+            return Severity::Normal;
+        }
         sev_high(
             self.cpu_pct as f64,
             CPU_WARN_PCT as f64,
@@ -406,7 +470,7 @@ impl SysMetrics {
         let disk = self.disk_label();
         let mut segs = vec![
             (format!("load {:.2}", self.load1), self.load_sev()),
-            (format!("cpu {:.0}%", self.cpu_pct), self.cpu_sev()),
+            (self.cpu_label(), self.cpu_sev()),
             (
                 format!(
                     "mem {:.0}% ({}/{})",
@@ -465,7 +529,7 @@ impl SysMetrics {
     fn alert_states(&self) -> [(&'static str, Severity, String); ALERT_RESOURCES] {
         [
             ("load", self.load_sev(), format!("load {:.2}", self.load1)),
-            ("cpu", self.cpu_sev(), format!("cpu {:.0}%", self.cpu_pct)),
+            ("cpu", self.cpu_sev(), self.cpu_label()),
             ("mem", self.mem_sev(), {
                 let mut s = format!(
                     "mem {:.0}% ({}/{})",
@@ -703,7 +767,10 @@ const DISK_TREND_DELTA: f64 = 64.0 * 1024.0 * 1024.0;
 #[derive(Clone, Copy)]
 struct TrendSample {
     t: Instant,
-    cpu_pct: f32,
+    /// 이 표본의 cpu% — **믿을 수 있을 때만** `Some`. 무효(`SysMetrics::cpu_valid=false`)한 값은 부팅 이후
+    /// 누적 평균이라 sparkline 막대·화살표를 그대로 오염시킨다. 표시·임계·기록 경로에서 버리는 값을
+    /// 추세 그래프에만 남길 이유가 없으므로 여기서도 배제한다(`None`은 sparkline이 건너뛴다).
+    cpu_pct: Option<f32>,
     mem_pct: f64,
     disk_avail: u64,
 }
@@ -753,7 +820,7 @@ impl TrendTracker {
         // ring push + window trim(시간 기준). armed 여부와 무관하게 쌓아 이력을 확보한다.
         self.ring.push(TrendSample {
             t: now,
-            cpu_pct: m.cpu_pct,
+            cpu_pct: m.cpu_valid.then_some(m.cpu_pct),
             mem_pct: m.mem_pct(),
             disk_avail: avail,
         });
@@ -834,8 +901,17 @@ impl TrendTracker {
         let vals: Vec<f64> = match chosen.0 {
             SEG_MEM => tail.iter().map(|s| s.mem_pct).collect(),
             SEG_DISK => tail.iter().map(|s| s.disk_avail as f64).collect(),
-            _ => tail.iter().map(|s| s.cpu_pct as f64).collect(),
+            // cpu는 무효 표본(None)을 건너뛴다 — 부팅 누적 평균이 막대·화살표를 왜곡하지 않게.
+            _ => tail
+                .iter()
+                .filter_map(|s| s.cpu_pct)
+                .map(f64::from)
+                .collect(),
         };
+        // 무효 표본을 걸러 낸 뒤 남은 점이 너무 적으면(첫 tick 직후) 아직 추세를 그리지 않는다.
+        if vals.len() < 3 {
+            return None;
+        }
         let (lo, hi, arrow_thr, flat_below) = match chosen.0 {
             SEG_DISK => {
                 let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1042,6 +1118,106 @@ mod tests {
         assert!(gate.allow("", t0)); // 빈 키는 dedup 대상 아님 — 항상 통과
     }
 
+    /// cpu 유효성의 유일한 기준은 **직전 cpu refresh와의 간격**이다. `new()` 직후 즉시 sample()하면
+    /// 간격≈0이라 sysinfo가 값을 갱신하지 않는다 → 무효(그 값은 0이 아니라 부팅 누적 평균이라 더 위험).
+    #[test]
+    fn immediate_sample_after_new_is_invalid() {
+        let mut s = SysSampler::new();
+        let m = s.sample();
+        assert!(
+            !m.cpu_valid,
+            "간격≈0인 샘플의 cpu는 갱신되지 않는다 — 무효여야 한다"
+        );
+        assert!(m.sampled_at.is_some(), "샘플 시각은 항상 기록된다");
+    }
+
+    /// **첫 샘플이라도** 간격만 충분하면 유효하다 — `new()`가 이미 기준선 refresh를 했기 때문이다.
+    /// 첫 샘플을 일괄 무효로 만들면 이 멀쩡한 값을 버리는 과교정이 된다(실측으로 확인: new() 후
+    /// 250ms 지연한 첫 샘플 43.97% vs 워밍업 샘플 47.50% — 같은 대역, 즉시 샘플만 20.94%로 이탈).
+    /// sleep은 하한만 보장하면 되므로 부하가 걸려 더 오래 자도 결론이 뒤집히지 않는다(flaky 아님).
+    #[test]
+    fn delayed_first_sample_is_valid() {
+        let mut s = SysSampler::new();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let first = s.sample();
+        assert!(
+            first.cpu_valid,
+            "new()가 기준선을 잡으므로, 간격({:?})을 채운 첫 샘플의 cpu는 유효해야 한다",
+            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL
+        );
+    }
+
+    /// 워밍업된 뒤에도 간격이 200ms 미만인 재샘플은 값이 갱신되지 않으므로 무효.
+    #[test]
+    fn resample_within_min_interval_is_invalid() {
+        let mut s = SysSampler::new();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let first = s.sample();
+        assert!(first.cpu_valid); // 여기까진 유효
+        let immediate = s.sample(); // 간격 ≈ 0
+        assert!(
+            !immediate.cpu_valid,
+            "MINIMUM_CPU_UPDATE_INTERVAL 안의 재샘플은 값이 갱신되지 않는다 — 무효여야 한다"
+        );
+    }
+
+    /// 무효 cpu는 **표시 경로에서도** 숫자를 내지 않는다 — 기록 경로에서 버리는 값을 화면에서만
+    /// 진짜인 척 보여줄 이유가 없다(같은 값이 같은 이유로 거짓이다). status_line·status_segments가
+    /// 같은 토큰(`cpu --%`)을 쓰는지도 함께 확인한다.
+    #[test]
+    fn invalid_cpu_is_rendered_as_unknown_not_a_number() {
+        let m = SysMetrics {
+            cpu_pct: 20.94, // 부팅 이후 누적 평균(실측) — 그럴싸하지만 거짓
+            cpu_valid: false,
+            cores: 8,
+            ..Default::default()
+        };
+        let line = m.status_line();
+        assert!(line.contains("cpu --%"), "{line}");
+        assert!(
+            !line.contains("cpu 21%"),
+            "거짓 숫자를 표시하면 안 된다: {line}"
+        );
+        let seg = m
+            .status_segments()
+            .into_iter()
+            .find(|(label, _)| label.starts_with("cpu"))
+            .expect("cpu 세그먼트");
+        assert_eq!(seg.0, "cpu --%", "status_line과 같은 토큰이어야 한다");
+    }
+
+    /// 무효 cpu로는 **임계 판정도 하지 않는다**(Normal). 부팅 누적 평균이 높은 호스트에서 첫 tick에
+    /// 거짓 경보가 나가는 것을 막는다 — AlertTracker가 `cpu_sev`를 그대로 쓰기 때문이다.
+    #[test]
+    fn invalid_cpu_never_triggers_severity_or_alert() {
+        let m = SysMetrics {
+            cpu_pct: 99.0, // 유효했다면 Crit이었을 값
+            cpu_valid: false,
+            cores: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            m.cpu_sev(),
+            Severity::Normal,
+            "믿을 수 없는 값으로 판정하지 않는다"
+        );
+        // AlertTracker도 같은 판정을 공유하므로 첫 관찰에서 cpu 알림이 나오지 않는다.
+        let mut tracker = AlertTracker::new();
+        let alerts = tracker.observe(&m, Instant::now());
+        assert!(
+            !alerts.iter().any(|a| a.message.contains("cpu")),
+            "무효 cpu로 경보를 내면 안 된다"
+        );
+    }
+
+    /// `Default`의 안전 기본값 — 출처를 모르는 스냅샷은 cpu를 신뢰하지 않고(false), 나이도 모른다(None).
+    #[test]
+    fn default_metrics_are_untrusted() {
+        let m = SysMetrics::default();
+        assert!(!m.cpu_valid);
+        assert!(m.sampled_at.is_none());
+    }
+
     #[test]
     fn human_bytes_scales() {
         assert_eq!(human_bytes(512), "512B");
@@ -1067,6 +1243,7 @@ mod tests {
             disk_write_bps: 512 * 1024,
             net_rx_bps: 3 * 1024 * 1024,
             net_tx_bps: 256 * 1024,
+            cpu_valid: true, // 워밍업된 실제 샘플 — 숫자가 표시돼야 한다
             ..Default::default()
         };
         let line = m.status_line();
@@ -1105,8 +1282,8 @@ mod tests {
         assert!(line.contains("disk n/a"), "{line}");
     }
 
-    // 테스트 픽스처 빌더 — `SysMetrics`의 필드를 그대로 나열하는 게 목적이라 인자가 많다.
-    // 여기서 struct로 묶으면 "무엇을 조합해 넣었는지"가 호출부에서 오히려 안 보인다.
+    // 테스트 전용 헬퍼 — 필드를 다 실어 나르다 보니 인자가 많다. 로직이 아니라
+    // 시그니처만의 문제라 clippy 임계치(7)만 넘어서므로 allow로 표시한다.
     #[allow(clippy::too_many_arguments)]
     fn metric(
         load1: f64,
@@ -1129,6 +1306,9 @@ mod tests {
             swap_total,
             disk_avail,
             disk_total,
+            // 이 헬퍼가 흉내 내는 것은 **워밍업된 실제 샘플**이다 — cpu 숫자·임계·sparkline을 검증하려면
+            // 그 cpu가 유효해야 한다(무효 스냅샷의 cpu는 표시도 판정도 되지 않는 게 계약이다).
+            cpu_valid: true,
             ..Default::default()
         }
     }
@@ -1484,6 +1664,33 @@ mod tests {
         assert_eq!(trend_arrow(10.0, 20.0, 3.0), '↑');
         assert_eq!(trend_arrow(20.0, 10.0, 3.0), '↓');
         assert_eq!(trend_arrow(10.0, 11.0, 3.0), '→'); // 임계 이하 변화는 정체.
+    }
+
+    /// sparkline ring도 무효 cpu 표본을 배제한다 — 부팅 누적 평균이 막대·화살표를 왜곡하지 않게.
+    /// 표시·임계·기록에서 버리는 값을 추세 그래프에만 남길 이유가 없다(같은 값, 같은 이유).
+    #[test]
+    fn sparkline_skips_invalid_cpu_samples() {
+        let t0 = Instant::now();
+        let g = 1024 * 1024 * 1024;
+        let mut tr = TrendTracker::new();
+        // 무효 cpu 표본만 5개 — cpu 유효 표본이 3개 미만이라 cpu sparkline은 그려지지 않는다.
+        let mut spark = None;
+        for i in 0..5u64 {
+            let mut m = metric(1.0, 20.94, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            m.cpu_valid = false;
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        assert!(
+            spark.is_none(),
+            "무효 cpu 표본만으로는 cpu sparkline을 그리지 않는다"
+        );
+        // 유효 표본이 3개 쌓이면 그때부터 그린다.
+        for i in 5..8u64 {
+            let m = metric(1.0, 50.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+            spark = tr.observe(t0 + Duration::from_secs(i * 2), &m).1;
+        }
+        let (idx, _) = spark.expect("유효 표본 3개 이후엔 sparkline이 나온다");
+        assert_eq!(idx, SEG_CPU);
     }
 
     #[test]
