@@ -2040,6 +2040,11 @@ fn handle_snapshot_capture(kind: &str, force: bool) -> anyhow::Result<()> {
 /// spawn_blocking pool 스레드를 영구 pin)을 다시 불러들이는 일이라 하지 않는다. host metrics는
 /// 이미 aicd가 주기 전송하므로 ts로 조인하면 그 시점 지표는 서버에 있다 — session.rs
 /// `record_metrics_summary` 문서 참고.
+///
+/// **여기서는 sync IPC를 쓴다**(chat은 async 판을 쓴다). `#[tokio::main]` 안이긴 하지만 이건
+/// one-shot CLI라 이 작업 말고 스케줄될 게 없다 — 막을 다른 task가 없으니 worker 점유가 무의미하고,
+/// 바로 위 `capture_forced`(probe 수 초)부터가 이미 sync다. async로 바꾸는 건 이득 없이 경로만
+/// 늘린다.
 fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
     match aic_client::agent::snapshot_capture::capture_forced("manual") {
         Ok(Some(path)) => {
@@ -2057,10 +2062,13 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
     let mut attrs = std::collections::BTreeMap::new();
     attrs.insert("note_source".to_string(), "cli".to_string());
     let sent = aic_client::agent_event::snapshot_recorded(memo, attrs);
-    if sent && aic_client::agent_event::exporter_status().is_none() {
-        eprintln!(
-            "{COL_DIM}OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.{COL_RESET}"
-        );
+    // 보낸 이벤트가 원격까지 갈 수 있는 상태인지 확인해 안내한다 — aicd 미실행뿐 아니라 **exporter가
+    // 꺼진 경우도** 알린다(그땐 aicd가 응답해 성공처럼 보이지만 이벤트는 구독자가 없어 조용히
+    // 버려진다). 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
+    if sent {
+        if let Some(notice) = aic_client::agent_event::remote_record_state().notice() {
+            eprintln!("{COL_DIM}{notice}{COL_RESET}");
+        }
     }
     Ok(())
 }
