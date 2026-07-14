@@ -2059,6 +2059,14 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
     // main은 출력과 exit code만 담당한다.
     let report = aic_client::agent::session::record_now_cli(memo);
 
+    // 빈/공백 메모는 저장·전송을 모두 생략했다(빈 메모로 부르는 건 사용자 오류). 사용자가 "기록했다"고
+    // 오해하지 않도록 명확히 알리고 exit 1로 표면화한다 — 조용히 exit 0을 내면 스크립트가 성공으로 본다.
+    if report.empty_memo {
+        return Err(anyhow::anyhow!(
+            "메모가 비어 있어(공백/제어문자뿐) 아무것도 기록하지 않았습니다 — `--memo`에 내용을 담아 주세요."
+        ));
+    }
+
     if report.truncated {
         eprintln!(
             "{COL_YELLOW}!{COL_RESET} {}",
@@ -2073,8 +2081,7 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
     // 여기서도 찍으면 **같은 에러가 stderr에 두 번** 나온다.
 
     // 로컬/원격 두 결과를 각각 사실대로 보고한다. 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
-    if let Some(notice) =
-        aic_client::agent::session::record_remote_notice(local_ok, report.remote)
+    if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, report.remote)
     {
         eprintln!("{COL_DIM}{notice}{COL_RESET}");
     }

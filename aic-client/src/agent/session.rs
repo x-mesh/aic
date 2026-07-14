@@ -2409,35 +2409,49 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
 /// 테스트를 지나간다**. main.rs는 이 결과를 출력하고 exit code를 정하는 일만 한다.
 pub struct RecordNowReport {
     /// 로컬 스냅샷 캡처 결과(메모는 이 레코드 **안에** 저장된다).
+    ///
+    /// 메모가 비어(공백/제어문자뿐) 아무것도 하지 않은 경우(`empty_memo == true`)는 `Ok(None)`이다 —
+    /// "캡처했는데 경로가 없다"가 아니라 "애초에 캡처하지 않았다"를 뜻한다. 둘의 구분은 `empty_memo`가 진다.
     pub local: anyhow::Result<Option<std::path::PathBuf>>,
     /// 메모가 상한을 넘겨 잘렸는가(사용자에게 알려야 한다).
     pub truncated: bool,
     /// 원격 전송의 **사후 결과**. 메모가 비어(F15) 보내지 않았으면 `None`.
     pub remote: Option<crate::agent_event::RecordOutcome>,
+    /// 메모가 비어 있어 **저장·전송을 모두 생략**했는가. 빈 메모로 `record`를 부르는 건 사용자 오류라
+    /// 조용히 스냅샷만 남기지 않는다(CLI doc의 "빈/공백이면 저장·전송 모두 생략" 약속과 일치). 호출부는
+    /// 이때 경고하고 exit 1로 표면화한다.
+    pub empty_memo: bool,
 }
 
 /// [`RecordNowReport`] 참고. chat `handle_record`와 **같은 규약**을 따른다: 메모는 한 번만 정제해
 /// 로컬 저장과 원격 전송이 그 하나를 공유하고, 로컬 캡처가 실패해도 메모는 보낸다.
 pub fn record_now_cli(raw_memo: &str) -> RecordNowReport {
-    let memo = crate::agent_event::Memo::sanitize(raw_memo);
+    let Some(memo) = crate::agent_event::Memo::sanitize(raw_memo) else {
+        // 메모가 공백/제어문자뿐이다. `record`는 메모 전용 leaf(순수 캡처는 `snapshot capture`)라,
+        // 빈 메모로 부르는 건 사용자 오류다. 조용히 스냅샷만 남기면 doc("빈/공백이면 저장·전송 모두
+        // 생략")과 어긋나고 사용자가 의도하지 않은 레코드가 생긴다 — 아무것도 하지 않고 표면화한다.
+        return RecordNowReport {
+            local: Ok(None),
+            truncated: false,
+            remote: None,
+            empty_memo: true,
+        };
+    };
 
     // 메모는 스냅샷 레코드 안에 저장된다 — 이게 본체다(원격은 부가 경로).
-    let local = crate::agent::snapshot_capture::capture_forced_with_memo(
-        "manual",
-        memo.as_ref().map(|m| m.text()),
-    );
+    let local =
+        crate::agent::snapshot_capture::capture_forced_with_memo("manual", Some(memo.text()));
 
     // 로컬 실패와 무관하게 보낸다(디스크가 꽉 찬 장애야말로 그 관찰이 가장 필요한 순간이다).
-    let remote = memo.as_ref().map(|m| {
-        let mut attrs = BTreeMap::new();
-        attrs.insert("note_source".to_string(), "cli".to_string());
-        crate::agent_event::snapshot_recorded(m, attrs)
-    });
+    let mut attrs = BTreeMap::new();
+    attrs.insert("note_source".to_string(), "cli".to_string());
+    let remote = Some(crate::agent_event::snapshot_recorded(&memo, attrs));
 
     RecordNowReport {
         local,
-        truncated: memo.is_some_and(|m| m.truncated()),
+        truncated: memo.truncated(),
         remote,
+        empty_memo: false,
     }
 }
 
@@ -3880,5 +3894,37 @@ mod tests {
         // 200자 cap + 말줄임 → 원문 500자가 그대로 들어가지 않는다.
         assert!(!preview.contains(&long));
         assert!(preview.contains('…'));
+    }
+
+    /// 빈/공백/제어문자뿐인 메모는 **저장도 전송도 하지 않는다**(CLI doc의 약속). 빈 메모로
+    /// `record`를 부르는 건 사용자 오류라, 조용히 스냅샷만 남기지 않는다.
+    ///
+    /// 이 경로는 `capture_forced_with_memo`를 **부르지 않으므로** store/파일시스템과 무관하게 순수하다 —
+    /// 그래서 이 머신에 무엇이 있든 결정적이다(테스트가 머신 상태에 의존하지 않는다).
+    #[test]
+    fn record_now_cli_on_empty_memo_stores_and_sends_nothing() {
+        // sanitize는 제어문자만 거른다(ANSI 페이로드 `[0m`은 일반 문자라 살아남는다 — 여기선
+        // "제어문자·공백뿐이라 정말로 비는" 입력만 쓴다). ESC/BEL/NUL은 전부 제어문자다.
+        for raw in ["", "   ", "\t\t", "\n \n", "\u{1b}\u{7}\u{0}", "\u{1b} \u{7}"] {
+            let report = record_now_cli(raw);
+            assert!(
+                report.empty_memo,
+                "빈 메모({raw:?})는 empty_memo=true여야 한다"
+            );
+            // 캡처를 애초에 안 했다 = Ok(None). "캡처했는데 경로가 없다"가 아니다.
+            assert!(
+                matches!(report.local, Ok(None)),
+                "빈 메모({raw:?})는 로컬 캡처를 생략해야 한다(Ok(None))"
+            );
+            assert!(
+                report.remote.is_none(),
+                "빈 메모({raw:?})는 원격 전송을 생략해야 한다"
+            );
+            assert!(!report.truncated, "빈 메모({raw:?})는 잘릴 것이 없다");
+        }
+        // mutation 가드: 빈 메모 가드를 없애면 `capture_forced_with_memo`가 불려 `local`이
+        // `Ok(Some(_))`이 되므로 위 `Ok(None)` 단언이 깨진다 — 이 테스트는 공허하지 않다.
+        // 반대 방향("비지 않은 메모가 생략된다")은 실제 메모를 흘리는 기존 테스트들이 이미 커버하고,
+        // 여기서 재현하면 store append로 파일시스템을 오염시키므로 넣지 않는다.
     }
 }

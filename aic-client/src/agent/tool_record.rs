@@ -146,7 +146,7 @@ fn head_lines(s: &str, n: usize) -> String {
 }
 
 /// UTF-8 경계에서 최대 `max` 바이트로 자른다. (잘림 여부, 결과).
-/// `agent_event::sanitize_memo`(F16: `/record now` 메모 절단)가 UTF-8 경계 보존 절단을 재사용한다.
+/// `agent_event::Memo::sanitize`(F16: `/record now` 메모 절단)가 UTF-8 경계 보존 절단을 재사용한다.
 pub(crate) fn cap_str(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
