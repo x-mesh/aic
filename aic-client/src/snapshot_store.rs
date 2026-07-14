@@ -165,14 +165,71 @@ pub fn env_enabled(var: &str) -> bool {
 }
 
 /// 영구 스냅샷 기록 opt-in(`AIC_SNAPSHOT_RECORD`). 기본 off.
+///
+/// 테스트는 env 대신 [`test_store`]의 주입값을 쓴다(2024 UB 회피 — [`snapshots_dir`] 참고).
 pub fn record_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_store::override_recording() {
+        return v;
+    }
     env_enabled("AIC_SNAPSHOT_RECORD")
 }
 
 /// `~/.aic/snapshots` 디렉터리(rca `incidents_dir`와 동형).
+///
+/// **테스트에서는 env(`HOME`)를 만지지 않고 [`test_store`]의 주입값을 쓴다** — `set_var("HOME")`은
+/// Rust 2024에서 unsafe(다른 스레드가 env를 읽는 동안 쓰면 data race)라, HOME을 바꿔 store를
+/// 격리하던 방식은 UB의 씨앗이었다. 주입은 프로세스 전역 상태(env) 대신 내부 값을 쓰므로 그 race가
+/// 없다. 프로덕션(`cfg(not(test))`)에는 이 분기가 아예 컴파일되지 않아 비용 0이다.
 pub fn snapshots_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = test_store::override_dir() {
+        return dir;
+    }
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".aic").join("snapshots")
+}
+
+/// 테스트가 store를 **주입으로 격리**하는 하네스 — env를 만지지 않는다(2024 UB 회피).
+///
+/// snapshots dir과 opt-in 플래그(`AIC_SNAPSHOT_RECORD` 대체) 두 축을 프로세스 전역 값으로 들고,
+/// [`snapshots_dir`]/[`record_enabled`]가 프로덕션 경로 대신 이 값을 참조한다. **thread-local이 아니라
+/// 전역인 이유**: chat `/record now`의 캡처는 `spawn_blocking`으로 다른 스레드에서 도는데, 그 스레드도
+/// 같은 override를 봐야 하기 때문이다(thread-local이면 못 본다). 전역이라 병렬 테스트끼리는 겹치므로
+/// [`home_test_lock`]으로 직렬화한다 — 예전 HomeGuard와 같은 직렬화이되, **공유하는 게 env가 아니라
+/// 내부 PathBuf/bool이라 data race가 없다**.
+#[cfg(test)]
+pub(crate) mod test_store {
+    use super::PathBuf;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Override {
+        dir: Option<PathBuf>,
+        /// `Some(v)`면 `record_enabled()`가 env 대신 `v`를 쓴다. `None`이면 기본(off).
+        recording: Option<bool>,
+    }
+    static OVERRIDE: Mutex<Override> = Mutex::new(Override {
+        dir: None,
+        recording: None,
+    });
+
+    fn lock() -> std::sync::MutexGuard<'static, Override> {
+        OVERRIDE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn override_dir() -> Option<PathBuf> {
+        lock().dir.clone()
+    }
+    pub(crate) fn override_recording() -> Option<bool> {
+        lock().recording
+    }
+    pub(crate) fn set_dir(dir: Option<PathBuf>) {
+        lock().dir = dir;
+    }
+    pub(crate) fn set_recording(v: Option<bool>) {
+        lock().recording = v;
+    }
 }
 
 /// append 임계구역 직렬화용 프로세스 전역 락. L1 이상-트리거 캡처는 `spawn_blocking` 스레드에서, /compare·
@@ -358,53 +415,62 @@ fn secure_file(path: &Path) {
     }
 }
 
-/// HOME env를 만지는 테스트(snapshot_store + snapshot_capture)가 공유하는 **프로세스 전역** 직렬화 락.
-/// 모듈마다 별도 OnceLock을 두면 `cargo test snapshot`처럼 두 모듈만 돌릴 때 서로의 HOME을 덮어 store가
-/// 오염되고 PoisonError가 연쇄된다 — 하나의 락으로 통일한다.
+/// store를 주입으로 격리하는 테스트들(snapshot_store + snapshot_capture + session)이 공유하는
+/// **프로세스 전역** 직렬화 락. override(dir/recording)가 전역이라 병렬 테스트끼리 겹치므로 하나의
+/// 락으로 직렬화한다(모듈별 별도 락이면 서로의 override를 덮어 오염된다).
 #[cfg(test)]
 pub(crate) fn home_test_lock() -> &'static std::sync::Mutex<()> {
-    static HOME_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    HOME_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    static STORE_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    STORE_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// **env를 만지지 않고** store를 tempdir로 격리하는 RAII 가드 — 예전 `HomeGuard`(HOME set_var)를
+/// 대체한다. 락을 잡아 병렬 테스트를 직렬화하고, [`test_store`] override를 세팅하며, drop 시 되돌린다.
+/// snapshot_store·snapshot_capture·session 테스트가 공유한다(한 곳에 두어 세 모듈이 같은 격리를 쓴다).
+#[cfg(test)]
+pub(crate) struct TestStore {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl TestStore {
+    /// 격리를 연다(기록 opt-in은 기본 off — `record_enabled()`가 false). 락은 이 가드 수명 동안 유지.
+    pub(crate) fn new() -> Self {
+        // poison 회복: 직전 테스트가 락 든 채 패닉해도 다음 테스트가 진행되게.
+        let lock = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        test_store::set_dir(Some(dir.path().to_path_buf()));
+        // **`None`이 아니라 `Some(false)`** — None이면 `record_enabled()`가 실 env(AIC_SNAPSHOT_RECORD)로
+        // 떨어져 테스트가 개발 머신/CI의 ambient env에 의존한다. 기본을 명시적 off로 못 박는다.
+        test_store::set_recording(Some(false));
+        Self {
+            _lock: lock,
+            _dir: dir,
+        }
+    }
+
+    /// 이 테스트 동안 `AIC_SNAPSHOT_RECORD` opt-in을 켜고/끈다(env 대신 주입). 예전엔 여기서
+    /// `set_var("AIC_SNAPSHOT_RECORD", ...)`를 했다.
+    pub(crate) fn set_recording(&self, on: bool) {
+        test_store::set_recording(Some(on));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestStore {
+    fn drop(&mut self) {
+        // 전역 override를 원상복구(다음 테스트가 프로덕션 기본을 보게).
+        test_store::set_dir(None);
+        test_store::set_recording(None);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::MutexGuard;
-    use tempfile::TempDir;
 
-    /// HOME을 임시 디렉터리로 바꿔 store를 격리하고, env 경합을 직렬화한다(rca.rs 패턴).
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
-        _dir: TempDir,
-    }
-    impl HomeGuard {
-        fn set() -> Self {
-            // poison 회복: 직전 테스트가 락 든 채 패닉해도 다음 테스트가 진행되게.
-            let lock = home_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new().unwrap();
-            let prev = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", dir.path());
-            }
-            Self {
-                prev,
-                _lock: lock,
-                _dir: dir,
-            }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
+    // 격리는 이제 `TestStore`(env 미접촉)가 담당한다 — 예전 HomeGuard(HOME set_var)를 대체했다.
 
     fn rec(kind: &str, body: &str, secs: i64) -> SnapshotRecord {
         let now = DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap();
@@ -446,7 +512,7 @@ mod tests {
 
     #[test]
     fn append_load_roundtrip_and_sections() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         append_snapshot(&rec(
             "local",
             "## host\nmyhost\n## disk\n/dev/sda1 90% /\n",
@@ -466,7 +532,7 @@ mod tests {
 
     #[test]
     fn loads_in_captured_at_order_regardless_of_append_order() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         append_snapshot(&rec("a", "## x\n1\n", 20)).unwrap();
         append_snapshot(&rec("b", "## x\n2\n", 5)).unwrap();
         append_snapshot(&rec("c", "## x\n3\n", 10)).unwrap();
@@ -480,7 +546,7 @@ mod tests {
 
     #[test]
     fn retention_head_trims_to_max() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         for i in 0..(MAX_SNAPSHOTS as i64 + 5) {
             append_snapshot(&rec("k", "## x\nv\n", i)).unwrap();
         }
@@ -498,7 +564,7 @@ mod tests {
         // L1 회귀: 캡처(spawn_blocking)와 /compare(세션 task)가 같은 프로세스에서 동시에 append할 수 있다.
         // 파일이 MAX를 넘은 상태의 동시 append는 각자 trim(read-all→rename)을 돌려, 직렬화가 없으면 한 쪽
         // 쓰기가 다른 쪽 rename에 덮여 유실된다. append_lock이 이를 막는지(모든 동시 쓰기 보존) 검증한다.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         for i in 0..(MAX_SNAPSHOTS as i64) {
             // 파일을 MAX로 채워 이후 append마다 trim이 발생하게 한다(rename 경쟁 윈도우 노출).
             append_snapshot(&rec("seed", "## x\nv\n", i)).unwrap();
@@ -527,7 +593,7 @@ mod tests {
         // L2: append가 cross-process lockfile(.lock)을 만들고, 그 파일이 store 데이터(load/trim)에 섞이지
         // 않으며, 락이 있어도 후속 append가 정상 동작(재진입 가능)함을 확인한다.
         use std::os::unix::fs::PermissionsExt;
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         append_snapshot(&rec("a", "## x\n1\n", 0)).unwrap();
         let lock_path = snapshots_dir().join(LOCKFILE);
         assert!(lock_path.exists(), "lockfile 미생성");
@@ -552,7 +618,7 @@ mod tests {
         // 완료 → 테스트 실패). unix flock은 cross-OFD를 同프로세스에서도 상호배제한다.
         use std::sync::mpsc;
         use std::time::Duration;
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let dir = snapshots_dir();
         fs::create_dir_all(&dir).unwrap();
         // append_snapshot의 cross_process_guard와 동일한 .lock을 **별도 OFD**로 미리 잡는다.
@@ -586,7 +652,7 @@ mod tests {
     fn old_records_without_memo_field_still_load() {
         // 하위 호환: 기존 레코드엔 `memo` 필드가 없다. 그 줄이 파싱 실패로 통째 유실되면(load가
         // 깨진 라인을 건너뛰므로) 과거 스냅샷이 조용히 사라진다 — `#[serde(default)]`로 None이 된다.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         fs::create_dir_all(snapshots_dir()).unwrap();
         let path = snapshots_dir().join(SNAPSHOTS_FILE);
         // 구버전 aic가 쓴 레코드 — `memo` 키가 **아예 없다**(있는데 null인 것과 다르다).
@@ -658,7 +724,7 @@ mod tests {
 
     #[test]
     fn body_redaction_masks_secrets() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         append_snapshot(&rec("local", "## net\nbind 10.1.2.3:8080\n", 0)).unwrap();
         let body = &load_snapshots().unwrap()[0].body;
         assert!(!body.contains("10.1.2.3"), "IPv4 미마스킹: {body}");
@@ -668,7 +734,7 @@ mod tests {
     #[test]
     fn stored_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         append_snapshot(&rec("local", "## x\n1\n", 0)).unwrap();
         let path = snapshots_dir().join(SNAPSHOTS_FILE);
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -689,24 +755,24 @@ mod tests {
     }
 
     #[test]
-    fn record_enabled_reads_the_snapshot_record_var() {
-        // `record_enabled`가 **어느 env를 보는지**(배선)만 최소로 확인한다 — 값 파싱 계약은 위
-        // 순수 테스트가 다 덮으므로, 여기선 딱 한 번의 env 왕복(HOME 락으로 직렬화·unsafe 래핑)이면
-        // 충분하다. 값 열거 루프를 env로 돌리던 예전 버전을 순수 테스트로 옮겨 UB 표면을 줄였다.
-        let _h = HomeGuard::set();
-        unsafe {
-            std::env::set_var("AIC_SNAPSHOT_RECORD", "1");
-        }
-        assert!(record_enabled(), "AIC_SNAPSHOT_RECORD=1인데 off로 본다");
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
-        }
-        assert!(!record_enabled(), "미설정 기본은 off");
+    fn record_enabled_defaults_off_and_follows_injection() {
+        // opt-in 게이트를 **env 없이** 검증한다(2024 UB 회피). 값 파싱 계약은 순수
+        // `enabled_value_parser_contract`가, env 배선(어느 var를 읽는지)은 프로덕션 경로가 담당하고
+        // `record_enabled`/`env_enabled` doc에 못 박혀 있다 — 여기선 게이트 동작만 결정적으로 본다.
+        let h = TestStore::new();
+        assert!(
+            !record_enabled(),
+            "TestStore 기본은 off(실 env에 의존하지 않는다)"
+        );
+        h.set_recording(true);
+        assert!(record_enabled(), "주입 on이면 record_enabled도 on");
+        h.set_recording(false);
+        assert!(!record_enabled(), "주입 off면 off");
     }
 
     #[test]
     fn torn_tail_does_not_eat_next_record() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         // 직전 append가 개행 없이 끊긴 상황 모사: 깨진 fragment를 직접 쓴다.
         fs::create_dir_all(snapshots_dir()).unwrap();
         let path = snapshots_dir().join(SNAPSHOTS_FILE);
@@ -720,7 +786,7 @@ mod tests {
 
     #[test]
     fn trim_self_heals_corruption_keeping_valid_records() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         fs::create_dir_all(snapshots_dir()).unwrap();
         let path = snapshots_dir().join(SNAPSHOTS_FILE);
         // 깨진 라인을 MAX개 미리 심어 budget을 잠식시킨다.
@@ -744,7 +810,7 @@ mod tests {
 
     #[test]
     fn cwd_and_host_redacted_at_write() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         // host/cwd에 redaction이 잡는 패턴(IPv4) → 저장된 값이 마스킹돼야(body와 동일 보장).
         let r = SnapshotRecord::new(

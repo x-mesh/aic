@@ -2502,9 +2502,14 @@ pub fn record_remote_notice(
         // 원격은 부가 경로이므로, 원격에 문제가 있어도 "메모 자체는 남았다"는 안심 사실을 함께 준다.
         // 예전엔 메모를 로컬에 저장조차 하지 않아서 원격 실패가 곧 유실이었다 — 이제는 아니다.
         (true, _) => remote_note.map(|n| format!("ℹ {n} (메모는 로컬 스냅샷에 저장됐습니다.)")),
-        // 로컬 실패 + 원격 도달 — 메모는 원격에만 있다. "아무것도 안 남았다"는 오해를 막는다.
+        // 로컬 실패 + 원격 "도달 경로에 올랐다". **여기서 "원격에만 남습니다"라고 단정하면
+        // 안 된다** — `Reaches`가 보장하는 건 "aicd가 받아들였고 구독자가 있다"까지이지 "서버가
+        // 갖고 있다"가 아니다(버스 lossy + collector push 비동기, `RemoteVerdict::Reaches` doc의
+        // 천장). 로컬이라는 확실한 사본이 사라진 상황이라 **더더욱** 원격을 과신시키면 안 된다 —
+        // 유일하게 남았을지 모르는 사본이 실은 보장되지 않는다는 걸 알린다. 그래서 ⚠(ℹ 아님).
         (false, RemoteVerdict::Reaches) => Some(format!(
-            "ℹ {}로컬 스냅샷 저장은 실패해, 이 메모는 원격에만 남습니다.",
+            "⚠ {}로컬 스냅샷 저장은 실패했습니다. 메모는 aicd가 받았지만 서버 반영은 비동기라 \
+             보장되지 않으니, 남았는지 확인이 필요합니다.",
             remote_note.map(|n| format!("{n} ")).unwrap_or_default()
         )),
         // 로컬 실패 + 원격 불확실 — 어느 쪽도 보장할 수 없다. 얼버무리지 않는다.
@@ -3206,38 +3211,10 @@ mod tests {
         (session, dir)
     }
 
-    /// HOME을 임시 디렉터리로 돌려 스냅샷 store를 격리한다(snapshot_store와 **같은** 프로세스 전역
-    /// 락을 공유 — 별도 락이면 두 모듈이 HOME을 서로 덮는다).
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-    }
-    impl HomeGuard {
-        fn set() -> Self {
-            let lock = crate::snapshot_store::home_test_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let dir = tempfile::tempdir().unwrap();
-            let prev = std::env::var_os("HOME");
-            unsafe { std::env::set_var("HOME", dir.path()) };
-            Self {
-                prev,
-                _lock: lock,
-                _dir: dir,
-            }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
+    // 스냅샷 store 격리는 `crate::snapshot_store::TestStore`가 담당한다 — **env를 만지지 않는다**
+    // (예전엔 여기 HomeGuard가 HOME set_var로 격리했는데, 2024에서 그건 UB다). chat 캡처가
+    // spawn_blocking으로 다른 스레드에서 돌아도 전역 override라 그 스레드가 같은 tempdir을 본다.
+    use crate::snapshot_store::TestStore;
 
     /// sink를 비우며 **우리 이벤트**(`snapshot.recorded`)만 골라 온다. 캡처는 probe를 돌리며
     /// `tool.run_command` 이벤트도 함께 내보내므로, 개수로 세면 그 노이즈에 걸린다.
@@ -3256,7 +3233,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_record_now_puts_truncation_flag_on_the_real_event() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
 
         let (mut session, _dir) = test_session();
@@ -3284,7 +3261,7 @@ mod tests {
 
     #[test]
     fn cli_record_now_puts_truncation_flag_on_the_real_event() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
 
         let oversized = "가".repeat(1_000_000);
@@ -3316,7 +3293,7 @@ mod tests {
     #[test]
     fn cli_short_memo_carries_no_truncation_flag() {
         // 항상 붙이면 의미가 없다 — 짧은 메모에는 표시가 없어야 한다.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
 
         let report = record_now_cli("디스크가 이상하다");
@@ -3359,7 +3336,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_record_now_surfaces_emptied_memo_but_still_captures() {
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
         let (mut session, _dir, mut rx) = test_session_capturing_notes();
 
@@ -3389,7 +3366,7 @@ mod tests {
     #[tokio::test]
     async fn chat_bare_record_now_does_not_warn_about_empty_memo() {
         // `/record now`(메모 없이)는 정당한 순수 캡처다 — 빈-메모 경고를 내면 안 된다(오경고).
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
         let (mut session, _dir, mut rx) = test_session_capturing_notes();
 
@@ -3407,7 +3384,7 @@ mod tests {
     #[tokio::test]
     async fn chat_real_memo_does_not_warn_and_stores_it() {
         // 대칭 확인: 진짜 메모는 경고 없이 로컬 저장 + 원격 발화.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let _ = crate::agent_event::test_sink::drain();
         let (mut session, _dir, mut rx) = test_session_capturing_notes();
 
@@ -3665,13 +3642,20 @@ mod tests {
     }
 
     #[test]
-    fn record_notice_tells_user_memo_survived_when_only_local_failed() {
+    fn record_notice_does_not_overclaim_remote_safety_when_only_local_failed() {
         use crate::agent_event::RecordOutcome;
-        // 로컬만 실패 + 원격 정상 — 메모는 살아있다는 걸 알려야 "아무것도 안 남았다"는 오해를 막는다.
+        // 로컬 실패 + 원격 Reaches. `Reaches`는 "aicd 수용 + 구독자 존재"까지이지 "서버가 갖고
+        // 있다"가 아니다(6차에 직접 세운 천장). 로컬이라는 확실한 사본이 사라진 상황에서 "원격에만
+        // 남습니다"라고 단정하면 유일 사본을 과신시킨다 — 보장되지 않는다는 걸 알려야 한다.
         let n = record_remote_notice(false, Some(RecordOutcome::Delivered { backlog: 0 }))
             .expect("안내가 있어야");
-        assert!(n.contains("원격"), "{n}");
-        assert!(n.contains("실패"), "{n}");
+        assert!(n.contains("로컬"), "로컬 실패 사실이 빠졌다: {n}");
+        assert!(n.contains("보장되지 않"), "원격 비보장을 안 알린다: {n}");
+        // **천장을 넘는 단정을 하면 안 된다.**
+        assert!(
+            !n.contains("원격에만 남습니다") && !n.contains("안전"),
+            "Reaches를 '원격에 보존됨'으로 단정한다: {n}"
+        );
     }
 
     #[test]

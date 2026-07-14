@@ -34,9 +34,12 @@ const IO_TIMEOUT: Duration = Duration::from_millis(300);
 /// 헤더가 거대한 할당으로 이어지지 않게 막는다.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// `/record now <메모>`가 보낼 수 있는 메모 상한(바이트). 사람이 손으로 남기는 관찰 메모치고는
+/// `/record now <메모>`가 저장·전송할 수 있는 메모 상한(바이트). 사람이 손으로 남기는 관찰 메모치고는
 /// 넉넉하되(64KiB), IPC 프레임 상한(`aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES`, 16MiB)에는 한참
-/// 못 미친다 — 1MB 메모 같은 병적 입력이 프레임 상한에 닿는 일을 여기서 미리 막는다(F16).
+/// 못 미친다 — 1MB 메모 같은 병적 입력이 프레임 상한에 닿는 일을 미리 막는다(F16).
+///
+/// **최종 바이트의 진짜 상한이다**: [`Memo::sanitize`]가 redaction을 **먼저** 하고 그 결과를 절단하므로,
+/// `[REDACTED:…]` 치환이 길이를 늘려도 저장/전송되는 바이트는 이 값을 넘지 않는다.
 pub const MEMO_MAX_BYTES: usize = 64 * 1024;
 
 /// agent가 셸 명령을 실행했다. 시스템을 바꿨을 수 있는 유일한 도구라 항상 보낸다.
@@ -105,17 +108,25 @@ pub struct Memo {
 impl Memo {
     /// 원문을 **딱 한 번** 정제한다. 정제 후 비면(F15) `None` — 보낼 것도 저장할 것도 없다.
     ///
-    /// 여기서 하는 일:
-    /// - **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
-    ///   않게. 개행/탭은 메모의 정상적인 부분이라 남긴다. ESC(`\x1b`)만 지워도 뒤따르는 CSI
-    ///   바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
-    /// - **UTF-8 경계 보존 절단**(F16) — IPC 프레임 상한(16MiB)에 닿지 않게 훨씬 낮은 선에서 자른다.
+    /// 순서가 중요하다(각 단계가 다음 단계의 입력을 바꾼다):
+    /// 1. **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
+    ///    않게. 개행/탭은 메모의 정상적인 부분이라 남긴다. ESC(`\x1b`)만 지워도 뒤따르는 CSI
+    ///    바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
+    /// 2. **redaction**(F14) — secret/PII 마스킹. `[REDACTED:…]` 치환은 **길이를 늘릴 수 있다**.
+    /// 3. **UTF-8 경계 보존 절단**(F16) — `MEMO_MAX_BYTES` 이하로.
+    ///
+    /// **redaction을 절단보다 먼저** 하는 이유(9차→10차 교정): 예전엔 절단이 먼저라, redaction이
+    /// 길이를 늘리면 최종 저장/전송 바이트가 `MEMO_MAX_BYTES`를 넘을 수 있었다 — 상한이 실제 상한이
+    /// 아니었다. redaction 후 절단하면 **최종 바이트가 진짜로 상한 이하**가 된다. `cap_str`이 UTF-8
+    /// 경계를 지키므로 redaction 뒤에 잘라도 문자 중간이 깨지지 않는다. (downstream의 store·build_event
+    /// redaction은 idempotent라 여기서 이미 마스킹된 값에 다시 걸려도 무해하다.)
     pub fn sanitize(raw: &str) -> Option<Self> {
         let cleaned: String = raw
             .chars()
             .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
             .collect();
-        let (text, truncated) = crate::agent::tool_record::cap_str(&cleaned, MEMO_MAX_BYTES);
+        let redacted = redact(&cleaned);
+        let (text, truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
         if text.trim().is_empty() {
             return None;
         }
@@ -255,7 +266,12 @@ pub enum RecordOutcome {
 /// 원격 기록의 최종 판정 — 안내 문구를 조립할 때 "실패인가"를 **문구 유무가 아니라 이 값으로** 가른다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteVerdict {
-    /// 구독자가 받아 갔다(밀려 있어도 지연일 뿐 유실은 아니다).
+    /// aicd가 받아들였고 **받아 갈 구독자가 있다**. 우리가 동기적으로 알 수 있는 최선이다.
+    ///
+    /// **"서버에 도착했다"가 아니다** — [`SendResult`]의 "우리가 알 수 있는 것의 천장" 참고. 구독자
+    /// 존재가 이 이벤트의 소비를 보장하지 않고(버스는 lossy broadcast — 폭주 시 `Lagged`로 유실),
+    /// 그 뒤 collector push는 비동기다. 즉 **"도달 경로에 올랐다"까지**이지 "서버가 갖고 있다"가
+    /// 아니다. 안내 문구도 이 선을 넘으면 안 된다(로컬 실패 경로에서 특히 — 유일 사본을 과신시킨다).
     Reaches,
     /// 도달 여부를 모른다 — 실패라고 단정할 수도, 성공이라 말할 수도 없다.
     Unknown,
@@ -1550,5 +1566,38 @@ mod tests {
             "sanitize 이후에도 secret이 마스킹돼야 함: {}",
             ev.summary
         );
+    }
+
+    #[test]
+    fn redaction_happens_before_truncation_so_cap_is_the_real_final_ceiling() {
+        // 10차: redaction은 절단보다 **먼저**여야 한다. `[REDACTED:…]` 치환이 길이를 **늘리면**,
+        // 절단이 먼저일 때 redaction 후 최종 바이트가 MEMO_MAX_BYTES를 넘는다 — 상한이 상한이 아니다.
+        //
+        // **길이가 늘어나는** redaction을 써야 이 순서를 실제로 검증한다: 짧은 email(`a@b.co`, 6바이트)이
+        // `[REDACTED:email]`(16바이트)로 커진다(≈2.4배). AWS 키처럼 줄어드는 secret으로는 순서가
+        // 뒤집혀도 상한을 안 넘어 테스트가 공허해진다(9차의 함정을 여기서 피한다).
+        let raw = "a@b.co ".repeat(20_000); // ≈140KB 입력, redaction 후 ≈340KB로 팽창
+        let m = memo(&raw);
+
+        // 최종 바이트가 진짜로 상한 이하다 — 이 게이트의 핵심 불변식.
+        // (절단 먼저였다면: 140KB→64KiB로 자른 뒤 redact가 ≈155KB로 부풀어 이 단언이 깨진다.)
+        assert!(
+            m.text().len() <= MEMO_MAX_BYTES,
+            "redaction 후 최종 바이트가 상한을 넘었다(절단이 redaction보다 먼저인 버그): {} > {}",
+            m.text().len(),
+            MEMO_MAX_BYTES
+        );
+        assert!(m.truncated(), "상한을 넘긴 입력인데 절단 표시가 없다");
+        // redaction이 실제로 걸렸다(원본 email이 남아 있지 않다).
+        assert!(
+            !m.text().contains("a@b.co"),
+            "최종 메모에 원본 email이 남아 있다"
+        );
+        assert!(
+            m.text().contains("[REDACTED:email]"),
+            "redaction이 안 걸렸다"
+        );
+        // UTF-8 경계 안전(절단이 문자 중간을 깨면 String이 성립하지 않는다 — 명시 확인).
+        assert!(m.text().is_char_boundary(m.text().len()));
     }
 }
