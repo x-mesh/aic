@@ -112,13 +112,20 @@ impl SnapshotRecord {
             self.sections.len(),
             self.sections.join(",")
         );
-        if let Some(memo) = &self.memo {
-            s.push_str(&format!(
-                " · memo: {}",
-                memo_preview(memo, MEMO_PREVIEW_CHARS)
-            ));
+        if let Some(mp) = self.memo_preview_line() {
+            s.push_str(&format!(" · {mp}"));
         }
         s
+    }
+
+    /// 목록 한 줄에 붙일 메모 미리보기(`memo: …`), 메모 없으면 `None`. **순수 함수** — CLI `list_line`과
+    /// chat `/snapshots`가 **이 하나를 공유**해, "저장한 메모를 다시 본다"는 원칙을 두 진입점에서 같은
+    /// 함수로 지킨다(각자 라인 나머지 형식은 문맥에 맞게: CLI는 rfc3339+전체 섹션, chat은 compact).
+    /// 예전엔 CLI만 메모를 보여줘 chat↔CLI 비대칭이었다.
+    pub fn memo_preview_line(&self) -> Option<String> {
+        self.memo
+            .as_ref()
+            .map(|m| format!("memo: {}", memo_preview(m, MEMO_PREVIEW_CHARS)))
     }
 }
 

@@ -646,13 +646,25 @@ fn query_at(socket: &std::path::Path, req: &IpcRequest) -> Roundtrip {
     let Ok(payload) = serde_json::to_vec(req) else {
         return Roundtrip::SendFailed;
     };
-    // **`UnixStream::connect`를 쓰지 않는다** — 상한이 없다([`connect_unix_timeout`] 참고).
+    // **단일 절대 deadline** — connect·write·read **총합**을 `IO_TIMEOUT`으로 묶는다(async 판과 대칭).
+    // 예전엔 세 단계가 각각 `set_*_timeout(IO_TIMEOUT)`을 독립으로 받아 최악 3×IO_TIMEOUT(=900ms)까지
+    // 막혔다 — sync 경로는 chat emit(`risk_denied` 등)과 status bar가 쓰므로 사용자 눈앞에서 멈춘다.
+    // 각 blocking op 직전에 **남은 예산**(`deadline.remaining()`)으로 timeout을 다시 준다.
+    let deadline = Deadline::new(IO_TIMEOUT);
+    // **`UnixStream::connect`를 쓰지 않는다** — 상한이 없다([`connect_unix_timeout`] 참고). connect가
+    // 예산을 얼마나 쓰든 아래 remaining()이 그만큼 줄어든 값을 write/read에 준다(총합 유지).
     let Ok(mut stream) = connect_unix_timeout(socket, IO_TIMEOUT) else {
         return Roundtrip::SendFailed;
     };
-    if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
-        || stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
-    {
+
+    // write: 남은 예산으로. 만료면 아직 안 보냈으니 SendFailed. `remaining()`은 0(만료)을 `None`으로
+    // 주므로 `set_write_timeout(Some(0))`(= 플랫폼상 "무한 대기") 함정에 빠지지 않는다.
+    let Some(rem) = deadline.remaining() else {
+        return Roundtrip::SendFailed;
+    };
+    #[cfg(test)]
+    test_timeout_probe::record(rem);
+    if stream.set_write_timeout(Some(rem)).is_err() {
         return Roundtrip::SendFailed;
     }
     // write_all은 전부 쓰거나 Err(부분 write 포함) — Err면 aicd가 유효 프레임을 못 받으니 SendFailed.
@@ -662,6 +674,14 @@ fn query_at(socket: &std::path::Path, req: &IpcRequest) -> Roundtrip {
 
     // ── 여기부터 프레임은 나갔다. 이후 실패는 전부 NoReply(나갔을 수 있으나 수용 여부 모름). ──
     // 4바이트 길이 헤더 → 본문. 상한을 두어 손상된 헤더가 거대한 할당으로 이어지지 않게 한다.
+    let Some(rem) = deadline.remaining() else {
+        return Roundtrip::NoReply;
+    };
+    #[cfg(test)]
+    test_timeout_probe::record(rem);
+    if stream.set_read_timeout(Some(rem)).is_err() {
+        return Roundtrip::NoReply;
+    }
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).is_err() {
         return Roundtrip::NoReply;
@@ -669,6 +689,15 @@ fn query_at(socket: &std::path::Path, req: &IpcRequest) -> Roundtrip {
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_RESPONSE_BYTES {
         return Roundtrip::NoReply; // 응답은 왔으나 못 쓴다 — 수용 여부는 여전히 모름.
+    }
+    // body read도 같은 deadline의 남은 예산으로(총합 유지).
+    let Some(rem) = deadline.remaining() else {
+        return Roundtrip::NoReply;
+    };
+    #[cfg(test)]
+    test_timeout_probe::record(rem);
+    if stream.set_read_timeout(Some(rem)).is_err() {
+        return Roundtrip::NoReply;
     }
     let mut body = vec![0u8; len];
     if stream.read_exact(&mut body).is_err() {
@@ -1004,6 +1033,27 @@ pub(crate) mod test_redact_probe {
     }
 }
 
+/// 테스트 전용 — `query_at`가 각 blocking op 직전에 `set_*_timeout`에 넘긴 timeout을 순서대로 기록한다.
+/// **단일 deadline**을 쓰는지(값이 단조 감소)를 **시계 없이** 결정적으로 관찰한다 — 세 단계 독립
+/// `IO_TIMEOUT`으로 되돌리면 값이 전부 같아져(감소 안 함) 테스트가 깨진다. thread-local이라 병렬 안전.
+#[cfg(test)]
+pub(crate) mod test_timeout_probe {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    thread_local! {
+        static TIMEOUTS: RefCell<Vec<Duration>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(d: Duration) {
+        TIMEOUTS.with(|c| c.borrow_mut().push(d));
+    }
+    /// 기록을 꺼내 비운다(호출 순서 = write, read-len, read-body).
+    pub(crate) fn drain() -> Vec<Duration> {
+        TIMEOUTS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_sink {
     use super::{AgentEvent, SendResult};
@@ -1223,6 +1273,57 @@ mod tests {
         assert_eq!(outcome, RecordOutcome::SentNoReply);
         assert_eq!(outcome.verdict(), RemoteVerdict::Unknown);
         assert_ne!(outcome, RecordOutcome::NotSent, "나간 메모를 유실로 오보");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn sync_query_shares_one_deadline_across_stages_not_three_independent() {
+        // **게이트 2**: sync query_at도 async처럼 **단일 deadline**을 써야 총 상한이 IO_TIMEOUT이다.
+        // 세 단계가 독립 IO_TIMEOUT을 받으면 최악 3×IO_TIMEOUT(=900ms) — sync는 chat emit·status bar가
+        // 쓰므로 사용자 눈앞 멈춤이다. **시계에 의존하지 않고**, 각 op에 넘긴 timeout이 **단조 감소**하는지
+        // (= 하나의 줄어드는 deadline에서 나왔는지)로 결정적으로 잡는다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reply.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // 요청을 받고 **즉시 Pong으로 응답** → client의 read(len·body)가 성사돼 timeout 3개(write·len·body)
+        // 가 모두 기록된다(mute 서버였다면 read가 timeout나 body 단계에 못 가 2개만 기록된다).
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut hdr = [0u8; 4];
+                if s.read_exact(&mut hdr).is_ok() {
+                    let n = u32::from_be_bytes(hdr) as usize;
+                    let mut body = vec![0u8; n];
+                    let _ = s.read_exact(&mut body);
+                }
+                let resp = serde_json::to_vec(&IpcResponse::Pong).unwrap();
+                let _ = s.write_all(&encode_frame(&resp));
+            }
+        });
+
+        let _ = test_timeout_probe::drain(); // 앞선 잔여 제거
+        let _ = query_at(&path, &IpcRequest::GetExporterStatus);
+        let timeouts = test_timeout_probe::drain();
+
+        assert_eq!(
+            timeouts.len(),
+            3,
+            "write + read-len + read-body 3단계여야: {timeouts:?}"
+        );
+        // 모든 op의 timeout ≤ IO_TIMEOUT(총 예산을 넘게 주지 않는다).
+        for t in &timeouts {
+            assert!(*t <= IO_TIMEOUT, "op timeout이 총 예산을 넘음: {t:?}");
+        }
+        // **단조 감소**: 하나의 줄어드는 deadline에서 나왔다. 세 독립 IO_TIMEOUT이면 전부 같아 깨진다.
+        // (op 사이에 실시간이 지나므로 remaining이 strict하게 준다 — 시계 값을 단언하는 게 아니라 순서만.)
+        assert!(
+            timeouts[1] < timeouts[0],
+            "read-len이 write보다 크거나 같다(독립 timeout 회귀): {timeouts:?}"
+        );
+        assert!(
+            timeouts[2] < timeouts[1],
+            "read-body가 read-len보다 크거나 같다(독립 timeout 회귀): {timeouts:?}"
+        );
         let _ = server.join();
     }
 

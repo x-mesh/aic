@@ -1729,12 +1729,18 @@ impl AgentSession {
                 let total = all.len();
                 let mut lines = vec![format!("최근 스냅샷 (총 {total}, store=~/.aic/snapshots):")];
                 for r in all.iter().rev().take(limit) {
-                    lines.push(format!(
+                    let mut line = format!(
                         "· {} · {} · sections={}",
                         r.captured_at.format("%m-%d %H:%M:%S"),
                         r.kind,
                         r.sections.len()
-                    ));
+                    );
+                    // CLI `list`와 **같은 pure 함수**로 메모를 보여준다(11차에 CLI에만 넣어 생긴
+                    // chat↔CLI 비대칭 교정) — 저장한 걸 볼 수 있어야 한다는 원칙은 chat도 같다.
+                    if let Some(mp) = r.memo_preview_line() {
+                        line.push_str(&format!(" · {mp}"));
+                    }
+                    lines.push(line);
                 }
                 self.out.note(&lines.join("\n")).await;
             }
@@ -3386,10 +3392,15 @@ mod tests {
             drain_snapshot_event().is_none(),
             "빈 메모인데 원격 이벤트가 나갔다"
         );
-        // 스냅샷 캡처 자체는 정당하므로 레코드는 남되, memo는 None이다.
-        let rec = crate::snapshot_store::load_snapshots().unwrap();
-        assert_eq!(rec.len(), 1, "스냅샷은 캡처돼야 한다(캡처는 메모와 무관)");
-        assert_eq!(rec[0].memo, None, "빈 메모가 레코드에 저장되면 안 된다");
+        // 로컬 레코드 검증은 **캡처가 이 환경에서 실제로 레코드를 냈을 때만** 한다 — 실제 캡처는 시스템
+        // probe·`Sandbox::from_cwd`를 타므로 CI/샌드박스에서 실패하면 store가 비어 `rec[0]`가 패닉한다
+        // ("코드가 틀렸다"가 아니라 "probe가 실패했다" — 원칙 위반). "빈 메모 → 레코드에 memo 없음"의
+        // 결정적 보증은 probe 없는 snapshot_capture의 `memo_is_redacted_and_empty_memo_stays_none`이
+        // 담당한다. 여기선 캡처됐다면 그 레코드의 memo가 None이어야 함만 본다(레코드가 있는데 memo가
+        // 붙었으면 그건 코드 버그로 잡힌다 — 환경 결함 skip, 코드 버그 catch).
+        if let Some(r) = crate::snapshot_store::load_snapshots().unwrap().first() {
+            assert_eq!(r.memo, None, "빈 메모가 레코드에 저장됐다(코드 버그)");
+        }
     }
 
     #[tokio::test]
@@ -3430,8 +3441,43 @@ mod tests {
         );
         let ev = drain_snapshot_event().expect("진짜 메모는 원격에 나가야 한다");
         assert_eq!(ev.summary, "cpu 이상하게 높음");
-        let rec = crate::snapshot_store::load_snapshots().unwrap();
-        assert_eq!(rec[0].memo.as_deref(), Some("cpu 이상하게 높음"));
+        // 로컬 레코드는 캡처가 실제로 성사됐을 때만 확인한다(probe/Sandbox 환경 실패로 store가 비면
+        // skip — 위 emptied 테스트와 같은 근거). 결정적 저장 보증은 `memo_survives_locally_...`가 본다.
+        if let Some(r) = crate::snapshot_store::load_snapshots().unwrap().first() {
+            assert_eq!(
+                r.memo.as_deref(),
+                Some("cpu 이상하게 높음"),
+                "캡처됐는데 저장된 메모가 다르다(코드 버그)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_snapshots_shows_stored_memo() {
+        // 게이트 5(chat↔CLI 대칭): 11차에 CLI `list`엔 메모를 넣었지만 chat `/snapshots`엔 안 넣었다.
+        // 저장한 걸 볼 수 있어야 한다는 원칙은 chat도 같다 — `/snapshots`가 저장된 메모를 보여줘야 한다.
+        // store를 **직접 씨딩**(probe 없이)해 결정적으로 만든다.
+        let _h = TestStore::new();
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let rec = crate::snapshot_store::SnapshotRecord::with_memo(
+            "manual",
+            "## host\nh\n",
+            None,
+            None,
+            now,
+            Some("디스크가 이상하다"),
+        );
+        crate::snapshot_store::append_snapshot(&rec).unwrap();
+
+        let (mut session, _dir, mut rx) = test_session_capturing_notes();
+        session.handle_snapshots(Some(10)).await;
+
+        let notes = drain_notes(&mut rx);
+        let shown = notes.join("\n");
+        assert!(
+            shown.contains("memo: 디스크가 이상하다"),
+            "chat /snapshots가 저장된 메모를 안 보여준다: {shown}"
+        );
     }
 
     #[test]
