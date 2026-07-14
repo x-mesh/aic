@@ -474,6 +474,17 @@ fn has_extended_acl(p: &Path) -> bool {
             _ => true,
         }
     }
+
+    // aicd는 macOS/Linux만 지원한다(`daemon_install.rs`의 `detect_platform`). 그 밖의 unix에서는 ACL을
+    // 확인할 방법이 없으므로 **fail-closed로 `true`(신뢰 못 함)**를 반환한다 — 이 함수는 보안 게이트라
+    // 모르는 건 위험한 것으로 친다. 영향은 "지원 밖 OS에서 **root로** 뜬 aicd"뿐이고(비-root는 신뢰
+    // 판정 자체를 안 탄다), 그 조합에서 docker exporter가 안 뜨는 건 안전한 실패다. 이 분기가 없으면
+    // 다른 unix에서 **컴파일 에러**가 나므로(반환값 없음), 명시적으로 처리한다.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = &c_path;
+        true
+    }
 }
 
 /// **이 프로세스가 실제로 spawn할 수 있는** 실행 파일인가.
@@ -596,9 +607,9 @@ pub struct DockerConfig {
 ///
 /// # 비용: 왜 `spawn_blocking`을 쓰지 않는가
 ///
-/// 재탐색은 `metadata`/`canonicalize`/`faccessat`(동기 FS 호출)을 런타임 스레드에서 직접 부른다.
-/// NFS/FUSE 같은 느린 FS라면 이론상 런타임 스레드를 블록할 수 있다. 그래도 `spawn_blocking`으로
-/// 옮기지 않는다:
+/// 재탐색은 동기 FS 호출(`metadata`/`symlink_metadata`/`faccessat`, 그리고 root면 실행 경로 성분별
+/// `symlink_metadata` + ACL 조회)을 런타임 스레드에서 직접 부른다. NFS/FUSE 같은 느린 FS라면
+/// 이론상 런타임 스레드를 블록할 수 있다. 그래도 `spawn_blocking`으로 옮기지 않는다:
 /// - **비용이 작다**: 재탐색은 **못 찾은 동안에만** 돌고(찾으면 멈춘다), 한 번에 stat 십수 회다.
 ///   주기는 60초다. 게다가 이 task는 어차피 매 tick 외부 프로세스를 spawn하는데(`docker system df`),
 ///   그 spawn 자체가 실행 파일을 읽는 FS 작업이다 — 재탐색이 더하는 몫은 그 옆에서 미미하다.
@@ -709,8 +720,8 @@ async fn serve_docker_with(
                         // 무관하게 다음 주기까지 skip한다 — connections.rs와 동일 원칙. health를
                         // 건드리지 않는다: health는 "push가 성공/실패했나"만 추적하고, 캡처 실패는
                         // 애초에 push를 시도조차 하지 않았기 때문이다.
-                        if is_binary_gone(&e) {
-                            // 찾아 뒀던 docker가 사라졌다(삭제·업그레이드로 경로 변경 등). 상태를
+                        if is_binary_unusable(&e) {
+                            // 찾아 뒀던 docker를 더는 못 쓴다(사라짐 ENOENT / 실행 불가 EACCES). 상태를
                             // 되돌려 다음 tick부터 재탐색한다 — WARN은 이 전이에서 한 번뿐이고, 못 찾는
                             // 동안은 조용하다(위 doc "로그는 상태 변화에만").
                             let _announced = state.mark_gone(&bin);
@@ -867,11 +878,11 @@ impl BinState {
         self.announced_bad = Announced::Nothing;
     }
 
-    /// 쓰던 실행 파일이 exec 시점에 없어졌다(`ENOENT`). 재탐색하도록 `current`를 비우고, **직전에
-    /// 이 경로를 이미 나쁘다고 알리지 않았을 때만** WARN을 낸다.
+    /// 쓰던 실행 파일을 exec 시점에 더는 못 쓴다(`ENOENT` 사라짐 / `EACCES` 실행 불가). 재탐색하도록
+    /// `current`를 비우고, **직전에 이 경로를 이미 나쁘다고 알리지 않았을 때만** WARN을 낸다.
     ///
     /// **알렸으면 `true`**를 돌려준다(테스트가 억제를 관찰하기 위함 — 상태만 보면 두 경우가 구분되지
-    /// 않는다). 이 반환값 + `announced_bad` 덕에 "같은 경로가 계속 ENOENT"에서도 WARN은 한 번뿐이다.
+    /// 않는다). 이 반환값 + `announced_bad` 덕에 "같은 경로가 계속 실패"해도 WARN은 한 번뿐이다.
     fn mark_gone(&mut self, bin: &Path) -> bool {
         self.current = None;
         if self.announced_bad == Announced::Bad(bin.to_path_buf()) {
@@ -879,7 +890,7 @@ impl BinState {
         }
         tracing::warn!(
             docker_bin = %bin.display(),
-            "docker 실행 파일이 사라졌다(exec ENOENT) — 다시 탐색한다(설치되면 자동으로 캡처를 재개한다)"
+            "docker 실행 파일을 더는 쓸 수 없다(사라졌거나 실행 불가) — 다시 탐색한다(복구되면 자동으로 캡처를 재개한다)"
         );
         self.announced_bad = Announced::Bad(bin.to_path_buf());
         true
@@ -899,13 +910,20 @@ impl BinState {
     }
 }
 
-/// 캡처 실패가 **실행 파일이 없어서**인가(spawn 시 `ENOENT`). 데몬 다운/권한 없음/timeout 등 다른
-/// 실패와 갈라내야 한다 — 그것들은 재탐색해 봐야 같은 경로가 다시 나올 뿐이다.
+/// 캡처 실패가 **이 실행 파일을 더는 쓸 수 없어서**인가 — spawn이 `ENOENT`(사라짐) 또는
+/// `EACCES`(실행 비트가 사라짐/권한 회수)로 실패한 경우. 둘 다 "이 경로는 끝났다"는 신호라
+/// **재탐색 대상**이다: 재탐색의 [`is_executable_file`] 검사가 실행 불가가 된 경로를 자연스럽게
+/// 걸러 내(다른 위치의 docker로 옮겨 가거나, 권한이 복구되면 같은 경로를 다시 잡는다). 재탐색이
+/// 같은 경로를 도로 물어와도 상태 기계가 조용히 유지하므로 무한 로그는 없다.
+///
+/// 데몬 down(non-zero exit)/timeout/파싱 실패와는 갈라진다 — 그것들은 실행 파일이 멀쩡하므로
+/// 재탐색이 무의미하고, `CaptureFailing`으로 전이-알림만 한다.
 ///
 /// `run_capped`의 `cmd.spawn()?`가 `std::io::Error`를 그대로 anyhow에 실어 주므로 downcast로 본다.
-fn is_binary_gone(e: &anyhow::Error) -> bool {
+fn is_binary_unusable(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
     e.downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        .is_some_and(|io| matches!(io.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied))
 }
 
 /// `docker_bin system df --format json`을 spawn해 stdout을 NDJSON 라인 단위로 파싱한다.
@@ -1586,6 +1604,30 @@ mod tests {
             !is_root_controlled_walk(&d, 0, &all_trusted),
             "디렉토리는 실행 파일이 아니다"
         );
+    }
+
+    /// **회귀 가드 — 최종 실행 파일 자신도 검사한다.** 부모 디렉토리가 전부 root 통제여도 **파일이
+    /// 0777이면** 사용자가 내용을 갈아치울 수 있다(디렉토리 무결성과 별개). 예전엔 이 검사를 깨는
+    /// mutation이 어떤 테스트도 안 깨뜨렸다(공허) — 파일 성분만 신뢰 밖으로 두고 거부되는지 본다.
+    #[test]
+    fn is_root_controlled_walk_checks_the_executable_file_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let f = root.join("docker");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 부모(루트~root)는 전부 신뢰, **파일 자신만** 신뢰 밖(예: 0777 실행 파일).
+        let fp = f.clone();
+        let untrusted_file = move |p: &Path| p != fp.as_path();
+        assert!(
+            !is_root_controlled_walk(&f, 0, &untrusted_file),
+            "실행 파일 자신이 신뢰 밖(사용자 쓰기 가능)인데 통과 — 파일 성분 검사가 빠졌다"
+        );
+
+        // 대조(공허 방지): 파일까지 신뢰하면 통과 — walk가 끝까지 도달함을 증명.
+        let all_trusted = |_: &Path| true;
+        assert!(is_root_controlled_walk(&f, 0, &all_trusted));
     }
 
     /// `..`는 거부가 아니라 **접는다**(부모로 올라감). 링크 없는 실경로에서의 `..` 폴딩은 커널 해소와
@@ -2423,38 +2465,105 @@ mod tests {
         }
     }
 
-    /// 주어진 클로저를 도는 동안 방출된 tracing 이벤트의 레벨을 수집한다. 이 모듈의 핵심 계약은
-    /// **로그 레벨**에 있다("오타는 WARN으로 보여야, 재탐색 반복은 WARN을 안 내야") — 상태만 봐선
-    /// 그걸 검증할 수 없어 실제 방출 레벨을 관찰한다.
-    fn capture_levels<F: FnOnce()>(f: F) -> Vec<tracing::Level> {
-        use std::sync::{Arc, Mutex};
-        use tracing::{span, Event, Metadata, Subscriber};
+    // ── 로그 캡처 (병렬-안전) ─────────────────────────────────────────────────
+    //
+    // **왜 `with_default`가 아니라 영구 전역 구독자인가**: tracing의 callsite interest 캐시는 프로세스
+    // 전역 원자값이다. `with_default`(스레드-로컬 구독자)로 캡처하면, 캡처 밖의 기본 구독자가
+    // `NoSubscriber`(interest=never)라, 어떤 callsite가 캡처 밖에서 처음 등록되면 "never"로 캐시돼
+    // 이후 캡처 안에서의 emit까지 통째로 억제된다 → WARN이 간헐적으로 0으로 잡히는 flaky(실측: 풀 모듈
+    // 병렬에서 4/10 실패). 락으로 직렬화해도 캐시가 캡처 밖에서 오염되므로 안 낫는다.
+    //
+    // 해법: **영구 전역 구독자를 한 번 설치**한다. 그러면 callsite는 항상 이 구독자 아래 등록돼
+    // "sometimes"로 캐시되고(never로 굳지 않음), 매 이벤트마다 `enabled`가 호출된다. 실제 수집은
+    // **스레드-로컬 sink**로 라우팅한다 — 캡처 중인 테스트는 자기 스레드 sink를 켜고, 병렬 테스트는
+    // 각자 자기 스레드 sink(또는 없음)라 서로 섞이지 않는다. 통합 테스트의 serve 루프는 current-thread
+    // 런타임의 block_on 스레드(=테스트 스레드)에서 폴링되므로 같은 sink에 잡힌다.
 
-        struct Rec(Arc<Mutex<Vec<tracing::Level>>>);
-        impl Subscriber for Rec {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
-            }
-            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-                span::Id::from_u64(1)
-            }
-            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-            fn event(&self, event: &Event<'_>) {
-                self.0.lock().unwrap().push(*event.metadata().level());
-            }
-            fn enter(&self, _: &span::Id) {}
-            fn exit(&self, _: &span::Id) {}
+    thread_local! {
+        static CAPTURE_SINK: std::cell::RefCell<Option<Vec<(tracing::Level, String)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    struct GlobalCapture;
+    impl tracing::Subscriber for GlobalCapture {
+        fn register_callsite(&self, _: &tracing::Metadata<'_>) -> tracing::subscriber::Interest {
+            // "sometimes" — callsite를 never로 굳히지 않고 매번 enabled()를 부르게 한다.
+            tracing::subscriber::Interest::sometimes()
         }
+        fn enabled(&self, md: &tracing::Metadata<'_>) -> bool {
+            // 이 crate 이벤트만(reqwest/hyper/tokio 노이즈 제외), 그리고 sink가 켜져 있을 때만.
+            md.target().starts_with("aic_server") && CAPTURE_SINK.with(|s| s.borrow().is_some())
+        }
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURE_SINK.with(|s| {
+                if let Some(v) = s.borrow_mut().as_mut() {
+                    struct MsgVisitor(String);
+                    impl tracing::field::Visit for MsgVisitor {
+                        fn record_debug(
+                            &mut self,
+                            field: &tracing::field::Field,
+                            value: &dyn std::fmt::Debug,
+                        ) {
+                            if field.name() == "message" {
+                                self.0 = format!("{value:?}");
+                            }
+                        }
+                    }
+                    let mut mv = MsgVisitor(String::new());
+                    event.record(&mut mv);
+                    v.push((*event.metadata().level(), mv.0));
+                }
+            });
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
-        let sink = Arc::new(Mutex::new(Vec::new()));
-        tracing::subscriber::with_default(Rec(sink.clone()), f);
-        let out = sink.lock().unwrap().clone();
-        out
+    fn install_global_capture() {
+        use std::sync::OnceLock;
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            // 이 테스트 바이너리에서 전역 구독자를 세우는 건 여기뿐이다. 실패해도(이미 설치됨) 무시.
+            let _ = tracing::subscriber::set_global_default(GlobalCapture);
+        });
+    }
+
+    /// 클로저를 도는 동안 이 스레드에서 방출된 `(레벨, message)`를 수집한다. 병렬 테스트와 섞이지
+    /// 않는다(스레드-로컬 sink). 위 "로그 캡처" 주석 참고.
+    fn capture_events<F: FnOnce()>(f: F) -> Vec<(tracing::Level, String)> {
+        install_global_capture();
+        CAPTURE_SINK.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        // sink는 panic 시에도 반드시 비운다(다음 테스트에 새지 않게).
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                CAPTURE_SINK.with(|s| *s.borrow_mut() = None);
+            }
+        }
+        let _clear = Clear;
+        f();
+        CAPTURE_SINK.with(|s| s.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// [`capture_events`]의 레벨만 보는 버전.
+    fn capture_levels<F: FnOnce()>(f: F) -> Vec<tracing::Level> {
+        capture_events(f).into_iter().map(|(l, _)| l).collect()
     }
 
     fn count(levels: &[tracing::Level], want: tracing::Level) -> usize {
         levels.iter().filter(|l| **l == want).count()
+    }
+
+    fn count_msg(events: &[(tracing::Level, String)], lvl: tracing::Level, needle: &str) -> usize {
+        events
+            .iter()
+            .filter(|(l, m)| *l == lvl && m.contains(needle))
+            .count()
     }
 
     /// **회귀 가드 — WARN 폭주(로그 레벨로 직접 검증).** 못 찾은 상태가 지속되는 동안 재탐색은 계속
@@ -2790,11 +2899,11 @@ mod tests {
             .expect("serve_docker가 에러로 끝남");
     }
 
-    /// spawn 실패가 **실행 파일이 없어서**인지 갈라내야 재탐색 여부를 정할 수 있다. 데몬 다운
-    /// (non-zero exit)이나 timeout은 재탐색해 봐야 같은 경로가 다시 나올 뿐이다.
+    /// spawn 실패가 **이 경로를 더는 못 써서**(ENOENT 사라짐 / EACCES 실행 불가)인지, 아니면 데몬
+    /// down/timeout(실행 파일은 멀쩡)인지 갈라내야 재탐색 여부를 정할 수 있다.
     #[tokio::test]
-    async fn is_binary_gone_distinguishes_enoent_from_other_capture_failures() {
-        // 없는 실행 파일 → ENOENT.
+    async fn is_binary_unusable_distinguishes_gone_and_noexec_from_daemon_down() {
+        // 없는 실행 파일 → ENOENT → 재탐색 대상.
         let missing = capture_docker_df(
             Path::new("/definitely/does/not/exist/docker"),
             Duration::from_secs(5),
@@ -2802,19 +2911,125 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            is_binary_gone(&missing),
-            "미설치 spawn 실패를 ENOENT로 인식하지 못했다: {missing}"
+            is_binary_unusable(&missing),
+            "미설치 spawn 실패를 재탐색 대상으로 인식하지 못했다: {missing}"
         );
 
-        // 데몬 다운(non-zero exit)은 실행 파일이 사라진 게 아니다 — 재탐색 대상이 아니다.
+        // 실행 비트가 없는 파일 → EACCES → 이것도 재탐색 대상(item 4 — 예전엔 CaptureFailing에 갇혔다).
         let dir = tempfile::tempdir().unwrap();
+        let noexec = dir.path().join("docker");
+        std::fs::write(&noexec, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&noexec, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let eacces = capture_docker_df(&noexec, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            is_binary_unusable(&eacces),
+            "실행 비트 없는 파일의 EACCES를 재탐색 대상으로 보지 않았다 — CaptureFailing에 갇힌다: {eacces}"
+        );
+
+        // 데몬 다운(non-zero exit)은 실행 파일이 멀쩡 — 재탐색 대상이 아니다(CaptureFailing).
         let bin = fake_docker_bin(&dir, "echo 'cannot connect' >&2; exit 1");
         let down = retry_busy(|| capture_docker_df(&bin, Duration::from_secs(5)))
             .await
             .unwrap_err();
         assert!(
-            !is_binary_gone(&down),
-            "데몬 다운을 '실행 파일이 사라졌다'로 오인했다 — 애먼 재탐색을 돈다: {down}"
+            !is_binary_unusable(&down),
+            "데몬 다운을 '실행 파일 못 씀'으로 오인했다 — 애먼 재탐색을 돈다: {down}"
+        );
+    }
+
+    /// **회귀 가드 — item 2: CaptureFailing 루프 배선.** 상태 기계 단위 테스트는 있지만, 그게
+    /// `serve_docker` 루프에 **실제로 배선됐는지**는 별개다(4차의 ENOENT 통합 테스트와 대칭). docker가
+    /// 계속 non-zero exit(데몬 down)일 때 **데몬-down WARN이 첫 tick 1회만** 나오고, 복구되면 INFO
+    /// 한 번이 나오는지를 루프를 실제로 돌려 확인한다.
+    ///
+    /// `with_default`가 현재 스레드에만 걸리므로 `tokio::spawn` 대신 current-thread 런타임 + block_on
+    /// 으로 **같은 스레드**에서 돌린다(위 [`capture_events`] 참고). fake docker는 호출 횟수를 세서
+    /// 처음 3번은 exit 1(데몬 down), 그 뒤엔 성공(복구)한다.
+    #[test]
+    fn serve_docker_warns_once_on_daemon_down_and_logs_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let count_file = dir.path().join("count");
+        // 처음 2회 exit 1(데몬 down), 그 뒤 정상 NDJSON(복구). 복구를 mid-run 개입 없이 스크립트가
+        // 호출 횟수로 스스로 만든다. down이 **2틱** 이상이라야 "always-WARN" 배선 회귀(M25)가
+        // down_warns=2로 잡힌다(1틱만 down이면 정상이든 회귀든 1이라 구분 못 한다).
+        let script = format!(
+            "n=$(cat '{cf}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{cf}'; \
+             if [ \"$n\" -le 2 ]; then echo 'cannot connect to the docker daemon' >&2; exit 1; fi; \
+             cat <<'NDJSON'\n{out}NDJSON",
+            cf = count_file.display(),
+            out = REAL_DF_OUTPUT
+        );
+        let bin = fake_docker_bin(&dir, &script);
+
+        let quotas = aic_common::SpoolQuotas {
+            metrics: 1024 * 1024,
+            logs: 1024 * 1024,
+            app_logs: 1024 * 1024,
+        };
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool = Arc::new(Spool::open(spool_dir.path().to_path_buf(), quotas).unwrap());
+        let health = Arc::new(super::super::ExporterHealth::new(
+            "http://127.0.0.1:1".to_string(),
+            spool.clone(),
+        ));
+        let cfg = DockerConfig {
+            endpoint: "http://127.0.0.1:1".to_string(), // 죽은 endpoint — push는 실패하지만 캡처와 무관.
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            interval: Duration::from_millis(5),
+            docker_bin: Some(bin.clone()),
+            configured_bin: None,
+            timeout: Duration::from_secs(5),
+            spool: spool.clone(),
+            health,
+        };
+        // current 가 항상 Some(bin)이라 resolver는 불리지 않는다(데몬 down은 재탐색 안 함) — 더미.
+        let resolver = |_: Option<&Path>| -> Option<PathBuf> { None };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let events = capture_events(|| {
+            rt.block_on(async {
+                let (tx, rx) = watch::channel(false);
+                let serve = serve_docker_with(cfg, rx, &resolver);
+                tokio::pin!(serve);
+                // **시계가 아니라 관찰로** 끝낸다: 복구(캡처 성공→spool 적재)가 실제로 일어날 때까지
+                // 기다렸다가 shutdown한다. 시간 기반이면 부하가 큰 병렬 실행에서 tick 수가 모자라
+                // flaky해진다(실측: 3s 고정이 풀 스위트 병렬에서 간헐 실패). 안전 상한만 넉넉히 둔다.
+                let _ = tokio::time::timeout(Duration::from_secs(20), async {
+                    loop {
+                        tokio::select! {
+                            _ = &mut serve => break,
+                            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                                if spool.batch_count() > 0 {
+                                    // 캡처가 성공해 spool에 쌓였다 = 복구가 일어났고 그 INFO도 이미 났다.
+                                    tx.send_replace(true);
+                                    let _ = (&mut serve).await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .await;
+            });
+        });
+
+        // 데몬-down WARN은 push-실패 WARN 등과 메시지로 구분해 센다.
+        let down_warns = count_msg(&events, tracing::Level::WARN, "캡처 실패(데몬 down");
+        assert_eq!(
+            down_warns, 1,
+            "데몬 down이 지속되는데 캡처 WARN이 {down_warns}번 — 전이-알림 배선이 끊겼다(매 tick 폭주)"
+        );
+        let recovery = count_msg(&events, tracing::Level::INFO, "정상으로 돌아왔다");
+        assert_eq!(
+            recovery, 1,
+            "복구 INFO가 {recovery}번 — 데몬이 다시 뜬 전이를 한 번 알려야 한다"
         );
     }
 }
