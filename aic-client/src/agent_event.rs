@@ -38,9 +38,28 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// 넉넉하되(64KiB), IPC 프레임 상한(`aic_common::ipc::MAX_FRAME_PAYLOAD_BYTES`, 16MiB)에는 한참
 /// 못 미친다 — 1MB 메모 같은 병적 입력이 프레임 상한에 닿는 일을 미리 막는다(F16).
 ///
-/// **최종 바이트의 진짜 상한이다**: [`Memo::sanitize`]가 redaction을 **먼저** 하고 그 결과를 절단하므로,
+/// **최종 저장 바이트의 진짜 상한이다**: [`Memo::sanitize`]가 redaction 후 이 값으로 2차 절단하므로,
 /// `[REDACTED:…]` 치환이 길이를 늘려도 저장/전송되는 바이트는 이 값을 넘지 않는다.
+///
+/// 단, 이건 **저장 상한**이지 **처리 상한**이 아니다 — regex가 보는 입력 크기는 [`MEMO_REDACT_INPUT_MAX`]가
+/// 따로 막는다(무제한 입력을 regex에 넘기면 ReDoS·메모리 압박 표면이 된다).
 pub const MEMO_MAX_BYTES: usize = 64 * 1024;
+
+/// redaction **전** 1차 절단 상한(**처리 상한**) — regex가 보는 입력을 유계로 만든다.
+///
+/// 왜 별도 상한인가(11차 코디네이터 지시의 미완성 보완): [`Memo::sanitize`]는 redaction을 먼저 하고
+/// 그 결과를 자르는데(저장 상한이 진짜 상한이 되도록), 절단이 맨 뒤라 **redaction regex가 상한 없는
+/// 원문 전체를 본다.** 3MB 메모면 3MB 전체에 regex를 돌린다 — `MEMO_MAX_BYTES`는 저장 바이트만 막지
+/// 처리 비용(CPU/메모리)은 못 막아 ReDoS·거대 입력 압박의 표면이 된다. 그래서 redaction **전에** 원문을
+/// 이 값으로 1차 절단해 regex 입력을 유계로 만든다.
+///
+/// `MEMO_MAX_BYTES × 8`인 근거:
+/// - **성장 여유**: redaction 최대 성장은 짧은 이메일(`a@b.co` 6B → `[REDACTED:email]` 16B ≈ 2.4배)로
+///   관측됐다. 8배는 그보다 넉넉해, 1차로 자른 입력이 redaction 후 저장 상한을 못 채우는 일이 없다.
+/// - **정상 메모 미손상**: 사람이 손으로 남기는 메모는 수 KB 규모라 512KiB(=8×64KiB)에 한참 못 미친다.
+///   1차 절단은 **병적 입력**(수 MB)에만 걸리고, 정상 메모는 redaction 전에 잘리지 않는다.
+/// - **처리 유계**: regex가 보는 입력이 512KiB로 상한 → µs∼ms급, 무제한 입력의 DoS 표면이 사라진다.
+const MEMO_REDACT_INPUT_MAX: usize = MEMO_MAX_BYTES * 8;
 
 /// agent가 셸 명령을 실행했다. 시스템을 바꿨을 수 있는 유일한 도구라 항상 보낸다.
 /// 차단된 명령은 여기가 아니라 [`risk_denied`]로 간다.
@@ -108,29 +127,46 @@ pub struct Memo {
 impl Memo {
     /// 원문을 **딱 한 번** 정제한다. 정제 후 비면(F15) `None` — 보낼 것도 저장할 것도 없다.
     ///
-    /// 순서가 중요하다(각 단계가 다음 단계의 입력을 바꾼다):
-    /// 1. **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
-    ///    않게. 개행/탭은 메모의 정상적인 부분이라 남긴다. ESC(`\x1b`)만 지워도 뒤따르는 CSI
-    ///    바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
-    /// 2. **redaction**(F14) — secret/PII 마스킹. `[REDACTED:…]` 치환은 **길이를 늘릴 수 있다**.
-    /// 3. **UTF-8 경계 보존 절단**(F16) — `MEMO_MAX_BYTES` 이하로.
+    /// 파이프라인은 **입력이 무한대여도 각 단계가 유계**여야 한다(11차 sweep). 순서:
+    /// 1. **1차 절단(처리 상한 `MEMO_REDACT_INPUT_MAX`)을 원문에 먼저** — 이 한 번의 절단이 **뒤의 모든
+    ///    단계**(제어문자 제거의 O(n) 할당, redaction regex)의 입력을 유계로 만든다. strip 앞에 두는
+    ///    이유: chat paste는 수십 MB일 수 있어, strip을 먼저 하면 그 할당이 무제한이 된다.
+    /// 2. **제어문자·ANSI escape 제거**(F17) — 화면을 깨지 않게. 개행/탭은 남긴다. ESC(`\x1b`)만 지워도
+    ///    뒤따르는 CSI 바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
+    /// 3. **redaction**(F14) — secret/PII 마스킹. `[REDACTED:…]` 치환은 **길이를 늘릴 수 있다**.
+    /// 4. **2차 절단(저장 상한 `MEMO_MAX_BYTES`)**(F16) — 최종 저장/전송 바이트를 진짜 상한 이하로.
     ///
-    /// **redaction을 절단보다 먼저** 하는 이유(9차→10차 교정): 예전엔 절단이 먼저라, redaction이
-    /// 길이를 늘리면 최종 저장/전송 바이트가 `MEMO_MAX_BYTES`를 넘을 수 있었다 — 상한이 실제 상한이
-    /// 아니었다. redaction 후 절단하면 **최종 바이트가 진짜로 상한 이하**가 된다. `cap_str`이 UTF-8
-    /// 경계를 지키므로 redaction 뒤에 잘라도 문자 중간이 깨지지 않는다. (downstream의 store·build_event
-    /// redaction은 idempotent라 여기서 이미 마스킹된 값에 다시 걸려도 무해하다.)
+    /// **왜 절단이 두 번인가**:
+    /// - redaction을 **저장 절단보다 먼저** 해야 저장 상한이 실제 상한이 된다(9차→10차 교정) — 치환이
+    ///   늘린 길이까지 2차 절단이 잡는다. `cap_str`이 UTF-8 경계를 지켜 문자 중간이 깨지지 않는다.
+    /// - 그런데 redaction이 맨 앞이면 **regex가 원문 전체(무제한)를 본다**(11차 보완) — 그래서 1차
+    ///   절단을 맨 앞에 둬 regex 입력(과 strip 할당)을 유계로 만든다. 저장 상한만으론 처리 비용
+    ///   (ReDoS·메모리)을 못 막는다.
+    ///
+    /// (downstream의 store·build_event redaction은 idempotent라 이미 마스킹된 값에 다시 걸려도 무해하다.)
     pub fn sanitize(raw: &str) -> Option<Self> {
-        let cleaned: String = raw
+        // 1차 절단(처리 상한)을 **맨 앞·원문에** — 이 아래 모든 단계의 입력이 이걸로 유계다.
+        let (bounded_raw, pre_truncated) =
+            crate::agent::tool_record::cap_str(raw, MEMO_REDACT_INPUT_MAX);
+        let cleaned: String = bounded_raw
             .chars()
             .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
             .collect();
+        // redact가 실제로 받는 입력 길이를 테스트가 관찰한다 — 1차 절단을 제거하면(무제한 입력이 regex에
+        // 감) 이 값이 상한을 넘어 `sanitize_bounds_redaction_input…`이 결정적으로(시계 무관) 깨진다.
+        #[cfg(test)]
+        test_redact_probe::record(cleaned.len());
         let redacted = redact(&cleaned);
-        let (text, truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
+        // 2차 절단(저장 상한): redaction이 늘린 최종 바이트를 진짜 상한 이하로.
+        let (text, post_truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
         if text.trim().is_empty() {
             return None;
         }
-        Some(Self { text, truncated })
+        // 1·2차 어느 쪽에서든 잘렸으면 "잘렸다".
+        Some(Self {
+            text,
+            truncated: pre_truncated || post_truncated,
+        })
     }
 
     /// 정제된 본문 — **로컬 저장과 원격 전송이 이 하나의 값을 공유한다**(둘이 각자 정규화하면
@@ -239,7 +275,17 @@ pub enum RecordOutcome {
     /// `Delivered`로 뭉개면 **모르는 것을 안다고 말하는 것**이다. 이 라운드에서 걸린 바로 그 종류의
     /// 거짓말이라, 모름은 모름으로 남긴다.
     Unknown,
-    /// **보내지 못했다** — aicd 미실행·응답 없음·timeout. 이건 probe가 아니라 **전송 실패 그 자체**다.
+    /// **write는 성공했는데 aicd 응답을 못 받았다**(read timeout 등). 메모가 소켓을 떠났으므로 aicd가
+    /// 받아 publish했을 수 있는데, 응답만 늦게/못 왔다.
+    ///
+    /// [`NotSent`](Self::NotSent)와 **다르다**: NotSent는 "확실히 안 나감"(connect/write 실패)이고,
+    /// 이건 "나갔을 수 있으나 수용 여부 모름"이다. read timeout을 NotSent로 뭉치면 도달했을 메모를
+    /// 유실로 오보한다. [`Unknown`](Self::Unknown)과도 다르다: Unknown은 aicd가 **받았음이 확실**하고
+    /// (Pong) 이후 도달만 모르지만, 여기선 aicd가 받았는지조차 모른다. verdict는 셋 다 `Unknown`이되
+    /// 문구가 각각 아는 만큼만 말한다.
+    SentNoReply,
+    /// **보내지 못했다** — connect/write 실패(미실행·backlog 포화·부분 write). 이건 probe가 아니라
+    /// **전송 실패 그 자체**이며, 메모가 소켓을 떠나지 못했음이 확실하다.
     NotSent,
     /// 소켓으로 보내는 데는 성공했지만 **데몬이 명시적으로 거절했다**(`IpcResponse::Error`, 또는
     /// 알 수 없는 응답). 메모는 버려졌다.
@@ -295,8 +341,27 @@ pub enum SendResult {
     Accepted,
     /// 데몬이 명시적으로 거절했거나(`Error`) 알 수 없는 응답을 줬다.
     Rejected(String),
-    /// 소켓 자체가 안 됐다(미실행·timeout·프레이밍 오류).
+    /// **write는 성공했는데 응답을 못 받았다**(read timeout·과대 length·응답 파싱 실패).
+    ///
+    /// 메모가 소켓을 **떠났다** — aicd가 받아 publish까지 했을 수 있는데 응답만 늦게/못 온 경우다.
+    /// 이걸 [`Failed`](Self::Failed)로 뭉치면 **도달했을 메모를 "안 보냈다"고 오보**한다. "보냈다"(write
+    /// 성공)와 "받아들여졌다"(응답 확인)는 다른 명제라는, 우리가 `Accepted`를 팔 때 세운 구분의 반대편이다.
+    SentNoReply,
+    /// **connect/write 단계에서 실패**(미실행·backlog 포화·부분 write) — 메모가 소켓을 떠나지 못했다.
+    /// 확실히 안 나갔다.
     Failed,
+}
+
+/// IPC 왕복 결과 — **실패 단계**를 구분한다(transport 내부). read 단계 실패("write는 됐으니 나갔을 수
+/// 있음")와 connect/write 단계 실패("확실히 안 나감")를 뭉치면 나간 메모를 유실로 오보하므로, 경계를
+/// write 성공 지점에 둔다.
+enum Roundtrip {
+    /// 응답을 받아 파싱까지 성공. `IpcResponse`가 큰 enum이라 box로 담아 variant 크기 편차를 줄인다.
+    Replied(Box<IpcResponse>),
+    /// connect/write 이전·도중 실패 — 메모가 **소켓을 떠나지 못했다**.
+    SendFailed,
+    /// write 성공 후 실패(read timeout·과대 length·파싱 실패) — 메모가 **나갔을 수 있으나** 수용 여부 모름.
+    NoReply,
 }
 
 impl RecordOutcome {
@@ -327,8 +392,15 @@ impl RecordOutcome {
                  없습니다."
                     .to_string(),
             ),
+            // "보냈지만 응답을 못 받았다" — aicd가 받았는지조차 모른다(Unknown은 Pong으로 수용이
+            // 확실했지만 여기선 아니다). "보내지 못했습니다"(NotSent)라고 하면 나갔을 메모를 유실로
+            // 오보하는 거짓말이라, 아는 만큼만 말한다.
+            RecordOutcome::SentNoReply => Some(
+                "메모를 보냈지만 aicd 응답을 확인하지 못했습니다 — 받았는지 알 수 없습니다."
+                    .to_string(),
+            ),
             RecordOutcome::NotSent => Some(
-                "원격 전송 실패(aicd 미실행·응답 없음) — 이 메모는 서버에 남지 않습니다."
+                "원격 전송 실패(aicd 미실행·연결 불가) — 이 메모는 서버에 남지 않습니다."
                     .to_string(),
             ),
             RecordOutcome::Rejected(why) => Some(format!(
@@ -368,8 +440,11 @@ impl RecordOutcome {
     pub fn verdict(&self) -> RemoteVerdict {
         match self {
             RecordOutcome::Delivered { .. } => RemoteVerdict::Reaches,
-            // 도달 여부를 확인할 수 없는 두 경우 — 단정하지 않는다.
-            RecordOutcome::Unknown | RecordOutcome::AgentExporterDown => RemoteVerdict::Unknown,
+            // 도달 여부를 확인할 수 없는 경우들 — 단정하지 않는다. `SentNoReply`(응답 못 받음)와
+            // `AgentExporterDown`(방금 죽었을 수 있음) 모두 유실을 확정할 근거가 없다.
+            RecordOutcome::Unknown
+            | RecordOutcome::SentNoReply
+            | RecordOutcome::AgentExporterDown => RemoteVerdict::Unknown,
             // 구독자가 애초에 없었음이 확실한 경우들.
             RecordOutcome::NotSent
             | RecordOutcome::Rejected(_)
@@ -405,6 +480,8 @@ fn classify_outcome(
     // 1) 전송 계층/데몬 수용 여부가 먼저다. 그 어떤 probe도 이 사실을 뒤집지 못한다.
     match sent {
         SendResult::Failed => return RecordOutcome::NotSent,
+        // write는 성공했으나 응답을 못 받았다 — 나갔을 수 있으니 "안 보냈다"(NotSent)로 뭉치지 않는다.
+        SendResult::SentNoReply => return RecordOutcome::SentNoReply,
         SendResult::Rejected(why) => return RecordOutcome::Rejected(why),
         SendResult::Accepted => {}
     }
@@ -432,20 +509,22 @@ fn classify_outcome(
     }
 }
 
-/// IPC 응답을 [`SendResult`]로 접는다(순수 함수). **성공 응답일 때만 `Accepted`다** — 알 수 없는
+/// IPC 왕복 결과를 [`SendResult`]로 접는다(순수 함수). **성공 응답일 때만 `Accepted`다** — 알 수 없는
 /// 응답 variant도 성공으로 세지 않는다(모르는 응답을 성공으로 낙관하면 그게 곧 다음 거짓말이 된다).
-fn to_send_result(res: std::io::Result<IpcResponse>) -> SendResult {
-    match res {
-        Ok(IpcResponse::Pong) => SendResult::Accepted,
-        Ok(IpcResponse::Error { message }) => SendResult::Rejected(message),
-        // 이 요청에 올 수 없는 응답 — 프로토콜이 어긋난 것이니 성공이라 볼 근거가 없다.
-        Ok(other) => SendResult::Rejected(format!("예상하지 못한 응답: {other:?}")),
-        Err(e) => {
-            // 소켓 자체가 안 됐다(미실행·timeout). 사용자에게는 "aicd 미실행"으로 접어서 보여주므로
-            // 원인 문자열은 여기서 흘리지 않는다.
-            let _ = e;
-            SendResult::Failed
-        }
+/// 그리고 **`NoReply`(write 성공 후 응답 실패)를 `Failed`로 뭉치지 않는다** — 나갔을 메모를 유실로
+/// 오보하지 않으려는 게 이 함수의 핵심이다.
+fn to_send_result(rt: Roundtrip) -> SendResult {
+    match rt {
+        Roundtrip::Replied(resp) => match *resp {
+            IpcResponse::Pong => SendResult::Accepted,
+            IpcResponse::Error { message } => SendResult::Rejected(message),
+            // 이 요청에 올 수 없는 응답 — 프로토콜이 어긋난 것이니 성공이라 볼 근거가 없다.
+            other => SendResult::Rejected(format!("예상하지 못한 응답: {other:?}")),
+        },
+        // connect/write 실패 = 확실히 안 나감.
+        Roundtrip::SendFailed => SendResult::Failed,
+        // write는 됐는데 응답을 못 받음 = 나갔을 수 있으나 수용 여부 모름.
+        Roundtrip::NoReply => SendResult::SentNoReply,
     }
 }
 
@@ -463,11 +542,15 @@ pub async fn exporter_status_async() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query_async(&IpcRequest::GetExporterStatus).await)
 }
 
-/// IPC 결과에서 `ExporterStatus`를 뽑는다. 구버전 aicd는 unknown request를 graceful Error로
-/// 답하므로 그 응답도 "조회 불가"(None)로 접는다.
-fn to_exporter_status(res: std::io::Result<IpcResponse>) -> Option<aic_common::ExporterStatus> {
-    match res {
-        Ok(IpcResponse::ExporterStatus(s)) => Some(s),
+/// IPC 왕복 결과에서 `ExporterStatus`를 뽑는다. 구버전 aicd는 unknown request를 graceful Error로
+/// 답하므로 그 응답도 "조회 불가"(None)로 접는다. 상태 조회는 실패 단계를 구분할 필요가 없어
+/// (SendFailed·NoReply 모두 "상태 모름") `Replied` 외엔 전부 None이다.
+fn to_exporter_status(rt: Roundtrip) -> Option<aic_common::ExporterStatus> {
+    match rt {
+        Roundtrip::Replied(resp) => match *resp {
+            IpcResponse::ExporterStatus(s) => Some(s),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -536,51 +619,65 @@ fn redact(s: &str) -> String {
     crate::redaction::redact(s).0
 }
 
-/// 요청을 보내고 응답을 파싱해 돌려준다(실 aicd 소켓). 프레임은 length-prefixed JSON(`encode_frame`).
+/// 요청을 보내고 응답을 받아 돌려준다(실 aicd 소켓). 프레임은 length-prefixed JSON(`encode_frame`).
 #[cfg(not(test))]
-fn query(req: &IpcRequest) -> std::io::Result<IpcResponse> {
+fn query(req: &IpcRequest) -> Roundtrip {
     query_at(&aic_common::aicd_socket_path(), req)
 }
 
 /// 테스트에서는 **실 aicd 소켓을 절대 건드리지 않는다**. 쓰기 경로는 [`dispatch`]가 sink로 돌리지만,
 /// 읽기 경로(`exporter_status` → `sys_sampler::sample`)가 남아 있으면 테스트 결과가 "이 개발 머신에
 /// aicd가 떠 있는가"에 따라 달라진다 — 이 저장소가 금지하는 바로 그 패턴이다(테스트는 코드의
-/// 불변식을 검증해야지 머신 상태를 반영하면 안 된다). 데몬 없음(=Err)으로 고정해 결정적으로 만든다.
-/// 전송 계층 자체는 [`query_at`]에 경로를 주입해 따로 검증한다.
+/// 불변식을 검증해야지 머신 상태를 반영하면 안 된다). 데몬 없음(=SendFailed)으로 고정한다.
+/// 전송 계층 자체는 [`query_at`]에 경로를 주입해 따로 검증한다(fake 서버로 NoReply까지).
 #[cfg(test)]
-fn query(_req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "테스트에서는 실 aicd에 연결하지 않는다",
-    ))
+fn query(_req: &IpcRequest) -> Roundtrip {
+    Roundtrip::SendFailed
 }
 
 /// 소켓 경로를 **주입받는** sync IPC. 프로덕션은 [`query`]가 실 경로를 넣고, 테스트는 존재하지 않는
-/// 경로를 넣어 "데몬이 없을 때 조용히 실패하는가"를 실 aicd 없이 검증한다.
-fn query_at(socket: &std::path::Path, req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    let payload = serde_json::to_vec(req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+/// 경로(→ SendFailed)나 fake 서버(→ NoReply)를 주입해 각 단계를 실 aicd 없이 검증한다.
+///
+/// **실패 단계를 [`Roundtrip`]으로 구분한다**: connect/write 이전·도중 실패는 `SendFailed`(확실히
+/// 안 나감), write 성공 후 실패는 `NoReply`(나갔을 수 있음). 경계는 **write+flush 성공 지점**이다 —
+/// 그 전 실패는 부분 write든 connect 실패든 aicd가 유효 프레임을 못 받으므로 안 나간 것이고, 그 후
+/// 실패(read timeout 등)는 프레임이 이미 커널로 넘어갔으므로 나갔을 수 있다.
+fn query_at(socket: &std::path::Path, req: &IpcRequest) -> Roundtrip {
+    let Ok(payload) = serde_json::to_vec(req) else {
+        return Roundtrip::SendFailed;
+    };
     // **`UnixStream::connect`를 쓰지 않는다** — 상한이 없다([`connect_unix_timeout`] 참고).
-    let mut stream = connect_unix_timeout(socket, IO_TIMEOUT)?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(&encode_frame(&payload))?;
-    stream.flush()?;
+    let Ok(mut stream) = connect_unix_timeout(socket, IO_TIMEOUT) else {
+        return Roundtrip::SendFailed;
+    };
+    if stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
+        || stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
+    {
+        return Roundtrip::SendFailed;
+    }
+    // write_all은 전부 쓰거나 Err(부분 write 포함) — Err면 aicd가 유효 프레임을 못 받으니 SendFailed.
+    if stream.write_all(&encode_frame(&payload)).is_err() || stream.flush().is_err() {
+        return Roundtrip::SendFailed;
+    }
 
+    // ── 여기부터 프레임은 나갔다. 이후 실패는 전부 NoReply(나갔을 수 있으나 수용 여부 모름). ──
     // 4바이트 길이 헤더 → 본문. 상한을 두어 손상된 헤더가 거대한 할당으로 이어지지 않게 한다.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
+    if stream.read_exact(&mut len_buf).is_err() {
+        return Roundtrip::NoReply;
+    }
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_RESPONSE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("응답이 너무 큼: {len} bytes"),
-        ));
+        return Roundtrip::NoReply; // 응답은 왔으나 못 쓴다 — 수용 여부는 여전히 모름.
     }
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body)?;
-    serde_json::from_slice(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    if stream.read_exact(&mut body).is_err() {
+        return Roundtrip::NoReply;
+    }
+    match serde_json::from_slice(&body) {
+        Ok(resp) => Roundtrip::Replied(Box::new(resp)),
+        Err(_) => Roundtrip::NoReply,
+    }
 }
 
 /// EAGAIN(backlog 가득) 재시도 간격. 아래 [`connect_unix_timeout`]의 실측 근거 참고.
@@ -806,51 +903,73 @@ fn socket_error(fd: std::os::unix::io::RawFd) -> std::io::Result<libc::c_int> {
 /// 소켓이 닫히고 스레드가 남지 않는다. 그래서 여기서는 sync를 감싸는 대신 **async I/O로 다시 쓴다** —
 /// `timeout`이 connect·write·read 전 구간을 덮으므로, aicd가 hang이든 미실행이든 `IO_TIMEOUT` 안에
 /// 확실히 풀려나고 아무것도 pin되지 않는다.
+/// **실패 단계를 [`Roundtrip`]으로 구분**하면서 전 구간을 `IO_TIMEOUT` 하나로 덮는다.
+///
+/// sync `query_at`처럼 경계는 **write+flush 성공 지점**이다: 그 전(connect·write) 실패/timeout은
+/// `SendFailed`(안 나감), 그 후(read) 실패/timeout은 `NoReply`(나갔을 수 있음). 예전엔 바깥 timeout
+/// 하나가 connect~read를 통째로 덮어 **어느 단계에서 끊겼는지 몰랐다** — read timeout을 SendFailed로
+/// 오판해 나간 메모를 유실로 오보하던 자리다.
+///
+/// 각 단계에 **같은 절대 deadline**(`timeout_at`)을 줘서 총합이 `IO_TIMEOUT`을 넘지 않게 한다(단계마다
+/// 새 timeout을 주면 최대 3배로 늘어난다). `spawn_blocking`이 아니라 async I/O인 이유는 [`Roundtrip`]
+/// 없던 옛 `query_async` 주석과 동일하다 — future를 drop하면 소켓이 닫혀 스레드가 pin되지 않는다.
 #[cfg(not(test))]
-async fn query_async(req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    tokio::time::timeout(IO_TIMEOUT, query_async_inner(req))
-        .await
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "aicd 응답 timeout",
-            ))
-        })
+async fn query_async(req: &IpcRequest) -> Roundtrip {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout_at;
+
+    let Ok(payload) = serde_json::to_vec(req) else {
+        return Roundtrip::SendFailed;
+    };
+    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+
+    // connect (실패/timeout = 안 나감).
+    let connect = timeout_at(
+        deadline,
+        tokio::net::UnixStream::connect(aic_common::aicd_socket_path()),
+    );
+    let Ok(Ok(mut stream)) = connect.await else {
+        return Roundtrip::SendFailed;
+    };
+
+    // write + flush (실패/timeout = 유효 프레임 못 보냄 = 안 나감).
+    let frame = encode_frame(&payload);
+    let write = timeout_at(deadline, async {
+        stream.write_all(&frame).await?;
+        stream.flush().await
+    });
+    if !matches!(write.await, Ok(Ok(()))) {
+        return Roundtrip::SendFailed;
+    }
+
+    // ── 여기부터 프레임은 나갔다. 이후 실패는 전부 NoReply. ──
+    let read = timeout_at(deadline, async {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_RESPONSE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "응답이 너무 큼",
+            ));
+        }
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await?;
+        Ok::<Vec<u8>, std::io::Error>(body)
+    });
+    let Ok(Ok(body)) = read.await else {
+        return Roundtrip::NoReply;
+    };
+    match serde_json::from_slice(&body) {
+        Ok(resp) => Roundtrip::Replied(Box::new(resp)),
+        Err(_) => Roundtrip::NoReply,
+    }
 }
 
 /// sync [`query`]와 같은 이유로 테스트에서는 소켓에 나가지 않는다.
 #[cfg(test)]
-async fn query_async(_req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "테스트에서는 실 aicd에 연결하지 않는다",
-    ))
-}
-
-/// [`query_async`]의 본체(취소 가능). timeout은 호출부가 전 구간에 씌운다.
-#[cfg(not(test))]
-async fn query_async_inner(req: &IpcRequest) -> std::io::Result<IpcResponse> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let payload = serde_json::to_vec(req)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut stream = tokio::net::UnixStream::connect(aic_common::aicd_socket_path()).await?;
-    stream.write_all(&encode_frame(&payload)).await?;
-    stream.flush().await?;
-
-    // sync 경로와 동일한 프레이밍(4바이트 길이 헤더 → 본문)과 동일한 할당 상한.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_RESPONSE_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("응답이 너무 큼: {len} bytes"),
-        ));
-    }
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await?;
-    serde_json::from_slice(&body)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+async fn query_async(_req: &IpcRequest) -> Roundtrip {
+    Roundtrip::SendFailed
 }
 
 /// 테스트 전용 이벤트 sink — `cargo test`가 개발 머신의 **실 aicd에 가짜 이벤트를 밀어 넣지 않도록**
@@ -861,6 +980,30 @@ async fn query_async_inner(req: &IpcRequest) -> std::io::Result<IpcResponse> {
 /// **주의**: `#[cfg(test)]`는 이 크레이트의 unit test에만 걸린다 — `tests/`의 integration test는
 /// 라이브러리를 cfg(test) 없이 링크하므로 여기 오지 않는다(현재 agent_event를 쓰는 integration
 /// test는 없다).
+/// 테스트 전용 — `Memo::sanitize`가 **redact에 넘긴 입력 길이**를 기록한다. 처리 상한(1차 절단)이
+/// 실제로 적용됐는지 **시계 없이 결정적으로** 관찰하려는 것이다(시간 기반 테스트는 flaky). 1차 절단을
+/// 제거하면 이 값이 상한을 넘어 테스트가 깨진다. thread-local이라 병렬 테스트끼리 섞이지 않는다
+/// (`Memo::sanitize`는 handle_record의 spawn_blocking **이전**, 같은 스레드에서 불린다).
+#[cfg(test)]
+pub(crate) mod test_redact_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LAST_INPUT_LEN: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn record(len: usize) {
+        LAST_INPUT_LEN.with(|c| c.set(Some(len)));
+    }
+    pub(crate) fn reset() {
+        LAST_INPUT_LEN.with(|c| c.set(None));
+    }
+    /// 마지막 `Memo::sanitize`가 redact에 넘긴 입력 길이(호출 없었으면 `None`).
+    pub(crate) fn last_input_len() -> Option<usize> {
+        LAST_INPUT_LEN.with(|c| c.get())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_sink {
     use super::{AgentEvent, SendResult};
@@ -1031,22 +1174,56 @@ mod tests {
     }
 
     #[test]
-    fn query_without_daemon_fails_quietly_instead_of_panicking() {
-        // aicd가 없을 때(미실행) 조용히 Err로 떨어지고 패닉하지 않아야 한다 — 정상 경로다(F19).
-        // **실 소켓을 쓰지 않는다**: 존재하지 않는 경로를 주입해 "데몬 없음"을 결정적으로 만든다.
-        // 예전 이 테스트는 실 aicd 경로로 나갔는데, 그러면 개발 머신에 aicd가 떠 있느냐에 따라
-        // 다른 코드를 실행하는 데다(회귀를 못 잡는다) 실 데몬을 오염시켰다.
+    fn query_without_daemon_is_send_failed_not_no_reply() {
+        // aicd가 없을 때(connect 실패) `SendFailed`여야 한다 — 소켓을 못 열었으니 프레임이 나가지도
+        // 못했다. 이걸 NoReply("나갔을 수 있음")로 오판하면 안 된다. **실 소켓을 쓰지 않는다**:
+        // 존재하지 않는 경로를 주입해 "데몬 없음"을 결정적으로 만든다.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-aicd.sock");
-        let res = query_at(&missing, &IpcRequest::GetExporterStatus);
-        assert!(res.is_err(), "없는 소켓인데 성공했다");
-        // 그리고 이 실패는 to_exporter_status를 통해 "조회 불가"(None)로 접힌다 — 그 상태에서
-        // 전송까지 실패했다면(데몬이 없으니 당연히) 결론은 NotSent다.
-        assert_eq!(to_exporter_status(res), None);
+        let rt = query_at(&missing, &IpcRequest::GetExporterStatus);
+        assert!(
+            matches!(rt, Roundtrip::SendFailed),
+            "없는 소켓(connect 실패)인데 SendFailed가 아니다"
+        );
+        // 상태 조회로는 "조회 불가"(None)로 접히고, 전송 결과로는 NotSent다(확실히 안 나감).
+        assert_eq!(to_exporter_status(rt), None);
+        assert_eq!(to_send_result(Roundtrip::SendFailed), SendResult::Failed);
         assert_eq!(
             classify_outcome(SendResult::Failed, None),
             RecordOutcome::NotSent
         );
+    }
+
+    #[test]
+    fn read_timeout_after_write_is_sent_no_reply_not_failed() {
+        // **게이트 1의 본체**: fake 서버가 요청을 받되 **응답을 안 보내면**, client는 write까지 성공한
+        // 뒤 read가 timeout된다 — 프레임은 이미 나갔으니 `NoReply`(나갔을 수 있음)여야지 `SendFailed`
+        // (안 나감)가 아니다. read timeout을 SendFailed로 뭉치면 도달했을 메모를 유실로 오보한다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mute.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // 요청을 받아 읽기만 하고 응답은 절대 안 보내는 서버 — accept한 소켓을 살려 둬 연결을 유지한다.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                use std::io::Read;
+                let mut buf = [0u8; 64];
+                let _ = s.read(&mut buf); // 요청은 읽되 응답은 안 씀
+                std::thread::sleep(IO_TIMEOUT * 3); // client read가 timeout날 때까지 소켓 유지
+            }
+        });
+
+        let rt = query_at(&path, &IpcRequest::GetExporterStatus);
+        assert!(
+            matches!(rt, Roundtrip::NoReply),
+            "write 성공 후 read timeout인데 NoReply가 아니다"
+        );
+        assert_eq!(to_send_result(Roundtrip::NoReply), SendResult::SentNoReply);
+        // 그리고 사후 결과는 NotSent가 아니라 SentNoReply(verdict Unknown)다.
+        let outcome = classify_outcome(SendResult::SentNoReply, None);
+        assert_eq!(outcome, RecordOutcome::SentNoReply);
+        assert_eq!(outcome.verdict(), RemoteVerdict::Unknown);
+        assert_ne!(outcome, RecordOutcome::NotSent, "나간 메모를 유실로 오보");
+        let _ = server.join();
     }
 
     #[test]
@@ -1256,25 +1433,28 @@ mod tests {
         // **"보냈다"(전송 계층)와 "받아들여졌다"(데몬)는 다른 명제다.** 소켓 write가 성공해도 데몬이
         // `IpcResponse::Error`로 거절하면 그 메모는 버려진 것이다 — 예전엔 `.is_ok()`만 봐서 거절을
         // 성공으로 셌고, 그 위에 "원격에 기록됐습니다"를 얹었다.
-        assert_eq!(to_send_result(Ok(IpcResponse::Pong)), SendResult::Accepted);
+        assert_eq!(
+            to_send_result(Roundtrip::Replied(Box::new(IpcResponse::Pong))),
+            SendResult::Accepted
+        );
 
         // 명시적 거절 → 실패. 이유(에러 메시지)를 보존해 사용자에게 보여준다(왜 거절됐는지가 진단이다).
-        let rejected = to_send_result(Ok(IpcResponse::Error {
+        let rejected = to_send_result(Roundtrip::Replied(Box::new(IpcResponse::Error {
             message: "bus full".to_string(),
-        }));
+        })));
         assert_eq!(rejected, SendResult::Rejected("bus full".to_string()));
 
         // 이 요청에 올 수 없는 응답도 성공으로 낙관하지 않는다 — 모르는 응답을 성공으로 세는 게
         // 바로 다음 거짓말의 씨앗이다.
-        let weird = to_send_result(Ok(IpcResponse::Lines(vec![])));
+        let weird = to_send_result(Roundtrip::Replied(Box::new(IpcResponse::Lines(vec![]))));
         assert!(
             matches!(weird, SendResult::Rejected(_)),
             "예상 못 한 응답을 성공으로 셌다: {weird:?}"
         );
 
-        // 소켓 자체 실패 → 전송 실패.
-        let io_err = Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no sock"));
-        assert_eq!(to_send_result(io_err), SendResult::Failed);
+        // connect/write 실패 → 전송 실패(확실히 안 나감). read 실패는 별건이다(위 전용 테스트).
+        assert_eq!(to_send_result(Roundtrip::SendFailed), SendResult::Failed);
+        assert_eq!(to_send_result(Roundtrip::NoReply), SendResult::SentNoReply);
     }
 
     #[test]
@@ -1599,5 +1779,67 @@ mod tests {
         );
         // UTF-8 경계 안전(절단이 문자 중간을 깨면 String이 성립하지 않는다 — 명시 확인).
         assert!(m.text().is_char_boundary(m.text().len()));
+    }
+
+    #[test]
+    fn sanitize_bounds_redaction_input_so_regex_never_sees_unbounded() {
+        // 11차: redaction이 맨 앞이면 regex가 원문 전체(무제한)를 본다 — ReDoS·메모리 압박 표면.
+        // 1차 절단이 redact **입력**을 처리 상한으로 막는지, **시계 없이** probe로 결정적으로 본다.
+        //
+        // 성장하는 redaction(email)을 써서 공허 함정을 피한다(9차: AWS 키는 줄어들어 무의미했다).
+        // 입력을 처리 상한(512KiB)보다 훨씬 크게(≈700KB) 잡아 1차 절단이 반드시 걸리게 한다.
+        let raw = "a@b.co ".repeat(100_000); // ≈700KB > MEMO_REDACT_INPUT_MAX(512KiB)
+        assert!(
+            raw.len() > MEMO_REDACT_INPUT_MAX,
+            "테스트 입력이 처리 상한을 안 넘어 공허하다"
+        );
+
+        test_redact_probe::reset();
+        let _ = Memo::sanitize(&raw);
+
+        let redact_input =
+            test_redact_probe::last_input_len().expect("sanitize가 redact를 안 불렀다");
+        assert!(
+            redact_input <= MEMO_REDACT_INPUT_MAX,
+            "redact가 무제한 입력을 봤다(1차 절단 제거 회귀): {redact_input} > {MEMO_REDACT_INPUT_MAX}"
+        );
+        // 실제로 잘렸음을 확인(입력보다 작아졌다) — 상한과 우연히 같아서 통과하는 게 아니다.
+        assert!(
+            redact_input < raw.len(),
+            "1차 절단이 전혀 안 일어났다: {redact_input} == 원문 {}",
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn first_stage_cap_does_not_cut_normal_sized_memos() {
+        // 1차 상한을 너무 빡세게 잡으면 redaction 전에 정상 메모를 잘라버린다 — 그러면 안 된다.
+        // 사람이 남기는 정상 규모 메모(수 KB, 처리 상한에 한참 못 미침)는 1차에서 안 잘리고 그대로
+        // redact를 통과해야 한다.
+        let normal = "디스크가 이상하게 느립니다. ".repeat(500); // 수십 KB, MEMO_REDACT_INPUT_MAX 이하
+        assert!(normal.len() < MEMO_REDACT_INPUT_MAX);
+
+        test_redact_probe::reset();
+        let m = Memo::sanitize(&normal).expect("정상 메모");
+
+        // redact 입력이 원문 그대로다(1차 절단이 안 건드렸다 — secret이 없어 redact도 길이 불변).
+        assert_eq!(
+            test_redact_probe::last_input_len(),
+            Some(normal.len()),
+            "정상 메모가 1차 절단에서 손상됐다"
+        );
+        assert!(!m.truncated(), "정상 메모인데 절단됐다고 표시된다");
+        assert_eq!(m.text(), normal, "정상 메모 내용이 바뀌었다");
+    }
+
+    #[test]
+    fn first_stage_truncation_is_reported_as_truncated() {
+        // 1차(처리 상한)에서 잘려도 "잘렸다"에 포함돼야 한다 — 사용자에게 뒤가 사라졌음을 알린다.
+        // secret 없는 거대 입력이라 redaction은 길이를 안 바꾸고, **오직 1차 절단만** 잘림을 만든다
+        // (2차는 안 걸린다 — 이 잘림이 pre_truncated 경로로 보고되는지 격리 검증).
+        let huge = "가".repeat(1_000_000); // 3MB > 처리 상한
+        let m = Memo::sanitize(&huge).expect("거대 메모");
+        assert!(m.truncated(), "1차 절단됐는데 절단 표시가 없다");
+        assert!(m.text().len() <= MEMO_MAX_BYTES);
     }
 }
