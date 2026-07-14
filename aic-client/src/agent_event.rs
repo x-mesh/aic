@@ -81,8 +81,8 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 /// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
 ///
 /// sync 호출부(CLI `aic snapshot record --memo`)용. async 호출부(chat `handle_record`)는 tokio
-/// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 둘 다
-/// [`prepare_snapshot_event`] 하나를 지난다.
+/// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 이미 [`Memo::sanitize`]가
+/// 끝냈고(빈 메모면 `Memo` 자체가 안 만들어진다), 여기선 `build_snapshot_event`로 조립만 한다.
 ///
 /// **한 번만** 정제된 메모 — 정제 결과와 "그때 잘렸는가"를 **같이** 들고 다닌다.
 ///
@@ -152,7 +152,7 @@ pub fn snapshot_recorded(memo: &Memo, attrs: BTreeMap<String, String>) -> Record
 }
 
 /// [`snapshot_recorded`]의 async 판(chat `/record now <메모>`). 전송을 **async IPC**로 한다 —
-/// 이유는 [`query_async`] 문서 참고(sync IPC를 async에서 그냥 부르면 tokio worker가 막힌다).
+/// 이유는 `query_async` 문서 참고(sync IPC를 async에서 그냥 부르면 tokio worker가 막힌다).
 pub async fn snapshot_recorded_async(
     memo: &Memo,
     attrs: BTreeMap<String, String>,
@@ -304,8 +304,8 @@ impl RecordOutcome {
                  (복구되면 전송됩니다)."
             )),
             RecordOutcome::Unknown => Some(
-                "메모를 aicd에 전달했지만 exporter 상태를 확인하지 못해 **서버 도달 여부는 알 수 \
-                 없습니다**."
+                "메모를 aicd에 전달했지만 exporter 상태를 확인하지 못해 서버 도달 여부는 알 수 \
+                 없습니다."
                     .to_string(),
             ),
             RecordOutcome::NotSent => Some(
@@ -331,7 +331,7 @@ impl RecordOutcome {
             ),
             RecordOutcome::AgentExporterDown => Some(
                 "aicd는 받았지만 OTLP agent exporter가 떠 있지 않습니다(설정은 켜져 있음) — \
-                 기동 실패했거나 죽은 것이니 **aicd 로그를 확인하세요**. 이 메모는 서버에 \
+                 기동 실패했거나 죽은 것이니 aicd 로그를 확인하세요. 이 메모는 서버에 \
                  남지 않았을 수 있습니다."
                     .to_string(),
             ),
@@ -434,7 +434,7 @@ fn to_send_result(res: std::io::Result<IpcResponse>) -> SendResult {
 ///
 /// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
 /// 응답이 timeout됐다. `Some(status)`의 `enabled: false`는 "aicd는 살아있지만 exporter가 꺼져
-/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다([`classify_remote`]).
+/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다(`classify_outcome` 참고).
 pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query(&IpcRequest::GetExporterStatus))
 }
@@ -480,7 +480,7 @@ fn build_event(
 /// 등)는 fire-and-forget이라 결과를 무시해도 되지만, 무시는 **호출부의 선택**이어야지 전송 계층이
 /// 정보를 없애 버릴 일이 아니다.
 ///
-/// **테스트에서는 소켓 대신 in-process sink로 간다**([`test_sink`]) — `cargo test`가 개발 머신의
+/// **테스트에서는 소켓 대신 in-process sink로 간다**(`test_sink`) — `cargo test`가 개발 머신의
 /// 실 aicd에 가짜 이벤트를 밀어 넣고, exporter가 켜져 있으면 그게 **운영 이벤트 스토어까지 나가는**
 /// 사고를 막는다(이 저장소에서 실제로 난 적이 있다). "무엇을 보내는가"는 sink로 검증하고, "소켓이
 /// 없을 때 조용한가"는 [`query_at`]에 없는 경로를 주입해 검증한다 — 실 소켓은 어느 쪽에도 필요 없다.
@@ -541,7 +541,8 @@ fn query(_req: &IpcRequest) -> std::io::Result<IpcResponse> {
 fn query_at(socket: &std::path::Path, req: &IpcRequest) -> std::io::Result<IpcResponse> {
     let payload = serde_json::to_vec(req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut stream = UnixStream::connect(socket)?;
+    // **`UnixStream::connect`를 쓰지 않는다** — 상한이 없다([`connect_unix_timeout`] 참고).
+    let mut stream = connect_unix_timeout(socket, IO_TIMEOUT)?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.write_all(&encode_frame(&payload))?;
@@ -561,6 +562,217 @@ fn query_at(socket: &std::path::Path, req: &IpcRequest) -> std::io::Result<IpcRe
     stream.read_exact(&mut body)?;
     serde_json::from_slice(&body)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// EAGAIN(backlog 가득) 재시도 간격. 아래 [`connect_unix_timeout`]의 실측 근거 참고.
+const CONNECT_RETRY_SLICE: Duration = Duration::from_millis(10);
+
+/// 데드라인 — `IO_TIMEOUT`이 **connect 전 구간**에 걸리게 하는 단일 기준점.
+///
+/// 각 재시도마다 timeout을 새로 주면 상한이 무의미해진다(EINTR·EAGAIN이 반복되면 영원히 늘어난다).
+/// 그래서 시작 시각을 한 번 잡고 **남은 시간**만 나눠 준다. 순수 로직이라 syscall 없이 테스트된다.
+#[derive(Clone, Copy)]
+struct Deadline {
+    start: std::time::Instant,
+    budget: Duration,
+}
+
+impl Deadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            budget,
+        }
+    }
+
+    /// 남은 시간. 다 썼으면 `None`(= 만료). 남은 시간이 정확히 0인 경우도 만료로 본다
+    /// (`Some(0)`을 돌려주면 poll에 timeout=0을 주게 되어 만료를 만료로 다루지 않는다).
+    fn remaining(&self) -> Option<Duration> {
+        self.budget
+            .checked_sub(self.start.elapsed())
+            .filter(|left| !left.is_zero())
+    }
+}
+
+/// timeout 만료 에러(호출부가 `ErrorKind::TimedOut`으로 식별한다).
+fn connect_timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "aicd 소켓 connect timeout (backlog 포화 가능성)",
+    )
+}
+
+/// 어떤 에러 경로로 빠져나가도 fd를 닫는 가드(누수 금지). `into_raw`로 소유권을 넘길 때만 살아남는다.
+struct FdGuard(std::os::unix::io::RawFd);
+
+impl FdGuard {
+    /// 소유권을 호출부로 넘기고 Drop의 close를 막는다.
+    fn into_raw(self) -> std::os::unix::io::RawFd {
+        let fd = self.0;
+        std::mem::forget(self);
+        fd
+    }
+}
+
+impl Drop for FdGuard {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// **connect에 상한을 건 UDS 연결.** `std`에는 `UnixStream::connect_timeout`이 없다
+/// (`TcpStream`에만 있다). 그래서 `UnixStream::connect`는 **무한정 막힐 수 있고**,
+/// `set_read_timeout`/`set_write_timeout`은 **연결이 선 뒤에만** 적용되므로 그 구멍을 못 막는다.
+///
+/// 왜 실질 위험인가: aicd의 listen backlog가 가득 차면 connect가 막힌다. 그 자리에서 막히는 건
+/// chat의 **sync emit 경로**(`tool_run_command`/`risk_denied`/`finding_created`)와 status bar의
+/// `exporter_status()`다 — 사용자 눈앞에서 멈춘다. async 경로는 `tokio::time::timeout`이 전 구간을
+/// 덮으므로 sync 쪽만 구멍이었다.
+///
+/// **커널 실측**(추측이 아니라 두 플랫폼에서 직접 재현했다 — 교과서적 recipe와 다르다):
+/// - **Linux**: backlog가 가득 찬 AF_UNIX에 non-blocking connect → `EINPROGRESS`가 아니라
+///   **`EAGAIN`**. 그리고 그 소켓에 `poll(POLLOUT)`을 걸면 **즉시** 깬다(`revents=0x14`) —
+///   즉 poll로 기다리면 **스핀 루프**가 된다. 그래서 `EAGAIN`은 poll하지 않고 **짧게 자고 connect를
+///   재시도**한다(연결 상태로 진입한 게 아니라 "지금은 자리 없음"이라는 뜻이기 때문이다).
+///   blocking 소켓이었다면 여기서 그냥 멈춘다 — 그게 우리가 막으려는 바로 그 상황이다.
+/// - **macOS**: 같은 상황에서 즉시 `ECONNREFUSED`. 멈추지는 않지만, 상한이 있어도 손해가 없다.
+///
+/// `EINPROGRESS`(다른 커널/미래 대비) 경로는 poll로 기다린 뒤 **반드시 `SO_ERROR`를 확인**한다 —
+/// 실패한 connect도 writable로 깨어나므로, 이 확인을 빼면 실패를 성공으로 센다.
+fn connect_unix_timeout(path: &std::path::Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+
+    // sockaddr_un 구성 — 경로가 sun_path에 안 들어가면 **명확히 실패**한다. 조용히 잘라 붙이면
+    // 엉뚱한 소켓에 연결된다(가장 나쁜 실패).
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= std::mem::size_of_val(&addr.sun_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "소켓 경로가 sun_path 상한을 넘음: {} bytes (max {})",
+                bytes.len(),
+                std::mem::size_of_val(&addr.sun_path) - 1
+            ),
+        ));
+    }
+    for (slot, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *b as libc::c_char;
+    }
+
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let guard = FdGuard(fd); // 이 아래 어떤 경로로 나가도 fd가 닫힌다.
+
+    // macOS엔 SOCK_CLOEXEC가 없다 — fcntl로 따로 건다(Linux와 다름).
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let deadline = Deadline::new(timeout);
+    let addr_ptr = &addr as *const libc::sockaddr_un as *const libc::sockaddr;
+    let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+
+    loop {
+        if deadline.remaining().is_none() {
+            return Err(connect_timed_out());
+        }
+        let ret = unsafe { libc::connect(fd, addr_ptr, addr_len) };
+        if ret == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // 시그널에 깨졌다 — **남은 시간으로** 재시도한다(전체 timeout을 새로 주지 않는다).
+            Some(libc::EINTR) => continue,
+            // 이미 연결됨(직전 시도가 비동기로 성사된 경우).
+            Some(libc::EISCONN) => break,
+            // 연결 진행 중 — poll로 기다린 뒤 SO_ERROR로 진짜 성패를 확인한다.
+            Some(libc::EINPROGRESS) | Some(libc::EALREADY) => {
+                wait_writable(fd, deadline)?;
+                let soerr = socket_error(fd)?;
+                if soerr != 0 {
+                    return Err(std::io::Error::from_raw_os_error(soerr));
+                }
+                break;
+            }
+            // Linux AF_UNIX: backlog 포화. poll하면 즉시 깨어 스핀이 되므로(실측) 자고 재시도한다.
+            Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
+                let Some(left) = deadline.remaining() else {
+                    return Err(connect_timed_out());
+                };
+                std::thread::sleep(CONNECT_RETRY_SLICE.min(left));
+                continue;
+            }
+            _ => return Err(err),
+        }
+    }
+
+    // blocking으로 되돌린다 — set_read_timeout/set_write_timeout은 blocking 소켓을 전제로 동작한다.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { UnixStream::from_raw_fd(guard.into_raw()) })
+}
+
+/// fd가 writable해질 때까지 **남은 시간만큼** 기다린다. `EINTR`이면 남은 시간으로 재시도한다
+/// (매번 전체 timeout을 새로 주면 상한이 무의미해진다).
+fn wait_writable(fd: std::os::unix::io::RawFd, deadline: Deadline) -> std::io::Result<()> {
+    loop {
+        let Some(left) = deadline.remaining() else {
+            return Err(connect_timed_out());
+        };
+        let ms = left.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue; // 남은 시간으로 재시도
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(connect_timed_out());
+        }
+        // POLLOUT/POLLERR/POLLHUP 어느 쪽이든 깼다 — **성패 판정은 호출부의 SO_ERROR가 한다**.
+        return Ok(());
+    }
+}
+
+/// `SO_ERROR`를 읽는다. poll이 깨웠다는 사실만으로 connect 성공이라 볼 수 없다(실패한 connect도
+/// writable로 깨어난다) — 이 확인을 빼면 실패한 연결을 성공으로 센다.
+fn socket_error(fd: std::os::unix::io::RawFd) -> std::io::Result<libc::c_int> {
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(err)
 }
 
 /// async 호출부(chat `handle_record`)를 위한 IPC.
@@ -679,6 +891,124 @@ mod tests {
     /// 테스트용 — 원문을 한 번 정제해 `Memo`로 만든다(비면 패닉: 픽스처가 잘못된 것이다).
     fn memo(raw: &str) -> Memo {
         Memo::sanitize(raw).expect("테스트 픽스처가 빈 메모다")
+    }
+
+    // ── connect 상한(sync IPC의 유일한 구멍이었다) ──────────────────────────────
+
+    #[test]
+    fn deadline_shrinks_and_expires_and_never_renews() {
+        // 상한이 **전 구간**에 걸린다는 불변식의 핵심 — 재시도(EINTR/EAGAIN)마다 timeout을 새로
+        // 주면 상한이 무의미해진다. 시계·syscall 없이 순수 로직만 고정한다.
+        let d = Deadline::new(Duration::from_millis(50));
+        let first = d.remaining().expect("방금 만들었으니 남아 있어야");
+        assert!(first <= Duration::from_millis(50));
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            d.remaining().is_none(),
+            "예산을 다 썼는데 남은 시간이 있다고 한다(재시도마다 상한이 갱신되는 버그)"
+        );
+
+        // 예산 0은 즉시 만료(poll에 timeout=0을 넘겨 '만료를 만료로 다루지 않는' 경로 방지).
+        assert!(Deadline::new(Duration::ZERO).remaining().is_none());
+    }
+
+    #[test]
+    fn connect_rejects_path_too_long_for_sun_path_instead_of_truncating() {
+        // 조용히 잘라 붙이면 **엉뚱한 소켓에 연결**된다 — 가장 나쁜 실패다. 명확한 에러로 거절한다.
+        let long = std::path::PathBuf::from("/tmp").join("a".repeat(300));
+        let err = connect_unix_timeout(&long, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    #[test]
+    fn connect_succeeds_and_roundtrips_against_a_real_listener() {
+        // 상한을 걸면서 **정상 경로를 깨뜨리지 않았는지**(O_NONBLOCK 해제, SO_ERROR 오판 없음).
+        // 여기서 blocking으로 되돌리지 않으면 아래 read가 WouldBlock으로 깨진다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).unwrap();
+            s.write_all(b"pong!").unwrap();
+        });
+
+        let mut c = connect_unix_timeout(&path, Duration::from_millis(500)).expect("연결 실패");
+        c.write_all(b"ping!").unwrap();
+        let mut buf = [0u8; 5];
+        c.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"pong!");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_to_missing_socket_fails_fast_not_by_timing_out() {
+        // 데몬 미실행(정상 상태)은 **즉시** 에러여야 한다 — timeout까지 기다리면 그만큼 chat이 멈춘다.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.sock");
+        let t0 = std::time::Instant::now();
+        let err = connect_unix_timeout(&missing, Duration::from_secs(5)).unwrap_err();
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "없는 소켓인데 timeout까지 기다렸다: {:?}",
+            t0.elapsed()
+        );
+        assert_ne!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+    }
+
+    #[test]
+    fn connect_never_hangs_when_backlog_is_saturated() {
+        // **이 테스트가 게이트의 본체다**: aicd가 accept를 못 따라가면 backlog가 차고, 그때
+        // `UnixStream::connect`는 **상한 없이 막힌다**(std에 connect_timeout이 없다). 그 자리에서
+        // 멈추는 건 chat의 sync emit 경로와 status bar다.
+        //
+        // 커널 실측(추측이 아니라 두 플랫폼에서 재현):
+        // - **Linux**: backlog 포화 시 non-blocking connect가 `EAGAIN`을 낸다(=blocking이었다면
+        //   여기서 멈춘다). 따라서 우리 함수는 `TimedOut`으로 빠져나와야 한다. 상한이 없으면 이
+        //   테스트는 **영원히 끝나지 않는다**(= 회귀가 즉시 드러난다).
+        // - **macOS**: 같은 상황에서 즉시 `ECONNREFUSED`라 멈추지 않는다. 그래서 macOS에서 이
+        //   테스트가 검증하는 건 "행이 없다 + 유한 시간에 Err"까지다. 커널이 다른 것뿐이라 skip하지
+        //   않고, **두 플랫폼 공통 불변식**("절대 무한정 막히지 않는다")을 고정한다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        // backlog를 최소로 잡고 **accept하지 않는다**(리스너는 살려 둔다 — drop되면 ECONNREFUSED가 된다).
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            libc::listen(listener.as_raw_fd(), 0);
+        }
+
+        let timeout = Duration::from_millis(200);
+        let mut held = Vec::new(); // 성공한 연결은 살려 둬야 큐가 안 빈다.
+        let mut saw_err = false;
+        let t0 = std::time::Instant::now();
+        for _ in 0..256 {
+            match connect_unix_timeout(&path, timeout) {
+                Ok(s) => held.push(s),
+                Err(_) => {
+                    saw_err = true;
+                    break;
+                }
+            }
+            // 상한이 있으면 최악이라도 (시도 수 × timeout) 안에 끝난다. 무한정 막히면 여기 못 온다.
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "connect가 상한 없이 막혔다"
+            );
+        }
+
+        assert!(
+            saw_err,
+            "backlog를 채웠는데도 256번 모두 성공했다 — 이 테스트가 공허하다"
+        );
+        // 어떤 커널이든 **유한 시간**에 끝나야 한다(이게 이 게이트의 불변식이다).
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "connect가 상한 없이 막혔다: {:?}",
+            t0.elapsed()
+        );
     }
 
     #[test]

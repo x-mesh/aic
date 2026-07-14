@@ -910,13 +910,17 @@ enum SnapshotOp {
         #[arg(long)]
         force: bool,
     },
-    /// (t3 B3) 1회 캡처(= `capture --force`와 동일)에 사람이 남기는 메모를 붙인다. chat
-    /// `/record now <메모>`의 CLI 진입점 — cron/서버/스크립트에서도 "지금 이 순간이 이상하다"를
-    /// 기록할 수 있어야 하므로 별도 leaf로 둔다. 로컬 스냅샷 store 저장은 `capture --force`와
-    /// 동일하게 항상 일어나고, 메모는 OTLP `aic.agent`(`kind=snapshot.recorded`)로 별도 발화된다
-    /// (aicd 미실행이면 조용히 생략 — best-effort).
+    /// (t3 B3) 1회 캡처에 사람이 남기는 메모를 붙인다. chat `/record now <메모>`의 CLI 진입점 —
+    /// cron/서버/스크립트에서도 "지금 이 순간이 이상하다"를 기록할 수 있어야 하므로 별도 leaf로 둔다.
+    ///
+    /// 메모는 **로컬 스냅샷 레코드 안에** 저장되고(이게 본체다 — aicd 없이도 남는다), 그와 별개로
+    /// OTLP `aic.agent`(`kind=snapshot.recorded`)로도 발화된다. 원격이 실패하거나 aicd가 없으면
+    /// 그 사실을 stderr로 한 줄 안내한다(메모는 로컬에 남아 있으니 유실은 아니다).
+    ///
+    /// exit: 로컬 저장이 성공하면 0, 실패하면 1(스크립트가 반쪽 성공을 완전 성공으로 오인하지 않게).
     Record {
-        /// 기록할 메모(사람의 관찰). 빈 문자열/공백뿐이면 OTLP는 조용히 생략되고 로컬 캡처만 남는다.
+        /// 기록할 메모(사람의 관찰). 빈 문자열/공백뿐이면 저장·전송 모두 생략된다(빈 메모는 무의미).
+        /// 64KiB를 넘으면 잘리며, 잘렸다고 stderr로 알린다.
         #[arg(long)]
         memo: String,
     },
