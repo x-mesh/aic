@@ -101,7 +101,8 @@ const MAX_DF_OUTPUT_BYTES: usize = 256 * 1024;
 /// 없다"이지 "비활성"이 아니다.
 ///
 /// 탐색 순서: `configured`(config `[aicd.exporter].docker_bin`) → `PATH` → [`FALLBACK_DOCKER_DIRS`]
-/// → `$HOME/.orbstack/bin/docker`. 서비스 매니저의 빈약한 PATH를 폴백이 메워 준다(위 상수 doc 참고).
+/// → [`HOME_RELATIVE_DOCKER_PATHS`](`$HOME/.orbstack/bin/docker`, `$HOME/.docker/bin/docker`).
+/// 서비스 매니저의 빈약한 PATH를 폴백이 메워 준다(위 상수 doc 참고).
 pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
     resolve_docker_bin_with(
         configured,
@@ -133,8 +134,8 @@ pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
 ///
 /// # 쓰기 가능 경로와 root
 ///
-/// 폴백 목록에는 쓰기 가능한 디렉토리가 섞여 있다 — `$HOME/.orbstack/bin`(사용자 소유),
-/// `/usr/local/bin`(macOS에선 admin 그룹 쓰기 가능). 그럼에도 폴백을 두는 근거:
+/// 폴백 목록에는 쓰기 가능한 디렉토리가 섞여 있다 — `$HOME/.orbstack/bin`·`$HOME/.docker/bin`
+/// (사용자 소유), `/usr/local/bin`(macOS에선 admin 그룹 쓰기 가능). 그럼에도 폴백을 두는 근거:
 ///
 /// aicd는 **사용자 단위 서비스**로만 설치된다 — `~/Library/LaunchAgents/com.x-mesh.aicd.plist`
 /// (LaunchAgents, `UserName` 키 없음)와 `systemctl --user`(`aic-client/src/daemon_install.rs`).
@@ -1635,19 +1636,33 @@ mod tests {
     /// 그래서 root도 필요 없다 — 비-root에선 walk가 사용자 소유 tempdir base에서 거부하고,
     /// canonicalize는 시스템 대상을 통과시키므로, 어느 권한에서든 둘이 갈린다. 시스템에 root 통제 하의
     /// 실행 파일이 없으면(비정상 환경) 판별 전제가 없으니 skip한다.
+    ///
+    /// **순환 전제 금지(패널 지적)**: 전제("시스템 대상이 root 통제 하")를 **검증 대상 함수로 고르면**
+    /// (`find(is_root_controlled_path)`), 그 함수가 `return false`로 망가질 때 전제 선택도 같이 눈이 멀어
+    /// 테스트가 실패가 아니라 **skip으로 도망친다**(실측으로 확인함). 그래서 전제는 **독립적인 직접
+    /// stat**([`independently_root_controlled`])으로 세우고, 나아가 **양방향으로** 단언한다:
+    /// - **positive**: 시스템 대상 자신은 root 통제 하이므로 `is_root_controlled_path`가 **채택**해야 한다
+    ///   → `return false`(전면 거부, exporter 사망) 회귀를 잡는다.
+    /// - **negative**: 사용자 쓰기 가능 경로의 링크는 **거부**해야 한다 → `return true`(전면 채택)와
+    ///   canonicalize-revert(대상만 보기) 회귀를 잡는다.
     #[test]
     fn is_root_controlled_path_rejects_a_link_in_a_writable_dir_even_when_target_is_root_safe() {
-        // 링크 대상: canonicalize가 tempdir 밖으로 해소되도록 **시스템 root 소유 실행 파일**을 쓴다.
-        // 그 자체가 root 통제 하임을 실제 판정으로 확인해(= canonicalize-revert가 이 대상은 "통과"할)
-        // 것을 고른다. 이게 곧 이 테스트의 판별 전제다.
+        // 전제 확립은 **검증 대상과 독립적인** 직접 stat으로 한다(순환 금지).
         let sys_target = ["/bin/true", "/usr/bin/true", "/bin/sh", "/usr/bin/env"]
             .into_iter()
             .map(PathBuf::from)
-            .find(|p| is_root_controlled_path(p));
+            .find(|p| independently_root_controlled(p));
         let Some(sys_target) = sys_target else {
-            eprintln!("skip: root 통제 하의 시스템 실행 파일을 찾지 못함(판별 전제 없음)");
+            eprintln!("skip: (독립 stat 기준) root 통제 하의 시스템 실행 파일을 찾지 못함");
             return;
         };
+
+        // positive: root 통제 하 시스템 대상은 채택되어야 한다 — `return false` 회귀를 여기서 잡는다.
+        assert!(
+            is_root_controlled_path(&sys_target),
+            "root 통제 하 시스템 실행 파일({})을 거부했다 — 전면 거부 회귀(exporter 사망)",
+            sys_target.display()
+        );
 
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
@@ -1660,12 +1675,34 @@ mod tests {
         let link = unsafe_dir.join("docker");
         std::os::unix::fs::symlink(&sys_target, &link).unwrap();
 
-        // 실제로 실행되는 경로는 tempdir 안의 link이므로 walk는 그 사용자 쓰기 가능 성분을 보고 거부해야
+        // negative: 실행 경로는 tempdir 안의 link이므로 walk는 사용자 쓰기 가능 성분을 보고 거부해야
         // 한다. canonicalize로 되돌아가면 대상(시스템 root 실행 파일)의 상위만 봐 통과해 버린다.
         assert!(
             !is_root_controlled_path(&link),
             "is_root_controlled_path가 링크 경로 성분을 안 봤다 — canonicalize 방식으로 되돌아갔다(스왑 하이재킹)"
         );
+    }
+
+    /// [`is_root_controlled_path`]와 **독립적인** root-통제 판정(직접 stat). 회귀 가드 테스트가 자기
+    /// 검증 대상으로 전제를 고르는 순환을 피하려고 쓴다 — canonicalize된 경로와 모든 상위가 root
+    /// 소유(`uid==0`)이고 non-root 쓰기 불가(`mode & 0o022 == 0`)인지 본다. 시스템 경로엔 확장 ACL이
+    /// 없으므로 여기선 ACL을 보지 않는다(전제 확립용 최소 판정).
+    fn independently_root_controlled(p: &Path) -> bool {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(real) = std::fs::canonicalize(p) else {
+            return false;
+        };
+        let mut cur: Option<&Path> = Some(real.as_path());
+        while let Some(c) = cur {
+            let Ok(md) = std::fs::symlink_metadata(c) else {
+                return false;
+            };
+            if md.uid() != 0 || md.permissions().mode() & 0o022 != 0 {
+                return false;
+            }
+            cur = c.parent();
+        }
+        true
     }
 
     /// walk는 **실행 파일(경로의 끝)**에 도달해야 한다 — 디렉토리로 끝나면 거부한다.
@@ -1865,6 +1902,11 @@ mod tests {
 
     /// ACL이 없는 평범한 파일에는 `has_extended_acl`이 false여야 한다 — 여기서 true가 나오면 정상적인
     /// 시스템 경로(`/usr/bin`, `/`)를 전부 거부해 root aicd가 docker를 영영 못 쓴다(과잉 거부).
+    ///
+    /// **macOS/Linux 전용**: 그 밖의 unix에선 `has_extended_acl`이 fail-closed로 `true`를 반환하는 게
+    /// **옳은 정책**이라("모르면 신뢰 안 함") plain file도 `true`가 정답이다 — false를 기대하는 이
+    /// 테스트는 그 플랫폼에서 의미가 없다. 프로덕션 fallback과 같은 지원 정책으로 gate한다.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn has_extended_acl_is_false_for_a_plain_file() {
         let dir = tempfile::tempdir().unwrap();
