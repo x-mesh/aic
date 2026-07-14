@@ -233,27 +233,118 @@ fn resolve_docker_bin_with(
 /// 후보 경로가 **root 통제 하**에 있는가 — euid가 0일 때만 쓴다([`resolve_docker_bin_with`]의
 /// "쓰기 가능 경로와 root" 참고).
 ///
-/// 심볼릭 링크를 먼저 해소한 뒤(`canonicalize`) 최종 경로와 **모든 상위 디렉토리**를 훑어, 각각이
-/// [`is_root_controlled_meta`]를 만족하는지 본다. 링크를 해소하는 이유: root 소유 심볼릭 링크라도
-/// 그 **대상**이 사용자 쓰기 가능한 곳(`/Applications/OrbStack.app/...`)이면 하이재킹 통로다.
-/// 해소 후에는 경로에 링크가 남지 않으므로 각 성분의 mode 검사가 의미를 가진다.
+/// # 검사 대상은 "실제로 실행될 전 구간"이다 (canonicalize만으로는 절반이다)
+///
+/// 커널이 `execve(cand)`를 처리할 때 경로를 **한 성분씩** 내려가며 심볼릭 링크를 따라간다. 이때
+/// 실제로 실행될 바이너리를 바꿀 수 있는 지점은 셋이다:
+/// 1. 경로 위의 **모든 디렉토리** — 비-root가 쓸 수 있으면 성분을 rename/replace해 딴 데로 돌린다.
+/// 2. 경로 위의 **모든 심볼릭 링크** — 대상을 바꾸면 실행 파일이 바뀐다. 링크는 제자리 수정이 안 되고
+///    **자기가 놓인 디렉토리**를 통해서만 교체되므로, 링크의 부모 디렉토리가 곧 통제점이다(→ 1).
+/// 3. **최종 실행 파일** — 비-root가 쓸 수 있으면 내용을 갈아친다.
+///
+/// 그래서 **원칙은 "실행될 경로를 구성하는 어떤 성분도 비-root가 바꿀 수 없어야 한다"**이다. 이걸
+/// 커널과 똑같이 성분 단위로 내려가며 검사한다 — 디렉토리를 만나면 그 디렉토리를, 링크를 만나면
+/// (부모는 이미 검사했으니) 링크를 따라 대상 경로로 갈아타 계속, 최종 파일에서 파일 자신을 검사한다.
+///
+/// 예전 판은 `canonicalize(cand)`의 성분만 검사했다 — 이건 **대상**만 본다. 정작 spawn되는 건
+/// `cand`(예: `/usr/local/bin/docker`)인데, 그 링크가 놓인 `/usr/local/bin`을 아무도 검사하지
+/// 않았다. `/usr/local/bin`이 group-writable(Homebrew 기본 `0775 root:admin`)이면 admin 그룹이
+/// 링크를 스왑해 root aicd가 임의 바이너리를 실행하게 만든다 — 우리가 3라운드 전에 막은 것의
+/// **정확한 대칭**(그때는 root 링크 → 사용자 대상, 이번엔 사용자 디렉토리의 링크 → root 대상)이다.
+///
+/// **심볼릭 링크 자신의 mode는 보지 않는다**: 링크는 언제나 `0777 lrwxrwxrwx`라 mode 검사가 무의미
+/// 하다. 링크의 무결성은 순전히 부모 디렉토리(교체 가능 여부)가 좌우하고, 그 부모는 내려오는 길에
+/// 이미 검사했다.
+///
+/// `.`/`..` 성분이나 stat 실패는 **거부**한다(fail-closed) — root 운영자는 깨끗한 절대경로를 주면
+/// 된다. 심볼릭 루프 방어로 따라가는 링크 수에 상한을 둔다.
 fn is_root_controlled_path(p: &Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    is_root_controlled_walk(p, 0, &|path| {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(md) => {
+                is_root_controlled_meta(md.uid(), md.permissions().mode(), has_extended_acl(path))
+            }
+            Err(_) => false,
+        }
+    })
+}
 
-    let Ok(real) = std::fs::canonicalize(p) else {
+/// 심볼릭 링크를 따라가며 실행 경로의 **모든 성분**을 검사하는 순수 코어. 성분의 신뢰 판정을
+/// 주입받는다 — 실제 판정(소유권/mode/ACL)은 root 소유 파일이 필요해 비-root 테스트로는 못 만들지만,
+/// **"어느 성분을 검사하는가"**(링크가 놓인 디렉토리를 빠뜨리지 않는지)는 이 주입점으로 결정적으로
+/// 검증할 수 있다. FS 구조(링크/디렉토리)는 tempdir에 실제로 만들어 traversal은 진짜로 돈다.
+fn is_root_controlled_walk(p: &Path, depth: u32, trusted: &dyn Fn(&Path) -> bool) -> bool {
+    use std::path::Component;
+
+    /// ELOOP 방어 — 커널 기본(`MAXSYMLINKS`)과 같은 40.
+    const MAX_SYMLINK_DEPTH: u32 = 40;
+    if depth > MAX_SYMLINK_DEPTH || !p.is_absolute() {
         return false;
-    };
-    let mut cur: Option<&Path> = Some(real.as_path());
-    while let Some(c) = cur {
-        let Ok(md) = std::fs::symlink_metadata(c) else {
+    }
+
+    let mut current = PathBuf::from("/");
+    // 루트(`/`)부터 검사한다 — 루트가 신뢰 밖이면 그 아래 전부 의미 없다.
+    if !trusted(&current) {
+        return false;
+    }
+
+    let comps: Vec<Component> = p.components().collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        let name = match comp {
+            Component::RootDir => continue,
+            Component::Normal(n) => n,
+            // `.`/`..`/prefix — 깨끗한 절대경로가 아니다. 위험한 쪽으로 친다.
+            _ => return false,
+        };
+        current.push(name);
+
+        let Ok(md) = std::fs::symlink_metadata(&current) else {
             return false;
         };
-        if !is_root_controlled_meta(md.uid(), md.permissions().mode(), has_extended_acl(c)) {
+        let ft = md.file_type();
+        let is_last = idx == comps.len() - 1;
+
+        if ft.is_symlink() {
+            // 부모 디렉토리는 이미 신뢰됨을 확인했다 → 이 링크는 비-root가 스왑할 수 없다.
+            // 링크 자신의 mode는 보지 않고(0777이라 무의미), 대상 경로로 갈아타 계속 검사한다.
+            let Ok(target) = std::fs::read_link(&current) else {
+                return false;
+            };
+            let base = match current.parent() {
+                Some(b) => b.to_path_buf(),
+                None => return false,
+            };
+            let mut next = if target.is_absolute() {
+                target
+            } else {
+                base.join(target)
+            };
+            // 이 링크 뒤에 남은 성분들을 대상 뒤에 이어 붙여 나머지 경로를 마저 해소한다.
+            for rest in &comps[idx + 1..] {
+                match rest {
+                    Component::Normal(n) => next.push(n),
+                    _ => return false,
+                }
+            }
+            return is_root_controlled_walk(&next, depth + 1, trusted);
+        } else if ft.is_dir() {
+            if !trusted(&current) {
+                return false;
+            }
+        } else if ft.is_file() {
+            // 실행 파일은 경로의 **끝**이어야 한다. 중간에 파일이 나오면 잘못된 경로다.
+            if !is_last {
+                return false;
+            }
+            return trusted(&current);
+        } else {
+            // 소켓·디바이스 등 — docker 실행 파일이 아니다.
             return false;
         }
-        cur = c.parent();
     }
-    true
+    // 모든 성분을 소진했는데 끝이 디렉토리였다 — 실행 **파일**이 아니다.
+    false
 }
 
 /// [`is_root_controlled_path`]의 순수 판정 — 한 경로 성분이 root 통제 하인가.
@@ -506,7 +597,7 @@ async fn serve_docker_with(
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::metrics_url(&cfg.endpoint);
     // 기동 시 못 찾았어도 task는 뜬다 — 아래 루프가 매 tick 재탐색한다.
-    let mut state = BinState::from_initial(cfg.docker_bin.clone());
+    let mut state = BinState::from_initial(cfg.docker_bin.clone(), cfg.configured_bin.as_deref());
     tracing::info!(
         url = %url,
         interval_secs = cfg.interval.as_secs(),
@@ -532,11 +623,13 @@ async fn serve_docker_with(
         tokio::select! {
             _ = ticker.tick() => {
                 // 아직 못 찾았으면 이번 tick에 다시 찾아본다(위 doc "나중에 설치된 docker").
-                let Some(bin) = state.ensure(resolve, cfg.configured_bin.as_deref()) else {
+                let Some((bin, _announced)) = state.ensure(resolve, cfg.configured_bin.as_deref()) else {
                     continue;
                 };
                 match capture_docker_df(&bin, cfg.timeout).await {
                     Ok(lines) => {
+                        // 캡처가 됐다 = 이 경로는 지금 멀쩡하다. 다음 장애를 새로 알릴 수 있게 기록을 지운다.
+                        state.mark_ok();
                         let points = build_metric_points(&lines);
                         if points.is_empty() {
                             continue;
@@ -609,79 +702,141 @@ async fn serve_docker_with(
 }
 
 /// docker 실행 파일의 탐색 상태. **로그를 상태 변화에만 남기기 위해** 존재한다
-/// ([`serve_docker`]의 "로그는 상태 변화에만" 참고) — 상태를 안 들고 있으면 "못 찾았다"를 매 tick
-/// 다시 외치게 되고, 그게 바로 이 모듈이 없애려던 WARN 폭주다.
+/// ([`serve_docker`]의 "로그는 상태 변화에만" 참고) — 상태를 안 들고 있으면 같은 사실("못 찾았다",
+/// "이 경로가 계속 실패한다")을 매 tick 다시 외치게 되고, 그게 이 모듈이 없애려던 WARN 폭주다.
+///
+/// 두 가지를 들고 있어야 한다:
+/// - `current`: 이번 tick에 쓸 실행 파일. `None`이면 재탐색해야 한다.
+/// - `announced_bad`: 마지막으로 "이 경로/부재가 나쁘다"고 알린 대상. 같은 대상이 같은 이유로 계속
+///   실패할 때 WARN/INFO를 반복하지 않기 위한 것이다. **왜 필요한가**: resolve는 성공하는데 exec만
+///   `ENOENT`로 실패하는 경우(예: 잘못된 shebang 인터프리터)를 생각하면, 재탐색이 매번 **같은 경로**를
+///   다시 찾아 `current`를 채우고 exec가 또 실패한다 — `announced_bad`가 없으면 tick마다
+///   `찾음(INFO) → 사라짐(WARN)`이 진동한다. 직전에 이미 이 경로를 나쁘다고 알렸으면 조용히 넘어간다.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum BinState {
-    /// 못 찾았다. 이미 알렸으므로 다시 알리지 않는다(재탐색은 계속한다).
+struct BinState {
+    current: Option<PathBuf>,
+    announced_bad: Announced,
+}
+
+/// [`BinState`]가 마지막으로 알린 나쁜 소식. `PartialEq`로 "같은 걸 또 알리려는가"를 판정한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Announced {
+    /// 아직 아무 나쁜 소식도 알리지 않았다(정상 동작 중이거나 기동 직후).
+    Nothing,
+    /// "아무 데서도 docker를 못 찾는다"를 알렸다.
     Missing,
-    /// 찾았다.
-    Found(PathBuf),
+    /// 이 **특정 경로**가 실패한다(exec ENOENT/사라짐)를 알렸다.
+    Bad(PathBuf),
 }
 
 impl BinState {
-    /// 기동 시 resolve 결과로 초기 상태를 만든다. 못 찾았으면 **여기서 딱 한 번** WARN을 낸다.
-    fn from_initial(resolved: Option<PathBuf>) -> Self {
+    /// 기동 시 상태를 만든다. resolve 결과와 config 값을 함께 받아, 못 찾았으면 **여기서 딱 한 번**
+    /// WARN을 낸다. config가 지정됐는데 못 찾은 경우(오타·상대경로·root 신뢰 실패, 또는 아직 미설치)는
+    /// **재탐색해도 안 바뀌는 영구 오설정일 수 있으므로** config를 짚어 주는 별도 문구로 알린다 —
+    /// 이 신호가 없으면 "오타를 조용히 덮지 않는다"는 원래 설계 목표가 기본 로그 레벨에서 실현되지
+    /// 않는다(거절의 유일한 신호가 재탐색 경로의 `debug`뿐이라 안 보인다).
+    fn from_initial(resolved: Option<PathBuf>, configured: Option<&Path>) -> Self {
         match resolved {
-            Some(p) => BinState::Found(p),
+            Some(p) => BinState {
+                current: Some(p),
+                announced_bad: Announced::Nothing,
+            },
             None => {
-                tracing::warn!(
-                    "docker 실행 파일을 찾지 못했다 — 설치되면 자동으로 캡처를 시작한다 \
-                     ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
-                );
-                BinState::Missing
+                if let Some(c) = configured {
+                    tracing::warn!(
+                        docker_bin = %c.display(),
+                        "[aicd.exporter].docker_bin을 지금은 쓸 수 없다(없거나·상대경로거나·root 신뢰 판정 실패) \
+                         — 절대경로로 지정했는지 확인할 것. 설치되면 자동으로 잡는다"
+                    );
+                } else {
+                    tracing::warn!(
+                        "docker 실행 파일을 찾지 못했다 — 설치되면 자동으로 캡처를 시작한다 \
+                         ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
+                    );
+                }
+                BinState {
+                    current: None,
+                    announced_bad: Announced::Missing,
+                }
             }
         }
     }
 
     fn path(&self) -> Option<&Path> {
-        match self {
-            BinState::Found(p) => Some(p),
-            BinState::Missing => None,
-        }
+        self.current.as_deref()
     }
 
-    /// 이번 tick에 쓸 실행 파일을 확보한다. 이미 찾았으면 그대로 쓰고, 아니면 재탐색한다.
-    /// **찾는 데 성공한 전이에서만** INFO를 낸다 — 실패가 지속되는 동안은 `debug`다.
+    /// 이번 tick에 쓸 실행 파일을 확보한다. 이미 있으면 그대로 쓰고, 아니면 재탐색한다.
+    ///
+    /// 반환값의 `bool`은 **이번 호출에서 "새로 찾았다"고 INFO를 냈는가**이다(테스트가 전이 억제를
+    /// 관찰하기 위한 것 — 로그로만 드러나는 성질이라 값으로 내주지 않으면 공허해진다). INFO는
+    /// **정말 새 소식일 때만** 낸다: 직전에 바로 이 경로가 나쁘다고 알린 상태(`Bad(같은 경로)`)에서
+    /// 재탐색이 같은 경로를 도로 물어온 것은 새 소식이 아니므로 조용하다.
     fn ensure(
         &mut self,
         resolve: &dyn Fn(Option<&Path>) -> Option<PathBuf>,
         configured: Option<&Path>,
-    ) -> Option<PathBuf> {
-        if let BinState::Found(p) = self {
-            return Some(p.clone());
+    ) -> Option<(PathBuf, bool)> {
+        if let Some(p) = &self.current {
+            return Some((p.clone(), false));
         }
         match resolve(configured) {
             Some(found) => {
-                tracing::info!(
-                    docker_bin = %found.display(),
-                    "docker 실행 파일을 찾았다 — docker exporter 캡처 시작"
-                );
-                *self = BinState::Found(found.clone());
-                Some(found)
+                // 직전에 바로 이 경로를 나쁘다고 알렸는가? 그렇다면 도로 물어온 것은 새 정보가 아니다.
+                let already_known_bad = self.announced_bad == Announced::Bad(found.clone());
+                let announced = if already_known_bad {
+                    tracing::debug!(
+                        docker_bin = %found.display(),
+                        "재탐색이 직전에 실패한 그 경로를 다시 찾음 — 조용히 재시도한다"
+                    );
+                    false
+                } else {
+                    tracing::info!(
+                        docker_bin = %found.display(),
+                        "docker 실행 파일을 찾았다 — docker exporter 캡처 시작"
+                    );
+                    // 새 경로를 찾았으니 "나쁘다"던 기록은 지운다(이 경로의 실패는 새로 알려야 한다).
+                    self.announced_bad = Announced::Nothing;
+                    true
+                };
+                self.current = Some(found.clone());
+                Some((found, announced))
             }
             None => {
-                // 이미 Missing이라고 알렸다 — 같은 상태를 반복해서 알리지 않는다.
+                // 이미 Missing이라고 알렸으면 조용히, 아니면(직전이 Bad/Nothing) 이번에 Missing 전이를
+                // 알린다 — 다만 대개 사라짐 WARN을 mark_gone이 이미 냈으므로 여기서는 debug로 족하다.
+                if self.announced_bad != Announced::Missing {
+                    self.announced_bad = Announced::Missing;
+                }
                 tracing::debug!("docker 실행 파일을 아직 찾지 못했다 — 이번 주기 skip");
                 None
             }
         }
     }
 
-    /// 찾아 뒀던 실행 파일이 사라졌다. **이 전이에서만** WARN을 내고 재탐색 상태로 되돌린다.
+    /// 캡처가 성공했다 — 이 경로는 지금 멀쩡하다. "나쁘다"던 기록을 지워, **다음 번 장애는 새로
+    /// 알리도록** 한다(안 지우면 P가 한 번 실패한 뒤로는 P의 어떤 장애도 영원히 억제된다).
+    fn mark_ok(&mut self) {
+        if self.announced_bad != Announced::Nothing {
+            self.announced_bad = Announced::Nothing;
+        }
+    }
+
+    /// 쓰던 실행 파일이 exec 시점에 없어졌다(`ENOENT`). 재탐색하도록 `current`를 비우고, **직전에
+    /// 이 경로를 이미 나쁘다고 알리지 않았을 때만** WARN을 낸다.
     ///
-    /// **알렸으면 `true`**를 돌려준다. 반환값이 있는 이유는 테스트다 — "같은 상태를 두 번 알리지
-    /// 않는다"는 로그로만 드러나는 성질이라, 이걸 값으로 내주지 않으면 `Missing -> Missing`에서
-    /// WARN을 또 내도 상태만 보는 테스트는 통과해 버린다(공허해진다).
+    /// **알렸으면 `true`**를 돌려준다(테스트가 억제를 관찰하기 위함 — 상태만 보면 두 경우가 구분되지
+    /// 않는다). 이 반환값 + `announced_bad` 덕에 "같은 경로가 계속 ENOENT"에서도 WARN은 한 번뿐이다.
     fn mark_gone(&mut self, bin: &Path) -> bool {
-        if matches!(self, BinState::Missing) {
+        self.current = None;
+        if self.announced_bad == Announced::Bad(bin.to_path_buf()) {
             return false;
         }
         tracing::warn!(
             docker_bin = %bin.display(),
-            "docker 실행 파일이 사라졌다 — 다시 탐색한다(설치되면 자동으로 캡처를 재개한다)"
+            "docker 실행 파일이 사라졌다(exec ENOENT) — 다시 탐색한다(설치되면 자동으로 캡처를 재개한다)"
         );
-        *self = BinState::Missing;
+        self.announced_bad = Announced::Bad(bin.to_path_buf());
         true
     }
 }
@@ -1253,13 +1408,138 @@ mod tests {
     }
 
     /// 경로 walk 쪽(FS를 실제로 만지는 부분)의 결정적 케이스: 없는 경로는 신뢰하지 않는다.
-    /// (긍정 케이스는 root 소유 디렉토리 체인이 필요해 비-root 테스트로는 만들 수 없다 — 그래서
-    /// 판정 본체를 위 순수 함수로 떼어 냈다.)
+    /// (소유권 긍정 케이스는 root 소유 디렉토리 체인이 필요해 비-root 테스트로는 못 만든다 — 그래서
+    /// 소유권 판정은 순수 함수로, **"어느 성분을 검사하는가"**는 아래 주입점으로 나눠 검증한다.)
     #[test]
     fn is_root_controlled_path_rejects_a_missing_path() {
         assert!(!is_root_controlled_path(Path::new(
             "/definitely/does/not/exist/docker"
         )));
+    }
+
+    /// **회귀 가드 — item 1(블로킹).** 예전 판은 `canonicalize(cand)`의 성분만 검사해서, 정작
+    /// 실행되는 **링크 경로**가 놓인 디렉토리를 아무도 안 봤다. 사용자 쓰기 가능 디렉토리에 놓인
+    /// 링크가 (그 자체로는 안전해 보이는) 대상을 가리키면, 공격자가 링크를 스왑해 root aicd에게
+    /// 임의 바이너리를 실행시킬 수 있다.
+    ///
+    /// FS 구조(링크·디렉토리)는 tempdir에 실제로 만들어 traversal이 진짜로 돌게 하고, 소유권 판정만
+    /// 주입한다("unsafe 디렉토리만 신뢰 안 함"). walk가 링크의 **부모 디렉토리**를 검사 대상에 넣으면
+    /// 거부되고, 빠뜨리면(=예전 버그) 대상까지 따라가 통과한다 — 그 차이를 잡는다.
+    #[test]
+    fn is_root_controlled_walk_checks_the_directory_that_holds_the_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        // canonicalize로 /var -> /private/var 류의 링크를 미리 해소해 둔다(경로 동일성 안정화).
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let safe = root.join("safe");
+        let unsafe_dir = root.join("unsafe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::create_dir(&unsafe_dir).unwrap();
+
+        // 대상 파일은 "안전한" safe/ 안에 둔다.
+        let target = safe.join("docker-real");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 실행되는 경로: unsafe/docker -> (절대경로) safe/docker-real.
+        // 절대 대상을 쓴다 — 상대 대상은 `..`를 만들어 walk가 fail-closed로 거부해 대조가 흐려진다.
+        let link = unsafe_dir.join("docker");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // 주입 판정: unsafe 디렉토리 하나만 신뢰 밖, 나머지(루트~safe, 대상 파일)는 전부 신뢰.
+        let unsafe_canon = unsafe_dir.clone();
+        let trusted = move |p: &Path| p != unsafe_canon.as_path();
+
+        assert!(
+            !is_root_controlled_walk(&link, 0, &trusted),
+            "링크가 놓인 사용자 쓰기 가능 디렉토리를 검사하지 않았다 — 스왑 하이재킹이 뚫린다"
+        );
+
+        // 대조(공허 방지): unsafe까지 신뢰하면 링크를 따라가 대상을 채택한다 — walk가 실제로 링크를
+        // 해소해 끝까지 도달함을 증명한다(위 거부가 "walk가 그냥 다 막아서"가 아님).
+        let all_trusted = |_: &Path| true;
+        assert!(
+            is_root_controlled_walk(&link, 0, &all_trusted),
+            "전부 신뢰인데 거부했다 — walk가 링크를 못 따라가거나 과잉 거부한다"
+        );
+    }
+
+    /// **배선 가드(root 전용) — item 1.** 위 주입 테스트는 `is_root_controlled_walk`를 직접 부르므로,
+    /// 프로덕션 진입점 `is_root_controlled_path`가 그 walk로 배선돼 있는지(예전 canonicalize 방식으로
+    /// 되돌아가지 않았는지)는 확인하지 못한다. 그 차이는 **root 소유 대상 + 사용자 쓰기 가능 링크
+    /// 디렉토리**에서만 드러나고, 그런 구조는 root라야 만들 수 있다.
+    ///
+    /// - walk: 링크가 놓인 `unsafe`(사용자 쓰기 가능) 디렉토리를 검사 → **거부**.
+    /// - canonicalize(예전 버그): 대상과 그 상위만 보므로 전부 root → **통과**.
+    ///
+    /// 비-root에선 root 소유 대상을 못 만들어 skip한다. 다만 **불변식 자체는
+    /// [`is_root_controlled_walk_checks_the_directory_that_holds_the_symlink`]가 어느 머신에서든**
+    /// 못박으므로, 이 skip이 커버리지에 구멍을 내지 않는다. 이 테스트의 몫은 오직 "프로덕션 배선"을
+    /// root에서 실측하는 것이고, CI/개발기 중 root로 도는 환경(예: 리뷰용 Linux 서버)에서 실제로 돈다.
+    #[test]
+    fn is_root_controlled_path_rejects_a_link_in_a_writable_dir_even_when_target_is_root_safe() {
+        if unsafe { libc::geteuid() } != 0 {
+            // root가 아니면 root 소유 대상 파일을 만들 수 없다 — 이 구조는 구성 불가.
+            eprintln!(
+                "skip: 비-root에선 root 소유 대상을 만들 수 없다(불변식은 injected-walk 테스트가 커버)"
+            );
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // root 소유 안전 대상.
+        let safe = base.join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = safe.join("docker-real");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 사용자(=비-root) 쓰기 가능한 링크 디렉토리. world-writable로 만들어 mode & 0o022 != 0.
+        let unsafe_dir = base.join("unsafe");
+        std::fs::create_dir(&unsafe_dir).unwrap();
+        std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = unsafe_dir.join("docker");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // canonicalize(link)의 상위는 전부 root(safe/base/tmp/…)라 예전 방식이면 "통과"다. 실제로
+        // 실행되는 경로는 unsafe/docker이므로 walk는 unsafe를 보고 거부해야 한다.
+        assert!(
+            !is_root_controlled_path(&link),
+            "is_root_controlled_path가 링크 디렉토리를 안 봤다 — canonicalize 방식으로 되돌아갔다(스왑 하이재킹)"
+        );
+    }
+
+    /// walk는 **실행 파일(경로의 끝)**에 도달해야 한다 — 디렉토리로 끝나면 거부한다.
+    #[test]
+    fn is_root_controlled_walk_rejects_a_directory_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let d = root.join("adir");
+        std::fs::create_dir(&d).unwrap();
+        let all_trusted = |_: &Path| true;
+        assert!(
+            !is_root_controlled_walk(&d, 0, &all_trusted),
+            "디렉토리는 실행 파일이 아니다"
+        );
+    }
+
+    /// `..`/`.` 성분은 fail-closed로 거부한다(깨끗한 절대경로만 신뢰).
+    #[test]
+    fn is_root_controlled_walk_rejects_dot_dot_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let f = root.join("docker");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let all_trusted = |_: &Path| true;
+
+        let with_dotdot = root.join("sub").join("..").join("docker");
+        assert!(
+            !is_root_controlled_walk(&with_dotdot, 0, &all_trusted),
+            ".. 성분이 든 경로는 거부해야 한다"
+        );
     }
 
     /// ACL이 없는 평범한 파일에는 `has_extended_acl`이 false여야 한다 — 여기서 true가 나오면 정상적인
@@ -1278,9 +1558,13 @@ mod tests {
     /// **탐지 자체**를 못박는다: 실제로 확장 ACL을 건 파일을 `has_extended_acl`이 잡아야 한다.
     ///
     /// ACL을 담지 못하는 파일시스템이라면 ACL로 하이재킹할 수도 없으므로 탐지할 대상 자체가 없다 —
-    /// 그때도 조용히 넘어가지 않고 "ACL 없음"을 단언한다. 정책 자체(ACL이 있으면 신뢰하지 않는다)는
-    /// 위 순수 테스트가 **어느 머신에서든** 못박으므로, 이 테스트가 환경 때문에 약해져도 불변식에
-    /// 구멍이 나지는 않는다.
+    /// 그때도 조용히 넘어가지 않고 "ACL 없음"을 단언한다.
+    ///
+    /// **item 4 — 이 테스트가 조용히 공허해지는 걸 막는다**: 예전엔 손으로 만든 xattr blob이 잘못돼
+    /// `EINVAL`이 나도 "이 FS는 ACL 미지원"으로 처리해 테스트가 통과했다. 이제 [`acl_unsupported`]는
+    /// **오직 `ENOTSUP`(=진짜 미지원)만** 미지원으로 치므로, blob이 틀리면(`EINVAL`) 아래 `panic`
+    /// 가지로 떨어져 시끄럽게 실패한다. set이 `Ok`라는 것 자체가 커널이 blob을 유효한 ACL로 받아
+    /// 저장했다는 뜻이고(malformed면 커널이 SET에서 EINVAL), 그 위에서 탐지를 시험하므로 순환이 없다.
     #[test]
     fn has_extended_acl_detects_a_real_extended_acl() {
         let dir = tempfile::tempdir().unwrap();
@@ -1300,16 +1584,34 @@ mod tests {
                     "ACL을 담지 못하는 FS인데 ACL이 있다고 답했다"
                 );
             }
-            Err(e) => panic!("ACL 설정이 예상 밖의 이유로 실패했다: {e}"),
+            Err(e) => panic!(
+                "ACL 설정이 예상 밖의 이유로 실패했다(blob 오류일 수 있다 — 조용히 넘기지 않는다): {e}"
+            ),
         }
     }
 
-    /// 이 파일시스템이 ACL을 담지 못한다는 신호인가.
+    /// 이 파일시스템이 ACL을 담지 못한다는 **진짜** 신호(`ENOTSUP`)인가. `EINVAL`(blob 오류)이나
+    /// `EPERM`(권한)은 여기 포함하지 않는다 — 그것들을 "미지원"으로 흡수하면 테스트 버그가 조용히
+    /// 통과한다(item 4). `EOPNOTSUPP`는 Linux에서 `ENOTSUP`과 같은 값이다.
     fn acl_unsupported(e: &std::io::Error) -> bool {
-        matches!(
-            e.raw_os_error(),
-            Some(libc::ENOTSUP) | Some(libc::EPERM) | Some(libc::EINVAL)
-        )
+        e.raw_os_error() == Some(libc::ENOTSUP)
+    }
+
+    /// **item 4 회귀 가드(순수·크로스플랫폼).** `acl_unsupported`가 `EINVAL`/`EPERM`을 "미지원"으로
+    /// 흡수하면, `has_extended_acl_detects_a_real_extended_acl`이 malformed blob(→EINVAL)에서도 조용히
+    /// skip돼 공허해진다. 분류 자체를 여기서 못박아, 흡수하는 mutation을 잡는다.
+    #[test]
+    fn acl_unsupported_accepts_only_enotsup_not_blob_or_perm_errors() {
+        use std::io::Error;
+        assert!(acl_unsupported(&Error::from_raw_os_error(libc::ENOTSUP)));
+        assert!(
+            !acl_unsupported(&Error::from_raw_os_error(libc::EINVAL)),
+            "blob 오류(EINVAL)를 '미지원'으로 흡수하면 테스트가 조용히 공허해진다"
+        );
+        assert!(
+            !acl_unsupported(&Error::from_raw_os_error(libc::EPERM)),
+            "권한 오류(EPERM)도 '미지원'이 아니다"
+        );
     }
 
     /// 테스트용으로 파일에 **확장 ACL**을 건다. 외부 CLI(`setfacl`)에 의존하지 않는다 — 없는 CI가
@@ -1978,29 +2280,76 @@ mod tests {
 
     // ── BinState: 로그는 상태 변화에만 ────────────────────────────────────────
 
-    /// **회귀 가드 — WARN 폭주.** 재탐색을 넣으면서 되살아났던 문제다. 못 찾은 상태가 지속되는 동안
-    /// 재탐색은 계속 돌아야 하지만(`ensure`가 매번 resolve를 부른다), 상태는 `Missing`에 머물러야
-    /// 한다 — 상태가 안 바뀌면 호출부가 다시 알릴 일도 없다.
-    ///
-    /// tracing 구독자를 붙여 로그 줄을 세는 대신 **상태 전이**를 검증한다: "알린다"의 유일한 근거가
-    /// 전이이므로, 전이가 없으면 로그도 없다는 게 구조적으로 보장된다.
+    fn missing() -> BinState {
+        BinState {
+            current: None,
+            announced_bad: Announced::Missing,
+        }
+    }
+    fn found(p: &str) -> BinState {
+        BinState {
+            current: Some(PathBuf::from(p)),
+            announced_bad: Announced::Nothing,
+        }
+    }
+
+    /// 주어진 클로저를 도는 동안 방출된 tracing 이벤트의 레벨을 수집한다. 이 모듈의 핵심 계약은
+    /// **로그 레벨**에 있다("오타는 WARN으로 보여야, 재탐색 반복은 WARN을 안 내야") — 상태만 봐선
+    /// 그걸 검증할 수 없어 실제 방출 레벨을 관찰한다.
+    fn capture_levels<F: FnOnce()>(f: F) -> Vec<tracing::Level> {
+        use std::sync::{Arc, Mutex};
+        use tracing::{span, Event, Metadata, Subscriber};
+
+        struct Rec(Arc<Mutex<Vec<tracing::Level>>>);
+        impl Subscriber for Rec {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Rec(sink.clone()), f);
+        let out = sink.lock().unwrap().clone();
+        out
+    }
+
+    fn count(levels: &[tracing::Level], want: tracing::Level) -> usize {
+        levels.iter().filter(|l| **l == want).count()
+    }
+
+    /// **회귀 가드 — WARN 폭주(로그 레벨로 직접 검증).** 못 찾은 상태가 지속되는 동안 재탐색은 계속
+    /// 돌아야 하지만(매 tick resolve 호출) **WARN은 단 한 번도 나오면 안 된다** — 못 찾음의 유일한
+    /// WARN은 기동 시 `from_initial`이 낸다.
     #[test]
-    fn bin_state_stays_missing_while_docker_is_absent() {
-        let mut state = BinState::Missing;
+    fn bin_state_is_silent_at_warn_while_docker_stays_absent() {
         let counter = std::cell::Cell::new(0);
         let resolver = |_: Option<&Path>| -> Option<PathBuf> {
             counter.set(counter.get() + 1);
             None
         };
 
-        for _ in 0..5 {
-            assert_eq!(state.ensure(&resolver, None), None);
-            assert_eq!(
-                state,
-                BinState::Missing,
-                "못 찾은 상태가 지속되는데 상태가 바뀌었다 — 그러면 매 tick 다시 알리게 된다"
-            );
-        }
+        let mut state = missing();
+        let levels = capture_levels(|| {
+            for _ in 0..5 {
+                assert!(state.ensure(&resolver, None).is_none());
+            }
+        });
+
+        assert_eq!(
+            count(&levels, tracing::Level::WARN),
+            0,
+            "못 찾은 상태가 지속되는데 재탐색이 WARN을 쏟았다 — 폭주"
+        );
         assert_eq!(
             counter.get(),
             5,
@@ -2008,28 +2357,32 @@ mod tests {
         );
     }
 
-    /// 없다가 찾으면 `Found`로 전이하고, 그 뒤로는 **재탐색하지 않는다**(찾은 뒤엔 비용 0).
+    /// 없다가 찾으면 INFO 한 번(전이)이고, 그 뒤로는 **재탐색하지 않는다**(찾은 뒤엔 비용 0).
     #[test]
     fn bin_state_transitions_to_found_and_then_stops_resolving() {
-        let mut state = BinState::Missing;
         let counter = std::cell::Cell::new(0);
         let resolver = |_: Option<&Path>| -> Option<PathBuf> {
             counter.set(counter.get() + 1);
             Some(PathBuf::from("/usr/bin/docker"))
         };
 
-        assert_eq!(
-            state.ensure(&resolver, None),
-            Some(PathBuf::from("/usr/bin/docker"))
-        );
-        assert_eq!(state, BinState::Found(PathBuf::from("/usr/bin/docker")));
+        let mut state = missing();
+        let levels = capture_levels(|| {
+            let (bin, announced) = state.ensure(&resolver, None).unwrap();
+            assert_eq!(bin, PathBuf::from("/usr/bin/docker"));
+            assert!(announced, "없다가 찾은 것은 새 소식 — INFO를 내야 한다");
 
-        for _ in 0..3 {
-            assert_eq!(
-                state.ensure(&resolver, None),
-                Some(PathBuf::from("/usr/bin/docker"))
-            );
-        }
+            for _ in 0..3 {
+                let (bin, announced) = state.ensure(&resolver, None).unwrap();
+                assert_eq!(bin, PathBuf::from("/usr/bin/docker"));
+                assert!(!announced, "이미 찾은 뒤엔 다시 알리지 않는다");
+            }
+        });
+        assert_eq!(
+            count(&levels, tracing::Level::INFO),
+            1,
+            "찾음 전이는 INFO 정확히 한 번"
+        );
         assert_eq!(
             counter.get(),
             1,
@@ -2037,18 +2390,21 @@ mod tests {
         );
     }
 
-    /// **회귀 가드 — 비대칭**: 찾은 뒤 docker가 사라지면 `Missing`으로 돌아가 재탐색이 다시 돌아야
-    /// 한다. 안 그러면 "있다가 없어지면 영원히 ENOENT만 찍는" 한쪽만 자가 치유되는 상태가 된다.
+    /// **회귀 가드 — 비대칭**: 찾은 뒤 docker가 사라지면 재탐색이 다시 돌아야 한다. 안 그러면
+    /// "있다가 없어지면 영원히 ENOENT만 찍는" 한쪽만 자가 치유되는 상태가 된다.
     #[test]
-    fn bin_state_returns_to_missing_when_the_binary_disappears() {
-        let mut state = BinState::Found(PathBuf::from("/usr/bin/docker"));
+    fn bin_state_re_resolves_after_the_binary_disappears() {
+        let mut state = found("/usr/bin/docker");
         assert!(
             state.mark_gone(Path::new("/usr/bin/docker")),
-            "Found -> Missing 전이는 알려야 한다"
+            "Found -> 사라짐 전이는 알려야 한다"
         );
-        assert_eq!(state, BinState::Missing);
+        assert_eq!(
+            state.path(),
+            None,
+            "사라졌으면 재탐색하도록 current를 비운다"
+        );
 
-        // 되돌아온 뒤에는 재탐색이 다시 돈다.
         let counter = std::cell::Cell::new(0);
         let resolver = |_: Option<&Path>| -> Option<PathBuf> {
             counter.set(counter.get() + 1);
@@ -2056,22 +2412,102 @@ mod tests {
         };
         assert_eq!(
             state.ensure(&resolver, None),
-            Some(PathBuf::from("/opt/docker"))
+            Some((PathBuf::from("/opt/docker"), true))
         );
         assert_eq!(counter.get(), 1, "사라진 뒤 재탐색이 돌지 않았다");
     }
 
-    /// **회귀 가드 — WARN 폭주(두 번째 통로)**: 이미 `Missing`인데 또 사라졌다고 알리면, docker가
-    /// 없는 동안 매 tick WARN이 다시 쏟아진다. 상태만 보면 `Missing -> Missing`이라 아무 차이가 없어
-    /// 보이므로, "알렸는가"를 값으로 받아 확인한다.
+    /// **회귀 가드 — 진동(item 2).** resolve는 늘 성공하는데 exec만 매번 `ENOENT`(잘못된 shebang 등)면,
+    /// 순진한 상태 기계는 tick마다 `찾음(INFO) → 사라짐(WARN)`을 반복한다. 같은 경로가 같은 이유로
+    /// 계속 실패하는 건 새 정보가 아니므로, **WARN도 INFO도 딱 한 번씩**이어야 한다.
     #[test]
-    fn bin_state_does_not_re_announce_a_loss_it_already_knows_about() {
-        let mut state = BinState::Missing;
-        assert!(
-            !state.mark_gone(Path::new("/usr/bin/docker")),
-            "이미 없는 줄 아는데 또 알렸다 — 못 찾는 동안 매 tick WARN이 쌓인다"
+    fn bin_state_suppresses_oscillation_when_a_resolved_path_keeps_failing_exec() {
+        let bad = PathBuf::from("/opt/bad/docker");
+        let b = bad.clone();
+        let resolver = move |_: Option<&Path>| Some(b.clone());
+
+        let mut state = missing();
+        let bad_for_loop = bad.clone();
+        let levels = capture_levels(|| {
+            for _ in 0..6 {
+                let (bin, _) = state
+                    .ensure(&resolver, None)
+                    .expect("resolve가 늘 경로를 준다");
+                assert_eq!(bin, bad_for_loop);
+                // 캡처가 ENOENT로 실패했다고 가정한다.
+                state.mark_gone(&bad_for_loop);
+            }
+        });
+
+        assert_eq!(
+            count(&levels, tracing::Level::WARN),
+            1,
+            "같은 경로가 계속 ENOENT인데 매 tick WARN을 냈다 — 진동/폭주"
         );
-        assert_eq!(state, BinState::Missing);
+        assert_eq!(
+            count(&levels, tracing::Level::INFO),
+            1,
+            "같은 경로를 도로 찾은 것은 새 소식이 아닌데 매번 INFO를 냈다 — 진동"
+        );
+    }
+
+    /// **회귀 가드 — mark_ok가 기록을 지운다.** 경로가 한 번 실패한 뒤 복구되어 캡처에 성공하면,
+    /// 그 뒤에 오는 **독립적인 새 장애는 다시 알려야 한다**. `mark_ok`가 "나쁨" 기록을 안 지우면
+    /// 첫 실패 이후 그 경로의 모든 장애가 영원히 억제된다.
+    #[test]
+    fn bin_state_re_announces_a_fresh_failure_after_a_successful_capture() {
+        let p = PathBuf::from("/usr/bin/docker");
+        let mut state = found("/usr/bin/docker");
+
+        assert!(state.mark_gone(&p), "첫 장애는 알려야 한다");
+
+        // 재탐색으로 같은 경로를 도로 찾고(조용히), 캡처에 성공한다.
+        let pp = p.clone();
+        let resolver = move |_: Option<&Path>| Some(pp.clone());
+        state.ensure(&resolver, None).unwrap();
+        state.mark_ok();
+
+        assert!(
+            state.mark_gone(&p),
+            "성공 뒤의 새 장애를 억제하면 안 된다 — mark_ok가 나쁨 기록을 지워야 한다"
+        );
+    }
+
+    /// **item 3 — config 오타는 기동 시 WARN으로 보여야 한다.** config가 지정됐는데 resolve가
+    /// 실패하면(오타·상대경로·root 신뢰 실패, 또는 아직 미설치), 유일한 신호가 재탐색 경로의 debug라면
+    /// 기본 로그 레벨에서 안 보인다. `from_initial`이 기동 시 WARN을 내는지 **레벨로** 확인한다.
+    #[test]
+    fn from_initial_warns_at_startup_when_a_configured_path_is_rejected() {
+        let levels = capture_levels(|| {
+            let st = BinState::from_initial(None, Some(Path::new("/typo/docker")));
+            assert_eq!(st.path(), None);
+            assert_eq!(st.announced_bad, Announced::Missing);
+        });
+        assert_eq!(
+            count(&levels, tracing::Level::WARN),
+            1,
+            "config가 거부됐는데 기동 WARN이 없다 — 오타가 기본 레벨에서 안 보인다"
+        );
+    }
+
+    /// config가 없을 때의 "못 찾음"도 기동 시 WARN 한 번(단, 문구가 config를 짚지 않는다).
+    #[test]
+    fn from_initial_warns_once_when_docker_is_absent_and_no_config() {
+        let levels = capture_levels(|| {
+            let st = BinState::from_initial(None, None);
+            assert_eq!(st.path(), None);
+        });
+        assert_eq!(count(&levels, tracing::Level::WARN), 1);
+    }
+
+    /// 기동 시 이미 찾은 경우엔 기동 경고가 없다.
+    #[test]
+    fn from_initial_is_quiet_when_docker_is_already_found() {
+        let levels = capture_levels(|| {
+            let st = BinState::from_initial(Some(PathBuf::from("/usr/bin/docker")), None);
+            assert_eq!(st.path(), Some(Path::new("/usr/bin/docker")));
+        });
+        assert_eq!(count(&levels, tracing::Level::WARN), 0);
     }
 
     /// **회귀 가드 — 비대칭(루프 배선)**: 위 `bin_state_*` 테스트들은 상태 기계만 본다. 그 기계가
