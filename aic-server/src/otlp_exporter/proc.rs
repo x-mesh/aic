@@ -24,16 +24,30 @@ use tokio::process::Command;
 /// 스트리밍 read 청크 크기. 최대 메모리는 `max_bytes + CHUNK`로 묶인다.
 const CHUNK: usize = 8 * 1024;
 
+/// stderr 보존 상한. 진단 문구는 보통 한두 줄이라 이 정도면 넘치고, 초과분은 **버리되 계속 읽어
+/// 비운다**(읽기를 멈추면 파이프가 차서 자식이 write에서 블록된다 — 그건 우리가 만든 hang이다).
+const MAX_STDERR_BYTES: usize = 16 * 1024;
+
+/// 실패 로그에 붙일 stderr 줄 수. 원인은 보통 마지막 줄에 있다.
+const STDERR_HINT_LINES: usize = 3;
+
 /// `cmd`를 spawn해 stdout을 **상한을 지키며** 수집하고, 종료 상태까지 확인해 stdout bytes를
-/// 돌려준다. stdin/stderr는 null, stdout은 pipe로 강제한다(호출부가 잊지 못하게).
+/// 돌려준다. stdin은 null, stdout/stderr는 pipe로 강제한다(호출부가 잊지 못하게).
 ///
 /// `what`은 에러 메시지에 쓰이는 사람이 읽을 명령 이름(예: `"docker system df"`).
+///
+/// **stderr는 왜 캡처하나**: 예전엔 null로 버렸는데, 그러면 non-zero exit 시 `exit status: 1`만
+/// 남아 **"데몬이 안 떴다"/"권한이 없다"/"소켓 경로가 틀렸다"를 구분할 수 없다**. 운영 중에 이걸
+/// 디버깅하는 사람에게는 그 한 줄이 전부다. 그래서 stderr를 [`MAX_STDERR_BYTES`] 상한으로 받아
+/// 실패 메시지에 붙인다. 단, **redaction을 거친다** — stderr에는 경로·호스트명·토큰이 섞일 수
+/// 있고, aicd 로그는 진단 번들에 실려 나갈 수 있다(송신 문자열을 전부 redact하는 repo 규약을
+/// 로그에도 동일하게 적용한다).
 ///
 /// `Err`가 되는 경우 — 호출부는 전부 "이번 주기 skip"으로 동일 취급한다:
 /// - spawn 실패(미설치 → ENOENT)
 /// - `timeout` 초과(hang) — 자식을 kill하고 reap한다
 /// - stdout이 `max_bytes`를 초과(비정상/무한 출력) — 읽는 도중 즉시 끊고 자식을 kill한다
-/// - non-zero exit(데몬 다운·권한 없음 등이 모두 여기로 온다 — 구분할 필요가 없다)
+/// - non-zero exit(데몬 다운·권한 없음 등이 모두 여기로 온다 — 구분은 stderr가 해 준다)
 pub(super) async fn run_capped(
     mut cmd: Command,
     timeout: Duration,
@@ -42,7 +56,7 @@ pub(super) async fn run_capped(
 ) -> anyhow::Result<Vec<u8>> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         // 핵심: 이게 없으면 아래 timeout이 만료돼 future가 drop될 때 자식이 살아남아 orphan이 된다.
         .kill_on_drop(true);
 
@@ -53,9 +67,21 @@ pub(super) async fn run_capped(
             .stdout
             .take()
             .ok_or_else(|| anyhow::anyhow!("{what}의 stdout을 잡지 못함"))?;
-        let buf = read_capped(&mut stdout, max_bytes, what).await?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("{what}의 stderr를 잡지 못함"))?;
+
+        // 두 파이프를 **동시에** 읽어야 한다. stdout만 읽으면 자식이 stderr를 많이 뱉을 때 파이프가
+        // 가득 차 write에서 블록되고, 우리는 오지 않을 stdout EOF를 기다리며 서로 멈춘다(고전적
+        // deadlock). `try_join!`은 한쪽이 Err(= stdout 상한 초과)면 즉시 단축해 다른 쪽 future를
+        // drop하므로, 무한 출력에 매달리지 않고 곧바로 kill 경로로 간다.
+        let (out, err) = tokio::try_join!(
+            read_capped(&mut stdout, max_bytes, what),
+            read_lossy_capped(&mut stderr, MAX_STDERR_BYTES),
+        )?;
         let status = child.wait().await?;
-        Ok::<_, anyhow::Error>((status, buf))
+        Ok::<_, anyhow::Error>((status, out, err))
     })
     .await;
 
@@ -70,11 +96,16 @@ pub(super) async fn run_capped(
             let _ = child.kill().await;
             Err(e)
         }
-        Ok(Ok((status, buf))) => {
+        Ok(Ok((status, out, err))) => {
             if !status.success() {
-                anyhow::bail!("{what}가 {status} 로 종료");
+                // stderr가 곧 원인이다 — 없으면 예전처럼 status만 남는다.
+                let hint = stderr_hint(&err);
+                if hint.is_empty() {
+                    anyhow::bail!("{what}가 {status} 로 종료 (stderr 없음)");
+                }
+                anyhow::bail!("{what}가 {status} 로 종료: {hint}");
             }
-            Ok(buf)
+            Ok(out)
         }
     }
 }
@@ -99,6 +130,48 @@ where
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// stderr용 — 상한까지만 **보존**하고 초과분은 버리되 EOF까지 계속 읽어 파이프를 비운다.
+///
+/// stdout과 달리 상한 초과를 에러로 올리지 않는다: stderr는 진단 보조일 뿐이라, 수다스럽다는
+/// 이유로 수집 전체를 실패시키면 본말이 전도된다. 읽기를 아예 멈추지도 않는다 — 파이프가 차면
+/// 자식이 write에서 블록돼 우리가 hang을 만든다. 메모리는 `max_bytes`로 묶이고, 무한히 뱉는
+/// 병적인 경우는 바깥 timeout이 받아낸다.
+async fn read_lossy_capped<R>(reader: &mut R, max_bytes: usize) -> anyhow::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        let room = max_bytes.saturating_sub(buf.len());
+        if room > 0 {
+            buf.extend_from_slice(&chunk[..n.min(room)]);
+        }
+    }
+}
+
+/// 실패 로그에 붙일 stderr 요약 — 마지막 [`STDERR_HINT_LINES`]줄을 redact해 한 줄로 합친다.
+/// 원인은 보통 끝줄에 있고(앞은 진행 로그), 로그 한 줄이 화면을 도배하지 않게 줄 수를 묶는다.
+fn stderr_hint(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let tail: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if tail.is_empty() {
+        return String::new();
+    }
+    let start = tail.len().saturating_sub(STDERR_HINT_LINES);
+    let joined = tail[start..].join(" | ");
+    // repo 규약: 밖으로 나가는 문자열은 예외 없이 redaction을 통과한다(로그도 진단 번들에 실린다).
+    aic_common::redaction::redact(&joined).0
 }
 
 /// orphan 회귀 가드를 세 모듈(proc/docker/connections)이 공유하기 위한 테스트 유틸.
@@ -210,6 +283,110 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(err.to_string().contains("종료"), "err={err}");
+    }
+
+    /// 실패 원인이 로그에 남아야 한다. 예전엔 stderr를 null로 버려 `exit status: 1`만 남았고,
+    /// "데몬이 안 떴다"인지 "권한이 없다"인지 구분할 수 없었다.
+    #[tokio::test]
+    async fn nonzero_exit_error_carries_the_stderr_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script_in(
+            &dir,
+            "daemon-down",
+            "echo 'failed to connect to the docker API at unix:///var/run/docker.sock; \
+             check if the daemon is running' >&2\nexit 1",
+        );
+        let err =
+            retry_busy(|| run_capped(Command::new(&bin), Duration::from_secs(5), 4096, "test"))
+                .await
+                .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("종료"), "err={msg}");
+        assert!(
+            msg.contains("check if the daemon is running"),
+            "실패 원인(stderr)이 에러에 실려야 한다: {msg}"
+        );
+    }
+
+    /// stderr가 비어 있으면 그렇다고 명시한다 — 조용한 실패와 "원인을 못 읽었다"를 섞지 않는다.
+    #[tokio::test]
+    async fn nonzero_exit_without_stderr_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script_in(&dir, "silent-fail", "exit 3");
+        let err =
+            retry_busy(|| run_capped(Command::new(&bin), Duration::from_secs(5), 4096, "test"))
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("stderr 없음"), "err={err}");
+    }
+
+    /// stderr에 섞인 secret은 로그로 새지 않는다(aicd 로그는 진단 번들에 실려 나갈 수 있다).
+    #[tokio::test]
+    async fn stderr_in_the_error_is_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = script_in(
+            &dir,
+            "leaky",
+            "echo 'auth failed for AKIAIOSFODNN7EXAMPLE' >&2\nexit 1",
+        );
+        let err =
+            retry_busy(|| run_capped(Command::new(&bin), Duration::from_secs(5), 4096, "test"))
+                .await
+                .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret이 에러 메시지로 유출됨: {msg}"
+        );
+        assert!(msg.contains("[REDACTED:"), "redaction 표식이 없음: {msg}");
+    }
+
+    /// 수다스러운 stderr가 수집 자체를 실패시키면 안 된다(진단 보조일 뿐이다). 상한을 넘겨도
+    /// stdout은 정상적으로 돌아오고, 자식은 파이프가 차서 블록되지 않는다(계속 비워 준다).
+    #[tokio::test]
+    async fn a_noisy_stderr_neither_fails_the_run_nor_deadlocks_the_child() {
+        let dir = tempfile::tempdir().unwrap();
+        // stderr로 상한(16KiB)을 훌쩍 넘겨 뱉은 뒤, stdout에 정상 결과를 낸다.
+        let bin = script_in(
+            &dir,
+            "noisy",
+            "i=0\nwhile [ $i -lt 4000 ]; do echo 'noise noise noise noise noise' >&2; i=$((i+1)); done\n\
+             echo ok",
+        );
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            retry_busy(|| run_capped(Command::new(&bin), Duration::from_secs(15), 4096, "test")),
+        )
+        .await
+        .expect("stderr를 비우지 않아 자식이 파이프에서 블록됐다(deadlock)")
+        .unwrap();
+
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "ok");
+    }
+
+    #[test]
+    fn stderr_hint_keeps_the_last_lines_and_redacts() {
+        let raw = b"progress 1\nprogress 2\nfatal: permission denied\n";
+        let hint = stderr_hint(raw);
+        assert!(hint.contains("fatal: permission denied"), "hint={hint}");
+
+        // 줄 수 상한을 넘으면 마지막 줄들만 남는다 — 원인은 끝에 있다.
+        let many = (1..=10)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hint = stderr_hint(many.as_bytes());
+        assert!(hint.contains("line10"), "마지막 줄이 남아야 함: {hint}");
+        assert!(!hint.contains("line1\n"), "앞줄은 버려야 함: {hint}");
+        assert!(
+            !hint.contains("line7"),
+            "STDERR_HINT_LINES(3)만 남아야 함: {hint}"
+        );
+
+        assert_eq!(stderr_hint(b"   \n  \n"), "", "공백뿐이면 빈 문자열");
     }
 
     #[tokio::test]
