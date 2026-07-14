@@ -385,7 +385,8 @@ impl SysMetrics {
         }
     }
 
-    fn mem_pct(&self) -> f64 {
+    /// mem 사용률(%). `session::record_metrics_attrs`(`/record now` OTLP attrs)가 재사용한다.
+    pub(crate) fn mem_pct(&self) -> f64 {
         if self.mem_total > 0 {
             self.mem_used as f64 * 100.0 / self.mem_total as f64
         } else {

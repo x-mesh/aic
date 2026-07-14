@@ -146,7 +146,8 @@ fn head_lines(s: &str, n: usize) -> String {
 }
 
 /// UTF-8 경계에서 최대 `max` 바이트로 자른다. (잘림 여부, 결과).
-fn cap_str(s: &str, max: usize) -> (String, bool) {
+/// `agent_event::sanitize_memo`(F16: `/record now` 메모 절단)가 UTF-8 경계 보존 절단을 재사용한다.
+pub(crate) fn cap_str(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
     }
@@ -204,8 +205,9 @@ pub(crate) enum SlashCommand {
     Trend(Option<usize>),
     /// `/compare` — 현재 시스템 스냅샷을 직전 baseline과 diff(LLM 미호출). 첫 호출은 baseline 저장.
     Compare,
-    /// `/record [on|off|now]` — 세션 스냅샷 자동 기록 토글. 인자 없으면 on↔off 반전, `now`=즉시 1회 캡처.
-    /// on이면 Warn↑ 알림·주기 캡처가 store에 쌓이고 status bar에 `● REC` 표시.
+    /// `/record [on|off|now [<메모>]]` — 세션 스냅샷 자동 기록 토글. 인자 없으면 on↔off 반전,
+    /// `now`=즉시 1회 캡처(+선택 메모). on이면 Warn↑ 알림·주기 캡처가 store에 쌓이고 status bar에
+    /// `● REC` 표시.
     Record(RecordAction),
     /// `/snapshots [N]` — store의 최근 스냅샷 N개(기본 10) inline 목록(LLM 미호출).
     Snapshots(Option<usize>),
@@ -254,13 +256,15 @@ pub(crate) enum SlashCommand {
 }
 
 /// `/record` 동작. 인자 없으면 `Toggle`(현재 상태 반전).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RecordAction {
     Toggle,
     On,
     Off,
-    /// 즉시 1회 캡처(토글 상태 무관).
-    Now,
+    /// 즉시 1회 캡처(토글 상태 무관). `Some(memo)`면 사람이 남긴 관찰 메모 — 로컬 캡처와 별개로
+    /// OTLP `snapshot.recorded`도 함께 발화한다(t3, B3). 메모 없이 `now`만 치면 기존 동작(로컬
+    /// 캡처만) 그대로다 — `String`이 아니라 `Option<String>`인 이유가 이 회귀 방지다.
+    Now(Option<String>),
 }
 
 /// `/rca` 하위 명령.
@@ -349,7 +353,9 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
 pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
         "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
-        "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => "Evidence",
+        "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => {
+            "Evidence"
+        }
         "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots" => {
             "System"
         }
@@ -386,7 +392,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "timeline" => "세션 tool 기록 시간순 (최근 N개)",
         "trend" => "최근 명령 exit 추세 ✓/✗ + 실패율 (최근 N개; LLM 미호출)",
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
-        "record" => "세션 스냅샷 자동 기록 토글 (on|off|now). on이면 Warn↑ 알림·주기(2분) 캡처 + REC 표시",
+        "record" => "세션 스냅샷 자동 기록 토글 (on|off|now [메모]). on이면 Warn↑ 알림·주기(2분) 캡처 + REC 표시",
         "snapshots" => "store의 최근 스냅샷 N개 목록 (기본 10, LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
@@ -491,17 +497,28 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         "trend" => SlashCommand::Trend(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "compare" => SlashCommand::Compare,
         "record" => {
-            let action = match parts.next() {
-                Some("on") => RecordAction::On,
-                Some("off") => RecordAction::Off,
-                Some("now") => RecordAction::Now,
+            // `now` 뒤 rest-of-line 전체가 메모(공백 보존, 둘러싼 따옴표 strip) — `/rca add note`와
+            // 같은 패턴. 메모가 없으면(공백뿐) None → 기존 "로컬 캡처만" 동작 그대로.
+            let s = rest.trim_start();
+            let mut split = s.splitn(2, char::is_whitespace);
+            let sub = split.next().unwrap_or("");
+            let tail = split.next().unwrap_or("").trim_start();
+            let action = match sub {
+                "on" => RecordAction::On,
+                "off" => RecordAction::Off,
+                "now" => {
+                    let memo = strip_surrounding_quotes(tail.trim());
+                    RecordAction::Now(if memo.is_empty() {
+                        None
+                    } else {
+                        Some(memo.to_string())
+                    })
+                }
                 _ => RecordAction::Toggle,
             };
             SlashCommand::Record(action)
         }
-        "snapshots" => {
-            SlashCommand::Snapshots(parts.next().and_then(|n| n.parse::<usize>().ok()))
-        }
+        "snapshots" => SlashCommand::Snapshots(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "bundle" => {
             // [name] — 라벨/파일명 전용(따옴표 strip), 셸 명령에 미포함.
             let name = strip_surrounding_quotes(rest.trim());
@@ -919,8 +936,11 @@ pub(crate) fn help_text() -> String {
         "  /timeline [N]        세션 tool 기록 시간순(최근 N개)",
         "  /trend [N]           최근 명령 exit 추세 ✓/✗ + 실패율(최근 N개; LLM 미호출)",
         "  /compare             현재 시스템 스냅샷을 직전 baseline과 diff(변경 섹션/±라인 요약; LLM 미호출)",
-        "  /record [on|off|now]  세션 스냅샷 자동 기록 토글. on이면 Warn↑ 알림·주기(2분) 캡처가 store에",
-        "                       쌓이고 status bar에 ● REC 표시. now=즉시 1회 캡처. (LLM 미호출)",
+        "  /record [on|off|now [메모]]  세션 스냅샷 자동 기록 토글. on이면 Warn↑ 알림·주기(2분) 캡처가",
+        "                       store에 쌓이고 status bar에 ● REC 표시. now=즉시 1회 캡처(로컬 저장은",
+        "                       항상). 메모를 붙이면(now <메모>) OTLP snapshot.recorded도 함께 기록",
+        "                       — 임계 스캔이 못 잡는 '지금 이상하다'를 사람이 직접 남기는 경로.",
+        "                       (LLM 미호출)",
         "  /snapshots [N]       store의 최근 스냅샷 N개 inline 목록(기본 10; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
         "  /rca start|use|add|timeline|report  persistent RCA workspace에 chat 증거 저장",
@@ -1098,7 +1118,13 @@ pub(crate) fn render_trend(ring: &VecDeque<ToolRecord>, n: Option<usize>) -> Str
     let fail = total - ok;
     let seq: String = recent
         .iter()
-        .map(|r| if r.exit.as_deref() == Some("0") { '✓' } else { '✗' })
+        .map(|r| {
+            if r.exit.as_deref() == Some("0") {
+                '✓'
+            } else {
+                '✗'
+            }
+        })
         .collect();
     let fail_pct = if total > 0 {
         fail as f64 * 100.0 / total as f64
@@ -1341,9 +1367,15 @@ mod tests {
             assert!(help.contains(cmd), "help_text missing {cmd}");
         }
         // /record 주기는 구체 값으로 안내한다.
-        assert!(help.contains("주기(2분)"), "help_text missing record interval");
+        assert!(
+            help.contains("주기(2분)"),
+            "help_text missing record interval"
+        );
         // alert-lane 토글 형태도 문서화한다.
-        assert!(help.contains("/watch arm"), "help_text missing alert-lane toggle");
+        assert!(
+            help.contains("/watch arm"),
+            "help_text missing alert-lane toggle"
+        );
     }
 
     #[test]
@@ -1400,10 +1432,19 @@ mod tests {
     #[test]
     fn trend_aggregates_exits_and_skips_non_exec() {
         let mut r = VecDeque::new();
-        push_record(&mut r, rec("a.1", "run_command", "exit_code=0 duration_ms=1"));
-        push_record(&mut r, rec("a.2", "run_command", "exit_code=1 duration_ms=1"));
+        push_record(
+            &mut r,
+            rec("a.1", "run_command", "exit_code=0 duration_ms=1"),
+        );
+        push_record(
+            &mut r,
+            rec("a.2", "run_command", "exit_code=1 duration_ms=1"),
+        );
         push_record(&mut r, rec("a.3", "read_file", "ok")); // exit 없음 → 집계 제외
-        push_record(&mut r, rec("a.4", "run_command", "exit_code=0 duration_ms=1"));
+        push_record(
+            &mut r,
+            rec("a.4", "run_command", "exit_code=0 duration_ms=1"),
+        );
         let out = render_trend(&r, None);
         assert!(out.contains("✓✗✓"), "out={out}"); // read_file 제외, 오래된→최신
         assert!(out.contains("성공 2 / 실패 1"), "out={out}");
@@ -1744,15 +1785,37 @@ mod tests {
         );
         assert_eq!(
             parse_slash("/record now"),
-            Some(SlashCommand::Record(RecordAction::Now))
+            Some(SlashCommand::Record(RecordAction::Now(None)))
         );
         // 알 수 없는 인자는 Toggle로 폴백(엄격 거부보다 관대).
         assert_eq!(
             parse_slash("/record bogus"),
             Some(SlashCommand::Record(RecordAction::Toggle))
         );
+        // `/record now <메모>` — rest-of-line 전체가 메모(공백 보존).
+        assert_eq!(
+            parse_slash("/record now cpu 이상하게 높음"),
+            Some(SlashCommand::Record(RecordAction::Now(Some(
+                "cpu 이상하게 높음".to_string()
+            ))))
+        );
+        // 둘러싼 따옴표는 strip(다른 rest-of-line 인자들과 동일 컨벤션).
+        assert_eq!(
+            parse_slash("/record now \"quoted memo\""),
+            Some(SlashCommand::Record(RecordAction::Now(Some(
+                "quoted memo".to_string()
+            ))))
+        );
+        // 공백뿐인 메모는 None(=기존 "로컬 캡처만" 동작) — 회귀 방지의 핵심 케이스.
+        assert_eq!(
+            parse_slash("/record now   "),
+            Some(SlashCommand::Record(RecordAction::Now(None)))
+        );
         // /snapshots [N]
-        assert_eq!(parse_slash("/snapshots"), Some(SlashCommand::Snapshots(None)));
+        assert_eq!(
+            parse_slash("/snapshots"),
+            Some(SlashCommand::Snapshots(None))
+        );
         assert_eq!(
             parse_slash("/snapshots 5"),
             Some(SlashCommand::Snapshots(Some(5)))
@@ -1980,7 +2043,10 @@ mod tests {
         let (start, c) = slash_completion("/loc", 4);
         assert_eq!(start, 1);
         assert_eq!(c, vec!["local".to_string()]);
-        assert!(slash_completion("/lo", 3).1.is_empty(), "lo→local/logs ambiguous");
+        assert!(
+            slash_completion("/lo", 3).1.is_empty(),
+            "lo→local/logs ambiguous"
+        );
 
         // '/s' → sys/snapshot ambiguous → 빈 후보(메뉴 오실행 방지, 원문 submit→parser 안내).
         let (_s, c) = slash_completion("/s", 2);
@@ -2053,10 +2119,22 @@ mod tests {
             })
         );
         // 알림 레인 토글(C7) — arm/on/off/mute는 bounded probe가 아닌 AlertLane으로 파싱.
-        assert_eq!(parse_slash("/watch arm"), Some(SlashCommand::AlertLane { on: true }));
-        assert_eq!(parse_slash("/watch on"), Some(SlashCommand::AlertLane { on: true }));
-        assert_eq!(parse_slash("/watch off"), Some(SlashCommand::AlertLane { on: false }));
-        assert_eq!(parse_slash("/watch mute"), Some(SlashCommand::AlertLane { on: false }));
+        assert_eq!(
+            parse_slash("/watch arm"),
+            Some(SlashCommand::AlertLane { on: true })
+        );
+        assert_eq!(
+            parse_slash("/watch on"),
+            Some(SlashCommand::AlertLane { on: true })
+        );
+        assert_eq!(
+            parse_slash("/watch off"),
+            Some(SlashCommand::AlertLane { on: false })
+        );
+        assert_eq!(
+            parse_slash("/watch mute"),
+            Some(SlashCommand::AlertLane { on: false })
+        );
         // 과도한 count는 MAX로 clamp, 0/과소 interval은 MIN으로 clamp(무한/과도 방지).
         match parse_slash("/watch --count 999 --every 10ms") {
             Some(SlashCommand::Watch {

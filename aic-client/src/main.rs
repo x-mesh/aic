@@ -910,6 +910,16 @@ enum SnapshotOp {
         #[arg(long)]
         force: bool,
     },
+    /// (t3 B3) 1회 캡처(= `capture --force`와 동일)에 사람이 남기는 메모를 붙인다. chat
+    /// `/record now <메모>`의 CLI 진입점 — cron/서버/스크립트에서도 "지금 이 순간이 이상하다"를
+    /// 기록할 수 있어야 하므로 별도 leaf로 둔다. 로컬 스냅샷 store 저장은 `capture --force`와
+    /// 동일하게 항상 일어나고, 메모는 OTLP `aic.agent`(`kind=snapshot.recorded`)로 별도 발화된다
+    /// (aicd 미실행이면 조용히 생략 — best-effort).
+    Record {
+        /// 기록할 메모(사람의 관찰). 빈 문자열/공백뿐이면 OTLP는 조용히 생략되고 로컬 캡처만 남는다.
+        #[arg(long)]
+        memo: String,
+    },
     /// store의 최근 스냅샷을 시간순으로 나열한다.
     List {
         /// 표시할 최대 레코드 수(기본 20).
@@ -1913,6 +1923,7 @@ fn snapshot_platform_label(p: aic_client::daemon_install::Platform) -> &'static 
 fn handle_snapshot(op: SnapshotOp) -> anyhow::Result<()> {
     match op {
         SnapshotOp::Capture { kind, force } => handle_snapshot_capture(&kind, force),
+        SnapshotOp::Record { memo } => handle_snapshot_record(&memo),
         SnapshotOp::List { limit, json } => handle_snapshot_list(limit, json),
         SnapshotOp::Status { json } => handle_snapshot_status(json),
         SnapshotOp::Install { interval, no_load } => handle_snapshot_install(interval, no_load),
@@ -2014,6 +2025,42 @@ fn handle_snapshot_capture(kind: &str, force: bool) -> anyhow::Result<()> {
             // 게이트/타이머 경로는 best-effort: 실패해도 exit 0. 경고만 stderr(타이머 로그에 남는다).
             eprintln!("{COL_YELLOW}!{COL_RESET} 스냅샷 캡처 실패(best-effort, 무시): {e}");
         }
+    }
+    Ok(())
+}
+
+/// `aic snapshot record --memo "<메모>"` — chat `/record now <메모>`의 CLI 진입점(t3 B3).
+/// cron/서버/스크립트 등 chat 밖에서도 "지금 이 순간이 이상하다"를 남길 수 있어야 한다.
+///
+/// 로컬 스냅샷 store 저장은 `--force` 수동 캡처와 동일한 경로(`capture_forced`)라 게이트와
+/// 무관하게 항상 일어난다 — 실패해도 exit 1(스크립트가 성공으로 오인하지 않게).
+///
+/// **지표는 붙이지 않는다.** CLI는 매 호출이 새 프로세스라 chat 세션 같은 warm cache가 없고,
+/// 즉석 샘플링은 `record_metrics_summary`가 의도적으로 걷어낸 바로 그 위험(hung statfs가
+/// spawn_blocking pool 스레드를 영구 pin)을 다시 불러들이는 일이라 하지 않는다. host metrics는
+/// 이미 aicd가 주기 전송하므로 ts로 조인하면 그 시점 지표는 서버에 있다 — session.rs
+/// `record_metrics_summary` 문서 참고.
+fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
+    match aic_client::agent::snapshot_capture::capture_forced("manual") {
+        Ok(Some(path)) => {
+            println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
+        }
+        Ok(None) => {
+            // capture_forced는 게이트를 우회하므로 이론상 오지 않지만, 방어적으로 안내만.
+            eprintln!("{COL_DIM}스냅샷이 기록되지 않았습니다.{COL_RESET}");
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}"));
+        }
+    }
+
+    let mut attrs = std::collections::BTreeMap::new();
+    attrs.insert("note_source".to_string(), "cli".to_string());
+    let sent = aic_client::agent_event::snapshot_recorded(memo, attrs);
+    if sent && aic_client::agent_event::exporter_status().is_none() {
+        eprintln!(
+            "{COL_DIM}OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.{COL_RESET}"
+        );
     }
     Ok(())
 }
