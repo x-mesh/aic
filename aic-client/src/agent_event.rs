@@ -298,10 +298,13 @@ impl RecordOutcome {
             //
             // backlog는 **공유 spool 전체**의 적재량이라 이 메모의 지연량이 아니다. 그래서 "이 메모가
             // {backlog}개만큼 밀렸다"가 아니라 "지금 spool이 밀려 있다"는 사실만 말한다.
+            // "복구되면 전송됩니다"는 **단언**이 되면 안 된다 — spool은 적재 한도를 넘기면 배치를
+            // 버린다(`spool_dropped`가 그 증거다). 보장할 수 없는 걸 보장처럼 쓰지 않고, 사실만 말한다:
+            // collector가 살아나면 재전송을 **시도**한다.
             RecordOutcome::Delivered { backlog } => Some(format!(
                 "메모를 aicd에 전달했습니다. 다만 지금 collector로 나가지 못한 배치가 spool에 \
                  {backlog}개 쌓여 있어(모든 exporter 합계), 서버 반영이 지연될 수 있습니다\
-                 (복구되면 전송됩니다)."
+                 (collector가 복구되면 재전송을 시도합니다)."
             )),
             RecordOutcome::Unknown => Some(
                 "메모를 aicd에 전달했지만 exporter 상태를 확인하지 못해 서버 도달 여부는 알 수 \

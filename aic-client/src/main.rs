@@ -2112,6 +2112,9 @@ fn handle_snapshot_list(limit: usize, json: bool) -> anyhow::Result<()> {
                     "sections": r.sections,
                     "host": r.host,
                     "cwd": r.cwd,
+                    // 저장한 메모를 machine 출력에도 싣는다 — 이 JSON은 struct의 serde 직렬화가 아니라
+                    // 수기 조립이라, 여기에 넣지 않으면 memo는 `--json`에도 안 나온다(빠뜨리기 쉬운 곳).
+                    "memo": r.memo,
                 })
             })
             .collect();
@@ -2130,13 +2133,9 @@ fn handle_snapshot_list(limit: usize, json: bool) -> anyhow::Result<()> {
     } else {
         println!("최근 스냅샷 {}개 (총 {}):", recent.len(), all.len());
         for r in recent {
-            println!(
-                "- {} · {} · sections={} ({})",
-                r.captured_at.to_rfc3339(),
-                r.kind,
-                r.sections.len(),
-                r.sections.join(",")
-            );
+            // 메모까지 포함한 한 줄은 SnapshotRecord::list_line(순수)이 만든다 — 포맷을 테스트 가능한
+            // 곳에 두어 "저장했지만 표시 안 함"을 회귀로 잡는다.
+            println!("{}", r.list_line());
         }
     }
     Ok(())

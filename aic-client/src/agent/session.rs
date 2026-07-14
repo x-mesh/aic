@@ -1627,7 +1627,15 @@ impl AgentSession {
             // 들고 다닌다. 예전엔 여기서 한 번, 전송부에서 또 한 번 정제해서(이중 sanitize) 두 번째
             // 호출이 이미 잘린 문자열을 보고 "안 잘렸다"고 판정했다 — `memo_truncated`가 실제 경로에서
             // 영영 안 붙었다. 절단 여부는 **정제 순간에만 알 수 있는 정보**라 나중에 재계산할 수 없다.
+            //
+            // CLI(`record_now_cli`)와 **같은 판정**(`Memo::sanitize == None`)을 쓰되, chat만의 비대칭이
+            // 하나 있다: `/record now`(메모 없이) 자체가 정당한 순수 캡처다. 그래서 CLI(메모 전용 leaf)처럼
+            // "무조건 스킵"하지 않고, **메모를 입력했는데(`memo_typed`) 정제 후 비었을 때만** 그 사실을
+            // 표면화한다. 예전엔 이 경우 chat이 "✓ 캡처"만 찍고 메모가 사라진 걸 안 알렸다 — CLI만 고치고
+            // 형제 경로를 놓친 것이었다.
+            let memo_typed = memo.as_deref().is_some_and(|s| !s.is_empty());
             let memo = memo.as_deref().and_then(crate::agent_event::Memo::sanitize);
+            let memo_emptied = memo_typed && memo.is_none();
 
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
@@ -1650,6 +1658,14 @@ impl AgentSession {
                 Err(e) => format!("스냅샷 캡처 task 실패: {e}"),
             };
             self.out.note(&msg).await;
+
+            // 메모를 입력했는데 정제 후 비었다(공백/제어문자뿐) — 스냅샷은 남았지만 **메모는 사라졌다**는
+            // 사실을 반드시 알린다(CLI가 exit 1로 알리는 것과 같은 표면화, chat은 한 줄로).
+            if memo_emptied {
+                self.out
+                    .note("ℹ 메모가 비어(공백/제어문자뿐) 기록하지 않았습니다 — 스냅샷만 저장했습니다.")
+                    .await;
+            }
 
             if memo.as_ref().is_some_and(|m| m.truncated()) {
                 self.out
@@ -3311,6 +3327,107 @@ mod tests {
         assert_eq!(ev.summary, "디스크가 이상하다");
     }
 
+    /// handle_record의 사용자 안내(note)를 채널로 잡아 오는 session — `ChatOut::Tui`로 붙인다.
+    /// Direct는 stderr(eprintln)라 관측이 안 되므로, 노트를 검증하려면 Tui로 바꾼다.
+    fn test_session_capturing_notes() -> (
+        AgentSession,
+        tempfile::TempDir,
+        tokio::sync::mpsc::Receiver<crate::agent::chat_tui::OutMsg>,
+    ) {
+        let (mut session, dir) = test_session();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        session.out = ChatOut::Tui(tx);
+        (session, dir, rx)
+    }
+
+    fn drain_notes(
+        rx: &mut tokio::sync::mpsc::Receiver<crate::agent::chat_tui::OutMsg>,
+    ) -> Vec<String> {
+        let mut notes = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let crate::agent::chat_tui::OutMsg::Note(s) = msg {
+                notes.push(s);
+            }
+        }
+        notes
+    }
+
+    // ── CLI/chat 대칭: 빈 메모 표면화 ────────────────────────────────────────────
+    // CLI는 `record_now_cli_on_empty_memo_stores_and_sends_nothing`이 exit 1로 알린다.
+    // chat은 스냅샷 캡처 자체는 정당하므로 캡처는 하되, **메모가 비었다는 사실을 한 줄로 알린다**.
+    // 예전엔 chat이 "✓ 캡처"만 찍고 메모가 사라진 걸 안 알렸다 — CLI만 고치고 형제를 놓친 것.
+
+    #[tokio::test]
+    async fn chat_record_now_surfaces_emptied_memo_but_still_captures() {
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+        let (mut session, _dir, mut rx) = test_session_capturing_notes();
+
+        // 사용자가 메모를 입력했지만 제어문자뿐이라 sanitize 후 빈다(F15).
+        session
+            .handle_record(tool_record::RecordAction::Now(Some(
+                "\x1b\x1b\x1b".to_string(),
+            )))
+            .await;
+
+        let notes = drain_notes(&mut rx);
+        assert!(
+            notes.iter().any(|n| n.contains("메모가 비어")),
+            "빈 메모를 사용자에게 안 알렸다: {notes:?}"
+        );
+        // 원격으로는 안 나갔다(빈 메모는 snapshot.recorded를 발화하지 않는다).
+        assert!(
+            drain_snapshot_event().is_none(),
+            "빈 메모인데 원격 이벤트가 나갔다"
+        );
+        // 스냅샷 캡처 자체는 정당하므로 레코드는 남되, memo는 None이다.
+        let rec = crate::snapshot_store::load_snapshots().unwrap();
+        assert_eq!(rec.len(), 1, "스냅샷은 캡처돼야 한다(캡처는 메모와 무관)");
+        assert_eq!(rec[0].memo, None, "빈 메모가 레코드에 저장되면 안 된다");
+    }
+
+    #[tokio::test]
+    async fn chat_bare_record_now_does_not_warn_about_empty_memo() {
+        // `/record now`(메모 없이)는 정당한 순수 캡처다 — 빈-메모 경고를 내면 안 된다(오경고).
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+        let (mut session, _dir, mut rx) = test_session_capturing_notes();
+
+        session
+            .handle_record(tool_record::RecordAction::Now(None))
+            .await;
+
+        let notes = drain_notes(&mut rx);
+        assert!(
+            !notes.iter().any(|n| n.contains("메모가 비어")),
+            "메모를 입력하지도 않았는데 빈-메모 경고를 냈다: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_real_memo_does_not_warn_and_stores_it() {
+        // 대칭 확인: 진짜 메모는 경고 없이 로컬 저장 + 원격 발화.
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+        let (mut session, _dir, mut rx) = test_session_capturing_notes();
+
+        session
+            .handle_record(tool_record::RecordAction::Now(Some(
+                "cpu 이상하게 높음".to_string(),
+            )))
+            .await;
+
+        let notes = drain_notes(&mut rx);
+        assert!(
+            !notes.iter().any(|n| n.contains("메모가 비어")),
+            "진짜 메모인데 빈-메모 경고를 냈다: {notes:?}"
+        );
+        let ev = drain_snapshot_event().expect("진짜 메모는 원격에 나가야 한다");
+        assert_eq!(ev.summary, "cpu 이상하게 높음");
+        let rec = crate::snapshot_store::load_snapshots().unwrap();
+        assert_eq!(rec[0].memo.as_deref(), Some("cpu 이상하게 높음"));
+    }
+
     #[test]
     fn test_session_keeps_sandbox_root_alive() {
         // 헬퍼가 TempDir을 반환하지 않으면 함수 종료 시 임시 디렉터리가 지워져 Sandbox가 존재하지 않는
@@ -3905,7 +4022,14 @@ mod tests {
     fn record_now_cli_on_empty_memo_stores_and_sends_nothing() {
         // sanitize는 제어문자만 거른다(ANSI 페이로드 `[0m`은 일반 문자라 살아남는다 — 여기선
         // "제어문자·공백뿐이라 정말로 비는" 입력만 쓴다). ESC/BEL/NUL은 전부 제어문자다.
-        for raw in ["", "   ", "\t\t", "\n \n", "\u{1b}\u{7}\u{0}", "\u{1b} \u{7}"] {
+        for raw in [
+            "",
+            "   ",
+            "\t\t",
+            "\n \n",
+            "\u{1b}\u{7}\u{0}",
+            "\u{1b} \u{7}",
+        ] {
             let report = record_now_cli(raw);
             assert!(
                 report.empty_memo,
