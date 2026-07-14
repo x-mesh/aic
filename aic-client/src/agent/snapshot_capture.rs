@@ -94,8 +94,7 @@ fn store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::MutexGuard;
-    use tempfile::TempDir;
+    use crate::snapshot_store::TestStore;
 
     fn alert(kind: AlertKind, severity: Severity) -> Alert {
         Alert {
@@ -132,58 +131,20 @@ mod tests {
         ]));
     }
 
-    // HOME 격리 + env 직렬화(snapshot_store 테스트와 동일 패턴).
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
-        _dir: TempDir,
-    }
-    impl HomeGuard {
-        fn set() -> Self {
-            // snapshot_store와 **같은** 프로세스 전역 HOME 락을 공유한다(별도 락이면 `cargo test snapshot`에서
-            // 두 모듈이 HOME을 서로 덮어 store 오염·PoisonError 연쇄).
-            let lock = crate::snapshot_store::home_test_lock()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let dir = TempDir::new().unwrap();
-            let prev = std::env::var_os("HOME");
-            unsafe {
-                std::env::set_var("HOME", dir.path());
-            }
-            Self {
-                prev,
-                _lock: lock,
-                _dir: dir,
-            }
-        }
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
+    // 격리는 `TestStore`(snapshot_store, env 미접촉)가 담당한다 — 예전 HomeGuard(HOME set_var) 대체.
 
     #[test]
     fn store_respects_opt_in() {
-        let _h = HomeGuard::set();
+        let h = TestStore::new();
         let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        // off(기본): 아무것도 안 쓴다.
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
-        }
+        // off(기본): 아무것도 안 쓴다. (opt-in은 env 대신 주입 — TestStore 기본 off.)
+        h.set_recording(false);
         assert!(store("alert", "## x\n1\n", now, false, None)
             .unwrap()
             .is_none());
         assert!(crate::snapshot_store::load_snapshots().unwrap().is_empty());
         // on: kind=alert 레코드 1건 저장(probe 미실행 — 결정적).
-        unsafe {
-            std::env::set_var("AIC_SNAPSHOT_RECORD", "1");
-        }
+        h.set_recording(true);
         assert!(store("alert", "## host\nh\n## disk\nd\n", now, false, None)
             .unwrap()
             .is_some());
@@ -194,20 +155,14 @@ mod tests {
             loaded[0].sections,
             vec!["host".to_string(), "disk".to_string()]
         );
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
-        }
     }
 
     #[test]
     fn force_bypasses_opt_in_gate() {
-        // force=true는 env가 off여도 store에 쓴다(--force 수동 캡처 경로). 게이트가 2곳이라 store가
+        // force=true는 opt-in이 off여도 store에 쓴다(--force 수동 캡처 경로). 게이트가 2곳이라 store가
         // 직접 force를 받아 둘 다 통과하는지 확인한다.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new(); // 기본 off
         let now = DateTime::from_timestamp(1_700_000_100, 0).unwrap();
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
-        }
         assert!(
             store("manual", "## host\nh\n", now, true, None)
                 .unwrap()
@@ -227,11 +182,8 @@ mod tests {
         //
         // 이 테스트는 **네트워크를 전혀 쓰지 않는다**(store만 호출) — 즉 aicd가 없는 상황 그 자체다.
         // 그 조건에서 메모가 로컬 레코드에 남아야 한다.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new(); // force=true 경로라 opt-in과 무관(기본 off로 충분)
         let now = DateTime::from_timestamp(1_700_000_200, 0).unwrap();
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
-        }
         store(
             "manual",
             "## host\nh\n",
@@ -253,7 +205,7 @@ mod tests {
     #[test]
     fn memo_is_redacted_and_empty_memo_stays_none() {
         // 메모에도 secret이 들어올 수 있다(F14) — body/host/cwd와 동일하게 at-rest redact.
-        let _h = HomeGuard::set();
+        let _h = TestStore::new();
         let now = DateTime::from_timestamp(1_700_000_300, 0).unwrap();
         store(
             "manual",
