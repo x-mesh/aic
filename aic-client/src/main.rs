@@ -2069,20 +2069,22 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
 
     let mut attrs = std::collections::BTreeMap::new();
     attrs.insert("note_source".to_string(), "cli".to_string());
-    let sent = aic_client::agent_event::snapshot_recorded(memo, attrs);
-    // 보낸 이벤트가 원격까지 갈 수 있는 상태인지 확인해 안내한다 — aicd 미실행뿐 아니라 exporter/
-    // agent-exporter가 꺼졌거나 spool에 밀린 경우도 알린다(그땐 aicd가 응답해 성공처럼 보이지만
-    // 이벤트는 서버에 닿지 않는다). 로컬/원격 두 결과를 **각각 사실대로** 보고한다.
-    // 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
-    let state = sent.then(aic_client::agent_event::remote_record_state);
-    if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, state) {
+    // 반환값이 곧 **사후 결과**다 — 보내기 전 probe로 성공을 단언하지 않는다. 로컬/원격 두 결과를
+    // 각각 사실대로 보고한다. 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
+    let outcome = aic_client::agent_event::snapshot_recorded(memo, attrs);
+    if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, outcome) {
         eprintln!("{COL_DIM}{notice}{COL_RESET}");
     }
 
-    // 로컬 실패는 exit 1(메모는 이미 보냈다 — 유실 없음).
+    // 로컬 저장 실패는 exit 1(메모는 이미 보냈다 — 유실 없음). **`Ok(None)`도 실패다**: 스냅샷이
+    // 기록되지 않았는데 exit 0을 내면, stderr를 읽지 않고 exit code만 보는 cron/스크립트가 반쪽
+    // 성공을 완전한 성공으로 오인한다(`Err`를 exit 1로 만든 것과 같은 취지).
     match local {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(anyhow::anyhow!(
+            "스냅샷이 기록되지 않았습니다 — 로컬 스냅샷 없이 메모만 전송되었습니다."
+        )),
         Err(e) => Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}")),
-        _ => Ok(()),
     }
 }
 

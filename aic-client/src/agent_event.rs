@@ -84,29 +84,34 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 /// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 둘 다
 /// [`prepare_snapshot_event`] 하나를 지난다.
 ///
-/// 반환값 = **실제로 발화를 시도했는가**. `false`면 sanitize 후 메모가 비어 스킵했다는 뜻(F15)이라,
-/// 호출부가 "메모가 비어 애초에 안 보냈다"와 "보냈지만 원격에 안 남는다"([`RemoteRecord`])를
-/// 구분해 안내할 수 있다. fire-and-forget이라 `true`가 aicd 도달을 보장하지는 않는다.
-pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) -> bool {
-    match prepare_snapshot_event(memo, attrs) {
-        Some(ev) => {
-            dispatch(ev);
-            true
-        }
-        None => false,
-    }
+/// 반환값 = **이 메모가 실제로 어떻게 됐는가**([`RecordOutcome`]). `None`이면 sanitize 후 메모가
+/// 비어 애초에 보내지 않았다는 뜻(F15)이라, 호출부가 "빈 메모라 안 보냄"과 "보냈고 그 결과는 이렇다"를
+/// 구분해 안내할 수 있다.
+///
+/// **결론은 전송 결과에서 나온다** — `dispatch`가 실패하면 어떤 probe 결과와도 무관하게 `NotSent`다.
+pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) -> Option<RecordOutcome> {
+    let ev = prepare_snapshot_event(memo, attrs)?;
+    // 먼저 **보내고**, 그 결과로 결론을 낸다. 상태 조회는 전송이 성공했을 때만 의미가 있으므로
+    // 실패하면 IPC를 한 번 더 걸지도 않는다(어차피 데몬이 없다).
+    let sent = dispatch(ev);
+    let status = sent.then(exporter_status).flatten();
+    Some(classify_outcome(sent, status.as_ref()))
 }
 
 /// [`snapshot_recorded`]의 async 판(chat `/record now <메모>`). 전송을 **async IPC**로 한다 —
 /// 이유는 [`query_async`] 문서 참고(sync IPC를 async에서 그냥 부르면 tokio worker가 막힌다).
-pub async fn snapshot_recorded_async(memo: &str, attrs: BTreeMap<String, String>) -> bool {
-    match prepare_snapshot_event(memo, attrs) {
-        Some(ev) => {
-            dispatch_async(ev).await;
-            true
-        }
-        None => false,
-    }
+pub async fn snapshot_recorded_async(
+    memo: &str,
+    attrs: BTreeMap<String, String>,
+) -> Option<RecordOutcome> {
+    let ev = prepare_snapshot_event(memo, attrs)?;
+    let sent = dispatch_async(ev).await;
+    let status = if sent {
+        exporter_status_async().await
+    } else {
+        None
+    };
+    Some(classify_outcome(sent, status.as_ref()))
 }
 
 /// 메모를 검사·안전화해 보낼 이벤트를 만든다. 보낼 게 없으면(F15) `None` — sync/async 두 진입점이
@@ -144,112 +149,116 @@ fn snapshot_event(memo: &str, attrs: BTreeMap<String, String>) -> AgentEvent {
     build_event(AGENT_KIND_SNAPSHOT_RECORDED, memo, "INFO", attrs)
 }
 
-/// 지금 보낸 이벤트가 **원격(collector)까지 갈 수 있는 상태인가**. `/record now <메모>`처럼 사람이
-/// "이 순간을 남긴다"고 판단한 기록은 조용히 유실되면 기능 자체가 무의미해지므로, 세 상태를
-/// 구분해 각각 다르게 안내한다.
+/// 방금 보낸 메모가 **실제로 어떻게 됐는가** — 사전 관찰이 아니라 **사후 결과**다.
 ///
-/// 특히 [`ExporterDisabled`](RemoteRecord::ExporterDisabled)를 성공으로 뭉개면 안 된다 — aicd는
-/// 응답하니 "살아있다"로 보이지만, aicd는 받은 이벤트를 tap에 publish할 뿐이고 **구독자(exporter)가
-/// 없으면 그대로 버려진다.** 사용자는 기록됐다고 믿는데 실제로는 아무 데도 안 남는, 가장 나쁜 종류의
-/// 유실이다.
+/// 예전 모델(`RemoteRecord`)은 보내기 **전에** exporter 상태를 probe해 "잘 갈 것 같다"를
+/// "갔다"로 단언했다. 그건 지난 라운드에 고친 거짓말(로컬 저장 성공을 알지도 못한 채 단언)과
+/// **똑같은 오류가 한 겹 아래 있던 것**이다. 사용자가 알고 싶은 건 "exporter가 대체로 건강한가"가
+/// 아니라 **"내가 방금 남긴 이 메모가 어떻게 됐나"**다.
+///
+/// 그래서 결론의 근거를 뒤집었다:
+/// - **"aicd가 받았다"는 오직 전송 결과에서만 나온다**(`dispatch`의 반환값).
+/// - 구독자 유무(exporter/agent exporter 꺼짐)는 **보내기 전에도 참인 사실**이라 probe해도 정직하다
+///   — "이 이벤트는 받는 쪽이 없어 버려진다"는 단언은 config 상태만으로 성립한다.
+/// - **누적 카운터(`spool_dropped`)는 쓰지 않는다.** 그건 "과거에 한 번이라도 버린 적 있음"이라,
+///   현재 상태로 읽으면 한 번 드롭된 이후 **영원히** "유실 중"이라고 오보한다. 전송 결과가 진실을
+///   말해 주는데 누적 카운터로 추측할 이유가 없다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteRecord {
-    /// aicd가 살아있고 exporter도 켜져 있다 — 이벤트가 collector로 나간다(안내 불필요).
-    Live,
-    /// aicd에 물어보지 못했다(미실행·구버전·timeout) — 이벤트를 받아 줄 데몬 자체가 없다.
-    DaemonDown,
-    /// aicd는 살아있지만 exporter **전체**가 꺼져 있다(`[aicd.exporter] enabled = false`) — 이벤트는
-    /// aicd까지 갔다가 구독자가 없어 **조용히 버려진다**.
-    ExporterDisabled,
-    /// exporter 부모 게이트는 켜졌는데 **agent exporter task가 안 떠 있다**
-    /// (`[aicd.exporter] agent_enabled = false`, 또는 endpoint 미설정·spool 실패로 task 기동 실패).
-    /// `AgentEventBus`에 구독자가 없어 우리 이벤트만 조용히 버려진다 — 다른 signal(host metrics 등)은
-    /// 멀쩡히 나가고 있어서 **가장 눈치채기 어려운 유실**이다.
-    AgentExporterDisabled,
-    /// 나가고는 있는데 collector에 못 닿아 **spool(디스크)에 밀려 있다**. 유실은 아니다 — collector가
-    /// 복구되면 드레인된다. 하지만 "지금 서버에서 볼 수 있다"는 뜻은 아니므로 사용자에게 알린다.
-    Backlogged(u64),
-    /// spool 상한을 넘겨 **실제로 배치를 버리고 있다**. 데이터가 사라지는 중이라 가장 심각하다.
-    Dropping(u64),
+pub enum RecordOutcome {
+    /// aicd가 **실제로 받았고**(전송 성공) 받아 갈 구독자도 있다 — collector로 나간다.
+    ///
+    /// `backlog` = 지금 spool에 밀려 있는 배치 수. **단언이 아니라 관찰**이다("서버에 이미 보인다"고
+    /// 말하지 않는다). `spool_batches`는 누적이 아니라 **현재 적재량**이라 드레인되면 줄어든다 —
+    /// 그래서 현재 상태로 읽어도 정직하다(`spool_dropped`와 다른 점이다).
+    Delivered { backlog: u64 },
+    /// **보내지 못했다** — aicd 미실행·응답 없음·timeout. 이 메모는 서버에 남지 않는다.
+    /// 이건 probe가 아니라 **전송 실패 그 자체**다.
+    NotSent,
+    /// aicd는 받았지만 exporter **전체**가 꺼져 있어(`[aicd.exporter] enabled = false`) 구독자가
+    /// 없다 — publish된 이벤트는 그대로 버려진다.
+    DroppedExporterOff,
+    /// aicd는 받았지만 **agent exporter**가 안 떠 있어(`agent_enabled = false`, 또는 endpoint
+    /// 미설정·spool 실패) 구독자가 없다. 다른 signal(host metrics 등)은 멀쩡히 나가고 있어서
+    /// **가장 눈치채기 어려운 유실**이다.
+    DroppedAgentExporterOff,
 }
 
-impl RemoteRecord {
-    /// 사용자에게 보여줄 한 줄 안내. 정상(`Live`)이면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다).
+impl RecordOutcome {
+    /// 사용자에게 보여줄 한 줄 안내. 완전한 성공이면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다).
     /// 스타일(색/아이콘)은 호출부가 입힌다(chat은 note, CLI는 dim stderr).
     ///
-    /// **로컬 스냅샷 성공 여부를 여기서 주장하지 않는다** — 그건 이 함수가 알 수 없는 사실이고,
-    /// 예전엔 "로컬 스냅샷은 정상 저장되었습니다"를 무조건 붙여 **캡처가 실패해도 성공했다고
-    /// 거짓말**했다. 원격 상태만 말하고, 로컬 사실은 호출부가 실제 결과로 합친다
-    /// (`session::record_remote_notice`).
+    /// **로컬 스냅샷 성공 여부를 여기서 주장하지 않는다** — 그건 이 함수가 알 수 없는 사실이다.
+    /// 원격 결과만 말하고, 로컬 사실은 호출부가 실제 결과로 합친다(`session::record_remote_notice`).
     pub fn notice(self) -> Option<String> {
         match self {
-            RemoteRecord::Live => None,
-            RemoteRecord::DaemonDown => {
-                Some("원격 기록 생략(aicd 미실행) — 이 메모는 서버에 남지 않습니다.".to_string())
-            }
-            RemoteRecord::ExporterDisabled => Some(
-                "aicd는 실행 중이지만 OTLP exporter가 꺼져 있어 원격 기록이 생략됩니다 — \
+            // 전송 성공 + 구독자 있음 + spool 비어 있음 = 할 말 없음.
+            RecordOutcome::Delivered { backlog: 0 } => None,
+            // 갔지만 아직 collector에 못 닿아 디스크에 쌓여 있다 — "서버에서 이미 보인다"고
+            // 오해하지 않도록 관찰 사실을 덧붙인다(유실은 아니다).
+            RecordOutcome::Delivered { backlog } => Some(format!(
+                "메모를 aicd에 전달했습니다. 다만 지금 collector에 닿지 못해 spool에 {backlog}개 \
+                 배치가 밀려 있어, 서버 반영이 지연될 수 있습니다(복구되면 전송됩니다)."
+            )),
+            RecordOutcome::NotSent => Some(
+                "원격 전송 실패(aicd 미실행·응답 없음) — 이 메모는 서버에 남지 않습니다."
+                    .to_string(),
+            ),
+            RecordOutcome::DroppedExporterOff => Some(
+                "aicd는 받았지만 OTLP exporter가 꺼져 있어 이 메모는 버려집니다 — \
                  config `[aicd.exporter] enabled = true`로 켜세요."
                     .to_string(),
             ),
-            RemoteRecord::AgentExporterDisabled => Some(
-                "OTLP agent exporter가 꺼져 있어 이 메모는 서버에 남지 않습니다 — \
+            RecordOutcome::DroppedAgentExporterOff => Some(
+                "aicd는 받았지만 OTLP agent exporter가 꺼져 있어 이 메모는 버려집니다 — \
                  config `[aicd.exporter] agent_enabled = true`로 켜세요."
                     .to_string(),
             ),
-            RemoteRecord::Backlogged(n) => Some(format!(
-                "collector에 닿지 못해 spool에 쌓이는 중입니다({n} 배치) — \
-                 복구되면 전송되지만 아직 서버에서는 보이지 않습니다."
-            )),
-            RemoteRecord::Dropping(n) => Some(format!(
-                "spool 상한 초과로 배치가 버려지고 있습니다({n} 배치 유실) — \
-                 이 메모도 서버에 닿지 못할 수 있습니다."
-            )),
         }
+    }
+
+    /// 이 메모가 **서버에 남을 것인가**(전송 성공 + 구독자 있음). 밀림(backlog)은 지연일 뿐
+    /// 유실이 아니므로 `true`다.
+    pub fn will_reach_server(self) -> bool {
+        matches!(self, RecordOutcome::Delivered { .. })
     }
 }
 
-/// IPC 응답을 사용자에게 의미 있는 상태로 접는다(순수 함수 — 소켓 없이 테스트 가능).
+/// **실제 전송 결과**(`sent`)와 exporter 구독 상태(`status`)를 합쳐 사후 결과를 낸다
+/// (순수 함수 — 소켓 없이 테스트 가능).
 ///
-/// 우선순위는 **나쁜 소식부터**다: 유실(Dropping) > 밀림(Backlogged)보다도, 애초에 **구독자가
-/// 없어 이벤트가 사라지는 상태**(Disabled 계열)를 먼저 본다 — spool 통계는 exporter가 돌 때만
-/// 의미가 있고, 꺼져 있으면 spool은 조용히 0이라 "정상"처럼 보이기 때문이다.
+/// 결론의 근거가 무엇인지가 이 함수의 전부다:
+/// - `sent`(= `dispatch`의 반환값)가 **거짓이면 무조건 [`NotSent`](RecordOutcome::NotSent)**다.
+///   exporter가 아무리 건강해 보여도, 보내지 못한 메모는 서버에 없다. **전송 실패가 다른 어떤
+///   probe보다 우선한다** — 이 순서가 뒤집히면 "보내지도 못했는데 기록됐다"는 거짓말이 된다.
+/// - 보냈다면, 그걸 **받아 갈 구독자가 있는지**를 본다. 구독자 없음(exporter/agent exporter 꺼짐)은
+///   전송 전에도 참인 config 사실이라 probe로 단언해도 정직하다("받는 쪽이 없어 버려진다").
+/// - `backlog`(현재 spool 적재량)는 **관찰로만** 싣는다 — 지연이지 유실이 아니다.
 ///
 /// `agent_enabled`가 `None`(구버전 aicd — 이 필드를 모른다)이면 **경고하지 않는다**: 모름을
 /// "꺼짐"으로 읽으면 멀쩡히 동작하는 구버전 사용자에게 매번 헛경고를 낸다. 구버전에서 agent
 /// exporter가 정말 꺼져 있는 경우는 감지할 수 없다 — IPC에 그 정보가 없으니 정직한 한계다.
-fn classify_remote(status: Option<&aic_common::ExporterStatus>) -> RemoteRecord {
+///
+/// status가 `None`(전송은 됐는데 상태 조회는 실패)이면 구독자 유무를 **모른다**. 이때 "버려진다"고
+/// 단언할 근거가 없으므로, 전송 성공이라는 아는 사실만 말한다(`Delivered`, backlog 0).
+fn classify_outcome(sent: bool, status: Option<&aic_common::ExporterStatus>) -> RecordOutcome {
+    // 1) 안 갔으면 끝이다. 그 어떤 probe도 이 사실을 뒤집지 못한다.
+    if !sent {
+        return RecordOutcome::NotSent;
+    }
+    // 2) 갔다면, 받아 갈 구독자가 있는가.
     let Some(s) = status else {
-        return RemoteRecord::DaemonDown;
+        return RecordOutcome::Delivered { backlog: 0 };
     };
     if !s.enabled {
-        return RemoteRecord::ExporterDisabled;
+        return RecordOutcome::DroppedExporterOff;
     }
     if s.agent_enabled == Some(false) {
-        return RemoteRecord::AgentExporterDisabled;
+        return RecordOutcome::DroppedAgentExporterOff;
     }
-    // 실제로 버리는 중이 가장 나쁘다 — 밀림보다 먼저 알린다.
-
-    if s.spool_dropped > 0 {
-        return RemoteRecord::Dropping(s.spool_dropped);
+    // 3) 구독자가 있다 → 나간다. 지금 밀려 있는 양은 관찰로만 덧붙인다(단언 아님).
+    RecordOutcome::Delivered {
+        backlog: s.spool_batches,
     }
-    // spool에 한 배치라도 있으면 직전 push가 실패했다는 뜻이다(성공하면 쌓이지 않는다).
-    // 임의의 임계값을 두지 않는 이유: 1건이든 1,500건이든 "지금 collector에 못 닿고 있다"는
-    // 사실은 같고, 사용자는 자기가 남긴 메모가 아직 서버에 없다는 걸 알 자격이 있다.
-    if s.spool_batches > 0 {
-        return RemoteRecord::Backlogged(s.spool_batches);
-    }
-    RemoteRecord::Live
-}
-
-/// 방금 보낸 이벤트가 원격까지 갈 수 있는지 aicd에 물어본다(sync 호출부용).
-pub fn remote_record_state() -> RemoteRecord {
-    classify_remote(exporter_status().as_ref())
-}
-
-/// [`remote_record_state`]의 async 판(chat용) — tokio worker를 막지 않는다.
-pub async fn remote_record_state_async() -> RemoteRecord {
-    classify_remote(exporter_status_async().await.as_ref())
 }
 
 /// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
@@ -294,37 +303,43 @@ fn build_event(
     }
 }
 
-/// 만들어진 이벤트를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태이고,
-/// 텔레메트리가 chat을 방해해선 안 된다 — audit/rca_memory 등 다른 best-effort 경로와 같은 관례).
+/// 만들어진 이벤트를 aicd로 보내고 **실제 전송 성공 여부를 돌려준다**.
+///
+/// 반환값을 버리지 않는 이유: `/record now <메모>`는 "이 메모가 어떻게 됐나"를 사용자에게
+/// 말해야 하는데, 결과를 `let _ =`로 버리면 **전송 실패와 성공이 구분되지 않는다**. 그 상태에서
+/// "원격에 기록됐습니다"라고 말하면 그건 추측이 아니라 거짓말이다. 다른 emitter(tool_run_command
+/// 등)는 fire-and-forget이라 결과를 무시해도 되지만, 무시는 **호출부의 선택**이어야지 전송 계층이
+/// 정보를 없애 버릴 일이 아니다.
 ///
 /// **테스트에서는 소켓 대신 in-process sink로 간다**([`test_sink`]) — `cargo test`가 개발 머신의
 /// 실 aicd에 가짜 이벤트를 밀어 넣고, exporter가 켜져 있으면 그게 **운영 이벤트 스토어까지 나가는**
 /// 사고를 막는다(이 저장소에서 실제로 난 적이 있다). "무엇을 보내는가"는 sink로 검증하고, "소켓이
 /// 없을 때 조용한가"는 [`query_at`]에 없는 경로를 주입해 검증한다 — 실 소켓은 어느 쪽에도 필요 없다.
 #[cfg(not(test))]
-fn dispatch(ev: AgentEvent) {
-    let _ = send(&IpcRequest::AgentEvent(ev));
+fn dispatch(ev: AgentEvent) -> bool {
+    send(&IpcRequest::AgentEvent(ev)).is_ok()
 }
 
 #[cfg(test)]
-fn dispatch(ev: AgentEvent) {
-    test_sink::push(ev);
+fn dispatch(ev: AgentEvent) -> bool {
+    test_sink::push(ev)
 }
 
 /// [`dispatch`]의 async 판 — chat(async)에서 tokio worker를 막지 않고 보낸다.
 #[cfg(not(test))]
-async fn dispatch_async(ev: AgentEvent) {
-    let _ = query_async(&IpcRequest::AgentEvent(ev)).await;
+async fn dispatch_async(ev: AgentEvent) -> bool {
+    query_async(&IpcRequest::AgentEvent(ev)).await.is_ok()
 }
 
 #[cfg(test)]
-async fn dispatch_async(ev: AgentEvent) {
-    test_sink::push(ev);
+async fn dispatch_async(ev: AgentEvent) -> bool {
+    test_sink::push(ev)
 }
 
-/// 한 행위를 aicd로 보낸다(build + dispatch).
+/// 한 행위를 aicd로 보낸다(build + dispatch). 이 emitter들은 fire-and-forget이라 결과를 **호출부가
+/// 명시적으로 무시**한다(전송 계층이 정보를 지우는 것과는 다르다 — [`dispatch`] 참고).
 fn emit(kind: &str, summary: &str, severity: &str, attrs: BTreeMap<String, String>) {
-    dispatch(build_event(kind, summary, severity, attrs));
+    let _sent = dispatch(build_event(kind, summary, severity, attrs));
 }
 
 /// 송신 대상 문자열을 마스킹한다. `redaction::redact`는 idempotent라 이미 redact된 입력에
@@ -459,15 +474,29 @@ async fn query_async_inner(req: &IpcRequest) -> std::io::Result<IpcResponse> {
 #[cfg(test)]
 pub(crate) mod test_sink {
     use super::AgentEvent;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
     thread_local! {
         static SENT: RefCell<Vec<AgentEvent>> = const { RefCell::new(Vec::new()) };
+        /// 다음 전송을 **실패**시킬지. aicd 미실행(=IPC 실패)을 실 소켓 없이 재현해, "전송에
+        /// 실패했는데 성공이라고 보고하는" 회귀를 end-to-end로 잡기 위한 스위치다.
+        static FAIL: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// dispatch가 보내려던 이벤트를 기록한다(소켓 대신).
-    pub(crate) fn push(ev: AgentEvent) {
+    /// dispatch가 보내려던 이벤트를 기록한다(소켓 대신). 반환값 = 전송 성공 여부(실 dispatch와 동일 계약).
+    /// [`fail_sends`]로 실패 모드를 켜면 **이벤트를 기록하지 않고** false를 돌려준다 — 실제 IPC 실패와
+    /// 같은 관찰(아무것도 안 나갔고, 호출부는 실패를 안다)을 만든다.
+    pub(crate) fn push(ev: AgentEvent) -> bool {
+        if FAIL.with(|f| f.get()) {
+            return false;
+        }
         SENT.with(|s| s.borrow_mut().push(ev));
+        true
+    }
+
+    /// 이 스레드의 전송을 실패시킨다(aicd 미실행 재현). 테스트 종료 시 `false`로 되돌린다.
+    pub(crate) fn fail_sends(fail: bool) {
+        FAIL.with(|f| f.set(fail));
     }
 
     /// 이 스레드에서 지금까지 dispatch된 이벤트를 꺼내 비운다.
@@ -497,8 +526,10 @@ mod tests {
         let missing = dir.path().join("no-such-aicd.sock");
         let res = query_at(&missing, &IpcRequest::GetExporterStatus);
         assert!(res.is_err(), "없는 소켓인데 성공했다");
-        // 그리고 이 실패는 to_exporter_status를 통해 "조회 불가"(None) → DaemonDown으로 접힌다.
-        assert_eq!(classify_remote(None), RemoteRecord::DaemonDown);
+        // 그리고 이 실패는 to_exporter_status를 통해 "조회 불가"(None)로 접힌다 — 그 상태에서
+        // 전송까지 실패했다면(데몬이 없으니 당연히) 결론은 NotSent다.
+        assert_eq!(to_exporter_status(res), None);
+        assert_eq!(classify_outcome(false, None), RecordOutcome::NotSent);
     }
 
     #[test]
@@ -599,11 +630,11 @@ mod tests {
 
     #[test]
     fn snapshot_recorded_skips_empty_or_whitespace_only_memo() {
-        // F15: 빈 메모/공백뿐인 메모는 발화하지 않는다 — 반환값 false뿐 아니라 **sink가 비어 있는지**
-        // 까지 본다(반환값만 보면 "false를 돌려주면서 보내기는 하는" 회귀를 놓친다).
+        // F15: 빈 메모/공백뿐인 메모는 발화하지 않는다 — 반환값(None)뿐 아니라 **sink가 비어 있는지**
+        // 까지 본다(반환값만 보면 "None을 돌려주면서 보내기는 하는" 회귀를 놓친다).
         let _ = test_sink::drain();
-        assert!(!snapshot_recorded("", BTreeMap::new()));
-        assert!(!snapshot_recorded("   \n\t  ", BTreeMap::new()));
+        assert_eq!(snapshot_recorded("", BTreeMap::new()), None);
+        assert_eq!(snapshot_recorded("   \n\t  ", BTreeMap::new()), None);
         assert!(
             test_sink::drain().is_empty(),
             "빈 메모인데 이벤트가 전송됐다"
@@ -616,7 +647,7 @@ mod tests {
         // 한다 — parse 단계의 `.trim()`(유니코드 공백만 제거)은 ESC 같은 제어문자를 못 거르므로,
         // 이 판정이 sanitize **이후**에 있어야만 잡히는 케이스다.
         let _ = test_sink::drain();
-        assert!(!snapshot_recorded("\x1b\x1b\x1b", BTreeMap::new()));
+        assert_eq!(snapshot_recorded("\x1b\x1b\x1b", BTreeMap::new()), None);
         assert!(
             test_sink::drain().is_empty(),
             "제어문자뿐인 메모인데 이벤트가 전송됐다"
@@ -629,7 +660,7 @@ mod tests {
         let _ = test_sink::drain();
         let mut attrs = BTreeMap::new();
         attrs.insert("note_source".to_string(), "chat".to_string());
-        assert!(snapshot_recorded("cpu 이상하게 높음", attrs));
+        assert!(snapshot_recorded("cpu 이상하게 높음", attrs).is_some());
 
         let sent = test_sink::drain();
         assert_eq!(sent.len(), 1, "정확히 1건이어야: {sent:?}");
@@ -638,15 +669,56 @@ mod tests {
         assert_eq!(sent[0].attrs.get("note_source"), Some(&"chat".to_string()));
     }
 
+    #[test]
+    fn snapshot_recorded_reports_not_sent_when_delivery_fails() {
+        // **A의 핵심 회귀 테스트**: 전송이 실패하면 결과는 반드시 NotSent다. 예전엔 dispatch 결과를
+        // `let _ =`로 버리고 "보내기 전 exporter 상태"로 성공을 단언해, aicd가 죽어 있어도
+        // "원격에 기록됐습니다"라고 말했다. sink를 실패 모드로 두어 실 소켓 없이 그 경로를 재현한다.
+        let _ = test_sink::drain();
+        test_sink::fail_sends(true);
+        let outcome = snapshot_recorded("디스크가 이상하다", BTreeMap::new());
+        test_sink::fail_sends(false); // 같은 스레드를 재사용하는 뒤 테스트를 오염시키지 않게 복구
+
+        assert_eq!(
+            outcome,
+            Some(RecordOutcome::NotSent),
+            "전송에 실패했는데 실패라고 보고하지 않는다"
+        );
+        assert!(
+            !outcome.unwrap().will_reach_server(),
+            "보내지도 못한 메모를 '서버에 남는다'고 말하면 안 된다"
+        );
+        assert!(
+            test_sink::drain().is_empty(),
+            "전송 실패인데 이벤트가 기록됐다"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_recorded_async_reports_not_sent_when_delivery_fails() {
+        // async(chat) 경로도 같은 계약 — 여기만 성공으로 단언하는 회귀를 막는다.
+        let _ = test_sink::drain();
+        test_sink::fail_sends(true);
+        let outcome = snapshot_recorded_async("느려짐", BTreeMap::new()).await;
+        test_sink::fail_sends(false);
+
+        assert_eq!(outcome, Some(RecordOutcome::NotSent));
+        assert!(test_sink::drain().is_empty());
+    }
+
     #[tokio::test]
     async fn snapshot_recorded_async_matches_sync_contract() {
         // chat(async) 경로도 sync와 **같은 계약**을 지킨다: 빈 메모는 스킵, 진짜 메모는 1건 전송.
         // 두 진입점이 prepare_snapshot_event를 공유하므로 여기서 갈라지면 곧바로 드러난다.
         let _ = test_sink::drain();
-        assert!(!snapshot_recorded_async("  ", BTreeMap::new()).await);
+        assert_eq!(snapshot_recorded_async("  ", BTreeMap::new()).await, None);
         assert!(test_sink::drain().is_empty(), "빈 메모인데 전송됨(async)");
 
-        assert!(snapshot_recorded_async("디스크가 이상하다", BTreeMap::new()).await);
+        assert!(
+            snapshot_recorded_async("디스크가 이상하다", BTreeMap::new())
+                .await
+                .is_some()
+        );
         let sent = test_sink::drain();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].kind, "snapshot.recorded");
@@ -665,41 +737,67 @@ mod tests {
     }
 
     #[test]
-    fn classify_remote_distinguishes_daemon_down_and_exporter_off_and_live() {
-        // aicd 미응답 / exporter 꺼짐 / 정상 — 셋은 사용자에게 전혀 다른 사실이다.
-        // 특히 **exporter 꺼짐을 성공으로 뭉개면 안 된다**: aicd는 응답하지만 이벤트는 구독자가
-        // 없어 조용히 버려진다(가장 나쁜 유실 — 사용자는 기록됐다고 믿는다).
-        let disabled = aic_common::ExporterStatus {
-            enabled: false,
-            ..Default::default()
-        };
-        assert_eq!(classify_remote(None), RemoteRecord::DaemonDown);
+    fn failed_send_beats_every_probe_and_is_never_reported_as_delivered() {
+        // **A의 뿌리**: 결론은 전송 결과에서만 나온다. exporter가 아무리 건강해 보여도(healthy),
+        // 보내지 못했으면 그 메모는 서버에 없다. 이 순서가 뒤집히면 "보내지도 못했는데 기록됐다"가 된다.
         assert_eq!(
-            classify_remote(Some(&disabled)),
-            RemoteRecord::ExporterDisabled
+            classify_outcome(false, Some(&healthy_status())),
+            RecordOutcome::NotSent,
+            "전송 실패인데 exporter가 건강하다는 이유로 성공이라 보고한다"
         );
-        assert_eq!(classify_remote(Some(&healthy_status())), RemoteRecord::Live);
+        assert_eq!(classify_outcome(false, None), RecordOutcome::NotSent);
+        assert!(!RecordOutcome::NotSent.will_reach_server());
     }
 
     #[test]
-    fn classify_remote_catches_disabled_agent_exporter_behind_enabled_parent() {
+    fn cumulative_drop_counter_does_not_poison_every_future_record() {
+        // **finding #1의 회귀 테스트**: `spool_dropped`는 **누적** 카운터다("과거에 한 번이라도 버림").
+        // 그걸 현재 상태로 읽으면, 오래전 collector 장애로 한 번 드롭된 이후 **이후 모든**
+        // `/record now`가 영구히 "유실 중"이라고 오보한다. 이제 그 필드는 판정에 쓰지 않는다 —
+        // 지금 전송이 성공했고 구독자가 있다면 이 메모는 나간다.
+        let long_ago_drop = aic_common::ExporterStatus {
+            spool_dropped: 9_999, // 과거의 유실 — 지금 이 메모와는 무관하다
+            spool_batches: 0,     // 지금은 밀린 것도 없다(정상 복구됨)
+            ..healthy_status()
+        };
+        assert_eq!(
+            classify_outcome(true, Some(&long_ago_drop)),
+            RecordOutcome::Delivered { backlog: 0 },
+            "과거 누적 드롭 때문에 지금 잘 간 메모를 유실이라고 오보한다"
+        );
+        assert!(classify_outcome(true, Some(&long_ago_drop)).will_reach_server());
+    }
+
+    #[test]
+    fn classify_outcome_catches_disabled_agent_exporter_behind_enabled_parent() {
         // **부모 게이트만 보면 놓치는 유실**: `[aicd.exporter] enabled = true`인데
         // `agent_enabled = false`면 serve_agent task가 안 떠서 AgentEventBus에 구독자가 없다 —
         // 우리 이벤트만 조용히 버려지는데 host metrics 등 다른 signal은 멀쩡히 나가므로
-        // 사용자가 눈치챌 방법이 없다. enabled=true를 Live로 뭉개면 이 유실을 보고하지 못한다.
+        // 사용자가 눈치챌 방법이 없다. 전송이 성공해도 이건 유실이다.
         let agent_off = aic_common::ExporterStatus {
             enabled: true, // 부모 게이트는 켜져 있다
             agent_enabled: Some(false),
             ..Default::default()
         };
         assert_eq!(
-            classify_remote(Some(&agent_off)),
-            RemoteRecord::AgentExporterDisabled
+            classify_outcome(true, Some(&agent_off)),
+            RecordOutcome::DroppedAgentExporterOff
+        );
+        assert!(!RecordOutcome::DroppedAgentExporterOff.will_reach_server());
+
+        // 부모 게이트가 꺼진 경우도 마찬가지로 유실이다(다른 조치가 필요하므로 다른 상태).
+        let all_off = aic_common::ExporterStatus {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_outcome(true, Some(&all_off)),
+            RecordOutcome::DroppedExporterOff
         );
     }
 
     #[test]
-    fn classify_remote_treats_unknown_agent_flag_as_ok_for_old_daemons() {
+    fn classify_outcome_treats_unknown_agent_flag_as_ok_for_old_daemons() {
         // 구버전 aicd는 이 필드를 모른다 → None. 모름을 "꺼짐"으로 읽으면 멀쩡한 구버전에 매번
         // 헛경고를 낸다. 하위 호환: 모르면 경고하지 않는다(#[serde(default)] → None).
         let old = aic_common::ExporterStatus {
@@ -707,70 +805,64 @@ mod tests {
             agent_enabled: None, // 구버전 — 필드 없음
             ..Default::default()
         };
-        assert_eq!(classify_remote(Some(&old)), RemoteRecord::Live);
+        assert_eq!(
+            classify_outcome(true, Some(&old)),
+            RecordOutcome::Delivered { backlog: 0 }
+        );
     }
 
     #[test]
-    fn classify_remote_reports_backlog_and_drop_instead_of_claiming_live() {
-        // exporter가 살아 있어도 collector에 못 닿으면 이벤트는 서버에 없다 — spool에 쌓이는 중
-        // (복구되면 전송)이거나, 상한 초과로 버려지는 중이다. 둘 다 "기록됨"이라고 말하면 안 된다.
+    fn backlog_is_an_observation_not_a_failure() {
+        // 밀림은 **지연이지 유실이 아니다** — 전송은 됐고 구독자도 있으니 복구되면 나간다.
+        // 그래서 will_reach_server()는 true지만, "이미 서버에서 보인다"고 오해하지 않도록
+        // 관찰 사실은 안내로 덧붙인다.
         let backlogged = aic_common::ExporterStatus {
             spool_batches: 1_500, // 실제로 이 개발 머신에서 관측된 값
             ..healthy_status()
         };
-        assert_eq!(
-            classify_remote(Some(&backlogged)),
-            RemoteRecord::Backlogged(1_500)
+        let outcome = classify_outcome(true, Some(&backlogged));
+        assert_eq!(outcome, RecordOutcome::Delivered { backlog: 1_500 });
+        assert!(
+            outcome.will_reach_server(),
+            "밀림은 유실이 아니다 — 복구되면 전송된다"
         );
-
-        // 유실이 실제로 일어났다면 그게 더 나쁜 소식이다 — 밀림보다 먼저 알린다.
-        let dropping = aic_common::ExporterStatus {
-            spool_batches: 10,
-            spool_dropped: 3,
-            ..healthy_status()
-        };
-        assert_eq!(classify_remote(Some(&dropping)), RemoteRecord::Dropping(3));
-    }
-
-    #[test]
-    fn classify_remote_prefers_silent_drop_over_spool_stats() {
-        // exporter가 꺼져 있으면 spool은 조용히 0이라 "정상"처럼 보인다 — 그래서 Disabled 계열을
-        // spool 통계보다 **먼저** 판정해야 한다(순서가 뒤집히면 꺼진 exporter가 Live로 보고된다).
-        let agent_off = aic_common::ExporterStatus {
-            enabled: true,
-            agent_enabled: Some(false),
-            spool_batches: 0,
-            spool_dropped: 0,
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_remote(Some(&agent_off)),
-            RemoteRecord::AgentExporterDisabled
+        let notice = outcome.notice().expect("밀려 있으면 알려야 한다");
+        assert!(
+            notice.contains("1500") || notice.contains("1,500"),
+            "{notice}"
         );
     }
 
     #[test]
-    fn only_live_is_silent_and_each_state_has_its_own_actionable_notice() {
-        // 정상만 조용하고, 나머지는 **서로 다른** 안내를 낸다 — 같은 문구면 사용자가 원인을
-        // 구분할 수 없다(aicd를 띄울지, 부모 게이트를 켤지, agent_enabled를 켤지, collector를
-        // 살릴지가 전부 다른 조치다).
-        assert_eq!(RemoteRecord::Live.notice(), None);
+    fn delivered_without_status_claims_only_what_the_send_result_proves() {
+        // 전송은 성공했는데 상태 조회를 못 했다 → 구독자 유무는 **모른다**. "버려진다"고 단언할
+        // 근거가 없으므로, 아는 사실(전달됨)만 말한다. 모름을 실패로 뭉개면 그것도 거짓 보고다.
+        assert_eq!(
+            classify_outcome(true, None),
+            RecordOutcome::Delivered { backlog: 0 }
+        );
+    }
+
+    #[test]
+    fn only_clean_delivery_is_silent_and_each_state_has_its_own_actionable_notice() {
+        // 완전한 성공만 조용하고, 나머지는 **서로 다른** 안내를 낸다 — 같은 문구면 사용자가 원인을
+        // 구분할 수 없다(aicd를 띄울지, 부모 게이트를 켤지, agent_enabled를 켤지가 다른 조치다).
+        assert_eq!(RecordOutcome::Delivered { backlog: 0 }.notice(), None);
         let notices: Vec<String> = [
-            RemoteRecord::DaemonDown,
-            RemoteRecord::ExporterDisabled,
-            RemoteRecord::AgentExporterDisabled,
-            RemoteRecord::Backlogged(7),
-            RemoteRecord::Dropping(2),
+            RecordOutcome::NotSent,
+            RecordOutcome::DroppedExporterOff,
+            RecordOutcome::DroppedAgentExporterOff,
+            RecordOutcome::Delivered { backlog: 7 },
         ]
         .into_iter()
-        .map(|s| s.notice().expect("Live 외에는 안내가 있어야 한다"))
+        .map(|s| s.notice().expect("완전한 성공 외에는 안내가 있어야 한다"))
         .collect();
 
         // 전부 서로 다른 문구여야 한다.
         let uniq: std::collections::HashSet<&String> = notices.iter().collect();
         assert_eq!(uniq.len(), notices.len(), "안내가 겹친다: {notices:?}");
 
-        // 각 안내는 사용자가 취할 조치를 짚는다.
+        // 각 안내는 사용자가 취할 조치(또는 알아야 할 사실)를 짚는다.
         assert!(notices[0].contains("aicd"), "{}", notices[0]);
         assert!(notices[1].contains("enabled = true"), "{}", notices[1]);
         assert!(
@@ -778,9 +870,7 @@ mod tests {
             "{}",
             notices[2]
         );
-        // 밀림/유실은 개수를 실어 심각도를 가늠하게 한다.
         assert!(notices[3].contains('7'), "{}", notices[3]);
-        assert!(notices[4].contains('2'), "{}", notices[4]);
 
         // **로컬 스냅샷 성공을 주장하지 않는다** — 이 함수는 그걸 알 수 없다(예전엔 무조건
         // "로컬 스냅샷은 정상 저장되었습니다"를 붙여 캡처 실패 시 거짓말을 했다).

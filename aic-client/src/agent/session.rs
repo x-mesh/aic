@@ -1650,16 +1650,10 @@ impl AgentSession {
             // worker가 최대 IO_TIMEOUT만큼 막힌다(agent_event::query_async 문서 참고).
             if let Some(memo) = memo {
                 let attrs = self.record_metrics_attrs();
-                let sent = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
-                // 보낸 이벤트가 **원격까지 갈 수 있는 상태인지** 확인해 안내한다(F19). aicd 미실행뿐
-                // 아니라 exporter/agent-exporter가 꺼졌거나 spool에 밀린 경우도 알린다 — 그땐 aicd가
-                // 응답해서 성공처럼 보이지만 이벤트는 서버에 닿지 않는다.
-                let state = if sent {
-                    Some(crate::agent_event::remote_record_state_async().await)
-                } else {
-                    None
-                };
-                if let Some(notice) = record_remote_notice(local_ok, state) {
+                // 반환값이 곧 **사후 결과**다 — 보내기 전 probe로 성공을 단언하지 않는다.
+                // `None`은 "메모가 비어 안 보냄"(F15)이고, `Some(outcome)`은 실제 전송 결과다.
+                let outcome = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
+                if let Some(notice) = record_remote_notice(local_ok, outcome) {
                     self.out.note(&notice).await;
                 }
             }
@@ -2395,6 +2389,10 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
 /// 성공할 수 있다. 예전엔 원격 안내에 "로컬 스냅샷은 정상 저장되었습니다"를 무조건 붙여, 캡처가
 /// 실패한 경우에도 성공했다고 **거짓말**했다. 사용자는 나중에 없는 스냅샷을 찾게 된다.
 ///
+/// `remote`는 이제 **사후 결과**([`RecordOutcome`](crate::agent_event::RecordOutcome))다 —
+/// "보내기 전에 exporter가 건강해 보였다"가 아니라 "실제로 보냈고 이렇게 됐다"이므로, 여기서
+/// 그 값을 근거로 성공을 말해도 거짓이 아니다.
+///
 /// - `remote`가 `None` = 메모가 비어 애초에 안 보냈다(F15). 원격에 대해 할 말이 없다 — 로컬 결과는
 ///   호출부가 이미 캡처 라인으로 보고했으므로 여기선 침묵한다.
 /// - 둘 다 성공하면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다. 캡처 라인이 이미 ✓를 찍었다).
@@ -2404,19 +2402,26 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
 /// 두 진입점이 각자 메시지를 지으면 한쪽만 고치고 잊는 경로가 생긴다.
 pub fn record_remote_notice(
     local_ok: bool,
-    remote: Option<crate::agent_event::RemoteRecord>,
+    remote: Option<crate::agent_event::RecordOutcome>,
 ) -> Option<String> {
     let remote = remote?;
+    // "메모는 서버에 남는다"는 결론은 **전송 결과**에서만 나온다(will_reach_server) — 이 판단을
+    // notice 문구 유무로 대신하면, 밀림(Delivered{backlog>0}: 안내는 있지만 유실은 아님)을
+    // 실패로 오인한다.
+    let remote_ok = remote.will_reach_server();
     match (local_ok, remote.notice()) {
         // 둘 다 정상 — 침묵.
         (true, None) => None,
-        // 원격만 문제 — 원격 사실만 말한다(로컬을 성공이라 주장하지 않고, 캡처 라인이 이미 말했다).
+        // 원격에 할 말이 있다(실패했거나, 갔지만 밀려 있다). 로컬을 성공이라 주장하지 않는다.
         (true, Some(n)) => Some(format!("ℹ {n}")),
         // 로컬만 실패 — 메모는 나갔다는 사실을 알려야 사용자가 "아무것도 안 남았다"고 오해하지 않는다.
         (false, None) => {
             Some("ℹ 메모는 원격에 기록됐습니다 — 로컬 스냅샷 저장만 실패했습니다.".to_string())
         }
-        // 둘 다 실패 — 가장 나쁜 경우. 얼버무리지 않는다.
+        // 로컬 실패 + 원격에도 할 말 있음. 여기서 "도"("원격도 실패")로 뭉치면 안 된다 — 밀림
+        // (Delivered{backlog>0})은 **지연이지 실패가 아니라서**, 원격까지 실패한 것처럼 읽히면
+        // 그것 역시 거짓 보고다. 원격이 살아 있는지는 notice 문구가 아니라 will_reach_server로 가른다.
+        (false, Some(n)) if remote_ok => Some(format!("ℹ {n} 로컬 스냅샷 저장은 실패했습니다.")),
         (false, Some(n)) => Some(format!("ℹ {n} 로컬 스냅샷 저장도 실패했습니다.")),
     }
 }
@@ -3307,10 +3312,10 @@ mod tests {
 
     #[test]
     fn record_notice_is_silent_only_when_both_succeeded() {
-        use crate::agent_event::RemoteRecord;
+        use crate::agent_event::RecordOutcome;
         // 둘 다 성공 — 캡처 라인이 이미 ✓를 찍었으므로 추가 안내 없음.
         assert_eq!(
-            record_remote_notice(true, Some(RemoteRecord::Live)),
+            record_remote_notice(true, Some(RecordOutcome::Delivered { backlog: 0 })),
             None,
             "둘 다 성공인데 잔소리를 한다"
         );
@@ -3318,23 +3323,26 @@ mod tests {
 
     #[test]
     fn record_notice_never_claims_local_success_when_capture_failed() {
-        use crate::agent_event::RemoteRecord;
+        use crate::agent_event::RecordOutcome;
         // **회귀 방지의 핵심**: 예전엔 원격 안내에 "로컬 스냅샷은 정상 저장되었습니다"를 무조건
         // 붙여, capture_forced가 실패해도 성공했다고 거짓말했다. 사용자는 나중에 없는 스냅샷을
         // 찾게 된다. 로컬이 실패했으면 어떤 조합에서도 성공을 주장하면 안 된다.
         for remote in [
-            RemoteRecord::Live,
-            RemoteRecord::DaemonDown,
-            RemoteRecord::ExporterDisabled,
-            RemoteRecord::AgentExporterDisabled,
-            RemoteRecord::Backlogged(3),
-            RemoteRecord::Dropping(1),
+            RecordOutcome::Delivered { backlog: 0 },
+            RecordOutcome::Delivered { backlog: 3 },
+            RecordOutcome::NotSent,
+            RecordOutcome::DroppedExporterOff,
+            RecordOutcome::DroppedAgentExporterOff,
         ] {
             let n = record_remote_notice(false, Some(remote))
                 .expect("로컬이 실패했으면 반드시 알려야 한다");
             assert!(
-                !n.contains("정상 저장") && !n.contains("저장되었습니다"),
+                !n.contains("정상 저장"),
                 "로컬 캡처가 실패했는데 저장됐다고 말한다: {n}"
+            );
+            assert!(
+                n.contains("로컬 스냅샷 저장"),
+                "로컬 실패 사실이 빠졌다: {n}"
             );
             assert!(n.contains("실패"), "로컬 실패 사실이 빠졌다: {n}");
         }
@@ -3342,20 +3350,37 @@ mod tests {
 
     #[test]
     fn record_notice_tells_user_memo_survived_when_only_local_failed() {
-        use crate::agent_event::RemoteRecord;
+        use crate::agent_event::RecordOutcome;
         // 로컬만 실패 + 원격 정상 — 메모는 살아있다는 걸 알려야 "아무것도 안 남았다"는 오해를 막는다.
-        let n = record_remote_notice(false, Some(RemoteRecord::Live)).expect("안내가 있어야");
+        let n = record_remote_notice(false, Some(RecordOutcome::Delivered { backlog: 0 }))
+            .expect("안내가 있어야");
         assert!(n.contains("원격"), "{n}");
         assert!(n.contains("실패"), "{n}");
     }
 
     #[test]
     fn record_notice_reports_both_failures_when_both_failed() {
-        use crate::agent_event::RemoteRecord;
+        use crate::agent_event::RecordOutcome;
         // 둘 다 실패 — 얼버무리지 않고 양쪽을 다 짚는다.
-        let n = record_remote_notice(false, Some(RemoteRecord::DaemonDown)).expect("안내가 있어야");
+        let n = record_remote_notice(false, Some(RecordOutcome::NotSent)).expect("안내가 있어야");
         assert!(n.contains("aicd"), "원격 실패 원인이 빠졌다: {n}");
         assert!(n.contains("로컬"), "로컬 실패 사실이 빠졌다: {n}");
+        assert!(n.contains("도 실패"), "양쪽 실패임이 드러나야 한다: {n}");
+    }
+
+    #[test]
+    fn record_notice_does_not_call_backlog_a_remote_failure() {
+        use crate::agent_event::RecordOutcome;
+        // 밀림은 **지연이지 실패가 아니다**. 로컬이 실패한 상황에서 "원격도 실패"라고 붙이면,
+        // 멀쩡히 전달된(나중에 드레인될) 메모를 유실로 오보하는 것이다 — notice 문구 유무가
+        // 아니라 will_reach_server로 갈라야 하는 이유.
+        let n = record_remote_notice(false, Some(RecordOutcome::Delivered { backlog: 5 }))
+            .expect("안내가 있어야");
+        assert!(
+            !n.contains("도 실패"),
+            "밀림(지연)을 원격 실패로 오보한다: {n}"
+        );
+        assert!(n.contains("로컬 스냅샷 저장은 실패"), "{n}");
     }
 
     #[test]
