@@ -1623,19 +1623,16 @@ impl AgentSession {
             // 경로이고 aicd 미실행은 정상 상태라, 원격에만 실으면 사람이 "지금 이게 중요하다"고
             // 남긴 관찰이 통째로 사라진다(`SnapshotRecord::memo` 문서 참고).
             //
-            // 저장/전송 양쪽이 **같은 sanitize를 지나야** 로컬과 원격의 메모가 어긋나지 않는다
-            // (제어문자 제거 + 64KiB 절단). 잘렸으면 사용자에게 말한다 — 예전엔 아무 표시 없이 잘렸다.
-            let sanitized = memo
-                .as_deref()
-                .map(crate::agent_event::sanitize_memo)
-                .filter(|(m, _)| !m.trim().is_empty());
-            let truncated = sanitized.as_ref().is_some_and(|(_, t)| *t);
-            let memo_text = sanitized.map(|(m, _)| m);
+            // 저장/전송이 **하나의 정제 결과를 공유한다** — `Memo`가 정제된 본문과 "잘렸는가"를 함께
+            // 들고 다닌다. 예전엔 여기서 한 번, 전송부에서 또 한 번 정제해서(이중 sanitize) 두 번째
+            // 호출이 이미 잘린 문자열을 보고 "안 잘렸다"고 판정했다 — `memo_truncated`가 실제 경로에서
+            // 영영 안 붙었다. 절단 여부는 **정제 순간에만 알 수 있는 정보**라 나중에 재계산할 수 없다.
+            let memo = memo.as_deref().and_then(crate::agent_event::Memo::sanitize);
 
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
             // 메모 유무와 무관하게 항상 로컬 스냅샷 store에 저장한다(기존 동작 유지).
-            let memo_for_capture = memo_text.clone();
+            let memo_for_capture = memo.as_ref().map(|m| m.text().to_string());
             let res = tokio::task::spawn_blocking(move || {
                 super::snapshot_capture::capture_forced_with_memo(
                     "manual",
@@ -1654,12 +1651,9 @@ impl AgentSession {
             };
             self.out.note(&msg).await;
 
-            if truncated {
+            if memo.as_ref().is_some_and(|m| m.truncated()) {
                 self.out
-                    .note(&format!(
-                        "ℹ 메모가 너무 길어 {}KiB에서 잘렸습니다(뒷부분은 저장·전송되지 않습니다).",
-                        crate::agent_event::MEMO_MAX_BYTES / 1024
-                    ))
+                    .note(&crate::agent_event::memo_truncated_notice())
                     .await;
             }
 
@@ -1672,11 +1666,12 @@ impl AgentSession {
             //
             // IPC는 **async 판**을 쓴다 — sync 판은 blocking `UnixStream`이라 여기서 부르면 tokio
             // worker가 최대 IO_TIMEOUT만큼 막힌다(agent_event::query_async 문서 참고).
-            if let Some(memo) = memo_text {
+            if let Some(memo) = &memo {
                 let attrs = self.record_metrics_attrs();
                 // 반환값이 곧 **사후 결과**다 — 보내기 전 probe로 성공을 단언하지 않는다.
-                let outcome = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
-                if let Some(notice) = record_remote_notice(local_ok, outcome) {
+                // `Memo`를 그대로 넘긴다(재정제 없음 → 절단 표시가 이벤트까지 살아서 간다).
+                let outcome = crate::agent_event::snapshot_recorded_async(memo, attrs).await;
+                if let Some(notice) = record_remote_notice(local_ok, Some(outcome)) {
                     self.out.note(&notice).await;
                 }
             }
@@ -2404,6 +2399,46 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
     m.cpu_valid
         && m.sampled_at
             .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
+}
+
+/// CLI `aic snapshot record --memo`가 실제로 하는 일 — **lib에 둔다**.
+///
+/// 왜 main.rs가 아닌가: 바이너리 크레이트의 함수는 단위 테스트로 부를 수 없다. 그래서 예전엔 CLI
+/// 경로가 테스트 없이 남았고, "고친 줄 알았는데 실제 호출 경로는 그 코드를 안 지나가는" 사고
+/// (`memo_truncated`)를 CLI 쪽에서는 아예 관측할 수도 없었다. 본체를 여기 두면 **진짜 CLI 경로가
+/// 테스트를 지나간다**. main.rs는 이 결과를 출력하고 exit code를 정하는 일만 한다.
+pub struct RecordNowReport {
+    /// 로컬 스냅샷 캡처 결과(메모는 이 레코드 **안에** 저장된다).
+    pub local: anyhow::Result<Option<std::path::PathBuf>>,
+    /// 메모가 상한을 넘겨 잘렸는가(사용자에게 알려야 한다).
+    pub truncated: bool,
+    /// 원격 전송의 **사후 결과**. 메모가 비어(F15) 보내지 않았으면 `None`.
+    pub remote: Option<crate::agent_event::RecordOutcome>,
+}
+
+/// [`RecordNowReport`] 참고. chat `handle_record`와 **같은 규약**을 따른다: 메모는 한 번만 정제해
+/// 로컬 저장과 원격 전송이 그 하나를 공유하고, 로컬 캡처가 실패해도 메모는 보낸다.
+pub fn record_now_cli(raw_memo: &str) -> RecordNowReport {
+    let memo = crate::agent_event::Memo::sanitize(raw_memo);
+
+    // 메모는 스냅샷 레코드 안에 저장된다 — 이게 본체다(원격은 부가 경로).
+    let local = crate::agent::snapshot_capture::capture_forced_with_memo(
+        "manual",
+        memo.as_ref().map(|m| m.text()),
+    );
+
+    // 로컬 실패와 무관하게 보낸다(디스크가 꽉 찬 장애야말로 그 관찰이 가장 필요한 순간이다).
+    let remote = memo.as_ref().map(|m| {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("note_source".to_string(), "cli".to_string());
+        crate::agent_event::snapshot_recorded(m, attrs)
+    });
+
+    RecordNowReport {
+        local,
+        truncated: memo.is_some_and(|m| m.truncated()),
+        remote,
+    }
 }
 
 /// `/record now <메모>`의 **두 결과를 각각 정확히** 한 줄로 보고한다(순수 함수, 테스트 가능).
@@ -3139,6 +3174,127 @@ mod tests {
             "english".to_string(),
         );
         (session, dir)
+    }
+
+    /// HOME을 임시 디렉터리로 돌려 스냅샷 store를 격리한다(snapshot_store와 **같은** 프로세스 전역
+    /// 락을 공유 — 별도 락이면 두 모듈이 HOME을 서로 덮는다).
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+    impl HomeGuard {
+        fn set() -> Self {
+            let lock = crate::snapshot_store::home_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", dir.path()) };
+            Self {
+                prev,
+                _lock: lock,
+                _dir: dir,
+            }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    /// sink를 비우며 **우리 이벤트**(`snapshot.recorded`)만 골라 온다. 캡처는 probe를 돌리며
+    /// `tool.run_command` 이벤트도 함께 내보내므로, 개수로 세면 그 노이즈에 걸린다.
+    fn drain_snapshot_event() -> Option<aic_common::AgentEvent> {
+        crate::agent_event::test_sink::drain()
+            .into_iter()
+            .find(|e| e.kind == aic_common::AGENT_KIND_SNAPSHOT_RECORDED)
+    }
+
+    // ── 실제 호출 경로가 정말 그 코드를 지나가는가 ────────────────────────────────
+    //
+    // 지난 라운드의 `memo_truncated`는 **단위 테스트는 통과하는데 실제 경로에선 작동하지 않았다** —
+    // 호출부가 sanitize를 한 번 하고 전송부가 또 한 번 해서, 두 번째가 이미 잘린 문자열을 보고
+    // "안 잘렸다"고 판정했다. 그래서 아래 두 테스트는 **진짜 진입점**(chat `handle_record`,
+    // CLI `record_now_cli`)을 그대로 호출해 이벤트에 무엇이 실려 나가는지 sink로 확인한다.
+
+    #[tokio::test]
+    async fn chat_record_now_puts_truncation_flag_on_the_real_event() {
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+
+        let (mut session, _dir) = test_session();
+        let oversized = "가".repeat(1_000_000); // 3MB — 64KiB 상한을 한참 넘긴다
+        session
+            .handle_record(tool_record::RecordAction::Now(Some(oversized)))
+            .await;
+
+        // 캡처가 probe를 돌리며 tool.run_command 이벤트도 함께 내보내므로, 우리 이벤트를 kind로 고른다.
+        let ev = drain_snapshot_event().expect("chat 경로에서 snapshot.recorded가 나가야 한다");
+        assert_eq!(
+            ev.attrs.get("memo_truncated"),
+            Some(&"true".to_string()),
+            "**실제 chat 경로**에서 절단 표시가 이벤트에 붙지 않았다: {:?}",
+            ev.attrs
+        );
+        assert!(ev.summary.len() <= crate::agent_event::MEMO_MAX_BYTES);
+
+        // 그리고 잘린 메모가 **로컬 레코드에도** 저장돼 있어야 한다(원격만 챙기고 로컬을 빠뜨리지 않게).
+        let rec = crate::snapshot_store::load_snapshots().unwrap();
+        let memo = rec[0].memo.as_deref().expect("로컬에 메모가 없다");
+        assert!(memo.len() <= crate::agent_event::MEMO_MAX_BYTES);
+        assert!(memo.chars().all(|c| c == '가'), "UTF-8 경계가 깨졌다");
+    }
+
+    #[test]
+    fn cli_record_now_puts_truncation_flag_on_the_real_event() {
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+
+        let oversized = "가".repeat(1_000_000);
+        let report = record_now_cli(&oversized);
+
+        assert!(
+            report.truncated,
+            "CLI가 절단 사실을 사용자에게 알리지 않는다"
+        );
+        assert!(report.remote.is_some(), "CLI가 메모를 보내지 않았다");
+
+        let ev = drain_snapshot_event().expect("CLI 경로에서 snapshot.recorded가 나가야 한다");
+        assert_eq!(
+            ev.attrs.get("memo_truncated"),
+            Some(&"true".to_string()),
+            "**실제 CLI 경로**에서 절단 표시가 이벤트에 붙지 않았다: {:?}",
+            ev.attrs
+        );
+
+        // 로컬 레코드에도 같은 메모가 저장된다(저장본과 전송본이 같은 정제 결과를 공유).
+        let rec = crate::snapshot_store::load_snapshots().unwrap();
+        assert_eq!(
+            rec[0].memo.as_deref(),
+            Some(ev.summary.as_str()),
+            "로컬에 저장된 메모와 전송된 메모가 다르다"
+        );
+    }
+
+    #[test]
+    fn cli_short_memo_carries_no_truncation_flag() {
+        // 항상 붙이면 의미가 없다 — 짧은 메모에는 표시가 없어야 한다.
+        let _h = HomeGuard::set();
+        let _ = crate::agent_event::test_sink::drain();
+
+        let report = record_now_cli("디스크가 이상하다");
+        assert!(!report.truncated);
+
+        let ev = drain_snapshot_event().expect("snapshot.recorded가 나가야 한다");
+        assert!(!ev.attrs.contains_key("memo_truncated"));
+        assert_eq!(ev.summary, "디스크가 이상하다");
     }
 
     #[test]

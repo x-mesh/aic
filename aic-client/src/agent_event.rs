@@ -84,79 +84,108 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 /// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 둘 다
 /// [`prepare_snapshot_event`] 하나를 지난다.
 ///
-/// 반환값 = **이 메모가 실제로 어떻게 됐는가**([`RecordOutcome`]). `None`이면 sanitize 후 메모가
-/// 비어 애초에 보내지 않았다는 뜻(F15)이라, 호출부가 "빈 메모라 안 보냄"과 "보냈고 그 결과는 이렇다"를
-/// 구분해 안내할 수 있다.
+/// **한 번만** 정제된 메모 — 정제 결과와 "그때 잘렸는가"를 **같이** 들고 다닌다.
+///
+/// 왜 타입이 필요한가(뼈아픈 교훈): 예전엔 `sanitize_memo(&str) -> (String, bool)`를 호출부가 한 번,
+/// 전송부가 또 한 번 불렀다. 두 번째 호출에는 **이미 잘린 문자열**이 들어오니 "잘렸다"고 판정할
+/// 근거가 없고, `memo_truncated`는 실제 경로에서 **항상 false**였다. 단위 테스트는 전송부를 직접
+/// 불러서 통과했지만 **진짜 호출 경로는 그 코드를 그렇게 지나가지 않았다** — "고친 줄 알았는데
+/// 실제로는 작동하지 않는" 바로 그 부류다.
+///
+/// 절단 여부는 **정제 순간에만 알 수 있는 정보**다. 나중에 재계산하려 하면 이미 소실됐다. 그래서
+/// 값과 함께 실어 나르고, 타입으로 **재정제를 불가능하게** 만든다(`&str`을 받는 전송 API를 없앴다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Memo {
+    /// 정제된 본문(제어문자 제거 + UTF-8 경계 보존 절단). 비어 있지 않음이 보장된다.
+    text: String,
+    /// 정제 과정에서 상한을 넘겨 잘렸는가.
+    truncated: bool,
+}
+
+impl Memo {
+    /// 원문을 **딱 한 번** 정제한다. 정제 후 비면(F15) `None` — 보낼 것도 저장할 것도 없다.
+    ///
+    /// 여기서 하는 일:
+    /// - **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
+    ///   않게. 개행/탭은 메모의 정상적인 부분이라 남긴다. ESC(`\x1b`)만 지워도 뒤따르는 CSI
+    ///   바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
+    /// - **UTF-8 경계 보존 절단**(F16) — IPC 프레임 상한(16MiB)에 닿지 않게 훨씬 낮은 선에서 자른다.
+    pub fn sanitize(raw: &str) -> Option<Self> {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect();
+        let (text, truncated) = crate::agent::tool_record::cap_str(&cleaned, MEMO_MAX_BYTES);
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(Self { text, truncated })
+    }
+
+    /// 정제된 본문 — **로컬 저장과 원격 전송이 이 하나의 값을 공유한다**(둘이 각자 정규화하면
+    /// 저장된 메모와 전송된 메모가 달라진다).
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// 상한을 넘겨 잘렸는가. 호출부가 사용자에게 알리는 데 쓴다.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// 반환값 = **이 메모가 실제로 어떻게 됐는가**([`RecordOutcome`]).
 ///
 /// **결론은 전송 결과에서 나온다** — `dispatch`가 실패하면 어떤 probe 결과와도 무관하게 `NotSent`다.
-pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) -> Option<RecordOutcome> {
-    let ev = prepare_snapshot_event(memo, attrs)?;
+///
+/// 빈 메모(F15)는 [`Memo::sanitize`]가 `None`을 내며 이 함수에 **도달조차 하지 않는다** — 그래서
+/// 여기서 다시 걸러낼 필요가 없다(타입이 불변식을 지킨다).
+pub fn snapshot_recorded(memo: &Memo, attrs: BTreeMap<String, String>) -> RecordOutcome {
+    let ev = build_snapshot_event(memo, attrs);
     // 먼저 **보내고**, 그 결과로 결론을 낸다. 상태 조회는 데몬이 받아들였을 때만 의미가 있으므로
     // 아니면 IPC를 한 번 더 걸지도 않는다.
     let sent = dispatch(ev);
     let status = matches!(sent, SendResult::Accepted)
         .then(exporter_status)
         .flatten();
-    Some(classify_outcome(sent, status.as_ref()))
+    classify_outcome(sent, status.as_ref())
 }
 
 /// [`snapshot_recorded`]의 async 판(chat `/record now <메모>`). 전송을 **async IPC**로 한다 —
 /// 이유는 [`query_async`] 문서 참고(sync IPC를 async에서 그냥 부르면 tokio worker가 막힌다).
 pub async fn snapshot_recorded_async(
-    memo: &str,
+    memo: &Memo,
     attrs: BTreeMap<String, String>,
-) -> Option<RecordOutcome> {
-    let ev = prepare_snapshot_event(memo, attrs)?;
+) -> RecordOutcome {
+    let ev = build_snapshot_event(memo, attrs);
     let sent = dispatch_async(ev).await;
     let status = if matches!(sent, SendResult::Accepted) {
         exporter_status_async().await
     } else {
         None
     };
-    Some(classify_outcome(sent, status.as_ref()))
+    classify_outcome(sent, status.as_ref())
 }
 
-/// 메모를 검사·안전화해 보낼 이벤트를 만든다. 보낼 게 없으면(F15) `None` — sync/async 두 진입점이
-/// **이 함수 하나**를 지나므로 병적 입력 방어가 한쪽에만 걸리는 일이 없다. 순수 함수(네트워크 없음).
+/// 메모가 잘렸을 때 사용자에게 보여줄 한 줄(chat·CLI 공용 — 두 진입점이 각자 문구를 지으면 한쪽만
+/// 고치고 잊는다).
+pub fn memo_truncated_notice() -> String {
+    format!(
+        "ℹ 메모가 너무 길어 {}KiB에서 잘렸습니다(뒷부분은 저장·전송되지 않습니다).",
+        MEMO_MAX_BYTES / 1024
+    )
+}
+
+/// 정제된 메모로 보낼 이벤트를 만든다. **재정제하지 않는다** — 절단 여부는 [`Memo`]가 들고 온 값을
+/// 그대로 쓴다(다시 계산하면 이미 잘린 문자열을 보게 되어 영영 false다).
 ///
-/// 호출부(chat `/record now <메모>`, CLI `aic snapshot record --memo`)를 대신해 여기서 병적 입력을
-/// 처리한다:
-/// - **빈 메모**(공백만 포함, 또는 sanitize 후 공백만 남는 메모)는 이벤트로서 무의미하므로 발화하지
-///   않는다(F15). 로컬 스냅샷 저장은 이 함수와 무관하게 호출부가 계속 수행한다.
-/// - **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
-///   않게. 개행/탭은 메모의 정상적인 부분이라 남긴다.
-/// - **UTF-8 경계 보존 절단**(F16) — IPC 프레임 상한(16MiB)에 닿지 않게 훨씬 낮은 선에서 자른다.
-///   잘렸으면 **`memo_truncated` attr로 표시**한다 — 뒤가 잘린 줄 모르는 채 나가면, 나중에 그 이벤트를
-///   보는 사람이 잘린 문장을 원문으로 읽는다.
-fn prepare_snapshot_event(memo: &str, mut attrs: BTreeMap<String, String>) -> Option<AgentEvent> {
-    let (memo, truncated) = sanitize_memo(memo);
-    if memo.trim().is_empty() {
-        return None;
-    }
-    if truncated {
+/// 잘렸으면 **`memo_truncated` attr로 표시**한다 — 뒤가 잘린 줄 모르는 채 나가면, 나중에 그 이벤트를
+/// 보는 사람이 잘린 문장을 원문으로 읽는다.
+fn build_snapshot_event(memo: &Memo, mut attrs: BTreeMap<String, String>) -> AgentEvent {
+    if memo.truncated() {
         attrs.insert("memo_truncated".to_string(), "true".to_string());
     }
-    Some(snapshot_event(&memo, attrs))
-}
-
-/// 메모를 저장/전송 전 안전화한다: 제어문자(ESC 등) 제거(개행·탭은 유지) → UTF-8 경계 보존 절단.
-/// 반환 = `(안전화된 메모, 절단됨?)`. 순수 함수(테스트 가능).
-///
-/// ESC(`\x1b`)만 지워도 뒤따르는 CSI 바이트열(`[33m` 등)은 그냥 평문으로 남아 터미널이 escape
-/// sequence로 해석하지 않으므로 이 정도로 충분하다.
-///
-/// **절단 여부를 버리지 않고 돌려준다** — 예전엔 `cap_str`의 플래그를 버려서, 64KiB를 넘긴 메모가
-/// 사용자에게도 이벤트에도 **아무 표시 없이** 잘렸다. 긴 메모를 남긴 사람은 뒤가 사라진 줄 모른다.
-///
-/// `pub`인 이유: **로컬 스냅샷에 저장하는 메모와 원격으로 보내는 메모가 같은 함수를 지나야 한다.**
-/// 둘이 각자 정규화하면 저장된 메모와 전송된 메모가 달라진다.
-pub fn sanitize_memo(memo: &str) -> (String, bool) {
-    let cleaned: String = memo
-        .chars()
-        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-        .collect();
-    let (capped, truncated) = crate::agent::tool_record::cap_str(&cleaned, MEMO_MAX_BYTES);
-    (capped, truncated)
+    snapshot_event(memo.text(), attrs)
 }
 
 /// `snapshot_recorded`가 보낼 이벤트를 만든다. kind/severity를 **인자로 받지 않고 본문에
@@ -204,12 +233,19 @@ pub enum RecordOutcome {
     /// 성공하기만 하면 성공으로 세서, 데몬이 거절해도 "기록됐습니다"라고 말했다.
     Rejected(String),
     /// aicd는 받았지만 exporter **전체**가 꺼져 있어(`[aicd.exporter] enabled = false`) 구독자가
-    /// 없다 — publish된 이벤트는 그대로 버려진다.
+    /// 없다 — publish된 이벤트는 그대로 버려진다. **설정을 켜면 해결된다.**
     DroppedExporterOff,
-    /// aicd는 받았지만 **agent exporter**가 안 떠 있어(`agent_enabled = false`, endpoint 미설정·spool
-    /// 실패, 또는 **task가 떴다가 죽음**) 구독자가 없다. 다른 signal(host metrics 등)은 멀쩡히 나가고
-    /// 있어서 **가장 눈치채기 어려운 유실**이다.
+    /// aicd는 받았지만 **agent exporter가 config에서 꺼져 있어**(`agent_enabled = false`) 구독자가
+    /// 없다. 다른 signal(host metrics 등)은 멀쩡히 나가고 있어서 **가장 눈치채기 어려운 유실**이다.
+    /// **설정을 켜면 해결된다.**
     DroppedAgentExporterOff,
+    /// **설정은 켜져 있는데 agent exporter task가 떠 있지 않다** — endpoint 오류·spool 실패로 기동
+    /// 실패했거나, 떴다가 죽었다.
+    ///
+    /// [`DroppedAgentExporterOff`](Self::DroppedAgentExporterOff)와 반드시 구분해야 한다: 여기서
+    /// "`agent_enabled = true`로 켜세요"라고 안내하면 **이미 켜 둔 사용자**가 시키는 대로 해도 안
+    /// 고쳐진다(오진). 진짜 이유는 aicd 로그에 있다.
+    AgentExporterDown,
 }
 
 /// 원격 기록의 최종 판정 — 안내 문구를 조립할 때 "실패인가"를 **문구 유무가 아니라 이 값으로** 가른다.
@@ -271,15 +307,24 @@ impl RecordOutcome {
             RecordOutcome::Rejected(why) => Some(format!(
                 "aicd가 이 메모를 거절했습니다({why}) — 서버에 남지 않습니다."
             )),
+            // 주의: aicd는 `enabled=true`라도 **endpoint가 비어 있으면** exporter를 아예 띄우지 않고
+            // 기본 status(`enabled: false`)를 돌려준다. 즉 이 분기는 "설정을 껐다"와 "켰는데 endpoint가
+            // 없다" 둘 다에서 온다 — 그래서 "켜세요"만 말하면 endpoint를 빠뜨린 사용자에게 오진이 된다.
+            // 둘 다 짚어 준다(가장 저렴한 정직).
             RecordOutcome::DroppedExporterOff => Some(
-                "aicd는 받았지만 OTLP exporter가 꺼져 있어 이 메모는 버려집니다 — \
-                 config `[aicd.exporter] enabled = true`로 켜세요."
+                "aicd는 받았지만 OTLP exporter가 돌고 있지 않아 이 메모는 버려집니다 — \
+                 config `[aicd.exporter]`의 `enabled = true`와 `endpoint` 설정을 확인하세요."
                     .to_string(),
             ),
             RecordOutcome::DroppedAgentExporterOff => Some(
-                "aicd는 받았지만 OTLP agent exporter가 떠 있지 않아 이 메모는 버려집니다 — \
-                 config `[aicd.exporter] agent_enabled = true`를 확인하세요(켜져 있는데도 이 \
-                 메시지가 보이면 exporter task가 죽은 것이니 aicd 로그를 확인하세요)."
+                "aicd는 받았지만 OTLP agent exporter가 config에서 꺼져 있어 이 메모는 버려집니다 — \
+                 config `[aicd.exporter] agent_enabled = true`로 켜세요."
+                    .to_string(),
+            ),
+            RecordOutcome::AgentExporterDown => Some(
+                "aicd는 받았지만 OTLP agent exporter가 떠 있지 않습니다(설정은 켜져 있음) — \
+                 기동 실패했거나 죽은 것이니 **aicd 로그를 확인하세요**. 이 메모는 서버에 \
+                 남지 않았을 수 있습니다."
                     .to_string(),
             ),
         }
@@ -287,10 +332,18 @@ impl RecordOutcome {
 
     /// 원격 판정. **`notice()` 유무로 성패를 가르지 마라** — 밀림(Delivered{backlog>0})은 안내가
     /// 있지만 유실이 아니고, Unknown은 실패가 아니라 모름이다.
+    ///
+    /// **왜 `AgentExporterDown`이 `Lost`가 아니라 `Unknown`인가**: 우리가 관측한 건 "publish 직후
+    /// 시점에 구독자가 없다"이지 "publish 순간에 없었다"가 아니다. task가 방금 죽은 경우라면 이벤트는
+    /// 죽기 전에 소비됐을 수도 있다 — **한 번의 관측으로 유실을 확정할 수 없다.** 반면 config가
+    /// 꺼져 있는 경우(`Dropped*Off`)는 애초에 구독자가 존재한 적이 없으므로 `Lost`가 사실이다.
+    /// 모르는 것은 모른다고 하고, 아는 것만 단언한다.
     pub fn verdict(&self) -> RemoteVerdict {
         match self {
             RecordOutcome::Delivered { .. } => RemoteVerdict::Reaches,
-            RecordOutcome::Unknown => RemoteVerdict::Unknown,
+            // 도달 여부를 확인할 수 없는 두 경우 — 단정하지 않는다.
+            RecordOutcome::Unknown | RecordOutcome::AgentExporterDown => RemoteVerdict::Unknown,
+            // 구독자가 애초에 없었음이 확실한 경우들.
             RecordOutcome::NotSent
             | RecordOutcome::Rejected(_)
             | RecordOutcome::DroppedExporterOff
@@ -336,7 +389,15 @@ fn classify_outcome(
         return RecordOutcome::DroppedExporterOff;
     }
     if s.agent_enabled == Some(false) {
-        return RecordOutcome::DroppedAgentExporterOff;
+        // 구독자가 없다. 그런데 **왜** 없는지에 따라 사용자가 할 일이 다르다:
+        // - config가 꺼짐 → 켜면 된다.
+        // - config는 켰는데 안 떠 있음 → 켜라고 하면 오진이다. aicd 로그를 봐야 한다.
+        // 구버전 aicd는 `agent_configured`를 모른다(None) → 예전처럼 "설정을 확인하라"로 접는다
+        // (그 버전에선 구분할 정보 자체가 없다 — 정직한 한계).
+        return match s.agent_configured {
+            Some(true) => RecordOutcome::AgentExporterDown,
+            _ => RecordOutcome::DroppedAgentExporterOff,
+        };
     }
     // 3) 구독자가 있다 → 나간다. 지금 밀려 있는 양은 관찰로만 덧붙인다(단언 아님).
     RecordOutcome::Delivered {
@@ -607,6 +668,11 @@ mod tests {
     /// 유출과 무관하게 그 카운트만 늘어난다.
     const AWS_KEY_FIXTURE: &str = "AKIAIOSFODNN7EXAMPLE";
 
+    /// 테스트용 — 원문을 한 번 정제해 `Memo`로 만든다(비면 패닉: 픽스처가 잘못된 것이다).
+    fn memo(raw: &str) -> Memo {
+        Memo::sanitize(raw).expect("테스트 픽스처가 빈 메모다")
+    }
+
     #[test]
     fn query_without_daemon_fails_quietly_instead_of_panicking() {
         // aicd가 없을 때(미실행) 조용히 Err로 떨어지고 패닉하지 않아야 한다 — 정상 경로다(F19).
@@ -635,7 +701,7 @@ mod tests {
         risk_denied("rm -rf /", "Dangerous", Some("builtin_denylist"));
         finding_created("disk_full", "WARN", "/ 사용률 95%");
         snapshot_recorded(
-            "cpu sys 26%, idle 67% — 커널 모드 비율이 높음",
+            &Memo::sanitize("cpu sys 26%, idle 67% — 커널 모드 비율이 높음").unwrap(),
             BTreeMap::new(),
         );
 
@@ -727,8 +793,9 @@ mod tests {
         // F15: 빈 메모/공백뿐인 메모는 발화하지 않는다 — 반환값(None)뿐 아니라 **sink가 비어 있는지**
         // 까지 본다(반환값만 보면 "None을 돌려주면서 보내기는 하는" 회귀를 놓친다).
         let _ = test_sink::drain();
-        assert_eq!(snapshot_recorded("", BTreeMap::new()), None);
-        assert_eq!(snapshot_recorded("   \n\t  ", BTreeMap::new()), None);
+        // 이제 타입이 막는다: 빈 메모는 `Memo`가 만들어지지 않으므로 전송 API에 **도달조차 못 한다**.
+        assert_eq!(Memo::sanitize(""), None);
+        assert_eq!(Memo::sanitize("   \n\t  "), None);
         assert!(
             test_sink::drain().is_empty(),
             "빈 메모인데 이벤트가 전송됐다"
@@ -741,7 +808,7 @@ mod tests {
         // 한다 — parse 단계의 `.trim()`(유니코드 공백만 제거)은 ESC 같은 제어문자를 못 거르므로,
         // 이 판정이 sanitize **이후**에 있어야만 잡히는 케이스다.
         let _ = test_sink::drain();
-        assert_eq!(snapshot_recorded("\x1b\x1b\x1b", BTreeMap::new()), None);
+        assert_eq!(Memo::sanitize("\x1b\x1b\x1b"), None);
         assert!(
             test_sink::drain().is_empty(),
             "제어문자뿐인 메모인데 이벤트가 전송됐다"
@@ -754,7 +821,7 @@ mod tests {
         let _ = test_sink::drain();
         let mut attrs = BTreeMap::new();
         attrs.insert("note_source".to_string(), "chat".to_string());
-        assert!(snapshot_recorded("cpu 이상하게 높음", attrs).is_some());
+        snapshot_recorded(&memo("cpu 이상하게 높음"), attrs);
 
         let sent = test_sink::drain();
         assert_eq!(sent.len(), 1, "정확히 1건이어야: {sent:?}");
@@ -770,16 +837,16 @@ mod tests {
         // "원격에 기록됐습니다"라고 말했다. sink를 실패 모드로 두어 실 소켓 없이 그 경로를 재현한다.
         let _ = test_sink::drain();
         test_sink::set_send_result(SendResult::Failed);
-        let outcome = snapshot_recorded("디스크가 이상하다", BTreeMap::new());
+        let outcome = snapshot_recorded(&memo("디스크가 이상하다"), BTreeMap::new());
         test_sink::set_send_result(SendResult::Accepted); // 같은 스레드를 재사용하는 뒤 테스트를 오염시키지 않게 복구
 
         assert_eq!(
             outcome,
-            Some(RecordOutcome::NotSent),
+            RecordOutcome::NotSent,
             "전송에 실패했는데 실패라고 보고하지 않는다"
         );
         assert!(
-            outcome.clone().unwrap().verdict() == RemoteVerdict::Lost,
+            outcome.verdict() == RemoteVerdict::Lost,
             "보내지도 못한 메모를 '서버에 남는다'고 말하면 안 된다"
         );
         assert!(
@@ -793,10 +860,10 @@ mod tests {
         // async(chat) 경로도 같은 계약 — 여기만 성공으로 단언하는 회귀를 막는다.
         let _ = test_sink::drain();
         test_sink::set_send_result(SendResult::Failed);
-        let outcome = snapshot_recorded_async("느려짐", BTreeMap::new()).await;
+        let outcome = snapshot_recorded_async(&memo("느려짐"), BTreeMap::new()).await;
         test_sink::set_send_result(SendResult::Accepted);
 
-        assert_eq!(outcome, Some(RecordOutcome::NotSent));
+        assert_eq!(outcome, RecordOutcome::NotSent);
         assert!(test_sink::drain().is_empty());
     }
 
@@ -805,14 +872,10 @@ mod tests {
         // chat(async) 경로도 sync와 **같은 계약**을 지킨다: 빈 메모는 스킵, 진짜 메모는 1건 전송.
         // 두 진입점이 prepare_snapshot_event를 공유하므로 여기서 갈라지면 곧바로 드러난다.
         let _ = test_sink::drain();
-        assert_eq!(snapshot_recorded_async("  ", BTreeMap::new()).await, None);
+        assert_eq!(Memo::sanitize("  "), None);
         assert!(test_sink::drain().is_empty(), "빈 메모인데 전송됨(async)");
 
-        assert!(
-            snapshot_recorded_async("디스크가 이상하다", BTreeMap::new())
-                .await
-                .is_some()
-        );
+        snapshot_recorded_async(&memo("디스크가 이상하다"), BTreeMap::new()).await;
         let sent = test_sink::drain();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].kind, "snapshot.recorded");
@@ -826,6 +889,7 @@ mod tests {
         aic_common::ExporterStatus {
             enabled: true,
             agent_enabled: Some(true),
+            agent_configured: Some(true),
             ..Default::default()
         }
     }
@@ -938,6 +1002,7 @@ mod tests {
         let agent_off = aic_common::ExporterStatus {
             enabled: true, // 부모 게이트는 켜져 있다
             agent_enabled: Some(false),
+            agent_configured: Some(false), // config에서도 꺼 뒀다 → 켜면 해결된다
             ..Default::default()
         };
         assert_eq!(
@@ -954,6 +1019,39 @@ mod tests {
         assert_eq!(
             classify_outcome(SendResult::Accepted, Some(&all_off)),
             RecordOutcome::DroppedExporterOff
+        );
+    }
+
+    #[test]
+    fn configured_but_down_is_not_misdiagnosed_as_a_config_problem() {
+        // **오진 회귀 테스트**: endpoint 오류·spool 실패·task 사망으로 안 떠 있는 경우에
+        // "`agent_enabled = true`로 켜세요"라고 안내하면, **이미 켜 둔 사용자**가 시키는 대로 해도
+        // 안 고쳐진다. 진짜 이유는 aicd 로그에 있다.
+        let down = aic_common::ExporterStatus {
+            enabled: true,
+            agent_enabled: Some(false),   // 안 떠 있다
+            agent_configured: Some(true), // 그런데 설정은 켜져 있다
+            ..Default::default()
+        };
+        let outcome = classify_outcome(SendResult::Accepted, Some(&down));
+        assert_eq!(outcome, RecordOutcome::AgentExporterDown);
+
+        let notice = outcome.notice().expect("안내가 있어야");
+        assert!(
+            notice.contains("aicd 로그"),
+            "진짜 원인을 볼 곳(aicd 로그)을 안내하지 않는다: {notice}"
+        );
+        assert!(
+            !notice.contains("agent_enabled = true"),
+            "이미 켜 둔 설정을 켜라고 오진한다: {notice}"
+        );
+
+        // 그리고 **유실로 확정하지 않는다**: 우리가 본 건 "publish 직후 시점에 구독자가 없다"이지
+        // "publish 순간에 없었다"가 아니다. 방금 죽은 task라면 이벤트는 죽기 전에 소비됐을 수 있다.
+        assert_eq!(
+            outcome.verdict(),
+            RemoteVerdict::Unknown,
+            "한 번의 관측으로 유실을 확정한다"
         );
     }
 
@@ -1042,7 +1140,8 @@ mod tests {
         // F17: 제어문자/ANSI escape가 수신측 표시를 깨지 않아야 한다. ESC를 지우면 뒤따르는
         // CSI 바이트열은 이스케이프 시퀀스가 아니라 평범한 문자로 남는다(터미널이 해석 안 함).
         let input = "line1\x1b[31mRED\x1b[0m\tline1-tab\nline2\x07bell";
-        let (out, truncated) = sanitize_memo(input);
+        let m = memo(input);
+        let (out, truncated) = (m.text(), m.truncated());
         assert!(!out.contains('\x1b'), "ESC가 남음: {out:?}");
         assert!(!out.contains('\x07'), "BEL이 남음: {out:?}");
         assert!(out.contains('\n'), "개행이 지워짐: {out:?}");
@@ -1057,7 +1156,8 @@ mod tests {
         // F16: 1MB 메모 같은 병적 입력이 절단되어 IPC 프레임 상한(16MiB)에 닿지 않는다.
         // 멀티바이트 문자(한글, 3바이트)로 채워 절단 지점이 문자 중간이면 즉시 드러나게 한다.
         let oversized = "가".repeat(1_000_000); // 3MB (문자당 3바이트)
-        let (out, truncated) = sanitize_memo(&oversized);
+        let m = memo(&oversized);
+        let (out, truncated) = (m.text(), m.truncated());
         assert!(
             out.len() <= MEMO_MAX_BYTES,
             "절단이 상한을 넘음: {} bytes",
@@ -1079,7 +1179,7 @@ mod tests {
         // 원문으로 읽지 않도록.
         let _ = test_sink::drain();
         let oversized = "가".repeat(1_000_000);
-        assert!(snapshot_recorded(&oversized, BTreeMap::new()).is_some());
+        snapshot_recorded(&memo(&oversized), BTreeMap::new());
 
         let sent = test_sink::drain();
         assert_eq!(sent.len(), 1);
@@ -1092,7 +1192,7 @@ mod tests {
         assert!(sent[0].summary.len() <= MEMO_MAX_BYTES);
 
         // 짧은 메모에는 그 플래그가 붙지 않는다(항상 붙이면 의미가 없다).
-        assert!(snapshot_recorded("짧은 메모", BTreeMap::new()).is_some());
+        snapshot_recorded(&memo("짧은 메모"), BTreeMap::new());
         let sent = test_sink::drain();
         assert!(!sent[0].attrs.contains_key("memo_truncated"));
     }
@@ -1103,8 +1203,7 @@ mod tests {
         // 서로를 무력화하지 않는다).
         let secret = AWS_KEY_FIXTURE;
         let noisy = format!("\x1b[31mexport AWS_SECRET_ACCESS_KEY={secret}\x1b[0m");
-        let (memo, _) = sanitize_memo(&noisy);
-        let ev = snapshot_event(&memo, BTreeMap::new());
+        let ev = snapshot_event(memo(&noisy).text(), BTreeMap::new());
         assert!(
             !ev.summary.contains(secret),
             "sanitize 이후에도 secret이 마스킹돼야 함: {}",
