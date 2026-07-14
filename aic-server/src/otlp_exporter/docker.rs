@@ -256,8 +256,14 @@ fn resolve_docker_bin_with(
 /// 하다. 링크의 무결성은 순전히 부모 디렉토리(교체 가능 여부)가 좌우하고, 그 부모는 내려오는 길에
 /// 이미 검사했다.
 ///
-/// `.`/`..` 성분이나 stat 실패는 **거부**한다(fail-closed) — root 운영자는 깨끗한 절대경로를 주면
-/// 된다. 심볼릭 루프 방어로 따라가는 링크 수에 상한을 둔다.
+/// **상대 링크 대상은 해소한다(거부하지 않는다)**: Homebrew가 정확히 상대 링크를 쓴다 —
+/// `/opt/homebrew/bin/docker -> ../Cellar/docker/<ver>/bin/docker`. `..`는 "위험"이 아니라 그냥
+/// "부모로 올라감"이라 거부가 아니라 접어야 한다. 링크가 놓인 디렉토리 기준으로 절대화한 뒤 다시
+/// 성분 단위로 walk하므로, `../Cellar/...`의 각 성분이 root 통제 하면 정상 통과한다(그렇지 않으면
+/// 그 성분에서 거부). `..`를 렉시컬하게 접는 게 안전한 근거는 아래 walk 본문의 `ParentDir` 주석 참고.
+///
+/// stat 실패나 파일 종류가 이상하면(디바이스 등) **거부**한다(fail-closed). 심볼릭 루프 방어로
+/// 따라가는 링크 수에 상한을 둔다.
 fn is_root_controlled_path(p: &Path) -> bool {
     is_root_controlled_walk(p, 0, &|path| {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -293,9 +299,19 @@ fn is_root_controlled_walk(p: &Path, depth: u32, trusted: &dyn Fn(&Path) -> bool
     for (idx, comp) in comps.iter().enumerate() {
         let name = match comp {
             Component::RootDir => continue,
+            // `.` — 무시한다(현재 위치 유지).
+            Component::CurDir => continue,
+            // `..` — 부모로 접는다. **이게 안전한 이유**: 이 walk는 심볼릭 링크를 만나면 즉시 대상
+            // 경로로 restart하므로(아래 `is_symlink` 가지), 여기까지 쌓인 `current`에는 링크가 하나도
+            // 없다(전부 실제 디렉토리). 링크 없는 경로에서 `..`를 렉시컬하게 pop하는 건 커널의 해소와
+            // 정확히 같다 — canonicalize가 필요한 "링크를 건너뛰며 접는" 위험이 여기엔 없다.
+            // (`/`에서 pop은 no-op이라 루트 위로는 못 올라간다.)
+            Component::ParentDir => {
+                current.pop();
+                continue;
+            }
             Component::Normal(n) => n,
-            // `.`/`..`/prefix — 깨끗한 절대경로가 아니다. 위험한 쪽으로 친다.
-            _ => return false,
+            Component::Prefix(_) => return false,
         };
         current.push(name);
 
@@ -311,6 +327,11 @@ fn is_root_controlled_walk(p: &Path, depth: u32, trusted: &dyn Fn(&Path) -> bool
             let Ok(target) = std::fs::read_link(&current) else {
                 return false;
             };
+            // **상대 링크 대상은 거부가 아니라 해소한다.** Homebrew가 정확히 상대 링크를 쓴다:
+            // `/opt/homebrew/bin/docker -> ../Cellar/docker/<ver>/bin/docker`. 링크가 놓인 디렉토리
+            // (`current.parent()`) 기준으로 절대화한 뒤, 남은 성분(`..`/`.` 포함)을 그대로 이어 붙여
+            // **다시 성분 단위로** walk한다 — restart하는 walk가 그 안의 링크를 또 성분별로 따라가고,
+            // `..`는 위에서 렉시컬하게 접힌다. `../Cellar/...`의 각 성분이 root 통제 하면 통과한다.
             let base = match current.parent() {
                 Some(b) => b.to_path_buf(),
                 None => return false,
@@ -320,11 +341,13 @@ fn is_root_controlled_walk(p: &Path, depth: u32, trusted: &dyn Fn(&Path) -> bool
             } else {
                 base.join(target)
             };
-            // 이 링크 뒤에 남은 성분들을 대상 뒤에 이어 붙여 나머지 경로를 마저 해소한다.
+            // 남은 성분을 있는 그대로(`..`/`.` 포함) 이어 붙인다 — 정규화는 restart된 walk가 한다.
             for rest in &comps[idx + 1..] {
                 match rest {
                     Component::Normal(n) => next.push(n),
-                    _ => return false,
+                    Component::CurDir => {}
+                    Component::ParentDir => next.push(".."),
+                    Component::RootDir | Component::Prefix(_) => return false,
                 }
             }
             return is_root_controlled_walk(&next, depth + 1, trusted);
@@ -380,9 +403,16 @@ fn is_root_controlled_meta(uid: u32, mode: u32, has_extended_acl: bool) -> bool 
 /// 이 경로에 **확장 ACL**이 붙어 있는가. 판단이 불가능하면 **`true`(신뢰 못 함)를 반환한다** —
 /// 이 함수의 소비자는 보안 게이트라 모르는 것은 위험한 것으로 친다(fail-closed).
 ///
+/// **호출자([`is_root_controlled_walk`])는 심볼릭 링크 성분엔 이 함수를 부르지 않는다** — 링크는
+/// 검사하지 않고 대상으로 따라가므로(무결성은 링크의 부모 디렉토리가 좌우), 여기 들어오는 건 언제나
+/// 실제 디렉토리이거나 최종 실행 **파일**이다(링크가 아니다). 그래서 링크-추종 여부는 실질적으로
+/// 무의미하지만, 아래 두 API 모두 **링크를 따라가지 않는 변종**(`_link_np` / `lgetxattr`)을 쓴다 —
+/// 설령 링크가 들어와도 대상이 아니라 그 경로 성분 자신의 ACL을 보는 보수적(fail-safe) 선택이다.
+/// (예전 doc은 "canonicalize한 뒤라 링크가 없다"고 했는데, walk 재작성으로 더는 canonicalize를 안
+/// 쓴다 — 링크가 없는 이유가 "canonicalize"가 아니라 "walk가 링크 성분을 검사 대상에서 제외"로 바뀌었다.)
+///
 /// - **macOS**: `acl_get_link_np(path, ACL_TYPE_EXTENDED)`가 non-NULL이면 ACL이 있다. 없으면 NULL +
-///   `ENOENT`. 링크를 따라가지 않는 `_link_np`를 쓰지만, 호출부가 이미 canonicalize한 뒤라 경로에
-///   심볼릭 링크는 남아 있지 않다.
+///   `ENOENT`.
 /// - **Linux**: `system.posix_acl_access` xattr이 있으면 ACL이 있다. 없으면 `ENODATA`. 파일시스템이
 ///   ACL을 아예 지원하지 않으면(`ENOTSUP`) ACL로 권한을 줄 수도 없으므로 "없음"으로 친다.
 ///   디렉토리의 *default* ACL(`system.posix_acl_default`)은 보지 않는다 — 상속 템플릿일 뿐,
@@ -680,12 +710,17 @@ async fn serve_docker_with(
                         // 건드리지 않는다: health는 "push가 성공/실패했나"만 추적하고, 캡처 실패는
                         // 애초에 push를 시도조차 하지 않았기 때문이다.
                         if is_binary_gone(&e) {
-                            // 찾아 뒀던 docker가 사라졌다(삭제·업그레이드로 경로 변경 등).
-                            // 상태를 되돌려 다음 tick부터 재탐색한다 — WARN은 이 전이에서 한 번뿐이고,
-                            // 못 찾는 동안은 조용하다(위 doc "로그는 상태 변화에만").
+                            // 찾아 뒀던 docker가 사라졌다(삭제·업그레이드로 경로 변경 등). 상태를
+                            // 되돌려 다음 tick부터 재탐색한다 — WARN은 이 전이에서 한 번뿐이고, 못 찾는
+                            // 동안은 조용하다(위 doc "로그는 상태 변화에만").
                             let _announced = state.mark_gone(&bin);
+                        } else if state.mark_capture_failed() {
+                            // docker는 있는데 명령이 실패했다(데몬 down/권한/timeout). 데몬 down은 흔한
+                            // 정상 상태라 **이 전이에서 한 번만** WARN하고, 지속되는 동안은 아래 debug다
+                            // (item 3). ENOENT(사라짐)와 달리 재탐색하지 않는다 — 실행 파일은 멀쩡하다.
+                            tracing::warn!(error = %e, "docker system df 캡처 실패(데몬 down/권한/timeout) — 다음 주기까지 skip");
                         } else {
-                            tracing::warn!(error = %e, "docker system df 캡처/파싱 실패 — 다음 주기까지 skip");
+                            tracing::debug!(error = %e, "docker system df 캡처 실패 지속 — 이번 주기 skip");
                         }
                     }
                 }
@@ -727,6 +762,11 @@ enum Announced {
     Missing,
     /// 이 **특정 경로**가 실패한다(exec ENOENT/사라짐)를 알렸다.
     Bad(PathBuf),
+    /// docker는 있는데 **명령이 실패한다**(데몬 down/권한/timeout — non-zero exit)를 알렸다.
+    /// `Bad`와 다르다: 실행 파일은 멀쩡하므로 `current`를 비우지 않고(재탐색 무의미) 같은 경로를
+    /// 계속 시도한다. docker 데몬이 꺼져 있는 건 흔한 정상 상태라, 전이에만 알리고 지속되는 동안은
+    /// 조용해야 한다(매 tick WARN은 소음이다).
+    CaptureFailing,
 }
 
 impl BinState {
@@ -815,11 +855,16 @@ impl BinState {
     }
 
     /// 캡처가 성공했다 — 이 경로는 지금 멀쩡하다. "나쁘다"던 기록을 지워, **다음 번 장애는 새로
-    /// 알리도록** 한다(안 지우면 P가 한 번 실패한 뒤로는 P의 어떤 장애도 영원히 억제된다).
+    /// 알리도록** 한다(안 지우면 P가 한 번 실패한 뒤로는 P의 어떤 장애도 영원히 억제된다). 직전에
+    /// 실제 장애(`Bad`/`CaptureFailing`)를 알렸던 상태에서 회복했다면 **복구 INFO를 한 번** 낸다.
     fn mark_ok(&mut self) {
-        if self.announced_bad != Announced::Nothing {
-            self.announced_bad = Announced::Nothing;
+        match self.announced_bad {
+            Announced::Nothing | Announced::Missing => {}
+            Announced::Bad(_) | Announced::CaptureFailing => {
+                tracing::info!("docker exporter 캡처가 정상으로 돌아왔다");
+            }
         }
+        self.announced_bad = Announced::Nothing;
     }
 
     /// 쓰던 실행 파일이 exec 시점에 없어졌다(`ENOENT`). 재탐색하도록 `current`를 비우고, **직전에
@@ -837,6 +882,19 @@ impl BinState {
             "docker 실행 파일이 사라졌다(exec ENOENT) — 다시 탐색한다(설치되면 자동으로 캡처를 재개한다)"
         );
         self.announced_bad = Announced::Bad(bin.to_path_buf());
+        true
+    }
+
+    /// docker는 실행됐는데 **명령(`docker system df`)이 실패**했다(데몬 down/권한/timeout — non-zero
+    /// exit, 미설치 아님). `current`는 그대로 둔다 — 실행 파일은 멀쩡하니 재탐색은 무의미하다.
+    ///
+    /// **처음 이 상태로 들어갈 때만 `true`**(=WARN)를 돌려주고, 지속되는 동안은 `false`(=조용히)다.
+    /// docker 데몬이 꺼져 있는 건 흔한 정상 상태라, 매 tick WARN을 쏟으면 소음이다(item 3).
+    fn mark_capture_failed(&mut self) -> bool {
+        if self.announced_bad == Announced::CaptureFailing {
+            return false;
+        }
+        self.announced_bad = Announced::CaptureFailing;
         true
     }
 }
@@ -1441,8 +1499,8 @@ mod tests {
         std::fs::write(&target, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        // 실행되는 경로: unsafe/docker -> (절대경로) safe/docker-real.
-        // 절대 대상을 쓴다 — 상대 대상은 `..`를 만들어 walk가 fail-closed로 거부해 대조가 흐려진다.
+        // 실행되는 경로: unsafe/docker -> (절대경로) safe/docker-real. 절대 대상을 쓴다 — 이 테스트의
+        // 관심은 "링크 디렉토리를 검사하는가"이고, 상대 대상 해소는 아래 relative 테스트가 따로 본다.
         let link = unsafe_dir.join("docker");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
@@ -1472,10 +1530,15 @@ mod tests {
     /// - walk: 링크가 놓인 `unsafe`(사용자 쓰기 가능) 디렉토리를 검사 → **거부**.
     /// - canonicalize(예전 버그): 대상과 그 상위만 보므로 전부 root → **통과**.
     ///
-    /// 비-root에선 root 소유 대상을 못 만들어 skip한다. 다만 **불변식 자체는
-    /// [`is_root_controlled_walk_checks_the_directory_that_holds_the_symlink`]가 어느 머신에서든**
-    /// 못박으므로, 이 skip이 커버리지에 구멍을 내지 않는다. 이 테스트의 몫은 오직 "프로덕션 배선"을
-    /// root에서 실측하는 것이고, CI/개발기 중 root로 도는 환경(예: 리뷰용 Linux 서버)에서 실제로 돈다.
+    /// 비-root에선 root 소유 대상을 못 만들어 skip한다(그 구조는 root라야 구성 가능하다). 다만
+    /// **불변식 자체는 [`is_root_controlled_walk_checks_the_directory_that_holds_the_symlink`]가 어느
+    /// 머신에서든** 못박으므로, 이 skip이 커버리지에 구멍을 내지 않는다. 이 테스트의 몫은 오직
+    /// "프로덕션 배선"을 root에서 실측하는 것이고, 리뷰 파이프라인의 Linux 서버(root)에서 실제로 돈다.
+    ///
+    /// **공허하지 않음을 실측했다**: 이 테스트 상태에서 `is_root_controlled_path`를 예전 canonicalize
+    /// 방식으로 되돌리는 mutation을 jw-server(root)에 적용하면 이 테스트가 정확히 위 assertion 메시지로
+    /// **FAILED**한다. canonicalize는 대상(`safe/docker-real`)의 상위만 봐서 전부 root라 "통과"하지만,
+    /// walk는 실행 경로의 `unsafe`(0777)를 보고 거부한다 — 그 차이를 이 테스트가 가른다.
     #[test]
     fn is_root_controlled_path_rejects_a_link_in_a_writable_dir_even_when_target_is_root_safe() {
         if unsafe { libc::geteuid() } != 0 {
@@ -1525,11 +1588,13 @@ mod tests {
         );
     }
 
-    /// `..`/`.` 성분은 fail-closed로 거부한다(깨끗한 절대경로만 신뢰).
+    /// `..`는 거부가 아니라 **접는다**(부모로 올라감). 링크 없는 실경로에서의 `..` 폴딩은 커널 해소와
+    /// 같다 — `root/sub/../docker`는 `root/docker`로 접혀 통과해야 한다.
     #[test]
-    fn is_root_controlled_walk_rejects_dot_dot_components() {
+    fn is_root_controlled_walk_folds_dot_dot_instead_of_rejecting() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
         let f = root.join("docker");
         std::fs::write(&f, b"x").unwrap();
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1537,8 +1602,73 @@ mod tests {
 
         let with_dotdot = root.join("sub").join("..").join("docker");
         assert!(
-            !is_root_controlled_walk(&with_dotdot, 0, &all_trusted),
-            ".. 성분이 든 경로는 거부해야 한다"
+            is_root_controlled_walk(&with_dotdot, 0, &all_trusted),
+            "root/sub/../docker는 root/docker로 접혀 통과해야 한다 — `..`를 거부하면 상대 링크가 깨진다"
+        );
+    }
+
+    /// **회귀 가드 — item 1(블로킹): Homebrew 상대 링크.** Homebrew는
+    /// `.../bin/docker -> ../Cellar/docker/<ver>/bin/docker`처럼 **상대 링크**를 쓴다. 예전 walk는
+    /// `..`를 fail-closed로 거부해 이 정상 설치의 exporter를 조용히 비활성시켰다. 이제는 링크가 놓인
+    /// 디렉토리 기준으로 해소해, 각 성분이 root 통제 하면 통과해야 한다.
+    ///
+    /// 소유권은 주입한다("전부 신뢰"). 링크와 디렉토리는 tempdir에 실제 상대 링크로 만들어 해소가
+    /// 진짜로 돈다.
+    #[test]
+    fn is_root_controlled_walk_resolves_a_relative_homebrew_style_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Homebrew 레이아웃: root/bin/docker -> ../Cellar/docker/1.0/bin/docker
+        let bindir = root.join("bin");
+        std::fs::create_dir(&bindir).unwrap();
+        let cellar_bin = root.join("Cellar").join("docker").join("1.0").join("bin");
+        std::fs::create_dir_all(&cellar_bin).unwrap();
+        let target = cellar_bin.join("docker");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let link = bindir.join("docker");
+        std::os::unix::fs::symlink("../Cellar/docker/1.0/bin/docker", &link).unwrap();
+
+        let all_trusted = |_: &Path| true;
+        assert!(
+            is_root_controlled_walk(&link, 0, &all_trusted),
+            "상대 링크가 전부 root 통제 하인데 거부됐다 — Homebrew 정상 설치가 깨진다"
+        );
+    }
+
+    /// 상대 링크라도 **지나는 디렉토리 하나라도 신뢰 밖이면 거부**한다 — 링크가 놓인 디렉토리 쪽이든
+    /// (item 1의 핵심), 대상 쪽 중간 디렉토리든 둘 다.
+    #[test]
+    fn is_root_controlled_walk_rejects_a_relative_link_through_an_untrusted_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let bindir = root.join("bin");
+        std::fs::create_dir(&bindir).unwrap();
+        let cellar_mid = root.join("Cellar").join("docker");
+        let cellar_bin = cellar_mid.join("1.0").join("bin");
+        std::fs::create_dir_all(&cellar_bin).unwrap();
+        let target = cellar_bin.join("docker");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = bindir.join("docker");
+        std::os::unix::fs::symlink("../Cellar/docker/1.0/bin/docker", &link).unwrap();
+
+        // (a) 링크가 놓인 디렉토리가 신뢰 밖 — 스왑 하이재킹 경로.
+        let bd = bindir.clone();
+        let untrusted_linkdir = move |p: &Path| p != bd.as_path();
+        assert!(
+            !is_root_controlled_walk(&link, 0, &untrusted_linkdir),
+            "상대 링크가 놓인 사용자 쓰기 가능 디렉토리를 통과시켰다"
+        );
+
+        // (b) 대상 쪽 중간 디렉토리가 신뢰 밖.
+        let cm = cellar_mid.clone();
+        let untrusted_target_mid = move |p: &Path| p != cm.as_path();
+        assert!(
+            !is_root_controlled_walk(&link, 0, &untrusted_target_mid),
+            "상대 링크 대상 경로의 사용자 쓰기 가능 중간 디렉토리를 통과시켰다"
         );
     }
 
@@ -2470,6 +2600,68 @@ mod tests {
         assert!(
             state.mark_gone(&p),
             "성공 뒤의 새 장애를 억제하면 안 된다 — mark_ok가 나쁨 기록을 지워야 한다"
+        );
+    }
+
+    /// **회귀 가드 — item 3: 데몬 down WARN 폭주.** docker는 있는데 `docker system df`가 non-zero
+    /// exit(데몬 꺼짐 — 흔한 정상 상태)면, 예전엔 매 tick WARN이 나왔다. 이제는 **전이에만** WARN하고
+    /// 지속되는 동안은 조용해야 한다. mark_capture_failed는 첫 진입에서만 true(=WARN 사유)를 준다.
+    #[test]
+    fn bin_state_capture_failure_warns_once_then_stays_quiet() {
+        let mut state = found("/usr/bin/docker");
+        assert!(
+            state.mark_capture_failed(),
+            "첫 캡처 실패(데몬 down)는 알려야 한다"
+        );
+        for _ in 0..5 {
+            assert!(
+                !state.mark_capture_failed(),
+                "데몬 down이 지속되는데 또 알렸다 — 매 tick WARN 폭주"
+            );
+        }
+        // current는 그대로여야 한다 — 실행 파일은 멀쩡하니 재탐색하지 않는다(ENOENT와 다르다).
+        assert_eq!(state.path(), Some(Path::new("/usr/bin/docker")));
+    }
+
+    /// 데몬이 다시 뜨면(캡처 성공) **복구 INFO 한 번**을 내고, 이후 성공은 조용하다. 그리고 다음
+    /// 독립 장애는 다시 WARN해야 한다(mark_ok가 CaptureFailing 기록을 지운다).
+    #[test]
+    fn bin_state_capture_recovery_logs_info_once_and_rearms() {
+        let mut state = found("/usr/bin/docker");
+
+        let levels = capture_levels(|| {
+            assert!(state.mark_capture_failed(), "첫 실패 WARN");
+            state.mark_ok(); // 데몬 복귀
+            state.mark_ok(); // 이후 성공은 조용
+        });
+        assert_eq!(
+            count(&levels, tracing::Level::INFO),
+            1,
+            "복구는 INFO 정확히 한 번(이후 성공은 조용)"
+        );
+
+        assert!(
+            state.mark_capture_failed(),
+            "복구 뒤의 새 장애는 다시 알려야 한다 — mark_ok가 CaptureFailing을 지워야 한다"
+        );
+    }
+
+    /// ENOENT(사라짐)와 데몬 down은 **구분**된다: 전자는 재탐색하도록 `current`를 비우고, 후자는
+    /// 같은 경로를 계속 시도한다.
+    #[test]
+    fn bin_state_distinguishes_missing_binary_from_daemon_down() {
+        let p = Path::new("/usr/bin/docker");
+
+        let mut gone = found("/usr/bin/docker");
+        gone.mark_gone(p);
+        assert_eq!(gone.path(), None, "ENOENT는 재탐색하도록 current를 비운다");
+
+        let mut down = found("/usr/bin/docker");
+        down.mark_capture_failed();
+        assert_eq!(
+            down.path(),
+            Some(p),
+            "데몬 down은 실행 파일이 멀쩡하니 같은 경로를 유지한다"
         );
     }
 
