@@ -883,6 +883,12 @@ fn load_docker_config(
         return None;
     }
 
+    // 파일시스템 탐색(resolve_docker_bin)보다 **먼저** 남은 게이트를 통과시킨다 — spool/health가
+    // 없으면 exporter는 어차피 안 뜨는데, 순서를 뒤집으면 뜨지도 않을 task를 위해 디스크를 뒤지고
+    // "docker를 못 찾았다"는 오해를 부르는 WARN까지 남긴다(진짜 원인은 spool/health인데).
+    let spool = spool?;
+    let health = health?;
+
     let configured = ex.docker_bin.as_deref().map(std::path::Path::new);
     let docker_bin = match aic_server::otlp_exporter::resolve_docker_bin(configured) {
         Some(p) => p,
@@ -897,8 +903,6 @@ fn load_docker_config(
         }
     };
 
-    let spool = spool?;
-    let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::DockerConfig {
         endpoint: ex.endpoint,
