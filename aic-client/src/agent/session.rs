@@ -1625,6 +1625,9 @@ impl AgentSession {
             let res =
                 tokio::task::spawn_blocking(|| super::snapshot_capture::capture_forced("manual"))
                     .await;
+            // 로컬 저장이 **실제로** 됐는지 붙잡아 둔다 — 예전엔 이 결과를 무시하고 뒤에서 무조건
+            // "로컬 스냅샷은 정상 저장되었습니다"라고 안내해, 캡처가 실패해도 성공했다고 거짓말했다.
+            let local_ok = matches!(res, Ok(Ok(Some(_))));
             let msg = match res {
                 Ok(Ok(Some(path))) => format!("✓ 스냅샷 캡처 → {}", path.display()),
                 Ok(Ok(None)) => "스냅샷이 기록되지 않았습니다.".to_string(),
@@ -1638,23 +1641,26 @@ impl AgentSession {
             // `snapshot_recorded_async` 내부가 스킵한다(F15) — 여기선 memo가 `Some`이었다는 사실만으로
             // 판단하지 않고 그 반환값으로 실제 전송 여부를 안다.
             //
+            // **로컬 캡처가 실패해도 메모는 보낸다**(설계 결정): 이 기능의 본질은 사람이 남기는
+            // 메모이고 스냅샷은 부가 증거다. 로컬 디스크 문제(권한·용량) 때문에 "지금 이상하다"는
+            // 사람의 관찰까지 버리면, 정작 그 관찰이 가장 필요한 상황(디스크가 꽉 찬 장애)에서
+            // 기능이 죽는다. 대신 **반쪽 성공을 반쪽이라고 정확히 보고**한다(record_remote_notice).
+            //
             // IPC는 **async 판**을 쓴다 — sync 판은 blocking `UnixStream`이라 여기서 부르면 tokio
             // worker가 최대 IO_TIMEOUT만큼 막힌다(agent_event::query_async 문서 참고).
             if let Some(memo) = memo {
                 let attrs = self.record_metrics_attrs();
                 let sent = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
                 // 보낸 이벤트가 **원격까지 갈 수 있는 상태인지** 확인해 안내한다(F19). aicd 미실행뿐
-                // 아니라 **exporter가 꺼진 경우도** 알려야 한다 — 그땐 aicd가 응답해서 성공처럼
-                // 보이지만 이벤트는 구독자가 없어 조용히 버려진다. 사용자가 "기록됐다"고 믿는데
-                // 아무 데도 안 남는 게 가장 나쁘다. 메모가 비어 애초에 안 보낸 경우(sent=false)는
-                // 안내할 게 없다.
-                if sent {
-                    if let Some(notice) = crate::agent_event::remote_record_state_async()
-                        .await
-                        .notice()
-                    {
-                        self.out.note(&format!("ℹ {notice}")).await;
-                    }
+                // 아니라 exporter/agent-exporter가 꺼졌거나 spool에 밀린 경우도 알린다 — 그땐 aicd가
+                // 응답해서 성공처럼 보이지만 이벤트는 서버에 닿지 않는다.
+                let state = if sent {
+                    Some(crate::agent_event::remote_record_state_async().await)
+                } else {
+                    None
+                };
+                if let Some(notice) = record_remote_notice(local_ok, state) {
+                    self.out.note(&notice).await;
                 }
             }
             return;
@@ -2381,6 +2387,38 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
     m.cpu_valid
         && m.sampled_at
             .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
+}
+
+/// `/record now <메모>`의 **두 결과를 각각 정확히** 한 줄로 보고한다(순수 함수, 테스트 가능).
+///
+/// 로컬 스냅샷 저장과 원격(OTLP) 기록은 **독립적인 두 결과**다 — 하나가 실패해도 다른 하나는
+/// 성공할 수 있다. 예전엔 원격 안내에 "로컬 스냅샷은 정상 저장되었습니다"를 무조건 붙여, 캡처가
+/// 실패한 경우에도 성공했다고 **거짓말**했다. 사용자는 나중에 없는 스냅샷을 찾게 된다.
+///
+/// - `remote`가 `None` = 메모가 비어 애초에 안 보냈다(F15). 원격에 대해 할 말이 없다 — 로컬 결과는
+///   호출부가 이미 캡처 라인으로 보고했으므로 여기선 침묵한다.
+/// - 둘 다 성공하면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다. 캡처 라인이 이미 ✓를 찍었다).
+/// - 그 밖엔 **실패한 쪽만** 정확히 짚는다.
+///
+/// chat(`handle_record`)과 CLI(`aic snapshot record`)가 **같은 문구·같은 판단**을 쓰도록 pub이다 —
+/// 두 진입점이 각자 메시지를 지으면 한쪽만 고치고 잊는 경로가 생긴다.
+pub fn record_remote_notice(
+    local_ok: bool,
+    remote: Option<crate::agent_event::RemoteRecord>,
+) -> Option<String> {
+    let remote = remote?;
+    match (local_ok, remote.notice()) {
+        // 둘 다 정상 — 침묵.
+        (true, None) => None,
+        // 원격만 문제 — 원격 사실만 말한다(로컬을 성공이라 주장하지 않고, 캡처 라인이 이미 말했다).
+        (true, Some(n)) => Some(format!("ℹ {n}")),
+        // 로컬만 실패 — 메모는 나갔다는 사실을 알려야 사용자가 "아무것도 안 남았다"고 오해하지 않는다.
+        (false, None) => {
+            Some("ℹ 메모는 원격에 기록됐습니다 — 로컬 스냅샷 저장만 실패했습니다.".to_string())
+        }
+        // 둘 다 실패 — 가장 나쁜 경우. 얼버무리지 않는다.
+        (false, Some(n)) => Some(format!("ℹ {n} 로컬 스냅샷 저장도 실패했습니다.")),
+    }
 }
 
 /// `SysMetrics` → `/record now <메모>` OTLP attrs(순수 함수, 테스트 가능). 호출부
@@ -3263,6 +3301,68 @@ mod tests {
                 "금지된 키 사용: {forbidden}"
             );
         }
+    }
+
+    // ── t3 B3: 로컬/원격 두 결과를 각각 정확히 보고 ──────────────────────────────
+
+    #[test]
+    fn record_notice_is_silent_only_when_both_succeeded() {
+        use crate::agent_event::RemoteRecord;
+        // 둘 다 성공 — 캡처 라인이 이미 ✓를 찍었으므로 추가 안내 없음.
+        assert_eq!(
+            record_remote_notice(true, Some(RemoteRecord::Live)),
+            None,
+            "둘 다 성공인데 잔소리를 한다"
+        );
+    }
+
+    #[test]
+    fn record_notice_never_claims_local_success_when_capture_failed() {
+        use crate::agent_event::RemoteRecord;
+        // **회귀 방지의 핵심**: 예전엔 원격 안내에 "로컬 스냅샷은 정상 저장되었습니다"를 무조건
+        // 붙여, capture_forced가 실패해도 성공했다고 거짓말했다. 사용자는 나중에 없는 스냅샷을
+        // 찾게 된다. 로컬이 실패했으면 어떤 조합에서도 성공을 주장하면 안 된다.
+        for remote in [
+            RemoteRecord::Live,
+            RemoteRecord::DaemonDown,
+            RemoteRecord::ExporterDisabled,
+            RemoteRecord::AgentExporterDisabled,
+            RemoteRecord::Backlogged(3),
+            RemoteRecord::Dropping(1),
+        ] {
+            let n = record_remote_notice(false, Some(remote))
+                .expect("로컬이 실패했으면 반드시 알려야 한다");
+            assert!(
+                !n.contains("정상 저장") && !n.contains("저장되었습니다"),
+                "로컬 캡처가 실패했는데 저장됐다고 말한다: {n}"
+            );
+            assert!(n.contains("실패"), "로컬 실패 사실이 빠졌다: {n}");
+        }
+    }
+
+    #[test]
+    fn record_notice_tells_user_memo_survived_when_only_local_failed() {
+        use crate::agent_event::RemoteRecord;
+        // 로컬만 실패 + 원격 정상 — 메모는 살아있다는 걸 알려야 "아무것도 안 남았다"는 오해를 막는다.
+        let n = record_remote_notice(false, Some(RemoteRecord::Live)).expect("안내가 있어야");
+        assert!(n.contains("원격"), "{n}");
+        assert!(n.contains("실패"), "{n}");
+    }
+
+    #[test]
+    fn record_notice_reports_both_failures_when_both_failed() {
+        use crate::agent_event::RemoteRecord;
+        // 둘 다 실패 — 얼버무리지 않고 양쪽을 다 짚는다.
+        let n = record_remote_notice(false, Some(RemoteRecord::DaemonDown)).expect("안내가 있어야");
+        assert!(n.contains("aicd"), "원격 실패 원인이 빠졌다: {n}");
+        assert!(n.contains("로컬"), "로컬 실패 사실이 빠졌다: {n}");
+    }
+
+    #[test]
+    fn record_notice_stays_quiet_about_remote_when_memo_was_empty() {
+        // 빈 메모(F15)면 애초에 안 보냈으니 원격에 대해 할 말이 없다 — 로컬 결과는 캡처 라인이
+        // 이미 보고했다. `None`(전송 안 함)이 "원격 실패"로 둔갑하면 안 된다.
+        assert_eq!(record_remote_notice(true, None), None);
     }
 
     #[test]

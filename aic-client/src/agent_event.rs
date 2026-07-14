@@ -158,35 +158,88 @@ pub enum RemoteRecord {
     Live,
     /// aicd에 물어보지 못했다(미실행·구버전·timeout) — 이벤트를 받아 줄 데몬 자체가 없다.
     DaemonDown,
-    /// aicd는 살아있지만 exporter가 꺼져 있다(`[aicd.exporter] enabled = false`) — 이벤트는
+    /// aicd는 살아있지만 exporter **전체**가 꺼져 있다(`[aicd.exporter] enabled = false`) — 이벤트는
     /// aicd까지 갔다가 구독자가 없어 **조용히 버려진다**.
     ExporterDisabled,
+    /// exporter 부모 게이트는 켜졌는데 **agent exporter task가 안 떠 있다**
+    /// (`[aicd.exporter] agent_enabled = false`, 또는 endpoint 미설정·spool 실패로 task 기동 실패).
+    /// `AgentEventBus`에 구독자가 없어 우리 이벤트만 조용히 버려진다 — 다른 signal(host metrics 등)은
+    /// 멀쩡히 나가고 있어서 **가장 눈치채기 어려운 유실**이다.
+    AgentExporterDisabled,
+    /// 나가고는 있는데 collector에 못 닿아 **spool(디스크)에 밀려 있다**. 유실은 아니다 — collector가
+    /// 복구되면 드레인된다. 하지만 "지금 서버에서 볼 수 있다"는 뜻은 아니므로 사용자에게 알린다.
+    Backlogged(u64),
+    /// spool 상한을 넘겨 **실제로 배치를 버리고 있다**. 데이터가 사라지는 중이라 가장 심각하다.
+    Dropping(u64),
 }
 
 impl RemoteRecord {
     /// 사용자에게 보여줄 한 줄 안내. 정상(`Live`)이면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다).
     /// 스타일(색/아이콘)은 호출부가 입힌다(chat은 note, CLI는 dim stderr).
-    pub fn notice(self) -> Option<&'static str> {
+    ///
+    /// **로컬 스냅샷 성공 여부를 여기서 주장하지 않는다** — 그건 이 함수가 알 수 없는 사실이고,
+    /// 예전엔 "로컬 스냅샷은 정상 저장되었습니다"를 무조건 붙여 **캡처가 실패해도 성공했다고
+    /// 거짓말**했다. 원격 상태만 말하고, 로컬 사실은 호출부가 실제 결과로 합친다
+    /// (`session::record_remote_notice`).
+    pub fn notice(self) -> Option<String> {
         match self {
             RemoteRecord::Live => None,
             RemoteRecord::DaemonDown => {
-                Some("OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.")
+                Some("원격 기록 생략(aicd 미실행) — 이 메모는 서버에 남지 않습니다.".to_string())
             }
             RemoteRecord::ExporterDisabled => Some(
-                "aicd는 실행 중이지만 OTLP exporter가 꺼져 있어 원격 기록은 생략됩니다 \
-                 (로컬 스냅샷은 저장됨). config `[aicd.exporter] enabled = true`로 켜세요.",
+                "aicd는 실행 중이지만 OTLP exporter가 꺼져 있어 원격 기록이 생략됩니다 — \
+                 config `[aicd.exporter] enabled = true`로 켜세요."
+                    .to_string(),
             ),
+            RemoteRecord::AgentExporterDisabled => Some(
+                "OTLP agent exporter가 꺼져 있어 이 메모는 서버에 남지 않습니다 — \
+                 config `[aicd.exporter] agent_enabled = true`로 켜세요."
+                    .to_string(),
+            ),
+            RemoteRecord::Backlogged(n) => Some(format!(
+                "collector에 닿지 못해 spool에 쌓이는 중입니다({n} 배치) — \
+                 복구되면 전송되지만 아직 서버에서는 보이지 않습니다."
+            )),
+            RemoteRecord::Dropping(n) => Some(format!(
+                "spool 상한 초과로 배치가 버려지고 있습니다({n} 배치 유실) — \
+                 이 메모도 서버에 닿지 못할 수 있습니다."
+            )),
         }
     }
 }
 
-/// IPC 응답을 세 상태로 접는다(순수 함수 — 소켓 없이 테스트 가능).
+/// IPC 응답을 사용자에게 의미 있는 상태로 접는다(순수 함수 — 소켓 없이 테스트 가능).
+///
+/// 우선순위는 **나쁜 소식부터**다: 유실(Dropping) > 밀림(Backlogged)보다도, 애초에 **구독자가
+/// 없어 이벤트가 사라지는 상태**(Disabled 계열)를 먼저 본다 — spool 통계는 exporter가 돌 때만
+/// 의미가 있고, 꺼져 있으면 spool은 조용히 0이라 "정상"처럼 보이기 때문이다.
+///
+/// `agent_enabled`가 `None`(구버전 aicd — 이 필드를 모른다)이면 **경고하지 않는다**: 모름을
+/// "꺼짐"으로 읽으면 멀쩡히 동작하는 구버전 사용자에게 매번 헛경고를 낸다. 구버전에서 agent
+/// exporter가 정말 꺼져 있는 경우는 감지할 수 없다 — IPC에 그 정보가 없으니 정직한 한계다.
 fn classify_remote(status: Option<&aic_common::ExporterStatus>) -> RemoteRecord {
-    match status {
-        None => RemoteRecord::DaemonDown,
-        Some(s) if !s.enabled => RemoteRecord::ExporterDisabled,
-        Some(_) => RemoteRecord::Live,
+    let Some(s) = status else {
+        return RemoteRecord::DaemonDown;
+    };
+    if !s.enabled {
+        return RemoteRecord::ExporterDisabled;
     }
+    if s.agent_enabled == Some(false) {
+        return RemoteRecord::AgentExporterDisabled;
+    }
+    // 실제로 버리는 중이 가장 나쁘다 — 밀림보다 먼저 알린다.
+
+    if s.spool_dropped > 0 {
+        return RemoteRecord::Dropping(s.spool_dropped);
+    }
+    // spool에 한 배치라도 있으면 직전 push가 실패했다는 뜻이다(성공하면 쌓이지 않는다).
+    // 임의의 임계값을 두지 않는 이유: 1건이든 1,500건이든 "지금 collector에 못 닿고 있다"는
+    // 사실은 같고, 사용자는 자기가 남긴 메모가 아직 서버에 없다는 걸 알 자격이 있다.
+    if s.spool_batches > 0 {
+        return RemoteRecord::Backlogged(s.spool_batches);
+    }
+    RemoteRecord::Live
 }
 
 /// 방금 보낸 이벤트가 원격까지 갈 수 있는지 aicd에 물어본다(sync 호출부용).
@@ -600,10 +653,19 @@ mod tests {
         assert_eq!(sent[0].summary, "디스크가 이상하다");
     }
 
-    // ── 원격 기록 가능 상태 3분기(조용한 유실 방지) ──────────────────────────────
+    // ── 원격 기록 가능 상태 분류(조용한 유실 방지) ────────────────────────────────
+
+    /// exporter가 정상 가동 중인 status(부모 게이트 on + agent exporter task 떠 있음 + spool 비어 있음).
+    fn healthy_status() -> aic_common::ExporterStatus {
+        aic_common::ExporterStatus {
+            enabled: true,
+            agent_enabled: Some(true),
+            ..Default::default()
+        }
+    }
 
     #[test]
-    fn classify_remote_distinguishes_three_states() {
+    fn classify_remote_distinguishes_daemon_down_and_exporter_off_and_live() {
         // aicd 미응답 / exporter 꺼짐 / 정상 — 셋은 사용자에게 전혀 다른 사실이다.
         // 특히 **exporter 꺼짐을 성공으로 뭉개면 안 된다**: aicd는 응답하지만 이벤트는 구독자가
         // 없어 조용히 버려진다(가장 나쁜 유실 — 사용자는 기록됐다고 믿는다).
@@ -611,34 +673,123 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let live = aic_common::ExporterStatus {
-            enabled: true,
-            ..Default::default()
-        };
         assert_eq!(classify_remote(None), RemoteRecord::DaemonDown);
         assert_eq!(
             classify_remote(Some(&disabled)),
             RemoteRecord::ExporterDisabled
         );
-        assert_eq!(classify_remote(Some(&live)), RemoteRecord::Live);
+        assert_eq!(classify_remote(Some(&healthy_status())), RemoteRecord::Live);
     }
 
     #[test]
-    fn only_live_is_silent_and_each_failure_has_its_own_notice() {
-        // 정상만 조용하고, 실패 두 종류는 **서로 다른** 안내를 낸다(같은 문구면 사용자가 원인을
-        // 구분할 수 없다 — DaemonDown은 aicd를 띄워야 하고 ExporterDisabled는 config를 켜야 한다).
+    fn classify_remote_catches_disabled_agent_exporter_behind_enabled_parent() {
+        // **부모 게이트만 보면 놓치는 유실**: `[aicd.exporter] enabled = true`인데
+        // `agent_enabled = false`면 serve_agent task가 안 떠서 AgentEventBus에 구독자가 없다 —
+        // 우리 이벤트만 조용히 버려지는데 host metrics 등 다른 signal은 멀쩡히 나가므로
+        // 사용자가 눈치챌 방법이 없다. enabled=true를 Live로 뭉개면 이 유실을 보고하지 못한다.
+        let agent_off = aic_common::ExporterStatus {
+            enabled: true, // 부모 게이트는 켜져 있다
+            agent_enabled: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_remote(Some(&agent_off)),
+            RemoteRecord::AgentExporterDisabled
+        );
+    }
+
+    #[test]
+    fn classify_remote_treats_unknown_agent_flag_as_ok_for_old_daemons() {
+        // 구버전 aicd는 이 필드를 모른다 → None. 모름을 "꺼짐"으로 읽으면 멀쩡한 구버전에 매번
+        // 헛경고를 낸다. 하위 호환: 모르면 경고하지 않는다(#[serde(default)] → None).
+        let old = aic_common::ExporterStatus {
+            enabled: true,
+            agent_enabled: None, // 구버전 — 필드 없음
+            ..Default::default()
+        };
+        assert_eq!(classify_remote(Some(&old)), RemoteRecord::Live);
+    }
+
+    #[test]
+    fn classify_remote_reports_backlog_and_drop_instead_of_claiming_live() {
+        // exporter가 살아 있어도 collector에 못 닿으면 이벤트는 서버에 없다 — spool에 쌓이는 중
+        // (복구되면 전송)이거나, 상한 초과로 버려지는 중이다. 둘 다 "기록됨"이라고 말하면 안 된다.
+        let backlogged = aic_common::ExporterStatus {
+            spool_batches: 1_500, // 실제로 이 개발 머신에서 관측된 값
+            ..healthy_status()
+        };
+        assert_eq!(
+            classify_remote(Some(&backlogged)),
+            RemoteRecord::Backlogged(1_500)
+        );
+
+        // 유실이 실제로 일어났다면 그게 더 나쁜 소식이다 — 밀림보다 먼저 알린다.
+        let dropping = aic_common::ExporterStatus {
+            spool_batches: 10,
+            spool_dropped: 3,
+            ..healthy_status()
+        };
+        assert_eq!(classify_remote(Some(&dropping)), RemoteRecord::Dropping(3));
+    }
+
+    #[test]
+    fn classify_remote_prefers_silent_drop_over_spool_stats() {
+        // exporter가 꺼져 있으면 spool은 조용히 0이라 "정상"처럼 보인다 — 그래서 Disabled 계열을
+        // spool 통계보다 **먼저** 판정해야 한다(순서가 뒤집히면 꺼진 exporter가 Live로 보고된다).
+        let agent_off = aic_common::ExporterStatus {
+            enabled: true,
+            agent_enabled: Some(false),
+            spool_batches: 0,
+            spool_dropped: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_remote(Some(&agent_off)),
+            RemoteRecord::AgentExporterDisabled
+        );
+    }
+
+    #[test]
+    fn only_live_is_silent_and_each_state_has_its_own_actionable_notice() {
+        // 정상만 조용하고, 나머지는 **서로 다른** 안내를 낸다 — 같은 문구면 사용자가 원인을
+        // 구분할 수 없다(aicd를 띄울지, 부모 게이트를 켤지, agent_enabled를 켤지, collector를
+        // 살릴지가 전부 다른 조치다).
         assert_eq!(RemoteRecord::Live.notice(), None);
-        let down = RemoteRecord::DaemonDown.notice().expect("안내가 있어야");
-        let off = RemoteRecord::ExporterDisabled
-            .notice()
-            .expect("안내가 있어야");
-        assert_ne!(down, off, "두 실패가 같은 안내를 낸다");
-        // 각 안내는 사용자가 할 일을 짚는다.
-        assert!(down.contains("aicd"), "{down}");
-        assert!(off.contains("exporter"), "{off}");
-        // 어느 쪽이든 로컬 스냅샷은 살아있다는 사실을 반드시 알린다(그게 F19의 핵심 안심 요소).
-        assert!(down.contains("로컬"), "{down}");
-        assert!(off.contains("로컬"), "{off}");
+        let notices: Vec<String> = [
+            RemoteRecord::DaemonDown,
+            RemoteRecord::ExporterDisabled,
+            RemoteRecord::AgentExporterDisabled,
+            RemoteRecord::Backlogged(7),
+            RemoteRecord::Dropping(2),
+        ]
+        .into_iter()
+        .map(|s| s.notice().expect("Live 외에는 안내가 있어야 한다"))
+        .collect();
+
+        // 전부 서로 다른 문구여야 한다.
+        let uniq: std::collections::HashSet<&String> = notices.iter().collect();
+        assert_eq!(uniq.len(), notices.len(), "안내가 겹친다: {notices:?}");
+
+        // 각 안내는 사용자가 취할 조치를 짚는다.
+        assert!(notices[0].contains("aicd"), "{}", notices[0]);
+        assert!(notices[1].contains("enabled = true"), "{}", notices[1]);
+        assert!(
+            notices[2].contains("agent_enabled = true"),
+            "{}",
+            notices[2]
+        );
+        // 밀림/유실은 개수를 실어 심각도를 가늠하게 한다.
+        assert!(notices[3].contains('7'), "{}", notices[3]);
+        assert!(notices[4].contains('2'), "{}", notices[4]);
+
+        // **로컬 스냅샷 성공을 주장하지 않는다** — 이 함수는 그걸 알 수 없다(예전엔 무조건
+        // "로컬 스냅샷은 정상 저장되었습니다"를 붙여 캡처 실패 시 거짓말을 했다).
+        for n in &notices {
+            assert!(
+                !n.contains("정상 저장"),
+                "원격 안내가 로컬 성공을 주장한다: {n}"
+            );
+        }
     }
 
     #[test]

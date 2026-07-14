@@ -230,7 +230,23 @@ pub enum IpcResponse {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ExporterStatus {
     /// exporter task가 떠 있는지. false면 나머지 필드는 의미 없다(config off 또는 endpoint 미설정).
+    ///
+    /// **이건 부모 게이트(`[aicd.exporter] enabled`)일 뿐이다.** 하위 signal별 게이트
+    /// (`agent_enabled` 등)는 이 값에 반영되지 않으므로, agent 이벤트가 실제로 나가는지는
+    /// [`Self::agent_enabled`]를 봐야 한다.
     pub enabled: bool,
+    /// **agent exporter task가 실제로 떠 있는지**(`aic.agent` scope — chat `/record now` 등).
+    ///
+    /// 왜 별도 필드인가: `enabled`(부모 게이트)가 true여도 `[aicd.exporter] agent_enabled = false`면
+    /// `serve_agent` task가 spawn되지 않고, `AgentEventBus`에 **구독자가 없어 publish가 조용히
+    /// 버려진다**. 그 상태를 chat이 IPC로 알 방법이 없으면 `/record now`는 "기록됨"이라고 말하면서
+    /// 사람이 남긴 순간을 잃는다 — 가장 나쁜 종류의 유실이다.
+    ///
+    /// `None` = **모름**(이 필드를 모르는 구버전 aicd). "확실히 꺼짐"(`Some(false)`)과 구분해야
+    /// 하므로 bool로 뭉개지 않는다 — 모름을 "꺼짐"으로 읽으면 멀쩡한 구버전에 헛경고를 내고,
+    /// "켜짐"으로 읽으면 진짜 유실을 놓친다. 호출부가 둘을 나눠 판단하게 둔다.
+    #[serde(default)]
+    pub agent_enabled: Option<bool>,
     /// collector base URL(표시용).
     #[serde(default)]
     pub endpoint: String,
@@ -347,6 +363,40 @@ pub fn decode_frame(data: &[u8]) -> anyhow::Result<(usize, &[u8])> {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    // ── ExporterStatus 와이어 호환 ─────────────────────────────
+
+    #[test]
+    fn exporter_status_from_old_daemon_has_unknown_agent_flag() {
+        // 구버전 aicd는 `agent_enabled`를 모른다 — 그 응답에는 필드가 아예 없다. 이때 `None`(모름)이
+        // 나와야 한다. 만약 이걸 `false`(꺼짐)로 역직렬화하면, 멀쩡히 동작하는 구버전 사용자에게
+        // `/record now`가 매번 "agent exporter가 꺼져 있다"고 헛경고를 낸다.
+        let old_wire = r#"{"enabled":true,"endpoint":"http://x:4318","push_ok_total":3,
+            "push_fail_total":0,"last_ok_secs_ago":1,"spool_batches":0,"spool_dropped":0}"#;
+        let s: ExporterStatus = serde_json::from_str(old_wire).unwrap();
+        assert!(s.enabled);
+        assert_eq!(
+            s.agent_enabled, None,
+            "필드 없는 구버전 응답은 '모름'이어야 한다(꺼짐이 아니다)"
+        );
+    }
+
+    #[test]
+    fn exporter_status_roundtrips_agent_flag() {
+        // 신버전끼리는 값이 그대로 왕복한다 — Some(false)(확실히 꺼짐)가 None(모름)으로 뭉개지면
+        // 진짜 유실을 보고하지 못한다.
+        for flag in [Some(true), Some(false), None] {
+            let s = ExporterStatus {
+                enabled: true,
+                agent_enabled: flag,
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            let back: ExporterStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.agent_enabled, flag);
+            assert_eq!(back, s);
+        }
+    }
 
     // ── IpcRequest 직렬화 ──────────────────────────────────────
 
