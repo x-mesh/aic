@@ -2073,16 +2073,16 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
             aic_client::agent_event::memo_truncated_notice()
         );
     }
-    let local_ok = matches!(report.local, Ok(Some(_)));
     if let Ok(Some(path)) = &report.local {
         println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
     }
-    // 실패 경로는 여기서 출력하지 않는다 — 아래 exit 1 에러가 같은 내용을 그대로 내보내므로,
-    // 여기서도 찍으면 **같은 에러가 stderr에 두 번** 나온다.
 
-    // 로컬/원격 두 결과를 각각 사실대로 보고한다. 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
-    if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, report.remote)
-    {
+    // **원격 결과만** stderr로 안내한다(로컬 실패는 아래 exit 1 Err가 단독으로 전한다). 여기서
+    // `record_remote_notice`(로컬+원격 합침)를 쓰면 로컬 실패가 이 안내와 Err에 **두 번** 찍힌다 —
+    // 예전 주석은 "중복 안 함"이라 했지만 실제로 그랬다. chat은 exit code가 없어 합친 문구가 필요하지만
+    // (그래서 record_remote_notice를 쓴다), CLI는 exit code가 로컬 채널이라 원격만 말하면 된다.
+    // 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
+    if let Some(notice) = report.remote.as_ref().and_then(|o| o.notice()) {
         eprintln!("{COL_DIM}{notice}{COL_RESET}");
     }
 
