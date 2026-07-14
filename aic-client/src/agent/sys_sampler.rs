@@ -183,6 +183,12 @@ pub(crate) enum ExporterState {
     Backlogged(u64),
     /// spool 상한을 넘겨 **실제로 버렸다**(버린 배치 수). 데이터가 유실됐다.
     Dropping(u64),
+    /// 부모 게이트(`enabled`)는 켜졌는데 **agent exporter가 떠 있지 않다**(`agent_enabled == Some(false)`).
+    /// host metric은 나가는데 chat 이벤트(`tool.run_command`·`risk.denied`·`/record now` 등)는 구독자가
+    /// 없어 **조용히 버려진다**. `enabled`만 보던 예전엔 이 상태에서도 `otlp ●`(정상)로 표시해, 사람이
+    /// 남긴 순간이 사라지는데도 눈치챌 수 없었다. `Some(false)`(확실히 꺼짐)만 이 상태다 — `None`
+    /// (필드를 모르는 구버전 aicd)은 "모름"이라 헛경고를 내지 않는다([`aic_common::ExporterStatus`]).
+    AgentOff,
 }
 
 impl ExporterState {
@@ -194,9 +200,16 @@ impl ExporterState {
         if !s.enabled {
             return ExporterState::Disabled;
         }
-        // 유실이 실제로 일어났다면 그게 가장 나쁜 소식이다 — 밀림보다 먼저 알린다.
+        // 유실이 실제로 일어났다면 그게 가장 나쁜 소식이다 — 밀림보다 먼저 알린다. spool은 주(host
+        // metric) 파이프라인이라 그 하드 유실을 최우선으로 표시한다.
         if s.spool_dropped > 0 {
             return ExporterState::Dropping(s.spool_dropped);
+        }
+        // agent exporter가 꺼져 chat 이벤트가 버려지는 중. spool 하드 유실보다는 뒤, 단순 밀림(지연이지
+        // 유실 아님)보다는 앞에 둔다 — 이건 **진행 중인 유실**이다. `Some(false)`만 — `None`(구버전
+        // 모름)은 헛경고를 피해 건드리지 않는다.
+        if s.agent_enabled == Some(false) {
+            return ExporterState::AgentOff;
         }
         if s.spool_batches > 0 {
             return ExporterState::Backlogged(s.spool_batches);
@@ -212,6 +225,9 @@ impl ExporterState {
             ExporterState::DaemonDown => Some(("otlp aicd off".to_string(), Severity::Crit)),
             ExporterState::Backlogged(n) => Some((format!("otlp ⚠ {n}밀림"), Severity::Warn)),
             ExporterState::Dropping(n) => Some((format!("otlp ✕ {n}유실"), Severity::Crit)),
+            // host metric은 나가지만 agent 이벤트는 버려지는 중 — 유실이라 표면화하되, 사용자가
+            // 의도적으로 껐을 수도 있어 Crit이 아니라 Warn(스스로 판단하게).
+            ExporterState::AgentOff => Some(("otlp ⚠ agent off".to_string(), Severity::Warn)),
         }
     }
 }
@@ -1411,6 +1427,11 @@ mod tests {
         let segs = with(ExporterState::Dropping(3)).status_segments();
         assert_eq!(segs[6].1, Severity::Crit);
         assert!(segs[6].0.contains('3'));
+
+        // agent off — chat 이벤트가 버려지는 중. 표면화(Warn)하되, 의도적 비활성일 수 있어 Crit 아님.
+        let segs = with(ExporterState::AgentOff).status_segments();
+        assert_eq!(segs[6].1, Severity::Warn);
+        assert!(segs[6].0.contains("agent off"), "라벨: {}", segs[6].0);
     }
 
     #[test]
@@ -1448,11 +1469,58 @@ mod tests {
 
         let backlogged = ExporterStatus {
             spool_batches: 5,
-            ..base
+            ..base.clone()
         };
         assert_eq!(
             ExporterState::from_status(Some(backlogged)),
             ExporterState::Backlogged(5)
+        );
+
+        // **agent exporter 유실**: 부모 게이트는 켜졌는데 agent_enabled == Some(false)면 chat 이벤트가
+        // 버려지는 중이다. 예전엔 이 상태를 Ok(otlp ●)로 표시해 유실을 숨겼다.
+        let agent_off = ExporterStatus {
+            agent_enabled: Some(false),
+            ..base.clone()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(agent_off)),
+            ExporterState::AgentOff,
+            "agent 이벤트가 버려지는데 Ok로 표시한다(유실 은폐)"
+        );
+
+        // 단순 밀림(지연)보다 agent 유실(진행 중 유실)을 먼저 알린다.
+        let agent_off_and_backlog = ExporterStatus {
+            agent_enabled: Some(false),
+            spool_batches: 5,
+            ..base.clone()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(agent_off_and_backlog)),
+            ExporterState::AgentOff,
+            "밀림(지연)이 agent 유실(진행 중 유실)을 가린다"
+        );
+
+        // spool 하드 유실은 agent off보다 앞선다 — 주 파이프라인의 확정 유실이 최우선.
+        let dropping_and_agent_off = ExporterStatus {
+            agent_enabled: Some(false),
+            spool_dropped: 3,
+            ..base.clone()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(dropping_and_agent_off)),
+            ExporterState::Dropping(3)
+        );
+
+        // **구버전 호환(핵심)**: agent_enabled == None(필드를 모르는 구버전 aicd)은 "모름"이라
+        // 헛경고를 내면 안 된다 — None을 "꺼짐"으로 읽으면 멀쩡한 구버전에 거짓 경고가 뜬다.
+        let old_daemon = ExporterStatus {
+            agent_enabled: None,
+            ..base
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(old_daemon)),
+            ExporterState::Ok,
+            "구버전(None)을 agent-off로 오독해 헛경고를 낸다"
         );
     }
 
