@@ -22,6 +22,11 @@
 //! Build Cache)을 attribute가 아니라 **metric 이름으로 펼친다**. 컨테이너 단위 attr을 넣지 않는
 //! 이유 — 수신측(rca) metric 읽기 경로에 attrs 필터가 없어 여러 값이 평균으로 뭉개진다.
 //!
+//! 내보내는 metric은 **네 카테고리 × (`Size`, `Reclaimable`) = 8개**이며 전부 `By`다:
+//! `aic.docker.{image,container,volume,build_cache}.disk.{usage,reclaimable}`. 컨테이너도
+//! 예외가 아니다 — `docker system df`는 컨테이너에도 `Reclaimable`을 보낸다(자세한 경위는
+//! [`build_metric_points`] 참고).
+//!
 //! **왜 기본 false인가**: 이 exporter 하나만 Docker라는 외부 CLI 존재에 의존한다(events/
 //! connections/changes/agent는 모두 `aic` 자체 spawn 또는 in-process sysinfo/tap이라 항상
 //! 가용). Docker가 없는 호스트에서 `enabled=true`로 부모 게이트만 켜면 이 task가 매 tick마다
@@ -169,6 +174,10 @@ pub async fn serve_docker(
 /// 초과 4중 방어는 [`super::proc::run_capped`]가 담당한다 — orphan 프로세스 방지(`kill_on_drop` +
 /// 명시적 kill)와 **스트리밍 상한**(버퍼링 후 사후 확인이 아니라 읽는 도중 차단)이 거기 있다.
 ///
+/// 데몬 다운과 권한 없음은 **제어 흐름상** 같은 경로(non-zero exit)지만, `run_capped`가 stderr를
+/// 캡처해 에러에 실어 주므로 **로그에서는 구분된다**(`"failed to connect to the docker API at ..."`
+/// vs 권한 거부 메시지). exit status만 남기면 운영 중에 원인을 못 가린다.
+///
 /// 개별 라인의 JSON 파싱 실패는 [`parse_ndjson_lines`]가 그 라인만 건너뛴다 — 전부 실패하면
 /// 여기서 `Err`로 승격해 이번 주기를 skip한다.
 async fn capture_docker_df(
@@ -240,36 +249,44 @@ fn parse_docker_size(raw: &str) -> Option<u64> {
 }
 
 /// 파싱된 df 라인들을 OTLP metric point로 펼친다. `Type`을 attribute가 아니라 metric 이름으로
-/// 펼치는 이유는 모듈 doc 참고(수신측 attrs 필터 부재로 평균에 뭉개지는 것을 막기 위함). 컨테이너는
-/// `Reclaimable` metric을 내지 않는다(스펙상 usage만).
+/// 펼치는 이유는 모듈 doc 참고(수신측 attrs 필터 부재로 평균에 뭉개지는 것을 막기 위함).
+///
+/// **네 카테고리 모두 `Size`와 `Reclaimable`을 둘 다 낸다 — 총 8개.** 한때 컨테이너의
+/// `Reclaimable`을 "스펙상 없다"며 버렸는데 **사실이 아니었다**: `docker system df`는 컨테이너에도
+/// `Reclaimable`을 보낸다(이 파일의 [`REAL_DF_OUTPUT`] 픽스처에 `"224.5kB (0%)"`로 실재한다).
+/// docker가 안 보낸 게 아니라 우리가 버리고 있었다. 카테고리별로 필드 유무를 다르게 취급하지
+/// 않는 지금 구조가 그 실수를 구조적으로 막는다 — 값이 오면 보내고, 못 읽으면 그 point만 생략한다.
 ///
 /// 바이트 파싱에 실패한 개별 값은 그 point만 생략한다 — 한 카테고리의 값 하나가 이상해도 나머지
 /// 카테고리/필드는 그대로 나간다.
 fn build_metric_points(lines: &[DfLine]) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     for line in lines {
-        let (usage_name, reclaimable_name): (&'static str, Option<&'static str>) =
-            match line.kind.as_str() {
-                "Images" => (
-                    "aic.docker.image.disk.usage",
-                    Some("aic.docker.image.disk.reclaimable"),
-                ),
-                "Containers" => ("aic.docker.container.disk.usage", None),
-                "Local Volumes" => (
-                    "aic.docker.volume.disk.usage",
-                    Some("aic.docker.volume.disk.reclaimable"),
-                ),
-                "Build Cache" => (
-                    "aic.docker.build_cache.disk.usage",
-                    Some("aic.docker.build_cache.disk.reclaimable"),
-                ),
-                other => {
-                    // 알 수 없는 Type(신규 Docker 버전이 카테고리를 추가한 경우 등) — 이 라인만
-                    // 건너뛰고 나머지는 그대로 처리한다.
-                    tracing::debug!(kind = other, "docker system df의 알 수 없는 Type — skip");
-                    continue;
-                }
-            };
+        let (usage_name, reclaimable_name): (&'static str, &'static str) = match line.kind.as_str()
+        {
+            "Images" => (
+                "aic.docker.image.disk.usage",
+                "aic.docker.image.disk.reclaimable",
+            ),
+            "Containers" => (
+                "aic.docker.container.disk.usage",
+                "aic.docker.container.disk.reclaimable",
+            ),
+            "Local Volumes" => (
+                "aic.docker.volume.disk.usage",
+                "aic.docker.volume.disk.reclaimable",
+            ),
+            "Build Cache" => (
+                "aic.docker.build_cache.disk.usage",
+                "aic.docker.build_cache.disk.reclaimable",
+            ),
+            other => {
+                // 알 수 없는 Type(신규 Docker 버전이 카테고리를 추가한 경우 등) — 이 라인만
+                // 건너뛰고 나머지는 그대로 처리한다.
+                tracing::debug!(kind = other, "docker system df의 알 수 없는 Type — skip");
+                continue;
+            }
+        };
 
         if let Some(bytes) = parse_docker_size(&line.size) {
             points.push(MetricPoint {
@@ -279,14 +296,14 @@ fn build_metric_points(lines: &[DfLine]) -> Vec<MetricPoint> {
             });
         }
 
-        if let (Some(name), Some(raw)) = (reclaimable_name, line.reclaimable.as_deref()) {
-            if let Some(bytes) = parse_docker_size(raw) {
-                points.push(MetricPoint {
-                    name,
-                    unit: "By",
-                    value: MetricValue::Int(bytes as i64),
-                });
-            }
+        // Reclaimable 필드가 아예 없는 버전 skew에서만 None이다 — 그때는 이 point만 생략한다
+        // (0으로 채우지 않는다: 측정 불가는 생략이지 "측정했더니 0"이 아니다).
+        if let Some(bytes) = line.reclaimable.as_deref().and_then(parse_docker_size) {
+            points.push(MetricPoint {
+                name: reclaimable_name,
+                unit: "By",
+                value: MetricValue::Int(bytes as i64),
+            });
         }
     }
     points
@@ -411,8 +428,13 @@ mod tests {
 
     // ── metric point 구성 ───────────────────────────────────────────────────
 
+    /// 픽스처에 있는 값은 **하나도 버리지 않는다** — 4 카테고리 × (Size, Reclaimable) = 8개.
+    ///
+    /// 회귀 이력: 한때 컨테이너의 `Reclaimable`을 "스펙상 없다"며 버렸는데, 바로 이 픽스처에
+    /// `"224.5kB (0%)"`로 실재했다. 그래서 이 테스트는 개별 metric을 확인하는 데 그치지 않고
+    /// **픽스처의 모든 (카테고리, 필드) 조합이 빠짐없이 나갔는지**를 대조한다.
     #[test]
-    fn build_metric_points_emits_seven_named_scalars_with_correct_bytes() {
+    fn build_metric_points_emits_all_eight_scalars_with_correct_bytes() {
         let lines = parse_ndjson_lines(REAL_DF_OUTPUT.as_bytes());
         let points = build_metric_points(&lines);
 
@@ -426,40 +448,58 @@ mod tests {
                 })
         };
 
-        assert_eq!(get("aic.docker.image.disk.usage"), Some(82_640_000_000));
-        assert_eq!(
-            get("aic.docker.image.disk.reclaimable"),
-            Some(39_930_000_000)
-        );
-        assert_eq!(get("aic.docker.container.disk.usage"), Some(222_600_000));
-        assert_eq!(get("aic.docker.volume.disk.usage"), Some(8_300_000_000));
-        assert_eq!(
-            get("aic.docker.volume.disk.reclaimable"),
-            Some(7_824_000_000)
-        );
-        assert_eq!(
-            get("aic.docker.build_cache.disk.usage"),
-            Some(42_600_000_000)
-        );
-        assert_eq!(
-            get("aic.docker.build_cache.disk.reclaimable"),
-            Some(21_660_000_000)
-        );
+        // 픽스처의 8개 값을 그대로 대조한다(Size 4 + Reclaimable 4).
+        let expected: [(&str, i64); 8] = [
+            ("aic.docker.image.disk.usage", 82_640_000_000),
+            ("aic.docker.image.disk.reclaimable", 39_930_000_000),
+            ("aic.docker.container.disk.usage", 222_600_000),
+            // 이 값이 픽스처의 "224.5kB (0%)"다 — 버려서는 안 된다.
+            ("aic.docker.container.disk.reclaimable", 224_500),
+            ("aic.docker.volume.disk.usage", 8_300_000_000),
+            ("aic.docker.volume.disk.reclaimable", 7_824_000_000),
+            ("aic.docker.build_cache.disk.usage", 42_600_000_000),
+            ("aic.docker.build_cache.disk.reclaimable", 21_660_000_000),
+        ];
+        for (name, want) in expected {
+            assert_eq!(get(name), Some(want), "{name} 누락 또는 값 불일치");
+        }
 
         assert_eq!(
             points.len(),
-            7,
-            "정확히 7개 — 컨테이너 reclaimable은 스펙상 없다"
-        );
-        assert!(
-            !points
-                .iter()
-                .any(|p| p.name == "aic.docker.container.disk.reclaimable"),
-            "컨테이너는 usage만 낸다"
+            8,
+            "4 카테고리 × (Size, Reclaimable) = 8개가 전부 나가야 한다 — 버리는 값이 없다"
         );
         for p in &points {
             assert_eq!(p.unit, "By", "모든 docker metric은 무차원 바이트");
         }
+    }
+
+    /// 위 테스트가 이름을 하드코딩하므로, 픽스처의 **줄 수**가 늘면(도커가 카테고리를 추가하면)
+    /// 조용히 놓치지 않도록 카테고리 수와 point 수의 관계를 따로 못박는다.
+    ///
+    /// **이름의 유일성까지 본다**: 개수만 세면 한 카테고리가 같은 이름을 두 번 내도 통과한다
+    /// (실제로 mutation 검증에서 이 구멍에 걸렸다 — 컨테이너의 reclaimable 이름을 usage로
+    /// 되돌렸는데 개수는 그대로 8이라 잡히지 않았다). metric 이름이 겹치면 수신측에서 서로를
+    /// 덮어쓰므로 유일성은 그 자체로 중요한 invariant다.
+    #[test]
+    fn every_parsed_category_contributes_a_distinct_size_and_reclaimable_point() {
+        let lines = parse_ndjson_lines(REAL_DF_OUTPUT.as_bytes());
+        let points = build_metric_points(&lines);
+        assert_eq!(
+            points.len(),
+            lines.len() * 2,
+            "카테고리마다 usage/reclaimable 두 개씩 — 어느 한쪽이라도 버리면 여기서 걸린다"
+        );
+
+        let mut names: Vec<&str> = points.iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(
+            before,
+            names.len(),
+            "metric 이름이 중복됐다 — 수신측에서 서로를 덮어쓴다: {names:?}"
+        );
     }
 
     #[test]
@@ -512,7 +552,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_docker_bin(&dir, &format!("cat <<'EOF'\n{REAL_DF_OUTPUT}EOF"));
 
-        let lines = capture_docker_df(&bin, Duration::from_secs(5))
+        let lines = retry_busy(|| capture_docker_df(&bin, Duration::from_secs(5)))
             .await
             .unwrap();
         assert_eq!(lines.len(), 4);
@@ -522,16 +562,23 @@ mod tests {
 
     #[tokio::test]
     async fn capture_docker_df_errors_on_nonzero_exit() {
-        // 데몬 다운/권한 없음 둘 다 non-zero exit로 나오므로 동일 경로 — 별도 분기 불필요.
+        // 데몬 다운/권한 없음 둘 다 non-zero exit라 제어 흐름은 같다 — 다만 stderr가 에러에 실려
+        // 로그에서는 둘을 구분할 수 있어야 한다(exit status만 남기면 운영 중에 원인을 못 가린다).
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_docker_bin(
             &dir,
             "echo 'failed to connect to the docker API at unix:///var/run/docker.sock' >&2; exit 1",
         );
-        let err = capture_docker_df(&bin, Duration::from_secs(5))
+        let err = retry_busy(|| capture_docker_df(&bin, Duration::from_secs(5)))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("종료"), "err={err}");
+
+        let msg = err.to_string();
+        assert!(msg.contains("종료"), "err={msg}");
+        assert!(
+            msg.contains("failed to connect to the docker API"),
+            "데몬 다운 원인(stderr)이 에러에 실려야 한다: {msg}"
+        );
     }
 
     #[tokio::test]
