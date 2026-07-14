@@ -31,7 +31,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Widget, Wrap};
 use ratatui::{backend::CrosstermBackend, Frame, Terminal, TerminalOptions, Viewport};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tui_textarea::TextArea;
 use unicode_width::UnicodeWidthStr;
@@ -194,6 +194,10 @@ pub(crate) struct ChatHandle {
     /// `run_turn` future와 race한다 — cancel arm이 이기면 future가 drop되어 reqwest/도구 await가
     /// 취소된다(앱은 유지, 입력 프롬프트로 복귀).
     cancel_rx: mpsc::Receiver<()>,
+    /// status bar 샘플러(전용 task)가 밀어넣는 최신 지표(t2: `/record now` 캐시 소스). statusbar
+    /// 비활성이면 sampler task 자체가 안 돌아 값이 영원히 `None`이다 — session은 이를 즉석 폴백
+    /// 신호로 쓴다(`AgentSession::record_metrics_summary`).
+    metrics_rx: watch::Receiver<Option<SysMetrics>>,
     join: JoinHandle<()>,
 }
 
@@ -211,6 +215,12 @@ impl ChatHandle {
     /// 출력 송신단을 복제한다 — session의 `ChatOut::Tui`가 답변/spin을 직접 보내게 한다.
     pub(crate) fn out_sender(&self) -> mpsc::Sender<OutMsg> {
         self.out_tx.clone()
+    }
+
+    /// 지표 watch 채널을 복제한다 — session이 보관해 `/record now` 등에서 최신 캐시를 당겨온다
+    /// (t2). `Receiver::clone()`은 채널을 새로 만들지 않고 같은 sender를 공유하는 핸들만 늘린다.
+    pub(crate) fn metrics_rx(&self) -> watch::Receiver<Option<SysMetrics>> {
+        self.metrics_rx.clone()
     }
 
     /// 작업 중 Ctrl+C 취소 신호를 기다린다(`run_turn`/`handle_slash`와 select!). 채널이 닫히면
@@ -307,6 +317,9 @@ pub(crate) fn start_chat_loop(
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
     // 취소 채널: 용량 1이면 충분(중복 Ctrl+C는 try_send 실패로 자연 병합). turn마다 drain_cancel로 비운다.
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    // 지표 watch 채널(t2) — with_statusbar=false면 chat_loop 내부 sampler task 자체가 안 돌아
+    // 이 sender에 아무것도 안 보내므로 receiver는 초기값 None에 계속 머문다(= 폴백 신호).
+    let (metrics_tx, metrics_rx) = watch::channel(None::<SysMetrics>);
     let join = tokio::spawn(chat_loop(
         line_tx,
         out_rx,
@@ -314,11 +327,13 @@ pub(crate) fn start_chat_loop(
         prompt,
         with_statusbar,
         recording,
+        metrics_tx,
     ));
     ChatHandle {
         line_rx,
         out_tx,
         cancel_rx,
+        metrics_rx,
         join,
     }
 }
@@ -1259,8 +1274,10 @@ fn strip_ansi(s: &str) -> String {
 
 /// metrics watch 채널 폴링 결과 — chat_loop의 select! arm이 채널 상태를 분기하는 데 쓴다.
 enum MetricsPoll {
-    /// 새 지표 도착(첫 sample 이후엔 항상 이 변형).
-    New(SysMetrics),
+    /// 새 지표 도착(첫 sample 이후엔 항상 이 변형). `SysMetrics`가 다른 변형(무데이터)보다 훨씬 커
+    /// enum 전체가 그 크기로 부풀지 않도록 Box에 담는다 — 지표 도착은 수 초에 한 번이라 할당 비용은
+    /// 무시할 수준이다(clippy::large_enum_variant).
+    New(Box<SysMetrics>),
     /// 채널이 변경됐으나 값이 아직 None(이론상 첫 sample 전 — 무시).
     Empty,
     /// 채널이 닫힘(sampler task 종료) — arm을 비활성화해 busy-loop를 막는다.
@@ -1340,6 +1357,9 @@ async fn chat_loop(
     prompt: String,
     with_statusbar: bool,
     recording: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // t2: 최신 지표를 session으로도 밀어보내는 채널(`/record now` 캐시 소스). 이 task는 여전히
+    // sampler task의 유일한 구독자다 — 여기서 받은 값을 그대로 한 번 더 forward할 뿐이다.
+    metrics_tx: watch::Sender<Option<SysMetrics>>,
 ) {
     if enable_raw_mode().is_err() {
         return;
@@ -1849,7 +1869,7 @@ async fn chat_loop(
                 match metrics_rx.as_mut() {
                     Some(rx) => match rx.changed().await {
                         Ok(()) => match rx.borrow_and_update().clone() {
-                            Some(m) => MetricsPoll::New(m),
+                            Some(m) => MetricsPoll::New(Box::new(m)),
                             None => MetricsPoll::Empty,
                         },
                         Err(_) => MetricsPoll::Closed,
@@ -1861,6 +1881,11 @@ async fn chat_loop(
                     MetricsPoll::New(m) => {
                         status = format!("· {}", m.status_line());
                         status_segs = Some(m.status_segments());
+                        // t2: session의 `last_metrics` 캐시로도 밀어보낸다 — `/record now`가 이 값을 재사용해
+                        // status bar와 같은 숫자를 기록한다. **첫 publish는 sampler의 첫 sample이라 cpu가
+                        // 오염돼 있다**(elapsed≈0) — 그 사실은 스냅샷의 `cpu_valid=false`가 실어 나르므로
+                        // session이 걸러낸다. 구독자가 없어도 send 실패는 무시(best-effort).
+                        let _ = metrics_tx.send(Some((*m).clone()));
                         // edge-triggered alert(C1): 악화 전이를 ambient Note로 로그에 직접 push한다.
                         // Note는 표시 전용 — LLM 컨텍스트엔 안 들어가고 turn을 시작하지도 않는다(§C1).
                         if let Some(tracker) = alert_tracker.as_mut() {

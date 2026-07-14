@@ -291,6 +291,26 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // A3: OTLP docker exporter (opt-in, [aicd.exporter] enabled=true + docker_enabled=true —
+    // 부모 게이트가 켜져도 docker_enabled 기본값 자체가 false다, otlp_exporter::docker 모듈 doc
+    // 참고). 주기적으로 `docker system df --format json`을 spawn한다. host metrics tick(in-process
+    // sysinfo)을 외부 프로세스 spawn이 막지 않도록 독립 task로 뜬다.
+    let docker_handle = match load_docker_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
+        Some(cfg) => {
+            let dk_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::serve_docker(cfg, dk_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP docker exporter 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
     // OTLP agent exporter (opt-in, [aicd.exporter] enabled=true + agent_enabled=true).
     // AgentEventBus tap을 구독해 chat/agent 행위를 실시간으로 push한다. events와 같은 push 기반
     // 구조지만, 소스가 store가 아니라 bus라 별도 task로 둔다.
@@ -464,6 +484,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = changes_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = docker_handle {
         let _ = h.await;
     }
     // RFC-006 로그 수집기도 동일 shutdown watch를 구독하므로 graceful 종료된다.
@@ -808,6 +831,39 @@ fn load_changes_config(
         token,
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         interval: std::time::Duration::from_secs(ex.changes_interval_secs.max(1)),
+        spool,
+        health,
+    })
+}
+
+/// A3: docker exporter 설정 로더. `docker_enabled`는 부모 게이트(`enabled`)가 켜져도 기본
+/// false다(otlp_exporter::docker 모듈 doc 참고) — 그래서 다른 로더와 달리 명시적으로 true로
+/// 설정된 환경에서만 task가 뜬다. `docker_bin`은 PATH 탐색에 맡긴다(connections의 `aic_bin`처럼
+/// aicd 옆 경로를 우선하지 않는다 — docker는 aic 배포물이 아니라 시스템에 이미 설치돼 있거나
+/// 없거나이므로 PATH가 유일하게 맞는 탐색 위치다).
+fn load_docker_config(
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+) -> Option<aic_server::otlp_exporter::DockerConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.docker_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — docker exporter 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::DockerConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        interval: std::time::Duration::from_secs(ex.docker_interval_secs.max(1)),
+        docker_bin: std::path::PathBuf::from("docker"),
+        timeout: std::time::Duration::from_secs(15),
         spool,
         health,
     })

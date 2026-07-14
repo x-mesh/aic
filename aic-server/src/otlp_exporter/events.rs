@@ -46,7 +46,10 @@ pub struct EventsConfig {
 }
 
 /// events exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
-pub async fn serve_events(cfg: EventsConfig, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve_events(
+    cfg: EventsConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::logs_url(&cfg.endpoint);
     let mut rx = cfg.store.subscribe();
@@ -148,11 +151,26 @@ mod tests {
     #[test]
     fn capture_quality_label_covers_all_variants() {
         use aic_common::CaptureQuality;
-        assert_eq!(capture_quality_label(CaptureQuality::FullOutput), "FullOutput");
-        assert_eq!(capture_quality_label(CaptureQuality::MetadataOnly), "MetadataOnly");
-        assert_eq!(capture_quality_label(CaptureQuality::RedactedOutput), "RedactedOutput");
-        assert_eq!(capture_quality_label(CaptureQuality::BinaryOmitted), "BinaryOmitted");
-        assert_eq!(capture_quality_label(CaptureQuality::TruncatedOutput), "TruncatedOutput");
+        assert_eq!(
+            capture_quality_label(CaptureQuality::FullOutput),
+            "FullOutput"
+        );
+        assert_eq!(
+            capture_quality_label(CaptureQuality::MetadataOnly),
+            "MetadataOnly"
+        );
+        assert_eq!(
+            capture_quality_label(CaptureQuality::RedactedOutput),
+            "RedactedOutput"
+        );
+        assert_eq!(
+            capture_quality_label(CaptureQuality::BinaryOmitted),
+            "BinaryOmitted"
+        );
+        assert_eq!(
+            capture_quality_label(CaptureQuality::TruncatedOutput),
+            "TruncatedOutput"
+        );
         assert_eq!(capture_quality_label(CaptureQuality::Unknown), "Unknown");
     }
 }
