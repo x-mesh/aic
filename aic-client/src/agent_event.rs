@@ -80,25 +80,51 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 /// **`attrs` 키에 `exit_code`/`cwd`/`duration_ms`를 쓰지 마라** — 서버의 `EVENT_MAPPED_KEYS`가
 /// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
 ///
+/// sync 호출부(CLI `aic snapshot record --memo`)용. async 호출부(chat `handle_record`)는 tokio
+/// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 둘 다
+/// [`prepare_snapshot_event`] 하나를 지난다.
+///
+/// 반환값 = **실제로 발화를 시도했는가**. `false`면 sanitize 후 메모가 비어 스킵했다는 뜻(F15)이라,
+/// 호출부가 "메모가 비어 애초에 안 보냈다"와 "보냈지만 원격에 안 남는다"([`RemoteRecord`])를
+/// 구분해 안내할 수 있다. fire-and-forget이라 `true`가 aicd 도달을 보장하지는 않는다.
+pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) -> bool {
+    match prepare_snapshot_event(memo, attrs) {
+        Some(ev) => {
+            dispatch(ev);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`snapshot_recorded`]의 async 판(chat `/record now <메모>`). 전송을 **async IPC**로 한다 —
+/// 이유는 [`query_async`] 문서 참고(sync IPC를 async에서 그냥 부르면 tokio worker가 막힌다).
+pub async fn snapshot_recorded_async(memo: &str, attrs: BTreeMap<String, String>) -> bool {
+    match prepare_snapshot_event(memo, attrs) {
+        Some(ev) => {
+            dispatch_async(ev).await;
+            true
+        }
+        None => false,
+    }
+}
+
+/// 메모를 검사·안전화해 보낼 이벤트를 만든다. 보낼 게 없으면(F15) `None` — sync/async 두 진입점이
+/// **이 함수 하나**를 지나므로 병적 입력 방어가 한쪽에만 걸리는 일이 없다. 순수 함수(네트워크 없음).
+///
 /// 호출부(chat `/record now <메모>`, CLI `aic snapshot record --memo`)를 대신해 여기서 병적 입력을
-/// 처리한다 — 두 호출부가 각자 방어하면 한쪽만 고치고 잊는 경로가 생긴다:
+/// 처리한다:
 /// - **빈 메모**(공백만 포함, 또는 sanitize 후 공백만 남는 메모)는 이벤트로서 무의미하므로 발화하지
 ///   않는다(F15). 로컬 스냅샷 저장은 이 함수와 무관하게 호출부가 계속 수행한다.
 /// - **제어문자·ANSI escape 제거**(F17) — 수신측(터미널로 events를 훑어보는 사람)의 화면을 깨지
 ///   않게. 개행/탭은 메모의 정상적인 부분이라 남긴다.
 /// - **UTF-8 경계 보존 절단**(F16) — IPC 프레임 상한(16MiB)에 닿지 않게 훨씬 낮은 선에서 자른다.
-///
-/// 반환값 = **실제로 발화를 시도했는가**(fire-and-forget이라 aicd 도달 여부는 알 수 없다 — 그건
-/// [`exporter_status`]로 별도 확인). `false`면 sanitize 후 메모가 비어 스킵했다는 뜻이라, 호출부가
-/// 이 값으로 "메모가 비어 애초에 안 보냈다"와 "보내려 했지만 aicd가 없어 조용히 실패했다"(F19)를
-/// 구분해 사용자에게 다른 안내를 줄 수 있다.
-pub fn snapshot_recorded(memo: &str, attrs: BTreeMap<String, String>) -> bool {
+fn prepare_snapshot_event(memo: &str, attrs: BTreeMap<String, String>) -> Option<AgentEvent> {
     let memo = sanitize_memo(memo);
     if memo.trim().is_empty() {
-        return false;
+        return None;
     }
-    dispatch(snapshot_event(&memo, attrs));
-    true
+    Some(snapshot_event(&memo, attrs))
 }
 
 /// 메모를 전송 전 안전화한다: 제어문자(ESC 등) 제거(개행·탭은 유지) → UTF-8 경계 보존 절단.
@@ -118,15 +144,80 @@ fn snapshot_event(memo: &str, attrs: BTreeMap<String, String>) -> AgentEvent {
     build_event(AGENT_KIND_SNAPSHOT_RECORDED, memo, "INFO", attrs)
 }
 
+/// 지금 보낸 이벤트가 **원격(collector)까지 갈 수 있는 상태인가**. `/record now <메모>`처럼 사람이
+/// "이 순간을 남긴다"고 판단한 기록은 조용히 유실되면 기능 자체가 무의미해지므로, 세 상태를
+/// 구분해 각각 다르게 안내한다.
+///
+/// 특히 [`ExporterDisabled`](RemoteRecord::ExporterDisabled)를 성공으로 뭉개면 안 된다 — aicd는
+/// 응답하니 "살아있다"로 보이지만, aicd는 받은 이벤트를 tap에 publish할 뿐이고 **구독자(exporter)가
+/// 없으면 그대로 버려진다.** 사용자는 기록됐다고 믿는데 실제로는 아무 데도 안 남는, 가장 나쁜 종류의
+/// 유실이다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRecord {
+    /// aicd가 살아있고 exporter도 켜져 있다 — 이벤트가 collector로 나간다(안내 불필요).
+    Live,
+    /// aicd에 물어보지 못했다(미실행·구버전·timeout) — 이벤트를 받아 줄 데몬 자체가 없다.
+    DaemonDown,
+    /// aicd는 살아있지만 exporter가 꺼져 있다(`[aicd.exporter] enabled = false`) — 이벤트는
+    /// aicd까지 갔다가 구독자가 없어 **조용히 버려진다**.
+    ExporterDisabled,
+}
+
+impl RemoteRecord {
+    /// 사용자에게 보여줄 한 줄 안내. 정상(`Live`)이면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다).
+    /// 스타일(색/아이콘)은 호출부가 입힌다(chat은 note, CLI는 dim stderr).
+    pub fn notice(self) -> Option<&'static str> {
+        match self {
+            RemoteRecord::Live => None,
+            RemoteRecord::DaemonDown => {
+                Some("OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.")
+            }
+            RemoteRecord::ExporterDisabled => Some(
+                "aicd는 실행 중이지만 OTLP exporter가 꺼져 있어 원격 기록은 생략됩니다 \
+                 (로컬 스냅샷은 저장됨). config `[aicd.exporter] enabled = true`로 켜세요.",
+            ),
+        }
+    }
+}
+
+/// IPC 응답을 세 상태로 접는다(순수 함수 — 소켓 없이 테스트 가능).
+fn classify_remote(status: Option<&aic_common::ExporterStatus>) -> RemoteRecord {
+    match status {
+        None => RemoteRecord::DaemonDown,
+        Some(s) if !s.enabled => RemoteRecord::ExporterDisabled,
+        Some(_) => RemoteRecord::Live,
+    }
+}
+
+/// 방금 보낸 이벤트가 원격까지 갈 수 있는지 aicd에 물어본다(sync 호출부용).
+pub fn remote_record_state() -> RemoteRecord {
+    classify_remote(exporter_status().as_ref())
+}
+
+/// [`remote_record_state`]의 async 판(chat용) — tokio worker를 막지 않는다.
+pub async fn remote_record_state_async() -> RemoteRecord {
+    classify_remote(exporter_status_async().await.as_ref())
+}
+
 /// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
 ///
 /// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
 /// 응답이 timeout됐다. `Some(status)`의 `enabled: false`는 "aicd는 살아있지만 exporter가 꺼져
-/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다.
+/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다([`classify_remote`]).
 pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
-    match query(&IpcRequest::GetExporterStatus) {
+    to_exporter_status(query(&IpcRequest::GetExporterStatus))
+}
+
+/// [`exporter_status`]의 async 판.
+pub async fn exporter_status_async() -> Option<aic_common::ExporterStatus> {
+    to_exporter_status(query_async(&IpcRequest::GetExporterStatus).await)
+}
+
+/// IPC 결과에서 `ExporterStatus`를 뽑는다. 구버전 aicd는 unknown request를 graceful Error로
+/// 답하므로 그 응답도 "조회 불가"(None)로 접는다.
+fn to_exporter_status(res: std::io::Result<IpcResponse>) -> Option<aic_common::ExporterStatus> {
+    match res {
         Ok(IpcResponse::ExporterStatus(s)) => Some(s),
-        // 구버전 aicd는 unknown request를 graceful Error로 답한다 → 조회 불가로 취급.
         _ => None,
     }
 }
@@ -152,8 +243,30 @@ fn build_event(
 
 /// 만들어진 이벤트를 aicd로 보낸다. 실패는 전부 무시한다(aicd 미실행은 정상 상태이고,
 /// 텔레메트리가 chat을 방해해선 안 된다 — audit/rca_memory 등 다른 best-effort 경로와 같은 관례).
+///
+/// **테스트에서는 소켓 대신 in-process sink로 간다**([`test_sink`]) — `cargo test`가 개발 머신의
+/// 실 aicd에 가짜 이벤트를 밀어 넣고, exporter가 켜져 있으면 그게 **운영 이벤트 스토어까지 나가는**
+/// 사고를 막는다(이 저장소에서 실제로 난 적이 있다). "무엇을 보내는가"는 sink로 검증하고, "소켓이
+/// 없을 때 조용한가"는 [`query_at`]에 없는 경로를 주입해 검증한다 — 실 소켓은 어느 쪽에도 필요 없다.
+#[cfg(not(test))]
 fn dispatch(ev: AgentEvent) {
     let _ = send(&IpcRequest::AgentEvent(ev));
+}
+
+#[cfg(test)]
+fn dispatch(ev: AgentEvent) {
+    test_sink::push(ev);
+}
+
+/// [`dispatch`]의 async 판 — chat(async)에서 tokio worker를 막지 않고 보낸다.
+#[cfg(not(test))]
+async fn dispatch_async(ev: AgentEvent) {
+    let _ = query_async(&IpcRequest::AgentEvent(ev)).await;
+}
+
+#[cfg(test)]
+async fn dispatch_async(ev: AgentEvent) {
+    test_sink::push(ev);
 }
 
 /// 한 행위를 aicd로 보낸다(build + dispatch).
@@ -169,15 +282,39 @@ fn redact(s: &str) -> String {
 
 /// 요청을 보내고 응답을 무시한다(fire-and-forget). 응답을 **읽기는** 한다 — 곧바로 끊으면
 /// aicd 쪽에 "클라이언트 조기 종료" 경고가 남기 때문이다.
+///
+/// 테스트에서는 [`dispatch`]가 소켓 대신 [`test_sink`]로 가므로 이 경로가 아예 쓰이지 않는다
+/// (그래서 `cfg(not(test))` — 안 그러면 dead_code 경고가 난다).
+#[cfg(not(test))]
 fn send(req: &IpcRequest) -> std::io::Result<()> {
     query(req).map(|_| ())
 }
 
-/// 요청을 보내고 응답을 파싱해 돌려준다. 프레임은 length-prefixed JSON(`encode_frame`).
+/// 요청을 보내고 응답을 파싱해 돌려준다(실 aicd 소켓). 프레임은 length-prefixed JSON(`encode_frame`).
+#[cfg(not(test))]
 fn query(req: &IpcRequest) -> std::io::Result<IpcResponse> {
+    query_at(&aic_common::aicd_socket_path(), req)
+}
+
+/// 테스트에서는 **실 aicd 소켓을 절대 건드리지 않는다**. 쓰기 경로는 [`dispatch`]가 sink로 돌리지만,
+/// 읽기 경로(`exporter_status` → `sys_sampler::sample`)가 남아 있으면 테스트 결과가 "이 개발 머신에
+/// aicd가 떠 있는가"에 따라 달라진다 — 이 저장소가 금지하는 바로 그 패턴이다(테스트는 코드의
+/// 불변식을 검증해야지 머신 상태를 반영하면 안 된다). 데몬 없음(=Err)으로 고정해 결정적으로 만든다.
+/// 전송 계층 자체는 [`query_at`]에 경로를 주입해 따로 검증한다.
+#[cfg(test)]
+fn query(_req: &IpcRequest) -> std::io::Result<IpcResponse> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "테스트에서는 실 aicd에 연결하지 않는다",
+    ))
+}
+
+/// 소켓 경로를 **주입받는** sync IPC. 프로덕션은 [`query`]가 실 경로를 넣고, 테스트는 존재하지 않는
+/// 경로를 넣어 "데몬이 없을 때 조용히 실패하는가"를 실 aicd 없이 검증한다.
+fn query_at(socket: &std::path::Path, req: &IpcRequest) -> std::io::Result<IpcResponse> {
     let payload = serde_json::to_vec(req)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut stream = UnixStream::connect(aic_common::aicd_socket_path())?;
+    let mut stream = UnixStream::connect(socket)?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.write_all(&encode_frame(&payload))?;
@@ -199,6 +336,93 @@ fn query(req: &IpcRequest) -> std::io::Result<IpcResponse> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// async 호출부(chat `handle_record`)를 위한 IPC.
+///
+/// **왜 sync 버전을 그냥 부르지 않는가**: 위 [`query_at`]은 blocking `UnixStream`이라 async 함수에서
+/// 직접 부르면 tokio worker 스레드가 최대 `IO_TIMEOUT`만큼 통째로 막힌다(`/record now`는 dispatch +
+/// 상태조회로 두 번 왕복한다).
+///
+/// **왜 `spawn_blocking`이 아닌가**: t2가 지표 폴백에서 정확히 그걸 시도했다가 걷어냈다 —
+/// `tokio::time::timeout`은 **기다리기를 포기할 뿐 클로저를 멈추지 못하므로**, 안에서 걸린 스레드는
+/// blocking pool에 영구히 pin된다. 반면 **tokio `UnixStream`은 진짜로 취소된다**: future를 drop하면
+/// 소켓이 닫히고 스레드가 남지 않는다. 그래서 여기서는 sync를 감싸는 대신 **async I/O로 다시 쓴다** —
+/// `timeout`이 connect·write·read 전 구간을 덮으므로, aicd가 hang이든 미실행이든 `IO_TIMEOUT` 안에
+/// 확실히 풀려나고 아무것도 pin되지 않는다.
+#[cfg(not(test))]
+async fn query_async(req: &IpcRequest) -> std::io::Result<IpcResponse> {
+    tokio::time::timeout(IO_TIMEOUT, query_async_inner(req))
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "aicd 응답 timeout",
+            ))
+        })
+}
+
+/// sync [`query`]와 같은 이유로 테스트에서는 소켓에 나가지 않는다.
+#[cfg(test)]
+async fn query_async(_req: &IpcRequest) -> std::io::Result<IpcResponse> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "테스트에서는 실 aicd에 연결하지 않는다",
+    ))
+}
+
+/// [`query_async`]의 본체(취소 가능). timeout은 호출부가 전 구간에 씌운다.
+#[cfg(not(test))]
+async fn query_async_inner(req: &IpcRequest) -> std::io::Result<IpcResponse> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let payload = serde_json::to_vec(req)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut stream = tokio::net::UnixStream::connect(aic_common::aicd_socket_path()).await?;
+    stream.write_all(&encode_frame(&payload)).await?;
+    stream.flush().await?;
+
+    // sync 경로와 동일한 프레이밍(4바이트 길이 헤더 → 본문)과 동일한 할당 상한.
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("응답이 너무 큼: {len} bytes"),
+        ));
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// 테스트 전용 이벤트 sink — `cargo test`가 개발 머신의 **실 aicd에 가짜 이벤트를 밀어 넣지 않도록**
+/// [`dispatch`]/[`dispatch_async`]를 소켓 대신 여기로 보낸다. 이 저장소에서 실제로 났던 사고다
+/// (테스트 픽스처가 실 aicd를 거쳐 서버까지 나갔다).
+///
+/// thread-local이라 병렬 테스트끼리 섞이지 않는다(각 테스트는 자기 스레드의 sink만 본다).
+/// **주의**: `#[cfg(test)]`는 이 크레이트의 unit test에만 걸린다 — `tests/`의 integration test는
+/// 라이브러리를 cfg(test) 없이 링크하므로 여기 오지 않는다(현재 agent_event를 쓰는 integration
+/// test는 없다).
+#[cfg(test)]
+pub(crate) mod test_sink {
+    use super::AgentEvent;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SENT: RefCell<Vec<AgentEvent>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// dispatch가 보내려던 이벤트를 기록한다(소켓 대신).
+    pub(crate) fn push(ev: AgentEvent) {
+        SENT.with(|s| s.borrow_mut().push(ev));
+    }
+
+    /// 이 스레드에서 지금까지 dispatch된 이벤트를 꺼내 비운다.
+    pub(crate) fn drain() -> Vec<AgentEvent> {
+        SENT.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,15 +435,41 @@ mod tests {
     const AWS_KEY_FIXTURE: &str = "AKIAIOSFODNN7EXAMPLE";
 
     #[test]
-    fn send_without_daemon_is_silent() {
-        // aicd 소켓이 없어도(미실행) 패닉하지 않고 조용히 실패해야 한다 — 정상 경로다.
-        // 실제 소켓 경로가 살아 있는 개발 머신에서도 이 호출은 성공하거나 조용히 실패할 뿐이다.
+    fn query_without_daemon_fails_quietly_instead_of_panicking() {
+        // aicd가 없을 때(미실행) 조용히 Err로 떨어지고 패닉하지 않아야 한다 — 정상 경로다(F19).
+        // **실 소켓을 쓰지 않는다**: 존재하지 않는 경로를 주입해 "데몬 없음"을 결정적으로 만든다.
+        // 예전 이 테스트는 실 aicd 경로로 나갔는데, 그러면 개발 머신에 aicd가 떠 있느냐에 따라
+        // 다른 코드를 실행하는 데다(회귀를 못 잡는다) 실 데몬을 오염시켰다.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-aicd.sock");
+        let res = query_at(&missing, &IpcRequest::GetExporterStatus);
+        assert!(res.is_err(), "없는 소켓인데 성공했다");
+        // 그리고 이 실패는 to_exporter_status를 통해 "조회 불가"(None) → DaemonDown으로 접힌다.
+        assert_eq!(classify_remote(None), RemoteRecord::DaemonDown);
+    }
+
+    #[test]
+    fn all_emitters_dispatch_exactly_one_event_each() {
+        // 각 emitter가 이벤트를 **하나씩** 실제로 dispatch에 넘기는지 sink로 확인한다(실 소켓 없음).
+        // 예전 이 테스트는 "패닉만 안 하면 통과"였다 — emit이 통째로 사라져도 통과했을 것이다.
+        let _ = test_sink::drain(); // 앞선 테스트 잔여물 제거(같은 스레드 재사용 대비)
         tool_run_command("echo hi", Some(0), 12, "/tmp");
         risk_denied("rm -rf /", "Dangerous", Some("builtin_denylist"));
         finding_created("disk_full", "WARN", "/ 사용률 95%");
         snapshot_recorded(
             "cpu sys 26%, idle 67% — 커널 모드 비율이 높음",
             BTreeMap::new(),
+        );
+
+        let kinds: Vec<String> = test_sink::drain().into_iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "tool.run_command",
+                "risk.denied",
+                "finding.created",
+                "snapshot.recorded",
+            ]
         );
     }
 
@@ -296,11 +546,15 @@ mod tests {
 
     #[test]
     fn snapshot_recorded_skips_empty_or_whitespace_only_memo() {
-        // F15: 빈 메모/공백뿐인 메모는 발화하지 않는다 — 반환값 false로 "스킵했다"를 네트워크
-        // 없이 관찰할 수 있다(dispatch를 부르기 **전에** 조기 반환하므로 daemon 유무와 무관하게
-        // 결정적).
+        // F15: 빈 메모/공백뿐인 메모는 발화하지 않는다 — 반환값 false뿐 아니라 **sink가 비어 있는지**
+        // 까지 본다(반환값만 보면 "false를 돌려주면서 보내기는 하는" 회귀를 놓친다).
+        let _ = test_sink::drain();
         assert!(!snapshot_recorded("", BTreeMap::new()));
         assert!(!snapshot_recorded("   \n\t  ", BTreeMap::new()));
+        assert!(
+            test_sink::drain().is_empty(),
+            "빈 메모인데 이벤트가 전송됐다"
+        );
     }
 
     #[test]
@@ -308,13 +562,83 @@ mod tests {
         // F15+F17 결합: 공백은 아니지만(제어문자만 있음) sanitize 후 공백만 남는 메모도 스킵해야
         // 한다 — parse 단계의 `.trim()`(유니코드 공백만 제거)은 ESC 같은 제어문자를 못 거르므로,
         // 이 판정이 sanitize **이후**에 있어야만 잡히는 케이스다.
+        let _ = test_sink::drain();
         assert!(!snapshot_recorded("\x1b\x1b\x1b", BTreeMap::new()));
+        assert!(
+            test_sink::drain().is_empty(),
+            "제어문자뿐인 메모인데 이벤트가 전송됐다"
+        );
     }
 
     #[test]
-    fn snapshot_recorded_sends_non_empty_memo() {
-        // 진짜 메모는 발화를 시도한다(반환 true) — daemon 유무와 무관(fire-and-forget).
-        assert!(snapshot_recorded("cpu 이상하게 높음", BTreeMap::new()));
+    fn snapshot_recorded_sends_memo_as_body_with_attrs() {
+        // 진짜 메모는 정확히 1건 나가고, body(summary)와 attrs가 그대로 실린다.
+        let _ = test_sink::drain();
+        let mut attrs = BTreeMap::new();
+        attrs.insert("note_source".to_string(), "chat".to_string());
+        assert!(snapshot_recorded("cpu 이상하게 높음", attrs));
+
+        let sent = test_sink::drain();
+        assert_eq!(sent.len(), 1, "정확히 1건이어야: {sent:?}");
+        assert_eq!(sent[0].kind, "snapshot.recorded");
+        assert_eq!(sent[0].summary, "cpu 이상하게 높음");
+        assert_eq!(sent[0].attrs.get("note_source"), Some(&"chat".to_string()));
+    }
+
+    #[tokio::test]
+    async fn snapshot_recorded_async_matches_sync_contract() {
+        // chat(async) 경로도 sync와 **같은 계약**을 지킨다: 빈 메모는 스킵, 진짜 메모는 1건 전송.
+        // 두 진입점이 prepare_snapshot_event를 공유하므로 여기서 갈라지면 곧바로 드러난다.
+        let _ = test_sink::drain();
+        assert!(!snapshot_recorded_async("  ", BTreeMap::new()).await);
+        assert!(test_sink::drain().is_empty(), "빈 메모인데 전송됨(async)");
+
+        assert!(snapshot_recorded_async("디스크가 이상하다", BTreeMap::new()).await);
+        let sent = test_sink::drain();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, "snapshot.recorded");
+        assert_eq!(sent[0].summary, "디스크가 이상하다");
+    }
+
+    // ── 원격 기록 가능 상태 3분기(조용한 유실 방지) ──────────────────────────────
+
+    #[test]
+    fn classify_remote_distinguishes_three_states() {
+        // aicd 미응답 / exporter 꺼짐 / 정상 — 셋은 사용자에게 전혀 다른 사실이다.
+        // 특히 **exporter 꺼짐을 성공으로 뭉개면 안 된다**: aicd는 응답하지만 이벤트는 구독자가
+        // 없어 조용히 버려진다(가장 나쁜 유실 — 사용자는 기록됐다고 믿는다).
+        let disabled = aic_common::ExporterStatus {
+            enabled: false,
+            ..Default::default()
+        };
+        let live = aic_common::ExporterStatus {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(classify_remote(None), RemoteRecord::DaemonDown);
+        assert_eq!(
+            classify_remote(Some(&disabled)),
+            RemoteRecord::ExporterDisabled
+        );
+        assert_eq!(classify_remote(Some(&live)), RemoteRecord::Live);
+    }
+
+    #[test]
+    fn only_live_is_silent_and_each_failure_has_its_own_notice() {
+        // 정상만 조용하고, 실패 두 종류는 **서로 다른** 안내를 낸다(같은 문구면 사용자가 원인을
+        // 구분할 수 없다 — DaemonDown은 aicd를 띄워야 하고 ExporterDisabled는 config를 켜야 한다).
+        assert_eq!(RemoteRecord::Live.notice(), None);
+        let down = RemoteRecord::DaemonDown.notice().expect("안내가 있어야");
+        let off = RemoteRecord::ExporterDisabled
+            .notice()
+            .expect("안내가 있어야");
+        assert_ne!(down, off, "두 실패가 같은 안내를 낸다");
+        // 각 안내는 사용자가 할 일을 짚는다.
+        assert!(down.contains("aicd"), "{down}");
+        assert!(off.contains("exporter"), "{off}");
+        // 어느 쪽이든 로컬 스냅샷은 살아있다는 사실을 반드시 알린다(그게 F19의 핵심 안심 요소).
+        assert!(down.contains("로컬"), "{down}");
+        assert!(off.contains("로컬"), "{off}");
     }
 
     #[test]

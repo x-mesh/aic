@@ -1635,18 +1635,26 @@ impl AgentSession {
 
             // 메모가 있으면 로컬 저장과 별개로 OTLP `snapshot.recorded`도 함께 발화한다 — 임계
             // 스캔이 원리상 못 잡는 "지금 이상하다"를 사람이 남기는 경로(B3). 빈/공백뿐 메모는
-            // `snapshot_recorded` 내부가 스킵한다(F15) — 여기선 memo가 `Some`이었다는 사실만으로
+            // `snapshot_recorded_async` 내부가 스킵한다(F15) — 여기선 memo가 `Some`이었다는 사실만으로
             // 판단하지 않고 그 반환값으로 실제 전송 여부를 안다.
+            //
+            // IPC는 **async 판**을 쓴다 — sync 판은 blocking `UnixStream`이라 여기서 부르면 tokio
+            // worker가 최대 IO_TIMEOUT만큼 막힌다(agent_event::query_async 문서 참고).
             if let Some(memo) = memo {
                 let attrs = self.record_metrics_attrs();
-                let sent = crate::agent_event::snapshot_recorded(&memo, attrs);
-                // 전송을 시도했는데 aicd가 안 보이면(F19) 한 줄 안내 — "로컬은 저장됐는데 왜
-                // OTLP는 안 보이지" 하는 혼란을 막는다. 메모가 sanitize 후 비어 애초에 안 보낸
-                // 경우(sent=false)는 안내할 게 없다(사용자가 이미 빈 메모를 쳤다는 걸 안다).
-                if sent && crate::agent_event::exporter_status().is_none() {
-                    self.out
-                        .note("ℹ OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.")
-                        .await;
+                let sent = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
+                // 보낸 이벤트가 **원격까지 갈 수 있는 상태인지** 확인해 안내한다(F19). aicd 미실행뿐
+                // 아니라 **exporter가 꺼진 경우도** 알려야 한다 — 그땐 aicd가 응답해서 성공처럼
+                // 보이지만 이벤트는 구독자가 없어 조용히 버려진다. 사용자가 "기록됐다"고 믿는데
+                // 아무 데도 안 남는 게 가장 나쁘다. 메모가 비어 애초에 안 보낸 경우(sent=false)는
+                // 안내할 게 없다.
+                if sent {
+                    if let Some(notice) = crate::agent_event::remote_record_state_async()
+                        .await
+                        .notice()
+                    {
+                        self.out.note(&format!("ℹ {notice}")).await;
+                    }
                 }
             }
             return;
@@ -2394,6 +2402,15 @@ fn metrics_to_attrs(m: &super::sys_sampler::SysMetrics) -> BTreeMap<String, Stri
             format!("{:.1}", m.mem_pct()),
         );
     }
+    // load_1m만 게이트가 없다 — 예외가 아니라 **게이트를 걸 수단이 없고, 걸면 오히려 틀리기 때문**이다.
+    // 다른 지표는 "측정 안 됨"을 가리키는 sentinel이 있다: disk/swap은 `total == 0`(읽기 실패·비활성),
+    // cpu는 `cpu_valid` 플래그. load1에는 그런 신호가 없다 — sysinfo는 유효성을 알려주지 않고, `0.0`은
+    // **한가한 머신의 정직한 값**이라 "못 읽음"과 구분되지 않는다. 그래서 `load1 > 0.0` 같은 게이트를
+    // 걸면 진짜 idle 호스트의 참값을 버리게 된다(없는 문제를 고치려다 있는 데이터를 잃는다).
+    // 플랫폼 문제도 아니다: 이 크레이트는 unix 전용이고(`std::os::unix::net::UnixStream`을 무조건
+    // 쓴다 — Windows에선 컴파일조차 안 된다), macOS/Linux 모두 load average를 제공한다.
+    // 게다가 여기 오는 스냅샷은 이미 `metrics_cache_usable`(cpu_valid + 신선함)을 통과했으므로
+    // sampler가 정상 동작한 표본이다 — load1이 "채워지지 않은 0"일 경로가 없다.
     attrs.insert("load_1m".to_string(), format!("{:.2}", m.load1));
     if m.disk_total > 0 {
         attrs.insert(
@@ -3246,6 +3263,26 @@ mod tests {
                 "금지된 키 사용: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_to_attrs_keeps_zero_load_because_idle_is_a_real_reading() {
+        // load_1m에 "0이면 생략" 게이트를 걸면 **한가한 호스트의 참값**(load 0.00)을 버린다 —
+        // disk/swap의 `total == 0`(측정 실패 sentinel)이나 cpu의 `cpu_valid`(유효성 플래그)와 달리
+        // load1에는 "못 읽음"을 뜻하는 신호가 없어서, 0을 결측으로 해석할 근거 자체가 없다.
+        // 다른 지표와 일관성을 맞춘답시고 게이트를 추가하는 회귀를 여기서 막는다.
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            load1: 0.0, // 진짜 idle
+            ..Default::default()
+        };
+        let attrs = metrics_to_attrs(&m);
+        assert_eq!(
+            attrs.get("load_1m"),
+            Some(&"0.00".to_string()),
+            "idle 호스트의 load 0.00은 결측이 아니라 참값이다 — 생략하면 안 된다"
+        );
     }
 
     #[test]
