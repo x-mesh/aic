@@ -459,6 +459,14 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+    // agent exporter가 **실제로 떴는지**를 health에 새긴다 — `GetExporterStatus`로 chat이 읽어간다.
+    // config 플래그(`agent_enabled`)가 아니라 spawn 결과를 싣는 이유: 플래그가 켜져 있어도 endpoint
+    // 미설정·spool 실패면 task가 안 뜨고, 그때 chat이 보낸 agent 이벤트는 구독자가 없어 조용히
+    // 버려진다. 사람이 알아야 하는 건 "설정을 켰나"가 아니라 "지금 받아 갈 구독자가 있나"다.
+    // serve() **전에** 새기므로 어떤 IPC 응답도 이 값을 못 본 채 나가지 않는다.
+    if let Some(health) = exporter_health.as_ref() {
+        health.set_agent_live(agent_handle.is_some());
+    }
 
     server.serve(control_ctx).await;
 

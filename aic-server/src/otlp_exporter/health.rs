@@ -9,7 +9,7 @@
 //! 알고 싶은 건 "이 호스트의 텔레메트리가 서버에 닿고 있나"이지 어느 signal이 실패했는지가
 //! 아니기 때문이다. 개별 signal의 실패는 로그에 남는다.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{SignalKind, Spool};
@@ -21,6 +21,15 @@ pub struct ExporterHealth {
     push_fail_total: AtomicU64,
     /// 마지막 push 성공 시각(unix seconds). 0이면 "성공한 적 없음".
     last_ok_unix: AtomicU64,
+    /// agent exporter task(`serve_agent`)가 실제로 떠 있는지. **config 플래그가 아니라 "task가
+    /// spawn됐는가"**를 담는다 — `agent_enabled=true`여도 endpoint 미설정·spool 실패로 task가 안
+    /// 뜰 수 있고, 그 경우 이벤트는 똑같이 버려지기 때문이다. 사람이 알아야 하는 건 설정값이
+    /// 아니라 **지금 내 이벤트를 받아 갈 구독자가 있느냐**다.
+    ///
+    /// 이 객체는 task들보다 **먼저** 만들어지므로(aicd_main), 값은 spawn 직후
+    /// [`set_agent_live`](Self::set_agent_live)로 채워진다. 그때까지는 false(=아직 구독자 없음)로,
+    /// 사실과 어긋나지 않는다.
+    agent_live: AtomicBool,
     /// 오프라인 spool — 밀린 배치 수/버린 수를 여기서 읽는다.
     spool: Arc<Spool>,
     /// collector base URL(표시용).
@@ -33,9 +42,15 @@ impl ExporterHealth {
             push_ok_total: AtomicU64::new(0),
             push_fail_total: AtomicU64::new(0),
             last_ok_unix: AtomicU64::new(0),
+            agent_live: AtomicBool::new(false),
             spool,
             endpoint,
         }
+    }
+
+    /// agent exporter task의 기동 여부를 기록한다(aicd_main이 spawn 직후 1회 호출).
+    pub fn set_agent_live(&self, live: bool) {
+        self.agent_live.store(live, Ordering::Relaxed);
     }
 
     /// push 1건 성공. 마지막 성공 시각도 갱신한다.
@@ -54,6 +69,8 @@ impl ExporterHealth {
         let last_ok = self.last_ok_unix.load(Ordering::Relaxed);
         aic_common::ExporterStatus {
             enabled: true, // 이 객체가 존재한다는 것 자체가 exporter 활성이라는 뜻이다.
+            // 이 aicd는 값을 **안다** — 그래서 Some이다. `None`은 이 필드를 모르는 구버전만 낸다.
+            agent_enabled: Some(self.agent_live.load(Ordering::Relaxed)),
             endpoint: self.endpoint.clone(),
             push_ok_total: self.push_ok_total.load(Ordering::Relaxed),
             push_fail_total: self.push_fail_total.load(Ordering::Relaxed),
@@ -104,6 +121,25 @@ mod tests {
         assert_eq!(s.push_fail_total, 0);
         // 성공한 적 없음은 None — "방금 성공(0초 전)"과 구분되어야 한다.
         assert_eq!(s.last_ok_secs_ago, None);
+    }
+
+    #[test]
+    fn agent_liveness_is_reported_and_defaults_to_not_live() {
+        // chat `/record now <메모>`가 "이 메모가 서버에 남는가"를 판단하는 유일한 근거다.
+        // 이 aicd는 값을 아는 버전이므로 **항상 Some**을 낸다 — None(모름)은 구버전만 낸다.
+        let h = health();
+        assert_eq!(
+            h.snapshot().agent_enabled,
+            Some(false),
+            "task가 아직 안 떴으면 false여야 한다(사실과 어긋나지 않게)"
+        );
+
+        // agent exporter task가 실제로 뜨면 true.
+        h.set_agent_live(true);
+        assert_eq!(h.snapshot().agent_enabled, Some(true));
+
+        // 부모 게이트(enabled)와는 별개의 축이다 — 이 객체가 존재하면 부모는 켜진 것이다.
+        assert!(h.snapshot().enabled);
     }
 
     #[test]

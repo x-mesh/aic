@@ -2045,8 +2045,16 @@ fn handle_snapshot_capture(kind: &str, force: bool) -> anyhow::Result<()> {
 /// one-shot CLI라 이 작업 말고 스케줄될 게 없다 — 막을 다른 task가 없으니 worker 점유가 무의미하고,
 /// 바로 위 `capture_forced`(probe 수 초)부터가 이미 sync다. async로 바꾸는 건 이득 없이 경로만
 /// 늘린다.
+/// **로컬 캡처가 실패해도 메모는 보낸다**(chat과 같은 결정): 본질은 사람이 남기는 메모이고
+/// 스냅샷은 부가 증거다. 디스크가 꽉 차 캡처가 실패하는 상황이야말로 그 관찰이 가장 필요한
+/// 순간인데, 거기서 메모까지 버리면 기능이 정작 필요할 때 죽는다. 다만 로컬 실패는 **exit 1**로
+/// 표면화한다 — cron/스크립트가 반쪽 성공을 완전한 성공으로 오인하면 안 된다.
 fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
-    match aic_client::agent::snapshot_capture::capture_forced("manual") {
+    // 로컬 캡처 결과를 **먼저 붙잡아만 두고** 즉시 return하지 않는다 — Err로 빠져나가면 메모가
+    // 통째로 사라진다(위 doc 참고).
+    let local = aic_client::agent::snapshot_capture::capture_forced("manual");
+    let local_ok = matches!(local, Ok(Some(_)));
+    match &local {
         Ok(Some(path)) => {
             println!("{COL_GREEN}✓{COL_RESET} 스냅샷 캡처 → {}", path.display());
         }
@@ -2055,22 +2063,27 @@ fn handle_snapshot_record(memo: &str) -> anyhow::Result<()> {
             eprintln!("{COL_DIM}스냅샷이 기록되지 않았습니다.{COL_RESET}");
         }
         Err(e) => {
-            return Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}"));
+            eprintln!("{COL_YELLOW}!{COL_RESET} 스냅샷 캡처 실패: {e}");
         }
     }
 
     let mut attrs = std::collections::BTreeMap::new();
     attrs.insert("note_source".to_string(), "cli".to_string());
     let sent = aic_client::agent_event::snapshot_recorded(memo, attrs);
-    // 보낸 이벤트가 원격까지 갈 수 있는 상태인지 확인해 안내한다 — aicd 미실행뿐 아니라 **exporter가
-    // 꺼진 경우도** 알린다(그땐 aicd가 응답해 성공처럼 보이지만 이벤트는 구독자가 없어 조용히
-    // 버려진다). 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
-    if sent {
-        if let Some(notice) = aic_client::agent_event::remote_record_state().notice() {
-            eprintln!("{COL_DIM}{notice}{COL_RESET}");
-        }
+    // 보낸 이벤트가 원격까지 갈 수 있는 상태인지 확인해 안내한다 — aicd 미실행뿐 아니라 exporter/
+    // agent-exporter가 꺼졌거나 spool에 밀린 경우도 알린다(그땐 aicd가 응답해 성공처럼 보이지만
+    // 이벤트는 서버에 닿지 않는다). 로컬/원격 두 결과를 **각각 사실대로** 보고한다.
+    // 안내는 stderr로만 — stdout은 스크립트가 파싱하는 면이다.
+    let state = sent.then(aic_client::agent_event::remote_record_state);
+    if let Some(notice) = aic_client::agent::session::record_remote_notice(local_ok, state) {
+        eprintln!("{COL_DIM}{notice}{COL_RESET}");
     }
-    Ok(())
+
+    // 로컬 실패는 exit 1(메모는 이미 보냈다 — 유실 없음).
+    match local {
+        Err(e) => Err(anyhow::anyhow!("스냅샷 캡처 실패: {e}")),
+        _ => Ok(()),
+    }
 }
 
 /// store의 최근 스냅샷을 최신순으로 나열한다(메타데이터만 — body는 출력 안 함).
