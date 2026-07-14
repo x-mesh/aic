@@ -42,13 +42,28 @@ pub fn capture_forced(kind: &str) -> anyhow::Result<Option<PathBuf>> {
 /// 메모를 로컬에 남기는 게 이 기능의 본체다 — OTLP는 부가 경로이고, aicd 미실행은 정상 상태라
 /// 원격에만 의존하면 사람이 "지금 이게 중요하다"고 남긴 관찰이 통째로 사라진다
 /// (`SnapshotRecord::memo` 문서 참고).
-pub fn capture_forced_with_memo(kind: &str, memo: Option<&str>) -> anyhow::Result<Option<PathBuf>> {
+///
+/// **`&str`이 아니라 [`Memo`]를 받는다** — 정제(제어문자 제거)·상한(`MEMO_MAX_BYTES`)·redaction을
+/// 통과한 값만 로컬 레코드에 들어갈 수 있게 **타입으로 강제**한다. 예전엔 `Option<&str>`이라 "올바른
+/// 호출자가 `Memo::sanitize`를 먼저 부른다"는 게 관례로만 지켜졌고, 새 호출자가 그 관례를 잊으면
+/// 거대·제어문자·미마스킹 메모가 그대로 저장됐다 — `memo_truncated`에서 배운 교훈("관례는 잊히는
+/// 순간 깨진다")을 저장 경로에도 적용해, 이중-sanitize를 컴파일 에러로 만든 것과 같은 수법이다.
+///
+/// `None`은 "메모 없이 순수 캡처"(`/record now` 메모 없이·alert 트리거)다.
+pub fn capture_forced_with_memo(
+    kind: &str,
+    memo: Option<&crate::agent_event::Memo>,
+) -> anyhow::Result<Option<PathBuf>> {
     capture_opts(kind, true, memo)
 }
 
 /// `force`면 게이트 무시, 아니면 opt-in 준수(off면 probe 전 early-out). 게이트는 여기와 [`store`] 두 곳에
 /// 있어 force가 양쪽을 모두 통과해야 한다(early-out 우회만으론 store에서 다시 막힘).
-fn capture_opts(kind: &str, force: bool, memo: Option<&str>) -> anyhow::Result<Option<PathBuf>> {
+fn capture_opts(
+    kind: &str,
+    force: bool,
+    memo: Option<&crate::agent_event::Memo>,
+) -> anyhow::Result<Option<PathBuf>> {
     if !force && !crate::snapshot_store::record_enabled() {
         return Ok(None); // opt-in off → probe fork 전 early-out(오버헤드 0).
     }
@@ -79,7 +94,7 @@ fn store(
     body: &str,
     now: DateTime<Utc>,
     force: bool,
-    memo: Option<&str>,
+    memo: Option<&crate::agent_event::Memo>,
 ) -> anyhow::Result<Option<PathBuf>> {
     if !force && !crate::snapshot_store::record_enabled() {
         return Ok(None);
@@ -87,7 +102,17 @@ fn store(
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.display().to_string());
-    let rec = crate::snapshot_store::SnapshotRecord::with_memo(kind, body, None, cwd, now, memo);
+    // 여기서 `Memo` → `&str`을 벗긴다(leaf). `SnapshotRecord::with_memo`는 저수준 store 생성자라
+    // 상위 계층(agent_event::Memo)에 역의존시키지 않는다 — 타입 불변식은 위 capture 진입점이 이미
+    // 강제했고, 여기까지 온 memo는 정제·상한을 통과한 값이다.
+    let rec = crate::snapshot_store::SnapshotRecord::with_memo(
+        kind,
+        body,
+        None,
+        cwd,
+        now,
+        memo.map(|m| m.text()),
+    );
     Ok(Some(crate::snapshot_store::append_snapshot(&rec)?))
 }
 
@@ -184,14 +209,8 @@ mod tests {
         // 그 조건에서 메모가 로컬 레코드에 남아야 한다.
         let _h = TestStore::new(); // force=true 경로라 opt-in과 무관(기본 off로 충분)
         let now = DateTime::from_timestamp(1_700_000_200, 0).unwrap();
-        store(
-            "manual",
-            "## host\nh\n",
-            now,
-            true,
-            Some("디스크가 이상하다"),
-        )
-        .unwrap();
+        let memo = crate::agent_event::Memo::sanitize("디스크가 이상하다").unwrap();
+        store("manual", "## host\nh\n", now, true, Some(&memo)).unwrap();
 
         let loaded = crate::snapshot_store::load_snapshots().unwrap();
         assert_eq!(loaded.len(), 1);
@@ -204,17 +223,13 @@ mod tests {
 
     #[test]
     fn memo_is_redacted_and_empty_memo_stays_none() {
-        // 메모에도 secret이 들어올 수 있다(F14) — body/host/cwd와 동일하게 at-rest redact.
+        // 메모에도 secret이 들어올 수 있다(F14) — 이제 `Memo::sanitize`가 정제 시점에 redact하고,
+        // store가 받는 건 이미 마스킹된 `Memo`다(타입 불변식). end-to-end로 secret이 디스크에
+        // 닿지 않는지 확인한다.
         let _h = TestStore::new();
         let now = DateTime::from_timestamp(1_700_000_300, 0).unwrap();
-        store(
-            "manual",
-            "## host\nh\n",
-            now,
-            true,
-            Some("bind 10.1.2.3:8080 확인"),
-        )
-        .unwrap();
+        let memo = crate::agent_event::Memo::sanitize("bind 10.1.2.3:8080 확인").unwrap();
+        store("manual", "## host\nh\n", now, true, Some(&memo)).unwrap();
         let memo = crate::snapshot_store::load_snapshots().unwrap()[0]
             .memo
             .clone()

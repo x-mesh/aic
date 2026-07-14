@@ -1640,11 +1640,13 @@ impl AgentSession {
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
             // 메모 유무와 무관하게 항상 로컬 스냅샷 store에 저장한다(기존 동작 유지).
-            let memo_for_capture = memo.as_ref().map(|m| m.text().to_string());
+            // `Memo`를 clone해 blocking task로 move한다(원본은 아래 truncated 안내·원격 전송에서 계속
+            // 쓴다). `&Memo`를 넘기므로 정제 안 된 문자열이 저장 경로에 들어갈 수 없다(타입 불변식).
+            let memo_for_capture = memo.clone();
             let res = tokio::task::spawn_blocking(move || {
                 super::snapshot_capture::capture_forced_with_memo(
                     "manual",
-                    memo_for_capture.as_deref(),
+                    memo_for_capture.as_ref(),
                 )
             })
             .await;
@@ -1659,12 +1661,12 @@ impl AgentSession {
             };
             self.out.note(&msg).await;
 
-            // 메모를 입력했는데 정제 후 비었다(공백/제어문자뿐) — 스냅샷은 남았지만 **메모는 사라졌다**는
-            // 사실을 반드시 알린다(CLI가 exit 1로 알리는 것과 같은 표면화, chat은 한 줄로).
+            // 메모를 입력했는데 정제 후 비었다(공백/제어문자뿐) — **메모는 사라졌다**는 사실을 반드시
+            // 알린다(CLI가 exit 1로 알리는 것과 같은 표면화, chat은 한 줄로). 문구는 `local_ok`를 반드시
+            // 반영한다(아래 pure `empty_memo_note` 참고) — 캡처 실패인데 "스냅샷만 저장했습니다"라고 하면
+            // 자기모순이자 알 수 없는 로컬 성공 단언이다.
             if memo_emptied {
-                self.out
-                    .note("ℹ 메모가 비어(공백/제어문자뿐) 기록하지 않았습니다 — 스냅샷만 저장했습니다.")
-                    .await;
+                self.out.note(empty_memo_note(local_ok)).await;
             }
 
             if memo.as_ref().is_some_and(|m| m.truncated()) {
@@ -2454,9 +2456,9 @@ pub fn record_now_cli(raw_memo: &str) -> RecordNowReport {
         };
     };
 
-    // 메모는 스냅샷 레코드 안에 저장된다 — 이게 본체다(원격은 부가 경로).
-    let local =
-        crate::agent::snapshot_capture::capture_forced_with_memo("manual", Some(memo.text()));
+    // 메모는 스냅샷 레코드 안에 저장된다 — 이게 본체다(원격은 부가 경로). `&Memo`를 그대로 넘긴다
+    // (정제·상한을 통과한 값만 저장 경로에 들어가도록 타입이 강제한다).
+    let local = crate::agent::snapshot_capture::capture_forced_with_memo("manual", Some(&memo));
 
     // 로컬 실패와 무관하게 보낸다(디스크가 꽉 찬 장애야말로 그 관찰이 가장 필요한 순간이다).
     let mut attrs = BTreeMap::new();
@@ -2486,6 +2488,20 @@ pub fn record_now_cli(raw_memo: &str) -> RecordNowReport {
 /// - 둘 다 성공하면 `None`(조용한 성공 — 잘 된 걸 떠들지 않는다. 캡처 라인이 이미 ✓를 찍었다).
 /// - 그 밖엔 **실패한 쪽만** 정확히 짚는다.
 ///
+/// chat `/record now <제어문자뿐>`처럼 메모를 입력했지만 정제 후 비었을 때의 한 줄 안내(순수 함수).
+///
+/// **`local_ok`를 반드시 반영한다.** 캡처가 실패했는데(`false`) "스냅샷만 저장했습니다"라고 하면, 바로
+/// 위 캡처 안내("스냅샷이 기록되지 않았습니다")를 다음 줄에서 뒤집는 자기모순이고, 우리가 이 프로젝트
+/// 내내 잡아온 "이미 실패로 아는 로컬 성공을 단언"하는 그 거짓말의 재발이다(10차에 한 번 밟았다).
+/// 인라인 `if`가 아니라 pure 함수로 뽑아 **probe/캡처 없이 결정적으로** mutation-test한다.
+fn empty_memo_note(local_ok: bool) -> &'static str {
+    if local_ok {
+        "ℹ 메모가 비어(공백/제어문자뿐) 기록하지 않았습니다 — 스냅샷만 저장했습니다."
+    } else {
+        "ℹ 메모가 비어(공백/제어문자뿐) 기록하지 않았습니다."
+    }
+}
+
 /// chat(`handle_record`)과 CLI(`aic snapshot record`)가 **같은 문구·같은 판단**을 쓰도록 pub이다 —
 /// 두 진입점이 각자 메시지를 지으면 한쪽만 고치고 잊는 경로가 생긴다.
 pub fn record_remote_notice(
@@ -3252,11 +3268,20 @@ mod tests {
         );
         assert!(ev.summary.len() <= crate::agent_event::MEMO_MAX_BYTES);
 
-        // 그리고 잘린 메모가 **로컬 레코드에도** 저장돼 있어야 한다(원격만 챙기고 로컬을 빠뜨리지 않게).
-        let rec = crate::snapshot_store::load_snapshots().unwrap();
-        let memo = rec[0].memo.as_deref().expect("로컬에 메모가 없다");
-        assert!(memo.len() <= crate::agent_event::MEMO_MAX_BYTES);
-        assert!(memo.chars().all(|c| c == '가'), "UTF-8 경계가 깨졌다");
+        // 로컬 레코드 검증은 **캡처가 이 환경에서 성사됐을 때만** 한다 — 실제 캡처는 시스템 probe를
+        // 돌리고 `Sandbox::from_cwd`를 타므로, CI/샌드박스에서 실패하면 store가 비어 `rec[0]`가 패닉했다.
+        // 그건 "코드가 틀렸다"가 아니라 "이 머신에서 probe가 마침 실패했다"라 이 프로젝트 원칙 위반이다.
+        // 메모가 probe와 **무관하게** 저장되는지는 probe 없는 `memo_survives_locally_even_with_no_daemon`이
+        // 결정적으로 검증한다. 여기선 캡처가 됐다면 메모가 반드시 있어야 함만 본다(threading 결함이면
+        // 아래 expect가 잡는다 — 캡처 성공 + 메모 없음은 코드 버그다).
+        if let Some(r) = crate::snapshot_store::load_snapshots().unwrap().first() {
+            let memo = r
+                .memo
+                .as_deref()
+                .expect("캡처됐는데 메모가 로컬에 없다(threading 결함)");
+            assert!(memo.len() <= crate::agent_event::MEMO_MAX_BYTES);
+            assert!(memo.chars().all(|c| c == '가'), "UTF-8 경계가 깨졌다");
+        }
     }
 
     #[test]
@@ -3281,13 +3306,17 @@ mod tests {
             ev.attrs
         );
 
-        // 로컬 레코드에도 같은 메모가 저장된다(저장본과 전송본이 같은 정제 결과를 공유).
-        let rec = crate::snapshot_store::load_snapshots().unwrap();
-        assert_eq!(
-            rec[0].memo.as_deref(),
-            Some(ev.summary.as_str()),
-            "로컬에 저장된 메모와 전송된 메모가 다르다"
-        );
+        // 로컬 레코드 검증은 캡처가 성사됐을 때만(report.local = Ok(Some)) — probe/Sandbox 환경 실패로
+        // store가 비면 skip한다(환경 문제와 코드 결함을 섞지 않는다; chat 테스트와 동일 근거). 저장본과
+        // 전송본이 같은 정제 결과를 공유하는지는 여기서, 결정적 저장 자체는 `memo_survives_locally_...`가 본다.
+        if matches!(report.local, Ok(Some(_))) {
+            let rec = crate::snapshot_store::load_snapshots().unwrap();
+            assert_eq!(
+                rec.first().and_then(|r| r.memo.as_deref()),
+                Some(ev.summary.as_str()),
+                "로컬에 저장된 메모와 전송된 메모가 다르다"
+            );
+        }
     }
 
     #[test]
@@ -3602,6 +3631,28 @@ mod tests {
     }
 
     // ── t3 B3: 로컬/원격 두 결과를 각각 정확히 보고 ──────────────────────────────
+
+    #[test]
+    fn empty_memo_note_does_not_claim_local_success_when_capture_failed() {
+        // **10차 재발 회귀 테스트**: 빈-메모 안내가 `local_ok`를 반드시 반영해야 한다. 캡처 실패면
+        // "저장했습니다"를 말하면 안 된다 — 위에서 "기록되지 않았습니다"를 찍고 뒤집는 자기모순이자,
+        // 이미 실패로 아는 로컬 성공을 단언하는 거짓말이다. pure 함수라 probe/캡처 없이 결정적으로 잡는다.
+        let failed = empty_memo_note(false);
+        assert!(
+            !failed.contains("저장했습니다"),
+            "캡처 실패인데 로컬 저장 성공을 단언한다: {failed}"
+        );
+        assert!(
+            failed.contains("기록하지 않았습니다"),
+            "메모가 비었다는 사실은 알려야 한다: {failed}"
+        );
+        // 성공(local_ok=true)이면 스냅샷은 남았다는 사실을 함께 준다(그건 아는 진실이다).
+        let ok = empty_memo_note(true);
+        assert!(
+            ok.contains("스냅샷만 저장했습니다"),
+            "캡처 성공인데 스냅샷 저장을 안 알린다: {ok}"
+        );
+    }
 
     #[test]
     fn record_notice_is_silent_only_when_both_succeeded() {
