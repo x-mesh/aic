@@ -222,12 +222,14 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
 /// 정확히 같은 부류다 — 몇 번을 보내도 성공하지 않는 배치. 같은 처리를 받는다.
 #[derive(Debug)]
 pub enum PushError {
-    /// 4xx — 요청 자체가 수신 측 계약을 위반했다. 재전송은 의미가 없다.
+    /// 요청 자체가 수신 측 계약을 위반했다 — 400·401·413 등. 재전송은 의미가 없다.
     ///
     /// 401도 여기 넣는다. 토큰을 고치면 성공할 수도 있지만 그건 **재시작을 동반**하고, 그때까지
     /// 401 배치가 큐를 막는 것보다는 버리는 편이 낫다 — 드롭 카운터가 그 사실을 드러낸다.
+    ///
+    /// **429·408은 여기가 아니다** — 그 둘은 "이따 다시 오라"는 뜻이라 `Transient`다([`classify`]).
     Permanent(String),
-    /// 5xx · 타임아웃 · 커넥션 실패 — collector가 돌아오면 성공할 수 있다.
+    /// 5xx · 429 · 408 · 타임아웃 · 커넥션 실패 — collector가 돌아오면 성공할 수 있다.
     Transient(String),
 }
 
@@ -247,9 +249,22 @@ impl PushError {
 }
 
 /// HTTP 응답을 [`PushError`]로 분류한다. `push`/`push_logs`가 공유한다.
+///
+/// **4xx라고 전부 영구는 아니다.** 두 개는 명시적으로 "지금은 안 되니 이따 다시 오라"는 뜻이라
+/// 재시도 대상이다 — 이걸 영구로 취급하면 **수신 측이 과부하인 바로 그 순간에 로그를 버린다.**
+/// 로그가 가장 필요한 순간이 정확히 그때다.
+///
+/// - `429 Too Many Requests` — 레이트 리밋. 물러섰다 다시 보내면 성공한다.
+/// - `408 Request Timeout` — 서버가 요청을 다 못 읽었다. 같은 배치가 다음엔 통과할 수 있다.
+///
+/// 나머지 4xx(400·401·413 등)는 재전송해도 같은 응답이다 — 영구.
 fn classify(status: reqwest::StatusCode) -> PushError {
     let msg = format!("collector가 {status} 응답");
-    if status.is_client_error() {
+    let retryable_4xx = matches!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::REQUEST_TIMEOUT
+    );
+    if status.is_client_error() && !retryable_4xx {
         PushError::Permanent(msg)
     } else {
         PushError::Transient(msg)
@@ -331,6 +346,39 @@ fn unix_nanos_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 4xx라고 전부 영구가 아니다. 429·408을 영구로 취급하면 **수신 측이 과부하인 바로 그 순간에
+    /// 로그를 버린다** — 로그가 가장 필요한 순간이 정확히 그때다.
+    #[test]
+    fn rate_limit_and_request_timeout_are_transient_not_permanent() {
+        use reqwest::StatusCode;
+
+        // "이따 다시 오라" — 물러섰다 재전송하면 성공한다.
+        for s in [StatusCode::TOO_MANY_REQUESTS, StatusCode::REQUEST_TIMEOUT] {
+            assert!(
+                !classify(s).is_permanent(),
+                "{s}는 재시도 대상이어야 한다 — 영구로 버리면 과부하 때 로그가 사라진다"
+            );
+        }
+
+        // 재전송해도 같은 응답 — spool에 넣으면 poison batch가 되어 FIFO를 막는다.
+        for s in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ] {
+            assert!(classify(s).is_permanent(), "{s}는 영구 실패여야 한다");
+        }
+
+        // 5xx·그 외는 collector가 돌아오면 성공한다.
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+        ] {
+            assert!(!classify(s).is_permanent(), "{s}는 재시도 대상이어야 한다");
+        }
+    }
 
     #[test]
     fn metrics_url_appends_path_without_double_slash() {
