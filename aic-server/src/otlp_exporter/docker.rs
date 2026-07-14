@@ -60,6 +60,9 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// "docker는 aic 배포물이 아니라 시스템에 이미 설치돼 있으니 PATH가 유일하게 맞는 탐색 위치"라는
 /// 판단이 틀렸다 — 그건 **셸에서 실행할 때만 참**이고, 데몬은 셸을 거치지 않는다.
+///
+/// **이 목록의 일부는 쓰기 가능한 디렉토리다** — 왜 그래도 괜찮은지는
+/// [`resolve_docker_bin_with`]의 "쓰기 가능 경로와 root" 절 참고.
 const FALLBACK_DOCKER_DIRS: &[&str] = &[
     // Docker Desktop·OrbStack이 심볼릭 링크를 두는 자리(macOS/Linux 공통). 이 머신도 여기다.
     "/usr/local/bin",
@@ -93,60 +96,144 @@ pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
         configured,
         std::env::var_os("PATH"),
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        // SAFETY: geteuid는 실패하지 않고 부작용이 없다(POSIX). aic 안에서도 이미 쓰는 패턴.
+        unsafe { libc::geteuid() } == 0,
         &is_executable_file,
     )
 }
 
-/// [`resolve_docker_bin`]의 순수 코어 — 환경(PATH/HOME)과 파일 존재 판정을 주입받아 테스트가
+/// [`resolve_docker_bin`]의 순수 코어 — 환경(PATH/HOME/euid)과 실행 가능 판정을 주입받아 테스트가
 /// **이 머신의 docker 설치 상태에 의존하지 않게** 한다(CI에는 docker가 없을 수 있다).
+///
+/// # 반환값은 반드시 절대경로다
+///
+/// aicd는 데몬이라 **cwd가 무엇인지 보장되지 않는다**(launchd는 `/`, systemd는 unit이 정하는 대로).
+/// 상대경로를 spawn하면 그 시점의 cwd 기준으로 해석되므로 "환경에 따라 조용히 다른 바이너리를
+/// 실행"할 수 있다 — 이 모듈이 없애려던 부류의 버그 그 자체다. 그래서 후보 채택을 아래 `accept`
+/// **한 곳**으로 모으고, 거기서 `is_absolute()`를 강제한다. 탐색 단계가 늘어도 절대경로 불변식이
+/// 새 코드 경로로 새지 않는다.
+///
+/// 두 군데가 특히 상대경로를 만든다:
+/// - **PATH의 빈 항목**: POSIX에서 `PATH`의 빈 항목(`/usr/bin::/bin`, 선행/후행 `:`)은 **cwd**를
+///   뜻한다. 그대로 join하면 후보가 `docker`(상대경로)가 된다 → 건너뛴다(탐색은 계속한다).
+/// - **상대경로 config**: `docker_bin = "bin/docker"` 같은 값 → **거부한다**(폴백하지 않는다).
+///   오타·상대경로를 조용히 덮고 엉뚱한 docker를 쓰는 것보다, 없다고 말해 주는 편이 덜 헷갈린다.
+///
+/// # 쓰기 가능 경로와 root
+///
+/// 폴백 목록에는 쓰기 가능한 디렉토리가 섞여 있다 — `$HOME/.orbstack/bin`(사용자 소유),
+/// `/usr/local/bin`(macOS에선 admin 그룹 쓰기 가능). 그럼에도 폴백을 두는 근거:
+///
+/// aicd는 **사용자 단위 서비스**로만 설치된다 — `~/Library/LaunchAgents/com.x-mesh.aicd.plist`
+/// (LaunchAgents, `UserName` 키 없음)와 `systemctl --user`(`aic-client/src/daemon_install.rs`).
+/// 둘 다 설치한 사용자의 권한으로 돈다. 그 사용자가 자기 `$HOME`에 docker를 심어 aicd에게
+/// 실행시키는 건 **권한 상승이 아니다** — 애초에 그 사용자는 plist 자체를 고쳐 아무 바이너리나
+/// 실행시킬 수 있다(plist가 있는 `~/Library/LaunchAgents`가 사용자 쓰기 가능하다).
+///
+/// 위험한 건 **root로 뜬 aicd**뿐이다(`sudo aicd` — 지원 설치 경로는 아니지만 막을 수는 없다).
+/// 그때는 사용자 쓰기 가능 경로를 뒤지는 것이 곧 root 하이재킹 통로다. 그래서 **euid가 0이면
+/// 폴백 탐색을 통째로 건너뛰고 config/PATH만 본다**. 폴백 목록을 골라내지 않고 전부 건너뛰는 이유:
+/// root의 PATH에는 이미 `/usr/bin`이 들어 있어(sudo secure_path) 폴백이 실제로 메워 주는 건
+/// **사용자 쓰기 가능 경로뿐**이고, "디렉토리 소유자를 stat해서 고른다"는 그 자체로 또 하나의
+/// TOCTOU를 들여온다. 못 찾으면 WARN이 `docker_bin`으로 못을 박으라고 알려 준다.
+///
+/// # TOCTOU는 굳이 막지 않는다
+///
+/// 판정(기동 시 1회)과 spawn(60초마다, 데몬 수명 내내) 사이에 경로를 갈아끼울 창은 분명히 있다.
+/// 그래도 **막지 않는다**: 그 창을 쓸 수 있는 주체는 (a) aicd와 같은 사용자 — 위에서 봤듯 이미
+/// plist로 임의 실행이 가능하니 얻는 게 없고, (b) root — 방어의 의미가 없다. root로 뜬 aicd는
+/// 애초에 사용자 쓰기 가능 경로를 안 본다. 즉 이 TOCTOU를 막아서 실제로 닫히는 공격은 **하나도
+/// 없다**. 매 tick 재판정이나 fd 고정(`fexecve`)은 순수 비용이라 넣지 않는다.
 fn resolve_docker_bin_with(
     configured: Option<&Path>,
     path_var: Option<OsString>,
     home: Option<&Path>,
+    running_as_root: bool,
     is_exec: &dyn Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
+    // 후보를 채택하는 **유일한** 관문. 절대경로 불변식이 여기 한 곳에만 있어야 탐색 단계가 늘어도
+    // 새 경로로 새지 않는다(위 doc "반환값은 반드시 절대경로다" 참고).
+    let accept = |cand: PathBuf| -> Option<PathBuf> {
+        (cand.is_absolute() && is_exec(&cand)).then_some(cand)
+    };
+
     // 1. config가 명시했으면 그것만 본다 — 비표준 위치에 설치한 사람의 명시적 의사다.
-    //    지정했는데 실행 파일이 아니면 **폴백하지 않고 실패**한다: 오타를 조용히 덮고 엉뚱한
-    //    docker를 쓰는 것보다, 지정한 게 없다고 말해 주는 편이 훨씬 덜 헷갈린다.
+    //    실행 파일이 아니거나 상대경로면 **폴백하지 않고 실패**한다.
     if let Some(p) = configured {
-        return is_exec(p).then(|| p.to_path_buf());
+        if !p.is_absolute() {
+            tracing::warn!(
+                docker_bin = %p.display(),
+                "[aicd.exporter].docker_bin이 상대경로 — 데몬은 cwd가 보장되지 않아 거부한다(절대경로로 지정할 것)"
+            );
+        }
+        return accept(p.to_path_buf());
     }
 
     // 2. PATH — 셸에서 띄운 aicd나 PATH가 제대로 잡힌 서비스라면 여기서 끝난다.
+    //    빈 항목(= cwd)이 만드는 상대경로 후보는 accept가 걸러 내고, 탐색은 다음 항목으로 계속된다.
     if let Some(paths) = path_var {
         for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("docker");
-            if is_exec(&cand) {
-                return Some(cand);
+            if let Some(found) = accept(dir.join("docker")) {
+                return Some(found);
             }
         }
     }
 
     // 3. 서비스 매니저 PATH에는 없지만 docker가 실제로 설치되는 표준 위치들.
+    //    root면 여기부터는 보지 않는다(위 doc "쓰기 가능 경로와 root" 참고).
+    if running_as_root {
+        tracing::warn!(
+            "root로 실행 중 — 사용자 쓰기 가능 폴백 경로($HOME/.orbstack/bin, /usr/local/bin 등)를 \
+             탐색하지 않는다. docker를 쓰려면 [aicd.exporter].docker_bin에 절대경로를 지정할 것"
+        );
+        return None;
+    }
+
     for dir in FALLBACK_DOCKER_DIRS {
-        let cand = Path::new(dir).join("docker");
-        if is_exec(&cand) {
-            return Some(cand);
+        if let Some(found) = accept(Path::new(dir).join("docker")) {
+            return Some(found);
         }
     }
     if let Some(h) = home {
-        let cand = h.join(HOME_RELATIVE_DOCKER_PATH);
-        if is_exec(&cand) {
-            return Some(cand);
+        if let Some(found) = accept(h.join(HOME_RELATIVE_DOCKER_PATH)) {
+            return Some(found);
         }
     }
 
     None
 }
 
-/// 실행 가능한 **파일**인가. `metadata`는 심볼릭 링크를 따라가므로
-/// `/usr/local/bin/docker → /Applications/OrbStack.app/...`처럼 링크로 설치된 경우도 통과한다
-/// (이 머신이 실제로 그렇다).
+/// **이 프로세스가 실제로 spawn할 수 있는** 실행 파일인가.
+///
+/// 두 검사를 모두 해야 한다:
+/// 1. **정규 파일인가** — `faccessat(X_OK)`는 *탐색 가능한 디렉토리*에도 성공하므로 이것만으론
+///    디렉토리를 docker로 오인한다. `metadata`는 심볼릭 링크를 따라가므로
+///    `/usr/local/bin/docker → /Applications/OrbStack.app/...`처럼 링크로 설치된 경우도 통과한다
+///    (이 머신이 실제로 그렇다).
+/// 2. **실효 권한으로 실행 가능한가** — 예전엔 `mode() & 0o111 != 0`을 봤는데, 이건 **"누군가는
+///    실행 가능"**만 본다. 소유자만 x 비트가 있고 aicd가 다른 사용자면 판정은 통과하는데 spawn은
+///    `EACCES`로 죽는다 — 이 커밋이 없애려던 "매 tick 실패"가 그대로 남는 것이다. 그래서
+///    `faccessat(..., X_OK, AT_EACCESS)`로 **실효 uid/gid** 기준 판정을 커널에 맡긴다
+///    (`access(2)`는 real uid를 보므로 setuid 상황에서 틀린 답을 낸다).
 fn is_executable_file(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    use std::os::unix::ffi::OsStrExt;
+
+    if !std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false) {
+        return false;
+    }
+    // 경로에 NUL이 있으면 애초에 exec할 수 없다.
+    let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: c_path는 살아 있는 NUL 종료 C 문자열이고, faccessat은 그것을 읽기만 한다.
+    unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            libc::X_OK,
+            libc::AT_EACCESS,
+        ) == 0
+    }
 }
 
 /// docker exporter 실행 설정.
@@ -437,9 +524,44 @@ mod tests {
 
     /// 주어진 경로 집합만 "실행 가능한 파일"로 치는 가짜 판정기(경로를 소유하므로 입력을 빌리지
     /// 않는다).
+    ///
+    /// **정확 경로 매칭이다** — 그래서 상대경로 후보(`docker`)도 목록에 넣으면 "있다"고 답한다.
+    /// 아래 절대경로 테스트들이 바로 그 성질을 이용해, resolve가 상대경로 후보를 채택하려 들면
+    /// 잡아낸다(예전엔 이 픽스처가 절대경로만 쥐여 줘서 그 버그를 구조적으로 못 봤다).
     fn only(existing: &[&str]) -> impl Fn(&Path) -> bool {
         let set: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
         move |p: &Path| set.iter().any(|e| e == p)
+    }
+
+    /// **모든 resolve 테스트가 통과하는 관문.** 개별 테스트는 `resolve_docker_bin_with`를 직접
+    /// 부르지 않고 반드시 이걸 거친다 — 어떤 입력을 주든 반환값이 절대경로임을 여기서 단언하므로,
+    /// 개별 테스트가 그 단언을 잊어도 불변식은 구조적으로 지켜진다.
+    fn resolve(
+        configured: Option<&Path>,
+        path_var: Option<OsString>,
+        home: Option<&Path>,
+        is_exec: &dyn Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        resolve_as(configured, path_var, home, false, is_exec)
+    }
+
+    /// [`resolve`]의 root 포함 버전 — 절대경로 단언은 동일하다.
+    fn resolve_as(
+        configured: Option<&Path>,
+        path_var: Option<OsString>,
+        home: Option<&Path>,
+        running_as_root: bool,
+        is_exec: &dyn Fn(&Path) -> bool,
+    ) -> Option<PathBuf> {
+        let got = resolve_docker_bin_with(configured, path_var, home, running_as_root, is_exec);
+        if let Some(p) = &got {
+            assert!(
+                p.is_absolute(),
+                "resolve가 상대경로를 반환했다 — aicd는 데몬이라 cwd가 보장되지 않는다: {}",
+                p.display()
+            );
+        }
+        got
     }
 
     /// **회귀 가드**: launchd로 뜬 aicd의 PATH는 `/usr/bin:/bin:/usr/sbin:/sbin`뿐이고 docker는
@@ -448,15 +570,14 @@ mod tests {
     #[test]
     fn finds_docker_outside_the_launchd_path() {
         let launchd_path = Some(OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
-        let got =
-            resolve_docker_bin_with(None, launchd_path, None, &only(&["/usr/local/bin/docker"]));
+        let got = resolve(None, launchd_path, None, &only(&["/usr/local/bin/docker"]));
         assert_eq!(got, Some(PathBuf::from("/usr/local/bin/docker")));
     }
 
     #[test]
     fn prefers_path_over_the_fallback_dirs() {
         // PATH에 있으면 굳이 폴백을 뒤지지 않는다(사용자 PATH가 우선).
-        let got = resolve_docker_bin_with(
+        let got = resolve(
             None,
             Some(OsString::from("/opt/custom/bin:/usr/bin")),
             None,
@@ -467,7 +588,7 @@ mod tests {
 
     #[test]
     fn configured_path_wins_over_everything() {
-        let got = resolve_docker_bin_with(
+        let got = resolve(
             Some(Path::new("/custom/docker")),
             Some(OsString::from("/usr/bin")),
             None,
@@ -480,7 +601,7 @@ mod tests {
     /// 엉뚱한 docker를 쓰면 더 헷갈린다.
     #[test]
     fn a_bad_configured_path_does_not_silently_fall_back() {
-        let got = resolve_docker_bin_with(
+        let got = resolve(
             Some(Path::new("/typo/dcoker")),
             Some(OsString::from("/usr/bin")),
             None,
@@ -494,7 +615,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_home_orbstack_path() {
-        let got = resolve_docker_bin_with(
+        let got = resolve(
             None,
             Some(OsString::from("/usr/bin")),
             Some(Path::new("/Users/someone")),
@@ -509,14 +630,14 @@ mod tests {
     /// Linux 배포판 패키지 위치(`/usr/bin/docker`)도 커버해야 한다.
     #[test]
     fn finds_the_linux_distro_package_path() {
-        let got = resolve_docker_bin_with(None, None, None, &only(&["/usr/bin/docker"]));
+        let got = resolve(None, None, None, &only(&["/usr/bin/docker"]));
         assert_eq!(got, Some(PathBuf::from("/usr/bin/docker")));
     }
 
     /// docker가 아예 없으면 `None` — 호출부가 exporter를 비활성한다(매 tick WARN 대신 기동 시 1회).
     #[test]
     fn returns_none_when_docker_is_absent_everywhere() {
-        let got = resolve_docker_bin_with(
+        let got = resolve(
             None,
             Some(OsString::from("/usr/bin:/bin")),
             Some(Path::new("/home/nobody")),
@@ -525,10 +646,150 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    // ── 절대경로 불변식: 상대경로 후보를 만드는 세 입력 ────────────────────────
+    //
+    // aicd는 데몬이라 cwd가 보장되지 않는다(launchd는 `/`, systemd는 unit이 정하는 대로). 상대경로를
+    // 채택하면 "cwd 기준 탐색"이 되어, 이 커밋이 없애려던 "환경에 따라 조용히 다른 걸 실행"이 그대로
+    // 돌아온다. 아래 셋은 판정기가 상대경로 후보에 "있다"고 답하도록 일부러 꾸며 놓았다.
+
+    /// **POSIX: `PATH`의 빈 항목은 cwd를 뜻한다.** `/nowhere::/also/nowhere`의 가운데 빈 항목이
+    /// 후보 `docker`(상대경로)를 만든다 — cwd에 악의적 `docker`가 놓인 상황 그대로다.
+    #[test]
+    fn an_empty_path_entry_never_yields_a_relative_candidate() {
+        let got = resolve(
+            None,
+            Some(OsString::from("/nowhere::/also/nowhere")),
+            None,
+            &only(&["docker"]),
+        );
+        assert_eq!(
+            got, None,
+            "PATH의 빈 항목(cwd)이 만든 상대경로 후보를 채택했다 — 데몬의 cwd는 보장되지 않는다"
+        );
+    }
+
+    /// 빈 항목은 **건너뛸 뿐, 탐색을 중단시키지 않는다** — 선행 `:`(= cwd가 맨 앞) 뒤의 정상
+    /// 디렉토리에서 계속 찾아야 한다. cwd의 `docker`가 `/usr/bin/docker`를 선점하면 안 된다.
+    #[test]
+    fn a_leading_empty_path_entry_is_skipped_not_preferred() {
+        let got = resolve(
+            None,
+            Some(OsString::from(":/usr/bin")),
+            None,
+            &only(&["docker", "/usr/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/usr/bin/docker")),
+            "cwd(빈 항목)의 docker를 절대경로보다 먼저 채택했다"
+        );
+    }
+
+    /// PATH에 들어 있는 **상대경로 디렉토리**도 같은 함정이다 — 건너뛰고 계속 찾는다.
+    #[test]
+    fn a_relative_path_dir_is_skipped() {
+        let got = resolve(
+            None,
+            Some(OsString::from("bin:./tools:/usr/bin")),
+            None,
+            &only(&["bin/docker", "./tools/docker", "/usr/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/usr/bin/docker")),
+            "PATH의 상대경로 디렉토리를 채택했다"
+        );
+    }
+
+    /// **상대경로 config는 거부한다**(폴백하지 않는다). 데몬의 cwd에 의존하는 설정은 조용히 받아
+    /// 주는 것보다 "없다"고 말해 주는 편이 맞다 — 무엇을 실행할지 애초에 예측할 수 없다.
+    #[test]
+    fn a_relative_configured_path_is_rejected() {
+        for rel in ["docker", "bin/docker", "./docker", "../bin/docker"] {
+            let got = resolve(
+                Some(Path::new(rel)),
+                Some(OsString::from("/usr/bin")),
+                None,
+                // 상대경로도 폴백도 전부 "있다"고 답한다 — 그래도 채택하면 안 된다.
+                &only(&[rel, "/usr/bin/docker", "/usr/local/bin/docker"]),
+            );
+            assert_eq!(
+                got, None,
+                "상대경로 config({rel})를 채택했다 — 데몬의 cwd는 보장되지 않는다"
+            );
+        }
+    }
+
+    // ── root 가드 ─────────────────────────────────────────────────────────────
+
+    /// root로 뜬 aicd는 **사용자 쓰기 가능 폴백 경로를 뒤지지 않는다**(`resolve_docker_bin_with`의
+    /// "쓰기 가능 경로와 root" 참고). 사용자 소유 `$HOME/.orbstack/bin`이나 admin 쓰기 가능한
+    /// `/usr/local/bin`에 심어 둔 바이너리를 root로 실행해 주면 그게 곧 권한 상승 통로다.
+    #[test]
+    fn as_root_the_writable_fallback_dirs_are_not_searched() {
+        let got = resolve_as(
+            None,
+            Some(OsString::from("/usr/sbin:/sbin")), // root PATH에는 docker가 없다.
+            Some(Path::new("/Users/victim")),
+            true,
+            &only(&[
+                "/usr/local/bin/docker",
+                "/Users/victim/.orbstack/bin/docker",
+            ]),
+        );
+        assert_eq!(
+            got, None,
+            "root인데 쓰기 가능 폴백 경로의 docker를 채택했다 — 권한 상승 통로"
+        );
+    }
+
+    /// 같은 입력을 **비-root로** 주면 찾아야 한다 — 위 테스트가 "root라서 막혔다"를 증명하려면
+    /// "root가 아니면 찾는다"가 함께 참이어야 한다(공허 통과 방지).
+    #[test]
+    fn as_non_root_the_same_fallback_dirs_are_searched() {
+        let got = resolve(
+            None,
+            Some(OsString::from("/usr/sbin:/sbin")),
+            Some(Path::new("/Users/victim")),
+            &only(&[
+                "/usr/local/bin/docker",
+                "/Users/victim/.orbstack/bin/docker",
+            ]),
+        );
+        assert_eq!(got, Some(PathBuf::from("/usr/local/bin/docker")));
+    }
+
+    /// 다만 root라도 **PATH와 config는 그대로 존중한다** — 폴백만 끊는 것이지 root에서 docker를
+    /// 못 쓰게 만드는 게 아니다(그래서 WARN이 `docker_bin`을 안내한다).
+    #[test]
+    fn as_root_path_and_config_still_resolve() {
+        let via_path = resolve_as(
+            None,
+            Some(OsString::from("/usr/bin")),
+            None,
+            true,
+            &only(&["/usr/bin/docker"]),
+        );
+        assert_eq!(via_path, Some(PathBuf::from("/usr/bin/docker")));
+
+        let via_config = resolve_as(
+            Some(Path::new("/opt/docker/bin/docker")),
+            None,
+            None,
+            true,
+            &only(&["/opt/docker/bin/docker"]),
+        );
+        assert_eq!(via_config, Some(PathBuf::from("/opt/docker/bin/docker")));
+    }
+
+    // ── 실행 가능 판정 ────────────────────────────────────────────────────────
+
     /// 실제 파일시스템 판정기 — 디렉토리나 비실행 파일을 docker로 오인하지 않는다.
     #[test]
     fn is_executable_file_rejects_dirs_and_non_executables() {
         let dir = tempfile::tempdir().unwrap();
+        // 디렉토리는 x 비트(= 탐색 권한)가 서 있어 `faccessat(X_OK)`가 **성공한다** —
+        // is_file() 검사가 없으면 디렉토리를 docker로 오인한다.
         assert!(
             !is_executable_file(dir.path()),
             "디렉토리는 실행 파일이 아니다"
@@ -557,6 +818,38 @@ mod tests {
         let link = dir.path().join("docker");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(is_executable_file(&link), "심볼릭 링크를 따라가야 한다");
+    }
+
+    /// **`mode() & 0o111 != 0`으로는 못 잡는 케이스**: 소유자에게만 x 비트가 **없는** 파일
+    /// (mode `0o011` — group/other만 실행 가능). "누군가는 실행 가능"만 보는 낡은 판정은 여기서
+    /// true를 내지만, aicd(= 이 파일의 소유자)가 실제로 spawn하면 `EACCES`로 죽는다 — 이 커밋이
+    /// 없애려던 "매 tick 실패"가 그대로 남는 것이다. 실효 권한(`faccessat` + `AT_EACCESS`)이라야
+    /// false다.
+    #[test]
+    fn is_executable_file_rejects_a_file_this_process_cannot_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("owner-cannot-exec");
+        std::fs::write(&f, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o011)).unwrap();
+
+        // 픽스처 전제를 못박는다 — 낡은 판정이라면 이 파일을 "실행 가능"으로 본다. 이게 깨지면
+        // 이 테스트는 아무것도 증명하지 못하므로 조용히 통과시키지 않고 여기서 터뜨린다.
+        let mode = std::fs::metadata(&f).unwrap().permissions().mode();
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "픽스처 전제 붕괴: 낡은 판정(mode & 0o111)이 이 파일을 실행 불가로 본다면 대조가 성립하지 않는다"
+        );
+
+        // root는 x 비트가 하나라도 서 있으면 실제로 실행할 수 있으니 그때는 true가 정답이다.
+        // 요점은 "우리 판정 == 커널의 실효 권한 판정"이고, 그건 양쪽 다에서 참이어야 한다.
+        // (mutation 검증은 비-root에서 한다 — 아래 assert가 false를 요구한다.)
+        let is_root = unsafe { libc::geteuid() } == 0;
+        assert_eq!(
+            is_executable_file(&f),
+            is_root,
+            "실효 권한으로 판정해야 한다 — 소유자에게 x가 없으면 소유자는 실행할 수 없다 (euid==0: {is_root})"
+        );
     }
 
     /// 실제 `docker system df --format json` 출력(TASK-CONTEXT.md 픽스처) — 4개 카테고리 NDJSON.
