@@ -38,9 +38,7 @@ pub(super) struct HostExtraState {
 }
 
 impl HostExtraState {
-    /// t8이 `host_metrics.rs`에서 이 상태를 들고 [`collect`]를 부르기 전까지는 호출부가 없다
-    /// ([`collect`]의 주석 참고 — 이 `allow`도 그때 함께 제거한다).
-    #[allow(dead_code)]
+    /// `host_metrics.rs`의 `HostSampler`가 이 상태를 들고 [`collect`]를 부른다(t8 배선).
     pub(super) fn new() -> Self {
         Self::default()
     }
@@ -49,15 +47,8 @@ impl HostExtraState {
 /// host_extra metric들을 수집한다. 개별 metric 실패는 해당 point만 생략하고 나머지는 계속
 /// 수집한다 — 어떤 경로로도 패닉하지 않는다.
 ///
-/// **`allow(dead_code)`가 여기 붙은 이유**: 이 모듈의 유일한 진입점인데, `mod.rs`는 아직 `mod
-/// host_extra;` 등록만 하고 호출하지 않는다(배선은 t8 몫 — 모듈 doc 참고). 진입점이 죽어 있으니
-/// 그 아래 `collect_*`/`compressor_points`/`HostPort`가 전부 **transitive하게** dead로 잡힌다.
-/// 그래서 개별 함수마다 `allow`를 뿌리지 않고 **진입점 하나만** 덮는다 — t8이 `collect()`를 부르는
-/// 순간 트리 전체가 살아나므로, 그때 이 `allow` 하나(와 `HostExtraState::new`의 것)만 지우면 된다.
-///
-/// 참고: 이건 플랫폼과 무관한 이유다(macOS/Linux 양쪽 다 호출부가 없어서 난다). 플랫폼별로 한쪽에서만
-/// 쓰이는 순수 파서(`parse_psi_avg10`/`parse_file_nr`)는 별도로 `cfg_attr`로 좁게 처리한다.
-#[allow(dead_code)]
+/// `host_metrics.rs`의 `HostSampler::sample()`이 이 함수를 호출한다(t8 배선). 플랫폼별로 한쪽에서만
+/// 쓰이는 순수 파서(`parse_psi_avg10`/`parse_file_nr`)는 별도로 `cfg_attr`로 dead_code를 좁게 처리한다.
 pub(super) fn collect(state: &mut HostExtraState) -> Vec<MetricPoint> {
     let mut points = Vec::new();
     collect_compressor(state, &mut points);
