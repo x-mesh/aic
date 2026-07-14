@@ -218,6 +218,10 @@ pub enum RecordOutcome {
     ///
     /// `backlog` = 지금 spool에 밀려 있는 배치 수. **단언이 아니라 관찰**이다. `spool_batches`는
     /// 누적이 아니라 **현재 적재량**이라 드레인되면 줄어든다(`spool_dropped`와 다른 점이다).
+    ///
+    /// **이 메모의 지연량이 아니다.** spool은 네 exporter(events/connections/changes/agent)가
+    /// **공유**하므로, 이 수치는 "지금 collector로 못 나가고 있는 배치 전체"이지 이 메모가 그 안
+    /// 어디에 있는지는 말해 주지 않는다. 안내 문구도 그 선을 넘지 않아야 한다.
     Delivered { backlog: u64 },
     /// aicd가 받아들였지만 **구독 상태를 확인하지 못했다**(status 조회 실패). 도달 여부를 **모른다**.
     ///
@@ -289,11 +293,15 @@ impl RecordOutcome {
         match self {
             // 전송 수용 + 구독자 있음 + spool 비어 있음 = 할 말 없음.
             RecordOutcome::Delivered { backlog: 0 } => None,
-            // 갔지만 아직 collector에 못 닿아 디스크에 쌓여 있다 — "서버에서 이미 보인다"고
+            // 갔지만 collector로 나가지 못한 배치가 spool에 쌓여 있다 — "서버에서 이미 보인다"고
             // 오해하지 않도록 관찰 사실을 덧붙인다(유실은 아니다).
+            //
+            // backlog는 **공유 spool 전체**의 적재량이라 이 메모의 지연량이 아니다. 그래서 "이 메모가
+            // {backlog}개만큼 밀렸다"가 아니라 "지금 spool이 밀려 있다"는 사실만 말한다.
             RecordOutcome::Delivered { backlog } => Some(format!(
-                "메모를 aicd에 전달했습니다. 다만 지금 collector에 닿지 못해 spool에 {backlog}개 \
-                 배치가 밀려 있어, 서버 반영이 지연될 수 있습니다(복구되면 전송됩니다)."
+                "메모를 aicd에 전달했습니다. 다만 지금 collector로 나가지 못한 배치가 spool에 \
+                 {backlog}개 쌓여 있어(모든 exporter 합계), 서버 반영이 지연될 수 있습니다\
+                 (복구되면 전송됩니다)."
             )),
             RecordOutcome::Unknown => Some(
                 "메모를 aicd에 전달했지만 exporter 상태를 확인하지 못해 **서버 도달 여부는 알 수 \
