@@ -175,7 +175,10 @@ fn resolve_docker_bin_with(
             return None;
         }
         if running_as_root && !is_root_controlled(&cand) {
-            tracing::warn!(
+            // **debug다** — 이 함수는 매 tick 재탐색에서 다시 불린다(`serve_docker`). 여기서 WARN을
+            // 내면 "60초마다 WARN을 쏟지 않는다"는 이 모듈의 보장이 그대로 깨진다. 상태가 바뀔 때만
+            // (찾음/잃음) 시끄러워야 하고, 그 판단은 상태를 아는 호출부가 한다.
+            tracing::debug!(
                 candidate = %cand.display(),
                 "root로 실행 중 — root 통제 밖(비-root 소유이거나 non-root 쓰기 가능) 경로의 docker는 \
                  채택하지 않는다. 쓰려면 [aicd.exporter].docker_bin에 root 통제 하의 절대경로를 지정할 것"
@@ -192,7 +195,8 @@ fn resolve_docker_bin_with(
     //    가드가 다시 우회된다.
     if let Some(p) = configured {
         if !p.is_absolute() {
-            tracing::warn!(
+            // 여기도 debug다 — 위 accept와 같은 이유(매 tick 재탐색에서 다시 불린다).
+            tracing::debug!(
                 docker_bin = %p.display(),
                 "[aicd.exporter].docker_bin이 상대경로 — 데몬은 cwd가 보장되지 않아 거부한다(절대경로로 지정할 것)"
             );
@@ -244,7 +248,7 @@ fn is_root_controlled_path(p: &Path) -> bool {
         let Ok(md) = std::fs::symlink_metadata(c) else {
             return false;
         };
-        if !is_root_controlled_meta(md.uid(), md.permissions().mode()) {
+        if !is_root_controlled_meta(md.uid(), md.permissions().mode(), has_extended_acl(c)) {
             return false;
         }
         cur = c.parent();
@@ -252,16 +256,103 @@ fn is_root_controlled_path(p: &Path) -> bool {
     true
 }
 
-/// [`is_root_controlled_path`]의 순수 판정 — 한 경로 성분의 `(uid, mode)`가 root 통제 하인가.
+/// [`is_root_controlled_path`]의 순수 판정 — 한 경로 성분이 root 통제 하인가.
 ///
-/// **root 소유**(`uid == 0`)이고 **group/other 쓰기 불가**(`mode & 0o022 == 0`)여야 한다. 둘 다
-/// 필요하다: 소유자만 보면 `/usr/local/bin`(macOS에서 root:admin **0775**)이 통과해 admin 그룹
-/// 아무나 하이재킹할 수 있고, 쓰기 비트만 보면 사용자 소유 0755 디렉토리가 통과한다.
+/// 셋 **모두** 필요하다:
+/// - **root 소유**(`uid == 0`) — 아니면 소유자가 언제든 갈아치운다.
+/// - **group/other 쓰기 불가**(`mode & 0o022 == 0`) — 소유자만 보면 `/usr/local/bin`(macOS에서
+///   root:admin **0775**)이 통과해 admin 그룹 아무나 하이재킹한다.
+/// - **확장 ACL 없음** — mode 비트가 깨끗해도 ACL로 쓰기 권한이 붙어 있을 수 있다. 아래 참고.
+///
+/// # 왜 ACL까지 보는가 (그리고 왜 "해석"하지 않는가)
+///
+/// macOS의 확장 ACL은 **mode 비트와 완전히 독립**이다. `chmod +a "someone allow write"`를 걸어도
+/// `ls -l`은 그대로 `0755 root:wheel`로 보인다 — 즉 `mode & 0o022`만 보는 판정은 **fail-open**이다.
+/// 겉보기 root 소유인데 실제로는 사용자가 쓸 수 있는 것, canonicalize로 막은 것과 정확히 같은
+/// 종류의 우회다. **fail-open인 방어 장치는 없느니만 못하다** — 있다고 믿게 만들기 때문이다.
+///
+/// ACL을 파싱해 "안전한 ACL인가"를 판정하지는 **않는다**. 그건 복잡하고 그 자체가 새 버그 표면이다.
+/// **확장 ACL이 존재하면 신뢰하지 않는다**로 끝낸다(fail-closed). 정상적인 시스템 경로(`/usr/bin`,
+/// `/usr`, `/`)엔 확장 ACL이 없으니 과잉 거부가 아니다.
+///
+/// Linux의 POSIX ACL은 사정이 다르다 — 명명된 사용자에게 쓰기를 주면 그 권한은 **ACL mask**를
+/// 거치고, mask는 곧 **group mode 비트로 드러난다**. 그래서 Linux에서는 `mode & 0o022`가 이미
+/// 잡는다(실효 쓰기 권한이 mode에 안 보이게 숨을 수 없다). 그럼에도 Linux에서도 ACL 존재를 함께
+/// 보는 이유는 방어 심층화이고 비용이 거의 없어서다.
 ///
 /// 파일시스템을 건드리지 않는 순수 함수로 떼어 낸 이유는 테스트다 — root 소유 디렉토리는 root가
 /// 아니면 만들 수 없어서, FS를 통째로 쓰면 "이 머신이 root인가"에 결과가 끌려간다.
-fn is_root_controlled_meta(uid: u32, mode: u32) -> bool {
-    uid == 0 && mode & 0o022 == 0
+fn is_root_controlled_meta(uid: u32, mode: u32, has_extended_acl: bool) -> bool {
+    uid == 0 && mode & 0o022 == 0 && !has_extended_acl
+}
+
+/// 이 경로에 **확장 ACL**이 붙어 있는가. 판단이 불가능하면 **`true`(신뢰 못 함)를 반환한다** —
+/// 이 함수의 소비자는 보안 게이트라 모르는 것은 위험한 것으로 친다(fail-closed).
+///
+/// - **macOS**: `acl_get_link_np(path, ACL_TYPE_EXTENDED)`가 non-NULL이면 ACL이 있다. 없으면 NULL +
+///   `ENOENT`. 링크를 따라가지 않는 `_link_np`를 쓰지만, 호출부가 이미 canonicalize한 뒤라 경로에
+///   심볼릭 링크는 남아 있지 않다.
+/// - **Linux**: `system.posix_acl_access` xattr이 있으면 ACL이 있다. 없으면 `ENODATA`. 파일시스템이
+///   ACL을 아예 지원하지 않으면(`ENOTSUP`) ACL로 권한을 줄 수도 없으므로 "없음"으로 친다.
+///   디렉토리의 *default* ACL(`system.posix_acl_default`)은 보지 않는다 — 상속 템플릿일 뿐,
+///   그 디렉토리 자체에 쓰기 권한을 주지 않는다.
+fn has_extended_acl(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return true; // 경로에 NUL — 판단 불가.
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS `sys/acl.h`: `ACL_TYPE_EXTENDED = 0x00000100`. libc 크레이트가 ACL API를 노출하지
+        // 않아 직접 선언한다.
+        const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+        extern "C" {
+            fn acl_get_link_np(
+                path: *const libc::c_char,
+                acl_type: libc::c_int,
+            ) -> *mut libc::c_void;
+            fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+        }
+
+        // SAFETY: c_path는 살아 있는 NUL 종료 C 문자열이고, acl_get_link_np는 그것을 읽기만 한다.
+        // 반환된 non-NULL 핸들은 acl_free로 즉시 해제한다(누수 방지).
+        let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
+        if !acl.is_null() {
+            // SAFETY: 방금 acl_get_link_np가 돌려준 유효한 핸들이다.
+            unsafe { acl_free(acl) };
+            return true;
+        }
+        // NULL이면 errno로 "없다"와 "모르겠다"를 가른다.
+        let err = std::io::Error::last_os_error();
+        !matches!(err.raw_os_error(), Some(libc::ENOENT))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        const ACL_XATTR: &[u8] = b"system.posix_acl_access\0";
+        // SAFETY: 두 포인터 모두 살아 있는 NUL 종료 C 문자열이고, 크기 0으로 물어보므로 값 버퍼에
+        // 쓰지 않는다(존재 여부만 확인).
+        let rc = unsafe {
+            libc::lgetxattr(
+                c_path.as_ptr(),
+                ACL_XATTR.as_ptr() as *const libc::c_char,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc >= 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // ACL 없음 / 이 FS는 ACL을 지원하지 않음(=> ACL로 권한을 줄 수도 없다).
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => false,
+            // 그 밖의 실패는 모른다는 뜻 — 보안 게이트라 위험한 쪽으로 친다.
+            _ => true,
+        }
+    }
 }
 
 /// **이 프로세스가 실제로 spawn할 수 있는** 실행 파일인가.
@@ -366,8 +457,33 @@ pub struct DockerConfig {
 /// 살아났다. launchd/systemd로 뜬 경우엔 애초에 작동하지 않았으니 그쪽은 회귀가 아니지만,
 /// 셸로 띄우는 경로는 실재한다.
 ///
-/// 비용은 무시할 만하다 — 못 찾은 동안 60초마다 stat 몇 번이 전부고, 찾은 뒤에는 재탐색하지 않는다.
-/// WARN 폭주(이 커밋이 없애려던 것)도 없다: 기동 시 1회만 WARN이고, 이후 미탐색 tick은 `debug`다.
+/// 반대 방향도 대칭으로 처리한다: 찾은 뒤에 docker가 **사라지면**(경로가 지워지거나 바뀌어 spawn이
+/// `ENOENT`) 다음 tick부터 다시 재탐색한다. 한쪽만 재탐색하면 "없다가 생기면 살아나지만, 있다가
+/// 없어지면 영원히 ENOENT만 찍는" 비대칭이 된다.
+///
+/// # 로그는 상태 변화에만
+///
+/// **같은 상태를 반복해서 알리는 로그는 정보가 아니라 소음이다.** 이 모듈이 없애려던 게 정확히
+/// 그것("60초마다 WARN을 쏟는 대신 기동 시 한 번만")이라, 재탐색을 넣으면서 그 보장을 되살리는 게
+/// 중요하다. 그래서 [`BinState`]로 상태를 들고, **전이할 때만** WARN/INFO를 낸다:
+/// - 못 찾은 상태가 지속되는 동안 → 조용하다(`debug`).
+/// - 없다가 찾았다 → `INFO` 한 번.
+/// - 있다가 사라졌다 → `WARN` 한 번.
+///
+/// 후보를 거절하는 개별 사유(상대경로·신뢰 못 할 경로 등)도 [`resolve_docker_bin_with`] 안에서
+/// `debug`다 — 매 tick 재탐색에서 다시 불리기 때문이다.
+///
+/// # 비용: 왜 `spawn_blocking`을 쓰지 않는가
+///
+/// 재탐색은 `metadata`/`canonicalize`/`faccessat`(동기 FS 호출)을 런타임 스레드에서 직접 부른다.
+/// NFS/FUSE 같은 느린 FS라면 이론상 런타임 스레드를 블록할 수 있다. 그래도 `spawn_blocking`으로
+/// 옮기지 않는다:
+/// - **비용이 작다**: 재탐색은 **못 찾은 동안에만** 돌고(찾으면 멈춘다), 한 번에 stat 십수 회다.
+///   주기는 60초다. 게다가 이 task는 어차피 매 tick 외부 프로세스를 spawn하는데(`docker system df`),
+///   그 spawn 자체가 실행 파일을 읽는 FS 작업이다 — 재탐색이 더하는 몫은 그 옆에서 미미하다.
+/// - **`spawn_blocking`이 공짜가 아니다**: 이 프로젝트에서 이미 겪었듯 `timeout`으로 감싸도 클로저는
+///   계속 돌아, 진짜로 매달린 FS 호출은 blocking-pool 스레드를 **영구히** 묶는다. 느린 FS를 상정한
+///   방어가 오히려 스레드 누수로 갚아지는 셈이라, 지금 규모에서는 손해다.
 pub async fn serve_docker(
     cfg: DockerConfig,
     shutdown: watch::Receiver<bool>,
@@ -390,11 +506,11 @@ async fn serve_docker_with(
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::metrics_url(&cfg.endpoint);
     // 기동 시 못 찾았어도 task는 뜬다 — 아래 루프가 매 tick 재탐색한다.
-    let mut docker_bin = cfg.docker_bin.clone();
+    let mut state = BinState::from_initial(cfg.docker_bin.clone());
     tracing::info!(
         url = %url,
         interval_secs = cfg.interval.as_secs(),
-        docker_bin = ?docker_bin.as_ref().map(|p| p.display().to_string()),
+        docker_bin = ?state.path().map(|p| p.display().to_string()),
         "OTLP docker exporter 시작"
     );
 
@@ -416,23 +532,8 @@ async fn serve_docker_with(
         tokio::select! {
             _ = ticker.tick() => {
                 // 아직 못 찾았으면 이번 tick에 다시 찾아본다(위 doc "나중에 설치된 docker").
-                let bin = match &docker_bin {
-                    Some(b) => b.clone(),
-                    None => match resolve(cfg.configured_bin.as_deref()) {
-                        Some(found) => {
-                            tracing::info!(
-                                docker_bin = %found.display(),
-                                "docker 실행 파일을 찾았다 — docker exporter 캡처 시작"
-                            );
-                            docker_bin = Some(found.clone());
-                            found
-                        }
-                        None => {
-                            // 기동 시 이미 WARN을 한 번 남겼다 — 매 tick 반복하지 않는다.
-                            tracing::debug!("docker 실행 파일을 아직 찾지 못했다 — 이번 주기 skip");
-                            continue;
-                        }
-                    },
+                let Some(bin) = state.ensure(resolve, cfg.configured_bin.as_deref()) else {
+                    continue;
                 };
                 match capture_docker_df(&bin, cfg.timeout).await {
                     Ok(lines) => {
@@ -485,7 +586,14 @@ async fn serve_docker_with(
                         // 무관하게 다음 주기까지 skip한다 — connections.rs와 동일 원칙. health를
                         // 건드리지 않는다: health는 "push가 성공/실패했나"만 추적하고, 캡처 실패는
                         // 애초에 push를 시도조차 하지 않았기 때문이다.
-                        tracing::warn!(error = %e, "docker system df 캡처/파싱 실패 — 다음 주기까지 skip");
+                        if is_binary_gone(&e) {
+                            // 찾아 뒀던 docker가 사라졌다(삭제·업그레이드로 경로 변경 등).
+                            // 상태를 되돌려 다음 tick부터 재탐색한다 — WARN은 이 전이에서 한 번뿐이고,
+                            // 못 찾는 동안은 조용하다(위 doc "로그는 상태 변화에만").
+                            let _announced = state.mark_gone(&bin);
+                        } else {
+                            tracing::warn!(error = %e, "docker system df 캡처/파싱 실패 — 다음 주기까지 skip");
+                        }
                     }
                 }
             }
@@ -498,6 +606,93 @@ async fn serve_docker_with(
     }
     tracing::info!("OTLP docker exporter 종료");
     Ok(())
+}
+
+/// docker 실행 파일의 탐색 상태. **로그를 상태 변화에만 남기기 위해** 존재한다
+/// ([`serve_docker`]의 "로그는 상태 변화에만" 참고) — 상태를 안 들고 있으면 "못 찾았다"를 매 tick
+/// 다시 외치게 되고, 그게 바로 이 모듈이 없애려던 WARN 폭주다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BinState {
+    /// 못 찾았다. 이미 알렸으므로 다시 알리지 않는다(재탐색은 계속한다).
+    Missing,
+    /// 찾았다.
+    Found(PathBuf),
+}
+
+impl BinState {
+    /// 기동 시 resolve 결과로 초기 상태를 만든다. 못 찾았으면 **여기서 딱 한 번** WARN을 낸다.
+    fn from_initial(resolved: Option<PathBuf>) -> Self {
+        match resolved {
+            Some(p) => BinState::Found(p),
+            None => {
+                tracing::warn!(
+                    "docker 실행 파일을 찾지 못했다 — 설치되면 자동으로 캡처를 시작한다 \
+                     ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
+                );
+                BinState::Missing
+            }
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match self {
+            BinState::Found(p) => Some(p),
+            BinState::Missing => None,
+        }
+    }
+
+    /// 이번 tick에 쓸 실행 파일을 확보한다. 이미 찾았으면 그대로 쓰고, 아니면 재탐색한다.
+    /// **찾는 데 성공한 전이에서만** INFO를 낸다 — 실패가 지속되는 동안은 `debug`다.
+    fn ensure(
+        &mut self,
+        resolve: &dyn Fn(Option<&Path>) -> Option<PathBuf>,
+        configured: Option<&Path>,
+    ) -> Option<PathBuf> {
+        if let BinState::Found(p) = self {
+            return Some(p.clone());
+        }
+        match resolve(configured) {
+            Some(found) => {
+                tracing::info!(
+                    docker_bin = %found.display(),
+                    "docker 실행 파일을 찾았다 — docker exporter 캡처 시작"
+                );
+                *self = BinState::Found(found.clone());
+                Some(found)
+            }
+            None => {
+                // 이미 Missing이라고 알렸다 — 같은 상태를 반복해서 알리지 않는다.
+                tracing::debug!("docker 실행 파일을 아직 찾지 못했다 — 이번 주기 skip");
+                None
+            }
+        }
+    }
+
+    /// 찾아 뒀던 실행 파일이 사라졌다. **이 전이에서만** WARN을 내고 재탐색 상태로 되돌린다.
+    ///
+    /// **알렸으면 `true`**를 돌려준다. 반환값이 있는 이유는 테스트다 — "같은 상태를 두 번 알리지
+    /// 않는다"는 로그로만 드러나는 성질이라, 이걸 값으로 내주지 않으면 `Missing -> Missing`에서
+    /// WARN을 또 내도 상태만 보는 테스트는 통과해 버린다(공허해진다).
+    fn mark_gone(&mut self, bin: &Path) -> bool {
+        if matches!(self, BinState::Missing) {
+            return false;
+        }
+        tracing::warn!(
+            docker_bin = %bin.display(),
+            "docker 실행 파일이 사라졌다 — 다시 탐색한다(설치되면 자동으로 캡처를 재개한다)"
+        );
+        *self = BinState::Missing;
+        true
+    }
+}
+
+/// 캡처 실패가 **실행 파일이 없어서**인가(spawn 시 `ENOENT`). 데몬 다운/권한 없음/timeout 등 다른
+/// 실패와 갈라내야 한다 — 그것들은 재탐색해 봐야 같은 경로가 다시 나올 뿐이다.
+///
+/// `run_capped`의 `cmd.spawn()?`가 `std::io::Error`를 그대로 anyhow에 실어 주므로 downcast로 본다.
+fn is_binary_gone(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// `docker_bin system df --format json`을 spawn해 stdout을 NDJSON 라인 단위로 파싱한다.
@@ -1018,24 +1213,42 @@ mod tests {
     /// - 쓰기 비트만 보면 사용자 소유 0755 디렉토리가 통과한다.
     #[test]
     fn is_root_controlled_meta_requires_root_owner_and_no_group_or_other_write() {
-        assert!(is_root_controlled_meta(0, 0o755), "root:root 0755 — 정상");
-        assert!(is_root_controlled_meta(0, 0o700), "root 전용 — 정상");
+        assert!(
+            is_root_controlled_meta(0, 0o755, false),
+            "root:root 0755 — 정상"
+        );
+        assert!(is_root_controlled_meta(0, 0o700, false), "root 전용 — 정상");
 
         assert!(
-            !is_root_controlled_meta(0, 0o775),
+            !is_root_controlled_meta(0, 0o775, false),
             "root 소유라도 group 쓰기 가능하면 안 된다 — macOS /usr/local/bin이 정확히 이거다"
         );
         assert!(
-            !is_root_controlled_meta(0, 0o777),
+            !is_root_controlled_meta(0, 0o777, false),
             "other 쓰기 가능하면 안 된다"
         );
         assert!(
-            !is_root_controlled_meta(501, 0o755),
+            !is_root_controlled_meta(501, 0o755, false),
             "사용자 소유면 mode가 아무리 빡빡해도 안 된다"
         );
         assert!(
-            !is_root_controlled_meta(501, 0o700),
+            !is_root_controlled_meta(501, 0o700, false),
             "사용자 소유 — 안 된다"
+        );
+    }
+
+    /// **fail-open 회귀 가드**: mode 비트가 완벽해 보여도(`0o755 root:wheel`) 확장 ACL로 쓰기 권한이
+    /// 붙어 있으면 신뢰하면 안 된다. macOS의 확장 ACL은 mode에 **전혀 드러나지 않는다** —
+    /// canonicalize로 막은 것과 같은 종류의 우회(겉보기 root 소유, 실제로는 사용자 쓰기 가능)다.
+    #[test]
+    fn is_root_controlled_meta_rejects_a_path_with_an_extended_acl() {
+        assert!(
+            !is_root_controlled_meta(0, 0o755, true),
+            "mode가 깨끗해도 확장 ACL이 있으면 신뢰하면 안 된다 — 방어가 fail-open이 된다"
+        );
+        assert!(
+            !is_root_controlled_meta(0, 0o700, true),
+            "root 전용 mode라도 ACL이 있으면 안 된다"
         );
     }
 
@@ -1047,6 +1260,133 @@ mod tests {
         assert!(!is_root_controlled_path(Path::new(
             "/definitely/does/not/exist/docker"
         )));
+    }
+
+    /// ACL이 없는 평범한 파일에는 `has_extended_acl`이 false여야 한다 — 여기서 true가 나오면 정상적인
+    /// 시스템 경로(`/usr/bin`, `/`)를 전부 거부해 root aicd가 docker를 영영 못 쓴다(과잉 거부).
+    #[test]
+    fn has_extended_acl_is_false_for_a_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("plain");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(
+            !has_extended_acl(&f),
+            "ACL을 걸지 않은 파일을 ACL 있음으로 봤다 — 정상 경로를 전부 거부하게 된다"
+        );
+    }
+
+    /// **탐지 자체**를 못박는다: 실제로 확장 ACL을 건 파일을 `has_extended_acl`이 잡아야 한다.
+    ///
+    /// ACL을 담지 못하는 파일시스템이라면 ACL로 하이재킹할 수도 없으므로 탐지할 대상 자체가 없다 —
+    /// 그때도 조용히 넘어가지 않고 "ACL 없음"을 단언한다. 정책 자체(ACL이 있으면 신뢰하지 않는다)는
+    /// 위 순수 테스트가 **어느 머신에서든** 못박으므로, 이 테스트가 환경 때문에 약해져도 불변식에
+    /// 구멍이 나지는 않는다.
+    #[test]
+    fn has_extended_acl_detects_a_real_extended_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("acl-target");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!has_extended_acl(&f), "전제: 아직 ACL이 없다");
+
+        match set_extended_acl_for_test(&f) {
+            Ok(()) => assert!(
+                has_extended_acl(&f),
+                "확장 ACL을 실제로 걸었는데 탐지하지 못했다 — 가드가 fail-open이다"
+            ),
+            Err(e) if acl_unsupported(&e) => {
+                assert!(
+                    !has_extended_acl(&f),
+                    "ACL을 담지 못하는 FS인데 ACL이 있다고 답했다"
+                );
+            }
+            Err(e) => panic!("ACL 설정이 예상 밖의 이유로 실패했다: {e}"),
+        }
+    }
+
+    /// 이 파일시스템이 ACL을 담지 못한다는 신호인가.
+    fn acl_unsupported(e: &std::io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENOTSUP) | Some(libc::EPERM) | Some(libc::EINVAL)
+        )
+    }
+
+    /// 테스트용으로 파일에 **확장 ACL**을 건다. 외부 CLI(`setfacl`)에 의존하지 않는다 — 없는 CI가
+    /// 있어서다. POSIX ACL xattr(`system.posix_acl_access`)을 직접 쓴다: 헤더(version=2) 뒤에
+    /// `{u16 tag, u16 perm, u32 id}` 엔트리들이 온다. 명명된 USER 엔트리를 넣으려면 MASK도 있어야
+    /// 커널이 받아 준다.
+    #[cfg(target_os = "linux")]
+    fn set_extended_acl_for_test(p: &Path) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        const ACL_USER_OBJ: u16 = 0x01;
+        const ACL_USER: u16 = 0x02;
+        const ACL_GROUP_OBJ: u16 = 0x04;
+        const ACL_MASK: u16 = 0x10;
+        const ACL_OTHER: u16 = 0x20;
+        const UNDEFINED_ID: u32 = 0xffff_ffff;
+
+        let mut blob: Vec<u8> = Vec::new();
+        blob.extend_from_slice(&2u32.to_ne_bytes()); // POSIX_ACL_XATTR_VERSION
+        let entry = |blob: &mut Vec<u8>, tag: u16, perm: u16, id: u32| {
+            blob.extend_from_slice(&tag.to_ne_bytes());
+            blob.extend_from_slice(&perm.to_ne_bytes());
+            blob.extend_from_slice(&id.to_ne_bytes());
+        };
+        entry(&mut blob, ACL_USER_OBJ, 7, UNDEFINED_ID);
+        // 명명된 사용자에게 쓰기 부여 — 이 엔트리가 ACL을 "확장"으로 만든다.
+        entry(&mut blob, ACL_USER, 2, 12345);
+        entry(&mut blob, ACL_GROUP_OBJ, 5, UNDEFINED_ID);
+        entry(&mut blob, ACL_MASK, 7, UNDEFINED_ID);
+        entry(&mut blob, ACL_OTHER, 5, UNDEFINED_ID);
+
+        let c_path = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        let name = b"system.posix_acl_access\0";
+        // SAFETY: 경로/이름은 살아 있는 NUL 종료 C 문자열이고, blob은 len 바이트만큼 유효하다.
+        let rc = unsafe {
+            libc::lsetxattr(
+                c_path.as_ptr(),
+                name.as_ptr() as *const libc::c_char,
+                blob.as_ptr() as *const libc::c_void,
+                blob.len(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// macOS: `chmod +a`로 확장 ACL을 건다. `chmod`는 base OS라 항상 있고 APFS/HFS+는 ACL을
+    /// 지원하므로, 이 경로는 개발기·CI 양쪽에서 실제로 돈다(스킵되지 않는다).
+    #[cfg(target_os = "macos")]
+    fn set_extended_acl_for_test(p: &Path) -> std::io::Result<()> {
+        // chmod는 숫자 uid를 UUID로 번역하지 못한다("Unable to translate '501' to a UUID") — 이름이
+        // 필요하다.
+        let who = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()?;
+        if !who.status.success() {
+            return Err(std::io::Error::other("id -un 실패"));
+        }
+        let user = String::from_utf8_lossy(&who.stdout).trim().to_string();
+
+        let out = std::process::Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(format!("user:{user} allow write"))
+            .arg(p)
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "chmod +a 실패: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )))
+        }
     }
 
     // ── 실행 가능 판정 ────────────────────────────────────────────────────────
@@ -1527,8 +1867,13 @@ mod tests {
             health: health.clone(),
         };
 
+        // 재탐색기를 고정한다 — 진짜 resolve를 쓰면 "이 머신에 docker가 깔려 있나"에 결과가 끌려간다
+        // (실행 파일이 사라지면 재탐색이 돌므로, 개발기에선 진짜 docker를 찾아 캡처에 성공해 버린다).
+        let missing = std::path::PathBuf::from("/definitely/does/not/exist/docker");
+        let resolver = move |_: Option<&Path>| -> Option<PathBuf> { Some(missing.clone()) };
+
         let (tx, rx) = watch::channel(false);
-        let handle = tokio::spawn(serve_docker(cfg, rx));
+        let handle = tokio::spawn(async move { serve_docker_with(cfg, rx, &resolver).await });
         // interval(15ms)보다 훨씬 긴 유예를 둬 여러 tick이 반드시 발생하게 한다.
         tokio::time::sleep(Duration::from_millis(100)).await;
         tx.send_replace(true);
@@ -1629,5 +1974,219 @@ mod tests {
             .expect("serve_docker가 shutdown 후 hang됨")
             .expect("serve_docker task가 panic함")
             .expect("serve_docker가 에러로 끝남");
+    }
+
+    // ── BinState: 로그는 상태 변화에만 ────────────────────────────────────────
+
+    /// **회귀 가드 — WARN 폭주.** 재탐색을 넣으면서 되살아났던 문제다. 못 찾은 상태가 지속되는 동안
+    /// 재탐색은 계속 돌아야 하지만(`ensure`가 매번 resolve를 부른다), 상태는 `Missing`에 머물러야
+    /// 한다 — 상태가 안 바뀌면 호출부가 다시 알릴 일도 없다.
+    ///
+    /// tracing 구독자를 붙여 로그 줄을 세는 대신 **상태 전이**를 검증한다: "알린다"의 유일한 근거가
+    /// 전이이므로, 전이가 없으면 로그도 없다는 게 구조적으로 보장된다.
+    #[test]
+    fn bin_state_stays_missing_while_docker_is_absent() {
+        let mut state = BinState::Missing;
+        let counter = std::cell::Cell::new(0);
+        let resolver = |_: Option<&Path>| -> Option<PathBuf> {
+            counter.set(counter.get() + 1);
+            None
+        };
+
+        for _ in 0..5 {
+            assert_eq!(state.ensure(&resolver, None), None);
+            assert_eq!(
+                state,
+                BinState::Missing,
+                "못 찾은 상태가 지속되는데 상태가 바뀌었다 — 그러면 매 tick 다시 알리게 된다"
+            );
+        }
+        assert_eq!(
+            counter.get(),
+            5,
+            "재탐색은 매 tick 계속 돌아야 한다(조용히 도는 것과 안 도는 것은 다르다)"
+        );
+    }
+
+    /// 없다가 찾으면 `Found`로 전이하고, 그 뒤로는 **재탐색하지 않는다**(찾은 뒤엔 비용 0).
+    #[test]
+    fn bin_state_transitions_to_found_and_then_stops_resolving() {
+        let mut state = BinState::Missing;
+        let counter = std::cell::Cell::new(0);
+        let resolver = |_: Option<&Path>| -> Option<PathBuf> {
+            counter.set(counter.get() + 1);
+            Some(PathBuf::from("/usr/bin/docker"))
+        };
+
+        assert_eq!(
+            state.ensure(&resolver, None),
+            Some(PathBuf::from("/usr/bin/docker"))
+        );
+        assert_eq!(state, BinState::Found(PathBuf::from("/usr/bin/docker")));
+
+        for _ in 0..3 {
+            assert_eq!(
+                state.ensure(&resolver, None),
+                Some(PathBuf::from("/usr/bin/docker"))
+            );
+        }
+        assert_eq!(
+            counter.get(),
+            1,
+            "이미 찾았는데 재탐색을 계속 돌렸다 — 매 tick 불필요한 stat이다"
+        );
+    }
+
+    /// **회귀 가드 — 비대칭**: 찾은 뒤 docker가 사라지면 `Missing`으로 돌아가 재탐색이 다시 돌아야
+    /// 한다. 안 그러면 "있다가 없어지면 영원히 ENOENT만 찍는" 한쪽만 자가 치유되는 상태가 된다.
+    #[test]
+    fn bin_state_returns_to_missing_when_the_binary_disappears() {
+        let mut state = BinState::Found(PathBuf::from("/usr/bin/docker"));
+        assert!(
+            state.mark_gone(Path::new("/usr/bin/docker")),
+            "Found -> Missing 전이는 알려야 한다"
+        );
+        assert_eq!(state, BinState::Missing);
+
+        // 되돌아온 뒤에는 재탐색이 다시 돈다.
+        let counter = std::cell::Cell::new(0);
+        let resolver = |_: Option<&Path>| -> Option<PathBuf> {
+            counter.set(counter.get() + 1);
+            Some(PathBuf::from("/opt/docker"))
+        };
+        assert_eq!(
+            state.ensure(&resolver, None),
+            Some(PathBuf::from("/opt/docker"))
+        );
+        assert_eq!(counter.get(), 1, "사라진 뒤 재탐색이 돌지 않았다");
+    }
+
+    /// **회귀 가드 — WARN 폭주(두 번째 통로)**: 이미 `Missing`인데 또 사라졌다고 알리면, docker가
+    /// 없는 동안 매 tick WARN이 다시 쏟아진다. 상태만 보면 `Missing -> Missing`이라 아무 차이가 없어
+    /// 보이므로, "알렸는가"를 값으로 받아 확인한다.
+    #[test]
+    fn bin_state_does_not_re_announce_a_loss_it_already_knows_about() {
+        let mut state = BinState::Missing;
+        assert!(
+            !state.mark_gone(Path::new("/usr/bin/docker")),
+            "이미 없는 줄 아는데 또 알렸다 — 못 찾는 동안 매 tick WARN이 쌓인다"
+        );
+        assert_eq!(state, BinState::Missing);
+    }
+
+    /// **회귀 가드 — 비대칭(루프 배선)**: 위 `bin_state_*` 테스트들은 상태 기계만 본다. 그 기계가
+    /// `serve_docker`의 캡처 실패 경로에 **실제로 연결돼 있는지**는 별개 문제라, ENOENT를
+    /// `mark_gone`으로 잇는 배선을 빼도 상태 기계 테스트는 전부 통과한다(실제로 mutation에서 그
+    /// 구멍에 걸렸다). 그래서 여기서는 루프 전체를 돌린다.
+    ///
+    /// 시나리오: A에 docker가 있어 캡처가 돌던 중 A가 사라지고 B에 나타난다. 재탐색이 배선돼 있으면
+    /// B로 옮겨 가 캡처가 재개된다(spool이 다시 늘어난다). 배선이 없으면 A에 대고 영원히 ENOENT만
+    /// 내므로 spool이 얼어붙는다.
+    #[tokio::test]
+    async fn serve_docker_recovers_when_the_running_binary_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = aic_common::SpoolQuotas {
+            metrics: 1024 * 1024,
+            logs: 1024 * 1024,
+            app_logs: 1024 * 1024,
+        };
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool = Arc::new(Spool::open(spool_dir.path().to_path_buf(), quotas).unwrap());
+        let health = Arc::new(super::super::ExporterHealth::new(
+            "http://127.0.0.1:1".to_string(),
+            spool.clone(),
+        ));
+
+        let path_a = dir.path().join("docker-a");
+        let path_b = dir.path().join("docker-b");
+        let script = format!("cat <<'EOF'\n{REAL_DF_OUTPUT}EOF");
+        fake_docker_bin_at(&path_a, &script);
+
+        let cfg = DockerConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            interval: Duration::from_millis(15),
+            docker_bin: Some(path_a.clone()),
+            configured_bin: None,
+            timeout: Duration::from_secs(5),
+            spool: spool.clone(),
+            health: health.clone(),
+        };
+
+        // 재탐색기: 지금 실제로 존재하는 쪽을 답한다(진짜 resolve의 머신 의존을 피한다).
+        let (a, b) = (path_a.clone(), path_b.clone());
+        let resolver = move |_: Option<&Path>| -> Option<PathBuf> {
+            if a.exists() {
+                Some(a.clone())
+            } else if b.exists() {
+                Some(b.clone())
+            } else {
+                None
+            }
+        };
+
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { serve_docker_with(cfg, rx, &resolver).await });
+
+        // A로 캡처가 돌기 시작할 때까지 기다린다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while spool.batch_count() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "A에 docker가 있는데 캡처가 시작되지 않았다 — 테스트 전제가 무너졌다"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // docker가 A에서 사라지고 B로 옮겨 간다(삭제 후 다른 경로에 재설치).
+        std::fs::remove_file(&path_a).unwrap();
+        fake_docker_bin_at(&path_b, &script);
+        let baseline = spool.batch_count();
+
+        // 재탐색이 배선돼 있으면 B를 찾아 캡처를 재개한다 — spool이 다시 늘어난다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while spool.batch_count() <= baseline + 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "실행 파일이 사라졌는데 재탐색이 돌지 않았다 — 사라진 경로에 대고 영원히 ENOENT만 낸다"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve_docker가 shutdown 후 hang됨")
+            .expect("serve_docker task가 panic함")
+            .expect("serve_docker가 에러로 끝남");
+    }
+
+    /// spawn 실패가 **실행 파일이 없어서**인지 갈라내야 재탐색 여부를 정할 수 있다. 데몬 다운
+    /// (non-zero exit)이나 timeout은 재탐색해 봐야 같은 경로가 다시 나올 뿐이다.
+    #[tokio::test]
+    async fn is_binary_gone_distinguishes_enoent_from_other_capture_failures() {
+        // 없는 실행 파일 → ENOENT.
+        let missing = capture_docker_df(
+            Path::new("/definitely/does/not/exist/docker"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            is_binary_gone(&missing),
+            "미설치 spawn 실패를 ENOENT로 인식하지 못했다: {missing}"
+        );
+
+        // 데몬 다운(non-zero exit)은 실행 파일이 사라진 게 아니다 — 재탐색 대상이 아니다.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_docker_bin(&dir, "echo 'cannot connect' >&2; exit 1");
+        let down = retry_busy(|| capture_docker_df(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert!(
+            !is_binary_gone(&down),
+            "데몬 다운을 '실행 파일이 사라졌다'로 오인했다 — 애먼 재탐색을 돈다: {down}"
+        );
     }
 }
