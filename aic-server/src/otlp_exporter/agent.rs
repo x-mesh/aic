@@ -14,8 +14,6 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::agent_event_bus::AgentEventBus;
-
 use super::backoff::Backoff;
 use super::logs_proto::{self, ResourceAttrs};
 use super::{SignalKind, Spool};
@@ -24,7 +22,6 @@ use super::{SignalKind, Spool};
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// agent exporter 실행 설정.
-#[derive(Clone)]
 pub struct AgentConfig {
     /// OTLP collector base URL. `/v1/logs`가 append된다.
     pub endpoint: String,
@@ -32,8 +29,17 @@ pub struct AgentConfig {
     pub token: Option<String>,
     /// resource `service.version`으로 붙일 aicd 버전.
     pub service_version: String,
-    /// 구독할 agent 행위 tap.
-    pub bus: AgentEventBus,
+    /// **이미 구독을 마친** agent 행위 tap receiver.
+    ///
+    /// 왜 `AgentEventBus`가 아니라 `Receiver`인가: 예전엔 bus를 넘겨 task **안에서**
+    /// `subscribe()`했다. 그러면 spawn과 첫 구독 사이에 유실 창이 생긴다 — broadcast는 replay가
+    /// 없어서, 그 창에 publish된 이벤트는 구독자가 없는 것으로 취급돼 조용히 사라진다. aicd 기동
+    /// 직후는 chat이 붙는 시점과 정확히 겹치므로 실제로 밟히는 경로다.
+    ///
+    /// 그래서 **부모(aicd_main)가 spawn 전에 구독**하고 그 receiver를 여기로 넘긴다. 구독이 끝난
+    /// 뒤에야 task가 뜨고 `set_agent_live(true)`가 켜지므로, 창 자체가 존재하지 않는다(구독 시점
+    /// 이후 publish된 이벤트는 task가 읽기 전이라도 채널 버퍼에 남아 있다가 전달된다).
+    pub rx: broadcast::Receiver<aic_common::AgentEvent>,
     /// 오프라인 spool. 다른 exporter task와 동일 인스턴스를 공유한다.
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
@@ -47,7 +53,9 @@ pub async fn serve_agent(
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::logs_url(&cfg.endpoint);
-    let mut rx = cfg.bus.subscribe();
+    // 구독은 **부모가 spawn 전에** 이미 끝냈다(AgentConfig::rx 참고) — 여기서 subscribe하면
+    // spawn~구독 사이에 유실 창이 생긴다.
+    let mut rx = cfg.rx;
 
     let host_name = sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string());
     let host_id = super::host_metrics::host_id(&host_name);
@@ -172,8 +180,46 @@ fn agent_event_time_unix_nano(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_event_bus::AgentEventBus;
     use prost::Message as _;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn subscribing_before_spawn_leaves_no_loss_window() {
+        // C: 구독이 task **안**에서 일어나면 spawn~구독 사이가 "구독자 0"인 창이 되고, 그 창에
+        // publish된 이벤트는 broadcast에 replay가 없어 조용히 사라진다. aicd 기동 직후는 chat이
+        // 붙는 시점과 겹쳐 실제로 밟히는 경로다.
+        //
+        // 계약: `load_agent_config`가 하듯 **부모가 먼저 subscribe**하면, task가 아직 recv()를
+        // 한 번도 돌리지 않은 상태에서 publish된 이벤트도 채널 버퍼에 보존돼 나중에 수신된다.
+        // 이 테스트는 receiver를 만들어 두고 **아무도 읽지 않는 동안** publish한 뒤, 그때서야
+        // 읽어서 이벤트가 살아있는지 본다(= task가 늦게 시작해도 유실 없음).
+        let bus = AgentEventBus::new();
+
+        // 부모가 spawn 전에 구독(= AgentConfig.rx). 이 시점에 구독자 수는 1이어야 한다.
+        let mut rx = bus.subscribe();
+        assert_eq!(bus.receiver_count(), 1, "구독이 성립하지 않았다");
+
+        // task가 아직 안 떴다고 가정하고(=recv 호출 전) 이벤트를 publish한다.
+        bus.publish(event_with_ts(chrono::Utc::now()));
+
+        // 이제서야 task가 읽기 시작한다 — 유실 없이 받아야 한다.
+        let got = rx.try_recv().expect("구독 후 publish된 이벤트가 유실됐다");
+        assert_eq!(got.kind, "tool.run_command");
+    }
+
+    #[test]
+    fn publishing_before_any_subscriber_is_lost() {
+        // 위 테스트의 대우(對偶) — 구독 **전에** publish하면 정말로 사라진다는 걸 고정한다.
+        // 이게 사실이 아니라면 위 테스트는 아무것도 증명하지 않는다(구독 순서가 무의미해진다).
+        let bus = AgentEventBus::new();
+        bus.publish(event_with_ts(chrono::Utc::now())); // 구독자 0 — 버려진다
+        let mut rx = bus.subscribe();
+        assert!(
+            rx.try_recv().is_err(),
+            "구독 전 이벤트가 replay됐다 — 그렇다면 구독 순서는 애초에 문제가 아니다"
+        );
+    }
 
     fn event_with_ts(ts: chrono::DateTime<chrono::Utc>) -> aic_common::AgentEvent {
         aic_common::AgentEvent {
