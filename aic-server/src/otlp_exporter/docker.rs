@@ -87,7 +87,12 @@ const HOME_RELATIVE_DOCKER_PATH: &str = ".orbstack/bin/docker";
 /// 출력이 검사에 도달하기 전에 이미 메모리를 먹는다).
 const MAX_DF_OUTPUT_BYTES: usize = 256 * 1024;
 
-/// docker 실행 파일의 **절대경로**를 찾는다. 못 찾으면 `None`(호출부는 exporter를 비활성한다).
+/// docker 실행 파일의 **절대경로**를 찾는다. 못 찾으면 `None`.
+///
+/// `None`이라고 exporter를 영영 포기하지는 않는다: [`serve_docker`] task는 그래도 뜨고, 기동 시
+/// 한 번 WARN을 남긴 뒤 **매 tick 이 함수를 다시 부른다** — docker가 나중에 설치되면 그때부터 캡처를
+/// 시작한다(자세한 건 [`serve_docker`]의 "나중에 설치된 docker" 참고). 즉 이 함수의 `None`은 "지금은
+/// 없다"이지 "비활성"이 아니다.
 ///
 /// 탐색 순서: `configured`(config `[aicd.exporter].docker_bin`) → `PATH` → [`FALLBACK_DOCKER_DIRS`]
 /// → `$HOME/.orbstack/bin/docker`. 서비스 매니저의 빈약한 PATH를 폴백이 메워 준다(위 상수 doc 참고).
@@ -1540,55 +1545,52 @@ mod tests {
         );
     }
 
-    /// **배선 가드(root 전용) — item 1.** 위 주입 테스트는 `is_root_controlled_walk`를 직접 부르므로,
-    /// 프로덕션 진입점 `is_root_controlled_path`가 그 walk로 배선돼 있는지(예전 canonicalize 방식으로
-    /// 되돌아가지 않았는지)는 확인하지 못한다. 그 차이는 **root 소유 대상 + 사용자 쓰기 가능 링크
-    /// 디렉토리**에서만 드러나고, 그런 구조는 root라야 만들 수 있다.
+    /// **배선 가드 — item 1.** 위 주입 테스트는 `is_root_controlled_walk`를 직접 부르므로, 프로덕션
+    /// 진입점 `is_root_controlled_path`가 그 walk로 배선돼 있는지(예전 canonicalize 방식으로
+    /// 되돌아가지 않았는지)는 확인하지 못한다. 그 차이를 잡는다:
+    /// - walk: 실행 경로(`tempdir/.../docker`) 성분 중 **비-root 통제 디렉토리**(tempdir 자체가 사용자
+    ///   소유이거나, root면 0777 `unsafe`)를 만나 **거부**.
+    /// - canonicalize(예전 버그): 링크의 **대상**과 그 상위만 보는데, 대상을 **시스템 실행 파일**
+    ///   (`/bin/true` 등, root 소유)로 두면 그 상위(`/bin`, `/`)가 전부 root라 **통과**한다.
     ///
-    /// - walk: 링크가 놓인 `unsafe`(사용자 쓰기 가능) 디렉토리를 검사 → **거부**.
-    /// - canonicalize(예전 버그): 대상과 그 상위만 보므로 전부 root → **통과**.
+    /// **핵심 — base 무관**: 대상을 tempdir 안이 아니라 **시스템 경로**로 두는 게 이 판의 요점이다.
+    /// canonicalize가 tempdir을 벗어나 시스템 경로로 해소되므로, 판별력이 `/tmp`(또는 `TMPDIR`)의
+    /// 소유·권한에 **의존하지 않는다**. 예전 판은 대상을 tempdir 안에 둬서, base가 root 통제가 아니면
+    /// canonicalize도 거부해 walk와 구분이 흐려졌다(패널 지적).
     ///
-    /// 비-root에선 root 소유 대상을 못 만들어 skip한다(그 구조는 root라야 구성 가능하다). 다만
-    /// **불변식 자체는 [`is_root_controlled_walk_checks_the_directory_that_holds_the_symlink`]가 어느
-    /// 머신에서든** 못박으므로, 이 skip이 커버리지에 구멍을 내지 않는다. 이 테스트의 몫은 오직
-    /// "프로덕션 배선"을 root에서 실측하는 것이고, 리뷰 파이프라인의 Linux 서버(root)에서 실제로 돈다.
-    ///
-    /// **공허하지 않음을 실측했다**: 이 테스트 상태에서 `is_root_controlled_path`를 예전 canonicalize
-    /// 방식으로 되돌리는 mutation을 jw-server(root)에 적용하면 이 테스트가 정확히 위 assertion 메시지로
-    /// **FAILED**한다. canonicalize는 대상(`safe/docker-real`)의 상위만 봐서 전부 root라 "통과"하지만,
-    /// walk는 실행 경로의 `unsafe`(0777)를 보고 거부한다 — 그 차이를 이 테스트가 가른다.
+    /// 그래서 root도 필요 없다 — 비-root에선 walk가 사용자 소유 tempdir base에서 거부하고,
+    /// canonicalize는 시스템 대상을 통과시키므로, 어느 권한에서든 둘이 갈린다. 시스템에 root 통제 하의
+    /// 실행 파일이 없으면(비정상 환경) 판별 전제가 없으니 skip한다.
     #[test]
     fn is_root_controlled_path_rejects_a_link_in_a_writable_dir_even_when_target_is_root_safe() {
-        if unsafe { libc::geteuid() } != 0 {
-            // root가 아니면 root 소유 대상 파일을 만들 수 없다 — 이 구조는 구성 불가.
-            eprintln!(
-                "skip: 비-root에선 root 소유 대상을 만들 수 없다(불변식은 injected-walk 테스트가 커버)"
-            );
+        // 링크 대상: canonicalize가 tempdir 밖으로 해소되도록 **시스템 root 소유 실행 파일**을 쓴다.
+        // 그 자체가 root 통제 하임을 실제 판정으로 확인해(= canonicalize-revert가 이 대상은 "통과"할)
+        // 것을 고른다. 이게 곧 이 테스트의 판별 전제다.
+        let sys_target = ["/bin/true", "/usr/bin/true", "/bin/sh", "/usr/bin/env"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| is_root_controlled_path(p));
+        let Some(sys_target) = sys_target else {
+            eprintln!("skip: root 통제 하의 시스템 실행 파일을 찾지 못함(판별 전제 없음)");
             return;
-        }
+        };
+
         let tmp = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(tmp.path()).unwrap();
 
-        // root 소유 안전 대상.
-        let safe = base.join("safe");
-        std::fs::create_dir(&safe).unwrap();
-        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let target = safe.join("docker-real");
-        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // 사용자(=비-root) 쓰기 가능한 링크 디렉토리. world-writable로 만들어 mode & 0o022 != 0.
+        // 사용자 쓰기 가능 링크 디렉토리(root로 돌 때도 0777이라 root 통제 밖). 비-root면 base 자체가
+        // 사용자 소유라 walk는 거기서 이미 거부한다 — 어느 쪽이든 walk는 실행 경로에서 막는다.
         let unsafe_dir = base.join("unsafe");
         std::fs::create_dir(&unsafe_dir).unwrap();
         std::fs::set_permissions(&unsafe_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         let link = unsafe_dir.join("docker");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::os::unix::fs::symlink(&sys_target, &link).unwrap();
 
-        // canonicalize(link)의 상위는 전부 root(safe/base/tmp/…)라 예전 방식이면 "통과"다. 실제로
-        // 실행되는 경로는 unsafe/docker이므로 walk는 unsafe를 보고 거부해야 한다.
+        // 실제로 실행되는 경로는 tempdir 안의 link이므로 walk는 그 사용자 쓰기 가능 성분을 보고 거부해야
+        // 한다. canonicalize로 되돌아가면 대상(시스템 root 실행 파일)의 상위만 봐 통과해 버린다.
         assert!(
             !is_root_controlled_path(&link),
-            "is_root_controlled_path가 링크 디렉토리를 안 봤다 — canonicalize 방식으로 되돌아갔다(스왑 하이재킹)"
+            "is_root_controlled_path가 링크 경로 성분을 안 봤다 — canonicalize 방식으로 되돌아갔다(스왑 하이재킹)"
         );
     }
 
@@ -1628,6 +1630,79 @@ mod tests {
         // 대조(공허 방지): 파일까지 신뢰하면 통과 — walk가 끝까지 도달함을 증명.
         let all_trusted = |_: &Path| true;
         assert!(is_root_controlled_walk(&f, 0, &all_trusted));
+    }
+
+    // ── fail-closed 형제 분기들 (item 3): 각 거부를 fail-open으로 뒤집는 mutation이 잡히도록 ──
+    //
+    // "파일 성분 검사가 공허했다"를 실측으로 배운 뒤, 나머지 fail-closed 분기(중간 성분이 정규 파일/
+    // 비정규 파일/심링크 depth 초과)도 같은 눈으로 각각 mutation으로 검증한다.
+
+    /// **회귀 가드**: 디렉토리여야 할 중간 성분이 **정규 파일**이면 거부한다(경로가 잘못됐다).
+    /// 이 거부(`is_file && !is_last -> return false`)를 빼면 그 파일에서 `trusted`를 반환해 조기 통과
+    /// 하므로(all_trusted 하에) 이 테스트가 잡는다.
+    #[test]
+    fn is_root_controlled_walk_rejects_a_regular_file_mid_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let midfile = root.join("notadir");
+        std::fs::write(&midfile, b"x").unwrap();
+        // 디렉토리가 와야 할 자리에 파일이 있다: root/notadir/docker
+        let path = midfile.join("docker");
+        let all_trusted = |_: &Path| true;
+        assert!(
+            !is_root_controlled_walk(&path, 0, &all_trusted),
+            "중간 성분이 정규 파일인데 통과 — 잘못된 경로를 받아들였다"
+        );
+    }
+
+    /// **회귀 가드**: 최종 성분이 **비정규 파일**(소켓 등 — 디렉토리도 정규 파일도 심링크도 아님)이면
+    /// 거부한다. 이 `else -> return false` 분기를 fail-open으로 바꾸면 소켓을 실행 파일로 오인한다.
+    #[test]
+    fn is_root_controlled_walk_rejects_a_non_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let sock_path = root.join("docker");
+        // UnixListener::bind가 소켓 파일을 만든다(mknod 권한 없이도 됨).
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        assert!(
+            sock_path.exists() && !sock_path.is_file() && !sock_path.is_dir(),
+            "전제: 소켓은 정규 파일도 디렉토리도 아니다"
+        );
+        let all_trusted = |_: &Path| true;
+        assert!(
+            !is_root_controlled_walk(&sock_path, 0, &all_trusted),
+            "비정규 파일(소켓)을 실행 파일로 받아들였다"
+        );
+    }
+
+    /// **회귀 가드**: 심링크 체인이 `MAX_SYMLINK_DEPTH`(40)를 넘으면 거부한다(ELOOP 방어). depth
+    /// 상한을 없애거나 크게 키우는 mutation은 이 41+단계 체인에서 잡힌다.
+    #[test]
+    fn is_root_controlled_walk_rejects_a_too_deep_symlink_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // 실제 파일 + link_0 -> link_1 -> ... -> link_44 -> real. 45단계라 depth 40을 확실히 넘는다.
+        let real = root.join("real");
+        std::fs::write(&real, b"x").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut prev = real.clone();
+        for i in 0..45u32 {
+            let link = root.join(format!("link_{i}"));
+            std::os::unix::fs::symlink(&prev, &link).unwrap();
+            prev = link;
+        }
+        // prev = link_44 (체인의 머리). walk가 45번 따라가면 depth가 40을 넘어 거부해야 한다.
+        let all_trusted = |_: &Path| true;
+        assert!(
+            !is_root_controlled_walk(&prev, 0, &all_trusted),
+            "심링크 체인이 depth 상한을 넘었는데 통과 — ELOOP 방어가 없다"
+        );
+
+        // 대조(공허 방지): 짧은 체인(상한 이내)은 통과 — 상한 자체가 정상 링크를 막지 않음을 확인.
+        let short = root.join("short_link");
+        std::os::unix::fs::symlink(&real, &short).unwrap();
+        assert!(is_root_controlled_walk(&short, 0, &all_trusted));
     }
 
     /// `..`는 거부가 아니라 **접는다**(부모로 올라감). 링크 없는 실경로에서의 `..` 폴딩은 커널 해소와
@@ -2528,8 +2603,15 @@ mod tests {
         use std::sync::OnceLock;
         static ONCE: OnceLock<()> = OnceLock::new();
         ONCE.get_or_init(|| {
-            // 이 테스트 바이너리에서 전역 구독자를 세우는 건 여기뿐이다. 실패해도(이미 설치됨) 무시.
-            let _ = tracing::subscriber::set_global_default(GlobalCapture);
+            // **실패를 삼키지 않는다.** 전역 구독자는 프로세스당 한 번만 설치되고, 이 `OnceLock`이
+            // 그 유일한 설치 지점이다 — 그러니 정상적으로는 반드시 성공한다. 만약 이 crate의 다른
+            // 코드가 먼저 전역 구독자를 설치했다면 여기서 실패하는데, 그걸 무시하면 **로그 캡처가
+            // "누가 먼저 돌았나"에 의존**하게 된다(순서/스케줄 의존 = 이번 라운드가 없애려던 flaky의
+            // 동종). `expect`로 그 위반을 **모든 실행에서 결정적으로** 드러낸다 — 통계로 넘어가는 게
+            // 아니라 구조로 못박는다. (실측: 이 바이너리엔 다른 전역 구독자가 없어 항상 성공한다.)
+            tracing::subscriber::set_global_default(GlobalCapture).expect(
+                "전역 캡처 구독자 설치 실패 — 다른 곳에서 이미 전역 tracing 구독자를 세웠다",
+            );
         });
     }
 
@@ -2564,6 +2646,44 @@ mod tests {
             .iter()
             .filter(|(l, m)| *l == lvl && m.contains(needle))
             .count()
+    }
+
+    /// **회귀 가드 — item 1: 로그 캡처가 순서/스레드에 무관하다.** 전역 구독자 + 스레드-로컬 sink
+    /// 구조가 "누가 먼저 돌았나"에 의존하지 않음을 못박는다. idempotent 설치(순차 두 번), 캡처 간
+    /// 격리(첫 캡처가 둘째로 안 샘), 스레드 격리(새 스레드에서도 자기 sink만), 누수 없음(캡처 밖
+    /// 로그는 어느 sink에도 안 들어감)을 모두 확인한다.
+    #[test]
+    fn capture_is_order_and_thread_independent() {
+        let e1 = capture_events(|| tracing::warn!("aic-cap-marker-one"));
+        assert_eq!(
+            count_msg(&e1, tracing::Level::WARN, "aic-cap-marker-one"),
+            1
+        );
+
+        let e2 = capture_events(|| tracing::warn!("aic-cap-marker-two"));
+        assert_eq!(
+            count_msg(&e2, tracing::Level::WARN, "aic-cap-marker-two"),
+            1
+        );
+        assert_eq!(
+            count_msg(&e2, tracing::Level::WARN, "marker-one"),
+            0,
+            "이전 캡처가 다음 캡처로 샜다"
+        );
+
+        let et = std::thread::spawn(|| capture_events(|| tracing::warn!("aic-cap-marker-thread")))
+            .join()
+            .unwrap();
+        assert_eq!(
+            count_msg(&et, tracing::Level::WARN, "marker-thread"),
+            1,
+            "새 스레드에서 캡처가 동작하지 않았다 — 스레드-로컬 sink 라우팅 실패"
+        );
+
+        // 캡처 밖에서 낸 로그는 어느 sink에도 안 들어간다(누수 없음).
+        tracing::warn!("aic-cap-marker-outside");
+        let e3 = capture_events(|| {});
+        assert_eq!(count_msg(&e3, tracing::Level::WARN, "marker-outside"), 0);
     }
 
     /// **회귀 가드 — WARN 폭주(로그 레벨로 직접 검증).** 못 찾은 상태가 지속되는 동안 재탐색은 계속
@@ -2944,9 +3064,10 @@ mod tests {
     /// 계속 non-zero exit(데몬 down)일 때 **데몬-down WARN이 첫 tick 1회만** 나오고, 복구되면 INFO
     /// 한 번이 나오는지를 루프를 실제로 돌려 확인한다.
     ///
-    /// `with_default`가 현재 스레드에만 걸리므로 `tokio::spawn` 대신 current-thread 런타임 + block_on
-    /// 으로 **같은 스레드**에서 돌린다(위 [`capture_events`] 참고). fake docker는 호출 횟수를 세서
-    /// 처음 3번은 exit 1(데몬 down), 그 뒤엔 성공(복구)한다.
+    /// 로그 캡처(`capture_events`)는 **스레드-로컬 sink**로 라우팅하므로, serve 루프를 `tokio::spawn`
+    /// (워커 스레드로 이동)하면 그 스레드엔 sink가 없어 이벤트가 안 잡힌다. 그래서 current-thread
+    /// 런타임 + block_on으로 **테스트 스레드에서** 폴링해 같은 sink에 잡히게 한다(위 "로그 캡처" 주석
+    /// 참고). fake docker는 호출 횟수를 세서 처음 2번은 exit 1(데몬 down), 그 뒤엔 성공(복구)한다.
     #[test]
     fn serve_docker_warns_once_on_daemon_down_and_logs_recovery() {
         let dir = tempfile::tempdir().unwrap();
