@@ -14,7 +14,7 @@ use aic_common::{AicError, CommandRecord};
 use crate::llm_dispatcher::LlmDispatcher;
 use crate::repl;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::debug::adbg;
 use super::obs_tools::ObsClient;
@@ -1585,9 +1585,8 @@ impl AgentSession {
     /// - **낡음**: status bar가 갱신되지 않은 채 시간이 흐르면(sampler task 정지, 프롬프트에서 장시간 대기)
     ///   그 값은 더 이상 "지금"이 아니다 — `METRICS_FRESH_WINDOW`를 넘기면 캐시를 버린다.
     ///
-    /// t2 시점엔 아직 호출부가 없다(OTLP로 실제 전송해 `/record now`에 붙이는 건 t3) — 소스만 준비해
-    /// 둔다. 테스트가 불변식을 검증하므로 `dead_code`는 여기서만 허용한다.
-    #[allow(dead_code)]
+    /// t3: `handle_record`의 `record_metrics_attrs`가 이 소스로 `/record now <메모>`의 OTLP attrs를
+    /// 채운다(None이면 attrs 없이 메모만 기록).
     pub(crate) fn record_metrics_summary(&mut self) -> Option<super::sys_sampler::SysMetrics> {
         if let Some(rx) = &self.metrics_rx {
             if let Some(m) = rx.borrow().clone() {
@@ -1601,15 +1600,28 @@ impl AgentSession {
             .cloned()
     }
 
+    /// `/record now <메모>`의 OTLP attrs — 지표 없으면(캐시 미스) `note_source`만 든 빈 요약을
+    /// 반환한다(메모만 기록, t3 계약). **서버 `EVENT_MAPPED_KEYS`가 컬럼으로 흡수하는
+    /// `exit_code`/`cwd`/`duration_ms`는 절대 키로 쓰지 않는다** — attrs에서 지워진다.
+    fn record_metrics_attrs(&mut self) -> BTreeMap<String, String> {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("note_source".to_string(), "chat".to_string());
+        if let Some(m) = self.record_metrics_summary() {
+            attrs.extend(metrics_to_attrs(&m));
+        }
+        attrs
+    }
+
     /// `/compare` — 고정 Safe probe로 현재 시스템 스냅샷을 만들고 직전 baseline과 diff(LLM 미호출).
     /// 첫 호출은 baseline만 저장. 이후 diff 출력 후 baseline 갱신.
     /// `/record [on|off|now]` — 세션 스냅샷 자동 기록 토글(+ `now`=즉시 1회 캡처).
     async fn handle_record(&mut self, action: tool_record::RecordAction) {
         use std::sync::atomic::Ordering;
         use tool_record::RecordAction;
-        if let RecordAction::Now = action {
+        if let RecordAction::Now(memo) = action {
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
+            // **기존 동작 그대로 유지**: 메모 유무와 무관하게 항상 로컬 스냅샷 store에 저장한다.
             let res =
                 tokio::task::spawn_blocking(|| super::snapshot_capture::capture_forced("manual"))
                     .await;
@@ -1620,6 +1632,23 @@ impl AgentSession {
                 Err(e) => format!("스냅샷 캡처 task 실패: {e}"),
             };
             self.out.note(&msg).await;
+
+            // 메모가 있으면 로컬 저장과 별개로 OTLP `snapshot.recorded`도 함께 발화한다 — 임계
+            // 스캔이 원리상 못 잡는 "지금 이상하다"를 사람이 남기는 경로(B3). 빈/공백뿐 메모는
+            // `snapshot_recorded` 내부가 스킵한다(F15) — 여기선 memo가 `Some`이었다는 사실만으로
+            // 판단하지 않고 그 반환값으로 실제 전송 여부를 안다.
+            if let Some(memo) = memo {
+                let attrs = self.record_metrics_attrs();
+                let sent = crate::agent_event::snapshot_recorded(&memo, attrs);
+                // 전송을 시도했는데 aicd가 안 보이면(F19) 한 줄 안내 — "로컬은 저장됐는데 왜
+                // OTLP는 안 보이지" 하는 혼란을 막는다. 메모가 sanitize 후 비어 애초에 안 보낸
+                // 경우(sent=false)는 안내할 게 없다(사용자가 이미 빈 메모를 쳤다는 걸 안다).
+                if sent && crate::agent_event::exporter_status().is_none() {
+                    self.out
+                        .note("ℹ OTLP 기록 생략(aicd 미실행) — 로컬 스냅샷은 정상 저장되었습니다.")
+                        .await;
+                }
+            }
             return;
         }
         let now_on = match action {
@@ -2344,6 +2373,41 @@ fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Inst
     m.cpu_valid
         && m.sampled_at
             .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
+}
+
+/// `SysMetrics` → `/record now <메모>` OTLP attrs(순수 함수, 테스트 가능). 호출부
+/// (`record_metrics_attrs`)는 이미 `metrics_cache_usable`을 거친 스냅샷만 넘기지만, 그 사실을
+/// 여기서 가정하지 않고 `m.cpu_valid`를 한 번 더 본다 — "판정은 언제나 스냅샷 자신이 들고
+/// 다닌다"는 t2의 불변식을 이 함수도 지킨다(오염된 캐시가 어떤 경로로든 여기 들어와도 cpu만
+/// 빠지지, 거짓 숫자가 나가지 않는다).
+///
+/// filesystem은 사용률 %가 아니라 여유 바이트를 싣는다 — macOS APFS는 `total - avail` 기반 %가
+/// 부정확하다(sys_sampler `disk_label` 문서 참고, 실측 df 21% vs 계산 93%).
+fn metrics_to_attrs(m: &super::sys_sampler::SysMetrics) -> BTreeMap<String, String> {
+    let mut attrs = BTreeMap::new();
+    if m.cpu_valid {
+        attrs.insert("cpu_utilization".to_string(), format!("{:.1}", m.cpu_pct));
+    }
+    if m.mem_total > 0 {
+        attrs.insert(
+            "memory_utilization".to_string(),
+            format!("{:.1}", m.mem_pct()),
+        );
+    }
+    attrs.insert("load_1m".to_string(), format!("{:.2}", m.load1));
+    if m.disk_total > 0 {
+        attrs.insert(
+            "filesystem_avail_bytes".to_string(),
+            m.disk_avail.to_string(),
+        );
+    }
+    if m.swap_total > 0 {
+        attrs.insert(
+            "swap_utilization".to_string(),
+            format!("{:.1}", m.swap_used as f64 * 100.0 / m.swap_total as f64),
+        );
+    }
+    attrs
 }
 
 /// 세션 correlation id(run). 시계열 nanos 하위 32비트를 8자리 hex로 — 로그 추적용
@@ -3144,6 +3208,84 @@ mod tests {
             ..Default::default()
         };
         assert!(!metrics_cache_usable(&undated, t0));
+    }
+
+    // ── t3 B3: `/record now <메모>` OTLP attrs 조립 ──────────────────────────────
+
+    #[test]
+    fn metrics_to_attrs_includes_cpu_when_valid() {
+        let m = warm_metrics(42.0);
+        let attrs = metrics_to_attrs(&m);
+        assert_eq!(attrs.get("cpu_utilization"), Some(&"42.0".to_string()));
+        assert!(attrs.contains_key("load_1m"));
+    }
+
+    #[test]
+    fn metrics_to_attrs_omits_cpu_when_invalid() {
+        // cpu_valid=false는 그럴싸하게 틀린 값(부팅 이후 누적 평균)이라 attrs에 아예 넣지 않는다 —
+        // 0을 넣거나 통째로 생략하는 것도 아니고, "cpu_utilization" 키 자체가 없어야 한다.
+        let m = polluted_metrics();
+        let attrs = metrics_to_attrs(&m);
+        assert!(
+            !attrs.contains_key("cpu_utilization"),
+            "cpu_valid=false인데 cpu_utilization이 들어감: {attrs:?}"
+        );
+        // 다른 지표(오염 아님)는 그대로 실린다 — cpu 하나만 빠져야 한다.
+        assert!(attrs.contains_key("load_1m"));
+    }
+
+    #[test]
+    fn metrics_to_attrs_never_uses_server_mapped_keys() {
+        // 서버 EVENT_MAPPED_KEYS가 exit_code/cwd/duration_ms를 컬럼으로 흡수해 attrs에서 지운다 —
+        // 이 세 이름을 절대 쓰지 않는다는 계약을 굳힌다(누군가 무심코 이름을 바꾸면 여기서 잡힌다).
+        let m = warm_metrics(10.0);
+        let attrs = metrics_to_attrs(&m);
+        for forbidden in ["exit_code", "cwd", "duration_ms"] {
+            assert!(
+                !attrs.contains_key(forbidden),
+                "금지된 키 사용: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_to_attrs_omits_disk_and_swap_when_totals_are_zero() {
+        // disk_total=0(probe 실패 등)·swap_total=0(swap 비활성)이면 해당 키를 아예 안 넣는다 —
+        // 0%처럼 "측정됐지만 0"으로 보이는 거짓 신호를 피한다.
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            disk_total: 0,
+            swap_total: 0,
+            ..Default::default()
+        };
+        let attrs = metrics_to_attrs(&m);
+        assert!(!attrs.contains_key("filesystem_avail_bytes"));
+        assert!(!attrs.contains_key("swap_utilization"));
+    }
+
+    #[test]
+    fn record_metrics_attrs_carries_only_note_source_without_cache() {
+        // 캐시가 없으면(None) 지표 attr을 전부 생략하고 note_source만 남는다 — "메모만 기록"의
+        // attrs 레벨 계약.
+        let (mut session, _dir) = test_session();
+        assert!(session.last_metrics.is_none() && session.metrics_rx.is_none());
+        let attrs = session.record_metrics_attrs();
+        assert_eq!(
+            attrs.len(),
+            1,
+            "지표 없이도 note_source 외 키가 섞임: {attrs:?}"
+        );
+        assert_eq!(attrs.get("note_source"), Some(&"chat".to_string()));
+    }
+
+    #[test]
+    fn record_metrics_attrs_carries_metrics_when_cache_warm() {
+        let (mut session, _dir) = test_session();
+        session.last_metrics = Some(warm_metrics(55.0));
+        let attrs = session.record_metrics_attrs();
+        assert_eq!(attrs.get("cpu_utilization"), Some(&"55.0".to_string()));
+        assert_eq!(attrs.get("note_source"), Some(&"chat".to_string()));
     }
 
     #[tokio::test]
