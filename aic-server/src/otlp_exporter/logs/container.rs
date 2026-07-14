@@ -857,9 +857,67 @@ mod tests {
 
     // ── 스트레스: 컨테이너 200개 × 다수 라인 — FD 누수 0, 완료 ───────────────
 
-    #[cfg(unix)]
-    fn open_fd_count() -> Option<usize> {
-        std::fs::read_dir("/dev/fd").ok().map(|it| it.count())
+    /// FD 번호 하나가 가리키는 경로를 얻는다.
+    ///
+    /// Linux는 `/proc/self/fd/<N>`이 심볼릭 링크라 `read_link`로 풀린다.
+    #[cfg(target_os = "linux")]
+    fn path_of_fd(fd: i32) -> Option<PathBuf> {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+
+    /// macOS의 `/dev/fd/<N>`은 심볼릭 링크가 아니라 character device라 `read_link`가 실패한다 —
+    /// `fcntl(fd, F_GETPATH, buf)`가 유일한 경로 획득 수단이다.
+    #[cfg(target_os = "macos")]
+    fn path_of_fd(fd: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH의 계약은 "PATH_MAX 바이트 버퍼"이고 buf가 정확히 그 크기다. 이미 닫힌
+        // FD 번호를 넘겨도 -1(EBADF)을 돌려줄 뿐 UB가 아니다.
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+        if rc == -1 {
+            return None;
+        }
+        let bytes: Vec<u8> = buf
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)))
+    }
+
+    /// 이 프로세스가 열어 둔 FD 중 **`dir` 아래의 파일을 가리키는 것만** 모은다.
+    ///
+    /// 예전 구현은 `/dev/fd` 엔트리 수(= 프로세스 전역 FD 개수)를 측정 전후로 비교했는데,
+    /// `cargo test`는 한 프로세스 안에서 테스트를 **스레드로 병렬 실행**한다 — 측정 구간 사이에
+    /// 다른 테스트가 연 파일이 그대로 잡혀 flaky했다(`+5` 여유는 병렬 부하 앞에서 무의미하다).
+    /// 우리 tempdir로 범위를 좁히면 다른 테스트의 FD는 각자 다른 tempdir을 가리키므로 자동으로
+    /// 배제되고, 여유값 없이 **정확한 개수**를 단언할 수 있다.
+    ///
+    /// ★ 경로 비교 전에 양쪽을 canonicalize한다. macOS의 tempdir은 `/var/folders/...`인데
+    /// `F_GETPATH`는 `/private/var/folders/...`를 돌려준다(`/var`가 `/private/var`의 심링크) —
+    /// canonicalize를 빠뜨리면 매칭이 0건이 되어 "누수 없음"으로 조용히 통과하는 **공허한
+    /// 테스트**가 된다.
+    fn open_fds_under(dir: &Path) -> Vec<PathBuf> {
+        let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+        let fd_dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        // FD 번호를 먼저 스냅샷으로 걷어낸다 — read_dir 이터레이터 자신이 들고 있는 FD를
+        // 해석 대상에서 빼기 위함이다(닫힌 뒤엔 EBADF로 걸러진다).
+        let fds: Vec<i32> = std::fs::read_dir(fd_dir)
+            .unwrap_or_else(|e| panic!("{fd_dir} 열기 실패 — FD 검사가 불가능하다: {e}"))
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+            .collect();
+
+        fds.into_iter()
+            .filter_map(path_of_fd)
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .filter(|p| p.starts_with(&root))
+            .collect()
     }
 
     #[test]
@@ -895,7 +953,16 @@ mod tests {
         }
         recv_all(&mut rx);
 
-        let baseline_fds = open_fd_count();
+        // ★ 공허한 테스트 방지 — 여기서 0이 나오면 FD→경로 해석이 실패한 것이지 "누수가 없는"
+        // 게 아니다. 아래의 "≤ N" / "= 0" 단언은 0건 매칭에서도 전부 통과해 버리므로, 헬퍼가
+        // 실제로 값을 잡아낸다는 것을 먼저 증명한다.
+        let established = open_fds_under(base.path());
+        assert_eq!(
+            established.len(),
+            N_CONTAINERS,
+            "확립 tick 후 tempdir을 가리키는 열린 FD가 컨테이너당 정확히 1개여야 함 \
+             (0이면 FD→경로 해석 실패 = 아무것도 검증하지 못하는 공허한 테스트다)"
+        );
 
         for path in &paths {
             let mut buf = Vec::new();
@@ -923,12 +990,24 @@ mod tests {
             "채널 용량을 넉넉히 뒀으므로 드롭이 없어야 함"
         );
 
-        if let (Some(before), Some(after)) = (baseline_fds, open_fd_count()) {
-            assert!(
-                after <= before + 5,
-                "FD 누수 의심 — tick 전 {before}, 처리 후 {after}(컨테이너당 최대 1개 열린 핸들만 유지되어야 함)"
-            );
-        }
+        // 로테이션/재오픈 경로를 다 돈 뒤에도 tail당 열린 핸들은 여전히 1개뿐이어야 한다.
+        // 전역 개수가 아니라 우리 tempdir을 가리키는 FD만 세므로 병렬로 도는 다른 테스트의
+        // 파일은 애초에 후보에 들어오지 않는다 — 여유값이 필요 없다.
+        let after_tick = open_fds_under(base.path());
+        assert!(
+            after_tick.len() <= N_CONTAINERS,
+            "FD 누수 — 컨테이너당 최대 1개(≤{N_CONTAINERS})여야 하는데 {}개가 열려 있다: {:?}",
+            after_tick.len(),
+            &after_tick[..after_tick.len().min(5)]
+        );
+
+        // 핸들이 실제로 닫히는지 — 지금까지 아무도 검증하지 않던 부분이다.
+        drop(tails);
+        let after_drop = open_fds_under(base.path());
+        assert!(
+            after_drop.is_empty(),
+            "FileTail을 drop한 뒤에도 로그 파일을 가리키는 FD가 남아 있다(핸들 누수): {after_drop:?}"
+        );
     }
 
     // ── 2단계 필터링 배선(엔드투엔드): 파싱 실패 라인이 외부로 새지 않음 ─────
