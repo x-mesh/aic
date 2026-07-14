@@ -476,6 +476,9 @@ mod tests {
         counters.by_rate_limit.fetch_add(22, Ordering::Relaxed);
         counters.by_channel_full.fetch_add(33, Ordering::Relaxed);
         counters.by_spool_quota.fetch_add(44, Ordering::Relaxed);
+        // 수신 측이 4xx로 영구 거부한 배치(413 등). 이게 노출되지 않으면 "보냈는데 사라진"
+        // 로그를 아무도 못 본다 — poison batch 방어의 유일한 가시화 수단이다.
+        counters.by_rejected.fetch_add(55, Ordering::Relaxed);
 
         let bytes = encode_metrics(&sample, "0.24.0", 1, &counters);
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
@@ -490,8 +493,8 @@ mod tests {
         let MetricData::Gauge(gauge) = dropped_metric.data.as_ref().unwrap();
         assert_eq!(
             gauge.data_points.len(),
-            4,
-            "사유 4종(severity/rate_limit/channel_full/spool_quota)"
+            5,
+            "사유 5종(severity/rate_limit/channel_full/spool_quota/rejected)"
         );
 
         let by_reason: std::collections::HashMap<String, i64> = gauge
@@ -518,6 +521,7 @@ mod tests {
         assert_eq!(by_reason.get("rate_limit"), Some(&22));
         assert_eq!(by_reason.get("channel_full"), Some(&33));
         assert_eq!(by_reason.get("spool_quota"), Some(&44));
+        assert_eq!(by_reason.get("rejected"), Some(&55));
 
         // 서비스 태그는 붙지 않는다 — reason 하나뿐이어야 한다(카디널리티 방어).
         for dp in &gauge.data_points {
