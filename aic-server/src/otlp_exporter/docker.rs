@@ -76,9 +76,15 @@ const FALLBACK_DOCKER_DIRS: &[&str] = &[
     "/Applications/Docker.app/Contents/Resources/bin",
 ];
 
-/// `$HOME` 밑의 docker 설치 위치(OrbStack이 사용자 홈에도 둔다). 홈은 런타임에만 알 수 있어
-/// [`FALLBACK_DOCKER_DIRS`]와 분리한다.
-const HOME_RELATIVE_DOCKER_PATH: &str = ".orbstack/bin/docker";
+/// `$HOME` 밑의 docker 설치 위치들. 홈은 런타임에만 알 수 있어 [`FALLBACK_DOCKER_DIRS`]와 분리한다.
+///
+/// - `.orbstack/bin/docker` — OrbStack이 사용자 홈에도 둔다.
+/// - `.docker/bin/docker` — Docker Desktop을 **user 설치**(Advanced settings → System/User)로 고르면
+///   여기 심볼릭 링크를 만든다. system 설치는 `/usr/local/bin`([`FALLBACK_DOCKER_DIRS`])이다.
+///
+/// 둘 다 사용자 쓰기 가능 경로라 **root aicd일 땐 walk가 자동으로 거부**한다([`resolve_docker_bin_with`]의
+/// "쓰기 가능 경로와 root" 참고) — 즉 이 폴백들은 비-root aicd에서만 유효하고, 그게 옳은 동작이다.
+const HOME_RELATIVE_DOCKER_PATHS: &[&str] = &[".orbstack/bin/docker", ".docker/bin/docker"];
 /// `docker system df --format json` stdout 상한. 정상 출력은 카테고리 4줄뿐이라 이 한도를 훨씬
 /// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다.
 ///
@@ -227,8 +233,10 @@ fn resolve_docker_bin_with(
         }
     }
     if let Some(h) = home {
-        if let Some(found) = accept(h.join(HOME_RELATIVE_DOCKER_PATH)) {
-            return Some(found);
+        for rel in HOME_RELATIVE_DOCKER_PATHS {
+            if let Some(found) = accept(h.join(rel)) {
+                return Some(found);
+            }
         }
     }
 
@@ -1220,6 +1228,71 @@ mod tests {
         );
     }
 
+    /// Docker Desktop **user 설치**의 `$HOME/.docker/bin/docker`도 커버해야 한다 — HOME 상대 폴백이
+    /// 이제 둘(`.orbstack`, `.docker`)이니 순회가 둘 다 도는지 확인한다.
+    #[test]
+    fn falls_back_to_home_docker_desktop_user_path() {
+        let got = resolve(
+            None,
+            Some(OsString::from("/usr/bin")),
+            Some(Path::new("/Users/someone")),
+            // .orbstack은 없고 .docker만 있다 — 순회가 첫 항목에서 멈추지 않아야 잡힌다.
+            &only(&["/Users/someone/.docker/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/Users/someone/.docker/bin/docker"))
+        );
+    }
+
+    /// **root/비-root 대칭**: `$HOME/.docker/bin`은 사용자 쓰기 가능이라, root aicd일 땐 walk(신뢰
+    /// 판정)가 거부하고 비-root에선 채택해야 한다 — 이 폴백 추가가 root 거부를 실제로 타는지 못박는다.
+    #[test]
+    fn home_docker_desktop_path_is_rejected_as_root_but_accepted_as_non_root() {
+        let home = Path::new("/Users/victim");
+        let cand = "/Users/victim/.docker/bin/docker";
+
+        // 비-root: 신뢰 판정 없이 채택.
+        let as_non_root = resolve(None, None, Some(home), &only(&[cand]));
+        assert_eq!(as_non_root, Some(PathBuf::from(cand)));
+
+        // root: 사용자 쓰기 가능이라 신뢰 밖 → 거부.
+        let as_root = resolve_as(
+            None,
+            None,
+            Some(home),
+            true,
+            &only(&[cand]),
+            &trusted(&[]), // 이 경로는 root 통제 밖.
+        );
+        assert_eq!(
+            as_root, None,
+            "root인데 사용자 쓰기 가능한 $HOME/.docker/bin의 docker를 채택했다"
+        );
+    }
+
+    /// **실측(주입 아님)**: 사용자 쓰기 가능한 `$HOME/.docker/bin/docker` 형태가 **진짜**
+    /// `is_root_controlled_path`(root일 때만 호출되는 그 가드)에서 거부되는지 확인한다. 위 두 테스트는
+    /// 신뢰 판정을 주입하지만, 이건 실제 판정을 실제 FS 구조에 돌려 "root 거부를 정말 탄다"를 못박는다.
+    /// `bin`을 0777로 둬 base 소유와 무관하게 거부되게 한다(root 머신에서도 유효).
+    #[test]
+    fn a_user_writable_home_docker_path_is_untrusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let bin = home.join(".docker").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(&docker, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // 사용자 쓰기 가능 시뮬레이트: 이 성분 하나만으로도 walk가 거부해야 한다(base 소유 무관).
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            !is_root_controlled_path(&docker),
+            "사용자 쓰기 가능한 $HOME/.docker/bin의 docker가 root 신뢰 판정을 통과했다"
+        );
+    }
+
     /// Linux 배포판 패키지 위치(`/usr/bin/docker`)도 커버해야 한다.
     #[test]
     fn finds_the_linux_distro_package_path() {
@@ -1227,7 +1300,8 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/usr/bin/docker")));
     }
 
-    /// docker가 아예 없으면 `None` — 호출부가 exporter를 비활성한다(매 tick WARN 대신 기동 시 1회).
+    /// docker가 아예 없으면 `None` — 호출부(`serve_docker`)는 task를 유지한 채 매 tick 재탐색하고,
+    /// WARN은 기동 시 1회만 낸다("지금은 없다"이지 "비활성"이 아니다 — `resolve_docker_bin` doc 참고).
     #[test]
     fn returns_none_when_docker_is_absent_everywhere() {
         let got = resolve(
@@ -1812,6 +1886,13 @@ mod tests {
     /// **오직 `ENOTSUP`(=진짜 미지원)만** 미지원으로 치므로, blob이 틀리면(`EINVAL`) 아래 `panic`
     /// 가지로 떨어져 시끄럽게 실패한다. set이 `Ok`라는 것 자체가 커널이 blob을 유효한 ACL로 받아
     /// 저장했다는 뜻이고(malformed면 커널이 SET에서 EINVAL), 그 위에서 탐지를 시험하므로 순환이 없다.
+    ///
+    /// **지원 정책 일관성**: 이 테스트와 그 헬퍼(`set_extended_acl_for_test`)는 ACL을 실제로 거는
+    /// 방법이 OS별이라 macOS/Linux에만 있다. 프로덕션 `has_extended_acl`이 그 밖의 unix를 fail-closed
+    /// 폴백으로 처리해 **컴파일은 되는** 것과 맞춰, 이 테스트도 지원 대상에서만 컴파일되게 gate한다
+    /// (다른 unix에서 테스트 바이너리가 깨지지 않는다). 분류 정책(ACL 있으면 신뢰 안 함)은
+    /// `is_root_controlled_meta_rejects_a_path_with_an_extended_acl`가 어느 플랫폼에서든 못박는다.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn has_extended_acl_detects_a_real_extended_acl() {
         let dir = tempfile::tempdir().unwrap();
