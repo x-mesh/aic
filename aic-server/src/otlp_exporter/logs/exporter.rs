@@ -87,9 +87,15 @@ struct LogsFlusher {
     limiter: Limiter,
 }
 
-/// 한 라인이 배치 크기에 기여하는 바이트. 인코딩 전 원문 기준이다 — protobuf 프레이밍과 attr
-/// 오버헤드가 그 위에 얹히므로, 이 합이 `batch_max_bytes`(수신 측 상한의 절반)를 안 넘으면
-/// 인코딩 결과도 상한 아래로 들어온다.
+/// 한 라인이 배치 크기에 기여하는 바이트. **인코딩 전 원문 기준**이다.
+///
+/// 이건 flush 시점을 정하는 **휴리스틱**이지 크기 보장이 아니다 — protobuf 프레이밍,
+/// `aic.log.` attr 키 prefix, resource attr이 이 위에 얹히므로 원문 합이 `batch_max_bytes`
+/// 아래여도 인코딩 결과는 넘을 수 있다. 실제 보장은 [`LogsFlusher::encode_within_limit`]가
+/// **인코딩된 본문을 직접 재서** 한다.
+///
+/// 라인마다 인코딩해 보고 결정하지 않는 이유는 비용이다 — 여기는 라인당 경로이고, 인코딩은
+/// 배치당 한 번이면 된다.
 fn line_bytes(line: &LogLine) -> usize {
     line.message.len()
         + line.service.len()
@@ -149,8 +155,55 @@ impl LogsFlusher {
             || self.buffered_bytes >= self.cfg.batch_max_bytes
     }
 
+    /// 라인 묶음 하나를 OTLP 본문으로 인코딩한다.
+    fn encode(&self, lines: &[LogLine]) -> Vec<u8> {
+        let resource = ResourceAttrs {
+            host_name: &self.host_name,
+            host_id: &self.host_id,
+            os_type: &self.os_type,
+            host_ip: None,
+        };
+        logs_proto::encode_log_line(lines, &resource, &self.cfg.service_version)
+    }
+
+    /// **인코딩된 본문**이 `batch_max_bytes`를 넘지 않도록 배치를 쪼갠다.
+    ///
+    /// [`line_bytes`]를 누적해 flush를 트리거하는 건 **휴리스틱**이다 — protobuf 프레이밍,
+    /// `aic.log.` attr 키 prefix, resource attr이 원문 바이트 위에 얹히므로 "원문 4 MiB면 인코딩
+    /// 후에도 4 MiB 아래"라는 보장이 없다. attr이 많은 라인(journald는 pid/unit/syslog_facility를
+    /// 붙인다)이 몰리면 오버헤드 비율이 커진다.
+    ///
+    /// 그래서 **실제 인코딩 결과를 재고**, 넘으면 반으로 쪼개 다시 잰다. 이게 없으면 초과분이
+    /// 수신 측 body-limit에 413으로 걸리고, 그 배치는 재전송해도 영원히 413이라 통째로 유실된다.
+    ///
+    /// 라인 하나는 `MAX_LOG_LINE_BYTES`(64 KiB)로 이미 잘려 있으므로 분할은 반드시 끝난다.
+    /// 그래도 한 줄이 상한을 넘으면(attr이 비정상적으로 큰 경우) 더 쪼갤 수 없으니 그대로 보낸다 —
+    /// 413을 받고 영구 실패로 드롭되며 카운터에 잡힌다. 조용히 사라지지는 않는다.
+    fn encode_within_limit(&self, batch: Vec<LogLine>) -> Vec<(Vec<u8>, usize)> {
+        let limit = self.cfg.batch_max_bytes;
+        let mut out = Vec::new();
+        // stack에서 pop하는 순서가 곧 전송 순서다 — right를 먼저 push해야 left가 먼저 나간다.
+        let mut stack = vec![batch];
+        while let Some(chunk) = stack.pop() {
+            if chunk.is_empty() {
+                continue;
+            }
+            let body = self.encode(&chunk);
+            if body.len() <= limit || chunk.len() == 1 {
+                out.push((body, chunk.len()));
+                continue;
+            }
+            let mid = chunk.len() / 2;
+            let mut left = chunk;
+            let right = left.split_off(mid);
+            stack.push(right);
+            stack.push(left);
+        }
+        out
+    }
+
     /// 현재 버퍼를 인코딩해 전송을 시도한다. 빈 버퍼는 no-op(빈 배치를 push/spool 어느 쪽에도
-    /// 남기지 않는다).
+    /// 남기지 않는다). 인코딩 결과가 상한을 넘으면 여러 배치로 나눠 보낸다.
     async fn flush(&mut self) {
         if self.buffer.is_empty() {
             return;
@@ -159,19 +212,18 @@ impl LogsFlusher {
         self.buffered_bytes = 0;
         self.deadline = None;
 
-        let resource = ResourceAttrs {
-            host_name: &self.host_name,
-            host_id: &self.host_id,
-            os_type: &self.os_type,
-            host_ip: None,
-        };
-        let body = logs_proto::encode_log_line(&batch, &resource, &self.cfg.service_version);
+        for (body, lines) in self.encode_within_limit(batch) {
+            self.send_one(body, lines).await;
+        }
+    }
 
+    /// 인코딩이 끝난 본문 하나를 push한다(실패 시 spool/드롭 분기 포함).
+    async fn send_one(&mut self, body: Vec<u8>, batch_lines: usize) {
         if !self.backoff.ready() {
             // backoff 윈도 안 — push 시도 없이 바로 spool(무유실). 드레인은 이 task가 하지
             // 않는다(host metrics task `serve`가 유일한 드레인 주체, 모듈 doc 참고).
             if let Err(e) = self.cfg.spool.append(SignalKind::AppLogs, &body) {
-                tracing::warn!(error = %e, batch_lines = batch.len(), "OTLP app logs spool append 실패 — 이 배치 유실");
+                tracing::warn!(error = %e, batch_lines, "OTLP app logs spool append 실패 — 이 배치 유실");
             }
             return;
         }
@@ -194,21 +246,21 @@ impl LogsFlusher {
             Err(e) if e.is_permanent() => {
                 tracing::warn!(
                     error = %e,
-                    batch_lines = batch.len(),
+                    batch_lines,
                     "collector가 app logs 배치를 영구 거부 — 이 배치 유실(spool에 넣지 않는다)"
                 );
                 self.cfg
                     .drop_counters
                     .by_rejected
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    .fetch_add(batch_lines as u64, Ordering::Relaxed);
                 // backoff는 올리지 않는다 — collector는 살아 있다. 우리 요청이 틀렸을 뿐이고,
                 // backoff를 걸면 멀쩡한 다음 배치까지 지연시킨다.
                 self.cfg.health.record_ok();
             }
             Err(e) => {
-                tracing::warn!(error = %e, batch_lines = batch.len(), "OTLP app logs push 실패 — spool에 적재");
+                tracing::warn!(error = %e, batch_lines, "OTLP app logs push 실패 — spool에 적재");
                 if let Err(e2) = self.cfg.spool.append(SignalKind::AppLogs, &body) {
-                    tracing::warn!(error = %e2, batch_lines = batch.len(), "OTLP app logs spool append 실패 — 이 배치 유실");
+                    tracing::warn!(error = %e2, batch_lines, "OTLP app logs spool append 실패 — 이 배치 유실");
                 }
                 self.backoff.on_failure();
                 self.cfg.health.record_fail();
@@ -367,7 +419,7 @@ mod tests {
             batch_max_lines: 500,
             // ms 타이머가 이 테스트에서 절대 끼어들지 않게 충분히 크게 잡는다.
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 3_600_000,
+            batch_max_ms: 3_600_000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -489,7 +541,7 @@ batch_max_ms: 3_600_000,
             // 라인 수로는 이 테스트에서 절대 안 걸리게.
             batch_max_lines: 10_000,
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 2000,
+            batch_max_ms: 2000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -534,7 +586,7 @@ batch_max_ms: 2000,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 2,
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 60_000,
+            batch_max_ms: 60_000,
             spool: spool.clone(),
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -579,7 +631,7 @@ batch_max_ms: 60_000,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 60_000, // 타이머로는 절대 안 나가게.
+            batch_max_ms: 60_000, // 타이머로는 절대 안 나가게.
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -684,7 +736,7 @@ batch_max_ms: 60_000, // 타이머로는 절대 안 나가게.
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 60_000,
+            batch_max_ms: 60_000,
             spool: spool.clone(),
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -722,7 +774,7 @@ batch_max_ms: 60_000,
             service_version: "0.0.0-test".to_string(),
             batch_max_lines: 500,
             batch_max_bytes: 4 * 1024 * 1024,
-batch_max_ms: 50,
+            batch_max_ms: 50,
             spool: spool.clone(),
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
@@ -802,7 +854,7 @@ batch_max_ms: 50,
             endpoint: format!("http://{addr}"),
             token: None,
             service_version: "0.0.0-test".to_string(),
-            batch_max_lines: 100, // 라인 수로는 flush 안 걸리게.
+            batch_max_lines: 100,             // 라인 수로는 flush 안 걸리게.
             batch_max_bytes: 4 * 1024 * 1024, // 바이트로도 안 걸리게.
             batch_max_ms: 60_000, // 타이머로도 flush 안 걸리게 — flush는 shutdown 때 한 번.
             spool: spool.clone(),
@@ -870,6 +922,128 @@ batch_max_ms: 50,
             drop_counters.by_rate_limit.load(Ordering::Relaxed),
             0,
             "rate limit은 10k/s라 이 테스트에서 걸리지 않아야 함"
+        );
+    }
+
+    /// 인코딩된 본문이 `batch_max_bytes`를 넘으면 배치를 쪼개 보낸다.
+    ///
+    /// line_bytes() 누적(= flush 트리거)은 **원문 바이트**만 센다. protobuf 프레이밍과
+    /// `aic.log.` attr 키 prefix, resource attr이 그 위에 얹히므로 원문이 상한 아래여도
+    /// 인코딩 결과는 넘을 수 있다. 넘긴 채로 보내면 수신 측이 413으로 자르고, 그 배치는
+    /// 재전송해도 영원히 413이라 통째로 유실된다.
+    ///
+    /// 실시간 시계로 돈다 — mock collector가 진짜 body를 받아야 크기를 잴 수 있다.
+    #[tokio::test]
+    async fn oversized_encoded_batch_is_split_under_the_wire_limit() {
+        use axum::extract::State;
+        use prost::Message as _;
+        use std::sync::Mutex;
+
+        type Captured = Arc<Mutex<Vec<Vec<u8>>>>;
+
+        async fn capture(
+            State(bodies): State<Captured>,
+            body: axum::body::Bytes,
+        ) -> axum::http::StatusCode {
+            bodies.lock().unwrap().push(body.to_vec());
+            axum::http::StatusCode::OK
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let bodies: Captured = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/v1/logs", axum::routing::post(capture))
+            .with_state(bodies.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 상한을 작게 잡아 인코딩 오버헤드만으로도 분할이 강제되게 한다.
+        const WIRE_LIMIT: usize = 4096;
+
+        let (_dir, spool) = test_spool();
+        let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
+        let logs_cfg = aic_common::AicdLogsConfig {
+            max_lines_per_sec: 100_000, // rate limit이 끼어들지 않게
+            ..Default::default()
+        };
+        let cfg = LogsExporterConfig {
+            endpoint: format!("http://{addr}"),
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            batch_max_lines: 10_000, // 라인 수로는 flush 안 걸리게
+            batch_max_bytes: WIRE_LIMIT,
+            batch_max_ms: 3_600_000, // 타이머로도 flush 안 걸리게 — flush는 shutdown 때 한 번
+            spool: spool.clone(),
+            health,
+            logs_cfg,
+            drop_counters: Arc::new(DropCounters::new()),
+        };
+        let (tx, rx) = mpsc::channel(1024);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_logs(cfg, rx, sd_rx));
+
+        const LINES: usize = 60;
+        const CHANNEL_CAP: usize = 1024;
+        for i in 0..LINES {
+            tx.send(log_line(&format!("line-{i:03}-{}", "x".repeat(40))))
+                .await
+                .unwrap();
+        }
+
+        // exporter가 채널을 **비울 때까지** 기다린다. `send().await`는 채널에 넣는 것까지만
+        // 보장한다 — 여기서 바로 shutdown을 쏘면 루프가 라인을 꺼내기도 전에 깨져 빈 버퍼를
+        // flush하고 끝난다(실제로 그렇게 실패했다). capacity가 전부 돌아오면 recv가 다 됐다는 뜻.
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while tx.capacity() < CHANNEL_CAP {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "exporter가 10초 안에 채널을 비우지 못했다"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            settle().await; // recv 직후 add_line이 끝날 틈
+        }
+
+        sd_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+
+        let captured = bodies.lock().unwrap();
+        assert!(
+            captured.len() >= 2,
+            "상한을 넘는 배치는 쪼개져야 한다 — 요청이 {}개뿐이다",
+            captured.len()
+        );
+
+        // 핵심 단언: **보낸 본문 중 상한을 넘는 게 하나도 없다.**
+        for (i, body) in captured.iter().enumerate() {
+            assert!(
+                body.len() <= WIRE_LIMIT,
+                "{i}번째 본문이 {} bytes로 상한({WIRE_LIMIT})을 넘었다 — 수신 측이 413으로 자른다",
+                body.len()
+            );
+        }
+
+        // 그리고 라인이 하나도 새지 않는다.
+        let total: usize = captured
+            .iter()
+            .map(|b| {
+                logs_proto::ExportLogsServiceRequest::decode(b.as_slice())
+                    .expect("valid OTLP logs protobuf")
+                    .resource_logs[0]
+                    .scope_logs[0]
+                    .log_records
+                    .len()
+            })
+            .sum();
+        assert_eq!(total, LINES, "분할 과정에서 라인이 유실되면 안 된다");
+
+        assert_eq!(
+            spool.batch_count(),
+            0,
+            "mock이 200을 주므로 spool로 새지 않는다"
         );
     }
 }
