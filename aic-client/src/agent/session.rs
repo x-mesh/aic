@@ -2508,8 +2508,10 @@ fn empty_memo_note(local_ok: bool) -> &'static str {
     }
 }
 
-/// chat(`handle_record`)과 CLI(`aic snapshot record`)가 **같은 문구·같은 판단**을 쓰도록 pub이다 —
-/// 두 진입점이 각자 메시지를 지으면 한쪽만 고치고 잊는 경로가 생긴다.
+/// chat(`handle_record`)이 쓴다 — chat은 exit code가 없어 **로컬+원격을 한 줄에 합쳐** 전해야 한다.
+/// CLI는 exit code가 로컬을 나르므로 로컬 실패를 문구로 반복하면 두 번 찍힌다 — 그래서 CLI는
+/// [`cli_remote_notice`]로 **원격만** 말한다. 두 진입점의 문구가 갈라지지 않도록 서로를 가리켜 둔다
+/// (한쪽만 고치고 잊지 않게 — 예전엔 이 함수를 CLI도 공유했지만 그 중복 때문에 갈라냈다).
 pub fn record_remote_notice(
     local_ok: bool,
     remote: Option<crate::agent_event::RecordOutcome>,
@@ -2545,6 +2547,38 @@ pub fn record_remote_notice(
             remote_note.map(|n| format!("{n} ")).unwrap_or_default()
         )),
     }
+}
+
+/// CLI(`aic snapshot record --memo`)용 원격 안내 — chat의 [`record_remote_notice`]와 **의도는 같되
+/// 로컬을 말하지 않는다**(CLI는 exit code가 로컬을 나른다).
+///
+/// 핵심은 `local_ok == false`일 때다: 로컬이라는 **확실한 사본이 사라졌으니**, 원격이 깨끗하게
+/// 전달됐어도(=[`RecordOutcome::notice`]가 `None`) **침묵하면 안 된다**. 침묵하면 사용자는 exit 1만
+/// 보고 "메모가 통째로 사라졌다"고 오해한다 — 실제로는 aicd에 도달했는데도. chat은 이 경우를
+/// `record_remote_notice(false, Reaches)`로 다루는데, CLI가 `notice()`만 쓰다가 이 안심 경로를
+/// 빠뜨렸다(chat↔CLI 비대칭). 로컬 실패 사실 자체는 여기서 반복하지 않는다 — exit-1 `Err`가 전한다.
+pub fn cli_remote_notice(
+    local_ok: bool,
+    remote: Option<crate::agent_event::RecordOutcome>,
+) -> Option<String> {
+    let remote = remote?;
+    if local_ok {
+        // 로컬이 안전하니 원격은 **문제 있을 때만** 말한다(깨끗하면 침묵 — ✓ 캡처 라인으로 충분).
+        return remote.notice();
+    }
+    // 로컬 실패: 원격 fate가 유일한 희망이라 **항상** 표면화한다. notice()가 있으면 그걸(밀림 등
+    // 구체 정보 포함), 없으면(깨끗한 Reaches) "aicd엔 도달했다"는 안심을 준다 — 단 `Reaches` doc의
+    // 천장을 넘지 않는다(서버 보장 아님, 반영은 비동기).
+    use crate::agent_event::RemoteVerdict;
+    remote.notice().or_else(|| match remote.verdict() {
+        RemoteVerdict::Reaches => {
+            Some("메모는 aicd에 전달됐습니다(서버 반영은 비동기라 확인이 필요합니다).".to_string())
+        }
+        // Unknown/Lost는 notice()가 항상 Some이라 여기 도달하지 않는다(방어적 fallback).
+        RemoteVerdict::Unknown | RemoteVerdict::Lost => {
+            Some("메모의 원격 전송 상태를 확인할 수 없습니다.".to_string())
+        }
+    })
 }
 
 /// `SysMetrics` → `/record now <메모>` OTLP attrs(순수 함수, 테스트 가능). 호출부
@@ -3763,6 +3797,38 @@ mod tests {
         assert!(n.contains("aicd"), "원격 실패 원인이 빠졌다: {n}");
         assert!(n.contains("로컬"), "로컬 실패 사실이 빠졌다: {n}");
         assert!(n.contains("도 실패"), "양쪽 실패임이 드러나야 한다: {n}");
+    }
+
+    #[test]
+    fn cli_remote_notice_surfaces_clean_remote_when_local_failed() {
+        use crate::agent_event::RecordOutcome;
+        // **로컬 실패 + 원격 깨끗 전달**(`notice()`가 None인 유일한 케이스). CLI가 `notice()`만 쓰면
+        // 여기서 아무 말도 안 해, 사용자는 exit 1만 보고 "메모가 통째로 사라졌다"고 오해한다 —
+        // 실제로는 aicd에 도달했는데도. `cli_remote_notice`는 그 안심을 반드시 준다.
+        // mutation: 이 함수를 `remote.notice()`로 되돌리면(=원래 CLI 버그) None이라 이 단언이 깨진다.
+        let n = cli_remote_notice(false, Some(RecordOutcome::Delivered { backlog: 0 }))
+            .expect("로컬 실패 시 깨끗한 원격 전달도 알려야 한다");
+        assert!(n.contains("aicd"), "원격 도달 사실이 빠졌다: {n}");
+        // 로컬 실패는 여기서 반복하지 않는다 — exit-1 Err가 나른다(중복 방지, 13차 교정).
+        assert!(
+            !n.contains("로컬"),
+            "CLI 원격 안내가 로컬을 반복한다(중복): {n}"
+        );
+        // `Reaches` 천장을 넘어 "서버 보존"을 단정하면 안 된다.
+        assert!(
+            !n.contains("안전") && !n.contains("남습니다"),
+            "천장을 넘어 단정한다: {n}"
+        );
+    }
+
+    #[test]
+    fn cli_remote_notice_is_silent_on_clean_delivery_when_local_ok() {
+        use crate::agent_event::RecordOutcome;
+        // 로컬 성공 + 원격 깨끗 = 할 말 없음(✓ 캡처 라인으로 충분). 여기서 뭔가 찍으면 소음이다.
+        assert!(
+            cli_remote_notice(true, Some(RecordOutcome::Delivered { backlog: 0 })).is_none(),
+            "로컬·원격 다 깨끗한데 원격 안내를 냈다(소음)"
+        );
     }
 
     #[test]
