@@ -54,7 +54,7 @@ mod spool;
 pub use agent::{serve_agent, AgentConfig};
 pub use changes::{serve_changes, ChangesConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
-pub use docker::{serve_docker, DockerConfig};
+pub use docker::{resolve_docker_bin, serve_docker, DockerConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};

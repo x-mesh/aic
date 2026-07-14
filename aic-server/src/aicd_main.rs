@@ -861,9 +861,14 @@ fn load_changes_config(
 
 /// A3: docker exporter 설정 로더. `docker_enabled`는 부모 게이트(`enabled`)가 켜져도 기본
 /// false다(otlp_exporter::docker 모듈 doc 참고) — 그래서 다른 로더와 달리 명시적으로 true로
-/// 설정된 환경에서만 task가 뜬다. `docker_bin`은 PATH 탐색에 맡긴다(connections의 `aic_bin`처럼
-/// aicd 옆 경로를 우선하지 않는다 — docker는 aic 배포물이 아니라 시스템에 이미 설치돼 있거나
-/// 없거나이므로 PATH가 유일하게 맞는 탐색 위치다).
+/// 설정된 환경에서만 task가 뜬다.
+///
+/// `docker_bin`은 **기동 시 절대경로로 resolve**한다. 예전엔 `PathBuf::from("docker")`로 PATH
+/// 탐색에 맡겼는데, aicd는 launchd/systemd로 뜨고 그 환경의 PATH는 셸이 아니라 서비스 매니저
+/// 기본값이라(`/usr/bin:/bin:/usr/sbin:/sbin`) `/usr/local/bin/docker`를 못 찾았다 — 실환경에서
+/// 매 tick `ENOENT`만 났다. 이제 PATH + 표준 설치 위치를 뒤져(`resolve_docker_bin`) 절대경로를
+/// 잡고, **못 찾으면 task를 아예 띄우지 않는다**: 60초마다 WARN을 쏟는 대신 기동 시 한 번만
+/// 남긴다(`docker_enabled=true`인데 docker가 없는 상황).
 fn load_docker_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
@@ -877,6 +882,21 @@ fn load_docker_config(
         tracing::warn!("exporter enabled이지만 endpoint 미설정 — docker exporter 비활성");
         return None;
     }
+
+    let configured = ex.docker_bin.as_deref().map(std::path::Path::new);
+    let docker_bin = match aic_server::otlp_exporter::resolve_docker_bin(configured) {
+        Some(p) => p,
+        None => {
+            // 한 번만 경고하고 task를 띄우지 않는다 — 매 tick 실패 로그를 쌓지 않기 위함.
+            tracing::warn!(
+                configured = ?ex.docker_bin,
+                "docker 실행 파일을 찾지 못해 docker exporter 비활성 \
+                 ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
+            );
+            return None;
+        }
+    };
+
     let spool = spool?;
     let health = health?;
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
@@ -885,7 +905,7 @@ fn load_docker_config(
         token,
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         interval: std::time::Duration::from_secs(ex.docker_interval_secs.max(1)),
-        docker_bin: std::path::PathBuf::from("docker"),
+        docker_bin,
         timeout: std::time::Duration::from_secs(15),
         spool,
         health,

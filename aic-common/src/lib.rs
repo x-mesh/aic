@@ -626,6 +626,15 @@ pub struct AicdExporterConfig {
     /// interval_secs와 별개로 둔다(connections_interval_secs와 동일 이유). 기본 60초.
     #[serde(default = "default_docker_interval")]
     pub docker_interval_secs: u64,
+    /// `docker` 실행 파일 경로. 미설정(기본)이면 aicd가 PATH와 표준 설치 위치를 순서대로 탐색한다.
+    ///
+    /// **왜 이 필드가 필요한가**: aicd는 launchd/systemd로 뜨고, 그 환경의 PATH는 셸의 PATH가
+    /// 아니라 서비스 매니저 기본값이다(실측: launchd의 PATH는 `/usr/bin:/bin:/usr/sbin:/sbin`뿐
+    /// 이라 `/usr/local/bin/docker`가 안 잡힌다). 자동 탐색이 표준 위치를 커버하지만, 비표준
+    /// 위치에 설치했다면 여기로 못을 박을 수 있다. 지정했는데 실행 파일이 아니면 폴백하지 않고
+    /// docker exporter를 비활성한다(오타를 조용히 덮지 않는다).
+    #[serde(default)]
+    pub docker_bin: Option<String>,
 }
 
 impl Default for AicdExporterConfig {
@@ -646,6 +655,7 @@ impl Default for AicdExporterConfig {
             logs_enabled: false,
             docker_enabled: false,
             docker_interval_secs: default_docker_interval(),
+            docker_bin: None,
         }
     }
 }
