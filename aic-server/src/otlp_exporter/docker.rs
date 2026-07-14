@@ -34,7 +34,8 @@
 //! `docker_enabled` 자체를 opt-in(기본 false)으로 둔다(events/connections/changes/agent의
 //! "부모 게이트 true면 기본 true" 관례에서 의도적으로 벗어난 유일한 플래그).
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,6 +49,33 @@ use super::{SignalKind, Spool};
 
 /// HTTP 요청 타임아웃 — 다른 exporter task와 동일 값.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// PATH에 없을 때 순서대로 뒤질 docker 설치 위치.
+///
+/// **왜 PATH만으로는 안 되나**: aicd는 launchd(macOS)/systemd(Linux)로 뜨고, 그 환경의 PATH는
+/// **셸의 PATH가 아니라 서비스 매니저 기본값**이다. 실측 — launchd로 뜬 aicd의 PATH는
+/// `/usr/bin:/bin:/usr/sbin:/sbin`뿐이라, `/usr/local/bin/docker`(Docker Desktop·OrbStack이
+/// 심볼릭 링크를 두는 자리)를 **못 찾는다**. 그래서 `docker_bin`을 그냥 `"docker"`로 두고 PATH
+/// 탐색에 맡겼더니 실환경에서 매 tick `ENOENT`만 났다.
+///
+/// "docker는 aic 배포물이 아니라 시스템에 이미 설치돼 있으니 PATH가 유일하게 맞는 탐색 위치"라는
+/// 판단이 틀렸다 — 그건 **셸에서 실행할 때만 참**이고, 데몬은 셸을 거치지 않는다.
+const FALLBACK_DOCKER_DIRS: &[&str] = &[
+    // Docker Desktop·OrbStack이 심볼릭 링크를 두는 자리(macOS/Linux 공통). 이 머신도 여기다.
+    "/usr/local/bin",
+    // Apple Silicon Homebrew.
+    "/opt/homebrew/bin",
+    // Linux 배포판 패키지(docker.io, docker-ce).
+    "/usr/bin",
+    // Ubuntu snap.
+    "/snap/bin",
+    // Docker Desktop을 앱 번들에서 직접 쓰는 경우(macOS).
+    "/Applications/Docker.app/Contents/Resources/bin",
+];
+
+/// `$HOME` 밑의 docker 설치 위치(OrbStack이 사용자 홈에도 둔다). 홈은 런타임에만 알 수 있어
+/// [`FALLBACK_DOCKER_DIRS`]와 분리한다.
+const HOME_RELATIVE_DOCKER_PATH: &str = ".orbstack/bin/docker";
 /// `docker system df --format json` stdout 상한. 정상 출력은 카테고리 4줄뿐이라 이 한도를 훨씬
 /// 밑돈다 — 초과분은 신뢰할 수 없는 출력으로 간주해 이번 주기를 스킵한다.
 ///
@@ -55,6 +83,71 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// 묶는다(출력을 전부 버퍼링한 뒤 길이를 재는 건 방어가 아니라 사후 확인이다 — 그렇게 짜면 무한
 /// 출력이 검사에 도달하기 전에 이미 메모리를 먹는다).
 const MAX_DF_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// docker 실행 파일의 **절대경로**를 찾는다. 못 찾으면 `None`(호출부는 exporter를 비활성한다).
+///
+/// 탐색 순서: `configured`(config `[aicd.exporter].docker_bin`) → `PATH` → [`FALLBACK_DOCKER_DIRS`]
+/// → `$HOME/.orbstack/bin/docker`. 서비스 매니저의 빈약한 PATH를 폴백이 메워 준다(위 상수 doc 참고).
+pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
+    resolve_docker_bin_with(
+        configured,
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        &is_executable_file,
+    )
+}
+
+/// [`resolve_docker_bin`]의 순수 코어 — 환경(PATH/HOME)과 파일 존재 판정을 주입받아 테스트가
+/// **이 머신의 docker 설치 상태에 의존하지 않게** 한다(CI에는 docker가 없을 수 있다).
+fn resolve_docker_bin_with(
+    configured: Option<&Path>,
+    path_var: Option<OsString>,
+    home: Option<&Path>,
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // 1. config가 명시했으면 그것만 본다 — 비표준 위치에 설치한 사람의 명시적 의사다.
+    //    지정했는데 실행 파일이 아니면 **폴백하지 않고 실패**한다: 오타를 조용히 덮고 엉뚱한
+    //    docker를 쓰는 것보다, 지정한 게 없다고 말해 주는 편이 훨씬 덜 헷갈린다.
+    if let Some(p) = configured {
+        return is_exec(p).then(|| p.to_path_buf());
+    }
+
+    // 2. PATH — 셸에서 띄운 aicd나 PATH가 제대로 잡힌 서비스라면 여기서 끝난다.
+    if let Some(paths) = path_var {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("docker");
+            if is_exec(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+
+    // 3. 서비스 매니저 PATH에는 없지만 docker가 실제로 설치되는 표준 위치들.
+    for dir in FALLBACK_DOCKER_DIRS {
+        let cand = Path::new(dir).join("docker");
+        if is_exec(&cand) {
+            return Some(cand);
+        }
+    }
+    if let Some(h) = home {
+        let cand = h.join(HOME_RELATIVE_DOCKER_PATH);
+        if is_exec(&cand) {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+/// 실행 가능한 **파일**인가. `metadata`는 심볼릭 링크를 따라가므로
+/// `/usr/local/bin/docker → /Applications/OrbStack.app/...`처럼 링크로 설치된 경우도 통과한다
+/// (이 머신이 실제로 그렇다).
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
 
 /// docker exporter 실행 설정.
 #[derive(Debug, Clone)]
@@ -67,7 +160,9 @@ pub struct DockerConfig {
     pub service_version: String,
     /// 캡처 주기.
     pub interval: Duration,
-    /// spawn할 `docker` 실행 파일 경로(보통 PATH 탐색에 맡기는 `"docker"`).
+    /// spawn할 `docker` 실행 파일의 **절대경로**. 호출부가 [`resolve_docker_bin`]으로 미리 찾아
+    /// 넘긴다 — `"docker"` 같은 상대 이름을 넣어 PATH 탐색에 맡기면 launchd/systemd의 빈약한
+    /// PATH에서 못 찾는다(상수 [`FALLBACK_DOCKER_DIRS`] doc 참고).
     pub docker_bin: PathBuf,
     /// `docker system df` 프로세스 타임아웃(hung 방어).
     pub timeout: Duration,
@@ -334,6 +429,135 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+
+    // ── docker 바이너리 탐색 ────────────────────────────────────────────────
+    //
+    // 전부 순수 함수 테스트다 — 존재 판정을 주입하므로 **이 머신에 docker가 깔려 있든 말든**
+    // 결과가 같다(CI에는 docker가 없을 수 있다).
+
+    /// 주어진 경로 집합만 "실행 가능한 파일"로 치는 가짜 판정기(경로를 소유하므로 입력을 빌리지
+    /// 않는다).
+    fn only(existing: &[&str]) -> impl Fn(&Path) -> bool {
+        let set: Vec<PathBuf> = existing.iter().map(PathBuf::from).collect();
+        move |p: &Path| set.iter().any(|e| e == p)
+    }
+
+    /// **회귀 가드**: launchd로 뜬 aicd의 PATH는 `/usr/bin:/bin:/usr/sbin:/sbin`뿐이고 docker는
+    /// `/usr/local/bin/docker`에 있다(이 머신 실측). 예전처럼 PATH 탐색에만 맡기면 여기서 못 찾아
+    /// 매 tick ENOENT가 났다 — 폴백이 이 상황을 건져야 한다.
+    #[test]
+    fn finds_docker_outside_the_launchd_path() {
+        let launchd_path = Some(OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"));
+        let got =
+            resolve_docker_bin_with(None, launchd_path, None, &only(&["/usr/local/bin/docker"]));
+        assert_eq!(got, Some(PathBuf::from("/usr/local/bin/docker")));
+    }
+
+    #[test]
+    fn prefers_path_over_the_fallback_dirs() {
+        // PATH에 있으면 굳이 폴백을 뒤지지 않는다(사용자 PATH가 우선).
+        let got = resolve_docker_bin_with(
+            None,
+            Some(OsString::from("/opt/custom/bin:/usr/bin")),
+            None,
+            &only(&["/opt/custom/bin/docker", "/usr/local/bin/docker"]),
+        );
+        assert_eq!(got, Some(PathBuf::from("/opt/custom/bin/docker")));
+    }
+
+    #[test]
+    fn configured_path_wins_over_everything() {
+        let got = resolve_docker_bin_with(
+            Some(Path::new("/custom/docker")),
+            Some(OsString::from("/usr/bin")),
+            None,
+            &only(&["/custom/docker", "/usr/bin/docker"]),
+        );
+        assert_eq!(got, Some(PathBuf::from("/custom/docker")));
+    }
+
+    /// config가 가리킨 경로가 실행 파일이 아니면 **폴백하지 않고 실패**한다 — 오타를 조용히 덮고
+    /// 엉뚱한 docker를 쓰면 더 헷갈린다.
+    #[test]
+    fn a_bad_configured_path_does_not_silently_fall_back() {
+        let got = resolve_docker_bin_with(
+            Some(Path::new("/typo/dcoker")),
+            Some(OsString::from("/usr/bin")),
+            None,
+            &only(&["/usr/bin/docker"]), // PATH엔 멀쩡한 docker가 있다.
+        );
+        assert_eq!(
+            got, None,
+            "지정한 경로가 틀렸으면 조용히 다른 걸 쓰면 안 된다"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_home_orbstack_path() {
+        let got = resolve_docker_bin_with(
+            None,
+            Some(OsString::from("/usr/bin")),
+            Some(Path::new("/Users/someone")),
+            &only(&["/Users/someone/.orbstack/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/Users/someone/.orbstack/bin/docker"))
+        );
+    }
+
+    /// Linux 배포판 패키지 위치(`/usr/bin/docker`)도 커버해야 한다.
+    #[test]
+    fn finds_the_linux_distro_package_path() {
+        let got = resolve_docker_bin_with(None, None, None, &only(&["/usr/bin/docker"]));
+        assert_eq!(got, Some(PathBuf::from("/usr/bin/docker")));
+    }
+
+    /// docker가 아예 없으면 `None` — 호출부가 exporter를 비활성한다(매 tick WARN 대신 기동 시 1회).
+    #[test]
+    fn returns_none_when_docker_is_absent_everywhere() {
+        let got = resolve_docker_bin_with(
+            None,
+            Some(OsString::from("/usr/bin:/bin")),
+            Some(Path::new("/home/nobody")),
+            &only(&[]),
+        );
+        assert_eq!(got, None);
+    }
+
+    /// 실제 파일시스템 판정기 — 디렉토리나 비실행 파일을 docker로 오인하지 않는다.
+    #[test]
+    fn is_executable_file_rejects_dirs_and_non_executables() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !is_executable_file(dir.path()),
+            "디렉토리는 실행 파일이 아니다"
+        );
+
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"x").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_executable_file(&plain), "실행 비트가 없으면 아니다");
+
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_executable_file(&plain), "실행 비트가 있으면 맞다");
+
+        assert!(!is_executable_file(&dir.path().join("nope")), "없는 경로");
+    }
+
+    /// 심볼릭 링크로 설치된 docker(이 머신의 `/usr/local/bin/docker → OrbStack.app/...`)도 잡아야
+    /// 한다 — `metadata`가 링크를 따라가는지 확인한다.
+    #[test]
+    fn is_executable_file_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-docker");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let link = dir.path().join("docker");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(is_executable_file(&link), "심볼릭 링크를 따라가야 한다");
+    }
 
     /// 실제 `docker system df --format json` 출력(TASK-CONTEXT.md 픽스처) — 4개 카테고리 NDJSON.
     const REAL_DF_OUTPUT: &str = concat!(
