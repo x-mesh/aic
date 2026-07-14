@@ -867,8 +867,11 @@ fn load_changes_config(
 /// 탐색에 맡겼는데, aicd는 launchd/systemd로 뜨고 그 환경의 PATH는 셸이 아니라 서비스 매니저
 /// 기본값이라(`/usr/bin:/bin:/usr/sbin:/sbin`) `/usr/local/bin/docker`를 못 찾았다 — 실환경에서
 /// 매 tick `ENOENT`만 났다. 이제 PATH + 표준 설치 위치를 뒤져(`resolve_docker_bin`) 절대경로를
-/// 잡고, **못 찾으면 task를 아예 띄우지 않는다**: 60초마다 WARN을 쏟는 대신 기동 시 한 번만
-/// 남긴다(`docker_enabled=true`인데 docker가 없는 상황).
+/// 잡는다.
+///
+/// **못 찾아도 task는 띄운다** — `serve_docker`가 매 tick 재탐색하다가 docker가 설치되면 그때부터
+/// 캡처를 시작한다(aicd 기동 뒤 docker를 깐 사람이 재시작 없이 살아나야 한다). WARN 폭주는 여전히
+/// 없다: 기동 시 한 번만 WARN이고, 못 찾은 동안의 tick 로그는 debug다.
 fn load_docker_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
@@ -889,19 +892,18 @@ fn load_docker_config(
     let spool = spool?;
     let health = health?;
 
-    let configured = ex.docker_bin.as_deref().map(std::path::Path::new);
-    let docker_bin = match aic_server::otlp_exporter::resolve_docker_bin(configured) {
-        Some(p) => p,
-        None => {
-            // 한 번만 경고하고 task를 띄우지 않는다 — 매 tick 실패 로그를 쌓지 않기 위함.
-            tracing::warn!(
-                configured = ?ex.docker_bin,
-                "docker 실행 파일을 찾지 못해 docker exporter 비활성 \
-                 ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
-            );
-            return None;
-        }
-    };
+    let configured_bin = ex.docker_bin.as_deref().map(std::path::PathBuf::from);
+    let docker_bin = aic_server::otlp_exporter::resolve_docker_bin(configured_bin.as_deref());
+    if docker_bin.is_none() {
+        // **여기서 WARN은 딱 한 번**이다. task는 그래도 띄우고, serve_docker가 매 tick 재탐색한다 —
+        // aicd가 뜬 뒤에 docker를 설치한 사람이 재시작 없이도 살아나야 하기 때문(serve_docker의
+        // "나중에 설치된 docker" 참고). 못 찾은 동안의 tick 로그는 debug라 WARN이 쌓이지 않는다.
+        tracing::warn!(
+            configured = ?ex.docker_bin,
+            "docker 실행 파일을 찾지 못했다 — 설치되면 자동으로 캡처를 시작한다 \
+             ([aicd.exporter].docker_bin으로 절대경로를 지정할 수 있다)"
+        );
+    }
 
     let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
     Some(aic_server::otlp_exporter::DockerConfig {
@@ -910,6 +912,7 @@ fn load_docker_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         interval: std::time::Duration::from_secs(ex.docker_interval_secs.max(1)),
         docker_bin,
+        configured_bin,
         timeout: std::time::Duration::from_secs(15),
         spool,
         health,

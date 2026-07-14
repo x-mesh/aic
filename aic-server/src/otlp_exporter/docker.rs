@@ -99,6 +99,7 @@ pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
         // SAFETY: geteuid는 실패하지 않고 부작용이 없다(POSIX). aic 안에서도 이미 쓰는 패턴.
         unsafe { libc::geteuid() } == 0,
         &is_executable_file,
+        &is_root_controlled_path,
     )
 }
 
@@ -131,34 +132,64 @@ pub fn resolve_docker_bin(configured: Option<&Path>) -> Option<PathBuf> {
 /// 실행시킬 수 있다(plist가 있는 `~/Library/LaunchAgents`가 사용자 쓰기 가능하다).
 ///
 /// 위험한 건 **root로 뜬 aicd**뿐이다(`sudo aicd` — 지원 설치 경로는 아니지만 막을 수는 없다).
-/// 그때는 사용자 쓰기 가능 경로를 뒤지는 것이 곧 root 하이재킹 통로다. 그래서 **euid가 0이면
-/// 폴백 탐색을 통째로 건너뛰고 config/PATH만 본다**. 폴백 목록을 골라내지 않고 전부 건너뛰는 이유:
-/// root의 PATH에는 이미 `/usr/bin`이 들어 있어(sudo secure_path) 폴백이 실제로 메워 주는 건
-/// **사용자 쓰기 가능 경로뿐**이고, "디렉토리 소유자를 stat해서 고른다"는 그 자체로 또 하나의
-/// TOCTOU를 들여온다. 못 찾으면 WARN이 `docker_bin`으로 못을 박으라고 알려 준다.
+/// 그때는 사용자 쓰기 가능 경로의 바이너리를 실행해 주는 것이 곧 root 하이재킹 통로다.
+///
+/// 그래서 **euid가 0이면 후보를 경로 속성으로 가려낸다** — 후보와 그 모든 상위 디렉토리가 root
+/// 소유이고 non-root 쓰기 불가여야 채택한다([`is_root_controlled_path`]). 판정을 **탐색 단계가
+/// 아니라 후보 자체에** 걸어야 하는 이유가 있다: 단계로 막으면(예: "폴백만 끊는다") 안 막은 단계로
+/// 그대로 우회된다. 실제로 그랬다 — root의 PATH에 `/usr/local/bin`이 있으면(macOS에선 admin 그룹
+/// 쓰기 가능, `sudo`가 `env_keep`으로 PATH를 물려주는 설정도 흔하다) 폴백을 아무리 끊어도 PATH에서
+/// 그대로 집어 왔다. `accept` 한 곳에 불변식을 모으는 지금 구조가 그 구멍을 구조적으로 막는다.
+///
+/// 이 방식은 **과잉 방어도 함께 푼다**: `/usr/bin`·`/snap/bin`처럼 root 통제 하의 폴백은 root로
+/// 떠도 그대로 통과하므로, root 운영자의 정상 설치를 이유 없이 깨뜨리지 않는다. 막히는 건 딱
+/// 위험한 것(`$HOME/.orbstack/bin`, group-writable `/usr/local/bin`)뿐이다. 못 찾으면 WARN이
+/// `docker_bin`으로 못을 박으라고 알려 준다.
 ///
 /// # TOCTOU는 굳이 막지 않는다
 ///
 /// 판정(기동 시 1회)과 spawn(60초마다, 데몬 수명 내내) 사이에 경로를 갈아끼울 창은 분명히 있다.
 /// 그래도 **막지 않는다**: 그 창을 쓸 수 있는 주체는 (a) aicd와 같은 사용자 — 위에서 봤듯 이미
-/// plist로 임의 실행이 가능하니 얻는 게 없고, (b) root — 방어의 의미가 없다. root로 뜬 aicd는
-/// 애초에 사용자 쓰기 가능 경로를 안 본다. 즉 이 TOCTOU를 막아서 실제로 닫히는 공격은 **하나도
-/// 없다**. 매 tick 재판정이나 fd 고정(`fexecve`)은 순수 비용이라 넣지 않는다.
+/// plist로 임의 실행이 가능하니 얻는 게 없고, (b) root — 그때는 신뢰 판정이 애초에 사용자 쓰기
+/// 가능 경로를 걸러 낸다. 즉 이 TOCTOU를 막아서 실제로 닫히는 공격은 **하나도 없다**.
+/// fd 고정(`fexecve`)은 순수 비용이라 넣지 않는다.
+///
+/// (앞선 판에서 "소유자를 stat하는 것 자체가 또 하나의 TOCTOU"라며 root일 때 폴백을 통째로 끊었는데,
+/// 그 논리는 틀렸다. 신뢰 판정은 **경로가 누구 통제 하에 있는가**라는 정책 질문이지 경합하는 상태가
+/// 아니다 — `/usr/bin`의 소유자가 tick 사이에 바뀌지 않는다. 게다가 그 판이 PATH는 그대로 열어 둬서
+/// root의 PATH에 `/usr/local/bin`이 있으면 가드가 통째로 우회됐다.)
 fn resolve_docker_bin_with(
     configured: Option<&Path>,
     path_var: Option<OsString>,
     home: Option<&Path>,
     running_as_root: bool,
     is_exec: &dyn Fn(&Path) -> bool,
+    is_root_controlled: &dyn Fn(&Path) -> bool,
 ) -> Option<PathBuf> {
-    // 후보를 채택하는 **유일한** 관문. 절대경로 불변식이 여기 한 곳에만 있어야 탐색 단계가 늘어도
-    // 새 경로로 새지 않는다(위 doc "반환값은 반드시 절대경로다" 참고).
+    // 후보를 채택하는 **유일한** 관문. 불변식(절대경로 + 실행 가능 + root일 때 신뢰 가능)이 여기 한
+    // 곳에만 있어야 탐색 단계가 늘어도 새 경로로 새지 않는다. 특히 신뢰 판정을 **후보 단위**로 두는
+    // 게 핵심이다 — "어느 단계에서 왔는가"(config/PATH/폴백)로 막으면 단계 하나만 빠뜨려도 가드가
+    // 통째로 우회된다(실제로 그렇게 새어서 이 판에서 고쳤다).
     let accept = |cand: PathBuf| -> Option<PathBuf> {
-        (cand.is_absolute() && is_exec(&cand)).then_some(cand)
+        if !cand.is_absolute() || !is_exec(&cand) {
+            return None;
+        }
+        if running_as_root && !is_root_controlled(&cand) {
+            tracing::warn!(
+                candidate = %cand.display(),
+                "root로 실행 중 — root 통제 밖(비-root 소유이거나 non-root 쓰기 가능) 경로의 docker는 \
+                 채택하지 않는다. 쓰려면 [aicd.exporter].docker_bin에 root 통제 하의 절대경로를 지정할 것"
+            );
+            return None;
+        }
+        Some(cand)
     };
 
     // 1. config가 명시했으면 그것만 본다 — 비표준 위치에 설치한 사람의 명시적 의사다.
     //    실행 파일이 아니거나 상대경로면 **폴백하지 않고 실패**한다.
+    //    config도 예외가 아니다: root면 신뢰 판정을 똑같이 받는다. "명시했으니 믿는다"고 열어 두면
+    //    config 파일 자체가 사용자 쓰기 가능한 경우(root aicd가 사용자 홈의 config를 읽는 경우)
+    //    가드가 다시 우회된다.
     if let Some(p) = configured {
         if !p.is_absolute() {
             tracing::warn!(
@@ -179,16 +210,8 @@ fn resolve_docker_bin_with(
         }
     }
 
-    // 3. 서비스 매니저 PATH에는 없지만 docker가 실제로 설치되는 표준 위치들.
-    //    root면 여기부터는 보지 않는다(위 doc "쓰기 가능 경로와 root" 참고).
-    if running_as_root {
-        tracing::warn!(
-            "root로 실행 중 — 사용자 쓰기 가능 폴백 경로($HOME/.orbstack/bin, /usr/local/bin 등)를 \
-             탐색하지 않는다. docker를 쓰려면 [aicd.exporter].docker_bin에 절대경로를 지정할 것"
-        );
-        return None;
-    }
-
+    // 3. 서비스 매니저 PATH에는 없지만 docker가 실제로 설치되는 표준 위치들. root라도 `/usr/bin`처럼
+    //    root 통제 하의 위치는 그대로 통과한다 — accept가 후보별로 가려낸다.
     for dir in FALLBACK_DOCKER_DIRS {
         if let Some(found) = accept(Path::new(dir).join("docker")) {
             return Some(found);
@@ -203,6 +226,44 @@ fn resolve_docker_bin_with(
     None
 }
 
+/// 후보 경로가 **root 통제 하**에 있는가 — euid가 0일 때만 쓴다([`resolve_docker_bin_with`]의
+/// "쓰기 가능 경로와 root" 참고).
+///
+/// 심볼릭 링크를 먼저 해소한 뒤(`canonicalize`) 최종 경로와 **모든 상위 디렉토리**를 훑어, 각각이
+/// [`is_root_controlled_meta`]를 만족하는지 본다. 링크를 해소하는 이유: root 소유 심볼릭 링크라도
+/// 그 **대상**이 사용자 쓰기 가능한 곳(`/Applications/OrbStack.app/...`)이면 하이재킹 통로다.
+/// 해소 후에는 경로에 링크가 남지 않으므로 각 성분의 mode 검사가 의미를 가진다.
+fn is_root_controlled_path(p: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(real) = std::fs::canonicalize(p) else {
+        return false;
+    };
+    let mut cur: Option<&Path> = Some(real.as_path());
+    while let Some(c) = cur {
+        let Ok(md) = std::fs::symlink_metadata(c) else {
+            return false;
+        };
+        if !is_root_controlled_meta(md.uid(), md.permissions().mode()) {
+            return false;
+        }
+        cur = c.parent();
+    }
+    true
+}
+
+/// [`is_root_controlled_path`]의 순수 판정 — 한 경로 성분의 `(uid, mode)`가 root 통제 하인가.
+///
+/// **root 소유**(`uid == 0`)이고 **group/other 쓰기 불가**(`mode & 0o022 == 0`)여야 한다. 둘 다
+/// 필요하다: 소유자만 보면 `/usr/local/bin`(macOS에서 root:admin **0775**)이 통과해 admin 그룹
+/// 아무나 하이재킹할 수 있고, 쓰기 비트만 보면 사용자 소유 0755 디렉토리가 통과한다.
+///
+/// 파일시스템을 건드리지 않는 순수 함수로 떼어 낸 이유는 테스트다 — root 소유 디렉토리는 root가
+/// 아니면 만들 수 없어서, FS를 통째로 쓰면 "이 머신이 root인가"에 결과가 끌려간다.
+fn is_root_controlled_meta(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o022 == 0
+}
+
 /// **이 프로세스가 실제로 spawn할 수 있는** 실행 파일인가.
 ///
 /// 두 검사를 모두 해야 한다:
@@ -215,25 +276,52 @@ fn resolve_docker_bin_with(
 ///    `EACCES`로 죽는다 — 이 커밋이 없애려던 "매 tick 실패"가 그대로 남는 것이다. 그래서
 ///    `faccessat(..., X_OK, AT_EACCESS)`로 **실효 uid/gid** 기준 판정을 커널에 맡긴다
 ///    (`access(2)`는 real uid를 보므로 setuid 상황에서 틀린 답을 낸다).
+///
+/// # `AT_EACCESS`를 테스트로 못 박는 방법과 그 한계
+///
+/// `AT_EACCESS`의 **동작 차이**는 실제 uid와 실효 uid가 갈릴 때만 드러난다(setuid 바이너리, 또는
+/// `setresuid`로 갈라 놓은 프로세스). 그런 상태는 in-process 단위 테스트로 만들 수 없다 — uid를
+/// 가르려면 애초에 특권이 필요하고, CI는 그런 특권으로 돌지 않는다. 그래서 "플래그를 빼도 테스트가
+/// 통과"하는 공허함이 생기기 쉽다.
+///
+/// 대신 **두 겹**으로 못 박는다:
+/// 1. 호출을 [`faccess_x_ok`]로 얇게 감싸고, 테스트 빌드에서 **실제로 넘어간 flags를 기록**한다 →
+///    `is_executable_file`이 `AT_EACCESS`를 넘기는지 단언한다(`AT_EACCESS`를 지우면 테스트가 깨진다).
+/// 2. 엉터리 플래그를 주면 커널이 `EINVAL`을 내는지 확인한다 → 이 플랫폼이 flags를 **실제로 검증**
+///    한다(무시하지 않는다)는 뜻이므로, 1이 확인한 `AT_EACCESS`가 실효를 갖는다.
+///
+/// 두 겹을 합쳐도 "실효 uid ≠ 실제 uid에서 판정이 달라진다"를 **직접** 재현하지는 못한다. 그건
+/// 특권 없이는 불가능하다 — 이 사실을 코드에 남겨 두는 것이, 없는 테스트를 있는 척하는 것보다 낫다.
 fn is_executable_file(p: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-
     if !std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false) {
         return false;
     }
+    faccess_x_ok(p, libc::AT_EACCESS)
+}
+
+// 테스트 빌드에서 `faccess_x_ok`에 마지막으로 넘어간 flags. 호출부가 `AT_EACCESS`를 실제로
+// 넘기는지 단언하기 위한 것 — 프로덕션 빌드에는 존재하지 않는다.
+#[cfg(test)]
+thread_local! {
+    static LAST_FACCESSAT_FLAGS: std::cell::Cell<libc::c_int> =
+        const { std::cell::Cell::new(i32::MIN) };
+}
+
+/// `faccessat(AT_FDCWD, p, X_OK, flags)`의 얇은 래퍼. `flags`를 인자로 빼 둔 이유는 오직 테스트가
+/// **호출부가 무엇을 넘기는지** 관찰하고, 엉터리 플래그에 커널이 `EINVAL`을 내는지 확인하기 위함이다
+/// ([`is_executable_file`]의 doc 참고). 프로덕션 호출부는 언제나 `AT_EACCESS`를 넘긴다.
+fn faccess_x_ok(p: &Path, flags: libc::c_int) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    #[cfg(test)]
+    LAST_FACCESSAT_FLAGS.with(|f| f.set(flags));
+
     // 경로에 NUL이 있으면 애초에 exec할 수 없다.
     let Ok(c_path) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
         return false;
     };
     // SAFETY: c_path는 살아 있는 NUL 종료 C 문자열이고, faccessat은 그것을 읽기만 한다.
-    unsafe {
-        libc::faccessat(
-            libc::AT_FDCWD,
-            c_path.as_ptr(),
-            libc::X_OK,
-            libc::AT_EACCESS,
-        ) == 0
-    }
+    unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), libc::X_OK, flags) == 0 }
 }
 
 /// docker exporter 실행 설정.
@@ -247,10 +335,16 @@ pub struct DockerConfig {
     pub service_version: String,
     /// 캡처 주기.
     pub interval: Duration,
-    /// spawn할 `docker` 실행 파일의 **절대경로**. 호출부가 [`resolve_docker_bin`]으로 미리 찾아
+    /// spawn할 `docker` 실행 파일의 **절대경로**. 호출부가 [`resolve_docker_bin`]으로 기동 시 찾아
     /// 넘긴다 — `"docker"` 같은 상대 이름을 넣어 PATH 탐색에 맡기면 launchd/systemd의 빈약한
     /// PATH에서 못 찾는다(상수 [`FALLBACK_DOCKER_DIRS`] doc 참고).
-    pub docker_bin: PathBuf,
+    ///
+    /// **`None`이면 기동 시엔 못 찾았다는 뜻**이고, task는 그래도 뜬다 — 매 tick 재탐색하다가
+    /// 찾으면 그때부터 캡처를 시작한다([`serve_docker`]의 "나중에 설치된 docker" 참고).
+    pub docker_bin: Option<PathBuf>,
+    /// config `[aicd.exporter].docker_bin` 원본. 재탐색할 때 같은 우선순위를 다시 적용하려면
+    /// 기동 때 쓴 입력이 그대로 있어야 한다.
+    pub configured_bin: Option<PathBuf>,
     /// `docker system df` 프로세스 타임아웃(hung 방어).
     pub timeout: Duration,
     /// 오프라인 spool(SRE t8). 다른 exporter task와 동일 인스턴스를 공유한다.
@@ -260,16 +354,47 @@ pub struct DockerConfig {
 }
 
 /// docker exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
+///
+/// # 나중에 설치된 docker
+///
+/// `cfg.docker_bin`이 `None`이면 기동 시엔 docker를 못 찾았다는 뜻이다. 그래도 task는 뜨고, **매
+/// tick 재탐색**하다가 찾으면 그때부터 캡처를 시작한다.
+///
+/// 왜 그냥 비활성하지 않는가: 기동 시 1회만 판정하면 aicd가 뜬 뒤 docker를 설치한 사람은 재시작
+/// 전까지 exporter가 **영구 비활성**이 된다. 이건 실제 회귀다 — 예전엔 `docker_bin`이 그냥
+/// `"docker"`라 매 tick PATH를 다시 탐색했고, 셸에서 띄운 aicd(PATH가 멀쩡한 경우)는 저절로
+/// 살아났다. launchd/systemd로 뜬 경우엔 애초에 작동하지 않았으니 그쪽은 회귀가 아니지만,
+/// 셸로 띄우는 경로는 실재한다.
+///
+/// 비용은 무시할 만하다 — 못 찾은 동안 60초마다 stat 몇 번이 전부고, 찾은 뒤에는 재탐색하지 않는다.
+/// WARN 폭주(이 커밋이 없애려던 것)도 없다: 기동 시 1회만 WARN이고, 이후 미탐색 tick은 `debug`다.
 pub async fn serve_docker(
     cfg: DockerConfig,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    serve_docker_with(cfg, shutdown, &resolve_docker_bin).await
+}
+
+/// [`serve_docker`]의 코어 — 재탐색기를 주입받는다.
+///
+/// 주입하는 이유는 테스트다. 진짜 [`resolve_docker_bin`]은 이 프로세스의 euid와 실제 파일시스템
+/// 소유권(`is_root_controlled_path`)을 보므로, 테스트가 임시 디렉토리에 가짜 docker를 놓으면
+/// **머신 상태에 결과가 끌려간다** — 예컨대 root로 도는 CI에서 `/tmp`가 world-writable이면 신뢰
+/// 판정이 (옳게) 거부해서, 코드가 멀쩡한데도 테스트가 깨진다. 재탐색 **루프 자체**를 검증하려면
+/// 탐색 결과를 결정적으로 줄 수 있어야 한다.
+async fn serve_docker_with(
+    cfg: DockerConfig,
     mut shutdown: watch::Receiver<bool>,
+    resolve: &(dyn Fn(Option<&Path>) -> Option<PathBuf> + Sync),
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = super::metrics_url(&cfg.endpoint);
+    // 기동 시 못 찾았어도 task는 뜬다 — 아래 루프가 매 tick 재탐색한다.
+    let mut docker_bin = cfg.docker_bin.clone();
     tracing::info!(
         url = %url,
         interval_secs = cfg.interval.as_secs(),
-        docker_bin = %cfg.docker_bin.display(),
+        docker_bin = ?docker_bin.as_ref().map(|p| p.display().to_string()),
         "OTLP docker exporter 시작"
     );
 
@@ -290,7 +415,26 @@ pub async fn serve_docker(
         }
         tokio::select! {
             _ = ticker.tick() => {
-                match capture_docker_df(&cfg.docker_bin, cfg.timeout).await {
+                // 아직 못 찾았으면 이번 tick에 다시 찾아본다(위 doc "나중에 설치된 docker").
+                let bin = match &docker_bin {
+                    Some(b) => b.clone(),
+                    None => match resolve(cfg.configured_bin.as_deref()) {
+                        Some(found) => {
+                            tracing::info!(
+                                docker_bin = %found.display(),
+                                "docker 실행 파일을 찾았다 — docker exporter 캡처 시작"
+                            );
+                            docker_bin = Some(found.clone());
+                            found
+                        }
+                        None => {
+                            // 기동 시 이미 WARN을 한 번 남겼다 — 매 tick 반복하지 않는다.
+                            tracing::debug!("docker 실행 파일을 아직 찾지 못했다 — 이번 주기 skip");
+                            continue;
+                        }
+                    },
+                };
+                match capture_docker_df(&bin, cfg.timeout).await {
                     Ok(lines) => {
                         let points = build_metric_points(&lines);
                         if points.is_empty() {
@@ -542,7 +686,11 @@ mod tests {
         home: Option<&Path>,
         is_exec: &dyn Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
-        resolve_as(configured, path_var, home, false, is_exec)
+        // 비-root에서는 신뢰 판정을 **아예 하지 않아야** 한다(불필요한 stat). 호출되면 터진다.
+        let never = |p: &Path| -> bool {
+            panic!("비-root인데 신뢰 판정을 호출했다: {}", p.display());
+        };
+        resolve_as(configured, path_var, home, false, is_exec, &never)
     }
 
     /// [`resolve`]의 root 포함 버전 — 절대경로 단언은 동일하다.
@@ -552,8 +700,16 @@ mod tests {
         home: Option<&Path>,
         running_as_root: bool,
         is_exec: &dyn Fn(&Path) -> bool,
+        is_root_controlled: &dyn Fn(&Path) -> bool,
     ) -> Option<PathBuf> {
-        let got = resolve_docker_bin_with(configured, path_var, home, running_as_root, is_exec);
+        let got = resolve_docker_bin_with(
+            configured,
+            path_var,
+            home,
+            running_as_root,
+            is_exec,
+            is_root_controlled,
+        );
         if let Some(p) = &got {
             assert!(
                 p.is_absolute(),
@@ -562,6 +718,12 @@ mod tests {
             );
         }
         got
+    }
+
+    /// root 신뢰 판정 픽스처 — 주어진 경로 집합만 "root 통제 하"로 친다.
+    fn trusted(paths: &[&str]) -> impl Fn(&Path) -> bool {
+        let set: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |p: &Path| set.iter().any(|e| e == p)
     }
 
     /// **회귀 가드**: launchd로 뜬 aicd의 PATH는 `/usr/bin:/bin:/usr/sbin:/sbin`뿐이고 docker는
@@ -722,20 +884,60 @@ mod tests {
 
     // ── root 가드 ─────────────────────────────────────────────────────────────
 
-    /// root로 뜬 aicd는 **사용자 쓰기 가능 폴백 경로를 뒤지지 않는다**(`resolve_docker_bin_with`의
-    /// "쓰기 가능 경로와 root" 참고). 사용자 소유 `$HOME/.orbstack/bin`이나 admin 쓰기 가능한
-    /// `/usr/local/bin`에 심어 둔 바이너리를 root로 실행해 주면 그게 곧 권한 상승 통로다.
+    /// **회귀 가드 — 이전 판의 블로킹 버그.** 가드를 "폴백 단계"에 걸었더니 PATH 탐색이 그보다
+    /// **먼저** 돌아 통째로 우회됐다. root의 PATH에 `/usr/local/bin`이 있으면(macOS에선 admin 그룹
+    /// 쓰기 가능, `sudo`의 `env_keep`으로 사용자 PATH가 넘어오는 설정도 흔하다) 폴백을 아무리
+    /// 끊어도 여기서 집어 왔다. 이제 신뢰 판정이 **후보 단위**라 PATH도 똑같이 걸러진다.
     #[test]
-    fn as_root_the_writable_fallback_dirs_are_not_searched() {
+    fn as_root_an_untrusted_path_entry_is_rejected() {
         let got = resolve_as(
             None,
-            Some(OsString::from("/usr/sbin:/sbin")), // root PATH에는 docker가 없다.
+            // root의 PATH에 사용자/admin 쓰기 가능 디렉토리가 섞여 있다.
+            Some(OsString::from("/usr/local/bin:/usr/sbin")),
+            None,
+            true,
+            &only(&["/usr/local/bin/docker"]),
+            &trusted(&[]), // 어느 것도 root 통제 하가 아니다.
+        );
+        assert_eq!(
+            got, None,
+            "root인데 PATH의 쓰기 가능 디렉토리에서 docker를 집어 왔다 — 가드가 PATH를 못 덮는다"
+        );
+    }
+
+    /// root라도 **root 통제 하의 PATH 항목**은 그대로 채택한다.
+    #[test]
+    fn as_root_a_trusted_path_entry_is_accepted() {
+        let got = resolve_as(
+            None,
+            Some(OsString::from("/usr/local/bin:/usr/bin")),
+            None,
+            true,
+            &only(&["/usr/local/bin/docker", "/usr/bin/docker"]),
+            // /usr/local/bin은 신뢰 못 하지만 /usr/bin은 신뢰한다 — 앞의 것을 건너뛰고 뒤를 잡아야 한다.
+            &trusted(&["/usr/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/usr/bin/docker")),
+            "신뢰 못 할 PATH 항목에서 멈추지 말고 신뢰 가능한 다음 항목을 계속 찾아야 한다"
+        );
+    }
+
+    /// root일 때 사용자 쓰기 가능 **폴백**(`$HOME/.orbstack/bin`, group-writable `/usr/local/bin`)도
+    /// 당연히 막힌다.
+    #[test]
+    fn as_root_untrusted_fallback_dirs_are_rejected() {
+        let got = resolve_as(
+            None,
+            Some(OsString::from("/usr/sbin:/sbin")), // PATH엔 docker가 없다.
             Some(Path::new("/Users/victim")),
             true,
             &only(&[
                 "/usr/local/bin/docker",
                 "/Users/victim/.orbstack/bin/docker",
             ]),
+            &trusted(&[]),
         );
         assert_eq!(
             got, None,
@@ -743,10 +945,29 @@ mod tests {
         );
     }
 
-    /// 같은 입력을 **비-root로** 주면 찾아야 한다 — 위 테스트가 "root라서 막혔다"를 증명하려면
+    /// **과잉 방어 회귀 가드**: 이전 판은 root면 폴백을 통째로 끊어, `/usr/bin`처럼 root 통제 하의
+    /// 정상 설치까지 이유 없이 깨뜨렸다. 이제는 root라도 신뢰 가능한 폴백이면 채택한다.
+    #[test]
+    fn as_root_a_trusted_fallback_dir_is_still_accepted() {
+        let got = resolve_as(
+            None,
+            Some(OsString::from("/usr/sbin:/sbin")), // PATH엔 없다 — 폴백으로 내려간다.
+            None,
+            true,
+            &only(&["/usr/bin/docker"]),
+            &trusted(&["/usr/bin/docker"]),
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from("/usr/bin/docker")),
+            "root라도 root 통제 하의 폴백(/usr/bin)은 정상 설치다 — 막으면 과잉 방어"
+        );
+    }
+
+    /// 같은 입력을 **비-root로** 주면 찾아야 한다 — 위 테스트들이 "root라서 막혔다"를 증명하려면
     /// "root가 아니면 찾는다"가 함께 참이어야 한다(공허 통과 방지).
     #[test]
-    fn as_non_root_the_same_fallback_dirs_are_searched() {
+    fn as_non_root_the_same_writable_dirs_are_searched() {
         let got = resolve(
             None,
             Some(OsString::from("/usr/sbin:/sbin")),
@@ -759,27 +980,73 @@ mod tests {
         assert_eq!(got, Some(PathBuf::from("/usr/local/bin/docker")));
     }
 
-    /// 다만 root라도 **PATH와 config는 그대로 존중한다** — 폴백만 끊는 것이지 root에서 docker를
-    /// 못 쓰게 만드는 게 아니다(그래서 WARN이 `docker_bin`을 안내한다).
+    /// **config도 신뢰 판정을 피해 가지 못한다.** root aicd가 사용자 쓰기 가능한 config를 읽는 경우
+    /// "명시했으니 믿는다"고 열어 두면 가드가 config로 우회된다.
     #[test]
-    fn as_root_path_and_config_still_resolve() {
-        let via_path = resolve_as(
+    fn as_root_an_untrusted_configured_path_is_rejected() {
+        let got = resolve_as(
+            Some(Path::new("/Users/victim/evil/docker")),
             None,
-            Some(OsString::from("/usr/bin")),
             None,
             true,
-            &only(&["/usr/bin/docker"]),
+            &only(&["/Users/victim/evil/docker"]),
+            &trusted(&[]),
         );
-        assert_eq!(via_path, Some(PathBuf::from("/usr/bin/docker")));
+        assert_eq!(got, None, "root인데 신뢰 못 할 config 경로를 채택했다");
+    }
 
-        let via_config = resolve_as(
+    /// root라도 root 통제 하의 config 경로는 그대로 존중한다 — WARN이 안내하는 탈출구가 실제로
+    /// 동작해야 한다.
+    #[test]
+    fn as_root_a_trusted_configured_path_is_accepted() {
+        let got = resolve_as(
             Some(Path::new("/opt/docker/bin/docker")),
             None,
             None,
             true,
             &only(&["/opt/docker/bin/docker"]),
+            &trusted(&["/opt/docker/bin/docker"]),
         );
-        assert_eq!(via_config, Some(PathBuf::from("/opt/docker/bin/docker")));
+        assert_eq!(got, Some(PathBuf::from("/opt/docker/bin/docker")));
+    }
+
+    // ── root 신뢰 판정(순수) ──────────────────────────────────────────────────
+
+    /// `is_root_controlled_meta`는 **두 조건이 모두** 필요하다. 어느 하나만 봐도 뚫린다:
+    /// - 소유자만 보면 macOS의 `/usr/local/bin`(root:admin **0775**)이 통과해 admin 그룹 아무나
+    ///   하이재킹한다.
+    /// - 쓰기 비트만 보면 사용자 소유 0755 디렉토리가 통과한다.
+    #[test]
+    fn is_root_controlled_meta_requires_root_owner_and_no_group_or_other_write() {
+        assert!(is_root_controlled_meta(0, 0o755), "root:root 0755 — 정상");
+        assert!(is_root_controlled_meta(0, 0o700), "root 전용 — 정상");
+
+        assert!(
+            !is_root_controlled_meta(0, 0o775),
+            "root 소유라도 group 쓰기 가능하면 안 된다 — macOS /usr/local/bin이 정확히 이거다"
+        );
+        assert!(
+            !is_root_controlled_meta(0, 0o777),
+            "other 쓰기 가능하면 안 된다"
+        );
+        assert!(
+            !is_root_controlled_meta(501, 0o755),
+            "사용자 소유면 mode가 아무리 빡빡해도 안 된다"
+        );
+        assert!(
+            !is_root_controlled_meta(501, 0o700),
+            "사용자 소유 — 안 된다"
+        );
+    }
+
+    /// 경로 walk 쪽(FS를 실제로 만지는 부분)의 결정적 케이스: 없는 경로는 신뢰하지 않는다.
+    /// (긍정 케이스는 root 소유 디렉토리 체인이 필요해 비-root 테스트로는 만들 수 없다 — 그래서
+    /// 판정 본체를 위 순수 함수로 떼어 냈다.)
+    #[test]
+    fn is_root_controlled_path_rejects_a_missing_path() {
+        assert!(!is_root_controlled_path(Path::new(
+            "/definitely/does/not/exist/docker"
+        )));
     }
 
     // ── 실행 가능 판정 ────────────────────────────────────────────────────────
@@ -852,6 +1119,43 @@ mod tests {
         );
     }
 
+    /// **호출부가 실제로 `AT_EACCESS`를 넘기는지** 못박는다. 플래그를 지우거나 `libc::access`
+    /// (real uid 기준)로 갈아치우면 여기서 깨진다 — 그게 없으면 "실효 권한으로 본다"는 주장이
+    /// 테스트로는 공허해진다(왜 동작 자체는 단위 테스트로 못 만드는지는 `is_executable_file` doc 참고).
+    #[test]
+    fn is_executable_file_passes_at_eaccess_to_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exec");
+        std::fs::write(&f, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        LAST_FACCESSAT_FLAGS.with(|c| c.set(i32::MIN));
+        assert!(is_executable_file(&f));
+        let flags = LAST_FACCESSAT_FLAGS.with(|c| c.get());
+        assert_eq!(
+            flags,
+            libc::AT_EACCESS,
+            "faccessat에 AT_EACCESS가 넘어가지 않았다 — 실효 uid가 아니라 real uid로 판정하게 된다"
+        );
+    }
+
+    /// 이 플랫폼이 `faccessat`의 flags를 **실제로 검증**한다는 확인 — 엉터리 플래그엔 `EINVAL`을
+    /// 낸다. flags를 무시하는 플랫폼이라면 위 테스트가 `AT_EACCESS`를 확인해도 의미가 없으므로,
+    /// 그 전제를 여기서 못박는다(macOS/Linux 둘 다 검증한다).
+    #[test]
+    fn the_platform_actually_validates_faccessat_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exec");
+        std::fs::write(&f, b"#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(faccess_x_ok(&f, libc::AT_EACCESS), "정상 플래그는 통과");
+        assert!(
+            !faccess_x_ok(&f, 0x4000),
+            "엉터리 플래그가 통과했다 — 이 플랫폼은 flags를 무시한다(그렇다면 AT_EACCESS도 무의미하다)"
+        );
+    }
+
     /// 실제 `docker system df --format json` 출력(TASK-CONTEXT.md 픽스처) — 4개 카테고리 NDJSON.
     const REAL_DF_OUTPUT: &str = concat!(
         r#"{"Active":"3","Reclaimable":"39.93GB (48%)","Size":"82.64GB","TotalCount":"179","Type":"Images"}"#,
@@ -868,11 +1172,16 @@ mod tests {
     /// 없이 spawn+timeout+parse 파이프라인 전체를 결정적으로 검증하기 위한 test double).
     fn fake_docker_bin(dir: &tempfile::TempDir, script: &str) -> std::path::PathBuf {
         let path = dir.path().join("fake-docker");
-        let mut f = std::fs::File::create(&path).unwrap();
+        fake_docker_bin_at(&path, script);
+        path
+    }
+
+    /// [`fake_docker_bin`]의 경로 지정 버전 — "나중에 docker를 설치한다"를 재현할 때 쓴다.
+    fn fake_docker_bin_at(path: &Path, script: &str) {
+        let mut f = std::fs::File::create(path).unwrap();
         writeln!(f, "#!/bin/sh\n{script}").unwrap();
         drop(f);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     // ── 바이트 파서 ─────────────────────────────────────────────────────────
@@ -1209,7 +1518,10 @@ mod tests {
             token: None,
             service_version: "0.0.0-test".to_string(),
             interval: Duration::from_millis(15),
-            docker_bin: std::path::PathBuf::from("/definitely/does/not/exist/docker"),
+            docker_bin: Some(std::path::PathBuf::from(
+                "/definitely/does/not/exist/docker",
+            )),
+            configured_bin: None,
             timeout: Duration::from_secs(5),
             spool: spool.clone(),
             health: health.clone(),
@@ -1240,5 +1552,82 @@ mod tests {
             0,
             "캡처 실패는 spool에 아무것도 남기지 않는다"
         );
+    }
+
+    /// **회귀 가드**: aicd가 뜬 뒤에 docker를 설치해도 재시작 없이 살아나야 한다. 기동 시 1회만
+    /// 판정하고 못 찾으면 task를 안 띄우던 앞 판에서는 exporter가 **영구 비활성**이었다
+    /// (`serve_docker`의 "나중에 설치된 docker" 참고).
+    ///
+    /// 캡처 성공 여부는 spool로 관찰한다 — endpoint가 죽어 있으니 캡처가 되면 push가 실패하고
+    /// 샘플이 spool에 쌓인다. 캡처 자체가 안 되면 spool은 그대로 0이다(바로 위 테스트가 그 성질을
+    /// 못박는다). 즉 `0 -> 0 초과`가 곧 "없던 docker를 찾아 캡처를 시작했다"는 증거다.
+    #[tokio::test]
+    async fn serve_docker_starts_capturing_when_docker_appears_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let quotas = aic_common::SpoolQuotas {
+            metrics: 1024 * 1024,
+            logs: 1024 * 1024,
+            app_logs: 1024 * 1024,
+        };
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool = Arc::new(Spool::open(spool_dir.path().to_path_buf(), quotas).unwrap());
+        let health = Arc::new(super::super::ExporterHealth::new(
+            "http://127.0.0.1:1".to_string(),
+            spool.clone(),
+        ));
+
+        // 아직 존재하지 않는 경로 — 나중에 여기에 "docker를 설치"한다.
+        let bin_path = dir.path().join("fake-docker");
+
+        let cfg = DockerConfig {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            interval: Duration::from_millis(15),
+            docker_bin: None, // 기동 시 못 찾았다.
+            configured_bin: Some(bin_path.clone()),
+            timeout: Duration::from_secs(5),
+            spool: spool.clone(),
+            health: health.clone(),
+        };
+
+        // 재탐색기: 파일이 실제로 생겨야 찾았다고 답한다(진짜 resolve의 euid/소유권 의존을 피한다).
+        let probe = bin_path.clone();
+        let resolver =
+            move |_: Option<&Path>| -> Option<PathBuf> { probe.exists().then(|| probe.clone()) };
+
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(async move { serve_docker_with(cfg, rx, &resolver).await });
+
+        // 아직 docker가 없다 — 여러 tick이 지나도 캡처는 없다.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            spool.batch_count(),
+            0,
+            "docker가 없는데 캡처가 됐다 — 테스트 전제가 무너졌다"
+        );
+
+        // 여기서 docker를 "설치"한다.
+        fake_docker_bin_at(&bin_path, &format!("cat <<'EOF'\n{REAL_DF_OUTPUT}EOF"));
+
+        // 재시작 없이 저절로 캡처가 시작돼야 한다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if spool.batch_count() > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "docker를 설치했는데도 캡처가 시작되지 않았다 — 재탐색이 동작하지 않는다"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("serve_docker가 shutdown 후 hang됨")
+            .expect("serve_docker task가 panic함")
+            .expect("serve_docker가 에러로 끝남");
     }
 }
