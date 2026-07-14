@@ -107,6 +107,28 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 ///
 /// 절단 여부는 **정제 순간에만 알 수 있는 정보**다. 나중에 재계산하려 하면 이미 소실됐다. 그래서
 /// 값과 함께 실어 나르고, 타입으로 **재정제를 불가능하게** 만든다(`&str`을 받는 전송 API를 없앴다).
+/// 화면에 아무것도 그리지 않는 폭 0/비가시 format 문자인가. **빈 판정에서만** 쓴다 — 저장 내용은
+/// 안 건드린다(이모지 ZWJ·다국어 조이너가 **보이는 문자와 섞이면** 그대로 보존돼야 하므로).
+/// bidi 제어(U+202A–E·U+2066–9)도 포함한다: 폭 0이라 "빈 것처럼 보임"에 해당하고, 단독으론 의미가 없다.
+fn is_zero_width_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{200B}'..='\u{200F}'   // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        | '\u{202A}'..='\u{202E}' // bidi embedding/override
+        | '\u{2060}'..='\u{2064}' // WORD JOINER, invisible operators
+        | '\u{2066}'..='\u{2069}' // bidi isolates
+        | '\u{00AD}'              // SOFT HYPHEN
+        | '\u{FEFF}'              // BOM / zero-width no-break space
+        | '\u{180E}'              // Mongolian vowel separator
+    )
+}
+
+/// 사람 눈에 **보이는 문자가 하나도 없는가**. `trim().is_empty()`는 공백(White_Space)만 보므로 폭 0
+/// 문자로만 이뤄진 메모를 놓친다(gate에서만 쓴다 — 저장 내용은 안 바꾼다).
+fn is_visually_empty(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_whitespace() || is_zero_width_invisible(c))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Memo {
     /// 정제된 본문(제어문자 제거 + UTF-8 경계 보존 절단). 비어 있지 않음이 보장된다.
@@ -164,7 +186,13 @@ impl Memo {
         // 저장 상한 절단: redaction이 늘린 최종 바이트를 진짜 상한 이하로. **이것만** 사용자 대면
         // `truncated`다 — notice가 말하는 임계(64KiB)와 정확히 일치한다.
         let (text, truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
-        if text.trim().is_empty() {
+        // 빈 판정은 **사람 눈 기준**이다. `trim()`은 공백(White_Space)만 지우므로, 폭 0/비가시 format
+        // 문자(U+200B ZWSP, U+FEFF BOM, U+2060 WJ, bidi 제어 등)로만 이뤄진 메모는 화면엔 비었는데
+        // `trim().is_empty()`를 통과해 "기록됨"이 된다 — 사람은 빈 걸 넣었다고 느끼는데 보이지 않는
+        // 기록이 남는다. **저장 내용은 건드리지 않는다**(이모지 ZWJ·다국어 조이너가 보이는 문자와
+        // 섞이면 그대로 보존): 여기선 오직 "보이는 문자가 하나도 없는가"만 보고, 순수 비가시 메모면
+        // `None` → 빈-메모 경로가 사람에게 "메모가 비었다"고 알린다(빈 문자열·공백뿐과 같은 취급).
+        if is_visually_empty(&text) {
             return None;
         }
         Some(Self { text, truncated })
@@ -1799,6 +1827,40 @@ mod tests {
         // ESC만 사라지고 나머지 텍스트(색상 코드 잔여물 포함)는 평문으로 보존.
         assert!(out.contains("[31mRED[0m"), "본문이 훼손됨: {out:?}");
         assert!(!truncated, "짧은 메모인데 절단됐다고 표시된다");
+    }
+
+    #[test]
+    fn sanitize_treats_zero_width_only_memo_as_empty() {
+        // 폭 0/비가시 문자로만 이뤄진 메모는 사람 눈엔 비었다 — `.is_control()`(Cc)은 이걸 안 지우고
+        // `trim().is_empty()`(White_Space)도 안 잡아, 예전엔 "보이지 않는 기록"이 저장·전송됐다.
+        // 빈-메모로 취급(None)해야 한다. mutation: gate를 `trim().is_empty()`로 되돌리면 Some이 돼 깨진다.
+        for s in [
+            "\u{200B}\u{200B}",     // ZWSP만
+            "\u{FEFF}",             // BOM
+            "\u{200D}\u{2060}",     // ZWJ + WORD JOINER
+            " \u{200B}\t\u{FEFF} ", // 공백 + 폭 0 혼합
+            "\u{202E}\u{202C}",     // bidi override
+        ] {
+            assert!(
+                Memo::sanitize(s).is_none(),
+                "폭 0 문자뿐인 메모({s:?})를 빈 것으로 안 봤다 — 보이지 않는 기록이 남는다"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_zero_width_joiners_inside_visible_text() {
+        // **저장 내용은 안 건드린다**는 불변식: 정상 이모지 ZWJ 시퀀스는 **보이는 이모지**가 있으니
+        // 빈 게 아니고, 조이너(ZWJ)도 그대로 보존돼야 한다 — 폭 0 문자를 무조건 지우면 가족 이모지가
+        // 세 개의 낱개 이모지로 깨진다. is_visually_empty는 판정에만 쓰고 content를 바꾸지 않으므로 안전.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧
+        let m = Memo::sanitize(family).expect("보이는 이모지가 있으니 빈 게 아니다");
+        assert!(
+            m.text().contains('\u{200D}'),
+            "ZWJ가 저장에서 사라져 이모지가 깨졌다: {:?}",
+            m.text()
+        );
+        assert_eq!(m.text(), family, "저장 내용이 원문과 달라졌다");
     }
 
     #[test]
