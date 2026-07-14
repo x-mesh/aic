@@ -45,13 +45,14 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// 따로 막는다(무제한 입력을 regex에 넘기면 ReDoS·메모리 압박 표면이 된다).
 pub const MEMO_MAX_BYTES: usize = 64 * 1024;
 
-/// redaction **전** 1차 절단 상한(**처리 상한**) — regex가 보는 입력을 유계로 만든다.
+/// redaction **전** 절단 상한(**처리 상한**) — regex가 보는 입력을 유계로 만든다. **순수 내부 비용
+/// 방어**이지 사용자 대면 상한이 아니다(여기서 잘려도 `Memo::truncated`에 안 든다 — 13차 교정).
 ///
 /// 왜 별도 상한인가(11차 코디네이터 지시의 미완성 보완): [`Memo::sanitize`]는 redaction을 먼저 하고
 /// 그 결과를 자르는데(저장 상한이 진짜 상한이 되도록), 절단이 맨 뒤라 **redaction regex가 상한 없는
 /// 원문 전체를 본다.** 3MB 메모면 3MB 전체에 regex를 돌린다 — `MEMO_MAX_BYTES`는 저장 바이트만 막지
 /// 처리 비용(CPU/메모리)은 못 막아 ReDoS·거대 입력 압박의 표면이 된다. 그래서 redaction **전에** 원문을
-/// 이 값으로 1차 절단해 regex 입력을 유계로 만든다.
+/// 이 값으로 절단해 regex 입력을 유계로 만든다.
 ///
 /// `MEMO_MAX_BYTES × 8`인 근거:
 /// - **성장 여유**: redaction 최대 성장은 짧은 이메일(`a@b.co` 6B → `[REDACTED:email]` 16B ≈ 2.4배)로
@@ -96,16 +97,6 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
     emit(AGENT_KIND_FINDING_CREATED, message, severity, attrs);
 }
 
-/// 사람이 "지금 이 순간을 남긴다"고 판단해 기록한다 — 임계에 안 걸려도 사람이 이상하다고
-/// 느낀 순간을 남기는 경로. severity는 항상 INFO(사건이 아니라 사람의 관찰 기록이다).
-///
-/// **`attrs` 키에 `exit_code`/`cwd`/`duration_ms`를 쓰지 마라** — 서버의 `EVENT_MAPPED_KEYS`가
-/// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
-///
-/// sync 호출부(CLI `aic snapshot record --memo`)용. async 호출부(chat `handle_record`)는 tokio
-/// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 이미 [`Memo::sanitize`]가
-/// 끝냈고(빈 메모면 `Memo` 자체가 안 만들어진다), 여기선 `build_snapshot_event`로 조립만 한다.
-///
 /// **한 번만** 정제된 메모 — 정제 결과와 "그때 잘렸는가"를 **같이** 들고 다닌다.
 ///
 /// 왜 타입이 필요한가(뼈아픈 교훈): 예전엔 `sanitize_memo(&str) -> (String, bool)`를 호출부가 한 번,
@@ -120,7 +111,9 @@ pub fn finding_created(probe_id: &str, severity: &str, message: &str) {
 pub struct Memo {
     /// 정제된 본문(제어문자 제거 + UTF-8 경계 보존 절단). 비어 있지 않음이 보장된다.
     text: String,
-    /// 정제 과정에서 상한을 넘겨 잘렸는가.
+    /// **저장 상한(`MEMO_MAX_BYTES`, 64KiB)에서** 잘렸는가. 처리 상한(512KiB) 절단은 여기 안 든다
+    /// (내부 비용 방어일 뿐 — `sanitize` doc 참고). 그래서 이 값이 true면 잘린 지점이 정확히 64KiB이고
+    /// `memo_truncated_notice`가 말하는 임계와 일치한다(틀린 임계를 말할 여지가 없다).
     truncated: bool,
 }
 
@@ -128,45 +121,53 @@ impl Memo {
     /// 원문을 **딱 한 번** 정제한다. 정제 후 비면(F15) `None` — 보낼 것도 저장할 것도 없다.
     ///
     /// 파이프라인은 **입력이 무한대여도 각 단계가 유계**여야 한다(11차 sweep). 순서:
-    /// 1. **1차 절단(처리 상한 `MEMO_REDACT_INPUT_MAX`)을 원문에 먼저** — 이 한 번의 절단이 **뒤의 모든
+    /// 1. **처리 상한 절단(`MEMO_REDACT_INPUT_MAX`)을 원문에 먼저** — 이 한 번의 절단이 **뒤의 모든
     ///    단계**(제어문자 제거의 O(n) 할당, redaction regex)의 입력을 유계로 만든다. strip 앞에 두는
     ///    이유: chat paste는 수십 MB일 수 있어, strip을 먼저 하면 그 할당이 무제한이 된다.
     /// 2. **제어문자·ANSI escape 제거**(F17) — 화면을 깨지 않게. 개행/탭은 남긴다. ESC(`\x1b`)만 지워도
     ///    뒤따르는 CSI 바이트열(`[33m` 등)은 평문으로 남아 터미널이 시퀀스로 해석하지 않는다.
     /// 3. **redaction**(F14) — secret/PII 마스킹. `[REDACTED:…]` 치환은 **길이를 늘릴 수 있다**.
-    /// 4. **2차 절단(저장 상한 `MEMO_MAX_BYTES`)**(F16) — 최종 저장/전송 바이트를 진짜 상한 이하로.
+    /// 4. **저장 상한 절단(`MEMO_MAX_BYTES`)**(F16) — 최종 저장/전송 바이트를 진짜 상한 이하로.
     ///
-    /// **왜 절단이 두 번인가**:
-    /// - redaction을 **저장 절단보다 먼저** 해야 저장 상한이 실제 상한이 된다(9차→10차 교정) — 치환이
-    ///   늘린 길이까지 2차 절단이 잡는다. `cap_str`이 UTF-8 경계를 지켜 문자 중간이 깨지지 않는다.
-    /// - 그런데 redaction이 맨 앞이면 **regex가 원문 전체(무제한)를 본다**(11차 보완) — 그래서 1차
-    ///   절단을 맨 앞에 둬 regex 입력(과 strip 할당)을 유계로 만든다. 저장 상한만으론 처리 비용
-    ///   (ReDoS·메모리)을 못 막는다.
+    /// **두 상한의 역할이 다르다 — 사용자에겐 저장 상한 하나만 보인다**:
+    /// - **저장 상한(`MEMO_MAX_BYTES`, 64KiB)**: 사용자 대면. 여기서 잘리면 `truncated=true`이고, notice가
+    ///   이 값을 말한다. redaction을 이 절단보다 먼저 해야 실제 상한이 된다(9차→10차 교정 — 치환이 늘린
+    ///   길이까지 잡는다). `cap_str`이 UTF-8 경계를 지켜 문자 중간이 깨지지 않는다.
+    /// - **처리 상한(`MEMO_REDACT_INPUT_MAX`, 512KiB)**: **순수 내부 비용 방어**(regex 입력·strip 할당을
+    ///   유계로). redaction이 맨 앞이면 regex가 원문 전체(무제한)를 보기 때문이다(11차). **이 절단은
+    ///   `truncated`에 넣지 않는다** — 사용자 대면 절단이 아니기 때문이다(13차 교정).
+    ///
+    /// **왜 처리 상한 절단을 truncated에 안 넣나**(핵심): 두 절단을 OR로 합치면 512KiB에서 잘린 걸 notice가
+    /// "64KiB에서 잘렸다"고 **틀린 임계**로 말한다. 그리고 실질적으로 최종 사용자가 보는 절단은 **언제나
+    /// 저장 상한(64KiB)**이다 — `truncated=true`(post)이려면 redaction 결과가 64KiB를 넘어야 하고, 그때
+    /// 잘린 지점은 정확히 64KiB다. 처리 상한(512KiB)이 잘린 극단 입력도 정상 텍스트라면 redaction이 길이를
+    /// 안 바꿔 저장 상한이 다시 이겨 결국 64KiB에서 잘린다(post도 true). 처리 상한만 잘리고 저장 상한은
+    /// 안 잘리는 유일한 경우는 **512KiB 이상이 redaction으로 64KiB 미만으로 줄어드는 병적 입력**(secret
+    /// 도배)뿐인데, 그건 최종 저장물이 온전(redacted)해 "잘렸다"고 할 의미 있는 손실이 없다. 그래서
+    /// **처리 상한은 조용히 두고, 사용자에겐 저장 상한 하나만** 보인다 — 틀린 임계를 말할 여지가 없어진다.
     ///
     /// (downstream의 store·build_event redaction은 idempotent라 이미 마스킹된 값에 다시 걸려도 무해하다.)
     pub fn sanitize(raw: &str) -> Option<Self> {
-        // 1차 절단(처리 상한)을 **맨 앞·원문에** — 이 아래 모든 단계의 입력이 이걸로 유계다.
-        let (bounded_raw, pre_truncated) =
+        // 처리 상한 절단을 **맨 앞·원문에** — 이 아래 모든 단계의 입력이 이걸로 유계다. 잘림 플래그는
+        // 버린다(`_`): 이건 내부 비용 방어이지 사용자 대면 절단이 아니다(위 doc 참고).
+        let (bounded_raw, _processing_cut) =
             crate::agent::tool_record::cap_str(raw, MEMO_REDACT_INPUT_MAX);
         let cleaned: String = bounded_raw
             .chars()
             .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
             .collect();
-        // redact가 실제로 받는 입력 길이를 테스트가 관찰한다 — 1차 절단을 제거하면(무제한 입력이 regex에
-        // 감) 이 값이 상한을 넘어 `sanitize_bounds_redaction_input…`이 결정적으로(시계 무관) 깨진다.
+        // redact가 실제로 받는 입력 길이를 테스트가 관찰한다 — 처리 상한 절단을 제거하면(무제한 입력이
+        // regex에 감) 이 값이 상한을 넘어 `sanitize_bounds_redaction_input…`이 결정적으로 깨진다.
         #[cfg(test)]
         test_redact_probe::record(cleaned.len());
         let redacted = redact(&cleaned);
-        // 2차 절단(저장 상한): redaction이 늘린 최종 바이트를 진짜 상한 이하로.
-        let (text, post_truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
+        // 저장 상한 절단: redaction이 늘린 최종 바이트를 진짜 상한 이하로. **이것만** 사용자 대면
+        // `truncated`다 — notice가 말하는 임계(64KiB)와 정확히 일치한다.
+        let (text, truncated) = crate::agent::tool_record::cap_str(&redacted, MEMO_MAX_BYTES);
         if text.trim().is_empty() {
             return None;
         }
-        // 1·2차 어느 쪽에서든 잘렸으면 "잘렸다".
-        Some(Self {
-            text,
-            truncated: pre_truncated || post_truncated,
-        })
+        Some(Self { text, truncated })
     }
 
     /// 정제된 본문 — **로컬 저장과 원격 전송이 이 하나의 값을 공유한다**(둘이 각자 정규화하면
@@ -175,12 +176,23 @@ impl Memo {
         &self.text
     }
 
-    /// 상한을 넘겨 잘렸는가. 호출부가 사용자에게 알리는 데 쓴다.
+    /// **저장 상한(64KiB)에서** 잘렸는가. 호출부가 `memo_truncated_notice`로 사용자에게 알리는 데 쓴다
+    /// (처리 상한 절단은 여기 안 든다 — `Memo::sanitize` doc 참고).
     pub fn truncated(&self) -> bool {
         self.truncated
     }
 }
 
+/// 사람이 "지금 이 순간을 남긴다"고 판단해 기록한다 — 임계에 안 걸려도 사람이 이상하다고
+/// 느낀 순간을 남기는 경로. severity는 항상 INFO(사건이 아니라 사람의 관찰 기록이다).
+///
+/// **`attrs` 키에 `exit_code`/`cwd`/`duration_ms`를 쓰지 마라** — 서버의 `EVENT_MAPPED_KEYS`가
+/// 이 키들을 컬럼으로 흡수하며 attrs에서 지운다.
+///
+/// sync 호출부(CLI `aic snapshot record --memo`)용. async 호출부(chat `handle_record`)는 tokio
+/// worker를 막지 않는 [`snapshot_recorded_async`]를 쓴다 — 병적 입력 처리는 이미 [`Memo::sanitize`]가
+/// 끝냈고(빈 메모면 `Memo` 자체가 안 만들어진다), 여기선 `build_snapshot_event`로 조립만 한다.
+///
 /// 반환값 = **이 메모가 실제로 어떻게 됐는가**([`RecordOutcome`]).
 ///
 /// **결론은 전송 결과에서 나온다** — `dispatch`가 실패하면 어떤 probe 결과와도 무관하게 `NotSent`다.
@@ -1934,13 +1946,39 @@ mod tests {
     }
 
     #[test]
-    fn first_stage_truncation_is_reported_as_truncated() {
-        // 1차(처리 상한)에서 잘려도 "잘렸다"에 포함돼야 한다 — 사용자에게 뒤가 사라졌음을 알린다.
-        // secret 없는 거대 입력이라 redaction은 길이를 안 바꾸고, **오직 1차 절단만** 잘림을 만든다
-        // (2차는 안 걸린다 — 이 잘림이 pre_truncated 경로로 보고되는지 격리 검증).
-        let huge = "가".repeat(1_000_000); // 3MB > 처리 상한
-        let m = Memo::sanitize(&huge).expect("거대 메모");
-        assert!(m.truncated(), "1차 절단됐는데 절단 표시가 없다");
-        assert!(m.text().len() <= MEMO_MAX_BYTES);
+    fn processing_cap_truncation_is_not_reported_as_user_facing_truncated() {
+        // **13차 교정 + gate 2 공허 방지**: `truncated`는 **저장 상한(64KiB)에서** 잘렸을 때만 true다.
+        // 처리 상한(512KiB) 절단은 내부 비용 방어라 여기 안 든다 — 두 절단을 OR로 합치면 notice가
+        // 512KiB에서 잘린 걸 "64KiB에서 잘렸다"고 **틀린 임계**로 말한다.
+        //
+        // 이걸 잡으려면 **처리 상한만 걸리고 저장 상한은 안 걸리는** 입력이 필요하다: 512KiB 이상이
+        // redaction으로 64KiB 미만으로 **줄어드는** 병적 입력. 긴 conn_string(`scheme://u:p@host…`)은
+        // 통째로 `[REDACTED:conn_string]`(22B)로 접혀 대폭 축소된다. (성장하는 email로는 이 케이스를
+        // 못 만든다 — 그건 저장 상한이 이겨 공허해진다. 9차의 반대 함정.)
+        let one = format!("x://u:p@{} ", "h".repeat(1000)); // ≈1010B, redact → 23B(라벨+공백)
+        let raw = one.repeat(600); // ≈606KB > 처리 상한(512KiB)
+        assert!(
+            raw.len() > MEMO_REDACT_INPUT_MAX,
+            "입력이 처리 상한을 안 넘어 공허"
+        );
+
+        let m = Memo::sanitize(&raw).expect("redacted conn_string 도배");
+
+        // redaction이 대폭 줄여 최종은 저장 상한 **미만** — 즉 저장 상한 절단은 안 걸렸다.
+        assert!(
+            m.text().len() < MEMO_MAX_BYTES,
+            "redaction이 저장 상한 밑으로 안 줄었다(테스트 전제 실패): {}",
+            m.text().len()
+        );
+        assert!(
+            m.text().contains("[REDACTED:conn_string]"),
+            "conn_string이 redact되지 않았다(전제 실패)"
+        );
+        // **핵심 단언**: 처리 상한만 잘렸으므로 사용자 대면 truncated는 **false**여야 한다.
+        // `truncated`를 `pre || post`로 되돌리면(=처리 상한을 사용자에게 노출) 이 단언이 깨진다.
+        assert!(
+            !m.truncated(),
+            "처리 상한 절단을 사용자 대면 truncated로 노출했다(틀린 임계 회귀)"
+        );
     }
 }
