@@ -100,19 +100,68 @@ impl SnapshotRecord {
             memo,
         }
     }
+
+    /// `aic snapshot list`의 사람이 보는 한 줄. **순수 함수**(store를 읽지 않으므로 격리 없이 테스트
+    /// 가능). 저장한 메모를 **다시 볼 경로**를 여기서 만든다 — 저장만 하고 표시하지 않으면
+    /// "메모는 로컬에 저장됐습니다"라는 안내가 빈 약속이 된다(사용자가 확인할 방법이 없다).
+    pub fn list_line(&self) -> String {
+        let mut s = format!(
+            "- {} · {} · sections={} ({})",
+            self.captured_at.to_rfc3339(),
+            self.kind,
+            self.sections.len(),
+            self.sections.join(",")
+        );
+        if let Some(memo) = &self.memo {
+            s.push_str(&format!(
+                " · memo: {}",
+                memo_preview(memo, MEMO_PREVIEW_CHARS)
+            ));
+        }
+        s
+    }
 }
 
-/// opt-in env 공통 파서. 기본 off. 값을 trim·소문자화 후 falsy 집합(""/0/false/no/off)이 아니면 on —
-/// 사용자가 `False`/`off`/공백을 끄려고 입력했는데 켜지는 footgun 방지. AIC_SNAPSHOT_RECORD(L0-L2)·
-/// AIC_AUTO_RCA(L3 auto_rca)가 공유한다.
-pub fn env_enabled(var: &str) -> bool {
-    match std::env::var(var) {
-        Ok(v) => !matches!(
+/// list 한 줄에 보여줄 메모 미리보기 최대 글자수(바이트 아님). 목록이 한 줄로 읽히게 짧게 자른다 —
+/// 전체 메모는 `snapshot compare`/bundle 등 본문 경로에서 본다.
+const MEMO_PREVIEW_CHARS: usize = 60;
+
+/// 메모를 **한 줄 미리보기**로 만든다(순수). 개행·탭(sanitize가 남긴 정상 문자)을 공백으로 접어
+/// 목록이 여러 줄로 깨지지 않게 하고, `max_chars`(글자 기준, UTF-8 경계 안전)를 넘으면 `…`로 자른다.
+fn memo_preview(memo: &str, max_chars: usize) -> String {
+    // 개행·탭 → 공백, 연속 공백은 하나로. (제어문자 자체는 sanitize 단계에서 이미 제거됨.)
+    let collapsed: String = memo
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect();
+    let collapsed = collapsed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = collapsed.chars().take(max_chars).collect();
+    if collapsed.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+/// opt-in **값 파서**(순수). 기본 off. 값을 trim·소문자화 후 falsy 집합(""/0/false/no/off)이 아니면
+/// on — 사용자가 `False`/`off`/공백을 끄려고 입력했는데 켜지는 footgun 방지.
+///
+/// **값을 주입받는다**(env를 읽지 않는다) — 그래서 계약을 격리 없이, 프로세스 전역 env를 만지지
+/// 않고 테스트할 수 있다. `set_var`는 Rust 2024에서 unsafe(다른 스레드가 env를 읽는 동안 쓰면
+/// data race)라, 값 열거를 env로 하면 병렬 테스트의 간헐 실패 씨앗이 된다 — 순수 코어를 분리해 피한다.
+pub fn enabled_from_value(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "no" | "off"
         ),
-        Err(_) => false,
+        None => false,
     }
+}
+
+/// opt-in env 공통 파서 — [`enabled_from_value`]에 env 값을 주입한다. AIC_SNAPSHOT_RECORD(L0-L2)·
+/// AIC_AUTO_RCA(L3 auto_rca)가 공유한다.
+pub fn env_enabled(var: &str) -> bool {
+    enabled_from_value(std::env::var(var).ok().as_deref())
 }
 
 /// 영구 스냅샷 기록 opt-in(`AIC_SNAPSHOT_RECORD`). 기본 off.
@@ -563,6 +612,50 @@ mod tests {
         assert_eq!(loaded[0].memo, None, "필드 없는 구버전은 메모 없음이어야");
     }
 
+    // ── list 표시: 저장한 메모를 다시 볼 경로(순수 포맷, store 미접촉) ────────────
+
+    #[test]
+    fn list_line_shows_memo_when_present_and_omits_when_absent() {
+        // 저장만 하고 표시 안 하면 "메모는 로컬에 저장됐습니다"가 빈 약속이 된다 — list가 보여준다.
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let with = SnapshotRecord::with_memo(
+            "manual",
+            "## host\nh\n",
+            None,
+            None,
+            now,
+            Some("디스크가 이상하다"),
+        );
+        let line = with.list_line();
+        assert!(
+            line.contains("memo: 디스크가 이상하다"),
+            "메모가 안 보인다: {line}"
+        );
+
+        // 메모 없는 레코드(alert 캡처 등)엔 memo 조각이 없다 — 없는 걸 있는 척하지 않는다.
+        let without = SnapshotRecord::new("alert", "## host\nh\n", None, None, now);
+        assert!(
+            !without.list_line().contains("memo:"),
+            "메모 없는데 memo: 표시"
+        );
+    }
+
+    #[test]
+    fn memo_preview_collapses_newlines_and_truncates_on_char_boundary() {
+        // 목록 한 줄이 여러 줄로 깨지지 않게 개행·탭을 접고, 길면 …로 자른다(UTF-8 경계 안전).
+        assert_eq!(memo_preview("한 줄\n둘째 줄\t셋", 40), "한 줄 둘째 줄 셋");
+
+        // 멀티바이트로 상한 초과 → 글자 기준 절단 + 말줄임(패닉하면 바이트 경계를 깬 것).
+        let long = "가".repeat(100);
+        let out = memo_preview(&long, 60);
+        assert_eq!(out.chars().count(), 61, "60글자 + …"); // 잘림 표시 포함
+        assert!(out.ends_with('…'));
+        assert!(out.chars().take(60).all(|c| c == '가'));
+
+        // 상한 이하면 말줄임 없음.
+        assert_eq!(memo_preview("짧다", 60), "짧다");
+    }
+
     #[test]
     fn body_redaction_masks_secrets() {
         let _h = HomeGuard::set();
@@ -583,56 +676,32 @@ mod tests {
     }
 
     #[test]
-    fn record_enabled_opt_in_default_off() {
-        let _h = HomeGuard::set(); // HOME_LOCK으로 env 경합 직렬화
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
+    fn enabled_value_parser_contract() {
+        // 공유 파서 계약 — **값을 주입**해 검증한다(env 미접촉 → 격리·직렬화 불필요, 2024 UB 없음).
+        // 미설정(None)과 falsy 문자열은 off, 그 외는 on. footgun: 끄려는 의도의 입력은 off로 정규화.
+        assert!(!enabled_from_value(None), "미설정은 off");
+        for off in ["", "0", "false", "False", "OFF", "no", "  off  "] {
+            assert!(!enabled_from_value(Some(off)), "off로 인식돼야: {off:?}");
         }
-        assert!(!record_enabled());
-        unsafe {
-            std::env::set_var("AIC_SNAPSHOT_RECORD", "1");
-        }
-        assert!(record_enabled());
-        unsafe {
-            std::env::set_var("AIC_SNAPSHOT_RECORD", "0");
-        }
-        assert!(!record_enabled());
-        // footgun 방지: 끄려는 의도의 입력은 off로(정규화).
-        for off in ["false", "False", "OFF", "no", "  off  "] {
-            unsafe {
-                std::env::set_var("AIC_SNAPSHOT_RECORD", off);
-            }
-            assert!(!record_enabled(), "off로 인식돼야: {off:?}");
-        }
-        unsafe {
-            std::env::remove_var("AIC_SNAPSHOT_RECORD");
+        for on in ["1", "true", "yes", "on", "anything"] {
+            assert!(enabled_from_value(Some(on)), "on으로 인식돼야: {on:?}");
         }
     }
 
     #[test]
-    fn env_enabled_parser_contract() {
-        // 공유 파서 계약을 임의 var명으로 직접 고정(AIC_SNAPSHOT_RECORD·AIC_AUTO_RCA 양쪽이 의존).
-        let _h = HomeGuard::set(); // env 경합 직렬화
-        let var = "AIC_TEST_ENV_ENABLED_CONTRACT";
+    fn record_enabled_reads_the_snapshot_record_var() {
+        // `record_enabled`가 **어느 env를 보는지**(배선)만 최소로 확인한다 — 값 파싱 계약은 위
+        // 순수 테스트가 다 덮으므로, 여기선 딱 한 번의 env 왕복(HOME 락으로 직렬화·unsafe 래핑)이면
+        // 충분하다. 값 열거 루프를 env로 돌리던 예전 버전을 순수 테스트로 옮겨 UB 표면을 줄였다.
+        let _h = HomeGuard::set();
         unsafe {
-            std::env::remove_var(var);
+            std::env::set_var("AIC_SNAPSHOT_RECORD", "1");
         }
-        assert!(!env_enabled(var), "미설정은 off");
-        for off in ["", "0", "false", "False", "OFF", "no", "  off  "] {
-            unsafe {
-                std::env::set_var(var, off);
-            }
-            assert!(!env_enabled(var), "off로 인식돼야: {off:?}");
-        }
-        for on in ["1", "true", "yes", "on", "anything"] {
-            unsafe {
-                std::env::set_var(var, on);
-            }
-            assert!(env_enabled(var), "on으로 인식돼야: {on:?}");
-        }
+        assert!(record_enabled(), "AIC_SNAPSHOT_RECORD=1인데 off로 본다");
         unsafe {
-            std::env::remove_var(var);
+            std::env::remove_var("AIC_SNAPSHOT_RECORD");
         }
+        assert!(!record_enabled(), "미설정 기본은 off");
     }
 
     #[test]
