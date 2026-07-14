@@ -1619,12 +1619,30 @@ impl AgentSession {
         use std::sync::atomic::Ordering;
         use tool_record::RecordAction;
         if let RecordAction::Now(memo) = action {
+            // 메모는 **로컬 스냅샷 레코드에 함께 저장한다** — 이게 이 기능의 본체다. OTLP는 부가
+            // 경로이고 aicd 미실행은 정상 상태라, 원격에만 실으면 사람이 "지금 이게 중요하다"고
+            // 남긴 관찰이 통째로 사라진다(`SnapshotRecord::memo` 문서 참고).
+            //
+            // 저장/전송 양쪽이 **같은 sanitize를 지나야** 로컬과 원격의 메모가 어긋나지 않는다
+            // (제어문자 제거 + 64KiB 절단). 잘렸으면 사용자에게 말한다 — 예전엔 아무 표시 없이 잘렸다.
+            let sanitized = memo
+                .as_deref()
+                .map(crate::agent_event::sanitize_memo)
+                .filter(|(m, _)| !m.trim().is_empty());
+            let truncated = sanitized.as_ref().is_some_and(|(_, t)| *t);
+            let memo_text = sanitized.map(|(m, _)| m);
+
             // 즉시 1회 캡처 — 토글 상태와 무관한 명시적 요청이라 게이트 우회(capture_forced).
             // probe 수집이 수초라 blocking pool로 분리(runtime worker 비차단). 상위 select!의 spin이 표시됨.
-            // **기존 동작 그대로 유지**: 메모 유무와 무관하게 항상 로컬 스냅샷 store에 저장한다.
-            let res =
-                tokio::task::spawn_blocking(|| super::snapshot_capture::capture_forced("manual"))
-                    .await;
+            // 메모 유무와 무관하게 항상 로컬 스냅샷 store에 저장한다(기존 동작 유지).
+            let memo_for_capture = memo_text.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                super::snapshot_capture::capture_forced_with_memo(
+                    "manual",
+                    memo_for_capture.as_deref(),
+                )
+            })
+            .await;
             // 로컬 저장이 **실제로** 됐는지 붙잡아 둔다 — 예전엔 이 결과를 무시하고 뒤에서 무조건
             // "로컬 스냅샷은 정상 저장되었습니다"라고 안내해, 캡처가 실패해도 성공했다고 거짓말했다.
             let local_ok = matches!(res, Ok(Ok(Some(_))));
@@ -1636,22 +1654,27 @@ impl AgentSession {
             };
             self.out.note(&msg).await;
 
-            // 메모가 있으면 로컬 저장과 별개로 OTLP `snapshot.recorded`도 함께 발화한다 — 임계
-            // 스캔이 원리상 못 잡는 "지금 이상하다"를 사람이 남기는 경로(B3). 빈/공백뿐 메모는
-            // `snapshot_recorded_async` 내부가 스킵한다(F15) — 여기선 memo가 `Some`이었다는 사실만으로
-            // 판단하지 않고 그 반환값으로 실제 전송 여부를 안다.
+            if truncated {
+                self.out
+                    .note(&format!(
+                        "ℹ 메모가 너무 길어 {}KiB에서 잘렸습니다(뒷부분은 저장·전송되지 않습니다).",
+                        crate::agent_event::MEMO_MAX_BYTES / 1024
+                    ))
+                    .await;
+            }
+
+            // 로컬 저장과 별개로 OTLP `snapshot.recorded`도 함께 발화한다 — 서버에서 시계열로
+            // 조인해 보려면 원격에도 있어야 한다. 빈/공백뿐 메모는 내부에서 스킵한다(F15).
             //
-            // **로컬 캡처가 실패해도 메모는 보낸다**(설계 결정): 이 기능의 본질은 사람이 남기는
-            // 메모이고 스냅샷은 부가 증거다. 로컬 디스크 문제(권한·용량) 때문에 "지금 이상하다"는
-            // 사람의 관찰까지 버리면, 정작 그 관찰이 가장 필요한 상황(디스크가 꽉 찬 장애)에서
-            // 기능이 죽는다. 대신 **반쪽 성공을 반쪽이라고 정확히 보고**한다(record_remote_notice).
+            // **로컬 캡처가 실패해도 메모는 보낸다**(설계 결정): 로컬 디스크 문제(권한·용량) 때문에
+            // 사람의 관찰까지 버리면, 정작 그 관찰이 가장 필요한 상황(디스크가 꽉 찬 장애)에서 기능이
+            // 죽는다. 대신 **반쪽 성공을 반쪽이라고 정확히 보고**한다(record_remote_notice).
             //
             // IPC는 **async 판**을 쓴다 — sync 판은 blocking `UnixStream`이라 여기서 부르면 tokio
             // worker가 최대 IO_TIMEOUT만큼 막힌다(agent_event::query_async 문서 참고).
-            if let Some(memo) = memo {
+            if let Some(memo) = memo_text {
                 let attrs = self.record_metrics_attrs();
                 // 반환값이 곧 **사후 결과**다 — 보내기 전 probe로 성공을 단언하지 않는다.
-                // `None`은 "메모가 비어 안 보냄"(F15)이고, `Some(outcome)`은 실제 전송 결과다.
                 let outcome = crate::agent_event::snapshot_recorded_async(&memo, attrs).await;
                 if let Some(notice) = record_remote_notice(local_ok, outcome) {
                     self.out.note(&notice).await;
@@ -2405,24 +2428,30 @@ pub fn record_remote_notice(
     remote: Option<crate::agent_event::RecordOutcome>,
 ) -> Option<String> {
     let remote = remote?;
-    // "메모는 서버에 남는다"는 결론은 **전송 결과**에서만 나온다(will_reach_server) — 이 판단을
-    // notice 문구 유무로 대신하면, 밀림(Delivered{backlog>0}: 안내는 있지만 유실은 아님)을
-    // 실패로 오인한다.
-    let remote_ok = remote.will_reach_server();
-    match (local_ok, remote.notice()) {
-        // 둘 다 정상 — 침묵.
-        (true, None) => None,
-        // 원격에 할 말이 있다(실패했거나, 갔지만 밀려 있다). 로컬을 성공이라 주장하지 않는다.
-        (true, Some(n)) => Some(format!("ℹ {n}")),
-        // 로컬만 실패 — 메모는 나갔다는 사실을 알려야 사용자가 "아무것도 안 남았다"고 오해하지 않는다.
-        (false, None) => {
-            Some("ℹ 메모는 원격에 기록됐습니다 — 로컬 스냅샷 저장만 실패했습니다.".to_string())
-        }
-        // 로컬 실패 + 원격에도 할 말 있음. 여기서 "도"("원격도 실패")로 뭉치면 안 된다 — 밀림
-        // (Delivered{backlog>0})은 **지연이지 실패가 아니라서**, 원격까지 실패한 것처럼 읽히면
-        // 그것 역시 거짓 보고다. 원격이 살아 있는지는 notice 문구가 아니라 will_reach_server로 가른다.
-        (false, Some(n)) if remote_ok => Some(format!("ℹ {n} 로컬 스냅샷 저장은 실패했습니다.")),
-        (false, Some(n)) => Some(format!("ℹ {n} 로컬 스냅샷 저장도 실패했습니다.")),
+    use crate::agent_event::RemoteVerdict;
+    // 원격의 성패는 **문구 유무가 아니라 verdict로** 가른다 — 밀림(Delivered{backlog>0})은 안내가
+    // 있지만 유실이 아니고, Unknown은 실패가 아니라 "모름"이다. 문구 유무로 판단하면 둘 다 오보한다.
+    let remote_note = remote.notice();
+    match (local_ok, remote.verdict()) {
+        // 로컬에 메모가 남았다 = **이 기능의 본체는 성공했다**(메모는 스냅샷 레코드 안에 있다).
+        // 원격은 부가 경로이므로, 원격에 문제가 있어도 "메모 자체는 남았다"는 안심 사실을 함께 준다.
+        // 예전엔 메모를 로컬에 저장조차 하지 않아서 원격 실패가 곧 유실이었다 — 이제는 아니다.
+        (true, _) => remote_note.map(|n| format!("ℹ {n} (메모는 로컬 스냅샷에 저장됐습니다.)")),
+        // 로컬 실패 + 원격 도달 — 메모는 원격에만 있다. "아무것도 안 남았다"는 오해를 막는다.
+        (false, RemoteVerdict::Reaches) => Some(format!(
+            "ℹ {}로컬 스냅샷 저장은 실패해, 이 메모는 원격에만 남습니다.",
+            remote_note.map(|n| format!("{n} ")).unwrap_or_default()
+        )),
+        // 로컬 실패 + 원격 불확실 — 어느 쪽도 보장할 수 없다. 얼버무리지 않는다.
+        (false, RemoteVerdict::Unknown) => Some(format!(
+            "⚠ {}로컬 스냅샷 저장도 실패해, 이 메모가 남았는지 확인할 수 없습니다.",
+            remote_note.map(|n| format!("{n} ")).unwrap_or_default()
+        )),
+        // 둘 다 실패 — 메모가 **어디에도 없다**. 가장 나쁜 경우이고, 반드시 그렇게 말해야 한다.
+        (false, RemoteVerdict::Lost) => Some(format!(
+            "⚠ {}로컬 스냅샷 저장도 실패했습니다 — 이 메모는 어디에도 기록되지 않았습니다.",
+            remote_note.map(|n| format!("{n} ")).unwrap_or_default()
+        )),
     }
 }
 
@@ -3381,6 +3410,55 @@ mod tests {
             "밀림(지연)을 원격 실패로 오보한다: {n}"
         );
         assert!(n.contains("로컬 스냅샷 저장은 실패"), "{n}");
+    }
+
+    #[test]
+    fn record_notice_reassures_that_memo_is_safe_locally_when_remote_is_lost() {
+        use crate::agent_event::RecordOutcome;
+        // 메모가 **로컬 스냅샷 레코드 안에** 저장되므로, 원격이 통째로 실패해도 관찰은 살아 있다.
+        // 예전엔 메모가 OTLP로만 나가서 aicd가 꺼져 있으면 그냥 유실이었다 — 그때는 이 안심 문구를
+        // 쓸 수조차 없었다. 이 테스트가 그 제품 구멍의 회귀를 잡는다.
+        for remote in [
+            RecordOutcome::NotSent,
+            RecordOutcome::DroppedExporterOff,
+            RecordOutcome::DroppedAgentExporterOff,
+            RecordOutcome::Rejected("bus full".to_string()),
+        ] {
+            let n = record_remote_notice(true, Some(remote)).expect("원격 문제는 알려야 한다");
+            assert!(
+                n.contains("로컬 스냅샷에 저장"),
+                "원격이 실패했는데 '메모는 로컬에 있다'는 안심을 못 준다: {n}"
+            );
+            // 로컬이 성공했으므로 "어디에도 기록되지 않았다" 같은 말은 나오면 안 된다.
+            assert!(!n.contains("어디에도"), "{n}");
+        }
+    }
+
+    #[test]
+    fn record_notice_says_unknown_is_unknown_not_failure() {
+        use crate::agent_event::RecordOutcome;
+        // 원격 도달 여부를 모를 때(status 조회 실패) 로컬까지 실패하면, "유실됐다"고 단정할 수도
+        // "남았다"고 안심시킬 수도 없다 — 모른다고 말해야 한다.
+        let n = record_remote_notice(false, Some(RecordOutcome::Unknown)).expect("안내가 있어야");
+        assert!(
+            n.contains("확인할 수 없"),
+            "모름을 모름이라 말하지 않는다: {n}"
+        );
+        assert!(
+            !n.contains("어디에도 기록되지 않"),
+            "모름을 유실로 단정한다: {n}"
+        );
+    }
+
+    #[test]
+    fn record_notice_says_memo_is_nowhere_when_both_paths_lost_it() {
+        use crate::agent_event::RecordOutcome;
+        // 로컬도 실패하고 원격도 유실 — 메모가 **어디에도 없다**. 가장 나쁜 경우이고, 얼버무리면 안 된다.
+        let n = record_remote_notice(false, Some(RecordOutcome::NotSent)).expect("안내가 있어야");
+        assert!(
+            n.contains("어디에도 기록되지 않"),
+            "메모가 완전히 사라졌는데 그렇게 말하지 않는다: {n}"
+        );
     }
 
     #[test]
