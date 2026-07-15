@@ -304,8 +304,9 @@ extern "C" fn restore_terminal_on_signal(sig: libc::c_int) {
     }
 }
 
-/// ChatLoop task를 띄우고 핸들을 돌려준다. TTY 전용(호출 측이 확인). `with_statusbar`면 2초마다
-/// 시스템 지표를 status bar에 갱신한다(non-TTY/opt-out은 호출 측에서 Direct 경로로 우회).
+/// ChatLoop task를 띄우고 핸들을 돌려준다. TTY 전용(호출 측이 확인). sampler task는 `with_statusbar`와
+/// 무관하게 항상 돈다(`/record now`가 status bar 표시 여부에 기대지 않도록, t2 후속) — `with_statusbar`는
+/// 화면 status bar 갱신·alert 무장 여부만 가른다(non-TTY/opt-out은 호출 측에서 Direct 경로로 우회).
 pub(crate) fn start_chat_loop(
     prompt: String,
     with_statusbar: bool,
@@ -317,8 +318,8 @@ pub(crate) fn start_chat_loop(
     let (out_tx, out_rx) = mpsc::channel::<OutMsg>(32);
     // 취소 채널: 용량 1이면 충분(중복 Ctrl+C는 try_send 실패로 자연 병합). turn마다 drain_cancel로 비운다.
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    // 지표 watch 채널(t2) — with_statusbar=false면 chat_loop 내부 sampler task 자체가 안 돌아
-    // 이 sender에 아무것도 안 보내므로 receiver는 초기값 None에 계속 머문다(= 폴백 신호).
+    // 지표 watch 채널(t2) — sampler task는 with_statusbar와 무관하게 항상 publish한다
+    // (`/record now` 자기완결화). receiver 초기값은 첫 sample 전까지 None.
     let (metrics_tx, metrics_rx) = watch::channel(None::<SysMetrics>);
     let join = tokio::spawn(chat_loop(
         line_tx,
@@ -1394,12 +1395,11 @@ async fn chat_loop(
     // 돌려 watch 채널로 publish한다. UI 루프는 채널만 읽으므로 (1) hung mount에서 statfs가 멈춰도
     // 얼지 않고, (2) 채널 갱신이 select!를 깨워 idle에서도 status가 흐른다(이전엔 tick이 spin 중에만
     // 돌아 idle에서 status가 멈췄다).
-    let (mut metrics_rx, sampler_task) = if with_statusbar {
-        let (rx, handle) = spawn_sampler();
-        (Some(rx), Some(handle))
-    } else {
-        (None, None)
-    };
+    // sampler task는 with_statusbar와 무관하게 항상 띄운다 — `/record now`가 status bar 표시
+    // 여부에 기대지 않고 metrics_tx(session의 last_metrics)를 자기완결적으로 채우도록(t2 후속).
+    // 화면 status/segs 갱신과 alert 무장은 여전히 with_statusbar만 따른다(아래 poll 처리부).
+    let (rx, handle) = spawn_sampler();
+    let (mut metrics_rx, sampler_task) = (Some(rx), Some(handle));
     // edge-triggered alert 트래커(C1). Some=무장(악화 전이 시 ambient Note+bell). statusbar가 켜졌을
     // 때만 무장한다. 추후 C7의 `/watch off`가 이를 None으로 돌려 alert lane을 끌 수 있다.
     let mut alert_tracker = with_statusbar.then(AlertTracker::new);
@@ -1879,12 +1879,17 @@ async fn chat_loop(
             } => {
                 match poll {
                     MetricsPoll::New(m) => {
-                        status = format!("· {}", m.status_line());
-                        status_segs = Some(m.status_segments());
-                        // t2: session의 `last_metrics` 캐시로도 밀어보낸다 — `/record now`가 이 값을 재사용해
-                        // status bar와 같은 숫자를 기록한다. **첫 publish는 sampler의 첫 sample이라 cpu가
-                        // 오염돼 있다**(elapsed≈0) — 그 사실은 스냅샷의 `cpu_valid=false`가 실어 나르므로
-                        // session이 걸러낸다. 구독자가 없어도 send 실패는 무시(best-effort).
+                        // 화면 status bar 갱신은 with_statusbar일 때만 — 꺼져 있으면 placeholder 문구를
+                        // 유지한다(사용자가 명시적으로 끈 화면을 조용히 되살리지 않는다).
+                        if with_statusbar {
+                            status = format!("· {}", m.status_line());
+                            status_segs = Some(m.status_segments());
+                        }
+                        // t2: session의 `last_metrics` 캐시로는 with_statusbar와 무관하게 항상 밀어보낸다 —
+                        // `/record now`가 status bar 표시 여부에 기대지 않고 자기완결적으로 지표를 남기도록.
+                        // **첫 publish는 sampler의 첫 sample이라 cpu가 오염돼 있다**(elapsed≈0) — 그 사실은
+                        // 스냅샷의 `cpu_valid=false`가 실어 나르므로 session이 걸러낸다. 구독자가 없어도
+                        // send 실패는 무시(best-effort).
                         let _ = metrics_tx.send(Some((*m).clone()));
                         // edge-triggered alert(C1): 악화 전이를 ambient Note로 로그에 직접 push한다.
                         // Note는 표시 전용 — LLM 컨텍스트엔 안 들어가고 turn을 시작하지도 않는다(§C1).
@@ -2075,8 +2080,12 @@ async fn chat_loop(
                     }
                     Some(OutMsg::AlertsArmed(on)) => {
                         // C7: 알림 레인 토글. 켜면 새 tracker(상태 초기화), 끄면 None(metrics arm이
-                        // 더 이상 alert를 내지 않는다). statusbar 비활성 시엔 어차피 metrics가 없어 무효.
-                        alert_tracker = on.then(AlertTracker::new);
+                        // 더 이상 alert를 내지 않는다). sampler task는 이제 statusbar와 무관하게 항상
+                        // metrics를 밀어넣으므로, statusbar 비활성 시에도 무장하면 실제로 alert가 뜬다 —
+                        // 그건 `recording_lane_live`(status bar 활성 TUI에서만 alert·주기 캡처가 산다는
+                        // 문서화된 계약, session.rs `recording_lane_live` 참고)를 깨므로 `with_statusbar`로
+                        // 명시적으로 막는다.
+                        alert_tracker = (with_statusbar && on).then(AlertTracker::new);
                     }
                     Some(OutMsg::Shutdown) | None => break,
                 }
