@@ -1203,6 +1203,13 @@ method = "prompt_marker"
         // t8: spool 기본값도 섹션 부재 시 안전한 기본으로 채워져야 한다.
         assert_eq!(cfg.aicd.exporter.spool_max_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 20);
+        // **나이 cap은 기본으로 데이터를 지우지 않는다** — `None`이면 exporter 루프가 prune 자체를
+        // 건너뛴다(mod.rs). 사용자가 config에 `spool_max_age_secs`를 명시할 때만 오래된 배치를 버린다.
+        // 회귀로 이 기본이 어떤 값이 되면 telemetry가 조용히 유실되므로 여기서 못박는다.
+        assert_eq!(
+            cfg.aicd.exporter.spool_max_age_secs, None,
+            "나이 cap 기본은 None이어야 한다(기본으로 데이터를 지우면 안 된다)"
+        );
         // changes: 프로세스 생명주기 전이. 부모 게이트가 실제 gate이므로 기본 활성.
         assert!(
             cfg.aicd.exporter.changes_enabled,
@@ -1387,10 +1394,13 @@ enabled = true
 endpoint = "http://127.0.0.1:4318"
 spool_max_bytes = 1048576
 spool_drain_batch_limit = 5
+spool_max_age_secs = 3600
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.aicd.exporter.spool_max_bytes, 1_048_576);
         assert_eq!(cfg.aicd.exporter.spool_drain_batch_limit, 5);
+        // 사용자가 명시하면 나이 cap이 켜진다(그때만 오래된 배치를 버린다).
+        assert_eq!(cfg.aicd.exporter.spool_max_age_secs, Some(3600));
     }
 
     #[test]
