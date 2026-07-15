@@ -40,6 +40,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use aic_common::SpoolQuotas;
 
@@ -314,6 +315,37 @@ impl Spool {
         self.dropped[kind.index()].load(Ordering::Relaxed)
     }
 
+    /// mtime이 `max_age`보다 오래된 배치를 **네트워크 없이 삭제**한다. 낡은 telemetry가 FIFO 머리를
+    /// 막아 **최근 배치가 그 뒤에 갇히는** 걸 막으려는 것이다 — drain 직전에 불러 큐를 최신 쪽으로
+    /// 당긴다(collector 장기 다운으로 수천 배치가 쌓이면, 20/tick 드레인으론 최근 이벤트가 몇 시간
+    /// 늦게 나간다). 상한 초과 드롭과 같은 취급(kind별 `dropped` 카운터·`totals` 갱신). 드롭 수를 돌려준다.
+    ///
+    /// **애매하면 보존한다**: mtime을 못 읽거나 미래 시각(시계 역행)이면 지우지 않는다 — 유실보다 안전.
+    pub fn prune_older_than(&self, max_age: Duration) -> u64 {
+        let Ok(files) = self.list_batch_files() else {
+            return 0;
+        };
+        let now = SystemTime::now();
+        let mut pruned = 0u64;
+        for path in files {
+            let too_old = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age > max_age);
+            if !too_old {
+                continue;
+            }
+            let kind = parse_batch_filename(&path).and_then(|(_, k)| k);
+            if let Some(k) = kind {
+                self.dropped[k.index()].fetch_add(1, Ordering::Relaxed);
+            }
+            self.remove_and_untrack(&path, kind);
+            pruned += 1;
+        }
+        pruned
+    }
+
     /// 현재 spool 디렉토리에 남아 있는 배치 파일 수(테스트 관측용, kind 무관 합계).
     pub fn batch_count(&self) -> usize {
         self.list_batch_files().map(|f| f.len()).unwrap_or(0)
@@ -513,6 +545,68 @@ mod tests {
             buf,
         )
         .unwrap();
+    }
+
+    /// 파일 mtime을 `secs_ago`초 전으로 설정한다(나이 cap 테스트용 — 실시간 sleep 없이 결정적).
+    fn set_mtime_ago(path: &Path, secs_ago: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: now - secs_ago as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv]; // atime, mtime
+                              // SAFETY: c는 살아 있는 NUL 종료 경로, times는 요소 2개 배열의 유효 포인터.
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes 실패");
+    }
+
+    #[test]
+    fn prune_older_than_drops_stale_keeps_recent() {
+        let (dir, spool) = tmp_spool(10 * 1024 * 1024);
+        let sp = dir.path().join("otlp-spool");
+        // 오래된 배치 2개(metrics/logs) + 최근 배치 1개.
+        write_new_batch(&sp, 1, SignalKind::Metrics, b"old-metrics");
+        write_new_batch(&sp, 2, SignalKind::Logs, b"old-logs");
+        write_new_batch(&sp, 3, SignalKind::Metrics, b"recent");
+        // seq 1,2를 2시간 전으로. seq 3은 방금(지금).
+        set_mtime_ago(
+            &sp.join(format!("{:020}.{}.batch", 1, SignalKind::Metrics.code())),
+            7200,
+        );
+        set_mtime_ago(
+            &sp.join(format!("{:020}.{}.batch", 2, SignalKind::Logs.code())),
+            7200,
+        );
+        assert_eq!(spool.batch_count(), 3, "전제: 배치 3개");
+
+        // 1시간(3600s) cap → 2시간 된 2개만 드롭, 최근 1개는 **보존**.
+        let pruned = spool.prune_older_than(Duration::from_secs(3600));
+        assert_eq!(pruned, 2, "오래된 배치 2개가 드롭돼야 한다");
+        assert_eq!(
+            spool.batch_count(),
+            1,
+            "최근 배치가 나이 cap에 걸려 사라졌다(최근을 낡은 것과 함께 버리면 안 된다)"
+        );
+        // 상한 초과 드롭과 같은 취급 — kind별 드롭 카운터가 오른다.
+        assert_eq!(spool.dropped_count(SignalKind::Metrics), 1);
+        assert_eq!(spool.dropped_count(SignalKind::Logs), 1);
+    }
+
+    #[test]
+    fn prune_keeps_everything_when_nothing_is_old_enough() {
+        // 공허 방지 대조: 전부 최근이면 cap이 커도 아무것도 안 지운다(prune가 "무조건 지운다"면 깨진다).
+        let (dir, spool) = tmp_spool(10 * 1024 * 1024);
+        let sp = dir.path().join("otlp-spool");
+        write_new_batch(&sp, 1, SignalKind::Metrics, b"a");
+        write_new_batch(&sp, 2, SignalKind::Logs, b"b");
+        let pruned = spool.prune_older_than(Duration::from_secs(1));
+        assert_eq!(pruned, 0, "방금 만든 배치를 나이 cap이 드롭했다");
+        assert_eq!(spool.batch_count(), 2);
     }
 
     /// 레거시 포맷(`{seq:020}.batch`, kind는 내용 첫 바이트) 배치 파일을 직접 심는다.
