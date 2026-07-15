@@ -350,6 +350,25 @@ fn classify(status: reqwest::StatusCode) -> PushError {
     }
 }
 
+/// reqwest 에러의 원인을 **source chain 끝까지** 이어붙인다.
+///
+/// reqwest `Error`의 `Display`는 "error sending request for url (...)"까지만 보여주고, 진짜
+/// 원인(`connection reset by peer` / `connection closed before message completed` /
+/// `connection refused` / timeout 등)은 그 아래 hyper·std::io 에러의 `source()` chain에
+/// 숨는다. 예전엔 `e.to_string()`만 저장해 이 껍데기 한 줄만 로그에 남았고, 그래서 수신 서버가
+/// 잠깐 죽은 건지(refused/reset) keep-alive 연결이 만료된 건지(closed before message completed)
+/// 구분할 수 없어 일시 실패의 원인을 영영 규명하지 못했다. chain을 전부 이어 그 정보를 살린다.
+fn err_chain(e: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        let _ = write!(s, ": {inner}");
+        src = inner.source();
+    }
+    s
+}
+
 /// OTLP protobuf 본문을 collector로 POST한다. 2xx가 아니면 [`PushError`].
 async fn push(
     client: &reqwest::Client,
@@ -364,11 +383,12 @@ async fn push(
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    // 네트워크·타임아웃 오류는 collector가 돌아오면 성공할 수 있다 — 일시 실패다.
+    // 네트워크·타임아웃 오류는 collector가 돌아오면 성공할 수 있다 — 일시 실패다. 에러는
+    // source chain 끝까지 남겨 원인(reset/refused/timeout 등)을 로그에서 구분할 수 있게 한다.
     let resp = req
         .send()
         .await
-        .map_err(|e| PushError::Transient(e.to_string()))?;
+        .map_err(|e| PushError::Transient(err_chain(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(classify(status));
@@ -406,7 +426,7 @@ async fn push_logs(
     let resp = req
         .send()
         .await
-        .map_err(|e| PushError::Transient(e.to_string()))?;
+        .map_err(|e| PushError::Transient(err_chain(&e)))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(classify(status));
@@ -457,6 +477,45 @@ mod tests {
         ] {
             assert!(!classify(s).is_permanent(), "{s}는 재시도 대상이어야 한다");
         }
+    }
+
+    #[test]
+    fn err_chain_appends_every_source_cause() {
+        // reqwest의 껍데기 메시지 뒤에 진짜 원인이 chain으로 이어붙는지 — 이게 안 되면 "왜
+        // 실패했나"(reset/refused/timeout)를 로그에서 영영 구분할 수 없다(Q3의 근본 원인).
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "connection reset by peer")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request for url (http://x/v1/logs)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        assert_eq!(
+            err_chain(&Outer(Inner)),
+            "error sending request for url (http://x/v1/logs): connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn err_chain_of_source_less_error_is_just_its_message() {
+        // source가 없으면 원래 메시지 그대로여야 한다 — chain 로직이 빈 ": "를 덧붙이는 회귀 방지.
+        let io = std::io::Error::other("boom");
+        assert_eq!(err_chain(&io), "boom");
     }
 
     #[test]
