@@ -101,6 +101,8 @@ pub async fn serve_connections(
                                 peer_port: c.peer_port,
                                 process: c.process.as_deref(),
                                 direction: c.direction.as_deref(),
+                                bytes_sent: c.bytes_sent,
+                                bytes_recv: c.bytes_recv,
                             })
                             .collect();
                         let resource = ResourceAttrs {
@@ -219,6 +221,11 @@ struct RawConnection {
     /// 통과시킨다. 여기서 재해석하지 않는다: 판정에 필요한 문맥은 client만 갖고 있다.
     #[serde(default)]
     direction: Option<String>,
+    /// 누적 카운터. 구 `aic` 바이너리는 필드를 보내지 않으므로 0으로 폴백한다.
+    #[serde(default)]
+    bytes_sent: u64,
+    #[serde(default)]
+    bytes_recv: u64,
 }
 
 #[cfg(test)]
@@ -268,6 +275,8 @@ mod tests {
         let c = &snapshot.connections[0];
         assert_eq!(c.process.as_deref(), Some("sshd"));
         assert_eq!(c.direction.as_deref(), Some("inbound"));
+        assert_eq!(c.bytes_sent, 0);
+        assert_eq!(c.bytes_recv, 0);
     }
 
     /// 구 `aic` 바이너리(process/direction 필드가 없는 스냅샷)와의 버전 skew에서도 파싱이 실패하지
@@ -284,6 +293,21 @@ mod tests {
         let c = &snapshot.connections[0];
         assert_eq!(c.process, None);
         assert_eq!(c.direction, None);
+        assert_eq!(c.bytes_sent, 0);
+        assert_eq!(c.bytes_recv, 0);
+    }
+
+    #[tokio::test]
+    async fn capture_inventory_parses_connection_byte_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{"schema_version":1,"host":{"name":"web-1","id":"host-abc123","ip":"10.0.0.5","os":"linux"},"connections":[{"protocol":"tcp","state":"ESTAB","local_addr":"10.0.0.5","local_port":51234,"peer_addr":"10.0.0.8","peer_port":443,"bytes_sent":1048576,"bytes_recv":8192}]}"#;
+        let bin = fake_aic_bin(&dir, &format!("cat <<'EOF'\n{json}\nEOF"));
+
+        let snapshot = retry_busy(|| capture_inventory(&bin, Duration::from_secs(5)))
+            .await
+            .unwrap();
+        assert_eq!(snapshot.connections[0].bytes_sent, 1_048_576);
+        assert_eq!(snapshot.connections[0].bytes_recv, 8_192);
     }
 
     #[tokio::test]
