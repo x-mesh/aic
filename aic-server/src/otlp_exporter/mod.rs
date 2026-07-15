@@ -36,6 +36,7 @@ mod agent;
 mod backoff;
 mod changes;
 mod connections;
+mod dns;
 mod docker;
 // `encode`/`logs_proto`는 OTLP wire 스키마(protobuf message subset) 정의다. 통합 테스트
 // (`tests/`)가 mock collector가 받은 본문을 **디코딩해서** 검증하려면 이 스키마가 필요하다 —
@@ -54,6 +55,7 @@ mod spool;
 pub use agent::{serve_agent, AgentConfig};
 pub use changes::{serve_changes, ChangesConfig};
 pub use connections::{serve_connections, ConnectionsConfig};
+pub use dns::{serve_dns, DnsConfig};
 pub use docker::{resolve_docker_bin, serve_docker, DockerConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;

@@ -289,6 +289,25 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Phase 2: OTLP DNS observer (opt-in, [aicd.exporter] enabled=true + dns_enabled=true).
+    // eBPF getaddrinfo uprobe로 FQDN↔IP를 관측해 scope=`aic.dns`로 push한다. 관측 백엔드(Linux
+    // eBPF)는 아직 골격이라, task는 떠도 현재는 no-op이다(dns.rs 모듈 doc 참고).
+    let dns_handle = match load_dns_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
+        Some(cfg) => {
+            let dns_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::serve_dns(cfg, dns_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP dns observer 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
     // OTLP changes exporter (opt-in, [aicd.exporter] enabled=true + changes_enabled=true).
     // 프로세스 테이블을 주기적으로 스냅샷해 직전 tick과 diff → start/exit/rss_spike 전이만 push한다.
     let changes_handle = match load_changes_config(
@@ -511,6 +530,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = connections_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = dns_handle {
         let _ = h.await;
     }
     if let Some(h) = agent_handle {
@@ -842,6 +864,35 @@ fn load_connections_config(
         interval: std::time::Duration::from_secs(ex.connections_interval_secs.max(1)),
         aic_bin: resolve_aic_bin(),
         timeout: std::time::Duration::from_secs(15),
+        spool,
+        health,
+    })
+}
+
+/// DNS observer 설정 로더(Phase 2). connections와 동일한 게이트(부모 `enabled` + 자기
+/// `dns_enabled`(기본 false, opt-in) + endpoint)를 통과해야 task가 뜬다. uprobe 이벤트 스트림이라
+/// `aic_bin`/`interval`/`timeout`이 없다. `dns_enabled=true`여도 관측 백엔드(Linux eBPF)가 없으면
+/// task는 떠도 no-op이다(dns.rs 모듈 doc 참고).
+fn load_dns_config(
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+) -> Option<aic_server::otlp_exporter::DnsConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.dns_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — dns observer 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::DnsConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
         spool,
         health,
     })
