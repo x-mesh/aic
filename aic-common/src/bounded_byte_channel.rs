@@ -99,10 +99,7 @@ impl BoundedByteChannel {
             tx,
             dropped,
         };
-        let receiver = BoundedByteReceiver {
-            rx,
-            queued_bytes,
-        };
+        let receiver = BoundedByteReceiver { rx, queued_bytes };
         (sender, receiver)
     }
 
@@ -197,8 +194,7 @@ impl BoundedByteReceiver {
     pub async fn recv(&mut self) -> Option<Bytes> {
         match self.rx.recv().await {
             Some(bytes) => {
-                self.queued_bytes
-                    .fetch_sub(bytes.len(), Ordering::Relaxed);
+                self.queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
                 Some(bytes)
             }
             None => None,
@@ -209,8 +205,7 @@ impl BoundedByteReceiver {
     pub fn try_recv(&mut self) -> Result<Bytes, mpsc::error::TryRecvError> {
         match self.rx.try_recv() {
             Ok(bytes) => {
-                self.queued_bytes
-                    .fetch_sub(bytes.len(), Ordering::Relaxed);
+                self.queued_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
                 Ok(bytes)
             }
             Err(e) => Err(e),
@@ -280,7 +275,11 @@ mod tests {
 
         // 추가 30 byte → 80+30=110 > 100 이므로 drop.
         assert_eq!(tx.try_send(b(30, 0x02)), SendOutcome::Dropped);
-        assert_eq!(tx.queued_bytes(), 80, "drop 된 chunk 는 queued 에 반영되지 않는다");
+        assert_eq!(
+            tx.queued_bytes(),
+            80,
+            "drop 된 chunk 는 queued 에 반영되지 않는다"
+        );
         assert_eq!(tx.dropped_bytes(), 30);
 
         // 20 byte → 80+20=100 → 경계상 허용.

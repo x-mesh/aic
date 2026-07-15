@@ -73,13 +73,9 @@ pub enum AttachClientFrame {
     /// `#[serde(skip)]` 에 의해 직렬화되지 않는다 — JSON 직렬화가 요청되면 디코드
     /// 시 `AttachDecodeError::JsonContainsPtyBytes` 로 거부한다.
     #[serde(skip)]
-    PtyBytes {
-        bytes: Bytes,
-    },
+    PtyBytes { bytes: Bytes },
     /// attach 세션 graceful 종료. 서버는 이후 EOF 와 동일하게 처리한다 (R5.3, R11.4).
-    AttachClose {
-        reason: String,
-    },
+    AttachClose { reason: String },
 }
 
 /// `aicd` → `aic-session` 방향의 attach frame. JSON 경로만 사용한다 (R5.4, R5.6).
@@ -87,13 +83,9 @@ pub enum AttachClientFrame {
 #[serde(tag = "kind")]
 pub enum AttachServerFrame {
     /// [`AttachClientFrame::AttachOpen`] 에 대한 승인 응답 (R5.4).
-    AttachAck {
-        protocol_version: u32,
-    },
+    AttachAck { protocol_version: u32 },
     /// attach 가 거부된 사유를 담는다 (R5.4, R13.5, R15.2, R15.4).
-    AttachError {
-        message: String,
-    },
+    AttachError { message: String },
 }
 
 /// [`read_attach_frame`] 이 돌려주는 디코딩 결과.
@@ -135,9 +127,7 @@ pub enum AttachDecodeError {
     #[error("attach frame discriminant 0x{0:02x} 를 알 수 없습니다")]
     UnknownDiscriminant(u8),
 
-    #[error(
-        "PtyBytes frame length {len} 이 허용 한계 {max} 를 초과합니다 (R15.4)"
-    )]
+    #[error("PtyBytes frame length {len} 이 허용 한계 {max} 를 초과합니다 (R15.4)")]
     PtyBytesTooLarge { len: usize, max: usize },
 
     #[error("JSON frame 안에 PtyBytes variant 가 포함되어 있습니다 — 이는 binary path 로만 전송되어야 합니다")]
@@ -214,9 +204,7 @@ where
 /// - `0x02` 이면 `[4B BE len][JSON]` 을 읽어 `AttachClientFrame` 또는
 ///   `AttachServerFrame` 중 deserialize 성공하는 쪽으로 반환한다. JSON 안에 PtyBytes
 ///   variant 가 섞여 들어오면 `AttachDecodeError::JsonContainsPtyBytes` 로 거부한다.
-pub async fn read_attach_frame<R>(
-    r: &mut R,
-) -> Result<AttachFrameKind, AttachDecodeError>
+pub async fn read_attach_frame<R>(r: &mut R) -> Result<AttachFrameKind, AttachDecodeError>
 where
     R: AsyncRead + Unpin + ?Sized,
 {
