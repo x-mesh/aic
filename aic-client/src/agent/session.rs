@@ -491,16 +491,21 @@ impl AgentSession {
         self.note_no_llm_if_needed().await;
         self.note_briefing_if_any().await;
 
-        // status bar 샘플러 — TTY이고 opt-out 미설정일 때만 생성(비-TTY/파이프/CI는 None = 비용 0).
-        let mut sampler = ui::statusbar_enabled().then(super::sys_sampler::SysSampler::new);
+        // status bar 샘플러 — TTY면 statusbar 토글과 무관하게 항상 생성한다(비-TTY/파이프/CI는
+        // None = 비용 0). `/record now`가 status bar 표시 여부에 기대지 않고 `last_metrics`를
+        // 자기완결적으로 채우도록(t2 후속) — 화면 출력만 `statusbar_enabled()`(opt-out 포함)를 따른다.
+        let mut sampler = ui::is_tty().then(super::sys_sampler::SysSampler::new);
+        let show_statusbar = ui::statusbar_enabled();
 
         loop {
-            // 입력 프롬프트 직전 1회 status bar 갱신 — reedline read_line 진입 전이라 충돌 0.
+            // 입력 프롬프트 직전 1회 지표 샘플 — reedline read_line 진입 전이라 충돌 0.
             // 동시에 `last_metrics`를 채운다(t2) — `/record now`가 이 워밍업된 값을 재사용해
             // cold-start cpu_pct 오염(SysSampler::new() 직후 sample()은 elapsed≈0) 없이 캡처한다.
             if let Some(s) = sampler.as_mut() {
                 let metrics = s.sample();
-                ui::print_status_bar(&metrics.status_line());
+                if show_statusbar {
+                    ui::print_status_bar(&metrics.status_line());
+                }
                 self.last_metrics = Some(metrics);
             }
             // 한 줄 읽기 (TTY는 Unicode-aware 라인 에디터, 비-TTY는 read_line)
@@ -2625,16 +2630,26 @@ pub fn cli_remote_notice(
 ///
 /// filesystem은 사용률 %가 아니라 여유 바이트를 싣는다 — macOS APFS는 `total - avail` 기반 %가
 /// 부정확하다(sys_sampler `disk_label` 문서 참고, 실측 df 21% vs 계산 93%).
+///
+/// `cores`/`*_total_bytes`/`top_mem_proc_*`는 백분율 하나만으론 못 읽는 걸 채운다: load_1m은
+/// 코어 수 없이는 심각도를 알 수 없고(4코어의 6.89와 16코어의 6.89는 다른 이야기다), mem/swap
+/// 사용률도 총량 없이는 "몇 GB 중 몇 %"인지 모른다. `top_mem_proc`은 SysSampler가 mem Warn
+/// 이상일 때 이미 계산해 두고도(§C4) 이 함수가 안 써서 버려지고 있었다 — `/record now`를 누르는
+/// 순간이야말로 "범인이 누구인지" 가장 궁금할 때라 가장 아쉬운 누락이었다.
 fn metrics_to_attrs(m: &super::sys_sampler::SysMetrics) -> BTreeMap<String, String> {
     let mut attrs = BTreeMap::new();
     if m.cpu_valid {
         attrs.insert("cpu_utilization".to_string(), format!("{:.1}", m.cpu_pct));
     }
+    // load_1m처럼 게이트가 없다 — `available_parallelism()`은 실패해도 1로 폴백해(§sys_sampler)
+    // "측정 안 됨" sentinel이 없는 값이다.
+    attrs.insert("cores".to_string(), m.cores.to_string());
     if m.mem_total > 0 {
         attrs.insert(
             "memory_utilization".to_string(),
             format!("{:.1}", m.mem_pct()),
         );
+        attrs.insert("memory_total_bytes".to_string(), m.mem_total.to_string());
     }
     // load_1m만 게이트가 없다 — 예외가 아니라 **게이트를 걸 수단이 없고, 걸면 오히려 틀리기 때문**이다.
     // 다른 지표는 "측정 안 됨"을 가리키는 sentinel이 있다: disk/swap은 `total == 0`(읽기 실패·비활성),
@@ -2657,6 +2672,11 @@ fn metrics_to_attrs(m: &super::sys_sampler::SysMetrics) -> BTreeMap<String, Stri
             "swap_utilization".to_string(),
             format!("{:.1}", m.swap_used as f64 * 100.0 / m.swap_total as f64),
         );
+        attrs.insert("swap_total_bytes".to_string(), m.swap_total.to_string());
+    }
+    if let Some((name, rss)) = &m.top_mem_proc {
+        attrs.insert("top_mem_proc_name".to_string(), name.clone());
+        attrs.insert("top_mem_proc_rss_bytes".to_string(), rss.to_string());
     }
     attrs
 }
@@ -3744,6 +3764,87 @@ mod tests {
                 "금지된 키 사용: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_to_attrs_includes_cores_even_when_everything_else_is_cold() {
+        // load_1m과 같은 이유로 게이트가 없다 — `available_parallelism()`은 실패해도 1로 폴백해
+        // "측정 안 됨"을 뜻하는 sentinel이 없다. cpu가 오염돼도(=이 테스트) cores는 그대로 실린다.
+        let m = polluted_metrics();
+        let attrs = metrics_to_attrs(&m);
+        assert!(
+            attrs.contains_key("cores"),
+            "cores는 게이트 없이 항상 실려야 한다"
+        );
+    }
+
+    #[test]
+    fn metrics_to_attrs_includes_totals_alongside_their_utilization() {
+        // mem/swap 총량(bytes)은 각자의 utilization %와 같은 게이트를 공유한다 — 퍼센트만으론
+        // "몇 GB 중 몇 %"인지 알 수 없어서 분모를 함께 싣는다.
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            mem_total: 16_000_000_000,
+            mem_used: 8_000_000_000,
+            swap_total: 4_000_000_000,
+            swap_used: 1_000_000_000,
+            ..Default::default()
+        };
+        let attrs = metrics_to_attrs(&m);
+        assert_eq!(
+            attrs.get("memory_total_bytes"),
+            Some(&"16000000000".to_string())
+        );
+        assert_eq!(
+            attrs.get("swap_total_bytes"),
+            Some(&"4000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn metrics_to_attrs_omits_totals_when_utilization_is_also_omitted() {
+        // 위 테스트의 짝 — total==0이면 utilization과 함께 total_bytes도 안 실려야 한다(둘이 따로
+        // 놀면 "총량은 있는데 사용률은 없다" 같은 앞뒤 안 맞는 attrs가 나간다).
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            mem_total: 0,
+            swap_total: 0,
+            ..Default::default()
+        };
+        let attrs = metrics_to_attrs(&m);
+        assert!(!attrs.contains_key("memory_total_bytes"));
+        assert!(!attrs.contains_key("swap_total_bytes"));
+    }
+
+    #[test]
+    fn metrics_to_attrs_includes_top_mem_proc_when_present() {
+        // SysSampler가 mem Warn 이상일 때 채우는 "범인 프로세스"(§C4) — `/record now`가 이걸
+        // 버리지 않고 실어야 "뭐가 문제였는지"를 나중에 다시 물을 수 있다.
+        let m = super::super::sys_sampler::SysMetrics {
+            cpu_valid: true,
+            sampled_at: Some(std::time::Instant::now()),
+            top_mem_proc: Some(("chrome".to_string(), 2_147_483_648)),
+            ..Default::default()
+        };
+        let attrs = metrics_to_attrs(&m);
+        assert_eq!(attrs.get("top_mem_proc_name"), Some(&"chrome".to_string()));
+        assert_eq!(
+            attrs.get("top_mem_proc_rss_bytes"),
+            Some(&"2147483648".to_string())
+        );
+    }
+
+    #[test]
+    fn metrics_to_attrs_omits_top_mem_proc_when_absent() {
+        // mem이 Normal이면 SysSampler가 애초에 이 필드를 안 채운다(process 열거 비용 회피) — None을
+        // 빈 문자열 등으로 얼버무리지 않고 키 자체가 없어야 한다.
+        let m = warm_metrics(10.0);
+        assert!(m.top_mem_proc.is_none());
+        let attrs = metrics_to_attrs(&m);
+        assert!(!attrs.contains_key("top_mem_proc_name"));
+        assert!(!attrs.contains_key("top_mem_proc_rss_bytes"));
     }
 
     // ── t3 B3: 로컬/원격 두 결과를 각각 정확히 보고 ──────────────────────────────
