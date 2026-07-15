@@ -654,6 +654,13 @@ pub struct AicdExporterConfig {
     /// 위치의 바이너리를 root로 실행해 주는 것이 곧 권한 상승 통로이기 때문).
     #[serde(default)]
     pub docker_bin: Option<String>,
+    /// DNS 관측(scope=`aic.dns`) push 활성화 여부. **기본 false**(opt-in) — 관측되는 도메인은 운영
+    /// 정보이자 PII가 될 수 있어, 다른 하위 플래그(events/connections 등, 기본 true)와 달리 명시적
+    /// opt-in으로 둔다(logs_enabled/docker_enabled와 동일 관례). 실제 수집은 aicd DNS observer
+    /// (eBPF getaddrinfo uprobe, Linux 전용)가 담당한다 — 미지원 플랫폼/권한 부족이면 task는 떠도
+    /// no-op이다.
+    #[serde(default)]
+    pub dns_enabled: bool,
 }
 
 impl Default for AicdExporterConfig {
@@ -676,6 +683,7 @@ impl Default for AicdExporterConfig {
             docker_enabled: false,
             docker_interval_secs: default_docker_interval(),
             docker_bin: None,
+            dns_enabled: false,
         }
     }
 }
@@ -1219,6 +1227,12 @@ method = "prompt_marker"
             cfg.aicd.exporter.changes_interval_secs, 30,
             "connections(60s)보다 짧아야 짧게 살다 간 프로세스를 덜 놓친다"
         );
+        // dns: 도메인은 운영/PII 정보라 logs/docker와 같은 opt-in(기본 false). 다른 하위 플래그
+        // (events/connections/changes, 기본 true)와 달리 섹션 부재 시 꺼져 있어야 한다.
+        assert!(
+            !cfg.aicd.exporter.dns_enabled,
+            "dns는 기본 opt-in(false) — 도메인은 명시적으로만 수집한다"
+        );
     }
 
     #[test]
@@ -1326,6 +1340,8 @@ interval_secs = 15
         assert!(cfg.aicd.exporter.events_enabled);
         assert!(cfg.aicd.exporter.connections_enabled);
         assert_eq!(cfg.aicd.exporter.connections_interval_secs, 60);
+        // dns는 섹션이 있어도 명시 안 하면 opt-in(false) — 레거시 config가 dns를 조용히 켜면 안 된다.
+        assert!(!cfg.aicd.exporter.dns_enabled);
     }
 
     #[test]
@@ -1345,11 +1361,14 @@ endpoint = "http://127.0.0.1:4318"
 events_enabled = false
 connections_enabled = false
 connections_interval_secs = 120
+dns_enabled = true
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!cfg.aicd.exporter.events_enabled);
         assert!(!cfg.aicd.exporter.connections_enabled);
         assert_eq!(cfg.aicd.exporter.connections_interval_secs, 120);
+        // opt-in dns를 명시로 켤 수 있어야 한다(override 파싱).
+        assert!(cfg.aicd.exporter.dns_enabled);
     }
 
     #[test]
