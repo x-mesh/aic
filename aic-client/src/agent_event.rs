@@ -26,9 +26,20 @@ use aic_common::{
     AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 
-/// 소켓 연결/송신/응답 대기 상한. chat 흐름을 막지 않도록 짧게 잡는다 — aicd는 로컬 UDS라
-/// 정상 상황에서 밀리초 단위로 끝난다.
+/// 소켓 연결/송신/응답 대기 상한(emit 경로). chat 흐름을 막지 않도록 짧게 잡는다 — aicd는 로컬
+/// UDS라 정상 상황에서 밀리초 단위로 끝난다. emit(`risk_denied` 등)은 사용자 입력 흐름에 얹히므로
+/// 지연에 민감해 이 짧은 값을 쓴다.
 const IO_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// status bar exporter 조회 전용 상한. emit보다 **여유롭게** 잡는다 — status 조회는 주기 갱신이라
+/// 지연에 안 민감한데, aicd가 큰 spool 드레인·다수 세션으로 잠깐 바쁠 때 300ms를 넘겨 응답하면
+/// (=`NoReply`) 그걸 "aicd off"로 오보하게 된다(살아있는데 꺼졌다고 거짓 보고). 여유를 줘 그 오탐을
+/// 줄이고, 그래도 `NoReply`면 호출부가 "모름"으로 다뤄 직전 상태를 유지한다([`ExporterProbe`]).
+///
+/// `query_status`가 `cfg(not(test))`라 test 빌드에선 이 상수가 안 쓰인다(test는 실 소켓 금지 →
+/// SendFailed 고정). 그때만 dead_code를 허용한다.
+#[cfg_attr(test, allow(dead_code))]
+const STATUS_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 응답 본문 상한 — 우리가 읽는 응답(Pong/ExporterStatus)은 수백 바이트다. 손상된 길이
 /// 헤더가 거대한 할당으로 이어지지 않게 막는다.
@@ -568,11 +579,12 @@ fn to_send_result(rt: Roundtrip) -> SendResult {
     }
 }
 
-/// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 (chat status bar용).
+/// exporter가 지금 collector에 닿고 있는지 aicd에 묻는다 — **`/record now` 결과 보강용**.
 ///
 /// `None`은 **aicd에 물어보지 못했다**는 뜻이다 — 미실행이거나, 이 요청을 모르는 구버전이거나,
-/// 응답이 timeout됐다. `Some(status)`의 `enabled: false`는 "aicd는 살아있지만 exporter가 꺼져
-/// 있다"로, 둘은 사용자에게 전혀 다른 상태라 구분해서 돌려준다(`classify_outcome` 참고).
+/// 응답이 timeout됐다. `/record now`는 send 결과가 1차 신호이고 이 status는 부가 보강이라, 여기선
+/// 실패 단계를 뭉개도 된다. **status bar는 다르다** — 아래 [`exporter_status_probe`]를 써야 한다
+/// (timeout을 "off"로 오보하면 안 되므로).
 pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query(&IpcRequest::GetExporterStatus))
 }
@@ -582,9 +594,49 @@ pub async fn exporter_status_async() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query_async(&IpcRequest::GetExporterStatus).await)
 }
 
-/// IPC 왕복 결과에서 `ExporterStatus`를 뽑는다. 구버전 aicd는 unknown request를 graceful Error로
-/// 답하므로 그 응답도 "조회 불가"(None)로 접는다. 상태 조회는 실패 단계를 구분할 필요가 없어
-/// (SendFailed·NoReply 모두 "상태 모름") `Replied` 외엔 전부 None이다.
+/// status bar가 본 exporter 조회 결과 — **"값 있음 / 못 닿음 / 못 알아냄"을 구분**한다.
+///
+/// 왜 `Option`으로 뭉치지 않나(뼈아픈 교훈): 예전엔 status bar도 [`exporter_status`]의 `None`을 받아
+/// `DaemonDown`("aicd off")으로 접었다. 그런데 `None`엔 **"connect가 거부됨(진짜 꺼짐)"**과
+/// **"write는 됐는데 응답이 timeout(살아있는데 느림)"**이 섞여 있었다 — 후자를 "off"라 말하는 건
+/// 우리가 이 프로젝트 내내 잡은 "모르는 걸 안다고 단언"하는 거짓말이다(aicd는 떠 있는데 꺼졌다고 보고).
+pub enum ExporterProbe {
+    /// 응답을 받았다 — 이 값으로 상태를 접는다.
+    Status(aic_common::ExporterStatus),
+    /// connect/write가 실패했다(`SendFailed`) = 소켓에 **못 닿았다**. "aicd off"가 정직한 유일한 경우.
+    Down,
+    /// 요청은 나갔는데 응답을 못 받았다(`NoReply` — read timeout 등), 또는 이 요청을 모르는 구버전이
+    /// graceful Error로 답했다. 어느 쪽도 **"꺼짐"이 아니다** — aicd는 살아있다. "모름"으로 다뤄
+    /// 직전 상태를 유지한다(호출부 책임).
+    Unknown,
+}
+
+/// status bar 전용 조회. emit 경로와 달리 여유로운 [`STATUS_QUERY_TIMEOUT`]을 쓰고, 실패 단계를
+/// [`ExporterProbe`]로 **구분해** 돌려준다(timeout을 "off"로 오보하지 않으려고).
+pub fn exporter_status_probe() -> ExporterProbe {
+    to_exporter_probe(query_status(&IpcRequest::GetExporterStatus))
+}
+
+/// IPC 왕복 결과를 [`ExporterProbe`]로 접는다(순수 함수). **`SendFailed`(못 닿음)만 `Down`**이고,
+/// `NoReply`·예상 못 한 응답은 `Unknown`이다 — "못 알아냄"을 "꺼짐"으로 단정하지 않는 게 핵심이다.
+fn to_exporter_probe(rt: Roundtrip) -> ExporterProbe {
+    match rt {
+        Roundtrip::Replied(resp) => match *resp {
+            IpcResponse::ExporterStatus(s) => ExporterProbe::Status(s),
+            // 이 요청에 올 수 없는 응답(구버전 graceful Error 포함) — 상태를 알 수 없지만 aicd는 답했다.
+            _ => ExporterProbe::Unknown,
+        },
+        // connect/write 실패 = 소켓에 못 닿음. 진짜 "off".
+        Roundtrip::SendFailed => ExporterProbe::Down,
+        // 나갔는데 응답 없음 = 살아있는데 느림. "off"라 단정하지 않는다.
+        Roundtrip::NoReply => ExporterProbe::Unknown,
+    }
+}
+
+/// IPC 왕복 결과에서 `ExporterStatus`를 뽑는다(`/record now` 보강용). 구버전 aicd는 unknown request를
+/// graceful Error로 답하므로 그 응답도 "조회 불가"(None)로 접는다. **`/record now`는** send 결과가
+/// 1차 신호라 실패 단계를 구분할 필요가 없어(SendFailed·NoReply 모두 "상태 모름") `Replied` 외엔 전부
+/// None이다 — status bar는 이 뭉개기를 쓰면 안 된다([`to_exporter_probe`]로 구분).
 fn to_exporter_status(rt: Roundtrip) -> Option<aic_common::ExporterStatus> {
     match rt {
         Roundtrip::Replied(resp) => match *resp {
@@ -660,9 +712,23 @@ fn redact(s: &str) -> String {
 }
 
 /// 요청을 보내고 응답을 받아 돌려준다(실 aicd 소켓). 프레임은 length-prefixed JSON(`encode_frame`).
+/// emit 경로(fire-and-forget + `/record now`)용 — 짧은 [`IO_TIMEOUT`].
 #[cfg(not(test))]
 fn query(req: &IpcRequest) -> Roundtrip {
-    query_at(&aic_common::aicd_socket_path(), req)
+    query_at(&aic_common::aicd_socket_path(), req, IO_TIMEOUT)
+}
+
+/// status bar 조회 전용 — emit보다 여유로운 [`STATUS_QUERY_TIMEOUT`]. 지연에 안 민감한 주기 조회가
+/// 부하 중 300ms를 넘겨 "off"로 오보하는 걸 막는다.
+#[cfg(not(test))]
+fn query_status(req: &IpcRequest) -> Roundtrip {
+    query_at(&aic_common::aicd_socket_path(), req, STATUS_QUERY_TIMEOUT)
+}
+
+/// 테스트에선 실 소켓을 안 건드린다 — 데몬 없음(=SendFailed)으로 고정([`query`] cfg(test) 참고).
+#[cfg(test)]
+fn query_status(_req: &IpcRequest) -> Roundtrip {
+    Roundtrip::SendFailed
 }
 
 /// 테스트에서는 **실 aicd 소켓을 절대 건드리지 않는다**. 쓰기 경로는 [`dispatch`]가 sink로 돌리지만,
@@ -682,18 +748,19 @@ fn query(_req: &IpcRequest) -> Roundtrip {
 /// 안 나감), write 성공 후 실패는 `NoReply`(나갔을 수 있음). 경계는 **write+flush 성공 지점**이다 —
 /// 그 전 실패는 부분 write든 connect 실패든 aicd가 유효 프레임을 못 받으므로 안 나간 것이고, 그 후
 /// 실패(read timeout 등)는 프레임이 이미 커널로 넘어갔으므로 나갔을 수 있다.
-fn query_at(socket: &std::path::Path, req: &IpcRequest) -> Roundtrip {
+fn query_at(socket: &std::path::Path, req: &IpcRequest, timeout: Duration) -> Roundtrip {
     let Ok(payload) = serde_json::to_vec(req) else {
         return Roundtrip::SendFailed;
     };
-    // **단일 절대 deadline** — connect·write·read **총합**을 `IO_TIMEOUT`으로 묶는다(async 판과 대칭).
-    // 예전엔 세 단계가 각각 `set_*_timeout(IO_TIMEOUT)`을 독립으로 받아 최악 3×IO_TIMEOUT(=900ms)까지
-    // 막혔다 — sync 경로는 chat emit(`risk_denied` 등)과 status bar가 쓰므로 사용자 눈앞에서 멈춘다.
-    // 각 blocking op 직전에 **남은 예산**(`deadline.remaining()`)으로 timeout을 다시 준다.
-    let deadline = Deadline::new(IO_TIMEOUT);
+    // **단일 절대 deadline** — connect·write·read **총합**을 `timeout`으로 묶는다(async 판과 대칭).
+    // 예전엔 세 단계가 각각 `set_*_timeout`을 독립으로 받아 최악 3×timeout까지 막혔다 — sync 경로는
+    // chat emit(`risk_denied` 등)과 status bar가 쓰므로 사용자 눈앞에서 멈춘다. 각 blocking op 직전에
+    // **남은 예산**(`deadline.remaining()`)으로 timeout을 다시 준다. `timeout`은 호출부가 정한다 —
+    // emit 경로는 `IO_TIMEOUT`(300ms), status 조회는 `STATUS_QUERY_TIMEOUT`(더 여유, 부하 중 오탐 방지).
+    let deadline = Deadline::new(timeout);
     // **`UnixStream::connect`를 쓰지 않는다** — 상한이 없다([`connect_unix_timeout`] 참고). connect가
     // 예산을 얼마나 쓰든 아래 remaining()이 그만큼 줄어든 값을 write/read에 준다(총합 유지).
-    let Ok(mut stream) = connect_unix_timeout(socket, IO_TIMEOUT) else {
+    let Ok(mut stream) = connect_unix_timeout(socket, timeout) else {
         return Roundtrip::SendFailed;
     };
 
@@ -1270,7 +1337,7 @@ mod tests {
         // 존재하지 않는 경로를 주입해 "데몬 없음"을 결정적으로 만든다.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-aicd.sock");
-        let rt = query_at(&missing, &IpcRequest::GetExporterStatus);
+        let rt = query_at(&missing, &IpcRequest::GetExporterStatus, IO_TIMEOUT);
         assert!(
             matches!(rt, Roundtrip::SendFailed),
             "없는 소켓(connect 실패)인데 SendFailed가 아니다"
@@ -1281,6 +1348,45 @@ mod tests {
         assert_eq!(
             classify_outcome(SendResult::Failed, None),
             RecordOutcome::NotSent
+        );
+    }
+
+    #[test]
+    fn exporter_probe_distinguishes_down_from_unknown() {
+        use aic_common::ExporterStatus;
+        // **핵심**: status bar는 "못 닿음(Down)"과 "못 알아냄(Unknown)"을 구분해야 한다.
+        // SendFailed(connect/write 실패)만 Down("aicd off")이고, NoReply(응답 timeout)는 Unknown이다 —
+        // 살아있는 aicd가 잠깐 느린 걸 "꺼짐"으로 오보하지 않으려는 게 이 매핑의 전부다.
+        // mutation: NoReply를 Down으로 바꾸면(=예전 거짓 "off") 이 단언이 깨진다.
+        assert!(matches!(
+            to_exporter_probe(Roundtrip::SendFailed),
+            ExporterProbe::Down
+        ));
+        assert!(
+            matches!(
+                to_exporter_probe(Roundtrip::NoReply),
+                ExporterProbe::Unknown
+            ),
+            "NoReply(살아있는데 느림)를 Down으로 오보한다"
+        );
+        // 응답을 받으면 그 값으로 Status.
+        let s = ExporterStatus {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            to_exporter_probe(Roundtrip::Replied(Box::new(IpcResponse::ExporterStatus(s)))),
+            ExporterProbe::Status(_)
+        ));
+        // 예상 못 한 응답(구버전 graceful Error 등)은 "꺼짐"이 아니라 "모름"이다 — aicd는 답했으니까.
+        assert!(
+            matches!(
+                to_exporter_probe(Roundtrip::Replied(Box::new(IpcResponse::Error {
+                    message: "unknown request".into()
+                }))),
+                ExporterProbe::Unknown
+            ),
+            "구버전 graceful Error를 Down으로 오보한다"
         );
     }
 
@@ -1302,7 +1408,7 @@ mod tests {
             }
         });
 
-        let rt = query_at(&path, &IpcRequest::GetExporterStatus);
+        let rt = query_at(&path, &IpcRequest::GetExporterStatus, IO_TIMEOUT);
         assert!(
             matches!(rt, Roundtrip::NoReply),
             "write 성공 후 read timeout인데 NoReply가 아니다"
@@ -1342,7 +1448,7 @@ mod tests {
         });
 
         let _ = test_timeout_probe::drain(); // 앞선 잔여 제거
-        let _ = query_at(&path, &IpcRequest::GetExporterStatus);
+        let _ = query_at(&path, &IpcRequest::GetExporterStatus, IO_TIMEOUT);
         let timeouts = test_timeout_probe::drain();
 
         assert_eq!(

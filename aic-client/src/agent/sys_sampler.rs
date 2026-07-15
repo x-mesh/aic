@@ -193,10 +193,19 @@ pub(crate) enum ExporterState {
 
 impl ExporterState {
     /// IPC 응답을 status bar용 상태로 접는다. `None`(조회 실패)은 곧 데몬이 없다는 뜻이다.
+    /// `Option`에서 접는 얇은 래퍼 — `None`은 "조회 불가"라 `DaemonDown`이다. **folding 테스트 전용**:
+    /// 실 status bar 경로는 [`Self::next_exporter_state`]로 timeout(모름)과 연결실패(꺼짐)를 구분하므로
+    /// production에선 안 쓰인다(그래서 `cfg(test)`). folding 자체는 여기서 `Some` 케이스로 검증한다.
+    #[cfg(test)]
     fn from_status(status: Option<aic_common::ExporterStatus>) -> Self {
-        let Some(s) = status else {
-            return ExporterState::DaemonDown;
-        };
+        match status {
+            Some(s) => Self::from_exporter_status(s),
+            None => ExporterState::DaemonDown,
+        }
+    }
+
+    /// `ExporterStatus` 하나를 status bar 상태로 접는다(순수 folding).
+    fn from_exporter_status(s: aic_common::ExporterStatus) -> Self {
         if !s.enabled {
             return ExporterState::Disabled;
         }
@@ -263,12 +272,33 @@ impl SysSampler {
 
     /// exporter 상태를 캐시 주기에 맞춰 조회한다. aicd 미실행이면 connect가 즉시 실패하므로
     /// 이 경로는 싸다.
+    ///
+    /// **timeout을 "off"로 오보하지 않는다**: 조회는 세 결과다 — 값을 받으면(`Status`) 그걸 접고,
+    /// connect가 거부되면(`Down`) `DaemonDown`("aicd off"), 나갔는데 응답이 없으면(`Unknown` — aicd가
+    /// 큰 spool 드레인·다수 세션으로 잠깐 느린 경우) **직전 상태를 유지**한다. 예전엔 셋을 `None`으로
+    /// 뭉쳐 전부 `DaemonDown`으로 접어, 살아있는 aicd가 잠깐 느릴 때마다 "aicd off"가 깜빡였다.
     fn exporter_state(&mut self) -> ExporterState {
         if self.exporter_cache.1.elapsed() >= EXPORTER_POLL_INTERVAL {
-            let state = ExporterState::from_status(crate::agent_event::exporter_status());
-            self.exporter_cache = (state, Instant::now());
+            let last = self.exporter_cache.0;
+            let next = Self::next_exporter_state(crate::agent_event::exporter_status_probe(), last);
+            self.exporter_cache = (next, Instant::now());
         }
         self.exporter_cache.0
+    }
+
+    /// probe 결과와 직전 상태 → 이번에 보여줄 상태(순수 함수). **`Unknown`이면 직전 상태를 유지**한다 —
+    /// 살아있는 aicd가 잠깐 느려 응답을 못 준 걸 "off"로 단정하지 않으려는 게 핵심이다. `Down`(connect
+    /// 거부 = 못 닿음)만 `DaemonDown`("aicd off")이다.
+    fn next_exporter_state(
+        probe: crate::agent_event::ExporterProbe,
+        last: ExporterState,
+    ) -> ExporterState {
+        use crate::agent_event::ExporterProbe;
+        match probe {
+            ExporterProbe::Status(s) => ExporterState::from_exporter_status(s),
+            ExporterProbe::Down => ExporterState::DaemonDown,
+            ExporterProbe::Unknown => last,
+        }
     }
 
     /// 현재 지표를 샘플한다. disk/net i/o는 직전 sample 이후 delta를 경과시간으로 나눠 bytes/s로 환산.
@@ -1521,6 +1551,39 @@ mod tests {
             ExporterState::from_status(Some(old_daemon)),
             ExporterState::Ok,
             "구버전(None)을 agent-off로 오독해 헛경고를 낸다"
+        );
+    }
+
+    #[test]
+    fn next_exporter_state_keeps_last_on_unknown_but_shows_down_on_unreachable() {
+        use crate::agent_event::ExporterProbe;
+        use aic_common::ExporterStatus;
+
+        // **핵심 버그 수정**: aicd가 살아있는데 잠깐 느려 응답을 못 준 경우(`Unknown`)를 "aicd off"로
+        // 오보하면 안 된다 — 직전 상태를 유지한다. 예전엔 timeout을 `None`→`DaemonDown`으로 접어
+        // 살아있는 aicd에 "off"가 깜빡였다(status line: 밀림 ↔ off 반복).
+        let last = ExporterState::Backlogged(1500);
+        assert_eq!(
+            SysSampler::next_exporter_state(ExporterProbe::Unknown, last),
+            last,
+            "Unknown(살아있는데 느림)을 'off'로 단정했다 — 직전 상태를 유지해야 한다"
+        );
+
+        // connect가 진짜 거부되면(`Down`) 그때만 "aicd off"다 — 이건 정직하다.
+        assert_eq!(
+            SysSampler::next_exporter_state(ExporterProbe::Down, last),
+            ExporterState::DaemonDown
+        );
+
+        // 값을 받으면 직전과 무관하게 새 상태로 접는다.
+        let s = ExporterStatus {
+            enabled: true,
+            spool_batches: 7,
+            ..Default::default()
+        };
+        assert_eq!(
+            SysSampler::next_exporter_state(ExporterProbe::Status(s), ExporterState::DaemonDown),
+            ExporterState::Backlogged(7)
         );
     }
 
