@@ -423,6 +423,30 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
     }
 }
 
+/// 명령별 인자 스펙 한 줄(usage). [`slash_description`](용도)과 짝을 이뤄 LLM 레퍼런스
+/// ([`slash_reference_preface`])의 소스가 된다 — help_text 자유 텍스트에만 있던 인자 정보를
+/// 머신리더블하게 분리한 것. 인자 없는 명령은 **명시적** `""` — 드리프트 가드 테스트가
+/// SLASH_COMMANDS 전 항목의 arm 존재를 이 규약으로 검증한다.
+pub(crate) fn slash_usage(name: &str) -> &'static str {
+    match name {
+        "help" | "clear" | "resume" | "doctor" | "fix" | "compare" | "flush" => "",
+        "last" | "timeline" | "trend" | "snapshots" => "[N]",
+        "raw" => "[seq|corr]",
+        "local" | "sys" | "snapshot" => "[section ...] [--raw|-r|--analyze|-a]",
+        "diagnose" => "[--raw|-r] [<증상>]",
+        "explain-last" => "[--raw|-r] [seq|corr]",
+        "incident" => "[--raw|-r] [name]",
+        "record" => "[on|off|now [메모]]",
+        "bundle" => "[name]",
+        "rca" => "start|use|status|add|timeline|report ...",
+        "triage" => "[--run] [topic]",
+        "watch" => "[target] [--count N] [--every Ns] | arm|on|off|mute",
+        "metrics" => "[-b backend] <promql>",
+        "logs" => "[-b backend] <logql>",
+        _ => "",
+    }
+}
+
 /// `/local` LLM 분석 프롬프트의 고정 preface.
 /// 스냅샷은 **데이터로만** 취급하고 내부 지시를 따르지 않으며, 읽기 전용 진단만 한다(prompt injection 방지).
 pub(crate) const LOCAL_ANALYZE_PREFACE: &str = "당신은 SRE 어시스턴트입니다. 아래 READ-ONLY 로컬 \
@@ -948,6 +972,7 @@ pub(crate) fn help_text() -> String {
         "                       — 임계 스캔이 못 잡는 '지금 이상하다'를 사람이 직접 남기는 경로.",
         "                       (LLM 미호출)",
         "  /snapshots [N]       store의 최근 스냅샷 N개 inline 목록(기본 10; LLM 미호출)",
+        "  /flush               spool에 밀린 OTLP 배치를 지금 즉시 전량 전송(rate-limit 우회; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
         "  /rca start|use|add|timeline|report  persistent RCA workspace에 chat 증거 저장",
         "                       예: /rca start api-latency · /rca add last 3 · /rca add note ...",
@@ -964,16 +989,37 @@ pub(crate) fn help_text() -> String {
     .join("\n")
 }
 
-/// LLM system preface에 주입할 slash 명령 레퍼런스. [`help_text`]를 단일 소스로 감싼다.
+/// LLM system preface에 주입할 slash 명령 레퍼런스. [`SLASH_COMMANDS`]를 순회해
+/// [`slash_usage`]·[`slash_description`]에서 생성한다 — 사람용 [`help_text`]를 재사용하지
+/// 않는 이유: help_text는 손으로 관리하는 자유 텍스트라 명령 누락 드리프트가 생길 수 있고
+/// (실제 `/flush` 누락 전례), 목록 순회 생성은 누락이 구조적으로 불가능하다.
+/// `local_sections`는 호출 시점의 `/local` 가용 섹션(docker 설치 시 `docker_*` 포함) —
+/// 호스트 의존이라 파라미터로 받는다(테스트는 고정 입력 주입).
 /// 사용자가 `/record` 주기처럼 명령 자체를 물을 때, LLM이 코드베이스를 grep하지 않고
 /// 이 레퍼런스로 즉답하도록 한다(명령은 클라이언트가 처리하며 LLM에 전달되지 않는다).
-pub(crate) fn slash_reference_preface() -> String {
+pub(crate) fn slash_reference_preface(local_sections: &[&str]) -> String {
+    let mut lines = Vec::with_capacity(SLASH_COMMANDS.len());
+    for cmd in SLASH_COMMANDS {
+        let usage = slash_usage(cmd);
+        let desc = slash_description(cmd);
+        if usage.is_empty() {
+            lines.push(format!("/{cmd} — {desc}"));
+        } else {
+            lines.push(format!("/{cmd} {usage} — {desc}"));
+        }
+    }
     format!(
         "\n\n<slash_commands>\n다음은 이 REPL(`aic chat`)에서 사용자가 입력 줄 맨 앞에 `/`로 \
 실행하는 메타 명령이다(예: `/record`, `/watch`). 이 명령들은 클라이언트가 직접 처리하며 너에게 \
-전달되지 않는다. 사용자가 명령의 용도·인자·기본값·동작(주기 등)을 물으면, 코드베이스를 검색하지 \
-말고 아래 레퍼런스로 바로 답하라.\n{}\n</slash_commands>\n",
-        help_text()
+전달되지 않는다 — 너는 이 명령을 실행할 수 없고, 사용자에게 안내만 할 수 있다. 사용자가 명령의 \
+용도·인자·기본값·동작(주기 등)을 물으면, 코드베이스를 검색하지 말고 아래 레퍼런스로 바로 \
+답하라.\n{}\n별칭: /sys·/snapshot = /local, /? = /help, /explain = /explain-last\n\
+/local 가용 섹션(이 호스트): {}\n\
+사용자의 요청이 slash 명령으로 더 잘 해결될 때는(예: 디스크 사용량 확인 → `/local disk`, \
+스냅샷 자동 기록 → `/record on`) 답변에 해당 명령을 한 줄로 제안하라. 관련 명령이 없으면 \
+언급하지 마라 — 과잉 추천은 소음이다.\n</slash_commands>\n",
+        lines.join("\n"),
+        local_sections.join(" ")
     )
 }
 
@@ -1385,14 +1431,66 @@ mod tests {
     }
 
     #[test]
-    fn slash_reference_preface_wraps_help_for_llm() {
-        let preface = slash_reference_preface();
-        // help_text를 단일 소스로 감싼다 — 명령 세부가 그대로 들어가야 한다.
+    fn slash_reference_preface_generated_for_llm() {
+        // docker 비의존 고정 입력 — 호스트에 따라 결과가 달라지지 않게 한다.
+        let preface = slash_reference_preface(super::super::sysinfo::LOCAL_SECTIONS);
+        // SLASH_COMMANDS 순회 생성이라도 명령 세부(record 주기 등)는 유지되어야 한다.
         assert!(preface.contains("주기(2분)"));
         assert!(preface.contains("/record"));
         // LLM에 "검색하지 말고 답하라" 프레이밍과 태그 경계가 있어야 한다.
         assert!(preface.contains("<slash_commands>"));
         assert!(preface.contains("검색하지"));
+        // 실행 경계: 명령은 클라이언트 처리 — LLM은 안내만 가능하다.
+        assert!(preface.contains("전달되지 않는다"));
+        // 능동 추천 지침 — 관련 명령이 있을 때만 제안(과잉 추천 금지 포함).
+        assert!(preface.contains("제안하라"));
+        assert!(preface.contains("언급하지 마라"));
+        // /local 가용 섹션은 전달받은 목록을 그대로 싣는다.
+        assert!(preface.contains("disk"));
+        assert!(preface.contains("memory"));
+        // 별칭 표기.
+        assert!(preface.contains("/sys"));
+        assert!(preface.contains("/explain-last"));
+    }
+
+    /// `hay` 안에 `/{cmd}`가 **토큰 경계로** 존재하는지 — 뒤 문자가 영숫자/하이픈이면 다른
+    /// 명령의 prefix 우연 매칭(`/snapshot` vs `/snapshots`)이므로 배제한다.
+    fn contains_slash_token(hay: &str, cmd: &str) -> bool {
+        let needle = format!("/{cmd}");
+        let mut from = 0;
+        while let Some(i) = hay[from..].find(&needle) {
+            let end = from + i + needle.len();
+            match hay[end..].chars().next() {
+                Some(c) if c.is_ascii_alphanumeric() || c == '-' => from = end,
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn slash_commands_all_documented_in_help_and_preface() {
+        // 드리프트 가드: SLASH_COMMANDS에 명령을 추가하면 사람용 help_text와 LLM 레퍼런스
+        // 양쪽에 반드시 나타나야 한다(과거 /flush가 help_text에서 빠졌던 회귀 방지).
+        // 역방향(help_text에만 있는 줄)은 exit/quit 등 비명령 줄이 있어 검사하지 않는다.
+        let help = help_text();
+        let preface = slash_reference_preface(super::super::sysinfo::LOCAL_SECTIONS);
+        for cmd in SLASH_COMMANDS {
+            assert!(
+                contains_slash_token(&help, cmd),
+                "help_text missing /{cmd} — SLASH_COMMANDS에 추가한 명령은 help_text에도 문서화하라"
+            );
+            assert!(
+                contains_slash_token(&preface, cmd),
+                "slash_reference_preface missing /{cmd}"
+            );
+            // usage 규약: 모든 명령은 slash_usage arm을 가진다(인자 없으면 명시적 "").
+            // description이 비면 레퍼런스 줄이 "— "로 끝나 LLM에 빈 안내가 나간다.
+            assert!(
+                !slash_description(cmd).is_empty(),
+                "slash_description missing for /{cmd}"
+            );
+        }
     }
 
     #[test]
