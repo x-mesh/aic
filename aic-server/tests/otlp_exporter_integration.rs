@@ -91,7 +91,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };
-    let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
+    let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
 
     // 첫 수신을 최대 5초 기다린다(실제 sysinfo 수집 + POST).
     let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -153,7 +153,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };
-    let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
+    let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
 
     let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await

@@ -211,6 +211,10 @@ pub(crate) enum SlashCommand {
     Record(RecordAction),
     /// `/snapshots [N]` — store의 최근 스냅샷 N개(기본 10) inline 목록(LLM 미호출).
     Snapshots(Option<usize>),
+    /// `/flush` — spool에 밀린 OTLP 배치를 **지금 즉시** 전량 전송한다(LLM 미호출). 평소 드레인은
+    /// tick당 속도 제한이 있어 큰 백로그는 천천히 빠진다 — collector가 복구됐고 "지금 밀어 넣어도
+    /// 된다"고 판단할 때 rate-limit을 한 번 우회한다.
+    Flush,
     /// `/bundle [name]` — 인시던트 증거를 redacted markdown으로 `~/.aic/bundles/`에 저장. name은 파일 라벨.
     Bundle(Option<String>),
     /// `/rca ...` — persistent RCA workspace를 chat 안에서 조작한다.
@@ -341,6 +345,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "compare",
     "record",
     "snapshots",
+    "flush",
     "bundle",
     "rca",
     "triage",
@@ -356,9 +361,8 @@ pub(crate) fn slash_category(name: &str) -> &'static str {
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => {
             "Evidence"
         }
-        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots" => {
-            "System"
-        }
+        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots"
+        | "flush" => "System",
         _ => "Meta", // help 등
     }
 }
@@ -394,6 +398,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
         "record" => "세션 스냅샷 자동 기록 토글 (on|off|now [메모]). on이면 Warn↑ 알림·주기(2분) 캡처 + REC 표시",
         "snapshots" => "store의 최근 스냅샷 N개 목록 (기본 10, LLM 미호출)",
+        "flush" => "spool에 밀린 OTLP 배치를 지금 즉시 전량 전송 (rate-limit 우회, LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
         "triage" => "토픽별 체크리스트 + 후보 probe (--run=probe 실행; LLM 미호출)",
@@ -519,6 +524,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
             SlashCommand::Record(action)
         }
         "snapshots" => SlashCommand::Snapshots(parts.next().and_then(|n| n.parse::<usize>().ok())),
+        "flush" => SlashCommand::Flush,
         "bundle" => {
             // [name] — 라벨/파일명 전용(따옴표 strip), 셸 명령에 미포함.
             let name = strip_surrounding_quotes(rest.trim());
@@ -1820,6 +1826,8 @@ mod tests {
             parse_slash("/snapshots 5"),
             Some(SlashCommand::Snapshots(Some(5)))
         );
+        // /flush
+        assert_eq!(parse_slash("/flush"), Some(SlashCommand::Flush));
         // /snapshot(단수)는 여전히 /local 별칭(회귀 방지).
         assert!(matches!(
             parse_slash("/snapshot"),
@@ -1868,10 +1876,20 @@ mod tests {
 
     #[test]
     fn parse_slash_fix() {
-        // exact + 유일 prefix(`f`로 시작하는 명령은 fix뿐).
+        // exact + 유일 prefix. `f`는 이제 fix/flush로 **모호**하다(flush 추가) — resolver가 그걸
+        // 정확히 감지한다. `fi`는 여전히 fix에 유일(flush는 `fl`).
         assert_eq!(parse_slash("/fix"), Some(SlashCommand::Fix));
-        assert_eq!(parse_slash("/f"), Some(SlashCommand::Fix));
+        assert_eq!(
+            parse_slash("/f"),
+            Some(SlashCommand::Ambiguous {
+                input: "f".to_string(),
+                candidates: vec!["fix".to_string(), "flush".to_string()],
+            })
+        );
         assert_eq!(parse_slash("/fi"), Some(SlashCommand::Fix));
+        // flush도 유일 prefix로 해소된다.
+        assert_eq!(parse_slash("/fl"), Some(SlashCommand::Flush));
+        assert_eq!(parse_slash("/flush"), Some(SlashCommand::Flush));
         // 메타데이터: Diagnostics 카테고리 + 설명 존재 + SLASH_COMMANDS 포함 + help 노출.
         assert_eq!(slash_category("fix"), "Diagnostics");
         assert!(!slash_description("fix").is_empty());

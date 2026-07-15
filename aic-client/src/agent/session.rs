@@ -1030,6 +1030,7 @@ impl AgentSession {
             SlashCommand::Compare => self.handle_compare().await,
             SlashCommand::Record(action) => self.handle_record(action).await,
             SlashCommand::Snapshots(n) => self.handle_snapshots(n).await,
+            SlashCommand::Flush => self.handle_flush().await,
             SlashCommand::Bundle(name) => self.handle_bundle(name.as_deref()).await,
             SlashCommand::Rca(cmd) => self.handle_rca(cmd).await,
             SlashCommand::Triage { topic, run } => self.handle_triage(topic.as_deref(), run).await,
@@ -1717,6 +1718,41 @@ impl AgentSession {
     }
 
     /// `/snapshots [N]` — store의 최근 스냅샷 N개(기본 10)를 inline 목록으로 표시한다.
+    /// `/flush` — spool에 밀린 OTLP 배치를 지금 즉시 전량 전송하라고 aicd에 요청하고, 결과를 사실대로
+    /// 보고한다. 큰 드레인은 수 초 걸릴 수 있어 진행 안내를 먼저 낸다. **"밀어 넣었다"를 단언하지
+    /// 않는다** — 실패/불확실이면 그대로 전한다(우리가 이 프로젝트 내내 지킨 원칙).
+    async fn handle_flush(&mut self) {
+        self.out
+            .note("⏳ spool 드레인 요청 중… (큰 백로그는 수 초 걸릴 수 있습니다)")
+            .await;
+        match crate::agent_event::flush_spool_async().await {
+            Ok(r) if r.drained == 0 && r.rejected == 0 && r.remaining == 0 => {
+                self.out
+                    .note("✓ spool이 이미 비어 있습니다 — 보낼 배치가 없습니다.")
+                    .await;
+            }
+            Ok(r) => {
+                let mut msg = format!("✓ spool 드레인: {}개 전송", r.drained);
+                if r.rejected > 0 {
+                    msg.push_str(&format!(", {}개 거부(4xx — 버림)", r.rejected));
+                }
+                if r.remaining > 0 {
+                    // 남았다 = 도중에 collector가 실패했다. 다음 주기 드레인/재-flush로 이어진다.
+                    msg.push_str(&format!(
+                        ", {}개 남음(collector가 도중에 실패 — 복구되면 이어서 전송, /flush 재실행 가능)",
+                        r.remaining
+                    ));
+                } else {
+                    msg.push_str(" — spool 비었습니다");
+                }
+                self.out.note(&msg).await;
+            }
+            Err(e) => {
+                self.out.note(&format!("⚠ flush하지 못했습니다: {e}")).await;
+            }
+        }
+    }
+
     async fn handle_snapshots(&mut self, n: Option<usize>) {
         let limit = n.unwrap_or(10);
         match crate::snapshot_store::load_snapshots() {

@@ -257,6 +257,7 @@ async fn ipc_pushed_log_lines_reach_collector() {
         exporter_health: None,
         // ★ 이게 t12가 배선한 지점 ★ — 이전엔 None이었다.
         logs_tx: Some(line_tx),
+        flush_tx: None,
     };
     let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 
@@ -347,7 +348,11 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         drop_counters: Arc::clone(&drop_counters),
     };
     let (msd_tx, msd_rx) = watch::channel(false);
-    let metrics_handle = tokio::spawn(serve(metrics_cfg, msd_rx));
+    let metrics_handle = tokio::spawn(async move {
+        let (_ftx, frx) =
+            tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+        serve(metrics_cfg, msd_rx, frx).await
+    });
 
     // DEBUG 3줄 — min_severity=WARN에 전부 걸린다.
     for i in 0..3 {

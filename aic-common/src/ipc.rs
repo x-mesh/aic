@@ -164,6 +164,11 @@ pub enum IpcRequest {
     /// 확인할 방법이 없다 — push가 계속 실패해도 aicd 로그에만 남는다. chat status bar가 이걸
     /// 주기적으로 물어 "지금 나가고 있다/밀리고 있다"를 눈에 보이게 한다.
     GetExporterStatus,
+    /// spool에 밀린 배치를 **지금 즉시** 전량 드레인하라고 요청한다(chat `/flush`). 평소 드레인은
+    /// tick당 `spool_drain_batch_limit`(기본 20)로 속도 제한돼, 큰 백로그는 collector 복구 후에도
+    /// 몇 시간에 걸쳐 빠진다 — 사용자가 "지금 밀어 넣어도 된다"고 판단하면 이 요청으로 rate-limit을
+    /// 한 번 우회한다. exporter가 꺼져 있으면 `Error`가 온다.
+    FlushSpool,
     /// `aic-client`(chat 등)의 자체 tracing 로그를 aicd로 흘려보낸다 (RFC-006 t11).
     ///
     /// `aic-client`는 `AgentEvent`와 같은 이유로 단명 프로세스라 OTLP exporter를 직접 들 수
@@ -221,9 +226,23 @@ pub enum IpcResponse {
     /// `GetExporterStatus` 응답. exporter가 꺼져 있으면 `enabled: false`인 기본값이 온다 —
     /// "꺼짐"과 "켜졌는데 실패 중"은 사용자에게 전혀 다른 상태라 응답 자체를 생략하지 않는다.
     ExporterStatus(ExporterStatus),
+    /// `FlushSpool` 응답 — 즉시 드레인 결과.
+    SpoolFlushed(SpoolFlushResult),
     Error {
         message: String,
     },
+}
+
+/// `/flush` 즉시 드레인 결과. `remaining`이 0이 아니면(collector가 도중에 실패) 남은 배치는 다음
+/// 주기 드레인으로 넘어간다.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpoolFlushResult {
+    /// 이번에 성공적으로 재전송+삭제한 배치 수.
+    pub drained: u64,
+    /// collector가 영구 거부(4xx)해 버린 배치 수.
+    pub rejected: u64,
+    /// 드레인 후 spool에 남은 배치 수(0이면 완전히 비었다).
+    pub remaining: u64,
 }
 
 /// OTLP exporter의 전송 건강 상태.
