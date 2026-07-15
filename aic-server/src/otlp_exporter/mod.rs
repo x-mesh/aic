@@ -97,10 +97,43 @@ pub struct ExporterConfig {
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// chat `/flush` 요청 — control server가 [`serve`]에 보내는 "지금 전량 드레인" 신호. 결과는
+/// `reply` oneshot으로 돌려받는다(control server가 IPC 응답으로 전달).
+pub struct FlushRequest {
+    pub reply: tokio::sync::oneshot::Sender<aic_common::SpoolFlushResult>,
+}
+
+/// spool을 `limit`개까지 드레인한다 — kind별로 올바른 OTLP endpoint로 재전송. tick 드레인과 `/flush`가
+/// **같은 로직을 공유**한다(한쪽만 고치고 잊는 걸 막는다). drain 자체가 첫 일시 실패에서 멈춘다.
+async fn drain_spool(
+    spool: &Spool,
+    limit: usize,
+    client: &reqwest::Client,
+    url: &str,
+    logs_endpoint: &str,
+    token: Option<&str>,
+) -> spool::DrainReport {
+    spool
+        .drain(limit, |kind, batch_body| async move {
+            match kind {
+                SignalKind::Metrics => push(client, url, token, batch_body).await,
+                // Logs/AppLogs는 엔드포인트가 동일(`/v1/logs`) — 갈리는 건 spool 쿼터뿐(R3).
+                SignalKind::Logs | SignalKind::AppLogs => {
+                    push_logs(client, logs_endpoint, token, batch_body).await
+                }
+            }
+        })
+        .await
+}
+
 /// exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
 /// bind가 아니라 아웃바운드라 시작 실패는 client build 정도뿐이며, 그 경우 에러를 반환한다
 /// (호출부는 aicd 전체를 abort하지 않고 경고만 — exporter는 opt-in 부가 기능).
-pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(
+    cfg: ExporterConfig,
+    mut shutdown: watch::Receiver<bool>,
+    mut flush_rx: tokio::sync::mpsc::Receiver<FlushRequest>,
+) -> anyhow::Result<()> {
     let client = reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?;
     let url = metrics_url(&cfg.endpoint);
     let logs_endpoint = logs_url(&cfg.endpoint);
@@ -176,24 +209,15 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
                 }
 
                 // (1) 드레인 — 밀린 배치를 FIFO로 먼저 흘려보낸다(새 데이터보다 오래된 데이터 우선).
-                let drain_report = cfg
-                    .spool
-                    .drain(cfg.drain_batch_limit, |kind, batch_body| {
-                        let client = &client;
-                        let url = &url;
-                        let logs_endpoint = &logs_endpoint;
-                        let token = cfg.token.as_deref();
-                        async move {
-                            match kind {
-                                SignalKind::Metrics => push(client, url, token, batch_body).await,
-                                SignalKind::Logs => push_logs(client, logs_endpoint, token, batch_body).await,
-                                // AppLogs도 엔드포인트는 Logs와 동일(`/v1/logs`) — 갈리는 건 spool
-                                // 쿼터뿐이다(R3, spool.rs 모듈 doc 참고).
-                                SignalKind::AppLogs => push_logs(client, logs_endpoint, token, batch_body).await,
-                            }
-                        }
-                    })
-                    .await;
+                let drain_report = drain_spool(
+                    &cfg.spool,
+                    cfg.drain_batch_limit,
+                    &client,
+                    &url,
+                    &logs_endpoint,
+                    cfg.token.as_deref(),
+                )
+                .await;
                 if drain_report.drained > 0 || drain_report.failed {
                     tracing::debug!(
                         drained = drain_report.drained,
@@ -227,6 +251,37 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+            }
+            Some(req) = flush_rx.recv() => {
+                // chat `/flush` — 사용자가 "지금 밀어 넣어도 된다"고 판단했다. rate-limit(tick당
+                // drain_batch_limit)을 우회해 **지금 전량 드레인**한다. backoff.ready()도 건너뛴다
+                // (명시적 요청). 나이 cap이 설정돼 있으면 낡은 것부터 버리고 시작한다.
+                if let Some(max_age) = cfg.spool_max_age {
+                    let _ = cfg.spool.prune_older_than(max_age);
+                }
+                // drain은 첫 일시 실패에서 멈추므로(FIFO 보존) collector가 죽어 있으면 빨리 반환한다 —
+                // usize::MAX여도 무한 대기하지 않는다. 살아 있으면 로컬 UDS/HTTP라 수천 배치도 초 단위.
+                let report = drain_spool(
+                    &cfg.spool,
+                    usize::MAX,
+                    &client,
+                    &url,
+                    &logs_endpoint,
+                    cfg.token.as_deref(),
+                )
+                .await;
+                if report.failed {
+                    backoff.on_failure();
+                    cfg.health.record_fail();
+                } else {
+                    backoff.on_success();
+                    cfg.health.record_ok();
+                }
+                let _ = req.reply.send(aic_common::SpoolFlushResult {
+                    drained: report.drained as u64,
+                    rejected: report.rejected as u64,
+                    remaining: cfg.spool.batch_count() as u64,
+                });
             }
         }
     }

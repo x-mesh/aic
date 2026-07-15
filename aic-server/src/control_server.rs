@@ -52,6 +52,10 @@ pub struct ControlContext {
     /// (가득 차면 조용히 drop — self_layer.rs의 재귀 방지 원칙과 동일하게 여기서도
     /// `tracing::` 매크로를 호출해 실패를 로깅하지 않는다).
     pub logs_tx: Option<mpsc::Sender<LogLine>>,
+    /// chat `/flush` 요청을 OTLP exporter task(`serve`)로 보내는 채널. exporter가 비활성이면
+    /// `None` — 그때 `FlushSpool`은 `Error`로 답한다. `Some`이면 요청 + oneshot reply를 보내고
+    /// 드레인 결과를 받아 IPC 응답으로 돌려준다.
+    pub flush_tx: Option<mpsc::Sender<crate::otlp_exporter::FlushRequest>>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -167,6 +171,34 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
                 // 호출부가 "꺼짐"을 "조회 실패"와 구분해야 하기 때문이다.
                 .unwrap_or_default(),
         ),
+        IpcRequest::FlushSpool => match &ctx.flush_tx {
+            None => IpcResponse::Error {
+                message: "OTLP exporter가 꺼져 있어 flush할 spool이 없습니다".to_string(),
+            },
+            Some(tx) => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let req = crate::otlp_exporter::FlushRequest { reply: reply_tx };
+                // exporter task가 죽었으면 send가 실패한다 — "성공"을 단언하지 않고 정직하게 에러.
+                if tx.send(req).await.is_err() {
+                    return IpcResponse::Error {
+                        message: "OTLP exporter task에 flush 요청을 전달하지 못했습니다(종료됨?)"
+                            .to_string(),
+                    };
+                }
+                // 드레인이 큰 백로그를 로컬로 밀 수 있으니 여유 timeout. drain은 첫 일시 실패에서
+                // 멈추므로 collector가 죽어 있어도 오래 걸리지 않는다.
+                match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+                    Ok(Ok(result)) => IpcResponse::SpoolFlushed(result),
+                    // reply drop(task가 응답 전에 죽음) 또는 timeout — 결과를 모른다. 단언 대신 에러.
+                    _ => IpcResponse::Error {
+                        message:
+                            "flush 결과를 확인하지 못했습니다(exporter가 응답 전에 종료했거나 \
+                                  30초 내 완료하지 못함)"
+                                .to_string(),
+                    },
+                }
+            }
+        },
         IpcRequest::AgentEvent(ev) => {
             // 저장하지 않고 tap으로 흘리기만 한다 — 로컬 기록은 chat 쪽 audit/tool_record가
             // 이미 담당한다. exporter가 꺼져 있으면 구독자가 없어 조용히 버려진다.
@@ -522,6 +554,7 @@ mod tests {
             exporter_health: None,
             // 아직 배선 전(t12) — PushLogLines 핸들러가 no-op으로 Pong만 응답하는지 검증.
             logs_tx: None,
+            flush_tx: None,
         }
     }
 

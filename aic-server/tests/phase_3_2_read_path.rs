@@ -200,6 +200,7 @@ impl AicdHarness {
             agent_bus: aic_server::agent_event_bus::AgentEventBus::new(),
             exporter_health: None,
             logs_tx: None,
+            flush_tx: None,
         };
         let ctx_clone = ctx.clone();
         let handle = tokio::spawn(async move { server.serve(ctx_clone).await });

@@ -591,7 +591,38 @@ pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
 
 /// [`exporter_status`]의 async 판.
 pub async fn exporter_status_async() -> Option<aic_common::ExporterStatus> {
-    to_exporter_status(query_async(&IpcRequest::GetExporterStatus).await)
+    to_exporter_status(query_async(&IpcRequest::GetExporterStatus, IO_TIMEOUT).await)
+}
+
+/// `/flush` 클라이언트 상한. 서버 드레인이 큰 백로그를 로컬로 밀면 시간이 걸리므로(aicd control
+/// handler는 30s까지 기다린다) 그보다 살짝 길게 잡아 서버가 응답할 여유를 준다.
+#[cfg_attr(test, allow(dead_code))]
+const FLUSH_QUERY_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// spool에 밀린 배치를 **지금 즉시 전량** 드레인하라고 aicd에 요청한다(chat `/flush`).
+///
+/// `Ok(result)` = 드레인 결과. `Err(msg)` = exporter 꺼짐 / aicd 미실행 / 응답 못 받음 등 —
+/// **"밀어 넣었다"를 단언하지 않고** 실패/불확실을 그대로 전한다(우리가 이 프로젝트 내내 지킨 원칙).
+#[cfg(not(test))]
+pub async fn flush_spool_async() -> Result<aic_common::SpoolFlushResult, String> {
+    match query_async(&IpcRequest::FlushSpool, FLUSH_QUERY_TIMEOUT).await {
+        Roundtrip::Replied(resp) => match *resp {
+            IpcResponse::SpoolFlushed(r) => Ok(r),
+            IpcResponse::Error { message } => Err(message),
+            other => Err(format!("예상하지 못한 응답: {other:?}")),
+        },
+        Roundtrip::SendFailed => Err("aicd에 연결하지 못했습니다(미실행?)".to_string()),
+        Roundtrip::NoReply => Err(
+            "요청은 보냈으나 aicd 응답을 확인하지 못했습니다(드레인은 진행 중일 수 있음)"
+                .to_string(),
+        ),
+    }
+}
+
+/// 테스트에선 실 소켓을 안 건드린다 — aicd 없음으로 고정([`query`] cfg(test) 참고).
+#[cfg(test)]
+pub async fn flush_spool_async() -> Result<aic_common::SpoolFlushResult, String> {
+    Err("aicd에 연결하지 못했습니다(미실행?)".to_string())
 }
 
 /// status bar가 본 exporter 조회 결과 — **"값 있음 / 못 닿음 / 못 알아냄"을 구분**한다.
@@ -691,7 +722,7 @@ fn dispatch(ev: AgentEvent) -> SendResult {
 /// [`dispatch`]의 async 판 — chat(async)에서 tokio worker를 막지 않고 보낸다.
 #[cfg(not(test))]
 async fn dispatch_async(ev: AgentEvent) -> SendResult {
-    to_send_result(query_async(&IpcRequest::AgentEvent(ev)).await)
+    to_send_result(query_async(&IpcRequest::AgentEvent(ev), IO_TIMEOUT).await)
 }
 
 #[cfg(test)]
@@ -1050,14 +1081,14 @@ fn socket_error(fd: std::os::unix::io::RawFd) -> std::io::Result<libc::c_int> {
 /// 새 timeout을 주면 최대 3배로 늘어난다). `spawn_blocking`이 아니라 async I/O인 이유는 [`Roundtrip`]
 /// 없던 옛 `query_async` 주석과 동일하다 — future를 drop하면 소켓이 닫혀 스레드가 pin되지 않는다.
 #[cfg(not(test))]
-async fn query_async(req: &IpcRequest) -> Roundtrip {
+async fn query_async(req: &IpcRequest, timeout: Duration) -> Roundtrip {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::time::timeout_at;
 
     let Ok(payload) = serde_json::to_vec(req) else {
         return Roundtrip::SendFailed;
     };
-    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     // connect (실패/timeout = 안 나감).
     let connect = timeout_at(
@@ -1104,7 +1135,7 @@ async fn query_async(req: &IpcRequest) -> Roundtrip {
 
 /// sync [`query`]와 같은 이유로 테스트에서는 소켓에 나가지 않는다.
 #[cfg(test)]
-async fn query_async(_req: &IpcRequest) -> Roundtrip {
+async fn query_async(_req: &IpcRequest, _timeout: Duration) -> Roundtrip {
     Roundtrip::SendFailed
 }
 

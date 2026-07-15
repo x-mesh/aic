@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aic_server::otlp_exporter::{
-    serve, DropCounters, ExporterConfig, ExporterHealth, SignalKind, Spool,
+    serve, DropCounters, ExporterConfig, ExporterHealth, FlushRequest, SignalKind, Spool,
 };
 use axum::body::Bytes;
 use axum::extract::State;
@@ -92,7 +92,13 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };
-    let handle = tokio::spawn(async move { serve(cfg, sd_rx).await });
+    let handle = tokio::spawn(async move {
+        {
+            let (_ftx, frx) =
+                tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+            serve(cfg, sd_rx, frx).await
+        }
+    });
 
     // "중앙 다운" 구간 — 여러 tick이 지나는 동안 push가 계속 실패해 spool에 쌓여야 한다.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -135,6 +141,110 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         received_metrics_count >= spooled_during_downtime.saturating_sub(1), // preexisting은 logs 채널
         "다운 구간에 쌓인 metrics 배치가 드레인으로 전부 collector에 도달해야 함: \
          received={received_metrics_count} spooled={spooled_during_downtime}"
+    );
+
+    sd_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+}
+
+/// `/flush` — 사용자가 요청하면 rate-limit(tick당 `drain_batch_limit`)을 우회해 **지금 전량** 드레인.
+/// `drain_batch_limit = 0`으로 두어 tick 드레인을 0으로 막고, spool을 비우는 건 오직 flush임을
+/// 결정적으로 격리한다. interval을 길게(1h) 잡아 첫 즉시 tick 외엔 끼어들지 않게 한다.
+#[tokio::test]
+async fn flush_drains_entire_spool_on_request_bypassing_rate_limit() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let up = Arc::new(AtomicBool::new(true)); // collector는 처음부터 UP.
+    let (metrics_tx, mut metrics_rx) = mpsc::channel::<Vec<u8>>(256);
+    let (logs_tx, mut logs_rx) = mpsc::channel::<Vec<u8>>(256);
+    let state = MockState {
+        up: up.clone(),
+        metrics_tx,
+        logs_tx,
+    };
+    let app = Router::new()
+        .route("/v1/metrics", post(metrics_handler))
+        .route("/v1/logs", post(logs_handler))
+        .with_state(state);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let quotas = aic_common::SpoolQuotas {
+        metrics: 16 * 1024 * 1024,
+        logs: 16 * 1024 * 1024,
+        app_logs: 16 * 1024 * 1024,
+    };
+    let spool = Arc::new(Spool::open(dir.path().join("otlp-spool"), quotas).unwrap());
+    // 미리 배치를 쌓아 둔다(collector는 UP이지만 tick 드레인 상한이 0이라 안 빠진다).
+    for i in 0..5u8 {
+        spool
+            .append(SignalKind::Metrics, format!("m-{i}").as_bytes())
+            .unwrap();
+    }
+    spool.append(SignalKind::Logs, b"l-0").unwrap();
+    let pre = spool.batch_count();
+    assert_eq!(pre, 6, "전제: 6개 적재");
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
+    let cfg = ExporterConfig {
+        endpoint: format!("http://{addr}"),
+        token: None,
+        interval: Duration::from_secs(3600), // 첫 즉시 tick 외엔 안 옴.
+        service_version: "9.9.9".to_string(),
+        spool: spool.clone(),
+        drain_batch_limit: 0, // tick은 아무것도 드레인하지 않는다 — flush만 spool을 비운다.
+        spool_max_age: None,
+        health,
+        drop_counters: Arc::new(DropCounters::new()),
+    };
+    let (flush_tx, flush_rx) = tokio::sync::mpsc::channel::<FlushRequest>(4);
+    let handle = tokio::spawn(async move { serve(cfg, sd_rx, flush_rx).await });
+
+    // 첫 즉시 tick이 지나가게 잠깐 둔다(tick은 drain_batch_limit=0이라 spool을 안 건드린다).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        spool.batch_count(),
+        6,
+        "tick(drain_batch_limit=0)이 spool을 건드리면 안 된다 — flush 격리가 깨진다"
+    );
+
+    // flush 요청 — oneshot으로 결과를 받는다.
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    flush_tx
+        .send(FlushRequest { reply: reply_tx })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), reply_rx)
+        .await
+        .expect("flush 응답 timeout")
+        .expect("flush reply drop됨");
+
+    assert_eq!(
+        result.drained, 6,
+        "flush가 6개 전량을 드레인해야 한다: {result:?}"
+    );
+    assert_eq!(
+        result.remaining, 0,
+        "flush 후 spool이 비어야 한다: {result:?}"
+    );
+    assert_eq!(spool.batch_count(), 0, "실제 spool도 비어야 한다");
+
+    // collector가 실제로 6개(metrics 5 + logs 1)를 받았는지 — 올바른 endpoint로 갔는지도 함께 검증.
+    let mut m = 0;
+    while metrics_rx.try_recv().is_ok() {
+        m += 1;
+    }
+    let mut l = 0;
+    while logs_rx.try_recv().is_ok() {
+        l += 1;
+    }
+    assert_eq!(l, 1, "logs 배치는 /v1/logs로 1개 가야 한다");
+    assert!(
+        m >= 5,
+        "metrics 배치 5개가 /v1/metrics로 가야 한다(+tick 샘플 가능): m={m}"
     );
 
     sd_tx.send(true).unwrap();

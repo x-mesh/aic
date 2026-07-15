@@ -174,6 +174,22 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    // OTLP exporter config를 여기서 미리 계산한다(원래는 아래 spawn 시점) — ControlContext가
+    // exporter task로 `/flush` 요청을 보내는 채널을 들어야 하는데, 그 채널은 exporter가 실제로 뜰
+    // 때만 의미가 있기 때문이다. exporter가 꺼져 있으면 `flush_tx = None` → `FlushSpool`은 "꺼짐" 에러.
+    let exporter_cfg = load_exporter_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+        log_drop_counters.clone(),
+    );
+    let (flush_tx, flush_rx) = if exporter_cfg.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(4);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let control_ctx = ControlContext {
         shutdown: shutdown.clone(),
         registry: registry.clone(),
@@ -182,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         agent_bus,
         exporter_health: exporter_health.clone(),
+        flush_tx,
         // t12: logs exporter가 배선되어 채널이 생겼으면(`logs_precheck.parent_enabled`) 그 Sender를
         // 그대로 공유한다 — `aic-client`의 `PushLogLines`가 이 채널을 통해 serve_logs까지 흐른다.
         // 로그가 off(기본)면 `None` 그대로라 기존 동작(수신은 하되 조용히 버림)과 동일하다.
@@ -216,16 +233,15 @@ async fn main() -> anyhow::Result<()> {
     // shutdown watch를 공유한다(webhook과 같은 패턴). off면 아래 config가 None이라 task 자체가
     // 뜨지 않아 코드 경로가 완전히 비활성이다(기존 동작 회귀 0). t8: spool의 유일한 드레인 주체
     // (enabled=true면 반드시 뜨는 유일한 task라서 — otlp_exporter 모듈 doc 참고).
-    let exporter_handle = match load_exporter_config(
-        exporter_section.clone(),
-        exporter_spool.clone(),
-        exporter_health.clone(),
-        log_drop_counters.clone(),
-    ) {
+    let exporter_handle = match exporter_cfg {
         Some(cfg) => {
             let ex_shutdown = shutdown.subscribe();
+            // flush_rx는 exporter_cfg가 Some일 때만 Some이라(위에서 함께 생성) 여기서 반드시 존재한다.
+            let ex_flush_rx = flush_rx.expect("exporter cfg가 있으면 flush_rx도 함께 생성된다");
             Some(tokio::spawn(async move {
-                if let Err(e) = aic_server::otlp_exporter::serve(cfg, ex_shutdown).await {
+                if let Err(e) =
+                    aic_server::otlp_exporter::serve(cfg, ex_shutdown, ex_flush_rx).await
+                {
                     tracing::warn!(error = %e, "OTLP exporter 종료(에러)");
                 }
             }))
