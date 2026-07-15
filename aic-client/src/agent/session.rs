@@ -363,7 +363,10 @@ impl AgentSession {
         }
         // slash 명령 레퍼런스를 system preface에 주입한다 — 사용자가 `/record` 주기처럼 명령 자체를
         // 물을 때 LLM이 코드 검색 없이 즉답하도록(명령 실행은 클라이언트가 처리, LLM 미전달).
-        preface.push_str(&tool_record::slash_reference_preface());
+        // /local 가용 섹션은 호스트 의존(docker 유무)이라 시작 시점 스냅샷을 전달한다.
+        preface.push_str(&tool_record::slash_reference_preface(
+            &super::sysinfo::available_sections(),
+        ));
         self.history.push(ChatMessage::System(preface));
 
         // MCP 서버 연결(핸드셰이크 + tool 발견). 서버별 독립·graceful degrade — 무응답 서버는 서버당
