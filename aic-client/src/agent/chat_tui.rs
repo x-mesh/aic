@@ -1957,7 +1957,16 @@ async fn chat_loop(
                         }
                         // 세션 자동 기록(L1.5, best-effort): 기록 on이면 알림과 무관하게 SESSION_RECORD_INTERVAL마다
                         // baseline 스냅샷을 detached로 남긴다(추세·"문제 직전 상태" 증거). off면 무동작(회귀 0).
-                        if recording.load(std::sync::atomic::Ordering::Relaxed) {
+                        //
+                        // **with_statusbar로 게이트한다**: sampler task는 이제 statusbar와 무관하게 항상
+                        // 돌아 MetricsPoll::New를 계속 낸다(`/record now` 자기완결화). 그 부작용으로, 이 게이트가
+                        // 없으면 statusbar를 끈 세션(AIC_NO_STATUSBAR/AIC_QUIET)에서도 `/record on`이 2분마다
+                        // 주기 캡처를 시작해, "statusbar가 꺼져 있으면 주기 캡처는 안 산다"는
+                        // `recording_lane_live` 계약(session.rs `recording_lane_live`·`handle_record` 안내)을
+                        // 깬다. alert 캡처(L1)는 `alert_tracker`(with_statusbar 게이트) 블록 안이라 이미 막히지만,
+                        // 이 주기 캡처는 그 밖이라 여기서 별도로 막아야 한다. 지표 캐시(metrics_tx) 갱신은 위에서
+                        // statusbar와 무관하게 계속한다 — 막는 건 주기 캡처뿐이다.
+                        if with_statusbar && recording.load(std::sync::atomic::Ordering::Relaxed) {
                             let now = Instant::now();
                             let due = last_record_capture
                                 .is_none_or(|t| now.duration_since(t) >= SESSION_RECORD_INTERVAL);
