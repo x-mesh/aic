@@ -7,7 +7,7 @@
 //! 별개 기능이라 그대로 재사용하면 의미가 섞인다. 대신 machine-readable 전용 hidden leaf를 새로
 //! 추가했다(사람이 직접 쓰는 명령이 아니라 `--help`에 노출하지 않는다).
 //!
-//! Linux는 `ss -tunap`, macOS는 `lsof -nP +c 0 -iTCP -iUDP`로 LISTEN/ESTABLISHED 소켓을 조회한다.
+//! Linux는 `ss -tiunap`, macOS는 `lsof -nP +c 0 -iTCP -iUDP`로 LISTEN/ESTABLISHED 소켓을 조회한다.
 //! 파싱 로직은 OS 무관 순수 함수([`parse_ss`]/[`parse_lsof`])로 분리해, 실제 프로세스를 spawn하지
 //! 않고 고정 fixture 문자열로 두 포맷 모두 결정적으로 테스트한다(`capture()`/`run_os_probe()` 자체는
 //! 실제 시스템 명령에 의존해 유닛 테스트 대상이 아니다 — 기존 `local_probes`류 패턴과 동일).
@@ -66,6 +66,12 @@ pub struct ConnectionInfo {
     /// 소켓을 소유한 프로세스 이름(실행 파일 이름이지 argv가 아니다 — 커맨드라인 인자는 애초에
     /// 들어오지 않는다). 권한이 없거나 커널 소켓이면 `None`(모듈 doc 참고).
     pub process: Option<String>,
+    /// 소켓 생성 이후 로컬→피어 누적 송신 바이트. Linux `ss -i`의 `tcp_info`에서 얻으며,
+    /// 지원하지 않는 프로토콜/OS에서는 0이다.
+    pub bytes_sent: u64,
+    /// 소켓 생성 이후 피어→로컬 누적 수신 바이트. Linux `ss -i`의 `tcp_info`에서 얻으며,
+    /// 지원하지 않는 프로토콜/OS에서는 0이다.
+    pub bytes_recv: u64,
     /// [`annotate_directions`]가 스냅샷 전체를 보고 확정한다. 파싱 단계에서는 peer 유무만 아는
     /// context-free 초기값이 들어간다.
     pub direction: Direction,
@@ -151,7 +157,9 @@ fn run_os_probe() -> anyhow::Result<String> {
 /// 전역 소켓 *목록*만 있으면 되므로 이 권한 부족의 영향을 받지 않는다(모듈 doc 참고).
 #[cfg(not(target_os = "macos"))]
 fn run_os_probe() -> anyhow::Result<String> {
-    let out = std::process::Command::new("ss").args(["-tunap"]).output()?;
+    let out = std::process::Command::new("ss")
+        .args(["-tiunap"])
+        .output()?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -264,18 +272,44 @@ pub(crate) fn parse_ss_process(field: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Linux `ss -tunap` 출력을 파싱한다. 컬럼: `Netid State Recv-Q Send-Q "Local Address:Port"
-/// "Peer Address:Port"`(+선택적 Process). 헤더 줄(`Netid`로 시작)과 필드 부족 줄은 skip한다.
-/// `-p` 없는 6컬럼 출력도 계속 파싱된다(`process`가 `None`이 될 뿐이다).
+/// `ss -i`의 TCP 상세 줄에서 누적 바이트 카운터를 읽어 직전 소켓 행에 붙인다. 커널/iproute2가
+/// 필드를 제공하지 않거나 숫자가 깨졌으면 0을 유지한다.
+fn annotate_tcp_info_counters(conn: Option<&mut ConnectionInfo>, fields: &[&str]) {
+    let Some(conn) = conn.filter(|c| c.protocol == "tcp") else {
+        return;
+    };
+    for field in fields {
+        if let Some(value) = field
+            .strip_prefix("bytes_sent:")
+            .and_then(|v| v.parse().ok())
+        {
+            conn.bytes_sent = value;
+        } else if let Some(value) = field
+            .strip_prefix("bytes_received:")
+            .and_then(|v| v.parse().ok())
+        {
+            conn.bytes_recv = value;
+        }
+    }
+}
+
+/// Linux `ss -tiunap` 출력을 파싱한다. 기본 행 컬럼은 `Netid State Recv-Q Send-Q
+/// "Local Address:Port" "Peer Address:Port"`(+선택적 Process)이고, 뒤따르는 `-i` 상세 줄의
+/// `bytes_sent`/`bytes_received`를 직전 TCP 소켓에 연결한다. `-p` 없는 6컬럼 출력도 계속
+/// 파싱된다(`process`가 `None`이 될 뿐이다).
 pub(crate) fn parse_ss(text: &str) -> Vec<ConnectionInfo> {
     let mut out = Vec::new();
     for line in text.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 6 || fields[0].eq_ignore_ascii_case("netid") {
+        if fields.is_empty() || fields[0].eq_ignore_ascii_case("netid") {
             continue;
         }
         let protocol = fields[0].to_lowercase();
         if protocol != "tcp" && protocol != "udp" {
+            annotate_tcp_info_counters(out.last_mut(), &fields);
+            continue;
+        }
+        if fields.len() < 6 {
             continue;
         }
         let state = fields[1].to_string();
@@ -298,6 +332,8 @@ pub(crate) fn parse_ss(text: &str) -> Vec<ConnectionInfo> {
             peer_addr,
             peer_port,
             process,
+            bytes_sent: 0,
+            bytes_recv: 0,
             direction: initial_direction(peer_port),
         });
     }
@@ -361,6 +397,8 @@ pub(crate) fn parse_lsof(text: &str) -> Vec<ConnectionInfo> {
             peer_addr,
             peer_port,
             process,
+            bytes_sent: 0,
+            bytes_recv: 0,
             direction: initial_direction(peer_port),
         });
     }
@@ -478,6 +516,38 @@ tcp    ESTAB   0      0            192.168.1.5:51234       140.82.113.4:443
         let outbound = conns.iter().find(|c| c.local_port == 51234).unwrap();
         assert_eq!(outbound.process, None);
         assert_eq!(outbound.peer_port, Some(443));
+    }
+
+    #[test]
+    fn parse_ss_attaches_tcp_info_bytes_to_the_preceding_socket() {
+        const SS_I_FIXTURE: &str = "\
+Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443 users:((\"curl\",pid=7,fd=3))
+     cubic wscale:7,7 rto:204 rtt:1.5/0.3 bytes_sent:1048576 bytes_acked:1048577 bytes_received:8192 segs_out:42
+tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=8,fd=4))
+     cubic cwnd:10
+udp UNCONN 0 0 0.0.0.0:53 0.0.0.0:* users:((\"named\",pid=9,fd=5))
+";
+        let conns = parse_ss(SS_I_FIXTURE);
+        assert_eq!(conns.len(), 3);
+        assert_eq!(conns[0].bytes_sent, 1_048_576);
+        assert_eq!(conns[0].bytes_recv, 8_192);
+        assert_eq!(conns[1].bytes_sent, 0);
+        assert_eq!(conns[1].bytes_recv, 0);
+        assert_eq!(conns[2].bytes_sent, 0);
+        assert_eq!(conns[2].bytes_recv, 0);
+    }
+
+    #[test]
+    fn parse_ss_ignores_malformed_tcp_info_counters() {
+        const MALFORMED: &str = "\
+Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port
+tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443
+     cubic bytes_sent:not-a-number bytes_received:also-bad
+";
+        let conns = parse_ss(MALFORMED);
+        assert_eq!(conns[0].bytes_sent, 0);
+        assert_eq!(conns[0].bytes_recv, 0);
     }
 
     #[test]
@@ -697,6 +767,8 @@ Google Chrome Helper 555 jinwoo 30u  IPv4 0x1234567890abcdef      0t0  TCP 10.0.
                 peer_addr: None,
                 peer_port: None,
                 process: Some("sshd".to_string()),
+                bytes_sent: 1_024,
+                bytes_recv: 2_048,
                 direction: Direction::Listen,
             }],
         };
@@ -707,6 +779,8 @@ Google Chrome Helper 555 jinwoo 30u  IPv4 0x1234567890abcdef      0t0  TCP 10.0.
         assert_eq!(json["connections"][0]["local_port"], 22);
         assert!(json["connections"][0]["peer_addr"].is_null());
         assert_eq!(json["connections"][0]["process"], "sshd");
+        assert_eq!(json["connections"][0]["bytes_sent"], 1_024);
+        assert_eq!(json["connections"][0]["bytes_recv"], 2_048);
         // 소문자여야 한다 — rca의 `parse_direction`이 소문자만 인식한다. 이 assert가 wire contract.
         assert_eq!(json["connections"][0]["direction"], "listen");
     }
