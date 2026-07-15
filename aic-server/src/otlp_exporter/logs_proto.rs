@@ -95,6 +95,40 @@ pub struct ConnectionEntry<'a> {
     pub bytes_recv: u64,
 }
 
+/// DNS 관측 하나 — `aic.dns` scope LogRecord로 인코딩할 입력.
+///
+/// **왜 별도 scope인가**: socket snapshot(`aic.connections`)은 숫자 peer IP만 담아, RCA가
+/// 애플리케이션이 실제 요청한 도메인을 복원하지 못한다. DNS 응답(A/AAAA)을 관측해 `FQDN ↔ IP`
+/// 매핑을 별도 신호로 보내면, RCA가 connection의 `remote_addr == answer_ip`(+시각·host·TTL)로
+/// 조인해 도메인을 붙일 수 있다. connection 행에 domain을 덮어쓰지 않는 이유는 shared IP 하나에
+/// 여러 FQDN이 대응할 수 있어서다(`topology-domain` 결정 참고).
+///
+/// **민감도**: 도메인은 운영 정보이자 PII가 될 수 있어 이 신호의 실제 수집은 opt-in이어야 한다 —
+/// 수집 게이트/retention은 이 데이터를 만드는 aicd DNS observer(Phase 2)가 담당하고, 이 인코더는
+/// 계약(wire shape)만 확정한다.
+///
+/// **wire contract**: attr 이름은 수신측(rca `otlp/decode.rs`) 디코더와 정확히 일치해야 한다.
+/// 값이 없으면 attr 자체를 생략한다(빈 문자열 금지) — 수신측이 "안 보냈다"와 "빈 값"을 구분한다.
+pub struct DnsObservation<'a> {
+    /// 정규화된 질의 FQDN(예: `"api.example.com"`).
+    pub question_name: &'a str,
+    /// 레코드 타입 — `"A"` | `"AAAA"`.
+    pub question_type: &'a str,
+    /// 응답 IP들. 빈 slice면 `dns.answers` attr을 생략한다(NXDOMAIN/negative 응답).
+    pub answers: &'a [&'a str],
+    /// 원본 응답 TTL(초).
+    pub ttl: u32,
+    /// 이 매핑이 만료되는 시각(unix epoch 나노초, observed + TTL). RCA가 "TTL 지난 매핑을 새
+    /// connection에 쓰지 않는다"는 acceptance를 판정하는 근거다.
+    pub expires_at_unix_nano: u64,
+    /// 출처 — `"dns"`(평문 DNS 관측) | `"application"`(OTEL server.address) | `"sni"`(TLS SNI).
+    pub source: &'a str,
+    /// 이 조회를 한 프로세스 PID. 얻을 수 없으면 `None` → attr 생략.
+    pub pid: Option<i64>,
+    /// 프로세스 실행 파일명. 얻을 수 없으면 `None` → attr 생략.
+    pub process_name: Option<&'a str>,
+}
+
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
 /// connections만 `host_ip`를 추가로 붙인다(hosts 메타 갱신, DoD 요구사항).
 pub struct ResourceAttrs<'a> {
@@ -242,6 +276,66 @@ pub fn encode_connections(
         })
         .collect();
     build_request(resource, "aic.connections", service_version, log_records)
+}
+
+/// `observations`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.dns`)로 배치 인코딩한다.
+///
+/// 시각을 하나만 받는다 — DNS 관측은 "그 순간 응답을 봤다"가 곧 이벤트라 발생=관측 시각이 같다
+/// (`encode_connections`와 동일 논리).
+///
+/// **`dns.answers`는 콤마 구분 문자열**로 싣는다(예: `"1.2.3.4,5.6.7.8"`). OTEL semconv는 문자열
+/// 배열을 쓰지만, 이 최소 subset은 scalar attr만 정의하며(파일 상단 참고) IP 목록은 콤마 join으로
+/// 손실 없이 표현되고 수신측(rca)이 `split(',')` 한 번으로 복원한다 — `array_value` 메시지를 더해
+/// 이 파일과 rca 디코더 양쪽을 늘리는 것보다 계약이 단순하다. IP라서 value는 redact하지 않는다
+/// (`attr_addr`, 모듈 doc의 redaction 예외). `dns.answers`의 원소가 IP인 것도 그 예외의 근거다.
+pub fn encode_dns_observations(
+    observations: &[DnsObservation<'_>],
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+    time_unix_nano: u64,
+) -> Vec<u8> {
+    let log_records = observations
+        .iter()
+        .map(|o| {
+            let mut attributes = vec![
+                attr_str("dns.question.name", o.question_name),
+                attr_str("dns.question.type", o.question_type),
+                attr_int("dns.ttl", i64::from(o.ttl)),
+                attr_int("aic.dns.expires_at", saturating_i64(o.expires_at_unix_nano)),
+                attr_str("aic.dns.source", o.source),
+            ];
+            // 응답이 있을 때만 dns.answers(콤마 구분 IP)를 붙인다 — negative 응답은 attr 생략으로
+            // "이름은 물었으나 IP는 없다"를 명시한다. IP라서 redact 예외(attr_addr).
+            if !o.answers.is_empty() {
+                attributes.push(attr_addr("dns.answers", &o.answers.join(",")));
+            }
+            if let Some(pid) = o.pid {
+                attributes.push(attr_int("process.pid", pid));
+            }
+            if let Some(name) = o.process_name.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("process.executable.name", name));
+            }
+            // body는 사람/LLM용 한 줄 요약이라 도메인+타입만 담는다 — 응답 IP는 dns.answers attr에만
+            // 둔다(body는 string_value라 redact를 거쳐 IP가 `[REDACTED:ipv4]`로 뭉개지므로, IP를
+            // 살려야 하는 곳은 redact 예외인 attr_addr 경로여야 한다).
+            let body_text = if o.answers.is_empty() {
+                format!("{} {} (no answer)", o.question_name, o.question_type)
+            } else {
+                format!("{} {}", o.question_name, o.question_type)
+            };
+            LogRecord {
+                time_unix_nano,
+                observed_time_unix_nano: time_unix_nano,
+                severity_number: SEVERITY_INFO,
+                severity_text: redact_str("INFO"),
+                body: Some(string_value(&body_text)),
+                attributes,
+                dropped_attributes_count: 0,
+                flags: 0,
+            }
+        })
+        .collect();
+    build_request(resource, "aic.dns", service_version, log_records)
 }
 
 /// `entries`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.changes`)로 배치 인코딩한다.
@@ -762,6 +856,129 @@ mod tests {
     #[test]
     fn connection_byte_counters_saturate_at_otlp_int_max() {
         assert_eq!(saturating_i64(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn dns_observation_roundtrips_with_all_fields() {
+        let obs = vec![DnsObservation {
+            question_name: "api.example.com",
+            question_type: "A",
+            answers: &["1.2.3.4", "5.6.7.8"],
+            ttl: 300,
+            expires_at_unix_nano: 1_700_000_000_000_000_000,
+            source: "dns",
+            pid: Some(4321),
+            process_name: Some("curl"),
+        }];
+        let bytes = encode_dns_observations(&obs, &resource(None), "0.24.0", 100);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let scope_logs = &req.resource_logs[0].scope_logs[0];
+        assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.dns");
+        assert_eq!(scope_logs.log_records.len(), 1);
+        let attrs = &scope_logs.log_records[0].attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(
+            matches!(get("dns.question.name"), Some(AnyValueOneof::StringValue(v)) if v == "api.example.com")
+        );
+        assert!(
+            matches!(get("dns.question.type"), Some(AnyValueOneof::StringValue(v)) if v == "A")
+        );
+        assert!(matches!(get("dns.ttl"), Some(AnyValueOneof::IntValue(300))));
+        assert!(matches!(
+            get("aic.dns.expires_at"),
+            Some(AnyValueOneof::IntValue(1_700_000_000_000_000_000))
+        ));
+        assert!(matches!(get("aic.dns.source"), Some(AnyValueOneof::StringValue(v)) if v == "dns"));
+        assert!(matches!(
+            get("process.pid"),
+            Some(AnyValueOneof::IntValue(4321))
+        ));
+        assert!(
+            matches!(get("process.executable.name"), Some(AnyValueOneof::StringValue(v)) if v == "curl")
+        );
+    }
+
+    #[test]
+    fn dns_answers_are_comma_joined_and_survive_redaction() {
+        // 응답 IP는 콤마로 join되고, redaction 패턴(ipv4)에 뭉개지지 않아야 한다 —
+        // dns.answers는 attr_addr(redact 예외) 경로여야 payload가 살아남는다. connections의
+        // network.peer.address와 같은 근거(모듈 doc redaction invariant 예외).
+        let obs = vec![DnsObservation {
+            question_name: "cdn.example.com",
+            question_type: "A",
+            answers: &["140.82.113.4", "140.82.113.5"],
+            ttl: 60,
+            expires_at_unix_nano: 1,
+            source: "dns",
+            pid: None,
+            process_name: None,
+        }];
+        let bytes = encode_dns_observations(&obs, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        let answers = attrs
+            .iter()
+            .find(|kv| kv.key == "dns.answers")
+            .and_then(|kv| kv.value.clone())
+            .and_then(|v| v.value);
+        assert!(
+            matches!(answers, Some(AnyValueOneof::StringValue(v)) if v == "140.82.113.4,140.82.113.5"),
+            "dns.answers가 콤마 join되지 않았거나 IP가 redact됨"
+        );
+    }
+
+    #[test]
+    fn dns_negative_answer_omits_answers_attr() {
+        // NXDOMAIN/negative 응답(빈 answers)은 dns.answers attr을 생략한다 — "이름은 물었으나 IP는
+        // 없다"를 수신측이 attr 부재로 구분한다(빈 문자열 금지, changes/connections와 동일 규약).
+        let obs = vec![DnsObservation {
+            question_name: "nx.example.com",
+            question_type: "AAAA",
+            answers: &[],
+            ttl: 0,
+            expires_at_unix_nano: 0,
+            source: "dns",
+            pid: None,
+            process_name: None,
+        }];
+        let bytes = encode_dns_observations(&obs, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let lr = &req.resource_logs[0].scope_logs[0].log_records[0];
+        assert!(
+            !lr.attributes.iter().any(|kv| kv.key == "dns.answers"),
+            "negative 응답인데 dns.answers attr이 붙었다"
+        );
+        // body는 도메인+타입 요약이며 응답 없음을 명시한다.
+        assert!(matches!(
+            lr.body.as_ref().and_then(|b| b.value.clone()),
+            Some(AnyValueOneof::StringValue(v)) if v == "nx.example.com AAAA (no answer)"
+        ));
+    }
+
+    #[test]
+    fn dns_omits_pid_and_process_when_absent() {
+        // 프로세스 정보를 못 얻으면 process.* attr을 아예 붙이지 않는다(빈 문자열 금지).
+        let obs = vec![DnsObservation {
+            question_name: "a.example.com",
+            question_type: "A",
+            answers: &["10.0.0.1"],
+            ttl: 30,
+            expires_at_unix_nano: 5,
+            source: "application",
+            pid: None,
+            process_name: Some(""), // 빈 문자열도 생략 대상
+        }];
+        let bytes = encode_dns_observations(&obs, &resource(None), "0.24.0", 1);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+        assert!(!attrs.iter().any(|kv| kv.key == "process.pid"));
+        assert!(!attrs.iter().any(|kv| kv.key == "process.executable.name"));
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
