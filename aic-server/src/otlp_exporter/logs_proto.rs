@@ -90,6 +90,9 @@ pub struct ConnectionEntry<'a> {
     /// `"listen"`|`"inbound"`|`"outbound"` (aic-client가 파생한 값을 그대로 통과시킨다).
     /// `None`이면 attr을 생략해 수신측이 state/peer 기반 폴백 파생을 하게 둔다.
     pub direction: Option<&'a str>,
+    /// 소켓 생성 이후 누적 송수신 바이트. 지원되지 않는 플랫폼/프로토콜은 0.
+    pub bytes_sent: u64,
+    pub bytes_recv: u64,
 }
 
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
@@ -208,6 +211,8 @@ pub fn encode_connections(
                 attr_str("aic.connection.state", c.state),
                 attr_addr("network.local.address", c.local_addr),
                 attr_int("network.local.port", c.local_port as i64),
+                attr_int("aic.connection.bytes_sent", saturating_i64(c.bytes_sent)),
+                attr_int("aic.connection.bytes_recv", saturating_i64(c.bytes_recv)),
             ];
             if let Some(pa) = c.peer_addr {
                 attributes.push(attr_addr("network.peer.address", pa));
@@ -426,6 +431,12 @@ fn attr_int(key: &str, value: i64) -> KeyValue {
             value: Some(AnyValueOneof::IntValue(value)),
         }),
     }
+}
+
+/// OTLP `AnyValue.int_value`는 signed 64-bit라, 커널의 u64 누적 카운터가 표현 범위를 넘으면
+/// 음수로 감기지 않게 최댓값에 고정한다.
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 /// network address 전용 — value는 redact **하지 않는다**(모듈 doc 최상단 "redaction invariant
@@ -666,6 +677,8 @@ mod tests {
                 peer_port: None,
                 process: Some("sshd"),
                 direction: Some("listen"),
+                bytes_sent: 0,
+                bytes_recv: 0,
             },
             ConnectionEntry {
                 protocol: "tcp",
@@ -676,6 +689,8 @@ mod tests {
                 peer_port: Some(54321),
                 process: Some("sshd"),
                 direction: Some("inbound"),
+                bytes_sent: 1_024,
+                bytes_recv: 2_048,
             },
         ];
         let bytes = encode_connections(&entries, &resource(Some("192.168.1.5")), "0.24.0", 100);
@@ -715,6 +730,8 @@ mod tests {
             peer_port: Some(54321),
             process: Some("sshd"),
             direction: Some("inbound"),
+            bytes_sent: 1_024,
+            bytes_recv: 2_048,
         }];
         let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
         let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
@@ -732,6 +749,19 @@ mod tests {
         assert!(
             matches!(get("aic.connection.process"), Some(AnyValueOneof::StringValue(v)) if v == "sshd")
         );
+        assert!(matches!(
+            get("aic.connection.bytes_sent"),
+            Some(AnyValueOneof::IntValue(1_024))
+        ));
+        assert!(matches!(
+            get("aic.connection.bytes_recv"),
+            Some(AnyValueOneof::IntValue(2_048))
+        ));
+    }
+
+    #[test]
+    fn connection_byte_counters_saturate_at_otlp_int_max() {
+        assert_eq!(saturating_i64(u64::MAX), i64::MAX);
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
@@ -747,6 +777,8 @@ mod tests {
             peer_port: None,
             process: None,
             direction: None,
+            bytes_sent: 0,
+            bytes_recv: 0,
         }];
         let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
         let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
@@ -866,6 +898,8 @@ mod tests {
                 peer_port: Some(443),
                 process: Some(name),
                 direction: Some("outbound"),
+                bytes_sent: 0,
+                bytes_recv: 0,
             }];
             let bytes = encode_connections(&entries, &resource(None), "0.24.0", 1);
             assert!(
@@ -897,6 +931,8 @@ mod tests {
             peer_port: Some(443),
             process: None,
             direction: Some("outbound"),
+            bytes_sent: 0,
+            bytes_recv: 0,
         }];
         let bytes = encode_connections(&entries, &resource(Some("192.168.1.5")), "0.24.0", 1);
         assert!(
