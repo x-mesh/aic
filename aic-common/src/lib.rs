@@ -600,6 +600,13 @@ pub struct AicdExporterConfig {
     /// 기본 20 — 밀린 배치가 더 있으면 다음 tick에 이어서 드레인한다.
     #[serde(default = "default_spool_drain_batch_limit")]
     pub spool_drain_batch_limit: usize,
+    /// spool 배치의 **최대 나이(초)**. 이보다 오래된 배치는 drain 직전에 네트워크 없이 드롭한다.
+    /// `None`(기본) = 나이 제한 없음(기존 동작). 왜 필요한가: collector가 오래 다운돼 수천 배치가
+    /// 쌓이면 FIFO 드레인(기본 20/tick)으론 최근 이벤트가 낡은 배치 뒤에 갇혀 몇 시간 늦게 나간다.
+    /// 나이 cap을 두면 낡은(가치 낮은) telemetry가 큐 머리에서 빠져 **최근 이벤트가 앞으로 당겨진다**.
+    /// 예: `3600`(1시간) — 1시간 넘게 못 보낸 배치는 버린다.
+    #[serde(default)]
+    pub spool_max_age_secs: Option<u64>,
     /// 프로세스 생명주기 변경 이벤트(start/exit/rss 급증)를 scope=`aic.changes`로 보낼지.
     /// 부모 게이트(`enabled`)가 꺼져 있으면 이 값과 무관하게 task 자체가 뜨지 않는다.
     #[serde(default = "default_true")]
@@ -662,6 +669,7 @@ impl Default for AicdExporterConfig {
             connections_interval_secs: default_connections_interval(),
             spool_max_bytes: default_spool_max_bytes(),
             spool_drain_batch_limit: default_spool_drain_batch_limit(),
+            spool_max_age_secs: None,
             changes_enabled: true,
             changes_interval_secs: default_changes_interval(),
             logs_enabled: false,

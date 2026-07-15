@@ -88,6 +88,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         service_version: "9.9.9".to_string(),
         spool: spool.clone(),
         drain_batch_limit: 50,
+        spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };

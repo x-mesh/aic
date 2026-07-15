@@ -81,6 +81,10 @@ pub struct ExporterConfig {
     pub spool: Arc<Spool>,
     /// 드레인 한 tick당 최대 배치 수(속도 제한). config `[aicd.exporter].spool_drain_batch_limit`.
     pub drain_batch_limit: usize,
+    /// spool 배치 최대 나이. `Some`이면 drain 직전에 이보다 오래된 배치를 네트워크 없이 드롭해,
+    /// 낡은 telemetry가 FIFO 머리를 막아 최근 이벤트가 뒤에 갇히는 걸 막는다(config
+    /// `[aicd.exporter].spool_max_age_secs`). `None`이면 나이 제한 없음(기존 동작).
+    pub spool_max_age: Option<Duration>,
     /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
     pub health: Arc<ExporterHealth>,
     /// 로그 드롭 사유별 카운터(SRE t6 볼륨 안전장치) — 매 tick마다 `encode::encode_metrics`가
@@ -160,6 +164,16 @@ pub async fn serve(cfg: ExporterConfig, mut shutdown: watch::Receiver<bool>) -> 
                 }
 
                 let mut tick_failed = false;
+
+                // (0) 나이 cap — 드레인 전에 너무 오래된 배치를 네트워크 없이 드롭한다. 낡은 telemetry가
+                // FIFO 머리를 막아 최근 이벤트가 그 뒤에 갇히는 걸 막는다(수천 배치 백로그에서 20/tick
+                // 드레인으론 최근 것이 몇 시간 늦게 나간다). `None`이면 이 단계는 없다(기존 동작).
+                if let Some(max_age) = cfg.spool_max_age {
+                    let pruned = cfg.spool.prune_older_than(max_age);
+                    if pruned > 0 {
+                        tracing::debug!(pruned, "OTLP spool 나이 cap 초과 배치 드롭");
+                    }
+                }
 
                 // (1) 드레인 — 밀린 배치를 FIFO로 먼저 흘려보낸다(새 데이터보다 오래된 데이터 우선).
                 let drain_report = cfg

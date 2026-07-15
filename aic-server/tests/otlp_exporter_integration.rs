@@ -87,6 +87,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         service_version: "9.9.9".to_string(),
         spool,
         drain_batch_limit: 20,
+        spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };
@@ -148,6 +149,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         service_version: "9.9.9".to_string(),
         spool,
         drain_batch_limit: 20,
+        spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
     };

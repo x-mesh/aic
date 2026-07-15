@@ -342,6 +342,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         service_version: "0.0.0-test".to_string(),
         spool: spool.clone(),
         drain_batch_limit: 20,
+        spool_max_age: None,
         health,
         drop_counters: Arc::clone(&drop_counters),
     };

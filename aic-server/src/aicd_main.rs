@@ -716,6 +716,7 @@ fn load_exporter_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         spool,
         drain_batch_limit: ex.spool_drain_batch_limit,
+        spool_max_age: ex.spool_max_age_secs.map(std::time::Duration::from_secs),
         health,
         // t12: 호출부(main)가 logs exporter(`serve_logs`)와 공유하는 동일 `Arc`를 넘긴다 — 두
         // task의 카운터가 합쳐져야 `aic.log.dropped` 게이지가 실제 드롭을 반영한다.
