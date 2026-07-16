@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-16
+
+### Added
+- **프로세스별 리소스 top-N exporter (`aic.process`)** — aicd가 host metrics tick(60초)에 편승해
+  CPU/메모리/디스크 IO 상위 소비자를 OTLP Logs(scope `aic.process`)로 전송한다. 각 LogRecord가
+  프로세스 하나이며 `process.executable.name`·`process.pid`·`process.cpu_utilization`(%, 코어 합산이라
+  100% 초과 가능)·`process.memory_rss_bytes`·`process.disk.read_bytes`·`process.disk.write_bytes`
+  (직전 tick delta) attr을 싣는다. **왜 metrics가 아니라 logs인가**: host metrics는 무차원 Gauge
+  (수신측이 `avg(value)`, GROUP BY 없음)라 이름/PID 차원을 못 싣는다 — 프로세스별은 필터·집계돼야
+  하므로 connections와 같은 logs 경로로 보낸다. **카디널리티**: 매 tick 호스트당 최대 3N=30개
+  (CPU 상위 N ∪ 메모리 상위 N ∪ 디스크 IO 상위 N, pid dedupe; N=10). 디스크를 별도 축으로 둬
+  백업/로그 flush처럼 CPU·메모리는 낮고 IO만 큰 프로세스도 잡는다. 이미 refresh한 프로세스 목록을
+  재사용하므로 추가 열거 비용이 없다. config `[aicd.exporter].process_enabled`(**기본 true**,
+  events/connections 관례)로 끌 수 있다.
+
+### Fixed
+- **`aic daemon start`/`restart`가 설정 오류 시 재시작하지 않고 중단** — config.toml 파싱 실패나
+  검증 오류가 있으면 데몬을 띄우지 않고 에러를 낸다(기존엔 조용히 기본값으로 폴백해 오설정이 묻혔다).
+  start는 ping 후, restart는 기존 프로세스를 내린 뒤 preflight로 검사한다.
+- **`aic update`가 셸 hook 파일을 재생성** — 바이너리 교체 후 `~/.aic/hooks.{bash,zsh}`·
+  `~/.aic/hook-events.{bash,zsh}`을 최신 내용으로 다시 쓴다. hook 포맷이 바뀐 버전으로 업데이트해도
+  사용자가 `aic init`을 다시 돌릴 필요가 없다(구 hook로 인한 명령 이벤트 유실 방지).
+
 ## [0.28.0] - 2026-07-16
 
 ### Added
