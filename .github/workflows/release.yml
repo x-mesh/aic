@@ -55,6 +55,17 @@ jobs:
           cargo install --locked cargo-zigbuild --version 0.20.1 || \
             cargo install --locked cargo-zigbuild
 
+      # darwin cross-compile이 macOS framework(Security/CoreFoundation/IOKit)를 링크하게 한다.
+      #   aic-server가 sysinfo(IOKit/CF)·keyring(Security)을 쓰게 된 v0.27.0부터, zig 링커는
+      #   Apple SDK framework 경로를 몰라 `undefined symbol: _IOBSDNameMatching`/`_SecKeychain*`
+      #   등으로 죽었다(GoReleaser rust builder는 tool과 무관하게 항상 `zigbuild`라 native cargo로
+      #   우회할 수 없다 — run 29462783583). cargo-zigbuild는 `SDKROOT`가 있으면 그 SDK의
+      #   framework를 zig에 넘긴다. macos runner엔 실제 SDK가 있으므로 경로를 박아 준다.
+      - name: Point cargo-zigbuild at the macOS SDK (darwin framework linking)
+        run: |
+          echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
       # Validate config first — fast feedback on .goreleaser.yaml syntax errors.
       # version 고정: `brews`가 GoReleaser v2.16에서 hard-removal 됐다(v2.10 soft-deprecate).
       # `version: latest`가 v2.16.0을 받으면서 `check`가 deprecated 속성으로 exit 2 →
