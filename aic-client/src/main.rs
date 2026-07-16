@@ -2282,12 +2282,49 @@ fn handle_snapshot_uninstall() -> anyhow::Result<()> {
 }
 
 /// `aic daemon start`: aicd binary를 시작한다 (이미 떠 있으면 no-op).
+/// config.toml 본문이 `AppConfig`로 파싱되는지 검증한다(순수 — IO 없음).
+///
+/// [`ConfigManager::load`]도 aicd(`aicd_main`)의 config 로더도 **파싱 실패를 경고만 내고 default/기능
+/// 비활성으로 폴백**한다 — 그래서 오타가 있는 config로 aicd를 띄우면 exporter·로그 수집이 조용히
+/// 전부 꺼진 채 데몬만 살아, 사용자는 "왜 텔레메트리가 안 가지"를 한참 뒤에야 눈치챈다. daemon
+/// start/restart 전에 이 함수로 파싱을 강제해 문제를 표면화하고, 잘못된 설정으로 기동하지 않는다.
+fn validate_config_toml(content: &str) -> Result<(), String> {
+    toml::from_str::<aic_common::AppConfig>(content)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// aicd 시작/재시작 전 config **파일이 있으면** 파싱이 유효한지 확인한다. 파일이 없으면 default로
+/// 도는 게 정상이므로 통과시킨다(설정을 안 둔 것은 오류가 아니다).
+fn preflight_daemon_config() -> Result<(), String> {
+    let path = ConfigManager::config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("{} 읽기 실패: {e}", path.display()))?;
+    validate_config_toml(&content).map_err(|e| format!("{} 파싱 실패:\n{e}", path.display()))
+}
+
+/// config 문제로 aicd를 기동하지 않을 때 사람이 읽을 에러를 찍고 프로세스를 종료한다.
+/// `action`은 `"시작"`/`"재시작"`.
+fn abort_daemon_on_bad_config(action: &str, msg: String) -> ! {
+    eprintln!("{COL_RED}✗{COL_RESET} 설정에 문제가 있어 aicd를 {action}하지 않습니다:\n{msg}");
+    eprintln!("{COL_DIM}  설정을 고친 뒤 다시 시도하세요.{COL_RESET}");
+    std::process::exit(1);
+}
+
 async fn handle_daemon_start(foreground: bool) {
     let sock = aic_common::aicd_socket_path();
     let client = UdsClient::new(sock.clone());
     if let Ok(true) = client.ping().await {
         println!("{COL_GREEN}✓{COL_RESET} aicd가 이미 실행 중입니다");
         return;
+    }
+
+    // 잘못된 config로 aicd를 띄우면 exporter/로그 수집이 조용히 꺼진다 — 기동 전에 파싱을 검증한다.
+    if let Err(msg) = preflight_daemon_config() {
+        abort_daemon_on_bad_config("시작", msg);
     }
 
     // aic 실행 파일과 같은 디렉토리에 있는 aicd를 우선 시도, 없으면 PATH로 폴백.
@@ -2803,6 +2840,13 @@ async fn handle_daemon_restart(if_running: bool) {
     if if_running && !was_running {
         println!("{COL_DIM}aicd가 실행 중이 아닙니다 — 재시작 skip{COL_RESET}");
         return;
+    }
+
+    // config 파싱을 먼저 검증한다 — unit 경유 재시작은 handle_daemon_start를 거치지 않으므로
+    // 여기서 막지 않으면 잘못된 설정으로 재기동돼 exporter/로그 수집이 조용히 꺼진다. 재시작하면
+    // 돌던 구버전/기존 aicd는 그대로 살아 있으니, 여기서 중단해도 관측이 끊기지 않는다.
+    if let Err(msg) = preflight_daemon_config() {
+        abort_daemon_on_bad_config("재시작", msg);
     }
 
     // 자동 시작 unit이 관리 중이면 매니저에게 맡긴다 — 우리가 죽이면 KeepAlive가
@@ -9625,7 +9669,7 @@ mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled, hooks_to_regenerate,
         is_destructive_command, parse_duration_arg, parse_session_capture_mode, resolve_init_modes,
-        resolve_provider, validate_bind, Cli, Commands, ATTACH_SNIPPET,
+        resolve_provider, validate_bind, validate_config_toml, Cli, Commands, ATTACH_SNIPPET,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -9846,6 +9890,19 @@ source /root/.aic/hook-events.bash
         assert!(names.contains(&"hook-events.bash"));
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|(_, body)| !body.is_empty()));
+    }
+
+    #[test]
+    fn validate_config_toml_accepts_valid_rejects_broken() {
+        // 최소 유효 config는 통과 — daemon start/restart가 정상 설정을 막으면 안 된다.
+        let ok = "[llm]\ndefault_provider = \"openai\"\n\
+                  [server]\nmax_buffer_lines = 500\n\
+                  [server.boundary_strategy]\nmethod = \"prompt_marker\"\n";
+        assert!(validate_config_toml(ok).is_ok(), "유효 config가 거부됨");
+        // 닫히지 않은 문자열 → 파싱 실패(load는 이걸 조용히 default로 폴백하지만 여기선 Err).
+        assert!(validate_config_toml("[llm]\ndefault_provider = \"openai\n").is_err());
+        // 타입 불일치(정수 자리에 문자열).
+        assert!(validate_config_toml("[server]\nmax_buffer_lines = \"nope\"\n").is_err());
     }
 
     #[test]
