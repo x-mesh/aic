@@ -1457,6 +1457,11 @@ async fn main() {
                 // binary를 갈아끼웠으면 이미 떠 있는 aicd는 아직 옛 코드로 돈다.
                 // 여기서 재시작까지 해야 update가 실제로 적용된다 (안내만 하면 빠뜨린다).
                 Ok(aic_client::update::Outcome::Replaced) => {
+                    // update는 binary만 갈아끼우므로 shell hook 파일(~/.aic/hooks.*·hook-events.*)은
+                    // 그대로다. 파일이 유실(rc의 source 라인만 남고 파일은 삭제)되거나 포맷이 낡으면
+                    // command 수집이 조용히 멈춘다(rc는 없는 파일을 source하려다 실패). init한 흔적이
+                    // 있는 셸의 hook 파일을 self-heal한다.
+                    regenerate_hooks_after_update();
                     handle_daemon_restart(true).await;
                 }
                 Ok(aic_client::update::Outcome::Unchanged) => {}
@@ -3061,6 +3066,60 @@ fi
 /// `aic init <shell>`: 셸 rc 파일에 `source ~/.aic/hooks.{shell}` 라인을 멱등 추가.
 /// 마커 `# >>> aic hooks >>>` ~ `# <<< aic hooks <<<` 로 감싸서 안전하게 롤백 가능.
 /// `no_attach`가 false(기본)면 source 앞에 PTY auto-attach 스니펫도 함께 넣는다.
+/// PTY hook(`hooks.*`)의 rc marker. [`handle_init`]과 [`hooks_to_regenerate`]가 공유한다.
+const AIC_HOOKS_MARKER: &str = "# >>> aic hooks >>>";
+
+/// `rc_content`에 어떤 aic hook의 marker가 있는지 보고, update 후 self-heal할 hook 파일 목록을
+/// `(파일명, 내용)`으로 돌려준다(순수 함수 — IO 없음). marker가 없는 hook은 애초에 `aic init`으로
+/// 설치한 적이 없으므로 재생성 대상이 아니다. hook 파일 내용은 항상 **현재 binary 기준 최신**으로
+/// 생성하므로, 유실뿐 아니라 낡은 포맷도 함께 갱신된다.
+fn hooks_to_regenerate(rc_content: &str, shell: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    // PTY hook (OSC 133 marker 기록) — `~/.aic/hooks.<shell>`.
+    if rc_content.contains(AIC_HOOKS_MARKER) {
+        out.push((
+            format!("hooks.{shell}"),
+            aic_common::generate_shell_hooks(shell),
+        ));
+    }
+    // metadata hook-events — `~/.aic/hook-events.<shell>`.
+    if rc_content.contains(aic_client::hook_install::RC_MARKER_BEGIN) {
+        let script = match shell {
+            "zsh" => aic_client::hook_install::zsh_hook_script(),
+            _ => aic_client::hook_install::bash_hook_script(),
+        };
+        out.push((format!("hook-events.{shell}"), script));
+    }
+    out
+}
+
+/// `aic update`로 binary를 갈아끼운 뒤, 이전에 `aic init`한 흔적(rc marker)이 있는 셸의 hook 파일을
+/// 재생성한다. **rc 자체는 건드리지 않는다**(marker/auto-attach 설정 보존) — 파일만 self-heal한다.
+fn regenerate_hooks_after_update() {
+    let Ok(home) = std::env::var("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let aic_dir = home.join(".aic");
+    for (rc_name, shell) in [(".zshrc", "zsh"), (".bashrc", "bash")] {
+        let Ok(rc) = std::fs::read_to_string(home.join(rc_name)) else {
+            continue; // rc 없음 = 이 셸은 미사용
+        };
+        for (filename, body) in hooks_to_regenerate(&rc, shell) {
+            if std::fs::create_dir_all(&aic_dir).is_err() {
+                continue;
+            }
+            let path = aic_dir.join(&filename);
+            match std::fs::write(&path, &body) {
+                Ok(()) => println!("{COL_GREEN}✔{COL_RESET} hook 재생성: {}", path.display()),
+                Err(e) => eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} hook 재생성 실패: {} — {e}",
+                    path.display()
+                ),
+            }
+        }
+    }
+}
+
 fn handle_init(shell_arg: Option<String>, hook_mode: bool, no_attach: bool) {
     const MARKER_BEGIN: &str = "# >>> aic hooks >>>";
     const MARKER_END: &str = "# <<< aic hooks <<<";
@@ -9564,7 +9623,7 @@ fn print_command_block(title: &str, cmd: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_config_set, apply_provider_override, chat_run_command_enabled,
+        apply_config_set, apply_provider_override, chat_run_command_enabled, hooks_to_regenerate,
         is_destructive_command, parse_duration_arg, parse_session_capture_mode, resolve_init_modes,
         resolve_provider, validate_bind, Cli, Commands, ATTACH_SNIPPET,
     };
@@ -9768,6 +9827,40 @@ mod tests {
 
         let err = apply_config_set(&mut cfg, "server.max_buffer_lines", "1000").unwrap_err();
         assert!(err.to_string().contains("지원하지 않는 config path"));
+    }
+
+    #[test]
+    fn hooks_to_regenerate_covers_present_markers_only() {
+        // 두 marker 다 있는 rc → hooks + hook-events 둘 다 재생성 대상, 내용 비어있지 않다.
+        let rc = "\
+# >>> aic hooks >>>
+source /root/.aic/hooks.bash
+# <<< aic hooks <<<
+# >>> aic hook-events >>>
+source /root/.aic/hook-events.bash
+# <<< aic hook-events <<<
+";
+        let out = hooks_to_regenerate(rc, "bash");
+        let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"hooks.bash"));
+        assert!(names.contains(&"hook-events.bash"));
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|(_, body)| !body.is_empty()));
+    }
+
+    #[test]
+    fn hooks_to_regenerate_skips_when_no_marker() {
+        // marker 없는 rc(= aic init 안 함)면 재생성 대상 0 — update가 rc를 새로 만들지 않는다.
+        assert!(hooks_to_regenerate("export PATH=/usr/bin\n", "zsh").is_empty());
+    }
+
+    #[test]
+    fn hooks_to_regenerate_only_pty_hook_when_only_that_marker() {
+        // hooks marker만 있으면 PTY hook 하나만(hook-events는 미설치라 건너뜀).
+        let rc = "# >>> aic hooks >>>\nsource x\n# <<< aic hooks <<<\n";
+        let out = hooks_to_regenerate(rc, "zsh");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "hooks.zsh");
     }
 
     #[test]
