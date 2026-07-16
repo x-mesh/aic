@@ -65,10 +65,32 @@ pub struct ResourceAttrs {
     pub os_desc: String,
 }
 
-/// 한 번 수집한 host metrics 스냅샷(resource + gauge point 목록).
+/// 프로세스별 리소스 top-N 샘플 하나 — `logs_proto::encode_process_samples`로 인코딩된다.
+/// host metrics와 달리 이름/PID 차원을 담으므로 metrics(무차원 Gauge)가 아니라 OTLP Logs로
+/// 나간다(logs_proto의 `ProcessEntry` doc 참고).
+pub struct ProcessSample {
+    pub name: String,
+    pub pid: i64,
+    /// 직전 tick 이후 CPU 사용률(%). 코어 합산이라 100%를 넘을 수 있다.
+    pub cpu_pct: f64,
+    pub rss_bytes: u64,
+    /// 직전 tick 이후 읽은/쓴 디스크 바이트(delta). 미지원 플랫폼/첫 tick은 0.
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+}
+
+/// 매 tick 실을 프로세스 수 — CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N(합집합, pid dedupe)
+/// 이라 최대 3N개. 시계열 키가 (host, pid, name)이라 이 값이 곧 프로세스 신호의 호스트당
+/// 카디널리티 상한을 정한다.
+const TOP_PROCESS_COUNT: usize = 10;
+
+/// 한 번 수집한 host metrics 스냅샷(resource + gauge point 목록 + top-N 프로세스).
 pub struct HostSample {
     pub resource: ResourceAttrs,
     pub points: Vec<MetricPoint>,
+    /// CPU/메모리 상위 소비자(scope=`aic.process`). `process_enabled=false`거나 프로세스를 하나도
+    /// 못 읽으면 비어 있고, 그러면 호출부(`serve`)가 process logs push를 건너뛴다.
+    pub top_processes: Vec<ProcessSample>,
 }
 
 /// stateful host metrics 샘플러. i/o delta 계산을 위해 `Disks`/`Networks`/직전 시각을 보존한다.
@@ -119,15 +141,24 @@ impl HostSampler {
     pub fn sample(&mut self) -> HostSample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        // 프로세스 수 + top RSS 계산에 memory()가 필요해 `.with_memory()`를 켠다. 이 머신(프로세스
-        // ~990개) 실측으로는 nothing() 8.1~15.4ms vs with_memory() 14.1~20.8ms — 차이가 프로세스당
-        // syscall 1회(`proc_pidinfo(PROC_PIDTASKINFO)`) 추가분이고, 재측정하면 순서가 뒤바뀔 만큼
-        // 회차 간 노이즈에 묻힌다. 프로세스 열거(`proc_listpids`) 자체가 이미 지배적 비용이라
-        // 60초 주기에서 유의미한 부담이 아니다.
+        // 프로세스 수 + top RSS 계산에 memory()가, top-N 프로세스(scope=`aic.process`)의 CPU·disk
+        // IO에 cpu_usage()·disk_usage()가 필요해 `.with_cpu().with_memory().with_disk_usage()`를
+        // 켠다. disk_usage도 proc_pidinfo(macOS)/`/proc/<pid>/io`(Linux)에서 같은 열거로 얻으므로
+        // 순증 비용이 작다. 이 머신(프로세스 ~990개) 실측:
+        // nothing() 8.1~15.4ms vs with_memory() 14.1~20.8ms — 차이가 프로세스당 syscall 1회
+        // (`proc_pidinfo(PROC_PIDTASKINFO)`) 추가분이고 회차 노이즈에 묻힌다. with_cpu()는
+        // proc_pidinfo(PROC_PIDTASKINFO)의 CPU tick을 같은 호출에서 얻으므로 순증 비용이 작다.
+        // 프로세스 열거(`proc_listpids`) 자체가 이미 지배적 비용이라 60초 주기에서 유의미한 부담이
+        // 아니다. **CPU 사용률은 직전 refresh 이후 delta**라, refresh를 안 하는 `new()` 직후 첫
+        // tick에선 프로세스 cpu가 0으로 나오고 두 번째 tick(=60초 후)부터 정상 값이 된다 — top-N도
+        // 첫 tick은 메모리 기준으로만 유효하고 그 다음부터 CPU가 채워진다(용인되는 초기 과도구간).
         self.sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
             true,
-            ProcessRefreshKind::nothing().with_memory(),
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .with_disk_usage(),
         );
         self.disks.refresh(false);
         self.networks.refresh(false);
@@ -181,6 +212,9 @@ impl HostSampler {
         // "범인이 누구인가"는 changes exporter의 rss_spike가 이미 다룬다.
         // 가시 범위(비루트 macOS는 same-uid만)는 모듈 doc 참고.
         let top_rss = top_process_rss(self.sys.processes().values().map(|p| p.memory()));
+        // 프로세스별 top-N(CPU/메모리 상위 소비자). 이미 refresh한 목록을 재사용하므로 추가 열거
+        // 비용이 없다. host_metrics의 무차원 Gauge와 달리 이름/PID를 담아 OTLP Logs로 나간다.
+        let top_processes = collect_top_processes(&self.sys, TOP_PROCESS_COUNT);
         let uptime = System::uptime();
         // filesystem은 available/limit만으로도 used를 유도할 수 있지만, 대시보드가 매번
         // 빼기를 하지 않도록 usage/utilization을 직접 낸다(디스크 full이 가장 흔한 사고 원인).
@@ -364,6 +398,7 @@ impl HostSampler {
                 os_desc: self.os_desc.clone(),
             },
             points,
+            top_processes,
         }
     }
 }
@@ -378,6 +413,88 @@ impl HostSampler {
 ///    0으로 보고되므로 max에서 자연히 무시된다 — 0이 최대라는 건 전부 실패했다는 것뿐이다.
 fn top_process_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
     memories.into_iter().max().filter(|&v| v > 0)
+}
+
+/// 이미 refresh된 `sys`의 프로세스 목록에서 top-N을 뽑는다(추가 열거 없음). sysinfo 경계에서
+/// 소유 [`ProcessSample`]로 복사한 뒤 순수 함수 [`select_top_processes`]에 위임한다 — 그래야 선택
+/// 로직을 sysinfo 없이 결정적으로 테스트할 수 있다.
+fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
+    let all: Vec<ProcessSample> = sys
+        .processes()
+        .values()
+        .map(|p| {
+            let io = p.disk_usage();
+            ProcessSample {
+                name: p.name().to_string_lossy().into_owned(),
+                pid: i64::from(p.pid().as_u32()),
+                cpu_pct: f64::from(p.cpu_usage()),
+                rss_bytes: p.memory(),
+                // read_bytes/written_bytes는 직전 refresh 이후 delta(total_*가 누적) — "이 창에서
+                // 누가 디스크를 때렸나"라 delta가 맞다.
+                disk_read_bytes: io.read_bytes,
+                disk_write_bytes: io.written_bytes,
+            }
+        })
+        .collect();
+    select_top_processes(all, n)
+}
+
+/// CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N을 골라 pid로 중복 제거한다. 순수 함수로 분리해
+/// sysinfo 없이 픽스처로 결정적 검증을 한다([`top_process_rss`]와 동일 취지).
+///
+/// - CPU 랭킹은 `cpu > 0`, 메모리 랭킹은 `rss > 0`, 디스크 랭킹은 `read+write > 0` 프로세스만
+///   후보로 본다 — idle/커널 스레드(세 지표 모두 0)가 동률로 상위에 끼어 노이즈를 만드는 걸 막는다.
+/// - 세 랭킹의 **합집합**을 pid로 dedupe → 한 프로세스가 여러 축에서 상위여도 한 번만 실린다.
+///   각 레코드는 cpu·rss·disk를 모두 담으므로 어느 축으로 뽑혔든 세 지표가 함께 나간다. 디스크
+///   전용 소비자(백업/로그 flush 등, CPU·mem은 낮음)를 놓치지 않으려 디스크를 별도 축으로 둔다.
+/// - 결과는 cpu 내림차순, 동률이면 pid 오름차순으로 정렬해 결정적이다(tie로 순서가 흔들리지 않게).
+fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let cpu_desc_pid_asc = |a: &usize, b: &usize, all: &[ProcessSample]| {
+        all[*b]
+            .cpu_pct
+            .partial_cmp(&all[*a].cpu_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(all[*a].pid.cmp(&all[*b].pid))
+    };
+    let disk_io = |p: &ProcessSample| p.disk_read_bytes.saturating_add(p.disk_write_bytes);
+
+    let mut by_cpu: Vec<usize> = (0..all.len()).filter(|&i| all[i].cpu_pct > 0.0).collect();
+    by_cpu.sort_by(|&a, &b| cpu_desc_pid_asc(&a, &b, &all));
+    let mut keep: std::collections::HashSet<usize> = by_cpu.into_iter().take(n).collect();
+
+    let mut by_mem: Vec<usize> = (0..all.len()).filter(|&i| all[i].rss_bytes > 0).collect();
+    by_mem.sort_by(|&a, &b| {
+        all[b]
+            .rss_bytes
+            .cmp(&all[a].rss_bytes)
+            .then(all[a].pid.cmp(&all[b].pid))
+    });
+    keep.extend(by_mem.into_iter().take(n));
+
+    let mut by_disk: Vec<usize> = (0..all.len()).filter(|&i| disk_io(&all[i]) > 0).collect();
+    by_disk.sort_by(|&a, &b| {
+        disk_io(&all[b])
+            .cmp(&disk_io(&all[a]))
+            .then(all[a].pid.cmp(&all[b].pid))
+    });
+    keep.extend(by_disk.into_iter().take(n));
+
+    let mut result: Vec<ProcessSample> = all
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, p)| p)
+        .collect();
+    result.sort_by(|a, b| {
+        b.cpu_pct
+            .partial_cmp(&a.cpu_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.pid.cmp(&b.pid))
+    });
+    result
 }
 
 /// aicd가 일부 프로세스의 RSS를 못 읽는 상태인가(= `top_process.usage`가 과소 집계될 수 있는가).
@@ -583,6 +700,123 @@ mod tests {
         // "아무도 메모리를 안 쓴다"는 거짓 신호가 되므로 point를 생략해야 한다.
         assert_eq!(top_process_rss([0u64, 0, 0]), None);
         assert_eq!(top_process_rss([0u64]), None);
+    }
+
+    fn proc(name: &str, pid: i64, cpu_pct: f64, rss_bytes: u64) -> ProcessSample {
+        ProcessSample {
+            name: name.to_string(),
+            pid,
+            cpu_pct,
+            rss_bytes,
+            disk_read_bytes: 0,
+            disk_write_bytes: 0,
+        }
+    }
+
+    fn proc_io(name: &str, pid: i64, disk_read_bytes: u64, disk_write_bytes: u64) -> ProcessSample {
+        ProcessSample {
+            name: name.to_string(),
+            pid,
+            cpu_pct: 0.0,
+            rss_bytes: 0,
+            disk_read_bytes,
+            disk_write_bytes,
+        }
+    }
+
+    #[test]
+    fn select_top_processes_unions_cpu_and_memory_leaders() {
+        // CPU 1등(rss 작음)과 메모리 1등(cpu 0)이 둘 다 뽑혀야 한다 — 한 축만 보면 반대 축의
+        // 범인을 놓친다. dedupe라 양쪽 상위인 프로세스는 한 번만.
+        let all = vec![
+            proc("cpu-hog", 1, 95.0, 1024),
+            proc("mem-hog", 2, 0.0, 8 * 1024 * 1024 * 1024),
+            proc("both", 3, 80.0, 4 * 1024 * 1024 * 1024),
+            proc("idle", 4, 0.0, 0), // cpu·rss 둘 다 0 → 후보 아님
+        ];
+        let top = select_top_processes(all, 2);
+        let pids: Vec<i64> = top.iter().map(|p| p.pid).collect();
+        // top2 cpu = {1,3}, top2 mem = {2,3} → 합집합 {1,2,3}, idle(4)은 제외.
+        assert!(pids.contains(&1) && pids.contains(&2) && pids.contains(&3));
+        assert!(!pids.contains(&4), "cpu·rss 둘 다 0인 idle은 실리면 안 된다");
+        assert_eq!(top.len(), 3);
+        // cpu 내림차순 정렬: cpu-hog(95) > both(80) > mem-hog(0).
+        assert_eq!(top[0].pid, 1);
+        assert_eq!(top[1].pid, 3);
+        assert_eq!(top[2].pid, 2);
+    }
+
+    #[test]
+    fn select_top_processes_dedupes_process_in_both_rankings() {
+        // 한 프로세스가 CPU·메모리 양쪽 최상위여도 한 번만 실린다(중복 시계열 금지).
+        let all = vec![
+            proc("heavy", 1, 99.0, 16 * 1024 * 1024 * 1024),
+            proc("light", 2, 1.0, 1024),
+        ];
+        let top = select_top_processes(all, 5);
+        assert_eq!(top.iter().filter(|p| p.pid == 1).count(), 1);
+    }
+
+    #[test]
+    fn select_top_processes_excludes_zero_cpu_zero_rss_noise() {
+        // 커널 스레드/idle(cpu=0 & rss=0)이 tie로 상위에 끼면 안 된다 — 후보 자체에서 배제.
+        let all = vec![
+            proc("real", 1, 5.0, 512 * 1024 * 1024),
+            proc("k0", 2, 0.0, 0),
+            proc("k1", 3, 0.0, 0),
+            proc("k2", 4, 0.0, 0),
+        ];
+        let top = select_top_processes(all, 3);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].pid, 1);
+    }
+
+    #[test]
+    fn select_top_processes_captures_disk_only_consumer() {
+        // 디스크 전용 소비자(cpu·rss 낮음, IO 큼 — 백업/로그 flush)가 CPU·메모리 축에는 안 걸려도
+        // 디스크 축으로 뽑혀야 한다. 디스크를 별도 축으로 두는 이유가 이것이다.
+        let all = vec![
+            proc("cpu-hog", 1, 90.0, 1024),
+            proc("mem-hog", 2, 0.0, 8 * 1024 * 1024 * 1024),
+            proc_io("backup", 3, 0, 2 * 1024 * 1024 * 1024), // disk write만 큼
+        ];
+        let top = select_top_processes(all, 1);
+        let pids: Vec<i64> = top.iter().map(|p| p.pid).collect();
+        // top1 cpu={1}, top1 mem={2}, top1 disk={3} → 합집합 {1,2,3}.
+        assert!(
+            pids.contains(&3),
+            "디스크 전용 소비자가 top-N에 없다: {pids:?}"
+        );
+        assert_eq!(top.len(), 3);
+    }
+
+    #[test]
+    fn select_top_processes_empty_when_n_is_zero() {
+        let all = vec![proc("a", 1, 10.0, 1024)];
+        assert!(select_top_processes(all, 0).is_empty());
+    }
+
+    #[test]
+    fn collect_top_processes_from_live_system_are_readable() {
+        // 실제 시스템: 자기 자신이 돌고 있으므로 최소 1개는 뽑히고(비어 있지 않고), 뽑힌 것은
+        // cpu>0 또는 rss>0 중 하나는 만족해야 한다(idle 노이즈 배제 회귀 가드).
+        let mut s = HostSampler::new();
+        // cpu delta가 채워지도록 두 번 sample한다(첫 tick은 프로세스 cpu가 0).
+        let _ = s.sample();
+        let sample = s.sample();
+        for p in &sample.top_processes {
+            assert!(
+                p.cpu_pct > 0.0 || p.rss_bytes > 0 || p.disk_read_bytes > 0 || p.disk_write_bytes > 0,
+                "cpu·rss·disk 모두 0인 프로세스가 top-N에 실렸다: {} pid={}",
+                p.name,
+                p.pid
+            );
+        }
+        assert!(
+            sample.top_processes.len() <= 3 * TOP_PROCESS_COUNT,
+            "top-N 상한(3N: cpu+mem+disk) 초과: {}",
+            sample.top_processes.len()
+        );
     }
 
     #[test]

@@ -346,6 +346,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         spool_max_age: None,
         health,
         drop_counters: Arc::clone(&drop_counters),
+        process_enabled: false,
     };
     let (msd_tx, msd_rx) = watch::channel(false);
     let metrics_handle = tokio::spawn(async move {

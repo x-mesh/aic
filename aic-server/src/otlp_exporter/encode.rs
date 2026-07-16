@@ -313,6 +313,8 @@ mod tests {
                     value: MetricValue::Int(8 * 1024 * 1024 * 1024),
                 },
             ],
+            // encode_metrics는 points만 인코딩한다(프로세스는 logs 경로) — 이 테스트엔 불필요.
+            top_processes: Vec::new(),
         }
     }
 

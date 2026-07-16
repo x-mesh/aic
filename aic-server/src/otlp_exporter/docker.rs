@@ -698,6 +698,9 @@ async fn serve_docker_with(
                                 os_desc: os_desc.clone(),
                             },
                             points,
+                            // docker task는 프로세스를 수집하지 않는다 — encode_metrics는 points만
+                            // 쓰므로 비워 둔다(process logs는 host metrics tick만 낸다).
+                            top_processes: Vec::new(),
                         };
                         let body = encode::encode_metrics(
                             &sample,

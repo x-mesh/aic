@@ -90,6 +90,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
     };
     let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
 
@@ -152,6 +153,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
     };
     let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
 
