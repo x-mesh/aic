@@ -7,10 +7,11 @@
 ```sh
 # 1. CHANGELOG의 [Unreleased] → [X.Y.Z] 로 정리
 # 2. Cargo.toml 버전 bump (aic-common/aic-server/aic-client) + Cargo.lock 반영
-# 3. 로컬 검증 (아래 "정상 흐름" 4번) — release.yml이 릴리스 게이트라, main CI는 안 쓴다
-# 4. bump 커밋은 [skip ci]로 — main FF push가 CI를 또 돌리지 않게(release=tag만 돈다)
-git commit -am "chore(release): vX.Y.Z [skip ci]"
-git push origin develop && git push origin develop:main   # main은 tag가 가리킬 커밋
+# 3. 로컬 검증 (아래 "정상 흐름" 4번) — release.yml이 릴리스 게이트다
+# 4. bump 커밋에 [skip ci]를 넣지 말 것 — tag가 이 커밋을 가리키는데, [skip ci]는
+#    tag push로 트리거될 release.yml까지 스킵한다(v0.29.0에서 release가 안 떴다 → 아래 트러블슈팅).
+git commit -am "chore(release): vX.Y.Z"
+git push origin develop && git push origin develop:main   # main은 tag가 가리킬 커밋(FF)
 # 5. tag push → release.yml(커스텀 빌드 + GitHub Release + brew) 발화
 git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
 # 6. release run 확인
@@ -19,8 +20,10 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 
 > **왜 main CI 게이트가 없는가**: release.yml **자체가 4 target을 릴리스 프로파일(phase-3_4)로 빌드**하므로,
 > 빌드가 깨지면 release가 실패하고 에셋이 안 나간다(`mode: replace` 멱등이라 재실행도 안전). 즉 release
-> run이 곧 게이트다. 코드 회귀 방지는 **로컬 사전 검증(4번)**과 개발 중 PR CI로 잡는다. 그래서 릴리스
-> 시엔 main push로 ci.yml을 중복해 돌릴 이유가 없어 `[skip ci]`로 끈다 — **tag(release)만 돈다.**
+> run이 곧 게이트다. 코드 회귀 방지는 **로컬 사전 검증(4번)**과 개발 중 PR CI로 잡는다. main FF push로
+> ci.yml이 한 번 도는 건 무해하니 그대로 둔다 — **bump 커밋에 `[skip ci]`를 넣지 말 것.** 그 커밋이 곧
+> tag 대상이라, `[skip ci]`가 있으면 main CI뿐 아니라 **tag push로 떠야 할 release.yml까지 스킵된다**
+> (`[skip ci]`는 이벤트 종류를 안 가리고 그 커밋을 참조하는 모든 push 워크플로를 끈다).
 
 이 tag push가 다음을 자동으로 한다 (`.github/workflows/release.yml`, `macos-latest` runner 단일 job):
 - Rust toolchain(4 triple) + zig + cargo-zigbuild 설치
@@ -63,8 +66,8 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
    AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
    ```
 
-5. `git commit -am "chore(release): vX.Y.Z [skip ci]"` — **커밋 메시지에 `[skip ci]`** (main push가 ci.yml을 또 돌리지 않게).
-6. `git push origin develop` 후 `git push origin develop:main` — main은 tag가 가리킬 커밋(FF). `[skip ci]`라 main CI는 안 돈다.
+5. `git commit -am "chore(release): vX.Y.Z"` — **`[skip ci]`를 넣지 말 것.** 이 커밋이 곧 tag 대상이라, `[skip ci]`가 있으면 tag push로 떠야 할 release.yml까지 스킵된다(v0.29.0 실측).
+6. `git push origin develop` 후 `git push origin develop:main` — main은 tag가 가리킬 커밋(FF). main push로 ci.yml이 한 번 도는 건 무해하니 그대로 둔다.
 7. `git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` — release.yml 발화.
 8. `gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status` — 그린이면 끝. `brew update && brew info x-mesh/tap/aic`로 새 버전 노출 확인.
 
@@ -88,7 +91,7 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 | **darwin 빌드 `undefined symbol: _SecKeychain*`/`_IOBSDNameMatching`** | zig 링커가 macOS 프레임워크(Security/CoreFoundation/IOKit)를 못 링크. **darwin은 반드시 native `cargo build`**(release.yml이 이미 그렇게 함). zigbuild로 darwin을 빌드하면 재발한다 — v0.27.0~v0.28.0에서 이걸로 5번 실패했다. |
 | linux zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. `mlugg/setup-zig` 버전과 `cargo-zigbuild --version`을 함께 bump. |
 | Formula가 안 갱신됨 | secret 권한 부족(Contents write). tap push 로그 확인. |
-| 릴리스 시 CI가 또 돎 | bump 커밋에 `[skip ci]`가 빠졌다. main FF push가 ci.yml을 발화한다. |
+| **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 ref_name이 브랜치라 어긋난다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
 | Release notes가 휑함 | `--notes-from-tag`가 tag 메시지를 쓴다. 필요하면 release.yml의 notes 소스를 CHANGELOG 섹션 추출로 바꾼다. |
 
 ## 왜 GoReleaser가 아닌가
