@@ -94,6 +94,10 @@ pub struct ExporterConfig {
     /// aicd_main에 배선되지 않은 동안은 항상 0이다 — 그게 배선되면 **동일 `Arc`**를
     /// `LogsExporterConfig::drop_counters`에도 넘겨야 두 task의 카운터가 하나로 합쳐진다.
     pub drop_counters: Arc<DropCounters>,
+    /// 프로세스별 리소스 top-N(scope=`aic.process`)을 host metrics tick에 편승해 보낼지.
+    /// config `[aicd.exporter].process_enabled`. host metrics가 이미 refresh한 프로세스 목록을
+    /// 재사용하므로 추가 열거 비용이 없다 — 그래서 별도 task가 아니라 이 tick에 얹는다.
+    pub process_enabled: bool,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
@@ -189,11 +193,51 @@ pub async fn serve(
                     Some(&cfg.drop_counters),
                 );
 
+                // 프로세스별 top-N(scope=aic.process)을 같은 tick에 얹는다 — sample이 이미
+                // top_processes를 채워 왔다(host_metrics가 프로세스를 한 번만 refresh하도록 편승,
+                // 별도 task로 두 번 열거하지 않는다). process_enabled=false거나 읽을 수 있는 프로세스가
+                // 없으면 None → push/spool 모두 건너뛴다. metrics(/v1/metrics)와 달리 이건
+                // logs(/v1/logs)라 이름/PID 차원을 담는다.
+                let process_body = if cfg.process_enabled && !sample.top_processes.is_empty() {
+                    let entries: Vec<logs_proto::ProcessEntry<'_>> = sample
+                        .top_processes
+                        .iter()
+                        .map(|p| logs_proto::ProcessEntry {
+                            name: &p.name,
+                            pid: p.pid,
+                            cpu_pct: p.cpu_pct,
+                            rss_bytes: p.rss_bytes,
+                            disk_read_bytes: p.disk_read_bytes,
+                            disk_write_bytes: p.disk_write_bytes,
+                        })
+                        .collect();
+                    let resource = logs_proto::ResourceAttrs {
+                        host_name: &sample.resource.host_name,
+                        host_id: &sample.resource.host_id,
+                        os_type: &sample.resource.os_type,
+                        host_ip: None,
+                    };
+                    Some(logs_proto::encode_process_samples(
+                        &entries,
+                        &resource,
+                        &cfg.service_version,
+                        unix_nanos_now(),
+                    ))
+                } else {
+                    None
+                };
+
                 if !backoff.ready() {
                     // backoff 윈도 안 — collector가 여전히 다운됐다고 보고 네트워크 시도(드레인·
                     // 신규 push 둘 다) 자체를 건너뛴다. 새 sample은 유실시키지 않고 spool에만 쌓는다.
                     if let Err(e) = cfg.spool.append(SignalKind::Metrics, &body) {
                         tracing::warn!(error = %e, "OTLP metrics spool append 실패 — 이 샘플 유실");
+                    }
+                    // 프로세스 logs도 같은 처리 — 유실 없이 spool에만 쌓는다(SignalKind::Logs).
+                    if let Some(pbody) = &process_body {
+                        if let Err(e) = cfg.spool.append(SignalKind::Logs, pbody) {
+                            tracing::warn!(error = %e, "OTLP process spool append 실패 — 이 샘플 유실");
+                        }
                     }
                     continue;
                 }
@@ -238,6 +282,21 @@ pub async fn serve(
                         tracing::warn!(error = %e2, "OTLP metrics spool append 실패 — 이 샘플 유실");
                     }
                     tick_failed = true;
+                }
+
+                // (3) 프로세스 top-N logs 송신(있을 때만). metrics와 독립적으로 성패를 따지되,
+                // 같은 tick의 backoff/health에 합산한다(tick_failed). collector 도달 실패면 spool에
+                // 적재해 복구 후 드레인되게 한다(connections/events와 동일 규약, SignalKind::Logs).
+                if let Some(pbody) = process_body {
+                    if let Err(e) =
+                        push_logs(&client, &logs_endpoint, cfg.token.as_deref(), pbody.clone()).await
+                    {
+                        tracing::warn!(error = %e, "OTLP process push 실패 — spool에 적재");
+                        if let Err(e2) = cfg.spool.append(SignalKind::Logs, &pbody) {
+                            tracing::warn!(error = %e2, "OTLP process spool append 실패 — 이 샘플 유실");
+                        }
+                        tick_failed = true;
+                    }
                 }
 
                 if tick_failed {

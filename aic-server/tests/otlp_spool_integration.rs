@@ -91,6 +91,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
     };
     let handle = tokio::spawn(async move {
         {
@@ -199,6 +200,7 @@ async fn flush_drains_entire_spool_on_request_bypassing_rate_limit() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
     };
     let (flush_tx, flush_rx) = tokio::sync::mpsc::channel::<FlushRequest>(4);
     let handle = tokio::spawn(async move { serve(cfg, sd_rx, flush_rx).await });

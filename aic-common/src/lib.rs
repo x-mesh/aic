@@ -661,6 +661,13 @@ pub struct AicdExporterConfig {
     /// no-op이다.
     #[serde(default)]
     pub dns_enabled: bool,
+    /// 프로세스별 리소스 top-N(scope=`aic.process`, CPU/메모리 상위 소비자) push 활성화 여부.
+    /// 기본 true — host metrics tick에 편승해 이미 refresh한 프로세스 목록을 재사용하므로 추가
+    /// 열거 비용이 없고, "누가 자원을 먹고 있나"는 SRE의 기본 질문이라 항상 수집한다(events/
+    /// connections와 동일 관례). (pid, name) 조합이 시계열 키가 되지만 매 tick 상위 N개만 보내
+    /// 카디널리티를 묶는다 — 그래도 부담되는 호스트에선 명시적으로 false로 끈다.
+    #[serde(default = "default_true")]
+    pub process_enabled: bool,
 }
 
 impl Default for AicdExporterConfig {
@@ -684,6 +691,7 @@ impl Default for AicdExporterConfig {
             docker_interval_secs: default_docker_interval(),
             docker_bin: None,
             dns_enabled: false,
+            process_enabled: true,
         }
     }
 }
@@ -1233,6 +1241,12 @@ method = "prompt_marker"
             !cfg.aicd.exporter.dns_enabled,
             "dns는 기본 opt-in(false) — 도메인은 명시적으로만 수집한다"
         );
+        // process: 프로세스별 top-N(CPU/메모리/디스크). 추가 열거 비용이 없어(host metrics tick
+        // 편승) 부모 게이트가 실제 gate이므로 기본 활성(events/connections와 동일 관례).
+        assert!(
+            cfg.aicd.exporter.process_enabled,
+            "process는 기본 활성(부모 게이트가 실제 gate)"
+        );
     }
 
     #[test]
@@ -1362,6 +1376,7 @@ events_enabled = false
 connections_enabled = false
 connections_interval_secs = 120
 dns_enabled = true
+process_enabled = false
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!cfg.aicd.exporter.events_enabled);
@@ -1369,6 +1384,8 @@ dns_enabled = true
         assert_eq!(cfg.aicd.exporter.connections_interval_secs, 120);
         // opt-in dns를 명시로 켤 수 있어야 한다(override 파싱).
         assert!(cfg.aicd.exporter.dns_enabled);
+        // 기본 true인 process를 명시로 끌 수 있어야 한다(override 파싱).
+        assert!(!cfg.aicd.exporter.process_enabled);
     }
 
     #[test]

@@ -759,6 +759,9 @@ fn load_exporter_config(
         // t12: 호출부(main)가 logs exporter(`serve_logs`)와 공유하는 동일 `Arc`를 넘긴다 — 두
         // task의 카운터가 합쳐져야 `aic.log.dropped` 게이지가 실제 드롭을 반영한다.
         drop_counters,
+        // 프로세스별 top-N(scope=aic.process)은 host metrics tick에 편승한다 — 별도 task가 아니라
+        // 이 config의 플래그로 on/off한다(기본 true).
+        process_enabled: ex.process_enabled,
     })
 }
 

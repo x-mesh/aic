@@ -129,6 +129,33 @@ pub struct DnsObservation<'a> {
     pub process_name: Option<&'a str>,
 }
 
+/// 프로세스 리소스 샘플 하나 — `aic.process` scope LogRecord로 인코딩할 입력.
+///
+/// **왜 metrics가 아니라 logs인가**: host metrics(`encode.rs`, `aic.system.*`)는 차원 없는
+/// Gauge(수신측 쿼리가 `metric=? + avg(value)`라 GROUP BY가 없다)라 프로세스명/PID 같은
+/// 고카디널리티 attr을 실을 수 없다(host_metrics.rs의 top_process 주석 참고). 프로세스별
+/// 관측은 name/pid로 필터·집계돼야 하므로 connections/dns와 같은 logs 경로로 보낸다.
+///
+/// **카디널리티**: 매 tick 프로세스 전체가 아니라 CPU/메모리 상위 N개만 담는다(수집측이 top-N을
+/// 골라 넘긴다). (pid, name) 조합이 시계열 키가 되므로 N을 작게 유지하는 게 수신측 부담을 막는
+/// 핵심이다.
+pub struct ProcessEntry<'a> {
+    /// 실행 파일명(예: `"aicd"`). connections process와 동일 — comm이지 argv가 아니라 secret 유입
+    /// 위험이 없어 [`redact_str`]를 그대로 통과한다(모듈 doc 참고).
+    pub name: &'a str,
+    /// 프로세스 PID.
+    pub pid: i64,
+    /// 직전 tick 이후 CPU 사용률(%). 코어 합산이라 100%를 넘을 수 있다(멀티스레드).
+    pub cpu_pct: f64,
+    /// Resident Set Size(바이트) — 실제 물리 메모리 점유.
+    pub rss_bytes: u64,
+    /// 직전 tick 이후 이 프로세스가 **읽은** 디스크 바이트(delta, 누적 아님). 미지원 플랫폼/첫
+    /// tick은 0. "누가 디스크를 때리나"의 직접 신호라 rate가 아니라 창(window) 합으로 싣는다.
+    pub disk_read_bytes: u64,
+    /// 직전 tick 이후 이 프로세스가 **쓴** 디스크 바이트(delta).
+    pub disk_write_bytes: u64,
+}
+
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
 /// connections만 `host_ip`를 추가로 붙인다(hosts 메타 갱신, DoD 요구사항).
 pub struct ResourceAttrs<'a> {
@@ -338,6 +365,48 @@ pub fn encode_dns_observations(
     build_request(resource, "aic.dns", service_version, log_records)
 }
 
+/// `samples`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.process`)로 배치 인코딩한다.
+///
+/// 시각을 하나만 받는다 — 프로세스 샘플은 주기 캡처라 "그 순간 관측한 상태"가 곧 이벤트다
+/// (`encode_connections`와 동일 논리).
+///
+/// **attr 이름은 수신측(rca `otlp/decode.rs`) 디코더와 정확히 일치해야 한다.** cpu_utilization은
+/// 소수점 정밀도가 필요해 double attr로 싣는다(int로 반올림하면 저사용률 프로세스 구분이 사라진다).
+pub fn encode_process_samples(
+    samples: &[ProcessEntry<'_>],
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+    time_unix_nano: u64,
+) -> Vec<u8> {
+    let log_records = samples
+        .iter()
+        .map(|p| {
+            let attributes = vec![
+                attr_str("process.executable.name", p.name),
+                attr_int("process.pid", p.pid),
+                attr_double("process.cpu_utilization", p.cpu_pct),
+                attr_int("process.memory_rss_bytes", saturating_i64(p.rss_bytes)),
+                // disk IO는 창(window) delta라 0도 "이번 창엔 IO 없음"이라는 실제 값이다
+                // (connection bytes와 동일 취지) — 그래서 부재가 아니라 항상 싣는다.
+                attr_int("process.disk.read_bytes", saturating_i64(p.disk_read_bytes)),
+                attr_int("process.disk.write_bytes", saturating_i64(p.disk_write_bytes)),
+            ];
+            let body_text = format!("{} pid={}", p.name, p.pid);
+            LogRecord {
+                time_unix_nano,
+                observed_time_unix_nano: time_unix_nano,
+                severity_number: SEVERITY_INFO,
+                severity_text: redact_str("INFO"),
+                body: Some(string_value(&body_text)),
+                attributes,
+                dropped_attributes_count: 0,
+                flags: 0,
+            }
+        })
+        .collect();
+    build_request(resource, "aic.process", service_version, log_records)
+}
+
 /// `entries`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.changes`)로 배치 인코딩한다.
 ///
 /// severity는 전이의 성격을 따른다: rss 급증은 WARN(주목할 만한 이상), 나머지(start/exit/churn/
@@ -527,6 +596,17 @@ fn attr_int(key: &str, value: i64) -> KeyValue {
     }
 }
 
+/// OTLP `AnyValue.double_value` — CPU 사용률처럼 정수로 뭉개면 안 되는 소수값 전용.
+/// 숫자라 redaction 대상이 아니다(key는 고정 상수라 no-op이지만 경로는 통일한다).
+fn attr_double(key: &str, value: f64) -> KeyValue {
+    KeyValue {
+        key: redact_str(key),
+        value: Some(AnyValue {
+            value: Some(AnyValueOneof::DoubleValue(value)),
+        }),
+    }
+}
+
 /// OTLP `AnyValue.int_value`는 signed 64-bit라, 커널의 u64 누적 카운터가 표현 범위를 넘으면
 /// 음수로 감기지 않게 최댓값에 고정한다.
 fn saturating_i64(value: u64) -> i64 {
@@ -634,7 +714,7 @@ pub struct KeyValue {
     pub value: Option<AnyValue>,
 }
 
-/// common/v1/common.proto — `AnyValue`. 우리는 string/int만 쓴다(bool/double 미사용이지만 wire
+/// common/v1/common.proto — `AnyValue`. 우리는 string/int/double을 쓴다(bool은 미사용이지만 wire
 /// 호환을 위해 oneof 태그는 스펙과 동일하게 4개 다 정의한다).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AnyValue {
@@ -979,6 +1059,87 @@ mod tests {
         let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
         assert!(!attrs.iter().any(|kv| kv.key == "process.pid"));
         assert!(!attrs.iter().any(|kv| kv.key == "process.executable.name"));
+    }
+
+    #[test]
+    fn process_samples_roundtrip_with_all_fields() {
+        let samples = vec![
+            ProcessEntry {
+                name: "aicd",
+                pid: 1234,
+                cpu_pct: 42.5,
+                rss_bytes: 128 * 1024 * 1024,
+                disk_read_bytes: 4096,
+                disk_write_bytes: 8192,
+            },
+            ProcessEntry {
+                name: "clickhouse",
+                pid: 5678,
+                cpu_pct: 210.0, // 멀티코어 합산이라 100% 초과 정상
+                rss_bytes: 4 * 1024 * 1024 * 1024,
+                disk_read_bytes: 512 * 1024 * 1024,
+                disk_write_bytes: 0, // 이번 창엔 쓰기 없음 — 0도 실제 값
+            },
+        ];
+        let bytes = encode_process_samples(&samples, &resource(None), "0.28.0", 100);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let scope_logs = &req.resource_logs[0].scope_logs[0];
+        assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.process");
+        assert_eq!(scope_logs.log_records.len(), 2);
+
+        let attrs = &scope_logs.log_records[0].attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(
+            matches!(get("process.executable.name"), Some(AnyValueOneof::StringValue(v)) if v == "aicd")
+        );
+        assert!(matches!(get("process.pid"), Some(AnyValueOneof::IntValue(1234))));
+        assert!(
+            matches!(get("process.cpu_utilization"), Some(AnyValueOneof::DoubleValue(v)) if (v - 42.5).abs() < 1e-9)
+        );
+        assert!(matches!(
+            get("process.memory_rss_bytes"),
+            Some(AnyValueOneof::IntValue(v)) if v == 128 * 1024 * 1024
+        ));
+        assert!(matches!(
+            get("process.disk.read_bytes"),
+            Some(AnyValueOneof::IntValue(4096))
+        ));
+        assert!(matches!(
+            get("process.disk.write_bytes"),
+            Some(AnyValueOneof::IntValue(8192))
+        ));
+
+        // 두 번째 레코드: 코어 합산 CPU(>100%)와 큰 RSS가 손실 없이 실린다.
+        let attrs2 = &scope_logs.log_records[1].attributes;
+        let get2 = |k: &str| {
+            attrs2
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(
+            matches!(get2("process.cpu_utilization"), Some(AnyValueOneof::DoubleValue(v)) if (v - 210.0).abs() < 1e-9)
+        );
+        assert!(matches!(
+            get2("process.memory_rss_bytes"),
+            Some(AnyValueOneof::IntValue(v)) if v == 4 * 1024 * 1024 * 1024
+        ));
+        // disk 쓰기 0도 attr을 생략하지 않고 실제 값으로 싣는다(창 delta 규약).
+        assert!(matches!(
+            get2("process.disk.read_bytes"),
+            Some(AnyValueOneof::IntValue(v)) if v == 512 * 1024 * 1024
+        ));
+        assert!(matches!(
+            get2("process.disk.write_bytes"),
+            Some(AnyValueOneof::IntValue(0))
+        ));
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
