@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-16
+
 ### Added
 - **connections에 방향(`direction`)과 프로세스명(`process`) 추가** — `aic.connections` LogRecord에
   `aic.connection.direction`(`listen`|`inbound`|`outbound`)과 `aic.connection.process` attr이 붙는다.
@@ -106,6 +108,28 @@
   이 CLI와 다른 빌드가 돌고 있으면 경고와 함께 `aic daemon restart`를 안내한다. `GetVersion`을 모르는
   구버전 데몬은 graceful `Error`로 응답하므로, 그 응답 자체를 "구버전이 돌고 있다"는 신호로 삼는다
   (`version: unknown`). `aic-session`도 같은 요청에 자기 빌드로 답한다.
+- **`/record now <메모>` — 지금 이 순간을 강제 기록** — 임계와 무관하게 현재 시스템 스냅샷을 즉시
+  캡처해 **로컬 스냅샷 store에 저장**하고, 메모가 있으면 OTLP `snapshot.recorded` 이벤트로도 보낸다.
+  로컬 저장이 본체라 **aicd 미실행이어도 메모는 남는다**(원격은 부가 경로). 이벤트 attrs에는 그 순간의
+  자원 지표를 싣는다: `cpu_utilization`·`memory_utilization`·`swap_utilization`·`load_1m`·
+  `filesystem_avail_bytes`에 더해 **`cores`(load 정규화용), `memory_total_bytes`/`swap_total_bytes`
+  (백분율의 분모), `top_mem_proc_name`/`top_mem_proc_rss_bytes`(메모리 최다 프로세스)**를 첨부한다.
+  status bar 표시 여부와 무관하게 지표가 자기완결적으로 수집된다. CLI는 `aic snapshot record --memo`.
+- **connection 누적 트래픽(`bytes_sent`/`bytes_recv`)** — `aic.connections` LogRecord에 소켓별 누적
+  송수신 바이트가 붙는다. Linux `ss -i`의 tcp_info(`ss -tunap` → **`ss -tiunap`**)에서 얻으며,
+  지원하지 않는 플랫폼/프로토콜(macOS lsof 등)은 0이다. RCA topology가 엣지 트래픽을 표현하는 데
+  쓴다. 값이 커널의 u64 범위를 넘으면 OTLP int64 최댓값에 고정한다.
+- **DNS observer (opt-in, `aic.dns` scope)** — `[aicd.exporter] dns_enabled`(기본 false, opt-in —
+  도메인은 운영/PII 정보)를 켜면 aicd가 프로세스의 이름 해석(FQDN↔IP)을 관측해 OTLP
+  Logs(scope=`aic.dns`, attrs: `dns.question.name`/`.type`·`dns.answers`·`dns.ttl`·`aic.dns.source`
+  등)로 push한다. RCA가 connection의 숫자 IP에 실제 도메인을 붙이는 신호다. **관측 백엔드는 eBPF
+  getaddrinfo uprobe(Linux 전용)로, 현재 골격이다** — `dns_enabled`를 켜도 아직 데이터는 나가지 않고
+  (인코딩 계약·task 배선까지 완성), 미지원 플랫폼/권한 부족이면 no-op이다.
+- **`/flush` 명령 — spool 즉시 전량 드레인** — collector 복구 직후 밀린 배치를 기본 rate-limit
+  (`spool_drain_batch_limit`)에 얽매이지 않고 한 번에 전부 재전송한다(급할 때 수동 드레인).
+- **spool 나이 cap (`[aicd.exporter] spool_max_age_secs`)** — 설정하면 그보다 오래된 spool 배치를
+  드레인 직전에 네트워크 없이 드롭해, collector가 오래 다운돼 쌓인 낡은 배치 뒤에 최근 이벤트가 갇히지
+  않게 한다. **기본 `None`(무제한 — 기본으로는 어떤 데이터도 지우지 않는다)**, 명시할 때만 적용된다.
 
 ### Fixed
 - **`make install` / `aic update` 후 구버전 aicd가 계속 도는 문제** — 두 경로 모두 세 binary를
@@ -118,6 +142,17 @@
   `KeepAlive`/`Restart=on-failure`가 걸려 있어 우리가 직접 죽이고 띄우면 매니저의 재기동과 singleton
   PID lock을 두고 경쟁하기 때문이다. `--if-running`은 aicd가 꺼져 있으면 아무것도 하지 않아, 설치가
   데몬을 새로 띄우는 부작용을 만들지 않는다.
+- **OTLP push 실패 로그에 실제 원인 보존** — 예전엔 exporter push 실패가 `error sending request for
+  url (...)`이라는 reqwest 껍데기 메시지만 남겨, 수신 서버가 잠깐 죽은 건지(connection refused/reset)
+  keep-alive 연결이 만료된 건지(closed before message completed) 구분할 수 없었다. 이제 에러의 source
+  chain을 끝까지 이어 붙여 진짜 원인을 로그에 남긴다(무유실 동작은 그대로 — spool 적재로 복구).
+- **status bar가 exporter 상태를 오보하던 문제** — (1) status 쿼리가 잠깐 느려 timeout이 나면 살아
+  있는 aicd를 "aicd off"로 오보하던 것을 직전 상태 유지로 바로잡았다. (2) status bar가 agent exporter
+  전송 유실을 숨기던 맹점을 수정했다.
+- **status bar를 끈 세션에서 주기 캡처가 계약과 다르게 동작하던 회귀** — `/record now`가 status bar
+  표시 여부와 무관하게 지표를 얻도록 sampler를 상시 구동하면서, `AIC_NO_STATUSBAR`/`AIC_QUIET` 세션에서
+  `/record on`이 주기 캡처를 시작해 "status bar가 꺼지면 주기 캡처는 살지 않는다"는 계약을 깨던 것을
+  막았다(지표 캐시 갱신은 유지, 주기 캡처만 status bar 활성 시로 게이트).
 
 ### Changed
 - **redaction 로직을 `aic-common`으로 이동** — LLM prompt(aic-client)와 OTLP exporter(aic-server)가
