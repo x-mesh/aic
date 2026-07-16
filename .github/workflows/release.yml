@@ -1,8 +1,17 @@
 name: release
 
-# `v*` 태그 push 시 GoReleaser가 multi-arch binary 빌드 + GitHub Release +
-# x-mesh/homebrew-tap Formula 자동 갱신까지 한 번에 처리한다.
-# x-mesh/gk와 같은 패턴 — secret 이름(`HOMEBREW_TAP_GITHUB_TOKEN`)도 동일.
+# `v*` 태그 push 시 4 OS/arch 바이너리 빌드 + GitHub Release + x-mesh/homebrew-tap
+# Formula 갱신까지 처리한다.
+#
+# **왜 GoReleaser가 아니라 커스텀 스크립트인가**: aic는 Rust + sysinfo(IOKit/CoreFoundation)·
+# keyring(Security)이라 darwin 빌드가 macOS 프레임워크를 C 링커로 링크해야 한다. GoReleaser
+# rust builder는 tool과 무관하게 항상 cargo-zigbuild(zig 링커)를 쓰는데, zig는 SDKROOT·
+# `-L framework=` search path를 줘도 macOS 프레임워크를 못 링크해 v0.27.0부터 5번 실패했다
+# (undefined symbol: _SecKeychain*/_IOBSDNameMatching). prebuilt builder는 GoReleaser Pro
+# 전용이라 OSS로 불가. 검증된 유일한 길은 native cargo build(Apple ld가 프레임워크 링크)라,
+# GoReleaser를 걷어내고 macos runner에서 직접 빌드·아카이브·릴리스·Formula 갱신을 한다.
+# (x-mesh/gk는 Go(CGO off) 순수 크로스컴파일이라 이 문제가 없어 GoReleaser로 충분하다 —
+# 언어가 달라 aic엔 그 패턴을 못 쓴다.)
 on:
   push:
     tags: ['v*']
@@ -12,20 +21,15 @@ permissions:
   contents: write   # GitHub Release 생성
 
 jobs:
-  goreleaser:
-    # macos-latest로 결정한 이유:
-    #   aic-client → keyring → security-framework가 macOS Security/CoreFoundation
-    #   framework에 link한다. ubuntu runner에서 zigbuild로 darwin cross-compile
-    #   시도 시 SDK framework를 못 찾아 link 단계에서 실패한다 (run 24985180591).
-    #   macos runner는 darwin을 native 빌드하고, linux 두 target은 zigbuild로
-    #   cross-compile한다 — 한 runner로 4 target 안전 처리.
+  release:
+    # darwin native 빌드에 필수 — Apple SDK/ld가 있는 runner라야 프레임워크가 링크된다.
+    # linux 두 target은 같은 runner에서 cargo-zigbuild로 cross-compile한다.
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 0   # tag 메타데이터 + 전체 git log (changelog 추출용)
+          fetch-depth: 0   # tag 메타데이터 + 전체 git log
 
-      # Rust toolchain + cross 컴파일 대상 4개.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-apple-darwin,aarch64-apple-darwin
@@ -42,55 +46,167 @@ jobs:
             ${{ runner.os }}-cargo-release-
             ${{ runner.os }}-cargo-
 
-      # zig + cargo-zigbuild — linux 두 target을 cross-compile.
-      # darwin은 native(macOS SDK 자동 발견).
+      # zig + cargo-zigbuild — linux 두 target 전용(darwin은 native cargo).
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.13.0
-
       - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.20.1 || cargo install --locked cargo-zigbuild
+
+      # 4 triple × 3 binary 빌드 → (os,arch)별 tar.gz + checksums.
+      #   linux는 cargo zigbuild(zig cross), darwin은 cargo build(native, Apple ld=framework 링크).
+      #   feature/package 인자는 이전 .goreleaser.yaml의 flags와 동일(phase-3_4 릴리스 빌드).
+      - name: Build, archive, checksum
         run: |
-          # Pin a known-good version. Newer versions sometimes require newer
-          # zig releases; bump together when updating.
-          cargo install --locked cargo-zigbuild --version 0.20.1 || \
-            cargo install --locked cargo-zigbuild
+          set -euxo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          mkdir -p dist
 
-      # darwin 빌드에서 zig가 macOS framework(Security/CoreFoundation/IOKit)를 링크하게 한다.
-      #   aic-server가 sysinfo(IOKit/CF)·keyring(Security)을 쓰게 된 v0.27.0부터, zig 링커는
-      #   SDKROOT만으론 `-framework Security` 등의 search path를 안 걸어 `undefined symbol:
-      #   _IOBSDNameMatching`/`_SecKeychain*`으로 죽었다. framework search path를 rustc에 명시하면
-      #   (rustc `-L framework=<path>` → zig cc `-F<path>`) zig가 SDK framework를 찾는다.
-      #   **darwin 두 target에만** 적용한다(CARGO_TARGET_<TRIPLE>_RUSTFLAGS) — linux 빌드는 무영향.
-      - name: Point cargo-zigbuild at the macOS SDK frameworks (darwin only)
-        run: |
-          SDK="$(xcrun --show-sdk-path)"
-          FW="-L framework=${SDK}/System/Library/Frameworks"
-          {
-            echo "SDKROOT=${SDK}"
-            echo "MACOSX_DEPLOYMENT_TARGET=11.0"
-            echo "CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS=${FW}"
-            echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=${FW}"
-          } >> "$GITHUB_ENV"
+          build() {  # $1=triple  $2=os  $3=arch  $4=tool(zig|native)
+            local triple="$1" os="$2" arch="$3" tool="$4"
+            if [ "$tool" = "zig" ]; then
+              cargo zigbuild --release --target "$triple" --no-default-features --features phase-3_4 \
+                -p aic-client --bin aic \
+                -p aic-server --bin aic-session --bin aicd
+            else
+              cargo build --release --target "$triple" --no-default-features --features phase-3_4 \
+                -p aic-client --bin aic \
+                -p aic-server --bin aic-session --bin aicd
+            fi
+            local stage="stage/${os}_${arch}"
+            mkdir -p "$stage"
+            cp "target/${triple}/release/aic" \
+               "target/${triple}/release/aic-session" \
+               "target/${triple}/release/aicd" \
+               "$stage/"
+            cp LICENSE* README.md CHANGELOG.md "$stage/" 2>/dev/null || true
+            tar -C "$stage" -czf "dist/aic_${VERSION}_${os}_${arch}.tar.gz" .
+          }
 
-      # Validate config first — fast feedback on .goreleaser.yaml syntax errors.
-      # version 고정: `brews`가 GoReleaser v2.16에서 hard-removal 됐다(v2.10 soft-deprecate).
-      # `version: latest`가 v2.16.0을 받으면서 `check`가 deprecated 속성으로 exit 2 →
-      # release.yml 전체 실패(0.10.0 사례). cask 마이그레이션(brews→homebrew_casks) 전까지
-      # brews를 지원하는 마지막 라인인 v2.15에 고정한다.
-      - name: GoReleaser check
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: '~> v2.15'
-          args: check
+          build x86_64-unknown-linux-gnu  linux  amd64  zig
+          build aarch64-unknown-linux-gnu linux  arm64  zig
+          build x86_64-apple-darwin       darwin amd64  native
+          build aarch64-apple-darwin      darwin arm64  native
 
-      - name: GoReleaser release
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: '~> v2.15'
-          args: release --clean
+          ( cd dist && shasum -a 256 *.tar.gz > checksums.txt )
+          ls -la dist
+
+      # GitHub Release — mode:replace 멱등(재실행 시 기존 asset 덮어쓰기).
+      - name: Create/refresh GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # x-mesh org-level secret으로 등록되어 있다면 별도 repo secret 등록 불필요.
-          # 없으면 fine-grained PAT(scope: contents+pull-requests on
-          # x-mesh/homebrew-tap)을 repo secret으로 등록한다 — RELEASING.md 참조.
+        run: |
+          set -euxo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz dist/checksums.txt --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz dist/checksums.txt \
+              --title "$TAG" --notes-from-tag
+          fi
+
+      # x-mesh/homebrew-tap Formula 갱신 — GoReleaser brews가 하던 것을 재현.
+      #   os/arch별 sha256을 checksums에서 뽑아 기존 Formula 형식(on_macos/on_linux ×
+      #   intel/arm, url+sha256+install)을 그대로 재생성 후 push한다.
+      - name: Update Homebrew tap Formula
+        env:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          base="https://github.com/x-mesh/aic/releases/download/${TAG}"
+          sha() { grep "aic_${VERSION}_$1.tar.gz" dist/checksums.txt | awk '{print $1}'; }
+          DA="$(sha darwin_amd64)"; DR="$(sha darwin_arm64)"
+          LA="$(sha linux_amd64)";  LR="$(sha linux_arm64)"
+
+          git clone --depth 1 \
+            "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/x-mesh/homebrew-tap.git" tap
+
+          cat > tap/Formula/aic.rb <<RUBY
+          # typed: false
+          # frozen_string_literal: true
+
+          # This file is generated by aic's release workflow. DO NOT EDIT.
+          class Aic < Formula
+            desc "Shell command error analyzer with LLM (PTY wrapper + supervisor daemon)"
+            homepage "https://github.com/x-mesh/aic"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "${base}/aic_${VERSION}_darwin_amd64.tar.gz"
+                sha256 "${DA}"
+
+                def install
+                  bin.install "aic"
+                  bin.install "aic-session"
+                  bin.install "aicd"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "${base}/aic_${VERSION}_darwin_arm64.tar.gz"
+                sha256 "${DR}"
+
+                def install
+                  bin.install "aic"
+                  bin.install "aic-session"
+                  bin.install "aicd"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "${base}/aic_${VERSION}_linux_amd64.tar.gz"
+                sha256 "${LA}"
+
+                def install
+                  bin.install "aic"
+                  bin.install "aic-session"
+                  bin.install "aicd"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "${base}/aic_${VERSION}_linux_arm64.tar.gz"
+                sha256 "${LR}"
+
+                def install
+                  bin.install "aic"
+                  bin.install "aic-session"
+                  bin.install "aicd"
+                end
+              end
+            end
+
+            def caveats
+              <<~EOS
+                To run aicd in the background and on login:
+
+                  aic daemon install        # writes the right unit for your OS
+
+                First-time setup:
+                  aic config                # interactive provider/api_key/model wizard
+                  aic init zsh              # add 'source ~/.aic/hooks.zsh' to your rc
+              EOS
+            end
+
+            test do
+              system "#{bin}/aic", "--version"
+              system "#{bin}/aic-session", "--version"
+              system "#{bin}/aicd", "--version"
+            end
+          end
+          RUBY
+
+          cd tap
+          git config user.name "aic-bot"
+          git config user.email "bot@x-mesh.dev"
+          git add Formula/aic.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged"
+          else
+            git commit -m "aic ${VERSION}"
+            git push
+          fi
