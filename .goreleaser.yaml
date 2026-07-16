@@ -27,23 +27,14 @@ builds:
   # 하기 때문에, workspace default (phase-3_1) 를 끄고 phase-3_4 를 명시적으로
   # 켜야 빌드가 성립한다. Phase 3.4 = Local Processing 제거 + Central Store
   # 기본 활성 (R6, R19) 가 릴리스 기본이다.
-  #
-  # **OS별로 tool을 나눈다** (v0.27.0 GoReleaser 3연속 실패의 원인 수정):
-  #   - linux 2 target → cargo-zigbuild (ubuntu SDK 없이 zig로 cross-compile).
-  #   - darwin 2 target → cargo (native). macos-latest runner의 Apple SDK가
-  #     프레임워크를 링크한다. aic-server가 sysinfo(IOKit/CoreFoundation) +
-  #     keyring(Security)을 쓰게 된 v0.27.0부터, zigbuild darwin은 이 프레임워크
-  #     심볼을 못 찾아 `undefined symbol: _IOBSDNameMatching`/`_SecKeychain*` 등으로
-  #     link 단계에서 죽었다(zig 링커는 Apple SDK framework를 모른다). native cargo는
-  #     runner의 실제 macOS SDK로 링크해 이 심볼들을 해소한다. build entry는 target이
-  #     아니라 entry 단위로 tool을 갖기 때문에, 같은 binary를 linux/darwin 두 entry로
-  #     쪼갠다(3 binary × 2 OS = 6 entry). archive는 (os,arch)로 다시 묶는다.
-  - id: aic-cli-linux
+  - id: aic-cli
     builder: rust
     binary: aic
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
     tool: cargo-zigbuild
     flags:
       - --release
@@ -51,26 +42,15 @@ builds:
       - --bin=aic
       - --no-default-features
       - --features=phase-3_4
-  - id: aic-cli-darwin
-    builder: rust
-    binary: aic
-    targets:
-      - x86_64-apple-darwin
-      - aarch64-apple-darwin
-    tool: cargo
-    flags:
-      - --release
-      - --package=aic-client
-      - --bin=aic
-      - --no-default-features
-      - --features=phase-3_4
 
-  - id: aic-session-linux
+  - id: aic-session
     builder: rust
     binary: aic-session
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
     tool: cargo-zigbuild
     flags:
       - --release
@@ -78,40 +58,16 @@ builds:
       - --bin=aic-session
       - --no-default-features
       - --features=phase-3_4
-  - id: aic-session-darwin
-    builder: rust
-    binary: aic-session
-    targets:
-      - x86_64-apple-darwin
-      - aarch64-apple-darwin
-    tool: cargo
-    flags:
-      - --release
-      - --package=aic-server
-      - --bin=aic-session
-      - --no-default-features
-      - --features=phase-3_4
 
-  - id: aicd-linux
+  - id: aicd
     builder: rust
     binary: aicd
     targets:
       - x86_64-unknown-linux-gnu
       - aarch64-unknown-linux-gnu
-    tool: cargo-zigbuild
-    flags:
-      - --release
-      - --package=aic-server
-      - --bin=aicd
-      - --no-default-features
-      - --features=phase-3_4
-  - id: aicd-darwin
-    builder: rust
-    binary: aicd
-    targets:
       - x86_64-apple-darwin
       - aarch64-apple-darwin
-    tool: cargo
+    tool: cargo-zigbuild
     flags:
       - --release
       - --package=aic-server
@@ -122,15 +78,10 @@ builds:
 archives:
   - id: aic-archive
     # 한 tar.gz에 세 binary를 모두 담아 brew install이 한 번에 끝나게 한다.
-    # linux/darwin으로 쪼갠 6 entry를 모두 넣으면 GoReleaser가 (os,arch)로 매칭해
-    # 아카이브당 세 binary를 묶는다.
     ids:
-      - aic-cli-linux
-      - aic-cli-darwin
-      - aic-session-linux
-      - aic-session-darwin
-      - aicd-linux
-      - aicd-darwin
+      - aic-cli
+      - aic-session
+      - aicd
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
