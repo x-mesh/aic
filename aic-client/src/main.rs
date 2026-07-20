@@ -200,6 +200,9 @@ enum Commands {
         /// RCA Settings에서 발급한 일회용 enrollment key
         #[arg(long, value_name = "KEY")]
         auth_key: String,
+        /// enrollment key를 교환·소비하거나 config/aicd를 변경하지 않고 적용 계획만 표시
+        #[arg(long)]
+        dry_run: bool,
     },
     /// 설정 파일 경로 및 현재 설정 표시/편집
     Config {
@@ -1242,8 +1245,12 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Enroll { server, auth_key }) => {
-            if let Err(e) = handle_enroll(&server, &auth_key).await {
+        Some(Commands::Enroll {
+            server,
+            auth_key,
+            dry_run,
+        }) => {
+            if let Err(e) = handle_enroll(&server, &auth_key, dry_run).await {
                 eprintln!("{COL_RED}✗{COL_RESET} enrollment 실패: {e}");
                 std::process::exit(1);
             }
@@ -1536,7 +1543,7 @@ struct EnrollmentResponse {
 ///
 /// key는 요청 본문 밖으로 출력하거나 저장하지 않는다. config는 temp file + rename으로 교체해
 /// aicd가 반쯤 작성된 TOML을 읽지 않게 한다.
-async fn handle_enroll(server: &str, auth_key: &str) -> anyhow::Result<()> {
+async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::Result<()> {
     let server = server.trim().trim_end_matches('/');
     if server.is_empty() || auth_key.trim().is_empty() {
         anyhow::bail!("--server와 --auth-key는 비어 있을 수 없습니다");
@@ -1545,6 +1552,11 @@ async fn handle_enroll(server: &str, auth_key: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("--server는 http 또는 https URL이어야 합니다"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         anyhow::bail!("--server는 http 또는 https URL이어야 합니다");
+    }
+
+    if dry_run {
+        print_enroll_dry_run(server)?;
+        return Ok(());
     }
 
     let host_name = std::env::var("HOSTNAME")
@@ -1613,6 +1625,50 @@ async fn handle_enroll(server: &str, auth_key: &str) -> anyhow::Result<()> {
     );
     println!("  enrollment_id: {}", enrolled.enrollment_id);
     Ok(())
+}
+
+/// `aic enroll --dry-run`: 일회용 key는 검증 형식만 확인하고, 서버로 보내지 않는다.
+/// 따라서 key의 유효성이나 RCA가 고른 provider/model은 이 단계에서 알 수 없다는 점을
+/// 명시해, 미리보기 성공을 enrollment 성공으로 오해하지 않게 한다.
+fn print_enroll_dry_run(server: &str) -> anyhow::Result<()> {
+    let config = ConfigManager::load()?;
+    let config_path = ConfigManager::config_path();
+    println!("dry-run: 변경하지 않습니다");
+    println!("  exchange: skip — enrollment key를 서버로 전송하거나 소비하지 않음");
+    println!("  config:   {}", config_path.display());
+    println!(
+        "  exporter.enabled: {} → true",
+        config.aicd.exporter.enabled
+    );
+    println!(
+        "  exporter.endpoint: {} → <RCA exchange 응답>",
+        display_config_value(&config.aicd.exporter.endpoint)
+    );
+    println!(
+        "  exporter.token: {} → <RCA ingest token (비공개)>",
+        if config.aicd.exporter.token.is_some() {
+            "configured"
+        } else {
+            "unset"
+        }
+    );
+    println!(
+        "  llm.default_provider: {} → <RCA provider>",
+        config.llm.default_provider
+    );
+    println!("  llm.providers.<RCA provider>.model: → <RCA model>");
+    println!("  aicd: install + restart 예정");
+    println!("  RCA server: {server}");
+    println!("  note: provider/model/endpoint의 실제 값은 key 교환 전에는 알 수 없습니다");
+    Ok(())
+}
+
+fn display_config_value(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "unset"
+    } else {
+        value
+    }
 }
 
 fn validate_enrollment_response(response: &EnrollmentResponse) -> anyhow::Result<()> {
