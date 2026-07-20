@@ -8,6 +8,10 @@
 #   AIC_VERSION=v0.3.0       특정 버전 고정 (default: latest)
 #   AIC_INSTALL_DIR=/path    설치 경로 (default: /usr/local/bin → fallback ~/.local/bin)
 #
+# RCA one-click enrollment:
+#   curl -fsSL https://rca.example/install/aic | sh -s -- \
+#     --server https://rca.example --auth-key rca-auth-...
+#
 # 무엇을 설치하나:
 #   - aic           : CLI
 #   - aic-session   : PTY wrapper
@@ -20,9 +24,34 @@ set -eu
 
 REPO="x-mesh/aic"
 BINS="aic aic-session aicd"
+enroll_server=""
+enroll_key=""
 
 err()  { printf "aic-install: %s\n" "$*" >&2; exit 1; }
 info() { printf "aic-install: %s\n" "$*"; }
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --server)
+      [ "$#" -ge 2 ] || err "--server requires a value"
+      enroll_server=$2
+      shift 2
+      ;;
+    --auth-key)
+      [ "$#" -ge 2 ] || err "--auth-key requires a value"
+      enroll_key=$2
+      shift 2
+      ;;
+    *) err "unknown argument: $1" ;;
+  esac
+done
+
+if [ -n "$enroll_server" ] && [ -z "$enroll_key" ]; then
+  err "--server requires --auth-key"
+fi
+if [ -n "$enroll_key" ] && [ -z "$enroll_server" ]; then
+  err "--auth-key requires --server"
+fi
 
 # --- detect os/arch ---------------------------------------------------------
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -114,6 +143,11 @@ if ! install_all_to "$target_dir"; then
 fi
 
 info "installed ${version} → $target_dir/{$(echo "$BINS" | tr ' ' ',')}"
+
+if [ -n "$enroll_key" ]; then
+  info "enrolling this host with RCA"
+  "$target_dir/aic" enroll --server "$enroll_server" --auth-key "$enroll_key"
+fi
 
 case ":$PATH:" in
   *":$target_dir:"*) ;;
