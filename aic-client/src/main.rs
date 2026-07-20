@@ -12,6 +12,7 @@ use aic_common::{
 };
 use clap::{Parser, Subcommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -191,6 +192,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// RCA enrollment key를 교환해 이 호스트의 telemetry exporter를 연결한다.
+    Enroll {
+        /// RCA 공개 base URL (예: https://rca.example.com)
+        #[arg(long)]
+        server: String,
+        /// RCA Settings에서 발급한 일회용 enrollment key
+        #[arg(long, value_name = "KEY")]
+        auth_key: String,
+    },
     /// 설정 파일 경로 및 현재 설정 표시/편집
     Config {
         #[command(subcommand)]
@@ -1232,6 +1242,12 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Enroll { server, auth_key }) => {
+            if let Err(e) = handle_enroll(&server, &auth_key).await {
+                eprintln!("{COL_RED}✗{COL_RESET} enrollment 실패: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Config { op }) => match op {
             None => handle_config(),
             Some(ConfigOp::Show { json, show_secrets }) => handle_config_show(json, show_secrets),
@@ -1506,6 +1522,116 @@ async fn main() {
 
 /// `aic config get <path>`: dotted path로 단일 값 추출 (스크립팅 친화).
 /// scalar는 raw 값, object/array는 JSON pretty로 출력.
+#[derive(Debug, Deserialize)]
+struct EnrollmentResponse {
+    enrollment_id: String,
+    host_name: String,
+    endpoint: String,
+    ingest_token: String,
+    provider: String,
+    model: String,
+}
+
+/// `aic enroll`: 일회용 RCA key를 telemetry token으로 교환하고, 성공한 응답만 설정에 반영한다.
+///
+/// key는 요청 본문 밖으로 출력하거나 저장하지 않는다. config는 temp file + rename으로 교체해
+/// aicd가 반쯤 작성된 TOML을 읽지 않게 한다.
+async fn handle_enroll(server: &str, auth_key: &str) -> anyhow::Result<()> {
+    let server = server.trim().trim_end_matches('/');
+    if server.is_empty() || auth_key.trim().is_empty() {
+        anyhow::bail!("--server와 --auth-key는 비어 있을 수 없습니다");
+    }
+    let parsed = reqwest::Url::parse(server)
+        .map_err(|_| anyhow::anyhow!("--server는 http 또는 https URL이어야 합니다"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("--server는 http 또는 https URL이어야 합니다");
+    }
+
+    let host_name = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .post(format!("{server}/api/agent-enrollments/exchange"))
+        .json(&serde_json::json!({ "key": auth_key.trim(), "host_name": host_name }))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("RCA enrollment exchange 요청 실패: {e}"))?;
+    if !response.status().is_success() {
+        // enrollment key는 절대 오류 본문에 echo하지 않는다.
+        anyhow::bail!(
+            "RCA enrollment exchange 거부됨 (HTTP {})",
+            response.status()
+        );
+    }
+    let enrolled: EnrollmentResponse = response
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("RCA enrollment 응답 형식이 올바르지 않습니다: {e}"))?;
+    validate_enrollment_response(&enrolled)?;
+
+    let mut config = ConfigManager::load()?;
+    config.aicd.exporter.enabled = true;
+    config.aicd.exporter.endpoint = enrolled.endpoint.trim_end_matches('/').to_string();
+    config.aicd.exporter.token = Some(enrolled.ingest_token);
+    // RCA가 선택한 provider/model을 기본값으로 반영한다. credential은 enrollment 응답에
+    // 포함되지 않으므로 기존 provider의 api_key/endpoint는 보존한다.
+    let provider = config
+        .llm
+        .providers
+        .entry(enrolled.provider.clone())
+        .or_insert(ProviderConfig {
+            provider_type: ProviderType::OpenAiCompatible,
+            endpoint: None,
+            api_key: None,
+            model: None,
+            cli_path: None,
+            cli_args: None,
+        });
+    provider.model = Some(enrolled.model.clone());
+    config.llm.default_provider = enrolled.provider.clone();
+    save_config(&config)?;
+
+    // install은 unit을 없으면 만들고 시작한다. 이미 떠 있던 aicd는 config를 메모리에
+    // 들고 있으므로, unit 경유 kickstart/restart로 반드시 새 token을 읽게 한다.
+    let report = aic_client::daemon_install::install(false)?;
+    if report.loaded {
+        let _ = aic_client::daemon_install::restart_via_unit()?;
+    }
+    println!("{COL_GREEN}✓{COL_RESET} RCA enrollment 완료");
+    println!("  host:     {}", enrolled.host_name);
+    println!("  endpoint: {}", config.aicd.exporter.endpoint);
+    println!("  provider: {} ({})", enrolled.provider, enrolled.model);
+    println!(
+        "  aicd:     {}",
+        if report.loaded {
+            "started"
+        } else {
+            "unit written (--no-load)"
+        }
+    );
+    println!("  enrollment_id: {}", enrolled.enrollment_id);
+    Ok(())
+}
+
+fn validate_enrollment_response(response: &EnrollmentResponse) -> anyhow::Result<()> {
+    let endpoint = reqwest::Url::parse(response.endpoint.trim())
+        .map_err(|_| anyhow::anyhow!("RCA가 유효하지 않은 telemetry endpoint를 반환했습니다"))?;
+    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+        anyhow::bail!("RCA가 유효하지 않은 telemetry endpoint를 반환했습니다");
+    }
+    if response.enrollment_id.trim().is_empty()
+        || response.host_name.trim().is_empty()
+        || response.ingest_token.trim().is_empty()
+        || response.provider.trim().is_empty()
+        || response.model.trim().is_empty()
+    {
+        anyhow::bail!("RCA enrollment 응답에 필수 필드가 없습니다");
+    }
+    Ok(())
+}
+
 fn handle_config_get(path: &str) {
     let config = match ConfigManager::load() {
         Ok(c) => c,
@@ -6046,7 +6172,12 @@ fn save_config(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     let toml_str = toml::to_string_pretty(config)?;
-    std::fs::write(&path, toml_str)?;
+    let parent = path.parent().expect("config path has parent");
+    let tmp = parent.join(format!(".config.toml.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, toml_str)?;
+    // 같은 filesystem 안의 rename은 atomic이다. aicd가 읽는 순간에는 이전 완성본 또는
+    // 새 완성본 중 하나만 보이며, 부분 작성 파일을 파싱해 exporter가 꺼지는 일이 없다.
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
