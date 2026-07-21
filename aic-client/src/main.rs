@@ -354,6 +354,14 @@ enum Commands {
         #[command(subcommand)]
         op: HookEventOp,
     },
+    /// (internal) 프로세스별 열린 fd 상위 N — `/local`의 `proc_fd_top` 섹션이 호출한다.
+    /// 사람이 직접 쓰는 명령이 아니라 `--help`에서 숨긴다. probe는 shell 파이프만 허용해
+    /// 프로세스별 fd 집계를 표현할 수 없어서, 계산을 이 leaf로 뺐다(`agent::proc_fd` doc 참고).
+    ///
+    /// **인자를 받지 않는다** — `risk_guard`가 `aic proc-fd-top`을 exact argv로만 Safe 판정하기
+    /// 때문이다(플래그를 추가하면 그 allowlist도 함께 넓혀야 하고, 그만큼 자동 실행 표면이 는다).
+    #[command(name = "proc-fd-top", hide = true)]
+    ProcFdTop,
     /// 명시적 capture wrapper (Phase 3.3) — hook mode에서도 정확한 출력을 잡고 싶을 때.
     ///
     /// `aic run -- <cmd...>`로 실행하면 wrapper가 stdout/stderr tail을 캡처하고
@@ -1344,6 +1352,7 @@ async fn main() {
             SessionOp::Untag { id } => handle_session_tag(id, None).await,
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
+        Some(Commands::ProcFdTop) => print!("{}", aic_client::agent::proc_fd::render()),
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
         Some(Commands::Chat {
             prompt,

@@ -18,6 +18,9 @@ pub(crate) const LOCAL_SECTIONS: &[&str] = &[
     "memory",
     "mem_top_proc",
     "fd",
+    // `fd`(호스트 전역) 바로 뒤에 프로세스 축을 둔다 — 전역이 한산해도 프로세스 하나가 자기
+    // 한도를 포화시킬 수 있어서, 둘을 나란히 봐야 "누가" 쥐고 있는지가 드러난다.
+    "proc_fd_top",
     "ip",
     "route",
     "ports",

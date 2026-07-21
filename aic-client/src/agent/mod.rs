@@ -33,6 +33,9 @@ pub(crate) mod mcp;
 // SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
 pub mod obs_tools;
 pub(crate) mod probes;
+// `/local`의 proc_fd_top 섹션 — 프로세스별 fd 상위 N. probe가 `aic proc-fd-top`으로 호출하므로
+// main.rs(외부 크레이트 경로)에서 접근 가능해야 해 pub.
+pub mod proc_fd;
 // RCA 강화 ③: baseline 스냅샷 대비 프로세스 rss 성장 리더보드(결정적 범인 후보 좁히기).
 pub(crate) mod proc_delta;
 pub mod run_command;

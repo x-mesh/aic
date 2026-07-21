@@ -1222,6 +1222,26 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
             return Some(RiskAssessment::safe("scutil.read"));
         }
     }
+    if head == "aic" {
+        // aic 자기 자신의 **read-only 계산 leaf만** exact argv로 carve-out한다(`/local`의
+        // proc_fd_top probe가 이걸 부른다).
+        //
+        // **`safe_set`(head allowlist)에 "aic"를 넣으면 절대 안 된다.** `aic run -- <임의 명령>`이
+        // trailing_var_arg 래퍼라 그 순간 임의 코드 실행이 자동 실행 Safe가 되고, `aic fix --yes`·
+        // `aic web --bind 0.0.0.0`도 함께 열린다. 그래서 head가 아니라 **argv 전체 일치**로만 본다.
+        //
+        // `first_subcommand`(첫 non-flag 토큰만 봄)도 쓰지 않는다 — `aic proc-fd-top --json extra`나
+        // `aic --config X proc-fd-top` 같은 변형이 뚫린다. 인자 개수까지 고정하는 슬라이스 패턴이라야
+        // probe 카탈로그의 고정 문자열 하나만 통과한다.
+        //
+        // `sudo aic proc-fd-top`은 호출부(`classify_single`)의 sudo floor가 NeedsConfirm으로
+        // 끌어올리므로 여기서 따로 막지 않는다. 잔여 리스크: `head`는 base_name을 거치므로 PATH상의
+        // 다른 `aic` 바이너리도 매칭된다 — probe 명령이 고정 상수라 실사용 경로에서는 발생하지 않는다.
+        if matches!(args, ["proc-fd-top"]) {
+            return Some(RiskAssessment::safe("aic.selfprobe"));
+        }
+        return None;
+    }
     None
 }
 
@@ -1544,6 +1564,48 @@ mod tests {
     #[test]
     fn unknown_for_unrecognized_command() {
         assert_eq!(lvl("some_obscure_tool --do-things"), RiskLevel::Unknown);
+    }
+
+    /// `/local`의 proc_fd_top probe만 Safe다 — probe는 Safe여야 자동 실행되기 때문.
+    #[test]
+    fn aic_self_probe_is_safe_by_exact_argv() {
+        assert_eq!(lvl("aic proc-fd-top"), RiskLevel::Safe);
+        // base_name을 거치므로 절대경로 형태도 같은 판정이어야 한다.
+        assert_eq!(lvl("/usr/local/bin/aic proc-fd-top"), RiskLevel::Safe);
+    }
+
+    /// **carve-out이 새면 안 된다.** `aic`를 head allowlist에 넣었다면 아래가 전부 Safe가 되는데,
+    /// `aic run --`은 임의 명령 래퍼라 그 순간 임의 코드 실행이 자동 실행 대상이 된다.
+    #[test]
+    fn aic_other_subcommands_are_not_safe() {
+        for cmd in [
+            "aic run -- rm -rf /tmp/x",
+            "aic chat",
+            "aic fix --yes",
+            "aic web --bind 0.0.0.0",
+            "aic",
+        ] {
+            assert_ne!(lvl(cmd), RiskLevel::Safe, "자동 실행되면 안 되는 명령: {cmd}");
+        }
+    }
+
+    /// exact argv라 인자가 하나라도 붙거나 앞에 전역 플래그가 오면 Safe가 아니다 — 인자를 허용하면
+    /// 그만큼 자동 실행 표면이 넓어지고, 무엇이 통과하는지 읽어서 알 수 없게 된다.
+    #[test]
+    fn aic_self_probe_rejects_argv_variants() {
+        for cmd in [
+            "aic proc-fd-top --json",
+            "aic proc-fd-top extra",
+            "aic --config /tmp/x proc-fd-top",
+        ] {
+            assert_ne!(lvl(cmd), RiskLevel::Safe, "exact argv가 아닌데 통과: {cmd}");
+        }
+    }
+
+    /// sudo가 붙으면 호출부의 sudo floor가 등급을 끌어올린다 — carve-out이 그걸 우회하지 않는다.
+    #[test]
+    fn sudo_aic_self_probe_is_not_safe() {
+        assert_ne!(lvl("sudo aic proc-fd-top"), RiskLevel::Safe);
     }
 
     #[test]
