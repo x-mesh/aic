@@ -110,6 +110,23 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(2),
     },
     ProbeSpec {
+        id: "proc_fd_top",
+        category: "process",
+        tags: &["fd", "files", "limits", "leak"],
+        description: "프로세스별 열린 fd 상위 N(누수 후보)",
+        // 위 `fd` 섹션은 **호스트 전역** 합계라, 프로세스 하나가 수만 개를 쥐고 있어도 머신 전체
+        // 대비로는 묻힌다(실측: gk watch가 fd 21019인데 호스트는 7% 사용). 그래서 프로세스 축을
+        // 따로 둔다.
+        //
+        // shell이 아니라 aic 서브커맨드를 부르는 이유: probe는 파이프만 허용해(`$`·`;` 금지)
+        // `/proc/*/fd`의 프로세스별 집계를 표현할 수 없고, lsof에 기대면 미설치 Linux 호스트에서
+        // 섹션이 통째로 빈다. `agent::proc_fd`가 aicd exporter와 **같은 fd 구현**을 공유한다.
+        // 이 명령 문자열은 risk_guard가 exact argv로 Safe 판정하므로 인자를 붙이면 즉시 막힌다.
+        linux_command: "aic proc-fd-top",
+        macos_command: "aic proc-fd-top",
+        max_lines: Some(17),
+    },
+    ProbeSpec {
         id: "ip",
         category: "system",
         tags: &["network", "ip"],

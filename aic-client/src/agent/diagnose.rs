@@ -211,7 +211,7 @@ pub(crate) fn collect_comprehensive_evidence(sandbox: &Sandbox, corr_prefix: &st
 /// 알 수 없는 id는 `section_command`가 None이라 조용히 빠진다(테스트가 키 누락을 잡는다).
 fn comprehensive_probes(docker_available: bool) -> Vec<(&'static str, String)> {
     let mut sections: Vec<&'static str> = Vec::new();
-    // base + scan_findings 7키 전부 + 보강 컨텍스트(원인 추적용 상위 프로세스·압박 신호).
+    // base + scan_findings 8키 전부 + 보강 컨텍스트(원인 추적용 상위 프로세스·압박 신호).
     let want: &[&str] = &[
         "date",
         "host",
@@ -227,6 +227,7 @@ fn comprehensive_probes(docker_available: bool) -> Vec<(&'static str, String)> {
         "process",
         "proc_states",
         "fd",
+        "proc_fd_top",
         "failed_units",
         "journal_errors", // process/services 키(+보강)
     ];
@@ -770,6 +771,21 @@ const FD_USED_PCT: u64 = 80;
 /// swap 사용률 ⚠ 임계(%). Linux `Swap: total used free` 형식에서만 판정한다 — macOS vm.swapusage는
 /// 정적으로도 높게(idle ~78%) 나와 used%만으로는 오탐이 잦다(P1 swap-thrash 상관에서 재평가).
 const SWAP_USED_PCT: u64 = 80;
+/// 프로세스 하나가 자기 fd 한도(`kern.maxfilesperproc` / `fs.nr_open`)의 몇 %를 넘으면 경고인가.
+/// 이건 **OS 한도 근접**을 잡는 축이다 — 넘으면 그 프로세스가 곧 `EMFILE`로 죽는다.
+const PROC_FD_PCT_WARN: u64 = 50;
+/// 비율과 **별개로** 절대량만으로 거는 ⚠ 임계(개).
+///
+/// 비율만으로는 실제 사고를 놓친다. 실측(gk watch): fd 21019를 6일간 쥐고 있었는데
+/// `kern.maxfilesperproc`가 245760이라 8.5%에 불과했고, 호스트 전역도 7%로 한산했다 — OS 관점에선
+/// 완전히 정상인데 정작 그 프로세스는 **자기 애플리케이션 예산**(감시자 fd budget)을 100% 쓴
+/// 포화 상태였다. OS 한도는 애플리케이션이 스스로 정한 천장을 모른다.
+///
+/// 그래서 "OS 기준으론 여유롭지만 비정상적으로 많다"를 절대량으로 따로 잡는다. DB·프록시처럼
+/// 수천 fd가 정상인 서버도 있어 오탐 여지가 있으므로 Warn에 그치고, 메시지에서 추세 확인을 권한다.
+const PROC_FD_ABS_WARN: u64 = 10_000;
+/// `proc_fd_top` 한 섹션에서 보고할 프로세스 최대 개수 — 한 번에 수십 줄이 뜨면 신호가 묻힌다.
+const PROC_FD_FINDING_CAP: usize = 3;
 /// 좀비 프로세스 ⚠ 최소 임계. 단발/소수 좀비는 정상이라 누적(부모 미회수)일 때만 신호로 본다.
 const ZOMBIE_WARN_MIN: u32 = 10;
 /// `⚠ 실패한 systemd 유닛` 라벨에 나열할 unit 이름 최대 개수.
@@ -1039,6 +1055,57 @@ fn scan_fd(body: &str) -> Vec<String> {
 /// swap_usage 섹션에서 swap 사용률(used/total)이 임계 이상이면 ⚠(순수). **Linux 형식(`Swap: total used
 /// free`)에서만** 판정한다 — macOS vm.swapusage(`total = .. used = ..`)는 정적 used%가 idle에도 높아
 /// (~78%) used% 단일 임계로는 오탐이 잦다(P1 swap-thrash 상관에서 재평가). total=0/미파싱이면 무발화.
+/// `proc_fd_top` 섹션에서 fd를 비정상적으로 많이 쥔 프로세스를 뽑는다.
+///
+/// 두 축을 **둘 다** 본다(하나만으로는 각각 다른 실패를 놓친다):
+/// - **비율** — 자기 한도의 [`PROC_FD_PCT_WARN`]% 이상. 곧 `EMFILE`로 죽을 프로세스.
+/// - **절대량** — [`PROC_FD_ABS_WARN`]개 이상. OS 한도로는 여유롭지만 애플리케이션 자체 예산이
+///   포화인 경우(상수 doc의 gk 실측 참고). 비율만 봤다면 그 사고는 8.5%로 조용히 지나갔다.
+///
+/// 입력은 [`super::proc_fd::render`]의 출력이다: `per-proc limit: N` 한 줄(모르면 없음) + `FD PID
+/// COMMAND` 표. 한도 줄이 없으면 절대량 축만 적용한다 — 분모를 모르면서 비율을 지어내지 않는다.
+fn scan_proc_fd(body: &str) -> Vec<String> {
+    let mut limit: Option<u64> = None;
+    let mut out = Vec::new();
+
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix(super::proc_fd::LIMIT_PREFIX) {
+            limit = rest.trim().parse().ok().filter(|m: &u64| *m > 0);
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        // 첫 토큰이 정수가 아니면 헤더(`FD PID COMMAND`)나 안내 문구다 — 조용히 건너뛴다.
+        let (Some(fd), Some(pid)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(fd), Ok(pid)) = (fd.parse::<u64>(), pid.parse::<u64>()) else {
+            continue;
+        };
+        let name = it.collect::<Vec<_>>().join(" ");
+        let name = if name.is_empty() { "?".to_string() } else { name };
+
+        let pct = limit.map(|m| fd.saturating_mul(100) / m);
+        if let Some(p) = pct.filter(|p| *p >= PROC_FD_PCT_WARN) {
+            out.push(format!(
+                "{name}(pid {pid}) fd {fd}개 — 프로세스 한도의 {p}% (>= {PROC_FD_PCT_WARN}%) — \
+                 'Too many open files'로 곧 죽을 수 있다"
+            ));
+        } else if fd >= PROC_FD_ABS_WARN {
+            let ratio = pct
+                .map(|p| format!("OS 한도로는 {p}%라 여유롭지만"))
+                .unwrap_or_else(|| "OS 한도는 확인하지 못했으나".to_string());
+            out.push(format!(
+                "{name}(pid {pid}) fd {fd}개 — {ratio} 절대량이 비정상적이다(>= {PROC_FD_ABS_WARN}). \
+                 애플리케이션 자체 fd 예산이 포화일 수 있으니 증가 추세를 확인하라"
+            ));
+        }
+        if out.len() >= PROC_FD_FINDING_CAP {
+            break;
+        }
+    }
+    out
+}
+
 fn scan_swap(body: &str) -> Vec<String> {
     // 단위 접미사(B/K/M/G/T, 'i' 허용: Gi/Mi)를 바이트(f64)로. 실패는 None. 'B'(예: free의 swap-off "0B")를
     // 명시 처리해 0이 Some(0.0)으로 파싱되게 한다 — 그러면 swap-off가 total<=0.0 가드 하나로 결정적으로 걸린다.
@@ -1095,6 +1162,7 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
             "proc_states" => (Severity::Warn, scan_zombies(stdout)),
             "failed_units" => (Severity::Warn, scan_failed_units(stdout)),
             "fd" => (Severity::Warn, scan_fd(stdout)),
+            "proc_fd_top" => (Severity::Warn, scan_proc_fd(stdout)),
             "swap_usage" => (Severity::Warn, scan_swap(stdout)),
             _ => continue,
         };
@@ -1754,9 +1822,48 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
         assert!(scan_findings(real)[0].message.contains("OOM-killer"));
     }
 
+    /// 비율 축 — 자기 한도의 절반을 넘으면 곧 EMFILE이다.
+    #[test]
+    fn scan_proc_fd_flags_process_near_its_limit() {
+        let body = "per-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n";
+        let found = scan_proc_fd(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("leaky"), "{found:?}");
+        assert!(found[0].contains("90%"), "{found:?}");
+    }
+
+    /// 절대량 축 — **이게 없으면 실제 사고를 놓친다.** gk 실측 재현: fd 21019인데 한도가 245760이라
+    /// 비율은 8%에 불과했다. 비율만 봤다면 6일간 조용히 지나갔을 케이스다.
+    #[test]
+    fn scan_proc_fd_flags_absolute_volume_even_when_ratio_is_low() {
+        let body = "per-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n";
+        let found = scan_proc_fd(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("21019"), "{found:?}");
+        assert!(found[0].contains("8%"), "비율 맥락이 빠졌다: {found:?}");
+    }
+
+    /// 한도 줄이 없으면 비율을 지어내지 않고 절대량 축만 쓴다.
+    #[test]
+    fn scan_proc_fd_without_limit_uses_absolute_axis_only() {
+        let body = "     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n";
+        let found = scan_proc_fd(body);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("huge"), "{found:?}");
+        assert!(found[0].contains("확인하지 못했"), "{found:?}");
+    }
+
+    /// 평범한 프로세스만 있으면 아무것도 보고하지 않는다 — 오탐이 나면 자동 발견 블록 전체가
+    /// 무시당한다.
+    #[test]
+    fn scan_proc_fd_is_quiet_on_normal_output() {
+        let body = "per-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n";
+        assert!(scan_proc_fd(body).is_empty());
+    }
+
     #[test]
     fn comprehensive_probes_cover_all_scan_findings_keys() {
-        // auto-RCA 포괄 수집은 scan_findings가 키로 삼는 7개 섹션을 (트리거 자원과 무관하게) 모두 포함해야
+        // auto-RCA 포괄 수집은 scan_findings가 키로 삼는 8개 섹션을 (트리거 자원과 무관하게) 모두 포함해야
         // 한다 — 누락되면 해당 Crit 신호(예: cpu/load Crit 시 dmesg_oom)가 인시던트 findings에서 사라진다.
         let names: Vec<&str> = comprehensive_probes(false)
             .iter()
@@ -1769,6 +1876,7 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
             "proc_states",
             "failed_units",
             "fd",
+            "proc_fd_top",
             "swap_usage",
         ] {
             assert!(
