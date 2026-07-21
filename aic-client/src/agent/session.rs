@@ -1236,8 +1236,11 @@ impl AgentSession {
         // spinner를 ChatOut sink로 — TUI는 viewport tick arm(누적 없음), Direct는 stderr spinner.
         // (4d/4e에서 run_turn만 이전했고 이 분석 경로가 누락되어 TUI에서 spinner 프레임이 누적됐었음.)
         self.out.spin_start(label, amber).await;
-        let result =
-            tokio::time::timeout(LOCAL_ANALYZE_TIMEOUT, self.dispatcher.send(prompt)).await;
+        // 데드라인은 dispatcher가 실제 HTTP 요청에 거는 값과 같게 맞추고, 하한만 여기서 지킨다.
+        // 상수를 그대로 씌우면 바깥이 항상 더 짧아 이겨서, 사용자가 config로 올린 여유가 이
+        // 경로에만 반영되지 않는다(추론 모델처럼 first-token이 느린 조합에서 fallback으로 드러난다).
+        let deadline = self.dispatcher.request_timeout().max(LOCAL_ANALYZE_MIN_TIMEOUT);
+        let result = tokio::time::timeout(deadline, self.dispatcher.send(prompt)).await;
         self.out.spin_stop().await;
 
         match result {
@@ -1274,7 +1277,9 @@ impl AgentSession {
             Err(_) => {
                 self.analysis_fallback(
                     kind,
-                    &format!("분석 timeout({}s)", LOCAL_ANALYZE_TIMEOUT.as_secs()),
+                    // 실제로 적용된 데드라인을 그대로 보여준다 — 상수를 찍으면 config를 올린
+                    // 사용자가 "왜 30초라고 나오지"에서 원인 추적이 막힌다.
+                    &format!("분석 timeout({}s)", deadline.as_secs()),
                     snapshot,
                 )
                 .await
@@ -2304,7 +2309,13 @@ impl AgentSession {
 }
 
 /// `/local` 분석 단발 LLM 호출의 최대 대기 시간(초). 초과 시 raw fallback.
-const LOCAL_ANALYZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// `/local`·`/diagnose` 분석 데드라인의 **하한**. 실제 값은 dispatcher의 요청 timeout을 따르되
+/// (`LlmDispatcher::request_timeout`), config의 `request_timeout_secs`가 아주 작게 잡힌 환경에서
+/// 분석이 시작하자마자 잘리지 않도록 이 값 아래로는 내려가지 않는다.
+///
+/// 상한이 아니라 하한인 게 핵심이다 — 상한으로 두면 사용자가 config를 올려도 여기서 잘려,
+/// "설정했는데 왜 안 늘어나지"가 된다(추론 모델처럼 first-token이 느린 조합에서 실제로 겪었다).
+const LOCAL_ANALYZE_MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `/incident` analyze evidence 바운드 — 과대 evidence로 인한 provider parsing/context 오류 방지.
 /// 섹션(=probe)별 본문 최대 줄 수(핵심 섹션은 모두 보존하되 각 섹션을 짧게).

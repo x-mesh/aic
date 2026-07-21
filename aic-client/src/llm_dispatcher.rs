@@ -824,6 +824,29 @@ impl LlmDispatcher {
     // ── 내부 헬퍼 ──────────────────────────────────────────────
 
     /// default_provider에 해당하는 ProviderConfig를 찾는다.
+    /// 현재 provider/model 기준 요청 timeout — 실제 HTTP 요청에 걸리는 값과 **동일**하다.
+    ///
+    /// 호출부가 자체 데드라인(`tokio::time::timeout`)을 씌울 때 이 값을 보라고 노출한다. 두 층이
+    /// 서로 다른 상수를 쓰면 바깥이 더 짧을 때 항상 이겨서, 사용자가 `request_timeout_secs`로 올린
+    /// 여유가 그 경로에만 반영되지 않는다(추론 모델처럼 first-token이 느린 조합에서 드러난다).
+    ///
+    /// provider를 못 찾으면 모델별 보정 없이 config의 기본 timeout을 돌려준다 — 그 경우 실제 요청도
+    /// 같은 이유로 실패할 것이므로 여기서 더 정교하게 추정할 이유가 없다.
+    pub fn request_timeout(&self) -> Duration {
+        let Ok(provider) = self.resolve_provider() else {
+            return Duration::from_secs(self.config.request_timeout_secs);
+        };
+        // 기본 모델은 wire format 계열마다 다르다(Anthropic은 openai_compat_defaults 밖).
+        let model = provider.model.as_deref().unwrap_or_else(|| {
+            if matches!(provider.provider_type, ProviderType::Anthropic) {
+                "claude-sonnet-4-6"
+            } else {
+                openai_compat_defaults(&provider.provider_type).1
+            }
+        });
+        estimate_request_timeout(model, self.config.request_timeout_secs)
+    }
+
     fn resolve_provider(&self) -> Result<&ProviderConfig, AicError> {
         self.config
             .providers
@@ -1198,6 +1221,50 @@ mod tests {
         let dispatcher = LlmDispatcher::from_config(config);
         let err = dispatcher.resolve_provider().unwrap_err();
         assert!(matches!(err, AicError::ConfigError(_)));
+    }
+
+    // ── request_timeout (호출부 데드라인과 공유하는 값) ─────────
+
+    fn config_with(model: &str, request_timeout_secs: u64) -> LlmConfig {
+        let mut cfg = make_config(ProviderType::OpenAiCompatible, Some("k"), None);
+        cfg.request_timeout_secs = request_timeout_secs;
+        if let Some(p) = cfg.providers.get_mut("openai") {
+            p.model = Some(model.to_string());
+        }
+        cfg
+    }
+
+    /// config의 `request_timeout_secs`가 그대로 반영돼야 한다 — 이 값이 `/local` 분석 데드라인의
+    /// 출처이므로, 여기서 잘리면 사용자가 config를 올려도 분석이 짧게 끊긴다.
+    #[test]
+    fn request_timeout_follows_config_for_unrecognized_model() {
+        // 이름 패턴(o1/opus/70b…)에 안 걸리는 모델은 보정 없이 config 값을 쓴다.
+        let d = LlmDispatcher::from_config(config_with("kiro/gpt-5.6-terra", 300));
+        assert_eq!(d.request_timeout(), Duration::from_secs(300));
+    }
+
+    /// 모델별 최소치는 config가 그보다 작을 때만 끌어올린다(floor 역할).
+    #[test]
+    fn request_timeout_raises_small_config_for_slow_models() {
+        let d = LlmDispatcher::from_config(config_with("claude-3-opus", 10));
+        assert_eq!(d.request_timeout(), Duration::from_secs(180));
+        // 반대로 config가 더 크면 config가 이긴다 — 사용자 의도가 우선이다.
+        let d = LlmDispatcher::from_config(config_with("claude-3-opus", 600));
+        assert_eq!(d.request_timeout(), Duration::from_secs(600));
+    }
+
+    /// provider를 못 찾아도 panic하지 않고 config 기본값으로 떨어진다.
+    #[test]
+    fn request_timeout_falls_back_when_provider_missing() {
+        let config = LlmConfig {
+            default_provider: "nonexistent".to_string(),
+            providers: HashMap::new(),
+            lang: "korean".to_string(),
+            connect_timeout_secs: 5,
+            request_timeout_secs: 45,
+        };
+        let d = LlmDispatcher::from_config(config);
+        assert_eq!(d.request_timeout(), Duration::from_secs(45));
     }
 
     // ── API key missing ────────────────────────────────────────
