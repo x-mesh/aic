@@ -6,6 +6,9 @@ pub mod central_store_flag;
 pub mod error;
 pub mod ipc;
 pub mod paths;
+// 프로세스 단위 OS 조회(fd 수 등). aic-server(OTLP exporter의 top-N)와 aic-client(`/local` probe)가
+// 같은 숫자를 보고해야 하므로 단일 원천으로 둔다.
+pub mod proc;
 // LLM/텔레메트리 송신 직전 secret·PII 마스킹. aic-client(LLM prompt)와 aic-server
 // (OTLP exporter, SRE t6) 양쪽이 공유하므로 lean한 aic-common으로 옮겨 단일 원천으로 둔다.
 pub mod redaction;
