@@ -126,7 +126,7 @@ pub async fn serve_agent(
                         }
 
                         match super::push_logs(&client, &url, cfg.token.as_deref(), body.clone()).await {
-                            Ok(()) => {
+                            Ok(_) => {
                                 backoff.on_success();
                                 cfg.health.record_ok();
                             }

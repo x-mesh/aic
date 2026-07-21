@@ -154,6 +154,17 @@ pub struct ProcessEntry<'a> {
     pub disk_read_bytes: u64,
     /// 직전 tick 이후 이 프로세스가 **쓴** 디스크 바이트(delta).
     pub disk_write_bytes: u64,
+    /// 프로세스 시작 시각(unix epoch 초). `(pid, start_time)`이 안정 식별자 — PID는 재사용되므로
+    /// pid만으로는 짧게 죽고 재사용된 프로세스가 한 시계열에 섞인다. 0이면 attr 생략(rest 버킷 등).
+    pub start_time: u64,
+    /// 소유자 실제 uid. Linux는 `/proc/<pid>/status`에서, 그 외/읽기 실패는 `None` → attr 생략.
+    pub uid: Option<u32>,
+    /// 컨테이너 id(docker/containerd 64-hex). Linux `/proc/<pid>/cgroup`에서 파싱, 없으면 `None`.
+    /// "어느 컨테이너가 자원을 먹나"를 rca가 붙일 수 있게 한다.
+    pub container_id: Option<&'a str>,
+    /// 이 프로세스가 열고 있는 fd 수. 권한 부족(타 uid)·프로세스 소멸·미지원 플랫폼은 `None` →
+    /// attr 생략. rca가 `(host, pid, name)` 시계열의 **기울기**로 fd 누수를 잡는 축이다.
+    pub fd_count: Option<u32>,
 }
 
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
@@ -381,7 +392,7 @@ pub fn encode_process_samples(
     let log_records = samples
         .iter()
         .map(|p| {
-            let attributes = vec![
+            let mut attributes = vec![
                 attr_str("process.executable.name", p.name),
                 attr_int("process.pid", p.pid),
                 attr_double("process.cpu_utilization", p.cpu_pct),
@@ -391,6 +402,23 @@ pub fn encode_process_samples(
                 attr_int("process.disk.read_bytes", saturating_i64(p.disk_read_bytes)),
                 attr_int("process.disk.write_bytes", saturating_i64(p.disk_write_bytes)),
             ];
+            // 아래 네 개는 "모르면 생략"(빈 값 금지, connections/dns 규약). start_time은 0(rest
+            // 버킷·미측정)이면 생략, uid/container/fd는 None이면 생략한다.
+            if p.start_time > 0 {
+                attributes.push(attr_int("process.start_time", saturating_i64(p.start_time)));
+            }
+            if let Some(uid) = p.uid {
+                attributes.push(attr_int("process.owner.uid", i64::from(uid)));
+            }
+            if let Some(cid) = p.container_id.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("container.id", cid));
+            }
+            // 호스트 전역 metric `aic.system.file_descriptor.count`와 이름을 맞춘 프로세스 축.
+            // disk IO와 달리 0을 실어야 할 이유가 없다 — fd 0개인 프로세스는 존재하지 않으므로
+            // 측정 실패(권한/소멸)와 구분이 안 되고, 그래서 아예 생략한다.
+            if let Some(fd) = p.fd_count {
+                attributes.push(attr_int("process.file_descriptor.count", i64::from(fd)));
+            }
             let body_text = format!("{} pid={}", p.name, p.pid);
             LogRecord {
                 time_unix_nano,
@@ -630,6 +658,28 @@ fn string_value(s: &str) -> AnyValue {
     }
 }
 
+/// collector가 200으로 응답한 body에서 `(버려진 레코드 수, 사유)`를 뽑는다.
+///
+/// **왜 필요한가**: OTLP는 요청을 받아도 일부 레코드를 **조용히 버릴 수 있다**(미지 scope·미지원
+/// 타입 등) — 그때 HTTP는 200이고, 버린 사실은 `partial_success`에만 담긴다. 발신 측이 이 body를
+/// 안 읽으면 자기 텔레메트리가 수신측에서 사라지는 걸 **영영 모른다**(예: rca가 `aic.process`
+/// decoder가 없어 전량 드롭해도 aicd는 성공으로 안다). 이 함수가 그 사각지대를 여는 창구다.
+///
+/// 재전송은 같은 결과라 이건 **재시도 대상이 아니다**(4xx `by_rejected`와 다른 범주 — 그쪽은
+/// 요청 자체 거부, 이쪽은 요청 수락 후 일부 폐기). 디코드 실패/`partial_success` 부재는 `(0, "")`로
+/// 본다(구 collector 호환 — 응답이 비었거나 형식이 달라도 push는 성공으로 유지한다).
+pub fn decode_logs_partial_reject(body: &[u8]) -> (u64, String) {
+    match ExportLogsServiceResponse::decode(body) {
+        Ok(resp) => match resp.partial_success {
+            Some(ps) if ps.rejected_log_records > 0 => {
+                (ps.rejected_log_records as u64, ps.error_message)
+            }
+            _ => (0, String::new()),
+        },
+        Err(_) => (0, String::new()),
+    }
+}
+
 // ── OTLP protobuf message subset (prost) — logs.proto v1 필드 번호와 1:1 ─────────────
 
 /// collector/logs/v1/logs_service.proto — `ExportLogsServiceRequest`.
@@ -637,6 +687,24 @@ fn string_value(s: &str) -> AnyValue {
 pub struct ExportLogsServiceRequest {
     #[prost(message, repeated, tag = "1")]
     pub resource_logs: Vec<ResourceLogs>,
+}
+
+/// collector/logs/v1/logs_service.proto — `ExportLogsServiceResponse`. 성공(200) 응답 body.
+/// `partial_success`가 있으면 collector가 요청은 받았으나 일부 레코드를 버렸다는 뜻이다
+/// ([`decode_logs_partial_reject`] 참고).
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportLogsServiceResponse {
+    #[prost(message, optional, tag = "1")]
+    pub partial_success: Option<ExportLogsPartialSuccess>,
+}
+
+/// collector/logs/v1/logs_service.proto — `ExportLogsPartialSuccess`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportLogsPartialSuccess {
+    #[prost(int64, tag = "1")]
+    pub rejected_log_records: i64,
+    #[prost(string, tag = "2")]
+    pub error_message: String,
 }
 
 /// logs/v1/logs.proto — `ResourceLogs`.
@@ -1062,6 +1130,40 @@ mod tests {
     }
 
     #[test]
+    fn partial_reject_decodes_rejected_count_and_reason() {
+        // collector가 200으로 응답하되 일부를 버린 경우 — 발신 측이 그 수/사유를 뽑아야 한다.
+        let resp = ExportLogsServiceResponse {
+            partial_success: Some(ExportLogsPartialSuccess {
+                rejected_log_records: 23,
+                error_message: "dropped 23 record(s) from unknown scope(s): aic.process".to_string(),
+            }),
+        };
+        let (rejected, reason) = decode_logs_partial_reject(&resp.encode_to_vec());
+        assert_eq!(rejected, 23);
+        assert!(reason.contains("aic.process"));
+    }
+
+    #[test]
+    fn partial_reject_is_zero_when_absent_or_empty() {
+        // partial_success 부재(전량 수용) → (0, "").
+        let ok = ExportLogsServiceResponse {
+            partial_success: None,
+        };
+        assert_eq!(decode_logs_partial_reject(&ok.encode_to_vec()), (0, String::new()));
+        // 빈 body / 디코드 불가 → (0, "") (구 collector 호환, push는 성공 유지).
+        assert_eq!(decode_logs_partial_reject(&[]), (0, String::new()));
+        assert_eq!(decode_logs_partial_reject(b"not-protobuf"), (0, String::new()));
+        // rejected=0이면 사유가 있어도 (0, "")로 본다(폐기 없음).
+        let zero = ExportLogsServiceResponse {
+            partial_success: Some(ExportLogsPartialSuccess {
+                rejected_log_records: 0,
+                error_message: "noise".to_string(),
+            }),
+        };
+        assert_eq!(decode_logs_partial_reject(&zero.encode_to_vec()), (0, String::new()));
+    }
+
+    #[test]
     fn process_samples_roundtrip_with_all_fields() {
         let samples = vec![
             ProcessEntry {
@@ -1071,6 +1173,10 @@ mod tests {
                 rss_bytes: 128 * 1024 * 1024,
                 disk_read_bytes: 4096,
                 disk_write_bytes: 8192,
+                start_time: 1_700_000_000,
+                uid: Some(1000),
+                container_id: Some("abc123def456abc123def456abc123def456abc123def456abc123def4560000"),
+                fd_count: Some(237),
             },
             ProcessEntry {
                 name: "clickhouse",
@@ -1079,6 +1185,10 @@ mod tests {
                 rss_bytes: 4 * 1024 * 1024 * 1024,
                 disk_read_bytes: 512 * 1024 * 1024,
                 disk_write_bytes: 0, // 이번 창엔 쓰기 없음 — 0도 실제 값
+                start_time: 0,       // 미측정 → attr 생략돼야 한다
+                uid: None,           // 생략
+                container_id: None,  // 생략
+                fd_count: None,      // 권한 부족(타 uid) → 생략
             },
         ];
         let bytes = encode_process_samples(&samples, &resource(None), "0.28.0", 100);
@@ -1114,6 +1224,21 @@ mod tests {
             get("process.disk.write_bytes"),
             Some(AnyValueOneof::IntValue(8192))
         ));
+        assert!(matches!(
+            get("process.start_time"),
+            Some(AnyValueOneof::IntValue(1_700_000_000))
+        ));
+        assert!(matches!(
+            get("process.owner.uid"),
+            Some(AnyValueOneof::IntValue(1000))
+        ));
+        assert!(
+            matches!(get("container.id"), Some(AnyValueOneof::StringValue(v)) if v.len() == 64)
+        );
+        assert!(matches!(
+            get("process.file_descriptor.count"),
+            Some(AnyValueOneof::IntValue(237))
+        ));
 
         // 두 번째 레코드: 코어 합산 CPU(>100%)와 큰 RSS가 손실 없이 실린다.
         let attrs2 = &scope_logs.log_records[1].attributes;
@@ -1140,6 +1265,13 @@ mod tests {
             get2("process.disk.write_bytes"),
             Some(AnyValueOneof::IntValue(0))
         ));
+        // start_time=0, uid/container/fd=None → 네 attr 모두 생략돼야 한다. fd는 특히 0으로
+        // 대체하면 안 된다 — "fd를 안 열었다"와 "권한이 없어 못 읽었다"가 뒤섞인다.
+        let attrs2 = &scope_logs.log_records[1].attributes;
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.start_time"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.file_descriptor.count"));
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
