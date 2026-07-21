@@ -1568,9 +1568,11 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
         return Ok(());
     }
 
-    let host_name = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|name| !name.trim().is_empty());
+    // hostname은 커널에서 직접 얻는다. `HOSTNAME` 환경변수에 기대면 셸에 따라 값이 갈린다 —
+    // sh/bash는 설정하지만 **zsh는 export하지 않아** macOS 기본 셸에서 직접 실행하면 빈 값이고,
+    // install.sh(#!/bin/sh) 경유일 때만 채워진다. 같은 명령이 실행 경로에 따라 다르게 동작하면
+    // RCA가 호스트를 이름 없이 등록하게 된다(저장소 다른 곳도 전부 sysinfo를 쓴다).
+    let host_name = sysinfo::System::host_name().filter(|name| !name.trim().is_empty());
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?
@@ -1596,6 +1598,8 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     config.aicd.exporter.enabled = true;
     config.aicd.exporter.endpoint = enrolled.endpoint.trim_end_matches('/').to_string();
     config.aicd.exporter.token = Some(enrolled.ingest_token);
+    // 어떤 등록으로 연결됐는지 남긴다 — 화면 출력만으로는 사용자가 그때 기억해야 한다.
+    config.aicd.exporter.enrollment_id = Some(enrolled.enrollment_id.clone());
     // RCA가 선택한 provider/model을 기본값으로 반영한다. credential은 enrollment 응답에
     // 포함되지 않으므로 기존 provider의 api_key/endpoint는 보존한다.
     let provider = config
@@ -5557,6 +5561,85 @@ fn mask_api_key(key: &str) -> String {
     let head: String = key.chars().take(8).collect();
     let tail: String = key.chars().skip(total - 4).collect();
     format!("{head}***{tail}")
+}
+
+#[cfg(test)]
+mod enrollment_response_tests {
+    use super::{validate_enrollment_response, EnrollmentResponse};
+
+    fn valid() -> EnrollmentResponse {
+        EnrollmentResponse {
+            enrollment_id: "enr_123".to_string(),
+            host_name: "web-1".to_string(),
+            endpoint: "https://rca.example.com".to_string(),
+            ingest_token: "tok_abc".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        }
+    }
+
+    #[test]
+    fn accepts_well_formed_response() {
+        assert!(validate_enrollment_response(&valid()).is_ok());
+        // http도 허용한다 — 사설망 collector가 TLS 없이 뜨는 구성이 실제로 있다.
+        let mut r = valid();
+        r.endpoint = "http://10.0.0.5:4318".to_string();
+        assert!(validate_enrollment_response(&r).is_ok());
+    }
+
+    /// endpoint는 http/https만 받는다. 다른 scheme을 그대로 config에 넣으면 exporter가 매 tick
+    /// 실패하며, 그때는 이미 enrollment key가 소비된 뒤라 되돌리기 어렵다.
+    #[test]
+    fn rejects_non_http_scheme() {
+        for bad in ["ftp://rca.example.com", "file:///etc/passwd", "not-a-url"] {
+            let mut r = valid();
+            r.endpoint = bad.to_string();
+            assert!(
+                validate_enrollment_response(&r).is_err(),
+                "허용되면 안 되는 endpoint: {bad}"
+            );
+        }
+    }
+
+    /// URL 파서가 관대해서 걸러지지 **않는** 형태를 못박아 둔다. `http:///v1/metrics`는 빈
+    /// authority가 아니라 host="v1"으로 해석되어 유효한 URL이 된다(실측 확인). 즉 endpoint
+    /// 오타는 이 검증을 통과해 그대로 저장되며, 잘못됐다는 건 exporter가 실제로 push를
+    /// 시도할 때에야 드러난다 — 이 검증의 한계로 알고 있어야 할 지점이다.
+    #[test]
+    fn url_parser_accepts_shapes_that_look_malformed() {
+        let mut r = valid();
+        r.endpoint = "http:///v1/metrics".to_string();
+        assert!(
+            validate_enrollment_response(&r).is_ok(),
+            "host=\"v1\"으로 파싱되므로 통과가 정상이다"
+        );
+    }
+
+    /// 필수 필드가 공백이면 거부한다. 빈 문자열을 그대로 저장하면 나중에 "설정은 됐는데 왜
+    /// 안 되지"로 나타나고, 원인이 enrollment 응답이었다는 걸 추적하기 어렵다.
+    #[test]
+    fn rejects_blank_required_fields() {
+        // 공백만 있는 값도 빈 값으로 본다 — trim 후 판정하므로 "  "와 "\t"도 거부돼야 한다.
+        let mut r = valid();
+        r.enrollment_id = "  ".to_string();
+        assert!(validate_enrollment_response(&r).is_err(), "enrollment_id");
+
+        let mut r = valid();
+        r.host_name = String::new();
+        assert!(validate_enrollment_response(&r).is_err(), "host_name");
+
+        let mut r = valid();
+        r.ingest_token = "\t".to_string();
+        assert!(validate_enrollment_response(&r).is_err(), "ingest_token");
+
+        let mut r = valid();
+        r.provider = String::new();
+        assert!(validate_enrollment_response(&r).is_err(), "provider");
+
+        let mut r = valid();
+        r.model = " ".to_string();
+        assert!(validate_enrollment_response(&r).is_err(), "model");
+    }
 }
 
 #[cfg(test)]

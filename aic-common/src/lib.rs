@@ -671,6 +671,13 @@ pub struct AicdExporterConfig {
     /// 카디널리티를 묶는다 — 그래도 부담되는 호스트에선 명시적으로 false로 끈다.
     #[serde(default = "default_true")]
     pub process_enabled: bool,
+    /// 이 호스트를 RCA에 연결한 enrollment의 id. `aic enroll`이 교환 성공 시 기록한다.
+    ///
+    /// 동작에는 쓰이지 않고 **출처 추적용**이다 — 나중에 "이 호스트가 어떤 등록으로 붙었나",
+    /// "재발급이 필요한가"를 config만 보고 답할 수 있게 남긴다. enroll 없이 손으로 설정한
+    /// 경우에는 `None`이며, 그 자체가 "수동 연결"이라는 정보다.
+    #[serde(default)]
+    pub enrollment_id: Option<String>,
 }
 
 impl Default for AicdExporterConfig {
@@ -695,6 +702,8 @@ impl Default for AicdExporterConfig {
             docker_bin: None,
             dns_enabled: false,
             process_enabled: true,
+            // 손으로 설정한 config는 enrollment을 거치지 않았다는 뜻이라 None이 기본이다.
+            enrollment_id: None,
         }
     }
 }
