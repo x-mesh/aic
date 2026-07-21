@@ -36,6 +36,10 @@
 
 use std::time::Instant;
 
+// fd 조회는 aic-client의 `/local` probe와 **같은 구현을 공유**한다 — 두 크레이트가 각자 세면 같은
+// 프로세스에 다른 숫자를 보고하게 되고, 그러면 어느 쪽이 맞는지 판단할 근거가 사라진다.
+use aic_common::proc::process_fd_count;
+
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 한 metric data point — 이름·단위·값. OTLP Gauge 하나로 인코딩된다.
@@ -77,12 +81,29 @@ pub struct ProcessSample {
     /// 직전 tick 이후 읽은/쓴 디스크 바이트(delta). 미지원 플랫폼/첫 tick은 0.
     pub disk_read_bytes: u64,
     pub disk_write_bytes: u64,
+    /// 프로세스 시작 시각(unix epoch 초). `(pid, start_time)` 안정 식별자. rest 버킷은 0.
+    pub start_time: u64,
+    /// 소유자 실제 uid. top-N만 `/proc/<pid>/status`에서 채운다(Linux). 그 외/미측정은 `None`.
+    pub uid: Option<u32>,
+    /// 컨테이너 id. top-N만 `/proc/<pid>/cgroup`에서 파싱(Linux). 없으면 `None`.
+    pub container_id: Option<String>,
+    /// 이 프로세스가 열고 있는 fd 수. **전체 프로세스에 채운다**([`process_fd_count`]) — top-N
+    /// 선정의 랭킹 축이라 선정 전에 있어야 하기 때문이다. 권한 부족/프로세스 소멸/미지원
+    /// 플랫폼은 `None` → attr 생략. **호스트 전역 `aic.system.file_descriptor.count`와 다른
+    /// 축이다**: 전역 합계는 머신 전체가 수천~수만이라 데몬 하나의 fd 누수가 노이즈에 묻힌다.
+    /// rest 버킷에서는 "읽을 수 있었던 프로세스들의 합"을 뜻한다.
+    pub fd_count: Option<u32>,
 }
 
-/// 매 tick 실을 프로세스 수 — CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N(합집합, pid dedupe)
-/// 이라 최대 3N개. 시계열 키가 (host, pid, name)이라 이 값이 곧 프로세스 신호의 호스트당
-/// 카디널리티 상한을 정한다.
+/// 매 tick 실을 프로세스 수 — CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N + **fd 상위 N**
+/// (합집합, pid dedupe)이라 최대 4N개. 시계열 키가 (host, pid, name)이라 이 값이 곧 프로세스
+/// 신호의 호스트당 카디널리티 상한을 정한다. fd 축을 더하며 상한이 3N→4N으로 늘었지만, 축이
+/// 겹치는 프로세스는 dedupe되므로 실측 레코드 수는 그보다 적다.
 const TOP_PROCESS_COUNT: usize = 10;
+
+/// rest 버킷(top-N 밖 프로세스 합계)의 센티넬 프로세스명. pid=0과 함께 "이건 집계지 프로세스가
+/// 아니다"를 수신측이 구분하는 표식이다.
+const REST_BUCKET_NAME: &str = "__rest__";
 
 /// 한 번 수집한 host metrics 스냅샷(resource + gauge point 목록 + top-N 프로세스).
 pub struct HostSample {
@@ -418,6 +439,14 @@ fn top_process_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
 /// 이미 refresh된 `sys`의 프로세스 목록에서 top-N을 뽑는다(추가 열거 없음). sysinfo 경계에서
 /// 소유 [`ProcessSample`]로 복사한 뒤 순수 함수 [`select_top_processes`]에 위임한다 — 그래야 선택
 /// 로직을 sysinfo 없이 결정적으로 테스트할 수 있다.
+///
+/// # 플랫폼별 가시성 (F — 조용히 두지 않는다)
+/// - **macOS 비루트**: 타 uid 프로세스의 RSS/CPU/디스크가 `proc_pidinfo` 권한 부족으로 0으로
+///   보고된다(모듈 상단 doc의 RSS 실측 참고 — cpu·disk도 같은 syscall 계열이라 동일하게 막힌다).
+///   그래서 top-N이 **same-uid 프로세스로 편향**된다. 또한 uid/container 귀속은 `/proc`에 의존하는
+///   Linux 전용이라 macOS에선 항상 `None`이다([`enrich_process_owner`]). aicd의 실제 배포 대상은
+///   Linux 서버라 이 편향은 로컬 macOS 개발 관측에만 영향을 준다.
+/// - **Linux**: `/proc/<pid>/*`가 world-readable이라 비루트도 전량 읽힌다(uid/container 포함).
 fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
     let all: Vec<ProcessSample> = sys
         .processes()
@@ -433,20 +462,90 @@ fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
                 // 누가 디스크를 때렸나"라 delta가 맞다.
                 disk_read_bytes: io.read_bytes,
                 disk_write_bytes: io.written_bytes,
+                // start_time은 sysinfo가 이미 준다(무비용, 전 플랫폼). uid/container는 비싸므로
+                // (프로세스당 /proc 파일 읽기) 여기서 채우지 않고 select 후 top-N만 enrich한다.
+                start_time: p.start_time(),
+                uid: None,
+                container_id: None,
+                // fd는 **전수**로 채운다 — [`select_top_processes`]의 랭킹 축이라 선정 *전에*
+                // 있어야 한다. top-N을 뽑은 뒤 채우면 fd만 새고 cpu·rss·disk는 조용한 프로세스가
+                // 애초에 후보에 못 들어 영원히 관측되지 않는다(= 누수 탐지가 노리는 바로 그 대상).
+                //
+                // 비용은 실측으로 확인했다 — 이 머신(1233 프로세스, 총 fd 33366개) 기준 전수
+                // 수집 **1.5~1.8ms**(프로세스당 ~1.3µs). 같은 tick의 sysinfo 프로세스 열거가
+                // 이미 8~20ms라 순증이 그 10~20%고, tick 주기는 60초다.
+                fd_count: process_fd_count(i64::from(p.pid().as_u32())),
             }
         })
         .collect();
-    select_top_processes(all, n)
+    let mut top = select_top_processes(all, n);
+    // uid/container는 top-N(+rest)에만 필요하니 여기서만 /proc 파일을 읽는다 — fd와 달리 랭킹
+    // 축이 아니라 귀속 정보일 뿐이라 전수로 읽을 이유가 없다. rest 버킷(pid=0)은 건너뛴다.
+    for s in top.iter_mut().filter(|s| s.pid > 0) {
+        let (uid, container) = enrich_process_owner(s.pid);
+        s.uid = uid;
+        s.container_id = container;
+    }
+    top
+}
+
+/// top-N 프로세스에만 붙이는 소유자/컨테이너 귀속. **Linux 전용** — `/proc/<pid>/status`의 실제
+/// uid와 `/proc/<pid>/cgroup`의 컨테이너 id를 읽는다. 비-Linux(macOS 등)는 `(None, None)`이다
+/// (proc 파일이 없다 — sysinfo `with_user`는 프로세스당 비용이 있어 쓰지 않는다). 읽기 실패도
+/// `None`으로 흡수한다(권한/레이스로 프로세스가 사라졌어도 신호 전체를 깨지 않는다).
+#[cfg(target_os = "linux")]
+fn enrich_process_owner(pid: i64) -> (Option<u32>, Option<String>) {
+    let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| parse_status_uid(&s));
+    let container = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .ok()
+        .and_then(|s| extract_container_id(&s));
+    (uid, container)
+}
+
+/// Linux가 아니면 proc 파일이 없다 — 귀속은 생략한다(RSS/CPU 등 나머지는 그대로 나간다).
+#[cfg(not(target_os = "linux"))]
+fn enrich_process_owner(_pid: i64) -> (Option<u32>, Option<String>) {
+    (None, None)
+}
+
+/// `/proc/<pid>/status`의 `Uid:` 줄에서 **실제 uid**(첫 필드)를 뽑는다. 순수 함수로 분리해 검증한다.
+/// 형식: `Uid:\t<real>\t<effective>\t<saved>\t<fs>`. 호출부([`enrich_process_owner`])는 Linux
+/// 전용이지만 파싱은 플랫폼 무관이라 어디서든 테스트한다 — 그래서 비-Linux 빌드의 미사용 lint만 끈다.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_status_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// `/proc/<pid>/cgroup`에서 컨테이너 id(docker/containerd/crio의 64-hex)를 뽑는다. 순수 함수.
+/// cgroup 경로 어딘가에 64자 hex 세그먼트가 있으면 그게 컨테이너 id다
+/// (예: `0::/system.slice/docker-<64hex>.scope`, `.../kubepods/.../<64hex>`). 없으면 `None`.
+/// [`parse_status_uid`]와 같은 이유로 비-Linux 빌드의 미사용 lint만 끈다(파싱은 플랫폼 무관).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn extract_container_id(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .flat_map(|l| l.split(['/', '-', '.', ':', '_']))
+        .find(|seg| seg.len() == 64 && seg.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 /// CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N을 골라 pid로 중복 제거한다. 순수 함수로 분리해
 /// sysinfo 없이 픽스처로 결정적 검증을 한다([`top_process_rss`]와 동일 취지).
 ///
-/// - CPU 랭킹은 `cpu > 0`, 메모리 랭킹은 `rss > 0`, 디스크 랭킹은 `read+write > 0` 프로세스만
-///   후보로 본다 — idle/커널 스레드(세 지표 모두 0)가 동률로 상위에 끼어 노이즈를 만드는 걸 막는다.
-/// - 세 랭킹의 **합집합**을 pid로 dedupe → 한 프로세스가 여러 축에서 상위여도 한 번만 실린다.
-///   각 레코드는 cpu·rss·disk를 모두 담으므로 어느 축으로 뽑혔든 세 지표가 함께 나간다. 디스크
-///   전용 소비자(백업/로그 flush 등, CPU·mem은 낮음)를 놓치지 않으려 디스크를 별도 축으로 둔다.
+/// - CPU 랭킹은 `cpu > 0`, 메모리 랭킹은 `rss > 0`, 디스크 랭킹은 `read+write > 0`, fd 랭킹은
+///   `fd > 0` 프로세스만 후보로 본다 — idle/커널 스레드(지표가 모두 0)가 동률로 상위에 끼어
+///   노이즈를 만드는 걸 막는다.
+/// - 네 랭킹의 **합집합**을 pid로 dedupe → 한 프로세스가 여러 축에서 상위여도 한 번만 실린다.
+///   각 레코드는 cpu·rss·disk·fd를 모두 담으므로 어느 축으로 뽑혔든 네 지표가 함께 나간다.
+///   디스크 전용 소비자(백업/로그 flush 등, CPU·mem은 낮음)를 놓치지 않으려 디스크를 별도 축으로
+///   두고, 같은 이유로 **fd 전용 누수**(cpu·rss·disk는 조용한 채 fd만 늘어나는 형태)를 놓치지
+///   않으려 fd를 네 번째 축으로 둔다.
 /// - 결과는 cpu 내림차순, 동률이면 pid 오름차순으로 정렬해 결정적이다(tie로 순서가 흔들리지 않게).
 fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample> {
     if n == 0 {
@@ -482,18 +581,68 @@ fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample>
     });
     keep.extend(by_disk.into_iter().take(n));
 
-    let mut result: Vec<ProcessSample> = all
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| keep.contains(i))
-        .map(|(_, p)| p)
-        .collect();
+    // fd 축 — cpu·rss·disk 어디에도 안 걸리는 **fd 전용 누수**를 잡는 유일한 경로다. 읽기 실패
+    // (`None`, 타 uid 권한)는 0으로 접어 후보에서 빠진다: "모른다"를 상위로 올리면 정작 아는
+    // 프로세스를 밀어낸다. 이 축이 있어야 fd 상위가 매 tick 안정적으로 실려 수신측이 기울기를
+    // 낼 수 있다(멤버십이 흔들리면 시계열에 구멍이 생겨 누수 판정 자체가 불가능하다).
+    let fd_of = |p: &ProcessSample| p.fd_count.unwrap_or(0);
+    let mut by_fd: Vec<usize> = (0..all.len()).filter(|&i| fd_of(&all[i]) > 0).collect();
+    by_fd.sort_by(|&a, &b| {
+        fd_of(&all[b])
+            .cmp(&fd_of(&all[a]))
+            .then(all[a].pid.cmp(&all[b].pid))
+    });
+    keep.extend(by_fd.into_iter().take(n));
+
+    // top-N에 든 것은 그대로 싣고, 나머지는 **합계 하나(rest 버킷)**로 접는다 — top-N만 보면
+    // "많은 작은 프로세스의 합"(fork bomb, N+1 프로세스 폭증, 로그 flush 떼)을 놓친다. rest가
+    // top 소비자보다 크면 문제의 성격이 다르다는 신호다. rest는 pid=0·name="__rest__" 센티넬로
+    // 표시하고 start_time/uid/container는 두지 않는다(집계라 프로세스 정체성이 없다).
+    // fd_count는 **합산한다** — fd를 전수로 수집하게 되면서 rest에 드는 프로세스도 측정값을
+    // 갖기 때문이다. 이 합계가 "top-N 밖 어딘가에서 fd가 늘고 있다"(워커 떼가 조금씩 새는 형태,
+    // 어느 하나도 단독으로는 상위에 못 드는 경우)를 드러낸다. 단 읽기 실패(`None`)는 합계에서
+    // 빠지므로 rest fd는 **읽을 수 있었던 것들의 합**이고, 하나도 못 읽었으면 `None`이 유지된다
+    // (0으로 접으면 "아무도 안 열었다"는 거짓 신호가 된다).
+    let mut result = Vec::with_capacity(keep.len() + 1);
+    let mut rest = ProcessSample {
+        name: REST_BUCKET_NAME.to_string(),
+        pid: 0,
+        cpu_pct: 0.0,
+        rss_bytes: 0,
+        disk_read_bytes: 0,
+        disk_write_bytes: 0,
+        start_time: 0,
+        uid: None,
+        container_id: None,
+        fd_count: None,
+    };
+    for (i, p) in all.into_iter().enumerate() {
+        if keep.contains(&i) {
+            result.push(p);
+        } else {
+            rest.cpu_pct += p.cpu_pct;
+            rest.rss_bytes = rest.rss_bytes.saturating_add(p.rss_bytes);
+            rest.disk_read_bytes = rest.disk_read_bytes.saturating_add(p.disk_read_bytes);
+            rest.disk_write_bytes = rest.disk_write_bytes.saturating_add(p.disk_write_bytes);
+            if let Some(fd) = p.fd_count {
+                rest.fd_count = Some(rest.fd_count.unwrap_or(0).saturating_add(fd));
+            }
+        }
+    }
     result.sort_by(|a, b| {
         b.cpu_pct
             .partial_cmp(&a.cpu_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.pid.cmp(&b.pid))
     });
+    // rest는 정렬 뒤 **맨 끝에** 붙인다(cpu 합이 커도 top 소비자로 오해되지 않게). 네 축 모두 0이면
+    // 생략한다 — 접을 게 없는데 빈 버킷을 보내면 노이즈다.
+    //
+    // fd를 이 조건에 넣는 게 중요하다: cpu·rss·disk가 전부 0인데 fd만 쥐고 있는 idle 워커 떼가
+    // 정확히 fd 누수 탐지의 대상인데, fd를 빼면 그 rest 버킷이 통째로 버려진다.
+    if rest.cpu_pct > 0.0 || rest.rss_bytes > 0 || disk_io(&rest) > 0 || fd_of(&rest) > 0 {
+        result.push(rest);
+    }
     result
 }
 
@@ -702,6 +851,7 @@ mod tests {
         assert_eq!(top_process_rss([0u64]), None);
     }
 
+
     fn proc(name: &str, pid: i64, cpu_pct: f64, rss_bytes: u64) -> ProcessSample {
         ProcessSample {
             name: name.to_string(),
@@ -710,6 +860,26 @@ mod tests {
             rss_bytes,
             disk_read_bytes: 0,
             disk_write_bytes: 0,
+            start_time: 0,
+            uid: None,
+            container_id: None,
+            fd_count: None,
+        }
+    }
+
+    /// cpu·rss·disk는 전부 0이고 **fd만** 높은 프로세스 — fd 전용 누수의 픽스처.
+    fn proc_fd(name: &str, pid: i64, fd_count: u32) -> ProcessSample {
+        ProcessSample {
+            name: name.to_string(),
+            pid,
+            cpu_pct: 0.0,
+            rss_bytes: 0,
+            disk_read_bytes: 0,
+            disk_write_bytes: 0,
+            start_time: 0,
+            uid: None,
+            container_id: None,
+            fd_count: Some(fd_count),
         }
     }
 
@@ -721,7 +891,79 @@ mod tests {
             rss_bytes: 0,
             disk_read_bytes,
             disk_write_bytes,
+            start_time: 0,
+            uid: None,
+            container_id: None,
+            fd_count: None,
         }
+    }
+
+    /// fd만 높고 cpu·rss·disk는 조용한 프로세스가 top-N에 실려야 한다. 이 축이 없으면 fd 전용
+    /// 누수 프로세스는 후보에조차 못 들어 **영원히** 관측되지 않는다 — 정확히 누수 탐지가 노리는
+    /// 대상이 사라지는 것이라, fd 축의 존재 이유가 이 테스트다.
+    #[test]
+    fn select_top_processes_includes_fd_only_leaker() {
+        let all = vec![
+            proc("cpu-hog", 1, 95.0, 0),
+            proc("mem-hog", 2, 0.0, 8_000_000_000),
+            proc_fd("fd-leaker", 3, 9000),
+            proc("idle", 4, 0.0, 0),
+        ];
+        let top = select_top_processes(all, 1);
+        let pids: Vec<i64> = top.iter().map(|p| p.pid).collect();
+        assert!(
+            pids.contains(&3),
+            "fd 전용 누수 프로세스가 top-N에 없다: {pids:?}"
+        );
+        assert!(
+            !pids.contains(&4),
+            "네 지표가 모두 0인 idle은 실리면 안 된다: {pids:?}"
+        );
+    }
+
+    /// top-N 밖 프로세스의 fd는 rest 버킷에 합산된다 — "어느 하나도 상위는 아니지만 떼로 새는"
+    /// 형태를 보려는 것이다. 반대로 전부 읽기 실패면 `None`이어야 한다: 0으로 접으면 "아무도 fd를
+    /// 안 열었다"는 거짓 신호가 되고, 인코딩에서 attr을 생략할 근거가 사라진다.
+    #[test]
+    fn rest_bucket_sums_readable_fd_only() {
+        let all = vec![
+            proc("top", 1, 99.0, 0),
+            proc_fd("small-a", 2, 100),
+            proc_fd("small-b", 3, 50),
+        ];
+        let top = select_top_processes(all, 1);
+        let rest = top.iter().find(|p| p.pid == 0).expect("rest 버킷이 있어야 한다");
+        // fd 축도 n=1이라 small-a(100)만 뽑히고 small-b(50)가 rest로 접힌다.
+        assert_eq!(rest.fd_count, Some(50));
+
+        // fd_count가 전부 None(권한 부족)이면 rest도 None을 유지한다.
+        let all = vec![
+            proc("top", 1, 99.0, 0),
+            proc("x", 2, 0.0, 10),
+            proc("y", 3, 0.0, 5),
+        ];
+        let top = select_top_processes(all, 1);
+        let rest = top.iter().find(|p| p.pid == 0).expect("rest 버킷이 있어야 한다");
+        assert_eq!(rest.fd_count, None);
+    }
+
+    /// cpu·rss·disk가 전부 0이어도 **fd 합계만 있으면** rest 버킷을 내보내야 한다. fd를 push
+    /// 조건에서 빼면 idle 워커 떼의 fd 누수 신호가 통째로 버려진다.
+    #[test]
+    fn rest_bucket_survives_on_fd_alone() {
+        let all = vec![
+            proc_fd("selected", 1, 500),
+            proc_fd("folded-a", 2, 40),
+            proc_fd("folded-b", 3, 30),
+        ];
+        let top = select_top_processes(all, 1);
+        let rest = top
+            .iter()
+            .find(|p| p.pid == 0)
+            .expect("fd만 있어도 rest 버킷이 남아야 한다");
+        assert_eq!(rest.fd_count, Some(70));
+        assert_eq!(rest.cpu_pct, 0.0);
+        assert_eq!(rest.rss_bytes, 0);
     }
 
     #[test]
@@ -791,6 +1033,59 @@ mod tests {
     }
 
     #[test]
+    fn select_top_processes_folds_long_tail_into_rest_bucket() {
+        // top-N 밖 프로세스들의 자원은 rest 버킷(pid=0, name=__rest__) 하나로 접혀 맨 끝에 붙는다.
+        let all = vec![
+            proc("big", 1, 90.0, 8 * 1024 * 1024 * 1024),
+            proc("small1", 2, 5.0, 1024 * 1024),
+            proc("small2", 3, 3.0, 2 * 1024 * 1024),
+        ];
+        let top = select_top_processes(all, 1);
+        // cpu/mem top1 = {big}, disk none → keep={1}. small1/small2는 rest로 접힘.
+        assert_eq!(top.len(), 2, "top1 + rest 버킷");
+        assert_eq!(top[0].pid, 1, "실제 top은 앞에");
+        let rest = top.last().unwrap();
+        assert_eq!(rest.pid, 0);
+        assert_eq!(rest.name, REST_BUCKET_NAME);
+        assert!((rest.cpu_pct - 8.0).abs() < 1e-9, "cpu 합 5+3");
+        assert_eq!(rest.rss_bytes, 3 * 1024 * 1024, "rss 합 1M+2M");
+    }
+
+    #[test]
+    fn select_top_processes_omits_empty_rest_bucket() {
+        // 모든 프로세스가 top-N에 들면 접을 게 없으니 rest 버킷을 붙이지 않는다.
+        let all = vec![proc("a", 1, 10.0, 1024), proc("b", 2, 5.0, 2048)];
+        let top = select_top_processes(all, 5);
+        assert!(top.iter().all(|p| p.pid != 0), "빈 rest 버킷은 없어야 한다");
+    }
+
+    #[test]
+    fn parse_status_uid_extracts_real_uid() {
+        let status = "Name:\tnginx\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_status_uid(status), Some(1000));
+        // root
+        assert_eq!(parse_status_uid("Uid:\t0\t0\t0\t0\n"), Some(0));
+        // Uid 줄 없음
+        assert_eq!(parse_status_uid("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn extract_container_id_finds_64hex_segment() {
+        let id = "abc123def456abc123def456abc123def456abc123def456abc123def4560000";
+        assert_eq!(
+            extract_container_id(&format!("0::/system.slice/docker-{id}.scope")),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            extract_container_id(&format!("12:cpu,cpuacct:/kubepods/burstable/pod-x/{id}")),
+            Some(id.to_string())
+        );
+        // 컨테이너 밖(호스트 프로세스) — 64-hex 세그먼트가 없다.
+        assert_eq!(extract_container_id("0::/init.scope"), None);
+        assert_eq!(extract_container_id("0::/user.slice/user-1000.slice"), None);
+    }
+
+    #[test]
     fn select_top_processes_empty_when_n_is_zero() {
         let all = vec![proc("a", 1, 10.0, 1024)];
         assert!(select_top_processes(all, 0).is_empty());
@@ -813,8 +1108,8 @@ mod tests {
             );
         }
         assert!(
-            sample.top_processes.len() <= 3 * TOP_PROCESS_COUNT,
-            "top-N 상한(3N: cpu+mem+disk) 초과: {}",
+            sample.top_processes.len() <= 3 * TOP_PROCESS_COUNT + 1,
+            "top-N 상한(3N: cpu+mem+disk, +1 rest 버킷) 초과: {}",
             sample.top_processes.len()
         );
     }

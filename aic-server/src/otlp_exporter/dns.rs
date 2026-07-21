@@ -108,7 +108,7 @@ impl DnsSink<'_> {
             time_unix_nano,
         );
         match super::push_logs(self.client, self.url, self.token, body.clone()).await {
-            Ok(()) => self.health.record_ok(),
+            Ok(_) => self.health.record_ok(),
             Err(e) => {
                 tracing::warn!(error = %e, "OTLP dns push 실패 — spool에 적재");
                 if let Err(e2) = self.spool.append(SignalKind::Logs, &body) {

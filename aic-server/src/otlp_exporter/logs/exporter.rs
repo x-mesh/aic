@@ -236,7 +236,9 @@ impl LogsFlusher {
         )
         .await
         {
-            Ok(()) => {
+            // partial_success 폐기 수(Ok(u64))는 여기선 무시한다 — aic.logs는 수신측이 아는 scope라
+            // 폐기가 없고, collector_dropped 게이지·전이 로그는 host-metrics 태스크(process)가 담당.
+            Ok(_) => {
                 self.backoff.on_success();
                 self.cfg.health.record_ok();
             }

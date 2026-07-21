@@ -41,6 +41,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///   막는다(RFC-006 §6.6). **이 카운터가 그 유실을 드러내는 유일한 창구다.** 0이 아니면 송신
 ///   측이 수신 측 계약을 위반하고 있다는 뜻이다(배치가 너무 크거나, 토큰이 죽었거나, 스키마가
 ///   갈렸거나).
+/// - `by_collector_dropped`: collector가 요청은 **200으로 받았지만** `partial_success`로 조용히
+///   버린 레코드 수(미지 scope·미지원 타입 등). `by_rejected`(4xx=요청 거부)와 다른 범주다 —
+///   이쪽은 수락 후 폐기라 HTTP만 보면 성공으로 보인다. 재전송해도 같은 결과라 spool에 넣지 않고,
+///   발신 측이 자기 데이터가 수신측에서 사라지는 걸 아는 유일한 창구다(예: rca가 `aic.process`
+///   decoder 부재로 전량 드롭). 현재는 host-metrics 태스크의 logs push(=process 신호)만 집계에
+///   반영하고, 나머지 logs 태스크는 전이 시점 로그로만 드러낸다.
 #[derive(Debug, Default)]
 pub struct DropCounters {
     pub by_severity: AtomicU64,
@@ -48,6 +54,7 @@ pub struct DropCounters {
     pub by_channel_full: AtomicU64,
     pub by_spool_quota: AtomicU64,
     pub by_rejected: AtomicU64,
+    pub by_collector_dropped: AtomicU64,
 }
 
 impl DropCounters {
@@ -58,13 +65,17 @@ impl DropCounters {
     /// `(reason, count)` 스냅샷 — `encode_metrics`가 `aic.log.dropped` 게이지 data point를
     /// 만드는 데 쓴다. 사유별로 별도 data point를 만들되, 서비스 태그는 붙이지 않는다
     /// (카디널리티 방어 — 이 태스크 계약 §3).
-    pub fn snapshot(&self) -> [(&'static str, u64); 5] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 6] {
         [
             ("severity", self.by_severity.load(Ordering::Relaxed)),
             ("rate_limit", self.by_rate_limit.load(Ordering::Relaxed)),
             ("channel_full", self.by_channel_full.load(Ordering::Relaxed)),
             ("spool_quota", self.by_spool_quota.load(Ordering::Relaxed)),
             ("rejected", self.by_rejected.load(Ordering::Relaxed)),
+            (
+                "collector_dropped",
+                self.by_collector_dropped.load(Ordering::Relaxed),
+            ),
         ]
     }
 }

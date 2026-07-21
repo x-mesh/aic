@@ -124,8 +124,10 @@ async fn drain_spool(
             match kind {
                 SignalKind::Metrics => push(client, url, token, batch_body).await,
                 // Logs/AppLogs는 엔드포인트가 동일(`/v1/logs`) — 갈리는 건 spool 쿼터뿐(R3).
+                // partial_success 폐기 수(Ok(u64))는 드레인 성패와 무관하므로 버린다(신규 push
+                // 경로에서만 게이지에 반영한다 — 드레인은 과거 배치 재전송이라 이중 계수 방지).
                 SignalKind::Logs | SignalKind::AppLogs => {
-                    push_logs(client, logs_endpoint, token, batch_body).await
+                    push_logs(client, logs_endpoint, token, batch_body).await.map(|_| ())
                 }
             }
         })
@@ -157,6 +159,9 @@ pub async fn serve(
     // t8: 이 task가 spool의 유일한 드레인 주체다(모듈 doc 참고) — backoff도 드레인+신규 push를
     // 아우르는 하나의 tick 성패로 판단한다.
     let mut backoff = backoff::Backoff::new();
+    // 직전 tick에 collector가 process 레코드를 버렸는지 — 전이(0↔>0)에서만 로그해 상시 조건이
+    // 매 tick warn을 뿜지 않게 한다(지속 신호는 aic.log.dropped `collector_dropped` 게이지가 든다).
+    let mut process_dropped_last = false;
 
     loop {
         if *shutdown.borrow() {
@@ -209,6 +214,10 @@ pub async fn serve(
                             rss_bytes: p.rss_bytes,
                             disk_read_bytes: p.disk_read_bytes,
                             disk_write_bytes: p.disk_write_bytes,
+                            start_time: p.start_time,
+                            uid: p.uid,
+                            container_id: p.container_id.as_deref(),
+                            fd_count: p.fd_count,
                         })
                         .collect();
                     let resource = logs_proto::ResourceAttrs {
@@ -288,14 +297,35 @@ pub async fn serve(
                 // 같은 tick의 backoff/health에 합산한다(tick_failed). collector 도달 실패면 spool에
                 // 적재해 복구 후 드레인되게 한다(connections/events와 동일 규약, SignalKind::Logs).
                 if let Some(pbody) = process_body {
-                    if let Err(e) =
-                        push_logs(&client, &logs_endpoint, cfg.token.as_deref(), pbody.clone()).await
-                    {
-                        tracing::warn!(error = %e, "OTLP process push 실패 — spool에 적재");
-                        if let Err(e2) = cfg.spool.append(SignalKind::Logs, &pbody) {
-                            tracing::warn!(error = %e2, "OTLP process spool append 실패 — 이 샘플 유실");
+                    match push_logs(&client, &logs_endpoint, cfg.token.as_deref(), pbody.clone()).await {
+                        Ok(rejected) => {
+                            // collector가 200으로 받았지만 partial_success로 버린 레코드(미지 scope
+                            // 등, 예: rca가 aic.process decoder 부재로 전량 드롭). 지속 신호는
+                            // 게이지가 들고, 전이에서만 로그한다(매 tick 스팸 방지).
+                            if rejected > 0 {
+                                cfg.drop_counters
+                                    .by_collector_dropped
+                                    .fetch_add(rejected, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let now_dropped = rejected > 0;
+                            if now_dropped && !process_dropped_last {
+                                tracing::warn!(
+                                    rejected,
+                                    "collector가 aic.process 레코드를 partial_success로 폐기 중 — \
+                                     수신측(rca) decoder/스키마 확인(aic.log.dropped collector_dropped 게이지 참고)"
+                                );
+                            } else if !now_dropped && process_dropped_last {
+                                tracing::info!("collector가 aic.process 레코드를 다시 수용");
+                            }
+                            process_dropped_last = now_dropped;
                         }
-                        tick_failed = true;
+                        Err(e) => {
+                            tracing::warn!(error = %e, "OTLP process push 실패 — spool에 적재");
+                            if let Err(e2) = cfg.spool.append(SignalKind::Logs, &pbody) {
+                                tracing::warn!(error = %e2, "OTLP process spool append 실패 — 이 샘플 유실");
+                            }
+                            tick_failed = true;
+                        }
                     }
                 }
 
@@ -471,12 +501,19 @@ fn logs_url(endpoint: &str) -> String {
 
 /// OTLP Logs protobuf 본문을 collector로 POST한다. events/connections가 공유하는 전송 helper —
 /// `push`(metrics 전용)와 동일한 형태지만 Content-Type/URL이 다르므로 별도 함수로 둔다.
+///
+/// 성공 시 **collector가 partial_success로 버린 레코드 수**를 돌려준다(보통 0). 200이어도 collector가
+/// 미지 scope·미지원 등으로 일부를 조용히 폐기할 수 있는데(예: rca가 `aic.process` decoder 부재 시
+/// 전량 드롭), 이 값이 그 사각지대를 드러내는 유일한 신호다. **재시도하지 않는다** — 재전송해도 같은
+/// 결과다(4xx `by_rejected`와 다른 범주). 사유 문자열은 debug 로그로만 남기고(스팸 방지 — 상시
+/// 조건이라 warn/카운터는 호출부가 상태를 들고 처리한다), 수만 반환한다. body를 못 읽어도 push는
+/// 성공(200)이므로 0으로 본다.
 async fn push_logs(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
     body: Vec<u8>,
-) -> Result<(), PushError> {
+) -> Result<u64, PushError> {
     let mut req = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
@@ -492,7 +529,14 @@ async fn push_logs(
     if !status.is_success() {
         return Err(classify(status));
     }
-    Ok(())
+    let Ok(resp_body) = resp.bytes().await else {
+        return Ok(0); // body 읽기 실패 — push 자체는 성공(200)이라 재시도하지 않는다.
+    };
+    let (rejected, reason) = logs_proto::decode_logs_partial_reject(&resp_body);
+    if rejected > 0 {
+        tracing::debug!(rejected, reason = %reason, url = %url, "collector partial_success 폐기");
+    }
+    Ok(rejected)
 }
 
 /// 현재 시각을 unix epoch 나노초로. 시스템 시계가 epoch 이전이면 0(비정상 환경 방어).

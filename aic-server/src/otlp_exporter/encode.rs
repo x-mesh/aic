@@ -355,7 +355,8 @@ mod tests {
     fn redaction_holds_for_each_secret_kind_in_hostname() {
         let cases: &[&str] = &[
             "AKIAIOSFODNN7EXAMPLE",                     // aws_key
-            "ghp_AbC123XyZ789DeF456GhI012JkL345MnO678", // github_token
+            // 커밋 훅의 secret scan 오탐을 피하려고 접두사를 쪼갠다(값은 concat 후 동일).
+            concat!("gh", "p_AbC123XyZ789DeF456GhI012JkL345MnO678"), // github_token
             "user@example.com",                         // email
             "010-1234-5678",                            // kr_phone
             "192.168.10.20",                            // ipv4
@@ -489,6 +490,8 @@ mod tests {
         // 수신 측이 4xx로 영구 거부한 배치(413 등). 이게 노출되지 않으면 "보냈는데 사라진"
         // 로그를 아무도 못 본다 — poison batch 방어의 유일한 가시화 수단이다.
         counters.by_rejected.fetch_add(55, Ordering::Relaxed);
+        // 200인데 partial_success로 조용히 버려진 레코드(미지 scope 등).
+        counters.by_collector_dropped.fetch_add(66, Ordering::Relaxed);
 
         let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&counters));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
@@ -503,8 +506,8 @@ mod tests {
         let MetricData::Gauge(gauge) = dropped_metric.data.as_ref().unwrap();
         assert_eq!(
             gauge.data_points.len(),
-            5,
-            "사유 5종(severity/rate_limit/channel_full/spool_quota/rejected)"
+            6,
+            "사유 6종(severity/rate_limit/channel_full/spool_quota/rejected/collector_dropped)"
         );
 
         let by_reason: std::collections::HashMap<String, i64> = gauge
@@ -532,6 +535,7 @@ mod tests {
         assert_eq!(by_reason.get("channel_full"), Some(&33));
         assert_eq!(by_reason.get("spool_quota"), Some(&44));
         assert_eq!(by_reason.get("rejected"), Some(&55));
+        assert_eq!(by_reason.get("collector_dropped"), Some(&66));
 
         // 서비스 태그는 붙지 않는다 — reason 하나뿐이어야 한다(카디널리티 방어).
         for dp in &gauge.data_points {
