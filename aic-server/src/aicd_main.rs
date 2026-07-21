@@ -738,6 +738,18 @@ fn load_exporter_config(
 ) -> Option<aic_server::otlp_exporter::ExporterConfig> {
     let ex = ex?;
     if !ex.enabled {
+        // endpoint를 적어 넣었다는 건 "보내겠다"는 의사 표시다. 그 상태로 꺼져 있는 건 모순이므로
+        // 조용히 넘기지 않는다 — 반대 조합(enabled인데 endpoint 없음)은 이미 아래에서 경고한다.
+        //
+        // 이 공백은 런타임 실패와 성격이 다르다: collector가 죽는 건 spool이 보존했다가 살아나면
+        // 재전송하지만, config가 꺼져 있던 기간은 **수집 자체를 안 해** 나중에 켜도 복구되지 않는다.
+        if !ex.endpoint.trim().is_empty() {
+            tracing::warn!(
+                "exporter endpoint가 설정돼 있으나 enabled=false — 텔레메트리를 수집·전송하지 \
+                 않는다(그 사이 데이터는 나중에 켜도 복구되지 않는다). `aic enroll`을 쓰거나 \
+                 config에서 aicd.exporter.enabled=true로 켜라"
+            );
+        }
         return None;
     }
     if ex.endpoint.trim().is_empty() {
@@ -1097,6 +1109,69 @@ method = "prompt_marker"
             Arc::new(DropCounters::new()),
         );
         assert!(cfg.is_none());
+    }
+
+    /// endpoint가 설정돼 있어도 `enabled=false`면 exporter는 뜨지 않는다 — 이 조합은 사용자가
+    /// "보내겠다"고 적어두고 스위치를 안 켠 모순 상태라 호출부가 warn을 남긴다(로그 자체는
+    /// 단언하지 않고, 게이트가 닫히는지만 잠근다).
+    ///
+    /// 이 공백은 collector 다운과 성격이 다르다: 런타임 push 실패는 spool이 보존했다가
+    /// 재전송하지만, 여기서 막히면 **수집 자체를 안 해** 나중에 켜도 그 구간은 복구되지 않는다.
+    #[test]
+    fn load_exporter_config_none_when_disabled_even_with_endpoint() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: false,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        let cfg = load_exporter_config(
+            Some(ex),
+            Some(spool),
+            Some(health),
+            Arc::new(DropCounters::new()),
+        );
+        assert!(cfg.is_none(), "enabled=false면 endpoint가 있어도 비활성이어야 한다");
+    }
+
+    /// 반대 조합 — 켜져 있어도 endpoint가 없으면 보낼 곳이 없어 비활성이다.
+    #[test]
+    fn load_exporter_config_none_when_endpoint_missing() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "   ".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        let cfg = load_exporter_config(
+            Some(ex),
+            Some(spool),
+            Some(health),
+            Arc::new(DropCounters::new()),
+        );
+        assert!(cfg.is_none(), "endpoint가 비면 enabled여도 비활성이어야 한다");
+    }
+
+    /// 두 게이트를 모두 통과하면 config가 만들어진다(`aic enroll`이 만드는 상태).
+    #[test]
+    fn load_exporter_config_builds_when_gates_pass() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318/".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        let cfg = load_exporter_config(
+            Some(ex),
+            Some(spool),
+            Some(health),
+            Arc::new(DropCounters::new()),
+        )
+        .expect("게이트를 통과하면 Some이어야 한다");
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:4318/");
     }
 
     /// `logs_enabled = false`(기본)면 exporter 전체가 enabled여도 logs exporter는 안 만든다.
