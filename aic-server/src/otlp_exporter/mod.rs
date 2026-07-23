@@ -183,6 +183,10 @@ pub async fn serve(
     // 꺼져 있으면 diff를 아예 돌리지 않으므로 prev가 낡을 일이 없다(config는 실행 중 불변).
     let mut inv_tracker = process_inventory::InventoryTracker::new(PROCESS_INVENTORY_KEYFRAME_TICKS);
     let mut inv_dropped_last = false;
+    // 직전 인벤토리 스캔 시각(unix 초). `remove` 레코드의 **종료 시각 하한**으로 실린다 — diff가
+    // 직전 스냅샷 대비이므로 사라진 프로세스는 그 시점엔 살아 있었던 게 확정이다. 첫 tick에는
+    // 직전 스캔이 없어 `None`이고, 그때는 attr을 생략해 수신측이 스캔 시각 폴백을 쓴다.
+    let mut prev_inventory_scan_unix: Option<u64> = None;
 
     loop {
         if *shutdown.borrow() {
@@ -267,6 +271,7 @@ pub async fn serve(
                 // 둘 다 꺼져 있으면 tracker를 아예 안 돌려 prev가 낡을 일도 없다.
                 let mut inventory_body = None;
                 if cfg.process_inventory_enabled || cfg.process_inventory_store.is_some() {
+                    let scan_unix = unix_nanos_now() / 1_000_000_000;
                     let changeset = inv_tracker
                         .diff(&sample.process_inventory, host_metrics::enrich_process_owner);
                     if changeset.emit {
@@ -281,7 +286,7 @@ pub async fn serve(
                         {
                             // observed_at은 프로세스 시작 시각이 아니라 **관측(tick) 시각**이다 —
                             // 폴링이라 최대 tick 주기만큼 늦을 수 있다(ProcessChange doc 참고).
-                            let observed_at = unix_nanos_now() / 1_000_000_000;
+                            let observed_at = scan_unix;
                             let changes: Vec<aic_common::ipc::ProcessChange> = changeset
                                 .records
                                 .iter()
@@ -322,12 +327,17 @@ pub async fn serve(
                                 &changes,
                                 changeset.sequence,
                                 changeset.keyframe,
+                                // 종료 시각의 하한 — 이번 diff의 기준이 된 **직전** 스캔 시각이다.
+                                prev_inventory_scan_unix,
                                 &resource,
                                 &cfg.service_version,
                                 unix_nanos_now(),
                             ));
                         }
                     }
+                    // emit 여부와 무관하게 갱신한다 — 변화가 없던 tick도 "그때 살아 있었다"는
+                    // 관측이므로, 다음 remove의 하한은 그 tick이어야 한다(더 좁은 구간).
+                    prev_inventory_scan_unix = Some(scan_unix);
                 }
 
                 if !backoff.ready() {
