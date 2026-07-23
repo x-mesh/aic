@@ -1237,7 +1237,7 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         // `sudo aic proc-fd-top`은 호출부(`classify_single`)의 sudo floor가 NeedsConfirm으로
         // 끌어올리므로 여기서 따로 막지 않는다. 잔여 리스크: `head`는 base_name을 거치므로 PATH상의
         // 다른 `aic` 바이너리도 매칭된다 — probe 명령이 고정 상수라 실사용 경로에서는 발생하지 않는다.
-        if matches!(args, ["proc-fd-top"]) {
+        if matches!(args, ["proc-fd-top"] | ["proc-changes"]) {
             return Some(RiskAssessment::safe("aic.selfprobe"));
         }
         return None;

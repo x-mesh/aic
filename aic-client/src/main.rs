@@ -362,6 +362,12 @@ enum Commands {
     /// 때문이다(플래그를 추가하면 그 allowlist도 함께 넓혀야 하고, 그만큼 자동 실행 표면이 는다).
     #[command(name = "proc-fd-top", hide = true)]
     ProcFdTop,
+    /// (internal) 최근 프로세스 생성/소멸 — `/local`의 `proc_changes` 섹션이 호출한다.
+    /// 계산이 아니라 **aicd 조회**다: 변화 이력은 aicd만 들고 있어 셸로는 얻을 수 없다.
+    ///
+    /// `proc-fd-top`과 같은 이유로 **인자를 받지 않는다**(risk_guard가 exact argv로만 Safe 판정).
+    #[command(name = "proc-changes", hide = true)]
+    ProcChanges,
     /// 명시적 capture wrapper (Phase 3.3) — hook mode에서도 정확한 출력을 잡고 싶을 때.
     ///
     /// `aic run -- <cmd...>`로 실행하면 wrapper가 stdout/stderr tail을 캡처하고
@@ -1353,6 +1359,7 @@ async fn main() {
         },
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::ProcFdTop) => print!("{}", aic_client::agent::proc_fd::render()),
+        Some(Commands::ProcChanges) => print!("{}", aic_client::agent::proc_changes::render()),
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
         Some(Commands::Chat {
             prompt,

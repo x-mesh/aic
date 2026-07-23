@@ -158,6 +158,10 @@ pub(crate) fn cap_str(s: &str, max: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
+/// `/procs`가 인자 없이 불렸을 때 보여줄 변화 수. `/local`의 요약 섹션(15줄)보다 넉넉히 잡는다 —
+/// 전용 커맨드는 사람이 작정하고 훑는 경로라 화면을 더 써도 된다.
+pub(crate) const PROCS_DEFAULT: usize = 40;
+
 /// 인식된 slash command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
@@ -177,6 +181,9 @@ pub(crate) enum SlashCommand {
         sections: Vec<String>,
         analyze: bool,
     },
+    /// `/procs [N]` — aicd가 관측한 최근 프로세스 생성/소멸 N개(기본 [`PROCS_DEFAULT`]).
+    /// `/local`의 `proc_changes` 섹션과 같은 데이터지만 더 많이·관측 시각까지 본다. LLM 미호출.
+    Procs(Option<usize>),
     /// `/diagnose [--raw|-r|--analyze|-a] [<증상 rest-of-line>]` — read-only SRE 진단.
     /// 기본 `analyze=true`. no-arg면 일반 health 진단. symptom은 quote strip된 자유 텍스트.
     Diagnose {
@@ -345,6 +352,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "compare",
     "record",
     "snapshots",
+    "procs",
     "flush",
     "bundle",
     "rca",
@@ -362,7 +370,7 @@ pub(crate) fn slash_category(name: &str) -> &'static str {
             "Evidence"
         }
         "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots"
-        | "flush" => "System",
+        | "procs" | "flush" => "System",
         _ => "Meta", // help 등
     }
 }
@@ -398,6 +406,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "compare" => "현재 시스템 스냅샷을 직전 baseline과 diff (LLM 미호출)",
         "record" => "세션 스냅샷 자동 기록 토글 (on|off|now [메모]). on이면 Warn↑ 알림·주기(2분) 캡처 + REC 표시",
         "snapshots" => "store의 최근 스냅샷 N개 목록 (기본 10, LLM 미호출)",
+        "procs" => "aicd가 관측한 최근 프로세스 생성/소멸 N개 (기본 40, LLM 미호출)",
         "flush" => "spool에 밀린 OTLP 배치를 지금 즉시 전량 전송 (rate-limit 우회, LLM 미호출)",
         "bundle" => "인시던트 증거를 redacted markdown 파일로 저장 (~/.aic/bundles/)",
         "rca" => "persistent RCA workspace 조작 (start/use/add/timeline/report)",
@@ -430,7 +439,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
 pub(crate) fn slash_usage(name: &str) -> &'static str {
     match name {
         "help" | "clear" | "resume" | "doctor" | "fix" | "compare" | "flush" => "",
-        "last" | "timeline" | "trend" | "snapshots" => "[N]",
+        "last" | "timeline" | "trend" | "snapshots" | "procs" => "[N]",
         "raw" => "[seq|corr]",
         "local" | "sys" | "snapshot" => "[section ...] [--raw|-r|--analyze|-a]",
         "diagnose" => "[--raw|-r] [<증상>]",
@@ -520,6 +529,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
             let (analyze, name) = parse_diagnose_args(rest);
             SlashCommand::Incident { name, analyze }
         }
+        "procs" => SlashCommand::Procs(parts.next().and_then(|n| n.parse::<usize>().ok())),
         "doctor" => SlashCommand::Doctor,
         "fix" => SlashCommand::Fix,
         "timeline" => SlashCommand::Timeline(parts.next().and_then(|n| n.parse::<usize>().ok())),
@@ -973,6 +983,8 @@ pub(crate) fn help_text() -> String {
         "                       — 임계 스캔이 못 잡는 '지금 이상하다'를 사람이 직접 남기는 경로.",
         "                       (LLM 미호출)",
         "  /snapshots [N]       store의 최근 스냅샷 N개 inline 목록(기본 10; LLM 미호출)",
+        "  /procs [N]           aicd가 관측한 최근 프로세스 생성/소멸 N개(기본 40; LLM 미호출).",
+        "                       tick(기본 60s) 사이에 떴다 죽은 단명 프로세스는 안 보인다",
         "  /flush               spool에 밀린 OTLP 배치를 지금 즉시 전량 전송(rate-limit 우회; LLM 미호출)",
         "  /bundle [name]       인시던트 증거를 redacted 파일로 저장(~/.aic/bundles/)",
         "  /rca start|use|add|timeline|report  persistent RCA workspace에 chat 증거 저장",

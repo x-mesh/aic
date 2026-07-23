@@ -570,6 +570,53 @@ mod tests {
         }
     }
 
+    /// 정상 경로: 링에 변화가 있으면 IPC가 **최신순**으로 돌려준다. exporter tick과 chat 사이의
+    /// 계약이라 여기서 고정한다(한쪽만 바뀌면 chat이 조용히 빈 화면을 보인다).
+    #[tokio::test]
+    async fn recent_process_changes_returns_newest_first() {
+        let store = Arc::new(crate::process_inventory_store::ProcessInventoryStore::new());
+        let mk = |pid: i64, op: &str| aic_common::ipc::ProcessChange {
+            op: op.to_string(),
+            pid,
+            ppid: 1,
+            start_time: 100,
+            name: format!("p{pid}"),
+            uid: None,
+            container_id: None,
+            observed_at: 1_700_000_000,
+        };
+        store
+            .push_many(vec![mk(1, "add"), mk(2, "add"), mk(3, "remove")])
+            .await;
+
+        let mut c = ctx();
+        c.process_inventory = Some(store);
+        let resp =
+            process_control_request(IpcRequest::GetRecentProcessChanges { count: 2 }, &c).await;
+        match resp {
+            IpcResponse::ProcessChanges(v) => {
+                assert_eq!(v.len(), 2, "count 상한이 지켜져야 한다");
+                assert_eq!(v[0].pid, 3, "가장 최근이 먼저");
+                assert_eq!(v[0].op, "remove");
+                assert_eq!(v[1].pid, 2);
+            }
+            other => panic!("ProcessChanges를 기대했는데 {other:?}"),
+        }
+    }
+
+    /// exporter가 안 떠 링이 없으면 **에러가 아니라 빈 목록**이다 — chat이 섹션을 비워 두면 되고,
+    /// 에러로 만들면 "수집 안 함"이 "고장"처럼 보인다.
+    #[tokio::test]
+    async fn recent_process_changes_without_store_is_empty_not_error() {
+        let c = ctx(); // process_inventory: None
+        let resp =
+            process_control_request(IpcRequest::GetRecentProcessChanges { count: 10 }, &c).await;
+        match resp {
+            IpcResponse::ProcessChanges(v) => assert!(v.is_empty()),
+            other => panic!("빈 ProcessChanges를 기대했는데 {other:?}"),
+        }
+    }
+
     fn agent_event(kind: &str) -> aic_common::AgentEvent {
         aic_common::AgentEvent {
             kind: kind.to_string(),
