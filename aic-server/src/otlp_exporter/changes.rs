@@ -113,7 +113,7 @@ impl ProcSampler {
             .sys
             .processes()
             .iter()
-            .filter(|(_, p)| p.thread_kind().is_none())
+            .filter(|(_, p)| !super::host_metrics::is_userland_thread(p))
             .map(|(pid, p)| {
                 (
                     pid.as_u32(),
