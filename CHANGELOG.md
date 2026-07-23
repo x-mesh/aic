@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-23
+
+### Added
+- **전체 프로세스 인벤토리 CDC exporter (`aic.process.inventory`)** — aicd가 host metrics tick마다
+  전수 프로세스를 이전 tick과 diff해 **변화분만**(생성 `add`/소멸 `remove`/정적 속성 변경 `change`)
+  OTLP Logs로 보낸다. 기존 top-N 리소스 스냅샷(`aic.process`)이 "지금 누가 자원을 먹나"라면 이쪽은
+  "무엇이 떴다 죽었나"다 — `ps`로는 얻을 수 없는 정보다(방금 죽은 프로세스는 이미 목록에 없다).
+  게이지(cpu/rss/io)는 매 tick 변해 delta로 압축되지 않으므로 여기서 다루지 않는다(상태=CDC /
+  메트릭=주기 스냅샷 분리). 식별자는 `(process.pid, process.start_time)` **복합키**다 — pid는
+  재사용되므로 단독으로 쓰면 짧게 죽고 재사용된 프로세스가 한 시계열에 섞인다. 매 batch에 단조 증가
+  `aic.process.inventory.sequence`를 실어 수신측이 갭을 감지하고, 주기적
+  `aic.process.inventory.keyframe`(전체 스냅샷)으로 재동기화한다. uid/container는 정적 속성이라
+  **새로 등장한 프로세스에만** `/proc`을 읽어 붙여 비용을 "매 tick 새 프로세스 수"로 묶는다.
+  config `[aicd.exporter].process_inventory_enabled`(**기본 false**, opt-in — 수신측 디코더가
+  준비되기 전에 켜면 collector가 partial_success로 전량 폐기한다).
+- **chat에서 프로세스 변화 확인 — `/local`의 `proc_changes` 섹션과 `/procs [N]` 커맨드** — aicd가
+  관측한 최근 생성/소멸을 로컬에서 바로 본다(`/local`은 요약 15줄, `/procs`는 관측 시각까지 포함해
+  기본 40개, LLM 미호출). **collector 설정과 무관하게 동작한다** — OTLP 전송을 켜지 않아도 로컬 링은
+  채워지므로 chat 뷰가 살아 있다. 조회 실패(aicd 미실행·구버전)와 변화 없음을 **다른 문구**로 내어
+  "조용한 것"과 "고장난 것"을 구분한다. 유저스페이스 폴링이라 tick(기본 60초) 사이에 떴다 사라진
+  단명 프로세스는 관측되지 않는다.
+
 ## [0.29.0] - 2026-07-16
 
 ### Added
