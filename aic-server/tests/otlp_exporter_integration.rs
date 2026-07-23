@@ -174,24 +174,32 @@ async fn exporter_without_token_sends_no_auth_header() {
     let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
 }
 
-/// 링(chat의 `/local`·`/procs`가 읽는 로컬 이력)은 **collector와 무관하게** 채워져야 한다.
+/// 링(chat의 `/local`·`/procs`가 읽는 로컬 이력)이 **실제 변화**만 담는지 확인한다.
 ///
-/// 단위 테스트는 tracker·링·IPC를 각각 덮지만, "실제 sampler가 뜬 프로세스를 tick이 diff해 링까지
-/// 넣는다"는 연결은 여기서만 확인된다. 그래서 (1) OTLP 인벤토리 전송을 **끄고**, (2) endpoint를
-/// **닿지 않는 곳**으로 두어, 두 조건 모두에서 링이 채워지는지를 본다 — 이게 게이트 분리의 실제
-/// 보증이다(OTLP를 안 켜도 chat 뷰가 살아야 한다).
+/// 두 가지를 한 번에 본다.
+/// 1. **keyframe은 링에 안 들어간다.** keyframe은 원격 소비자의 재동기화용 전체 스냅샷이라, 링에
+///    넣으면 기동 직후 살아 있던 프로세스 전부가 `add`로 들어차 진짜 변화를 밀어낸다(이 머신 실측
+///    ~1021개 vs 링 용량 1024 — 사실상 링 전체가 잠식된다).
+/// 2. **새로 뜬 프로세스는 잡힌다.** 실제 자식 프로세스를 띄워, 실제 sampler → CDC tracker → 링
+///    연결이 살아 있는지를 단위 테스트가 못 덮는 범위까지 확인한다.
+///
+/// OTLP 인벤토리 전송은 끄고 endpoint는 닫힌 포트로 둔다 — 그 두 조건에서도 링이 동작해야 한다는
+/// 게 게이트 분리의 실제 보증이다(OTLP를 안 켜도 chat 뷰가 살아야 한다).
 #[tokio::test]
-async fn process_inventory_ring_fills_with_otlp_off_and_collector_unreachable() {
+async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
     let store = Arc::new(aic_server::process_inventory_store::ProcessInventoryStore::new());
     let (sd_tx, sd_rx) = watch::channel(false);
     let (_spool_dir, spool) = test_spool();
-    // 닫힌 포트 — push는 반드시 실패한다. 그래도 링은 채워져야 한다.
+    // 닫힌 포트 — push는 반드시 실패한다. 그래도 링은 동작해야 한다.
     let endpoint = "http://127.0.0.1:1".to_string();
     let health = Arc::new(ExporterHealth::new(endpoint.clone(), spool.clone()));
     let cfg = ExporterConfig {
         endpoint,
         token: None,
-        interval: Duration::from_millis(50),
+        // 짧게 잡으면 안 된다: 바쁜 머신은 tick 사이에도 프로세스가 뜨고 죽어, delta가 링에
+        // 들어오면서 "keyframe이 안 들어갔다"를 검증할 수 없게 된다. tick1(keyframe)만 돈 시점을
+        // 관측할 수 있도록 주기를 충분히 벌린다.
+        interval: Duration::from_secs(3),
         service_version: "9.9.9".to_string(),
         spool,
         drain_batch_limit: 20,
@@ -199,7 +207,7 @@ async fn process_inventory_ring_fills_with_otlp_off_and_collector_unreachable() 
         health,
         drop_counters: Arc::new(DropCounters::new()),
         process_enabled: false,
-        // OTLP 인벤토리 전송은 꺼 둔다 — 링은 이 플래그와 무관하게 채워져야 한다.
+        // OTLP 인벤토리 전송은 꺼 둔다 — 링은 이 플래그와 무관하게 동작해야 한다.
         process_inventory_enabled: false,
         process_inventory_store: Some(store.clone()),
     };
@@ -208,35 +216,41 @@ async fn process_inventory_ring_fills_with_otlp_off_and_collector_unreachable() 
         serve(cfg, sd_rx, frx).await
     });
 
-    let filled = tokio::time::timeout(Duration::from_secs(15), async {
+    // 첫 tick(keyframe)은 즉시 돈다. 다음 tick은 3초 뒤라, 여기서는 keyframe만 지나간 상태다.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        store.is_empty().await,
+        "keyframe이 링에 들어갔다 — 기동 직후 전체 프로세스가 add로 밀려들어 진짜 변화를 덮는다"
+    );
+
+    // 실제로 프로세스를 하나 띄운다 → 다음 tick의 delta에 add로 잡혀야 한다.
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("sleep spawn 실패");
+    let child_pid = i64::from(child.id().expect("자식 pid를 못 얻음"));
+
+    let found = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            let recent = store.recent(usize::MAX).await;
-            if !recent.is_empty() {
-                return recent;
+            if let Some(c) = store
+                .recent(usize::MAX)
+                .await
+                .into_iter()
+                .find(|c| c.pid == child_pid)
+            {
+                return c;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("15초 내에 링이 채워지지 않음 — sampler→tracker→링 연결이 끊겼다");
+    .expect("20초 내에 새로 뜬 프로세스가 링에 안 잡혔다 — sampler→tracker→링 연결이 끊겼다");
 
     sd_tx.send(true).unwrap();
+    let _ = child.kill().await;
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
-    // 첫 tick은 keyframe이라 살아 있는 프로세스가 전부 add로 들어온다.
-    assert!(
-        filled.iter().all(|c| c.op == "add"),
-        "첫 tick(keyframe)은 전량 add여야 한다: {:?}",
-        filled.iter().find(|c| c.op != "add")
-    );
-    // 실제 호스트를 훑었다면 프로세스가 한 줌 이상 나온다(정확한 수는 환경마다 다르므로 하한만).
-    assert!(
-        filled.len() > 5,
-        "실제 프로세스를 못 읽었다(권한/샘플러 문제?): {}",
-        filled.len()
-    );
-    // 이름과 관측 시각이 실제로 채워져야 한다 — 비면 chat이 빈 칸/`-`를 그린다.
-    assert!(filled.iter().all(|c| !c.name.is_empty()), "이름이 빈 레코드가 있다");
-    assert!(filled.iter().all(|c| c.observed_at > 0), "observed_at이 0이다");
-    assert!(filled.iter().all(|c| c.pid > 0), "pid가 0인 레코드가 있다");
+    assert_eq!(found.op, "add", "새로 뜬 프로세스는 add여야 한다");
+    assert!(found.observed_at > 0, "observed_at이 0이면 chat이 `-`를 그린다");
+    assert!(!found.name.is_empty(), "이름이 비면 chat에 빈 칸이 나간다");
 }

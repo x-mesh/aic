@@ -270,7 +270,15 @@ pub async fn serve(
                     let changeset = inv_tracker
                         .diff(&sample.process_inventory, host_metrics::enrich_process_owner);
                     if changeset.emit {
-                        if let Some(store) = &cfg.process_inventory_store {
+                        // **keyframe은 링에 넣지 않는다.** keyframe은 원격 소비자가 상태를
+                        // 재구성하기 위한 전체 스냅샷이지 "최근 변화"가 아니다. 링을 읽는 chat은
+                        // 상태를 재구성하지 않고 이벤트를 보여줄 뿐이라, keyframe을 넣으면 기동
+                        // 직후 살아 있던 프로세스 전부(이 머신 실측 ~1021개, 링 용량 1024)가
+                        // `add`로 들어차 진짜 변화를 밀어낸다 — 사용자에게는 "방금 뜬 프로세스"로
+                        // 잘못 보인다. OTLP 쪽은 재동기화가 필요하므로 keyframe을 그대로 보낸다.
+                        if let (Some(store), false) =
+                            (&cfg.process_inventory_store, changeset.keyframe)
+                        {
                             // observed_at은 프로세스 시작 시각이 아니라 **관측(tick) 시각**이다 —
                             // 폴링이라 최대 tick 주기만큼 늦을 수 있다(ProcessChange doc 참고).
                             let observed_at = unix_nanos_now() / 1_000_000_000;
