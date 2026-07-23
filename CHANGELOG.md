@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-23
+
 ### Fixed
 - **Linux에서 스레드를 프로세스로 집계하던 문제** — sysinfo의 `processes()`는 Linux에서 스레드
   (task)까지 돌려주는데 이를 걸러내지 않아, 프로세스 관측 전반이 오염돼 있었다. 실측(jw-server)에서
