@@ -544,9 +544,25 @@ fn collect_process_inventory(sys: &System) -> Vec<ProcInv> {
 /// [`Process::thread_kind`](sysinfo::Process::thread_kind)는 **Linux 외 플랫폼에서 항상 `None`**을
 /// 돌려주므로, macOS에서는 이 필터가 no-op이다(그래서 이 버그는 Linux 배포 후에야 드러났다).
 fn real_processes(sys: &System) -> impl Iterator<Item = &sysinfo::Process> {
-    sys.processes()
-        .values()
-        .filter(|p| p.thread_kind().is_none())
+    sys.processes().values().filter(|p| !is_userland_thread(p))
+}
+
+/// 이 항목이 **유저랜드 스레드**인가 — 제외 대상은 이것 하나뿐이다.
+///
+/// sysinfo의 `thread_kind()`는 세 값을 돌려주는데 **`Some`이라고 다 스레드가 아니다**
+/// (`sysinfo-0.33/src/unix/linux/process.rs:468` 참고):
+/// - `None` — 진짜 프로세스. 유지.
+/// - `Some(Kernel)` — `PF_KTHREAD` 플래그가 선 **커널 스레드**(`[kworker/*]` 등). 이것도
+///   `Tgid == Pid`인 독립 top-level 항목이고 `ps -e`에 나온다. **유지해야 한다.**
+/// - `Some(Userland)` — 다른 프로세스의 task. 이것만 제외한다.
+///
+/// **처음엔 `is_none()`으로 걸러 커널 스레드까지 날렸다(v0.31.0 회귀).** jw-server 실측으로
+/// `Tgid == Pid` 302개 중 **210개가 커널 스레드**였고, 남은 92개만 보고돼 rca가 받는 프로세스
+/// 집합이 실제의 30% 수준으로 줄었다. 그 위에서 도는 rss_spike 이상 탐지가 그날 0건이 됐다
+/// (직전까지 매일 14~423건). 커버리지 손실은 조용해서 수신측이 스스로 알아채지 못한다 —
+/// 그래서 이 구분을 코드에 못박아 둔다.
+pub(super) fn is_userland_thread(p: &sysinfo::Process) -> bool {
+    matches!(p.thread_kind(), Some(sysinfo::ThreadKind::Userland))
 }
 
 /// top-N 프로세스에만 붙이는 소유자/컨테이너 귀속. **Linux 전용** — `/proc/<pid>/status`의 실제
@@ -1149,6 +1165,50 @@ mod tests {
     fn select_top_processes_empty_when_n_is_zero() {
         let all = vec![proc("a", 1, 10.0, 1024)];
         assert!(select_top_processes(all, 0).is_empty());
+    }
+
+    /// **v0.31.0 회귀 가드.** 처음 스레드 필터를 넣을 때 `thread_kind().is_none()`으로 걸러
+    /// 커널 스레드(`Some(Kernel)`)까지 날렸고, Linux에서 관측 대상이 실제의 30%로 줄었다
+    /// (jw-server 실측: `Tgid == Pid` 302개 중 210개가 커널 스레드). 제외 대상은 **유저랜드
+    /// 스레드 하나뿐**이라는 규칙을 여기서 못박는다 — 이 구분이 코드에 없어서 회귀가 났다.
+    #[test]
+    fn only_userland_threads_are_excluded() {
+        // 판정은 sysinfo 값에 대한 순수 매칭이라, 세 경우의 기대를 표로 고정한다.
+        // (실제 Process 인스턴스는 sysinfo 내부 생성자라 여기서 만들 수 없으므로 규칙만 검증한다.)
+        let cases = [
+            (None, false, "진짜 프로세스는 유지"),
+            (Some(sysinfo::ThreadKind::Kernel), false, "커널 스레드는 유지 — Tgid==Pid인 독립 항목"),
+            (Some(sysinfo::ThreadKind::Userland), true, "유저랜드 스레드만 제외"),
+        ];
+        for (kind, expect_excluded, why) in cases {
+            let excluded = matches!(kind, Some(sysinfo::ThreadKind::Userland));
+            assert_eq!(excluded, expect_excluded, "{why} (kind={kind:?})");
+        }
+    }
+
+    /// 살아 있는 시스템에서 커널 스레드가 실제로 남아 있는지 — 위 규칙이 수집 경로까지
+    /// 이어졌는지 확인한다. macOS는 커널 스레드가 목록에 없으므로 Linux에서만 의미가 있다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_inventory_keeps_kernel_threads() {
+        let mut s = HostSampler::new();
+        let sample = s.sample();
+        // 커널 스레드는 보통 `[]`로 감싸이거나 kworker/ksoftirqd 계열 이름을 갖는다.
+        let kernelish = sample
+            .process_inventory
+            .iter()
+            .filter(|p| {
+                p.name.starts_with("kworker")
+                    || p.name.starts_with("ksoftirqd")
+                    || p.name.starts_with("rcu_")
+                    || p.name.starts_with("migration")
+            })
+            .count();
+        assert!(
+            kernelish > 0,
+            "커널 스레드가 인벤토리에서 전부 사라졌다 — v0.31.0 과교정 회귀 (총 {}개)",
+            sample.process_inventory.len()
+        );
     }
 
     #[test]
