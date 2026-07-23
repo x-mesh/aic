@@ -95,6 +95,25 @@ pub struct ProcessSample {
     pub fd_count: Option<u32>,
 }
 
+/// 전체 프로세스 인벤토리 항목 하나 — `aic.process.inventory` CDC용 **경량** 식별 레코드.
+///
+/// [`ProcessSample`](top_processes)와 달리 **전수**이며 정적 속성만 담는다(cpu/rss/io 같은 게이지
+/// 없음) — 이 스트림은 "무엇이 떴다/죽었나"(생성/소멸/변경)를 추적하지 리소스 사용량을 재지
+/// 않는다. 게이지는 top-N `aic.process`가 이미 담당한다. `(pid, start_time)`이 안정 식별자다.
+///
+/// uid/container_id를 여기 담지 않는 이유: 그건 프로세스당 `/proc` 파일 읽기라 비싸므로, CDC
+/// 추적기가 **새로 등장한 프로세스(add)에만** enrich한다([`enrich_process_owner`]) — 정적 속성이라
+/// 살아 있는 동안 재조회할 필요가 없다. 여기서는 무비용 필드(pid/ppid/start_time/name)만 전수로 낸다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInv {
+    pub pid: i64,
+    /// 부모 pid(프로세스 트리/토폴로지 조인용). 없으면 0.
+    pub ppid: i64,
+    /// 시작 시각(unix epoch 초). `(pid, start_time)` 안정 식별자.
+    pub start_time: u64,
+    pub name: String,
+}
+
 /// 매 tick 실을 프로세스 수 — CPU 상위 N + 메모리 상위 N + 디스크 IO 상위 N + **fd 상위 N**
 /// (합집합, pid dedupe)이라 최대 4N개. 시계열 키가 (host, pid, name)이라 이 값이 곧 프로세스
 /// 신호의 호스트당 카디널리티 상한을 정한다. fd 축을 더하며 상한이 3N→4N으로 늘었지만, 축이
@@ -112,6 +131,10 @@ pub struct HostSample {
     /// CPU/메모리 상위 소비자(scope=`aic.process`). `process_enabled=false`거나 프로세스를 하나도
     /// 못 읽으면 비어 있고, 그러면 호출부(`serve`)가 process logs push를 건너뛴다.
     pub top_processes: Vec<ProcessSample>,
+    /// 전체 프로세스 인벤토리(전수, 경량). CDC exporter(`aic.process.inventory`)가 이전 tick과
+    /// diff해 add/remove/change만 방출한다. 수집 비용이 미미해(무비용 필드만) `process_enabled`/
+    /// `process_inventory_enabled`와 무관하게 항상 채운다 — 사용 여부는 호출부(`serve`)가 판단한다.
+    pub process_inventory: Vec<ProcInv>,
 }
 
 /// stateful host metrics 샘플러. i/o delta 계산을 위해 `Disks`/`Networks`/직전 시각을 보존한다.
@@ -236,6 +259,9 @@ impl HostSampler {
         // 프로세스별 top-N(CPU/메모리 상위 소비자). 이미 refresh한 목록을 재사용하므로 추가 열거
         // 비용이 없다. host_metrics의 무차원 Gauge와 달리 이름/PID를 담아 OTLP Logs로 나간다.
         let top_processes = collect_top_processes(&self.sys, TOP_PROCESS_COUNT);
+        // 전체 프로세스 인벤토리(전수, 경량). 같은 refresh 목록을 재사용하며 무비용 필드만 읽으므로
+        // top-N 수집과 별개의 추가 열거·syscall이 없다(uid/container는 CDC 추적기가 add에만 붙인다).
+        let process_inventory = collect_process_inventory(&self.sys);
         let uptime = System::uptime();
         // filesystem은 available/limit만으로도 used를 유도할 수 있지만, 대시보드가 매번
         // 빼기를 하지 않도록 usage/utilization을 직접 낸다(디스크 full이 가장 흔한 사고 원인).
@@ -420,6 +446,7 @@ impl HostSampler {
             },
             points,
             top_processes,
+            process_inventory,
         }
     }
 }
@@ -489,12 +516,28 @@ fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
     top
 }
 
+/// 전체 프로세스를 [`ProcInv`] 경량 인벤토리로 수집한다(전수). `sys`는 호출부(`sample`)가 이미
+/// `refresh_processes_specifics(All, ..)`한 상태라, 여기서는 무비용 필드(pid/ppid/start_time/name)만
+/// 읽는다 — 추가 열거나 `/proc` 파일 읽기가 없다. uid/container는 비싸므로(프로세스당 `/proc` 읽기)
+/// 여기서 채우지 않고 CDC 추적기가 새로 등장한 프로세스(add)에만 붙인다([`enrich_process_owner`]).
+fn collect_process_inventory(sys: &System) -> Vec<ProcInv> {
+    sys.processes()
+        .values()
+        .map(|p| ProcInv {
+            pid: i64::from(p.pid().as_u32()),
+            ppid: p.parent().map_or(0, |pp| i64::from(pp.as_u32())),
+            start_time: p.start_time(),
+            name: p.name().to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
 /// top-N 프로세스에만 붙이는 소유자/컨테이너 귀속. **Linux 전용** — `/proc/<pid>/status`의 실제
 /// uid와 `/proc/<pid>/cgroup`의 컨테이너 id를 읽는다. 비-Linux(macOS 등)는 `(None, None)`이다
 /// (proc 파일이 없다 — sysinfo `with_user`는 프로세스당 비용이 있어 쓰지 않는다). 읽기 실패도
 /// `None`으로 흡수한다(권한/레이스로 프로세스가 사라졌어도 신호 전체를 깨지 않는다).
 #[cfg(target_os = "linux")]
-fn enrich_process_owner(pid: i64) -> (Option<u32>, Option<String>) {
+pub(super) fn enrich_process_owner(pid: i64) -> (Option<u32>, Option<String>) {
     let uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
         .ok()
         .and_then(|s| parse_status_uid(&s));
@@ -506,7 +549,7 @@ fn enrich_process_owner(pid: i64) -> (Option<u32>, Option<String>) {
 
 /// Linux가 아니면 proc 파일이 없다 — 귀속은 생략한다(RSS/CPU 등 나머지는 그대로 나간다).
 #[cfg(not(target_os = "linux"))]
-fn enrich_process_owner(_pid: i64) -> (Option<u32>, Option<String>) {
+pub(super) fn enrich_process_owner(_pid: i64) -> (Option<u32>, Option<String>) {
     (None, None)
 }
 

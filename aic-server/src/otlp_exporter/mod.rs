@@ -50,6 +50,7 @@ pub mod logs;
 pub mod logs_proto;
 mod ntp;
 mod proc;
+mod process_inventory;
 mod spool;
 
 pub use agent::{serve_agent, AgentConfig};
@@ -98,10 +99,20 @@ pub struct ExporterConfig {
     /// config `[aicd.exporter].process_enabled`. host metrics가 이미 refresh한 프로세스 목록을
     /// 재사용하므로 추가 열거 비용이 없다 — 그래서 별도 task가 아니라 이 tick에 얹는다.
     pub process_enabled: bool,
+    /// 전체 프로세스 인벤토리 CDC(scope=`aic.process.inventory`)를 host metrics tick에 편승해
+    /// 보낼지. config `[aicd.exporter].process_inventory_enabled`(기본 false, opt-in). `serve`가
+    /// 이전 tick과 diff해 add/remove/change만 보낸다 — top-N 메트릭(`process_enabled`)과 독립이다.
+    pub process_inventory_enabled: bool,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 프로세스 인벤토리 CDC의 keyframe 주기(host metrics tick 단위). 이 tick 수마다 전체 스냅샷을
+/// 한 번 실어, 재접속/프레임 유실로 틀어진 소비자 상태가 재동기화되게 한다(첫 tick은 항상
+/// keyframe). tick 주기가 기본 60초라 30이면 약 30분마다 keyframe이다 — delta 스트림에서 갭 복구
+/// 지연의 상한을 정한다.
+const PROCESS_INVENTORY_KEYFRAME_TICKS: u32 = 30;
 
 /// chat `/flush` 요청 — control server가 [`serve`]에 보내는 "지금 전량 드레인" 신호. 결과는
 /// `reply` oneshot으로 돌려받는다(control server가 IPC 응답으로 전달).
@@ -162,6 +173,10 @@ pub async fn serve(
     // 직전 tick에 collector가 process 레코드를 버렸는지 — 전이(0↔>0)에서만 로그해 상시 조건이
     // 매 tick warn을 뿜지 않게 한다(지속 신호는 aic.log.dropped `collector_dropped` 게이지가 든다).
     let mut process_dropped_last = false;
+    // 프로세스 인벤토리 CDC의 diff 상태(이전 tick 인벤토리). tick 간 delta를 계산한다 — config가
+    // 꺼져 있으면 diff를 아예 돌리지 않으므로 prev가 낡을 일이 없다(config는 실행 중 불변).
+    let mut inv_tracker = process_inventory::InventoryTracker::new(PROCESS_INVENTORY_KEYFRAME_TICKS);
+    let mut inv_dropped_last = false;
 
     loop {
         if *shutdown.borrow() {
@@ -236,6 +251,48 @@ pub async fn serve(
                     None
                 };
 
+                // 프로세스 인벤토리 CDC(scope=aic.process.inventory)를 같은 tick에 얹는다 — sample이
+                // 전수 인벤토리를 채워 왔다(top-N과 같은 refresh 재사용). 이전 tick과 diff해
+                // add/remove/change만 방출하고, 변화가 없으면 None이라 sequence도 소비하지 않는다.
+                // uid/container는 새로 등장한 프로세스(add)에만 enrich한다(정적 속성).
+                let inventory_body = if cfg.process_inventory_enabled {
+                    let changeset =
+                        inv_tracker.diff(&sample.process_inventory, host_metrics::enrich_process_owner);
+                    if !changeset.emit {
+                        None
+                    } else {
+                        let changes: Vec<logs_proto::InventoryChange<'_>> = changeset
+                            .records
+                            .iter()
+                            .map(|r| logs_proto::InventoryChange {
+                                op: r.op.as_str(),
+                                pid: r.pid,
+                                ppid: r.ppid,
+                                name: &r.name,
+                                start_time: r.start_time,
+                                uid: r.uid,
+                                container_id: r.container_id.as_deref(),
+                            })
+                            .collect();
+                        let resource = logs_proto::ResourceAttrs {
+                            host_name: &sample.resource.host_name,
+                            host_id: &sample.resource.host_id,
+                            os_type: &sample.resource.os_type,
+                            host_ip: None,
+                        };
+                        Some(logs_proto::encode_process_inventory_changes(
+                            &changes,
+                            changeset.sequence,
+                            changeset.keyframe,
+                            &resource,
+                            &cfg.service_version,
+                            unix_nanos_now(),
+                        ))
+                    }
+                } else {
+                    None
+                };
+
                 if !backoff.ready() {
                     // backoff 윈도 안 — collector가 여전히 다운됐다고 보고 네트워크 시도(드레인·
                     // 신규 push 둘 다) 자체를 건너뛴다. 새 sample은 유실시키지 않고 spool에만 쌓는다.
@@ -246,6 +303,13 @@ pub async fn serve(
                     if let Some(pbody) = &process_body {
                         if let Err(e) = cfg.spool.append(SignalKind::Logs, pbody) {
                             tracing::warn!(error = %e, "OTLP process spool append 실패 — 이 샘플 유실");
+                        }
+                    }
+                    // 인벤토리 CDC도 동일 — delta가 유실되면 다음 keyframe까지 갭이 생기니 spool에
+                    // 쌓아 복구 후 드레인되게 한다(연속성이 sequence/keyframe으로 복구된다).
+                    if let Some(ibody) = &inventory_body {
+                        if let Err(e) = cfg.spool.append(SignalKind::Logs, ibody) {
+                            tracing::warn!(error = %e, "OTLP process inventory spool append 실패 — 이 변화분 유실");
                         }
                     }
                     continue;
@@ -323,6 +387,40 @@ pub async fn serve(
                             tracing::warn!(error = %e, "OTLP process push 실패 — spool에 적재");
                             if let Err(e2) = cfg.spool.append(SignalKind::Logs, &pbody) {
                                 tracing::warn!(error = %e2, "OTLP process spool append 실패 — 이 샘플 유실");
+                            }
+                            tick_failed = true;
+                        }
+                    }
+                }
+
+                // (4) 프로세스 인벤토리 CDC logs 송신(변화가 있을 때만). process top-N과 동일 규약
+                // (독립 성패, tick_failed 합산, 실패 시 SignalKind::Logs로 spool 적재).
+                if let Some(ibody) = inventory_body {
+                    match push_logs(&client, &logs_endpoint, cfg.token.as_deref(), ibody.clone()).await {
+                        Ok(rejected) => {
+                            // 수신측(rca)에 aic.process.inventory decoder가 아직 없으면 여기로 온다
+                            // (partial_success 폐기). 지속 신호는 게이지가 들고 전이에서만 로그한다.
+                            if rejected > 0 {
+                                cfg.drop_counters
+                                    .by_collector_dropped
+                                    .fetch_add(rejected, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            let now_dropped = rejected > 0;
+                            if now_dropped && !inv_dropped_last {
+                                tracing::warn!(
+                                    rejected,
+                                    "collector가 aic.process.inventory 레코드를 partial_success로 폐기 중 — \
+                                     수신측(rca) decoder/스키마 확인(aic.log.dropped collector_dropped 게이지 참고)"
+                                );
+                            } else if !now_dropped && inv_dropped_last {
+                                tracing::info!("collector가 aic.process.inventory 레코드를 다시 수용");
+                            }
+                            inv_dropped_last = now_dropped;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "OTLP process inventory push 실패 — spool에 적재");
+                            if let Err(e2) = cfg.spool.append(SignalKind::Logs, &ibody) {
+                                tracing::warn!(error = %e2, "OTLP process inventory spool append 실패 — 이 변화분 유실");
                             }
                             tick_failed = true;
                         }

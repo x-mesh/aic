@@ -167,6 +167,27 @@ pub struct ProcessEntry<'a> {
     pub fd_count: Option<u32>,
 }
 
+/// `aic.process.inventory` CDC 레코드 하나 — [`encode_process_inventory_changes`]의 인코딩 입력.
+///
+/// mod.rs가 `process_inventory::InvRecord`를 이 형태로 매핑해 넘긴다 — logs_proto가 상위 모듈
+/// 타입(`process_inventory`)에 의존하지 않도록 [`ProcessEntry`]와 동일한 경계를 둔다(host_metrics
+/// 타입을 mod.rs가 `ProcessEntry`로 옮기는 것과 같은 방식).
+pub struct InventoryChange<'a> {
+    /// 변화 종류 문자열: `"add"` | `"remove"` | `"change"`.
+    pub op: &'a str,
+    pub pid: i64,
+    /// 부모 pid(프로세스 트리 조인용). 0이면 attr 생략.
+    pub ppid: i64,
+    /// 실행 파일명(comm) — [`ProcessEntry::name`]과 동일하게 argv가 아니라 secret 유입 위험이 없다.
+    pub name: &'a str,
+    /// 시작 시각(unix epoch 초). `(pid, start_time)` 안정 식별자. 0이면 attr 생략.
+    pub start_time: u64,
+    /// 소유자 uid(add에서 채움, Linux). `None`이면 생략.
+    pub uid: Option<u32>,
+    /// 컨테이너 id(add에서 채움, Linux). `None`/빈 값이면 생략.
+    pub container_id: Option<&'a str>,
+}
+
 /// resource attrs 공통 부분(host.name/id/os.type/service.*) — events/connections가 공유.
 /// connections만 `host_ip`를 추가로 붙인다(hosts 메타 갱신, DoD 요구사항).
 pub struct ResourceAttrs<'a> {
@@ -433,6 +454,73 @@ pub fn encode_process_samples(
         })
         .collect();
     build_request(resource, "aic.process", service_version, log_records)
+}
+
+/// `changes`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.process.inventory`)로 인코딩한다.
+///
+/// top-N 리소스 스냅샷(`aic.process`, [`encode_process_samples`])과 **다른 scope**다 — 이쪽은
+/// 게이지 없는 change-delta(add/remove/change)라, 수신측이 "무엇이 떴다/죽었나"를 리소스 사용량과
+/// 별개 테이블/쿼리로 다룰 수 있어야 하기 때문이다.
+///
+/// **`sequence`/`keyframe`**은 batch 단위 메타지만 OTLP LogRecord에는 batch attr이 없어 **각
+/// 레코드에** 실어 자기서술적으로 만든다(재동기화 판단에 레코드 하나만 봐도 되게). 같은 batch의
+/// 모든 레코드는 동일 `sequence`/`keyframe`을 갖는다.
+///
+/// **attr 이름은 수신측(rca `otlp/decode.rs`) 디코더와 정확히 일치해야 한다.** 프로세스 식별 attr은
+/// `aic.process`와 같은 이름을 재사용해(`process.pid`/`process.executable.name`/`process.start_time`/
+/// `process.owner.uid`/`container.id`) 두 scope의 조인을 쉽게 한다. 나머지 CDC 전용 attr은
+/// `aic.process.op`/`process.parent_pid`/`aic.process.inventory.sequence`/`.keyframe`이다.
+pub fn encode_process_inventory_changes(
+    changes: &[InventoryChange<'_>],
+    sequence: u64,
+    keyframe: bool,
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+    time_unix_nano: u64,
+) -> Vec<u8> {
+    let log_records = changes
+        .iter()
+        .map(|c| {
+            let mut attributes = vec![
+                attr_str("aic.process.op", c.op),
+                attr_int("process.pid", c.pid),
+                attr_str("process.executable.name", c.name),
+                attr_int("aic.process.inventory.sequence", saturating_i64(sequence)),
+                // OTLP AnyValue에 bool 헬퍼가 없어 0/1 int로 싣는다(디코더도 0/1로 읽는다).
+                attr_int("aic.process.inventory.keyframe", i64::from(keyframe)),
+            ];
+            // "모르면 생략"(빈 값 금지, connections/dns 규약)과 동일 취지 — 0/None은 attr을 뺀다.
+            if c.ppid > 0 {
+                attributes.push(attr_int("process.parent_pid", c.ppid));
+            }
+            if c.start_time > 0 {
+                attributes.push(attr_int("process.start_time", saturating_i64(c.start_time)));
+            }
+            if let Some(uid) = c.uid {
+                attributes.push(attr_int("process.owner.uid", i64::from(uid)));
+            }
+            if let Some(cid) = c.container_id.filter(|s| !s.is_empty()) {
+                attributes.push(attr_str("container.id", cid));
+            }
+            let body_text = format!("{} {} pid={}", c.op, c.name, c.pid);
+            LogRecord {
+                time_unix_nano,
+                observed_time_unix_nano: time_unix_nano,
+                severity_number: SEVERITY_INFO,
+                severity_text: redact_str("INFO"),
+                body: Some(string_value(&body_text)),
+                attributes,
+                dropped_attributes_count: 0,
+                flags: 0,
+            }
+        })
+        .collect();
+    build_request(
+        resource,
+        "aic.process.inventory",
+        service_version,
+        log_records,
+    )
 }
 
 /// `entries`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.changes`)로 배치 인코딩한다.
@@ -1272,6 +1360,73 @@ mod tests {
         assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
         assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
         assert!(!attrs2.iter().any(|kv| kv.key == "process.file_descriptor.count"));
+    }
+
+    #[test]
+    fn process_inventory_changes_roundtrip_and_omit_rules() {
+        let changes = vec![
+            InventoryChange {
+                op: "add",
+                pid: 4242,
+                ppid: 1,
+                name: "postgres",
+                start_time: 1_700_000_500,
+                uid: Some(70),
+                container_id: Some("beef00beef00beef00beef00beef00beef00beef00beef00beef00beef000000"),
+            },
+            InventoryChange {
+                op: "remove",
+                pid: 9,
+                ppid: 0,           // 생략돼야 한다
+                name: "gone",
+                start_time: 0,     // 생략돼야 한다
+                uid: None,         // 생략
+                container_id: None, // 생략
+            },
+        ];
+        // sequence=7, keyframe=false → 모든 레코드에 동일 메타가 실린다.
+        let bytes = encode_process_inventory_changes(&changes, 7, false, &resource(None), "0.28.0", 100);
+        let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+        let scope_logs = &req.resource_logs[0].scope_logs[0];
+        assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.process.inventory");
+        assert_eq!(scope_logs.log_records.len(), 2);
+
+        let attrs = &scope_logs.log_records[0].attributes;
+        let get = |k: &str| {
+            attrs
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(matches!(get("aic.process.op"), Some(AnyValueOneof::StringValue(v)) if v == "add"));
+        assert!(matches!(get("process.pid"), Some(AnyValueOneof::IntValue(4242))));
+        assert!(matches!(get("process.parent_pid"), Some(AnyValueOneof::IntValue(1))));
+        assert!(
+            matches!(get("process.executable.name"), Some(AnyValueOneof::StringValue(v)) if v == "postgres")
+        );
+        assert!(matches!(
+            get("process.start_time"),
+            Some(AnyValueOneof::IntValue(1_700_000_500))
+        ));
+        assert!(matches!(get("process.owner.uid"), Some(AnyValueOneof::IntValue(70))));
+        assert!(matches!(get("container.id"), Some(AnyValueOneof::StringValue(v)) if v.len() == 64));
+        assert!(matches!(
+            get("aic.process.inventory.sequence"),
+            Some(AnyValueOneof::IntValue(7))
+        ));
+        assert!(matches!(
+            get("aic.process.inventory.keyframe"),
+            Some(AnyValueOneof::IntValue(0))
+        ));
+
+        // 두 번째 레코드: ppid=0/start_time=0/uid/container=None은 attr 생략, 메타는 여전히 실린다.
+        let attrs2 = &scope_logs.log_records[1].attributes;
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.parent_pid"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.start_time"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
+        assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
+        assert!(attrs2.iter().any(|kv| kv.key == "aic.process.inventory.sequence"));
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
