@@ -295,18 +295,18 @@ mod tests {
         };
         let mut t = InventoryTracker::new(2); // 2 tick마다 keyframe
         let cur = vec![inv(10, 100, "a")];
-        let cs1 = t.diff(&cur, &counting); // seq1 keyframe, enrich 1회(신규 a)
+        let cs1 = t.diff(&cur, counting); // seq1 keyframe, enrich 1회(신규 a)
         assert!(cs1.keyframe);
         assert_eq!(enrich_calls.get(), 1);
         // tick2: 변화 없음 → emit 안 함, ticks_since_keyframe=1
-        let cs2 = t.diff(&cur, &counting);
+        let cs2 = t.diff(&cur, counting);
         assert!(!cs2.emit);
         // tick3: ticks_since_keyframe(1) < 2라 아직 keyframe 아님, 변화도 없음
-        let cs3 = t.diff(&cur, &counting);
+        let cs3 = t.diff(&cur, counting);
         assert!(!cs3.emit);
         // tick4: ticks_since_keyframe가 2에 도달 → keyframe. a는 이미 알아서 enrich 재호출 없음.
         let before = enrich_calls.get();
-        let cs4 = t.diff(&cur, &counting);
+        let cs4 = t.diff(&cur, counting);
         assert!(cs4.keyframe);
         assert!(cs4.emit);
         assert_eq!(cs4.sequence, 2, "방출된 batch는 keyframe1, keyframe4 두 번뿐");
@@ -321,9 +321,9 @@ mod tests {
             (Some(7), Some(format!("c{pid}")))
         };
         let mut t = InventoryTracker::new(0);
-        t.diff(&[inv(10, 100, "a")], &counting); // keyframe, enrich a (1회)
+        t.diff(&[inv(10, 100, "a")], counting); // keyframe, enrich a (1회)
         assert_eq!(enrich_calls.get(), 1);
-        let cs = t.diff(&[inv(10, 100, "a"), inv(20, 200, "b")], &counting);
+        let cs = t.diff(&[inv(10, 100, "a"), inv(20, 200, "b")], counting);
         assert_eq!(enrich_calls.get(), 2, "기존 a는 재-enrich 없이 신규 b만");
         let b = cs.records.iter().find(|r| r.pid == 20).unwrap();
         assert_eq!(b.uid, Some(7));

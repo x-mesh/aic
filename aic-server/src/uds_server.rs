@@ -395,6 +395,7 @@ async fn process_request(
         | IpcRequest::GetExporterStatus
         | IpcRequest::FlushSpool
         | IpcRequest::PushLogLines { .. }
+        | IpcRequest::GetRecentProcessChanges { .. }
         | IpcRequest::PruneSessions { .. }
         | IpcRequest::Shutdown
         | IpcRequest::RegisterSession(_)

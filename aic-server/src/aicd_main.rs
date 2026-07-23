@@ -177,11 +177,17 @@ async fn main() -> anyhow::Result<()> {
     // OTLP exporter config를 여기서 미리 계산한다(원래는 아래 spawn 시점) — ControlContext가
     // exporter task로 `/flush` 요청을 보내는 채널을 들어야 하는데, 그 채널은 exporter가 실제로 뜰
     // 때만 의미가 있기 때문이다. exporter가 꺼져 있으면 `flush_tx = None` → `FlushSpool`은 "꺼짐" 에러.
+    // 프로세스 인벤토리 변화 링 — exporter tick이 채우고 chat이 IPC로 읽는다. exporter task가
+    // 안 뜨면 아무도 채우지 않으므로 ControlContext에는 `None`을 넘겨 "수집 안 함"을 표현한다.
+    let process_inventory_store = Arc::new(
+        aic_server::process_inventory_store::ProcessInventoryStore::new(),
+    );
     let exporter_cfg = load_exporter_config(
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
         log_drop_counters.clone(),
+        Some(process_inventory_store.clone()),
     );
     let (flush_tx, flush_rx) = if exporter_cfg.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(4);
@@ -203,6 +209,10 @@ async fn main() -> anyhow::Result<()> {
         // 그대로 공유한다 — `aic-client`의 `PushLogLines`가 이 채널을 통해 serve_logs까지 흐른다.
         // 로그가 off(기본)면 `None` 그대로라 기존 동작(수신은 하되 조용히 버림)과 동일하다.
         logs_tx: logs_tx.clone(),
+        // exporter가 뜰 때만 링이 채워진다 — 안 뜨면 None이라 chat이 빈 목록을 받는다.
+        process_inventory: exporter_cfg
+            .as_ref()
+            .map(|_| process_inventory_store.clone()),
     };
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
@@ -735,6 +745,9 @@ fn load_exporter_config(
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
     drop_counters: Arc<DropCounters>,
+    process_inventory_store: Option<
+        Arc<aic_server::process_inventory_store::ProcessInventoryStore>,
+    >,
 ) -> Option<aic_server::otlp_exporter::ExporterConfig> {
     let ex = ex?;
     if !ex.enabled {
@@ -777,6 +790,9 @@ fn load_exporter_config(
         // 전체 프로세스 인벤토리 CDC(scope=aic.process.inventory)도 같은 tick에 편승한다(기본
         // false, opt-in — 수신측 rca decoder 준비 전엔 partial_success 폐기 노이즈를 막는다).
         process_inventory_enabled: ex.process_inventory_enabled,
+        // 같은 diff를 로컬 링에도 남긴다 — chat의 `GetRecentProcessChanges`가 읽는다. OTLP 전송
+        // 플래그와 무관하게 채워지므로, collector를 안 켜도 chat 실시간 확인은 동작한다.
+        process_inventory_store,
     })
 }
 
@@ -1134,6 +1150,7 @@ method = "prompt_marker"
             Some(spool),
             Some(health),
             Arc::new(DropCounters::new()),
+            None,
         );
         assert!(cfg.is_none(), "enabled=false면 endpoint가 있어도 비활성이어야 한다");
     }
@@ -1153,6 +1170,7 @@ method = "prompt_marker"
             Some(spool),
             Some(health),
             Arc::new(DropCounters::new()),
+            None,
         );
         assert!(cfg.is_none(), "endpoint가 비면 enabled여도 비활성이어야 한다");
     }
@@ -1172,6 +1190,7 @@ method = "prompt_marker"
             Some(spool),
             Some(health),
             Arc::new(DropCounters::new()),
+            None,
         )
         .expect("게이트를 통과하면 Some이어야 한다");
         assert_eq!(cfg.endpoint, "http://127.0.0.1:4318/");

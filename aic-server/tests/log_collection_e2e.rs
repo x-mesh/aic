@@ -258,6 +258,7 @@ async fn ipc_pushed_log_lines_reach_collector() {
         // ★ 이게 t12가 배선한 지점 ★ — 이전엔 None이었다.
         logs_tx: Some(line_tx),
         flush_tx: None,
+        process_inventory: None,
     };
     let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 
@@ -347,6 +348,8 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         health,
         drop_counters: Arc::clone(&drop_counters),
         process_enabled: false,
+        process_inventory_enabled: false,
+        process_inventory_store: None,
     };
     let (msd_tx, msd_rx) = watch::channel(false);
     let metrics_handle = tokio::spawn(async move {

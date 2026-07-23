@@ -178,6 +178,15 @@ pub enum IpcRequest {
     PushLogLines {
         lines: Vec<LogLine>,
     },
+    /// 최근 프로세스 인벤토리 변화(생성/소멸/변경)를 **최신순**으로 `count`개까지 돌려준다.
+    ///
+    /// aicd가 host metrics tick마다 전수 프로세스를 이전 tick과 diff해 링에 쌓아 둔 것을 읽는다
+    /// — chat이 "방금 뭐가 떴다 죽었나"를 폴링으로 확인하는 경로다. OTLP 전송
+    /// (`aic.process.inventory`)과 **같은 관측이지만 게이트가 다르다**: 이쪽은 collector 설정과
+    /// 무관하게 채워지므로 `process_inventory_enabled=false`여도 조회된다.
+    GetRecentProcessChanges {
+        count: usize,
+    },
 }
 
 /// chat/agent의 한 행위. `kind`가 문자열이라 새 행위를 추가해도 IPC 스키마가 바뀌지 않는다.
@@ -228,9 +237,38 @@ pub enum IpcResponse {
     ExporterStatus(ExporterStatus),
     /// `FlushSpool` 응답 — 즉시 드레인 결과.
     SpoolFlushed(SpoolFlushResult),
+    /// `GetRecentProcessChanges` 응답 — 최신순 프로세스 변화 목록. exporter task가 안 떠서 링
+    /// 자체가 없으면 빈 목록이 온다("변화 없음"과 "수집 안 함"을 여기서 구분하지 않는다 — 구분이
+    /// 필요하면 `GetExporterStatus`가 답한다).
+    ProcessChanges(Vec<ProcessChange>),
     Error {
         message: String,
     },
+}
+
+/// 프로세스 인벤토리 변화 하나 — aicd가 최근분을 링에 들고 chat이 IPC로 읽어 간다.
+///
+/// OTLP `aic.process.inventory` scope로 나가는 것과 **같은 관측**이지만, 이쪽은 로컬 실시간
+/// 확인용이라 collector 설정과 무관하게 채워진다. `(pid, start_time)`이 안정 식별자다 — pid는
+/// 재사용되므로 단독으로는 짧게 죽고 재사용된 프로세스가 섞인다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessChange {
+    /// `"add"` | `"remove"` | `"change"`.
+    pub op: String,
+    pub pid: i64,
+    /// 부모 pid(프로세스 트리). 미상이면 0.
+    pub ppid: i64,
+    /// 시작 시각(unix epoch 초). 미상이면 0.
+    pub start_time: u64,
+    /// 실행 파일명(comm) — argv가 아니라 secret 유입 위험이 없다.
+    pub name: String,
+    /// 소유자 uid. Linux에서 add 때만 채운다.
+    pub uid: Option<u32>,
+    /// 컨테이너 id. Linux에서 add 때만 채운다.
+    pub container_id: Option<String>,
+    /// aicd가 이 변화를 **관측한** 시각(unix epoch 초). 프로세스 시작 시각이 아니라 tick 시각이라,
+    /// 최대 tick 주기만큼 늦을 수 있다(폴링의 구조적 한계 — 그 사이 떴다 죽은 건 아예 안 보인다).
+    pub observed_at: u64,
 }
 
 /// `/flush` 즉시 드레인 결과. `remaining`이 0이 아니면(collector가 도중에 실패) 남은 배치는 다음
