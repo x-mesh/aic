@@ -4,6 +4,19 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Linux에서 스레드를 프로세스로 집계하던 문제** — sysinfo의 `processes()`는 Linux에서 스레드
+  (task)까지 돌려주는데 이를 걸러내지 않아, 프로세스 관측 전반이 오염돼 있었다. 실측(jw-server)에서
+  `tokio-rt-worker`가 1시간 동안 고유 pid **812개**로 잡혔고 그중에는 aicd **자신의** tokio 워커
+  스레드도 있었다(`/proc/<tid>/status`의 `Tgid != Pid`). 영향은 세 갈래였다: (1) top-N
+  (`aic.process`)에서 스레드가 자리를 차지해 **진짜 자원 소비 프로세스가 밀려남** — ClickHouse
+  호스트의 상위가 `MergeMutate`·`BgSchPool` 같은 내부 스레드로 채워졌다, (2) 프로세스 수 메트릭과
+  `aic.process.inventory` 볼륨이 스레드 수만큼 부풀어 호스트/시점 간 비교가 무의미해짐,
+  (3) `aic.changes`의 프로세스 start/exit 이벤트와 rss_spike가 스레드 단위로 발생.
+  이제 `Process::thread_kind()`가 `Some`인 항목을 전 수집 경로에서 제외한다(프로세스 수·최대 RSS·
+  top-N·인벤토리·changes, 그리고 클라이언트 `/local`의 `proc_fd_top`). **macOS에서는 `thread_kind()`가
+  항상 `None`이라 no-op**이며, 그래서 이 결함은 Linux 배포 후에야 드러났다.
+
 ### Added
 - **프로세스 종료 시각의 하한을 함께 보낸다 (`process.last_seen_unix`)** — `aic.process.inventory`의
   `remove` 레코드에 **직전 스캔 시각**을 싣는다. diff가 직전 스냅샷 대비이므로 사라진 프로세스는 그

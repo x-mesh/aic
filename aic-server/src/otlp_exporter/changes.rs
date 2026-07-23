@@ -106,10 +106,14 @@ impl ProcSampler {
             ProcessRefreshKind::nothing().with_memory(),
         );
 
+        // 스레드는 제외한다 — Linux의 `processes()`는 task까지 돌려주므로, 그대로 두면 스레드
+        // 생성/소멸이 프로세스 start/exit 이벤트로 나가고 rss_spike도 스레드 단위로 잡힌다
+        // (host_metrics의 `real_processes` doc 참고). 비-Linux에서 `thread_kind()`는 항상 `None`.
         let current: HashMap<u32, ProcSnap> = self
             .sys
             .processes()
             .iter()
+            .filter(|(_, p)| p.thread_kind().is_none())
             .map(|(pid, p)| {
                 (
                     pid.as_u32(),
