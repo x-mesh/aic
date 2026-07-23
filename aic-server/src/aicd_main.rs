@@ -774,6 +774,9 @@ fn load_exporter_config(
         // 프로세스별 top-N(scope=aic.process)은 host metrics tick에 편승한다 — 별도 task가 아니라
         // 이 config의 플래그로 on/off한다(기본 true).
         process_enabled: ex.process_enabled,
+        // 전체 프로세스 인벤토리 CDC(scope=aic.process.inventory)도 같은 tick에 편승한다(기본
+        // false, opt-in — 수신측 rca decoder 준비 전엔 partial_success 폐기 노이즈를 막는다).
+        process_inventory_enabled: ex.process_inventory_enabled,
     })
 }
 

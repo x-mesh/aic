@@ -671,6 +671,14 @@ pub struct AicdExporterConfig {
     /// 카디널리티를 묶는다 — 그래도 부담되는 호스트에선 명시적으로 false로 끈다.
     #[serde(default = "default_true")]
     pub process_enabled: bool,
+    /// 전체 프로세스 인벤토리 CDC(scope=`aic.process.inventory`) push 활성화 여부. **기본 false**
+    /// (opt-in). `process_enabled`(top-N 리소스 스냅샷)와 별개다 — 이쪽은 **전수** 프로세스의
+    /// 생성/소멸/변경(add/remove/change)만 이전 tick과 diff해 보내는 change-delta 스트림이라,
+    /// 정적 속성만 담아 top-N보다 카디널리티 특성이 다르다(생성/소멸 위주). 수신측(rca) 디코더가
+    /// `aic.process.inventory` scope를 아직 모르면 partial_success로 폐기되므로, 디코더가 준비될
+    /// 때까지 opt-in으로 둔다(dns_enabled와 동일 관례).
+    #[serde(default)]
+    pub process_inventory_enabled: bool,
     /// 이 호스트를 RCA에 연결한 enrollment의 id. `aic enroll`이 교환 성공 시 기록한다.
     ///
     /// 동작에는 쓰이지 않고 **출처 추적용**이다 — 나중에 "이 호스트가 어떤 등록으로 붙었나",
@@ -702,6 +710,7 @@ impl Default for AicdExporterConfig {
             docker_bin: None,
             dns_enabled: false,
             process_enabled: true,
+            process_inventory_enabled: false,
             // 손으로 설정한 config는 enrollment을 거치지 않았다는 뜻이라 None이 기본이다.
             enrollment_id: None,
         }
