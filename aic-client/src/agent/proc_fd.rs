@@ -33,6 +33,10 @@ pub fn render() -> String {
     let mut rows: Vec<(u32, i64, String)> = sys
         .processes()
         .iter()
+        // 스레드는 제외한다. Linux의 `processes()`는 task까지 돌려주는데, 스레드의 `/proc/<tid>/fd`는
+        // 소속 프로세스의 fd 테이블을 그대로 비추므로 같은 fd가 스레드 수만큼 중복 집계돼 상위가
+        // 스레드로 도배된다(aicd 쪽 `real_processes` doc의 실측 참고). 비-Linux는 항상 `None`이라 no-op.
+        .filter(|(_, p)| p.thread_kind().is_none())
         .filter_map(|(pid, p)| {
             let id = i64::from(pid.as_u32());
             process_fd_count(id).map(|fd| (fd, id, p.name().to_string_lossy().into_owned()))

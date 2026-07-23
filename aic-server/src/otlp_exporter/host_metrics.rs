@@ -249,13 +249,15 @@ impl HostSampler {
         let swap_used = self.sys.used_swap();
         let swap_total = self.sys.total_swap();
         let load = System::load_average();
-        let proc_count = self.sys.processes().len();
+        // 스레드는 세지 않는다 — Linux의 `processes()`가 task까지 돌려주므로 그대로 세면 프로세스
+        // 수가 스레드 수만큼 부풀어 다른 호스트/시점과 비교할 수 없게 된다([`real_processes`]).
+        let proc_count = real_processes(&self.sys).count();
         // 최대 RSS 프로세스의 값만 낸다. 이름/PID는 attr로 넣지 않는다 — 이 머신 고유 프로세스명이
         // 623종이라 cardinality 폭탄이고, 수신측(rca-server) 읽기 경로가 전부 `WHERE host=? AND
         // metric=?` + `avg(value)`라 attrs 필터/GROUP BY가 없어 차원을 넣으면 평균으로 뭉개진다.
         // "범인이 누구인가"는 changes exporter의 rss_spike가 이미 다룬다.
         // 가시 범위(비루트 macOS는 same-uid만)는 모듈 doc 참고.
-        let top_rss = top_process_rss(self.sys.processes().values().map(|p| p.memory()));
+        let top_rss = top_process_rss(real_processes(&self.sys).map(|p| p.memory()));
         // 프로세스별 top-N(CPU/메모리 상위 소비자). 이미 refresh한 목록을 재사용하므로 추가 열거
         // 비용이 없다. host_metrics의 무차원 Gauge와 달리 이름/PID를 담아 OTLP Logs로 나간다.
         let top_processes = collect_top_processes(&self.sys, TOP_PROCESS_COUNT);
@@ -475,9 +477,7 @@ fn top_process_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
 ///   Linux 서버라 이 편향은 로컬 macOS 개발 관측에만 영향을 준다.
 /// - **Linux**: `/proc/<pid>/*`가 world-readable이라 비루트도 전량 읽힌다(uid/container 포함).
 fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
-    let all: Vec<ProcessSample> = sys
-        .processes()
-        .values()
+    let all: Vec<ProcessSample> = real_processes(sys)
         .map(|p| {
             let io = p.disk_usage();
             ProcessSample {
@@ -521,8 +521,7 @@ fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
 /// 읽는다 — 추가 열거나 `/proc` 파일 읽기가 없다. uid/container는 비싸므로(프로세스당 `/proc` 읽기)
 /// 여기서 채우지 않고 CDC 추적기가 새로 등장한 프로세스(add)에만 붙인다([`enrich_process_owner`]).
 fn collect_process_inventory(sys: &System) -> Vec<ProcInv> {
-    sys.processes()
-        .values()
+    real_processes(sys)
         .map(|p| ProcInv {
             pid: i64::from(p.pid().as_u32()),
             ppid: p.parent().map_or(0, |pp| i64::from(pp.as_u32())),
@@ -530,6 +529,24 @@ fn collect_process_inventory(sys: &System) -> Vec<ProcInv> {
             name: p.name().to_string_lossy().into_owned(),
         })
         .collect()
+}
+
+/// 스레드를 제외한 **진짜 프로세스**만 훑는다.
+///
+/// **Linux의 `sys.processes()`는 스레드(task)까지 함께 돌려준다.** 실측(jw-server): 1시간 동안
+/// `tokio-rt-worker`가 고유 pid 812개로 잡혔고, 그 안에는 aicd **자신의** tokio 워커 스레드도
+/// 있었다(`/proc/<tid>/status`에서 `Tgid != Pid`). 걸러내지 않으면 세 가지가 동시에 망가진다:
+/// (1) top-N 자리를 스레드가 차지해 진짜 자원 소비 프로세스가 밀려나고(실측: ClickHouse 호스트의
+/// 상위가 `MergeMutate`·`BgSchPool` 같은 내부 스레드로 채워짐), (2) 프로세스 수 메트릭과 인벤토리
+/// 볼륨이 부풀며, (3) `aic.process.inventory`에 프로세스가 아닌 것이 섞여 "무엇이 떴다 죽었나"가
+/// 스레드 생성/소멸에 묻힌다.
+///
+/// [`Process::thread_kind`](sysinfo::Process::thread_kind)는 **Linux 외 플랫폼에서 항상 `None`**을
+/// 돌려주므로, macOS에서는 이 필터가 no-op이다(그래서 이 버그는 Linux 배포 후에야 드러났다).
+fn real_processes(sys: &System) -> impl Iterator<Item = &sysinfo::Process> {
+    sys.processes()
+        .values()
+        .filter(|p| p.thread_kind().is_none())
 }
 
 /// top-N 프로세스에만 붙이는 소유자/컨테이너 귀속. **Linux 전용** — `/proc/<pid>/status`의 실제
