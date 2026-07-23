@@ -466,14 +466,27 @@ pub fn encode_process_samples(
 /// 레코드에** 실어 자기서술적으로 만든다(재동기화 판단에 레코드 하나만 봐도 되게). 같은 batch의
 /// 모든 레코드는 동일 `sequence`/`keyframe`을 갖는다.
 ///
+/// **`prev_scan_unix`는 종료 시각의 하한이다.** 이 레코드들은 직전 tick 스냅샷과의 diff이므로,
+/// `remove`된 프로세스는 **직전 스캔 시점에는 살아 있었다는 게 확정**이다. 레코드 시각(= 이번 스캔)만
+/// 보내면 수신측은 "언제 죽었는지"의 상한만 알고 실제 수명을 최대 한 tick만큼 과대평가한다(rca 실측:
+/// 수명 60초에 분포가 몰리고 60초 미만이 정확히 0건 — 스캔 주기의 지문). 하한을 함께 실으면 수신측이
+/// 점 추정 대신 **구간 [prev_scan, 이번 scan]** 을 갖는다. `None`(첫 tick·keyframe 직후 등 직전 스캔이
+/// 없을 때)이면 attr을 생략해, 수신측이 기존처럼 스캔 시각 폴백을 쓰게 한다(하위호환).
+///
+/// 이건 정확도가 아니라 **정직함**의 개선이다 — 실제 종료 시각은 커널 이벤트(netlink proc connector /
+/// eBPF `sched_process_exit`)로만 알 수 있고, 두 스캔 사이에 태어나 죽은 프로세스는 여전히 관측되지
+/// 않는다(폴링의 구조적 한계).
+///
 /// **attr 이름은 수신측(rca `otlp/decode.rs`) 디코더와 정확히 일치해야 한다.** 프로세스 식별 attr은
 /// `aic.process`와 같은 이름을 재사용해(`process.pid`/`process.executable.name`/`process.start_time`/
 /// `process.owner.uid`/`container.id`) 두 scope의 조인을 쉽게 한다. 나머지 CDC 전용 attr은
-/// `aic.process.op`/`process.parent_pid`/`aic.process.inventory.sequence`/`.keyframe`이다.
+/// `aic.process.op`/`process.parent_pid`/`aic.process.inventory.sequence`/`.keyframe`/
+/// `process.last_seen_unix`다.
 pub fn encode_process_inventory_changes(
     changes: &[InventoryChange<'_>],
     sequence: u64,
     keyframe: bool,
+    prev_scan_unix: Option<u64>,
     resource: &ResourceAttrs<'_>,
     service_version: &str,
     time_unix_nano: u64,
@@ -501,6 +514,13 @@ pub fn encode_process_inventory_changes(
             }
             if let Some(cid) = c.container_id.filter(|s| !s.is_empty()) {
                 attributes.push(attr_str("container.id", cid));
+            }
+            // 종료 시각의 하한 — `remove`에만 의미가 있다(add/change는 그 시점에 살아 있으므로
+            // "마지막으로 살아 있던 시각"이라는 개념 자체가 성립하지 않는다).
+            if c.op == "remove" {
+                if let Some(prev) = prev_scan_unix.filter(|v| *v > 0) {
+                    attributes.push(attr_int("process.last_seen_unix", saturating_i64(prev)));
+                }
             }
             let body_text = format!("{} {} pid={}", c.op, c.name, c.pid);
             LogRecord {
@@ -1385,7 +1405,16 @@ mod tests {
             },
         ];
         // sequence=7, keyframe=false → 모든 레코드에 동일 메타가 실린다.
-        let bytes = encode_process_inventory_changes(&changes, 7, false, &resource(None), "0.28.0", 100);
+        // prev_scan=1_700_000_400 → remove 레코드에만 종료 시각 하한이 실려야 한다.
+        let bytes = encode_process_inventory_changes(
+            &changes,
+            7,
+            false,
+            Some(1_700_000_400),
+            &resource(None),
+            "0.28.0",
+            100,
+        );
         let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
         let scope_logs = &req.resource_logs[0].scope_logs[0];
         assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.process.inventory");
@@ -1420,6 +1449,10 @@ mod tests {
             Some(AnyValueOneof::IntValue(0))
         ));
 
+        // add 레코드에는 종료 시각 하한이 없다 — 살아 있는 프로세스에 "마지막으로 살아 있던 시각"은
+        // 개념 자체가 성립하지 않는다.
+        assert!(!attrs.iter().any(|kv| kv.key == "process.last_seen_unix"));
+
         // 두 번째 레코드: ppid=0/start_time=0/uid/container=None은 attr 생략, 메타는 여전히 실린다.
         let attrs2 = &scope_logs.log_records[1].attributes;
         assert!(!attrs2.iter().any(|kv| kv.key == "process.parent_pid"));
@@ -1427,6 +1460,50 @@ mod tests {
         assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
         assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
         assert!(attrs2.iter().any(|kv| kv.key == "aic.process.inventory.sequence"));
+        // remove 레코드에는 종료 시각 **하한**이 실린다 — 수신측이 점 추정 대신 구간을 갖게 한다.
+        let get2 = |k: &str| {
+            attrs2
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| kv.value.clone())
+                .and_then(|v| v.value)
+        };
+        assert!(matches!(
+            get2("process.last_seen_unix"),
+            Some(AnyValueOneof::IntValue(1_700_000_400))
+        ));
+    }
+
+    /// 첫 tick처럼 직전 스캔이 없으면 attr을 **생략**한다 — 0을 실으면 수신측이 1970년을 하한으로
+    /// 읽어 수명이 폭발한다. 없을 때 생략해야 기존 스캔 시각 폴백이 그대로 동작한다(하위호환).
+    #[test]
+    fn process_inventory_omits_last_seen_when_no_previous_scan() {
+        let changes = vec![InventoryChange {
+            op: "remove",
+            pid: 9,
+            ppid: 0,
+            name: "gone",
+            start_time: 0,
+            uid: None,
+            container_id: None,
+        }];
+        for prev in [None, Some(0)] {
+            let bytes = encode_process_inventory_changes(
+                &changes,
+                1,
+                false,
+                prev,
+                &resource(None),
+                "0.28.0",
+                100,
+            );
+            let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
+            let attrs = &req.resource_logs[0].scope_logs[0].log_records[0].attributes;
+            assert!(
+                !attrs.iter().any(|kv| kv.key == "process.last_seen_unix"),
+                "prev={prev:?}일 때 하한 attr이 실렸다"
+            );
+        }
     }
 
     /// 모르는 값은 빈 문자열이 아니라 **attr 생략**이어야 한다 — rca는 attr이 없을 때만 폴백
