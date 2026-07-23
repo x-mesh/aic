@@ -56,6 +56,11 @@ pub struct ControlContext {
     /// `None` — 그때 `FlushSpool`은 `Error`로 답한다. `Some`이면 요청 + oneshot reply를 보내고
     /// 드레인 결과를 받아 IPC 응답으로 돌려준다.
     pub flush_tx: Option<mpsc::Sender<crate::otlp_exporter::FlushRequest>>,
+    /// 최근 프로세스 인벤토리 변화 링. host metrics exporter task가 채우므로, exporter가 아예
+    /// 안 뜨면 `None`이고 `GetRecentProcessChanges`는 빈 목록으로 답한다("변화 없음"과 "수집
+    /// 안 함"은 `GetExporterStatus`가 구분해 준다).
+    pub process_inventory:
+        Option<Arc<crate::process_inventory_store::ProcessInventoryStore>>,
 }
 
 /// aicd control UDS 엔드포인트.
@@ -289,6 +294,12 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
         // Phase 3.1 Task 1.8 / Phase 3.2 Task 2.1: `aic history` 및 Phase 3.2 read path가 사용한다.
         // list-op 성격(recent / find_by_prefix / recent_lines)이므로 해당 세션에 record가
         // 없어도 빈 Vec로 응답한다 — client가 "no records" UI를 직접 결정할 수 있도록.
+        IpcRequest::GetRecentProcessChanges { count } => match &ctx.process_inventory {
+            Some(store) => IpcResponse::ProcessChanges(store.recent(count).await),
+            // exporter task가 안 떠서 링이 없다 — 에러가 아니라 빈 목록이다(chat이 섹션을
+            // 그냥 비워 두면 되고, 왜 비었는지는 exporter status가 답한다).
+            None => IpcResponse::ProcessChanges(Vec::new()),
+        },
         IpcRequest::GetRecentCommandsForSession { id, count } => {
             IpcResponse::CommandRecords(ctx.record_store.recent(&id, count).await)
         }
@@ -546,6 +557,7 @@ mod tests {
         ControlContext {
             shutdown: watch::channel(false).0,
             registry: SessionRegistry::new(),
+            process_inventory: None,
             record_store: CommandRecordStore::new(),
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),

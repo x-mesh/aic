@@ -214,6 +214,7 @@ mod tests {
             exporter_health: None,
             logs_tx: None,
             flush_tx: None,
+            process_inventory: None,
         };
         let serve_handle = tokio::spawn(async move { server.serve(ctx).await });
 

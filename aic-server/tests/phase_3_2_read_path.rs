@@ -201,6 +201,7 @@ impl AicdHarness {
             exporter_health: None,
             logs_tx: None,
             flush_tx: None,
+            process_inventory: None,
         };
         let ctx_clone = ctx.clone();
         let handle = tokio::spawn(async move { server.serve(ctx_clone).await });

@@ -103,6 +103,12 @@ pub struct ExporterConfig {
     /// 보낼지. config `[aicd.exporter].process_inventory_enabled`(기본 false, opt-in). `serve`가
     /// 이전 tick과 diff해 add/remove/change만 보낸다 — top-N 메트릭(`process_enabled`)과 독립이다.
     pub process_inventory_enabled: bool,
+    /// 같은 diff 결과를 로컬에도 남길 링 store. chat이 IPC(`GetRecentProcessChanges`)로 읽는다.
+    ///
+    /// **`process_inventory_enabled`와 게이트가 다르다** — collector로 보낼지(위 플래그)와 로컬에
+    /// 남길지는 별개 판단이다. OTLP를 안 켰다고 로컬 관측까지 사라지면 chat이 쓸모없어지므로,
+    /// 링은 이 값이 `Some`이기만 하면 채운다. 둘 다 꺼져 있으면 diff 자체를 건너뛴다.
+    pub process_inventory_store: Option<Arc<crate::process_inventory_store::ProcessInventoryStore>>,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
@@ -255,43 +261,66 @@ pub async fn serve(
                 // 전수 인벤토리를 채워 왔다(top-N과 같은 refresh 재사용). 이전 tick과 diff해
                 // add/remove/change만 방출하고, 변화가 없으면 None이라 sequence도 소비하지 않는다.
                 // uid/container는 새로 등장한 프로세스(add)에만 enrich한다(정적 속성).
-                let inventory_body = if cfg.process_inventory_enabled {
-                    let changeset =
-                        inv_tracker.diff(&sample.process_inventory, host_metrics::enrich_process_owner);
-                    if !changeset.emit {
-                        None
-                    } else {
-                        let changes: Vec<logs_proto::InventoryChange<'_>> = changeset
-                            .records
-                            .iter()
-                            .map(|r| logs_proto::InventoryChange {
-                                op: r.op.as_str(),
-                                pid: r.pid,
-                                ppid: r.ppid,
-                                name: &r.name,
-                                start_time: r.start_time,
-                                uid: r.uid,
-                                container_id: r.container_id.as_deref(),
-                            })
-                            .collect();
-                        let resource = logs_proto::ResourceAttrs {
-                            host_name: &sample.resource.host_name,
-                            host_id: &sample.resource.host_id,
-                            os_type: &sample.resource.os_type,
-                            host_ip: None,
-                        };
-                        Some(logs_proto::encode_process_inventory_changes(
-                            &changes,
-                            changeset.sequence,
-                            changeset.keyframe,
-                            &resource,
-                            &cfg.service_version,
-                            unix_nanos_now(),
-                        ))
+                // 링(chat 로컬 조회)과 OTLP 전송은 **게이트가 다르다** — 링은 collector 설정과
+                // 무관하게 채우고, OTLP는 process_inventory_enabled일 때만 보낸다. 그래서 둘 중
+                // 하나라도 필요하면 diff를 돌린다(diff는 tick당 해시맵 비교 한 번이라 저렴하다).
+                // 둘 다 꺼져 있으면 tracker를 아예 안 돌려 prev가 낡을 일도 없다.
+                let mut inventory_body = None;
+                if cfg.process_inventory_enabled || cfg.process_inventory_store.is_some() {
+                    let changeset = inv_tracker
+                        .diff(&sample.process_inventory, host_metrics::enrich_process_owner);
+                    if changeset.emit {
+                        if let Some(store) = &cfg.process_inventory_store {
+                            // observed_at은 프로세스 시작 시각이 아니라 **관측(tick) 시각**이다 —
+                            // 폴링이라 최대 tick 주기만큼 늦을 수 있다(ProcessChange doc 참고).
+                            let observed_at = unix_nanos_now() / 1_000_000_000;
+                            let changes: Vec<aic_common::ipc::ProcessChange> = changeset
+                                .records
+                                .iter()
+                                .map(|r| aic_common::ipc::ProcessChange {
+                                    op: r.op.as_str().to_string(),
+                                    pid: r.pid,
+                                    ppid: r.ppid,
+                                    start_time: r.start_time,
+                                    name: r.name.clone(),
+                                    uid: r.uid,
+                                    container_id: r.container_id.clone(),
+                                    observed_at,
+                                })
+                                .collect();
+                            store.push_many(changes).await;
+                        }
+                        if cfg.process_inventory_enabled {
+                            let changes: Vec<logs_proto::InventoryChange<'_>> = changeset
+                                .records
+                                .iter()
+                                .map(|r| logs_proto::InventoryChange {
+                                    op: r.op.as_str(),
+                                    pid: r.pid,
+                                    ppid: r.ppid,
+                                    name: &r.name,
+                                    start_time: r.start_time,
+                                    uid: r.uid,
+                                    container_id: r.container_id.as_deref(),
+                                })
+                                .collect();
+                            let resource = logs_proto::ResourceAttrs {
+                                host_name: &sample.resource.host_name,
+                                host_id: &sample.resource.host_id,
+                                os_type: &sample.resource.os_type,
+                                host_ip: None,
+                            };
+                            inventory_body = Some(logs_proto::encode_process_inventory_changes(
+                                &changes,
+                                changeset.sequence,
+                                changeset.keyframe,
+                                &resource,
+                                &cfg.service_version,
+                                unix_nanos_now(),
+                            ));
+                        }
                     }
-                } else {
-                    None
-                };
+                }
 
                 if !backoff.ready() {
                     // backoff 윈도 안 — collector가 여전히 다운됐다고 보고 네트워크 시도(드레인·
