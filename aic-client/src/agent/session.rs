@@ -1011,6 +1011,13 @@ impl AgentSession {
                     .note(&tool_record::render_raw(&self.tool_records, t.as_deref()))
                     .await
             }
+            SlashCommand::Procs(n) => {
+                // LLM 미호출 — aicd가 이미 관측해 둔 이력을 그대로 보여준다.
+                let count = n.unwrap_or(tool_record::PROCS_DEFAULT);
+                self.out
+                    .note(&crate::agent::proc_changes::render_detailed(count))
+                    .await;
+            }
             SlashCommand::Local { sections, analyze } => {
                 self.handle_local(&sections, analyze).await
             }

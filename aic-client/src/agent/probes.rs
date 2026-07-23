@@ -127,6 +127,21 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(17),
     },
     ProbeSpec {
+        id: "proc_changes",
+        category: "process",
+        tags: &["process", "lifecycle", "churn", "change"],
+        description: "최근 프로세스 생성/소멸(aicd 관측 이력)",
+        // 다른 process 섹션이 "지금 무엇이 돌고 있나"를 보여주는 것과 달리, 이건 **무엇이 바뀌었나**다.
+        // `ps`로는 얻을 수 없다 — 방금 죽은 프로세스는 이미 목록에 없기 때문이다. 변화 이력을 들고
+        // 있는 건 aicd(host metrics tick마다 전수 diff)뿐이라, 이 leaf가 IPC로 물어온다.
+        //
+        // proc_fd_top과 같이 risk_guard가 exact argv로 Safe 판정하므로 인자를 붙이면 즉시 막힌다.
+        linux_command: "aic proc-changes",
+        macos_command: "aic proc-changes",
+        // 헤더 1 + 최대 15행 + 안내 문구 여유.
+        max_lines: Some(17),
+    },
+    ProbeSpec {
         id: "ip",
         category: "system",
         tags: &["network", "ip"],

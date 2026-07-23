@@ -678,6 +678,26 @@ fn to_exporter_status(rt: Roundtrip) -> Option<aic_common::ExporterStatus> {
     }
 }
 
+/// aicd가 들고 있는 최근 프로세스 인벤토리 변화를 **최신순**으로 가져온다(`/local`의
+/// `proc_changes` 섹션과 `/procs` 커맨드가 쓴다).
+///
+/// **`None`과 빈 `Vec`은 다른 뜻이다** — `None`은 aicd에 *물어보지 못했다*(미실행·이 요청을 모르는
+/// 구버전·timeout), 빈 `Vec`은 물어봤는데 *변화가 없거나 수집을 안 하고 있다*(exporter task 미기동).
+/// 호출부가 둘을 다르게 안내해야 사용자가 "조용한 것"과 "고장난 것"을 구분할 수 있다.
+pub fn recent_process_changes(count: usize) -> Option<Vec<aic_common::ipc::ProcessChange>> {
+    to_process_changes(query(&IpcRequest::GetRecentProcessChanges { count }))
+}
+
+fn to_process_changes(rt: Roundtrip) -> Option<Vec<aic_common::ipc::ProcessChange>> {
+    match rt {
+        Roundtrip::Replied(resp) => match *resp {
+            IpcResponse::ProcessChanges(v) => Some(v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// `AgentEvent`를 만든다(summary/attrs 값 redaction 포함). 순수 함수라 네트워크 없이 검증 가능하다.
 fn build_event(
     kind: &str,

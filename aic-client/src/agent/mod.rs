@@ -33,6 +33,9 @@ pub(crate) mod mcp;
 // SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
 pub mod obs_tools;
 pub(crate) mod probes;
+// `/local`의 proc_changes 섹션 + `/procs` — 최근 프로세스 생성/소멸. probe가 `aic proc-changes`로
+// 호출하므로 proc_fd와 같은 이유로 pub.
+pub mod proc_changes;
 // `/local`의 proc_fd_top 섹션 — 프로세스별 fd 상위 N. probe가 `aic proc-fd-top`으로 호출하므로
 // main.rs(외부 크레이트 경로)에서 접근 가능해야 해 pub.
 pub mod proc_fd;
