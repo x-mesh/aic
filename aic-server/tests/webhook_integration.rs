@@ -71,6 +71,16 @@ fn fake_aic_script(counter: &std::path::Path) -> std::path::PathBuf {
     script
 }
 
+/// 카운터 파일에 쌓인 실행 횟수. 파일이 아직 없으면 0.
+#[cfg(unix)]
+fn count_runs(counter: &std::path::Path) -> usize {
+    std::fs::read_to_string(counter)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
 fn alertmanager_body() -> serde_json::Value {
     serde_json::json!({
         "alerts": [{
@@ -170,11 +180,19 @@ async fn auto_diagnose_spawns_once_per_fingerprint() {
             .unwrap();
         assert_eq!(resp.status(), 200);
     }
-    // spawn된 자식 프로세스가 완료될 시간을 준다.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    let runs = std::fs::read_to_string(&counter).unwrap_or_default();
-    let count = runs.lines().filter(|l| !l.is_empty()).count();
+    // 첫 실행이 기록될 때까지 폴링한다. 고정 sleep(400ms)이었을 때, 부하가 있으면 spawn된 자식이
+    // 그 안에 끝나지 못해 플레이키했다 — 로컬 macOS 실측 5회 중 3회 실패. CI가 green이었던 것도
+    // 운이지 보장이 아니다.
+    let count = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while count_runs(&counter) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // 1회를 본 뒤에도 조금 더 기다린다 — 이 테스트의 본질은 "1회는 온다"가 아니라 **2번째가
+        // 오지 않는다**이므로, 첫 기록 즉시 단정하면 dedup이 깨져도 통과해 버린다.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        count_runs(&counter)
+    };
     assert_eq!(count, 1, "동일 fingerprint는 dedup으로 1회만 spawn (실제 {count})");
     let _ = std::fs::remove_file(&counter);
 }
