@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.31.1] - 2026-07-25
+
 ### Fixed
 - **aicd가 프로세스마다 `/proc/<pid>/stat` fd를 상주로 붙들고 있던 문제** — sysinfo는 Linux에서
   매 tick 다시 열지 않으려고 프로세스별 stat 핸들을 캐시하는데, 관측 대상이 곧 호스트 전체인
