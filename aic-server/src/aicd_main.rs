@@ -51,6 +51,26 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // sysinfo의 `/proc/<pid>/stat` fd 캐시를 끈다 — **첫 프로세스 refresh보다 먼저** 불러야 한다
+    // (sysinfo 문서의 명시 조건).
+    //
+    // sysinfo는 Linux에서 매 tick `/proc/<pid>/stat`을 다시 열지 않으려고 프로세스마다 그 핸들을
+    // **열어둔 채 들고 있다**(`FileCounter`, 상한은 RLIMIT_NOFILE의 절반). 관측 대상이 곧 호스트의
+    // 전 프로세스인 aicd에서는 이 캐시가 그대로 상주 fd가 된다 — jw-server 실측(프로세스 520개)에서
+    // `System` 하나당 fd 524개, 그리고 aicd는 `System`을 둘(host_metrics·changes) 들고 있어 총
+    // **1062개**가 잡혀 있었다. 게다가 Linux `processes()`는 유저랜드 스레드까지 돌려주므로
+    // `/proc/<pid>/task/<tid>/stat` 핸들도 함께 쌓인다(수집 후 걸러내는 `real_processes`는 fd를
+    // 되돌려주지 못한다 — 필터는 보고 단계에 있다).
+    //
+    // 끄면 refresh마다 open+close가 프로세스 수만큼 추가되지만, 같은 실측에서
+    // **26ms → 28ms**(회차 노이즈 24.6~28.1ms 안)이고 fd는 **524 → 4**로 떨어진다. 스캔 주기가
+    // 60초라 이 2ms는 무의미한 반면, 상주 fd 1000개는 `lsof`로 aicd를 들여다본 사람에게 항상
+    // "fd 누수"로 읽힌다. 캐시를 사서 얻는 게 없다.
+    //
+    // 반환값은 무시한다 — Linux 외에서는 항상 `false`이고, 애초에 이 캐시 자체가 Linux 전용이라
+    // macOS에서는 no-op이 정확한 동작이다.
+    sysinfo::set_open_files_limit(0);
+
     // RFC-006 로그 수집기 — self-log layer는 tracing subscriber를 단 한 번(전역 `.init()`)만
     // 등록할 수 있어, 뒤에서 `read_exporter_section`/`read_logs_config`(경고 로깅 포함, 의도적으로
     // telemetry 초기화 이후에 호출한다)로 다시 읽기 전에 "로그 채널을 만들지/self 수집기를 붙일지"

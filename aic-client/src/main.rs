@@ -1241,6 +1241,14 @@ enum ConfigOp {
 
 #[tokio::main]
 async fn main() {
+    // sysinfo의 `/proc/<pid>/stat` fd 캐시를 끈다 — aicd(`aicd_main.rs`)와 같은 이유이고, 거기에
+    // 배경과 실측치를 적어 뒀다. 여기서도 필요한 건 클라이언트에 **장수 샘플러**가 둘 있어서다:
+    // `SysSampler`(chat status bar, 2초 주기)와 `WebProcessSampler`(`aic web` 대시보드)는 세션이
+    // 사는 내내 `System`을 들고 재사용하므로, 캐시를 켜두면 몇 시간짜리 chat 하나가 호스트
+    // 프로세스 수만큼 fd를 붙들고 앉아 있게 된다. 단발 서브커맨드(`proc_fd` 등)에서는 어차피 첫
+    // refresh가 캐시 미스라 잃는 것도 없다. 첫 프로세스 refresh보다 먼저 불러야 한다.
+    sysinfo::set_open_files_limit(0);
+
     // aic-client 최초의 tracing subscriber(RFC-006 t11) — 이전엔 tracing 이 facade뿐이라
     // tracing:: 매크로가 no-op이었다. debug_log!(아래)와는 별개 경로로 공존한다(모듈 doc 참고).
     aic_client::log_sink::init();

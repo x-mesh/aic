@@ -5,6 +5,23 @@
 ## [Unreleased]
 
 ### Fixed
+- **aicd가 프로세스마다 `/proc/<pid>/stat` fd를 상주로 붙들고 있던 문제** — sysinfo는 Linux에서
+  매 tick 다시 열지 않으려고 프로세스별 stat 핸들을 캐시하는데, 관측 대상이 곧 호스트 전체인
+  aicd에서는 그게 그대로 상주 fd가 된다. jw-server 실측(프로세스 520개)에서 **fd 1062개**를 들고
+  있었다 — `System` 인스턴스가 둘(host metrics·changes)이라 프로세스당 2개씩이고, Linux
+  `processes()`가 유저랜드 스레드까지 돌려주므로 `/proc/<pid>/task/<tid>/stat` 핸들도 함께
+  쌓였다(스레드 필터는 보고 단계에 있어 이미 열린 fd를 되돌리지 못한다). 이제 시작 시
+  `set_open_files_limit(0)`으로 이 캐시를 끈다 — 같은 실측에서 refresh **26ms → 28ms**(회차 노이즈
+  안), 상주 fd **524 → 4**. 60초 주기에서 2ms는 무의미한 반면 fd 1000개는 `lsof`로 보는 사람에게
+  항상 누수로 읽힌다. macOS에는 이 캐시가 없어 no-op이다.
+
+  `aic` 클라이언트에도 같은 처방을 넣었다 — chat status bar의 `SysSampler`(2초 주기)와 `aic web`의
+  `WebProcessSampler`는 세션이 사는 내내 `System`을 재사용하므로, 몇 시간짜리 chat 하나가 호스트
+  프로세스 수만큼 fd를 붙들고 있었다.
+
+  참고로 `lsof | grep aic`가 보여주던 **15022줄은 fd 개수가 아니다** — 인자 없는 `lsof`는 스레드
+  (task)마다 같은 fd 목록을 반복 출력하므로 aicd 스레드 14개만큼 부풀려진 값이었다
+  (`lsof -p <pid>`는 1071줄).
 - **v0.31.0의 스레드 필터가 커널 스레드까지 잘라내던 회귀** — 스레드 제외를
   `thread_kind().is_none()`으로 구현했는데, sysinfo는 **`Some`이라고 다 스레드가 아니다**:
   `Some(Kernel)`은 `PF_KTHREAD`가 선 커널 스레드(`[kworker/*]` 등)로 `Tgid == Pid`인 독립
