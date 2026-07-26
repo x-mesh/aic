@@ -29,11 +29,30 @@ pub(crate) struct SysSampler {
     /// exporter 상태 캐시 + 마지막 조회 시각. status bar는 자주 갱신되는데 매번 aicd에 IPC를
     /// 걸 이유가 없다 — 이 값은 초 단위로만 변한다.
     exporter_cache: (ExporterState, Instant),
+    /// **마지막으로 프로세스 목록을 refresh한 시각**(아직 한 번도 안 열었으면 `None`).
+    ///
+    /// 프로세스별 cpu%도 전역 cpu와 똑같이 **직전 refresh와의 델타**다. 그런데 이 refresh는 이상
+    /// 신호가 있을 때만 도므로, 전역 `last_cpu_refresh`로는 유효성을 판정할 수 없다 — 전역 cpu는
+    /// 매 tick 갱신되지만 프로세스 목록은 몇 분 만에 처음 열릴 수도 있다. 그래서 시각을 따로 든다.
+    last_proc_refresh: Option<Instant>,
+    /// 연속 proc-enrich refresh 횟수. **cpu 델타는 3회차부터 유효하다** — 1회차는 프로세스 객체를
+    /// 만들고, 2회차는 `old_stime` 기준선만 채우며 값은 0으로 둔다([`super::proc_groups::render`]의
+    /// 실측 참고). 시각만으로 판정하면 2회차의 0%를 진짜 값으로 믿게 된다.
+    proc_refreshes: u8,
 }
+
+/// proc-enrich 기준선의 최대 나이. 경보가 간헐적이면 refresh 사이가 몇 분씩 벌어지는데, 그 구간의
+/// cpu%는 "지금 누가 바쁜가"가 아니라 그 긴 구간의 평균이다. 이보다 오래되면 기준선을 버리고 다시
+/// 센다(그동안은 `cpu_pct: None`으로 나가고, 그룹은 rss 기준으로 정렬된다).
+const PROC_BASELINE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// exporter 상태를 aicd에 다시 물어보는 최소 간격. status bar 갱신 빈도와 무관하게 이 주기로만
 /// 조회한다.
 const EXPORTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 프로세스 그룹 리더보드에 담을 행 수. status bar는 그중 1행만 쓰고, 진단 화면이 나머지를 쓴다 —
+/// 범인이 2~3위에 숨어 있는 경우가 있어 1개만 들고 오면 다시 스캔해야 한다.
+const PROC_GROUP_TOP_N: usize = 5;
 
 /// status bar 지표의 임계 단계 — 정상(dim) → 경고(주황) → 위험(빨강). status bar 컬러링용.
 /// 변형 선언 순서(Normal < Warn < Crit)가 곧 심각도 순서다 — `Ord`로 `overall_severity`가
@@ -132,9 +151,13 @@ pub(crate) struct SysMetrics {
     /// 전체 인터페이스 합산 수신/송신 bytes/s (loopback 포함).
     pub net_rx_bps: u64,
     pub net_tx_bps: u64,
-    /// mem가 Warn 이상일 때만 채워지는 "가장 무거운(최대 RSS) 프로세스" — alert가 범인을 지목하는 데
-    /// 쓴다(이름, RSS bytes). Normal이면 None(process 열거 비용 0). §C4 actionability.
+    /// 이상 신호가 있을 때만 채워지는 "가장 무거운(최대 RSS) 프로세스" — alert가 범인을 지목하는 데
+    /// 쓴다(이름, RSS bytes). 평시엔 None(process 열거 비용 0). §C4 actionability.
     pub top_mem_proc: Option<(String, u64)>,
+    /// 이름별 프로세스 그룹 상위 N(개수·cpu 합·rss 합). `top_mem_proc`이 답할 수 없는 질문 —
+    /// **"개체는 작은데 무리가 큰"** 경우 — 를 위한 값이다. `load 16.68`의 범인이 "claude 21개가
+    /// 합쳐 40%"일 때 최대 RSS 프로세스 하나만 보면 아무 이상도 보이지 않는다. 평시엔 빈 vec.
+    pub proc_groups: Vec<super::proc_groups::ProcGroup>,
     /// disk 소진 ETA(C2) — sampler task의 `TrendTracker`가 채운다(`sample()`은 항상 None으로 두고
     /// task가 덮어쓴다). status bar disk 세그먼트에 dim 접미로 표시. 비-task 경로(spinner 등)는 None.
     pub disk_eta: Option<DiskEta>,
@@ -262,6 +285,10 @@ impl SysSampler {
             // 위 refresh_cpu_usage()가 델타의 **기준선**이다 — 그 시각을 기록해 둔다. 덕분에 첫 sample()도
             // 간격만 충분하면 유효한 cpu를 낸다(첫 샘플이라고 버리지 않는다 — 멀쩡한 값을 버리는 과교정).
             last_cpu_refresh: Instant::now(),
+            // 프로세스 목록은 여기서 열지 않는다 — 평시 비용 0을 지키려는 것이고, 그래서 기준선도
+            // 없다. 첫 proc-enrich 스캔의 cpu%는 믿을 수 없으므로 None/0으로 시작한다.
+            last_proc_refresh: None,
+            proc_refreshes: 0,
             // 첫 sample()에서 곧바로 조회하도록, 캐시는 만료된 상태로 시작한다.
             exporter_cache: (
                 ExporterState::Disabled,
@@ -358,6 +385,7 @@ impl SysSampler {
             net_rx_bps: (rx as f64 / elapsed) as u64,
             net_tx_bps: (tx as f64 / elapsed) as u64,
             top_mem_proc: None,
+            proc_groups: Vec::new(),
             // sample()은 ETA·sparkline을 모른다(상태가 필요) — sampler task의 TrendTracker가 publish
             // 직전 덮어쓴다.
             disk_eta: None,
@@ -366,25 +394,69 @@ impl SysSampler {
             cpu_valid,
             sampled_at: Some(self.last),
         };
-        // proc-enrich(§C4): mem가 Warn 이상일 때만 process 목록을 in-process로 refresh해 최대 RSS
-        // 프로세스(범인)를 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
+        // proc-enrich(§C4): **이상 신호가 하나라도 있으면** process 목록을 in-process로 refresh해
+        // 범인을 지목한다. Normal 경로는 process 열거를 전혀 하지 않아 sub-ms 비용을 유지하고
         // (probe fork도 아님), 이 호출은 sampler task의 spawn_blocking에서 도므로 UI를 막지 않는다.
-        // RSS는 단일 refresh로 정확하다(cpu%는 delta가 필요해 별도 — 미구현).
-        if m.mem_sev() >= Severity::Warn {
-            // **memory만** refresh한다 — cmd/env/cwd/disk까지 가져오는 full refresh는 macOS 첫 호출에서
-            // 수 초가 걸린다. 우리는 (이름, RSS)만 필요하므로 ProcessRefreshKind::nothing().with_memory()로
-            // 비용을 최소화한다(이름은 기본 정보라 항상 포함).
+        //
+        // 예전에는 `mem_sev()`만 봤다. 그래서 **메모리가 멀쩡한 채 load만 치솟은 호스트**
+        // (실측: load 16.68 / 12코어, mem 22% 사용)에서는 프로세스를 아예 열어보지 않아 원인을 찾을
+        // 방법이 없었다. 부하의 종류와 무관하게 "이상하면 들여다본다"가 맞다.
+        if m.overall_severity() >= Severity::Warn {
+            // 기준선이 너무 오래됐으면 버리고 다시 센다 — 경보가 간헐적이면 그 사이 구간의 평균이
+            // 나와 "지금 누가 바쁜가"의 답이 아니게 된다.
+            if self
+                .last_proc_refresh
+                .is_some_and(|t| t.elapsed() > PROC_BASELINE_MAX_AGE)
+            {
+                self.proc_refreshes = 0;
+            }
+            // 프로세스 cpu%는 **3회차 refresh부터** 유효하다(1회차 생성 · 2회차 기준선 · 3회차 델타).
+            // 전역 `cpu_valid`와 같은 함정이지만 여기서는 더 지독하다 — 2회차 값은 "그럴싸하게 틀린"
+            // 수도 아니고 **일괄 0**이라, 시각만 보고 유효하다고 판정하면 "아무도 CPU를 안 쓴다"는
+            // 정반대 결론을 낸다. 이 refresh는 평시에 아예 돌지 않으므로 초기 회차가 기본 경로다.
+            let proc_cpu_valid = self.proc_refreshes >= 2
+                && self
+                    .last_proc_refresh
+                    .is_some_and(|t| t.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+            // **memory + cpu만** refresh한다 — cmd/env/cwd/disk까지 가져오는 full refresh는 macOS 첫
+            // 호출에서 수 초가 걸린다(이름은 기본 정보라 항상 포함).
             self.sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
-                ProcessRefreshKind::nothing().with_memory(),
+                ProcessRefreshKind::nothing().with_memory().with_cpu(),
             );
+            self.last_proc_refresh = Some(Instant::now());
+            self.proc_refreshes = self.proc_refreshes.saturating_add(1);
             m.top_mem_proc = self
                 .sys
                 .processes()
                 .values()
                 .max_by_key(|p| p.memory())
                 .map(|p| (p.name().to_string_lossy().into_owned(), p.memory()));
+            // 부하의 종류에 따라 범인이 다르다 — mem 경보엔 RSS 합, 그 밖(load/cpu/…)엔 CPU 합 기준.
+            let sort = if m.mem_sev() >= Severity::Warn {
+                super::proc_groups::GroupSort::Rss
+            } else {
+                super::proc_groups::GroupSort::Cpu
+            };
+            m.proc_groups = super::proc_groups::top_groups(
+                self.sys
+                    .processes()
+                    .values()
+                    // 유저랜드 스레드를 빼야 개수가 사실이 된다(스레드 20개짜리 프로세스가 `×20`으로
+                    // 보이면 안 된다). 커널 스레드는 남긴다 — `is_countable` 주석의 회귀 참고.
+                    .filter(|p| super::proc_groups::is_countable(p))
+                    .map(|p| {
+                        (
+                            p.name().to_string_lossy().into_owned(),
+                            p.cpu_usage(),
+                            p.memory(),
+                        )
+                    }),
+                PROC_GROUP_TOP_N,
+                sort,
+                proc_cpu_valid,
+            );
         }
         m
     }
@@ -392,43 +464,20 @@ impl SysSampler {
 
 impl SysMetrics {
     /// status bar 한 줄(ANSI 없음 — 출력 시 paint). 순수 함수(테스트 가능).
+    ///
+    /// **`status_segments`에서 파생한다** — 두 경로가 각자 포맷을 조립하던 시절엔 한쪽에만 있는
+    /// 지표가 생겼다(`net`이 이 줄에만 있고 TUI 컬러 경로에는 빠져 있었다). 이제 세그먼트 목록이
+    /// 유일한 원본이라 두 경로가 어긋날 수 없다. 시각(clock)만 이 줄 전용 prefix다 — TUI는
+    /// 터미널·OS 시계와 겹쳐 자리를 낭비하지 않으려고 쓰지 않는다.
     pub fn status_line(&self) -> String {
-        let mem_pct = if self.mem_total > 0 {
-            self.mem_used as f64 * 100.0 / self.mem_total as f64
-        } else {
-            0.0
-        };
-        // swap: 활성(total>0)이면 사용률 %, 아니면 off.
-        let swap = if self.swap_total > 0 {
-            format!(
-                "swap {:.0}%",
-                self.swap_used as f64 * 100.0 / self.swap_total as f64
-            )
-        } else {
-            "swap off".to_string()
-        };
-        let disk = self.disk_label();
         let clock = chrono::Local::now().format("%H:%M:%S").to_string();
-        let line = format!(
-            "{} · load {:.2} · {} · mem {:.0}% ({}/{}) · {} · {} · io r{}/s w{}/s · net ↑{}/s ↓{}/s",
-            clock,
-            self.load1,
-            self.cpu_label(),
-            mem_pct,
-            human_bytes(self.mem_used),
-            human_bytes(self.mem_total),
-            swap,
-            disk,
-            human_bytes(self.disk_read_bps),
-            human_bytes(self.disk_write_bps),
-            human_bytes(self.net_tx_bps),
-            human_bytes(self.net_rx_bps),
-        );
-        // exporter 상태(꺼져 있으면 생략) — status_segments와 같은 정보를 같은 자리에 둔다.
-        match self.exporter.segment() {
-            Some((label, _)) => format!("{line} · {label}"),
-            None => line,
-        }
+        let body = self
+            .status_segments()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        format!("{clock} · {body}")
     }
 
     /// mem 사용률(%). `session::record_metrics_attrs`(`/record now` OTLP attrs)가 재사용한다.
@@ -467,9 +516,94 @@ impl SysMetrics {
         s
     }
 
+    /// load 세그먼트 텍스트 — **절대값과 코어 대비 비율을 나란히** 낸다(`load 9.12 (0.65×)`).
+    ///
+    /// 절대값만으로는 위험 여부를 알 수 없다. `load 9.12`는 14코어에서 여유(0.65×)지만 4코어에서는
+    /// 비상(2.28×)이다 — 같은 숫자가 호스트마다 다른 뜻이라 판단을 사용자에게 떠넘기게 된다. 반대로
+    /// 비율만 두면 `top`·`uptime`이 보여주는 익숙한 숫자와 눈을 맞출 수 없다. 그래서 참고용 절대값과
+    /// 판단 기준인 비율(**1.0×가 포화선**)을 함께 둔다.
+    /// **Warn 이상에서 최다 기여 그룹을 접미**한다(`load 16.68 (1.39×) ▸ claude ×21`). `mem`이
+    /// `▸ Chrome 12.0G`로 범인을 지목하는 것과 같은 규칙이다 — 경보만으로는 다음 행동이 안 정해진다.
+    ///
+    /// 개수만 붙이고 판단은 하지 않는다. `claude ×21`이 폭주인지 정상 병렬 작업인지는 개수로 알 수
+    /// 없다(`proc_groups` 모듈 주석 참고).
+    fn load_label(&self) -> String {
+        let base = format!("load {:.2} ({:.2}×)", self.load1, self.load_ratio());
+        if self.load_sev() == Severity::Normal {
+            return base;
+        }
+        match self.proc_groups.first() {
+            // 무리일 때만 개수를 붙인다 — `×1`은 자리만 먹고 알려주는 게 없다.
+            Some(g) if g.count > 1 => {
+                format!("{base} ▸ {} ×{}", short_proc(&g.name), g.count)
+            }
+            Some(g) => format!("{base} ▸ {}", short_proc(&g.name)),
+            None => base,
+        }
+    }
+
+    /// 코어 대비 load 비율 — 1.0×가 포화선. `load_label`·`load_sev`가 같은 값을 공유한다.
+    fn load_ratio(&self) -> f64 {
+        self.load1 / self.cores.max(1) as f64
+    }
+
+    /// mem 세그먼트 텍스트 — 평시엔 사용률만, **Warn 이상에서 최다 사용 프로세스를 접미**한다
+    /// (`mem 94% ▸ Chrome 12.0G`).
+    ///
+    /// 총량 표기(`(8.0G/16.0G)`)는 뺐다. 세션 내내 변하지 않는 값이라 한 번 알면 끝인데 매 tick 자리를
+    /// 차지했다 — 그 폭을 **"왜 높은가"**에 쓰는 편이 낫다. `top_mem_proc`은 `alert_states`(알림 문구)
+    /// 에서는 이미 쓰이고 있었지만 status bar에는 나오지 않았다. 같은 근거를 같은 자리에서 보게 한다.
+    fn mem_label(&self) -> String {
+        let base = format!("mem {:.0}%", self.mem_pct());
+        if self.mem_sev() == Severity::Normal {
+            return base;
+        }
+        match &self.top_mem_proc {
+            Some((name, bytes)) => {
+                format!("{base} ▸ {} {}", short_proc(name), human_bytes(*bytes))
+            }
+            None => base,
+        }
+    }
+
+    /// io 세그먼트 텍스트 — 평시엔 읽기+쓰기 **합계**(`io 2.5M/s`), `expand`면 방향별 **분해**
+    /// (`io r2.0M w512.0K/s`).
+    ///
+    /// 평시에 알고 싶은 건 "디스크가 바쁜가?" 하나뿐이라 숫자 넷을 늘어놓을 이유가 없다. 읽기냐 쓰기냐는
+    /// 이미 뭔가 이상하다는 걸 안 다음에야 의미를 갖는다.
+    fn io_label(&self, expand: bool) -> String {
+        if expand {
+            format!(
+                "io r{} w{}/s",
+                human_bytes(self.disk_read_bps),
+                human_bytes(self.disk_write_bps)
+            )
+        } else {
+            format!(
+                "io {}/s",
+                human_bytes(self.disk_read_bps.saturating_add(self.disk_write_bps))
+            )
+        }
+    }
+
+    /// net 세그먼트 텍스트 — io와 같은 규칙(평시 합계 `net 3.2M/s`, `expand`면 `net ↑256.0K ↓3.0M/s`).
+    fn net_label(&self, expand: bool) -> String {
+        if expand {
+            format!(
+                "net ↑{} ↓{}/s",
+                human_bytes(self.net_tx_bps),
+                human_bytes(self.net_rx_bps)
+            )
+        } else {
+            format!(
+                "net {}/s",
+                human_bytes(self.net_tx_bps.saturating_add(self.net_rx_bps))
+            )
+        }
+    }
+
     fn load_sev(&self) -> Severity {
-        let ratio = self.load1 / self.cores.max(1) as f64;
-        sev_high(ratio, LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
+        sev_high(self.load_ratio(), LOAD_WARN_RATIO, LOAD_CRIT_RATIO)
     }
     /// cpu 단계 — **믿을 수 없는 값(`cpu_valid=false`)으로는 판정하지 않는다**(Normal 취급).
     /// 그 값은 부팅 이후 누적 평균이라, 오래 바빴던 호스트에서는 그것만으로 임계를 넘겨 **첫 tick에
@@ -503,8 +637,9 @@ impl SysMetrics {
         sev_low(self.disk_avail, DISK_WARN_FREE, DISK_CRIT_FREE)
     }
 
-    /// status bar를 (라벨, 단계) 세그먼트로 분해한다(컬러링용, 순수). 텍스트는 `status_line`과 동일 포맷.
-    /// io 세그먼트는 처리량이라 임계 없음(항상 Normal). chat_tui가 단계별 색을 입혀 렌더한다.
+    /// status bar를 (라벨, 단계) 세그먼트로 분해한다(컬러링용, 순수). **status bar 텍스트의 유일한
+    /// 원본** — `status_line`이 이걸 join해서 만들므로 두 경로가 어긋날 수 없다.
+    /// io·net 세그먼트는 처리량이라 임계 없음(항상 Normal). chat_tui가 단계별 색을 입혀 렌더한다.
     pub fn status_segments(&self) -> Vec<(String, Severity)> {
         let swap = if self.swap_total > 0 {
             format!(
@@ -515,28 +650,20 @@ impl SysMetrics {
             "swap off".to_string()
         };
         let disk = self.disk_label();
+        // io·net 분해 여부 — 이 둘은 처리량이라 **자체 임계를 세울 수 없다**(같은 10M/s가 NVMe에서는
+        // 한가하고 네트워크 드라이브에서는 포화다). 대신 **시스템 전체가 Warn 이상일 때** 펼친다:
+        // "뭔가 이상한데 io가 원인인가?"를 묻는 순간이 정확히 그때고, 평시엔 합계 하나로 족하다.
+        let expand = self.overall_severity() >= Severity::Warn;
         let mut segs = vec![
-            (format!("load {:.2}", self.load1), self.load_sev()),
+            (self.load_label(), self.load_sev()),
             (self.cpu_label(), self.cpu_sev()),
-            (
-                format!(
-                    "mem {:.0}% ({}/{})",
-                    self.mem_pct(),
-                    human_bytes(self.mem_used),
-                    human_bytes(self.mem_total)
-                ),
-                self.mem_sev(),
-            ),
+            (self.mem_label(), self.mem_sev()),
             (swap, self.swap_sev()),
             (disk, self.disk_sev()),
-            (
-                format!(
-                    "io r{}/s w{}/s",
-                    human_bytes(self.disk_read_bps),
-                    human_bytes(self.disk_write_bps)
-                ),
-                Severity::Normal,
-            ),
+            (self.io_label(expand), Severity::Normal),
+            // net은 io **뒤**에 온다 — `SEG_*` 상수(load..io = 0..5)가 trend_spark 위치를 인덱스로
+            // 가리키므로, 앞이나 중간에 끼우면 sparkline이 엉뚱한 세그먼트에 붙는다.
+            (self.net_label(expand), Severity::Normal),
         ];
         // sparkline(C2)을 대상 세그먼트에 접미 — 그 세그먼트 단계 색을 상속한다(standalone 무색 없음).
         // exporter 세그먼트보다 **먼저** 붙인다: trend_spark의 인덱스는 위 고정 목록 기준이라,
@@ -575,9 +702,13 @@ impl SysMetrics {
     /// 사용자가 색·alert·텍스트를 1:1로 대응시킬 수 있다.
     fn alert_states(&self) -> [(&'static str, Severity, String); ALERT_RESOURCES] {
         [
-            ("load", self.load_sev(), format!("load {:.2}", self.load1)),
+            // load는 status bar와 같은 토큰(절대값 + 코어 대비 비율) — 알림 문구만 보고도 왜 경보인지
+            // 알 수 있다. `load 19.4`는 코어 수를 모르면 판단이 안 되지만 `(1.4×)`는 그 자체로 답이다.
+            ("load", self.load_sev(), self.load_label()),
             ("cpu", self.cpu_sev(), self.cpu_label()),
             ("mem", self.mem_sev(), {
+                // 알림은 status bar와 달리 폭 제약이 느슨하다 — 총량과 **자르지 않은** 프로세스명을
+                // 그대로 싣는다. status bar(`mem_label`)는 같은 근거를 좁은 폭에 맞춰 줄여 보여준다.
                 let mut s = format!(
                     "mem {:.0}% ({}/{})",
                     self.mem_pct(),
@@ -1126,6 +1257,20 @@ fn sev_low(v: u64, warn: u64, crit: u64) -> Severity {
     }
 }
 
+/// 프로세스명을 status bar 폭에 맞게 줄인다. 순수 함수.
+///
+/// `Google Chrome Helper (Renderer)` 같은 이름은 그대로 두면 세그먼트 하나가 줄 전체를 밀어낸다.
+/// 폭 제약이 없는 알림 문구(`alert_states`)는 자르지 않은 원래 이름을 쓴다 — 자르는 건 좁은 자리에
+/// 끼워 넣는 status bar 쪽 사정이다.
+fn short_proc(name: &str) -> String {
+    const MAX_CHARS: usize = 16;
+    if name.chars().count() <= MAX_CHARS {
+        return name.to_string();
+    }
+    let head: String = name.chars().take(MAX_CHARS - 1).collect();
+    format!("{head}…")
+}
+
 /// bytes를 사람이 읽는 단위로(B/K/M/G/T). 순수 함수.
 fn human_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
@@ -1294,16 +1439,92 @@ mod tests {
             ..Default::default()
         };
         let line = m.status_line();
-        assert!(line.contains("load 1.23"), "{line}");
+        // load는 절대값 + 코어(8) 대비 비율을 함께 — 1.23/8 = 0.15×.
+        assert!(line.contains("load 1.23 (0.15×)"), "{line}");
         assert!(line.contains("cpu 46%"), "{line}");
         assert!(line.contains("mem 50%"), "{line}");
+        // 총량은 세션 내내 불변이라 뺐다 — 매 tick 자리를 차지할 이유가 없다.
+        assert!(!line.contains("16.0G"), "mem 총량이 남아 있다: {line}");
         assert!(line.contains("swap 25%"), "{line}");
         // disk는 신뢰 가능한 free만(사용률 %는 macOS APFS에서 부정확).
         assert!(line.contains("disk 70.0G free"), "{line}");
-        assert!(line.contains("io r2.0M/s w512.0K/s"), "{line}");
-        assert!(line.contains("net ↑256.0K/s ↓3.0M/s"), "{line}");
+        // 평시(전부 Normal)엔 io·net을 합계 하나로 압축한다: 2.0M+512K, 256K+3.0M.
+        assert!(line.contains("io 2.5M/s"), "{line}");
+        assert!(line.contains("net 3.2M/s"), "{line}");
         // clock: HH:MM:SS 형식 검증(값은 실행 시점 의존이므로 패턴만).
         assert!(line.contains(':'), "{line}");
+    }
+
+    /// 시스템이 Warn 이상이면 io·net이 방향별로 펼쳐지고 mem에 범인 프로세스가 붙는다.
+    ///
+    /// 평시에 알고 싶은 건 "바쁜가?" 하나뿐이지만, 이상이 생긴 뒤에는 "읽기냐 쓰기냐", "누가 먹고
+    /// 있나"가 곧 다음 행동을 정한다. 같은 폭을 상황에 따라 다르게 쓰는 것이 이 설계의 요지다.
+    #[test]
+    fn segments_expand_when_system_is_stressed() {
+        let g = 1024 * 1024 * 1024;
+        // cpu 99% → Crit, mem 15/16 ≈ 94% → Warn(임계 90).
+        let mut m = metric(1.0, 99.0, 8, 15 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        m.disk_read_bps = 2 * 1024 * 1024;
+        m.disk_write_bps = 512 * 1024;
+        m.net_rx_bps = 3 * 1024 * 1024;
+        m.net_tx_bps = 256 * 1024;
+        m.top_mem_proc = Some(("Google Chrome Helper (Renderer)".to_string(), 12 * g));
+
+        let line = m.status_line();
+        assert!(line.contains("io r2.0M w512.0K/s"), "{line}");
+        assert!(line.contains("net ↑256.0K ↓3.0M/s"), "{line}");
+        // 범인 프로세스 접미 — 긴 이름은 status bar 폭에 맞게 잘린다.
+        assert!(line.contains("▸ Google Chrome H… 12.0G"), "{line}");
+
+        // 대조군: 평시에는 같은 프로세스 정보가 있어도 붙지 않는다(자리를 아낀다).
+        let mut calm = metric(1.0, 10.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
+        calm.top_mem_proc = Some(("Google Chrome Helper (Renderer)".to_string(), 12 * g));
+        assert!(!calm.status_line().contains('▸'), "{}", calm.status_line());
+    }
+
+    /// load 경보에 최다 기여 그룹이 붙는다 — 붙여넣은 실사례(load 16.68 / 12코어, mem은 멀쩡)를
+    /// 그대로 재현한다. **이 케이스가 예전 구조에서는 통째로 안 잡혔다**: proc-enrich 트리거가
+    /// `mem_sev()` 전용이라 메모리가 정상이면 프로세스를 열어보지도 않았기 때문이다.
+    #[test]
+    fn load_label_names_the_top_group_when_stressed() {
+        use super::super::proc_groups::ProcGroup;
+        let g = 1024 * 1024 * 1024;
+        // load 16.68 / 12코어 = 1.39× → Warn. mem은 22%로 정상.
+        let mut m = metric(16.68, 20.0, 12, 10 * g, 48 * g, 0, 0, 83 * g, 900 * g);
+        m.proc_groups = vec![ProcGroup {
+            name: "claude".to_string(),
+            count: 21,
+            rss: 4 * g,
+            cpu_pct: Some(40.2),
+        }];
+        assert_eq!(m.load_label(), "load 16.68 (1.39×) ▸ claude ×21");
+        // mem은 정상이므로 범인 접미가 붙지 않는다(경보가 난 지표만 원인을 말한다).
+        assert!(!m.mem_label().contains('▸'), "{}", m.mem_label());
+
+        // 단독 프로세스면 개수를 생략한다 — `×1`은 자리만 먹는다.
+        m.proc_groups = vec![ProcGroup {
+            name: "swift-frontend".to_string(),
+            count: 1,
+            rss: g,
+            cpu_pct: Some(98.0),
+        }];
+        assert_eq!(m.load_label(), "load 16.68 (1.39×) ▸ swift-frontend");
+
+        // 평시에는 그룹 정보가 있어도 붙지 않는다.
+        let calm = metric(1.0, 10.0, 12, 10 * g, 48 * g, 0, 0, 83 * g, 900 * g);
+        assert_eq!(calm.load_label(), "load 1.00 (0.08×)");
+    }
+
+    #[test]
+    fn short_proc_truncates_only_long_names() {
+        assert_eq!(short_proc("aicd"), "aicd");
+        assert_eq!(short_proc("0123456789abcdef"), "0123456789abcdef"); // 정확히 16자는 그대로
+        assert_eq!(short_proc("0123456789abcdefg"), "0123456789abcde…");
+        // 멀티바이트 이름을 byte로 자르면 패닉한다 — char 단위로 센다.
+        assert_eq!(
+            short_proc("가나다라마바사아자차카타파하거너더"),
+            "가나다라마바사아자차카타파하거…"
+        );
     }
 
     #[test]
@@ -1327,6 +1548,40 @@ mod tests {
         let line = m.status_line();
         assert!(line.contains("swap off"), "{line}");
         assert!(line.contains("disk n/a"), "{line}");
+    }
+
+    /// 두 렌더 경로(문자열 `status_line` / TUI 컬러 `status_segments`)가 같은 지표 집합을 낸다.
+    ///
+    /// 회귀 방지 — 한때 두 함수가 각자 포맷을 조립해서 `net`이 `status_line`에만 있고 chat TUI에는
+    /// 아예 표시되지 않았다. `status_line`이 segments에서 파생되는 한 이 불일치는 구조적으로 불가능
+    /// 하지만, 누군가 다시 갈라놓으면 여기서 잡힌다.
+    #[test]
+    fn status_line_and_segments_never_diverge() {
+        let g = 1024 * 1024 * 1024;
+        let mut m = metric(1.0, 10.0, 8, 4 * g, 16 * g, g, 4 * g, 50 * g, 200 * g);
+        m.disk_read_bps = 2 * 1024 * 1024;
+        m.disk_write_bps = 512 * 1024;
+        m.net_rx_bps = 3 * 1024 * 1024;
+        m.net_tx_bps = 256 * 1024;
+        m.exporter = ExporterState::DaemonDown;
+
+        let line = m.status_line();
+        let segs = m.status_segments();
+        for (label, _) in &segs {
+            assert!(
+                line.contains(label.as_str()),
+                "segments의 `{label}`이 status_line에 없다: {line}"
+            );
+        }
+        // TUI 경로에 net이 실제로 있는지 — 위 루프는 segments가 비어도 공허하게 통과한다.
+        assert!(
+            segs.iter().any(|(l, _)| l.starts_with("net ")),
+            "status_segments에 net 세그먼트가 없다: {segs:?}"
+        );
+        assert!(
+            segs.iter().any(|(l, _)| l.starts_with("io ")),
+            "status_segments에 io 세그먼트가 없다: {segs:?}"
+        );
     }
 
     // 테스트 전용 헬퍼 — 필드를 다 실어 나르다 보니 인자가 많다. 로직이 아니라
@@ -1416,12 +1671,22 @@ mod tests {
         let g = 1024 * 1024 * 1024;
         let m = metric(1.0, 99.0, 8, 4 * g, 16 * g, 0, 0, 50 * g, 200 * g);
         let segs = m.status_segments();
-        // 세그먼트 6개(load/cpu/mem/swap/disk/io), 텍스트는 status_line과 동일 토큰.
+        // 세그먼트 7개(load/cpu/mem/swap/disk/io/net), 텍스트는 status_line과 동일 토큰.
         // exporter는 기본 Disabled라 세그먼트를 만들지 않는다(안 켠 기능은 표시하지 않는다).
-        assert_eq!(segs.len(), 6);
+        assert_eq!(segs.len(), 7);
         assert!(segs[1].0.starts_with("cpu "));
         assert_eq!(segs[1].1, Severity::Crit); // cpu 99% >= 95
         assert_eq!(segs[5].1, Severity::Normal); // io는 임계 없음
+        assert!(segs[5].0.starts_with("io "));
+        assert!(segs[6].0.starts_with("net ")); // net도 처리량이라 임계 없음
+        assert_eq!(segs[6].1, Severity::Normal);
+
+        // `SEG_*`(trend_spark 부착 위치)가 실제 세그먼트 순서와 맞는지 — 목록 중간에 세그먼트를
+        // 끼우면 sparkline이 엉뚱한 지표에 붙는다. net을 io 뒤에 둔 이유가 이것이고, 다음 사람이
+        // 앞쪽에 추가하면 여기서 걸린다.
+        assert!(segs[SEG_CPU].0.starts_with("cpu "));
+        assert!(segs[SEG_MEM].0.starts_with("mem "));
+        assert!(segs[SEG_DISK].0.starts_with("disk "));
     }
 
     /// exporter 상태별로 status bar에 무엇이 뜨는지 고정한다. 이 표시가 곧 "내 데이터가
@@ -1435,33 +1700,43 @@ mod tests {
             m
         };
 
-        // 꺼져 있으면 아예 표시하지 않는다.
-        assert_eq!(with(ExporterState::Disabled).status_segments().len(), 6);
+        // exporter는 언제나 **맨 뒤**라서 `last()`로 집는다 — 시스템 지표 세그먼트가 늘어도
+        // (net 추가처럼) 이 테스트가 인덱스 때문에 깨지지 않는다.
+        let tail = |st: ExporterState| with(st).status_segments().pop().unwrap();
+
+        // 꺼져 있으면 아예 표시하지 않는다 — 켠 경우보다 세그먼트가 정확히 하나 적다.
+        let off = with(ExporterState::Disabled).status_segments();
+        assert_eq!(
+            off.len() + 1,
+            with(ExporterState::Ok).status_segments().len()
+        );
+        assert!(!off.iter().any(|(l, _)| l.starts_with("otlp")));
 
         // 정상 — 조용한 Normal 표시.
-        let segs = with(ExporterState::Ok).status_segments();
-        assert_eq!(segs.len(), 7);
-        assert_eq!(segs[6], ("otlp ●".to_string(), Severity::Normal));
+        assert_eq!(
+            tail(ExporterState::Ok),
+            ("otlp ●".to_string(), Severity::Normal)
+        );
 
         // aicd가 없으면 데이터가 전혀 나가지 않는다 — 가장 강한 경고.
-        let segs = with(ExporterState::DaemonDown).status_segments();
-        assert_eq!(segs[6].1, Severity::Crit);
-        assert!(segs[6].0.contains("aicd off"));
+        let seg = tail(ExporterState::DaemonDown);
+        assert_eq!(seg.1, Severity::Crit);
+        assert!(seg.0.contains("aicd off"));
 
         // 밀림 — collector에 못 닿는 중(아직 유실은 아님).
-        let segs = with(ExporterState::Backlogged(12)).status_segments();
-        assert_eq!(segs[6].1, Severity::Warn);
-        assert!(segs[6].0.contains("12"));
+        let seg = tail(ExporterState::Backlogged(12));
+        assert_eq!(seg.1, Severity::Warn);
+        assert!(seg.0.contains("12"));
 
         // 유실 — 이미 버려진 데이터가 있다. 밀림보다 심각.
-        let segs = with(ExporterState::Dropping(3)).status_segments();
-        assert_eq!(segs[6].1, Severity::Crit);
-        assert!(segs[6].0.contains('3'));
+        let seg = tail(ExporterState::Dropping(3));
+        assert_eq!(seg.1, Severity::Crit);
+        assert!(seg.0.contains('3'));
 
         // agent off — chat 이벤트가 버려지는 중. 표면화(Warn)하되, 의도적 비활성일 수 있어 Crit 아님.
-        let segs = with(ExporterState::AgentOff).status_segments();
-        assert_eq!(segs[6].1, Severity::Warn);
-        assert!(segs[6].0.contains("agent off"), "라벨: {}", segs[6].0);
+        let seg = tail(ExporterState::AgentOff);
+        assert_eq!(seg.1, Severity::Warn);
+        assert!(seg.0.contains("agent off"), "라벨: {}", seg.0);
     }
 
     #[test]

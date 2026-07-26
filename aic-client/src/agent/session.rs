@@ -160,6 +160,23 @@ impl ChatOut {
         }
     }
 
+    /// 모델명을 status bar에 전달한다(세션당 1회). `ctx` 비율의 분모를 TUI가 여기서 얻는다 —
+    /// 모델을 모르면 한계도 모르므로 `ctx`는 비율 대신 추정 토큰수로 폴백한다.
+    async fn send_model(&self, model: &str) {
+        if let ChatOut::Tui(tx) = self {
+            let _ = tx
+                .send(super::chat_tui::OutMsg::Model(model.to_string()))
+                .await;
+        }
+    }
+
+    /// 직전 턴 소요 시간을 status bar에 전달한다. Direct는 표시 자리가 없어 no-op.
+    async fn send_turn_done(&self, elapsed: std::time::Duration) {
+        if let ChatOut::Tui(tx) = self {
+            let _ = tx.send(super::chat_tui::OutMsg::TurnDone(elapsed)).await;
+        }
+    }
+
     /// proactive 알림 레인(C7)을 켜고 끈다. Tui면 `OutMsg::AlertsArmed`로 ChatLoop의 alert tracker를
     /// 토글한다. Direct는 alert 레인이 없으므로 no-op(호출부가 안내 note를 따로 출력).
     async fn alerts_armed(&self, on: bool) {
@@ -582,6 +599,11 @@ impl AgentSession {
 
         // 시작 시 1회 컨텍스트 토큰 표시(preface seed 후 — 보통 system 프롬프트만 있는 상태).
         self.out.send_ctx(self.estimate_tokens()).await;
+        // 모델명도 1회. status bar가 `ctx N%`의 분모(모델별 컨텍스트 창)를 여기서 찾는다 — provider가
+        // 미등록이면 `self.model`이 None이라 아무것도 보내지 않고, ctx는 추정 토큰수로 폴백한다.
+        if let Some(model) = self.model.clone() {
+            self.out.send_model(&model).await;
+        }
 
         loop {
             let line = match handle.recv_line().await {
@@ -620,10 +642,16 @@ impl AgentSession {
             // reqwest/도구 await가 중단된다. 직전 turn 종료와 동시에 눌린 잔여 신호는 drain으로 제거.
             handle.drain_cancel();
             let mark = self.history.len();
+            let started = std::time::Instant::now();
             let outcome = tokio::select! {
                 r = self.run_turn() => Some(r),
                 _ = handle.recv_cancel() => None,
             };
+            // **완료된 턴만** 시간을 보고한다 — 취소(None)는 사용자가 끊은 것이지 응답이 느린 게
+            // 아니다. Ctrl+C를 빨리 누를수록 "빨라 보이는" 거짓 숫자가 남지 않게 한다.
+            if outcome.is_some() {
+                self.out.send_turn_done(started.elapsed()).await;
+            }
             match outcome {
                 Some(Ok(())) => {}
                 Some(Err(e)) => self.out.note(&format!("LLM 요청 실패: {e}")).await,
@@ -1246,7 +1274,10 @@ impl AgentSession {
         // 데드라인은 dispatcher가 실제 HTTP 요청에 거는 값과 같게 맞추고, 하한만 여기서 지킨다.
         // 상수를 그대로 씌우면 바깥이 항상 더 짧아 이겨서, 사용자가 config로 올린 여유가 이
         // 경로에만 반영되지 않는다(추론 모델처럼 first-token이 느린 조합에서 fallback으로 드러난다).
-        let deadline = self.dispatcher.request_timeout().max(LOCAL_ANALYZE_MIN_TIMEOUT);
+        let deadline = self
+            .dispatcher
+            .request_timeout()
+            .max(LOCAL_ANALYZE_MIN_TIMEOUT);
         let result = tokio::time::timeout(deadline, self.dispatcher.send(prompt)).await;
         self.out.spin_stop().await;
 
