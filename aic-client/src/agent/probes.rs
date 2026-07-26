@@ -127,6 +127,24 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(17),
     },
     ProbeSpec {
+        id: "proc_groups",
+        category: "process",
+        tags: &["process", "cpu", "memory", "load"],
+        description: "이름별 프로세스 그룹 상위 N(개수·cpu 합·rss 합)",
+        // 다른 process 섹션이 **개체**를 나열하는 것과 달리 이건 **무리**를 센다. `ps`로 상위를 뽑으면
+        // 같은 이름 21개가 각각 2%로 흩어져 아무것도 아닌 것처럼 보이지만, 묶으면 40%로 목록 맨 위에
+        // 온다(실측: load 16.68 / 12코어 호스트의 실제 범인). 개체 최댓값만 보는 status bar의
+        // `top_mem_proc`이 답할 수 없던 질문이다.
+        //
+        // shell이 아니라 aic 서브커맨드인 이유: cpu%는 refresh 사이의 델타라 간격이 필요하고,
+        // 유저랜드 스레드 제외 판정(`is_countable`)을 `ps` 파이프라인으로 표현할 수 없다.
+        // proc_fd_top과 같이 risk_guard가 exact argv로 Safe 판정하므로 인자를 붙이면 즉시 막힌다.
+        linux_command: "aic proc-groups",
+        macos_command: "aic proc-groups",
+        // 헤더 1 + 최대 10행 + 안내 문구 여유.
+        max_lines: Some(12),
+    },
+    ProbeSpec {
         id: "proc_changes",
         category: "process",
         tags: &["process", "lifecycle", "churn", "change"],

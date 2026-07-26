@@ -368,6 +368,13 @@ enum Commands {
     /// `proc-fd-top`과 같은 이유로 **인자를 받지 않는다**(risk_guard가 exact argv로만 Safe 판정).
     #[command(name = "proc-changes", hide = true)]
     ProcChanges,
+    /// (internal) 이름별 프로세스 그룹 상위 N — `/local`의 `proc_groups` 섹션이 호출한다.
+    /// cpu%가 두 번 refresh 사이의 델타라 200ms 간격이 필요하고, 유저랜드 스레드 제외 판정을
+    /// 셸 파이프라인으로 표현할 수 없어 계산을 이 leaf로 뺐다(`agent::proc_groups` doc 참고).
+    ///
+    /// `proc-fd-top`과 같은 이유로 **인자를 받지 않는다**(risk_guard가 exact argv로만 Safe 판정).
+    #[command(name = "proc-groups", hide = true)]
+    ProcGroups,
     /// 명시적 capture wrapper (Phase 3.3) — hook mode에서도 정확한 출력을 잡고 싶을 때.
     ///
     /// `aic run -- <cmd...>`로 실행하면 wrapper가 stdout/stderr tail을 캡처하고
@@ -1368,6 +1375,7 @@ async fn main() {
         Some(Commands::HookEvent { op }) => handle_hook_event(op).await,
         Some(Commands::ProcFdTop) => print!("{}", aic_client::agent::proc_fd::render()),
         Some(Commands::ProcChanges) => print!("{}", aic_client::agent::proc_changes::render()),
+        Some(Commands::ProcGroups) => print!("{}", aic_client::agent::proc_groups::render()),
         Some(Commands::Run { cmd }) => handle_run(cmd, cli.provider).await,
         Some(Commands::Chat {
             prompt,
