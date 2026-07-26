@@ -1237,7 +1237,7 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         // `sudo aic proc-fd-top`은 호출부(`classify_single`)의 sudo floor가 NeedsConfirm으로
         // 끌어올리므로 여기서 따로 막지 않는다. 잔여 리스크: `head`는 base_name을 거치므로 PATH상의
         // 다른 `aic` 바이너리도 매칭된다 — probe 명령이 고정 상수라 실사용 경로에서는 발생하지 않는다.
-        if matches!(args, ["proc-fd-top"] | ["proc-changes"]) {
+        if matches!(args, ["proc-fd-top"] | ["proc-changes"] | ["proc-groups"]) {
             return Some(RiskAssessment::safe("aic.selfprobe"));
         }
         return None;
@@ -1570,8 +1570,11 @@ mod tests {
     #[test]
     fn aic_self_probe_is_safe_by_exact_argv() {
         assert_eq!(lvl("aic proc-fd-top"), RiskLevel::Safe);
+        assert_eq!(lvl("aic proc-groups"), RiskLevel::Safe);
         // base_name을 거치므로 절대경로 형태도 같은 판정이어야 한다.
         assert_eq!(lvl("/usr/local/bin/aic proc-fd-top"), RiskLevel::Safe);
+        // 인자가 붙으면 exact argv 매치가 깨져 Safe가 아니다(allowlist가 넓어지지 않는다).
+        assert_ne!(lvl("aic proc-groups --json"), RiskLevel::Safe);
     }
 
     /// **carve-out이 새면 안 된다.** `aic`를 head allowlist에 넣었다면 아래가 전부 Safe가 되는데,

@@ -41,6 +41,9 @@ pub mod proc_changes;
 pub mod proc_fd;
 // RCA 강화 ③: baseline 스냅샷 대비 프로세스 rss 성장 리더보드(결정적 범인 후보 좁히기).
 pub(crate) mod proc_delta;
+// 이름별 프로세스 그룹 집계(개수·cpu 합·rss 합) — 개체 최댓값 하나로는 안 보이는 "무리"를 드러낸다.
+// probe가 `aic proc-groups`로 호출하므로 main.rs(외부 크레이트 경로)에서 접근 가능해야 해 pub.
+pub mod proc_groups;
 pub mod run_command;
 pub mod sandbox;
 pub mod session;
