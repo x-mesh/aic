@@ -28,6 +28,7 @@ pub mod snapshot_store;
 pub mod snapshot_timer;
 pub mod spinner;
 pub mod streaming;
+pub mod term_restore;
 pub mod top;
 pub mod uds_client;
 pub mod update;

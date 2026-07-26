@@ -366,6 +366,11 @@ fn slash_keybindings() -> reedline::Keybindings {
 fn build_reedline() -> anyhow::Result<reedline::Reedline> {
     use reedline::{Emacs, FileBackedHistory, Reedline};
 
+    // reedline도 `read_line` 동안 raw mode를 켠다. 그 사이 외부 시그널로 죽으면 raw가 그대로
+    // 남아 셸의 이후 출력이 계단식으로 밀리므로, 엔진을 만들기 전에(=raw 진입 전에) 복원
+    // 가드를 설치한다. 자세한 배경은 [`crate::term_restore`] 모듈 문서 참고.
+    crate::term_restore::install();
+
     let path = chat_history_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
