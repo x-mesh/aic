@@ -175,8 +175,13 @@ pub(crate) enum OutMsg {
     SpinStart(String),
     /// thinking 표시 종료 → 입력 줄 복귀.
     SpinStop,
-    /// 컨텍스트 토큰 추정치(history 문자 수/4) → status bar 끝에 ` · ctx ~Nk` 표시.
+    /// 컨텍스트 토큰 추정치(history 문자 수/4) → status bar `ctx N%`(모델 한계를 알 때) 또는 `ctx ~Nk`.
     Ctx(usize),
+    /// 현재 모델명 → status bar 세션 세그먼트. 세션당 1회(provider가 등록된 경우에만 온다).
+    /// `ctx` 비율의 분모(모델별 컨텍스트 창)를 여기서 찾는다.
+    Model(String),
+    /// 직전 턴 소요 시간 → status bar `3.2s`. 응답이 느려지는 걸 알아채는 유일한 표시다.
+    TurnDone(std::time::Duration),
     /// NeedsConfirm 명령 확인 요청. prompt(예: `⚠ … 실행? [y/N]`)를 입력 줄에 띄우고,
     /// y/Y면 true·그 외 키(n/N/Esc/Enter/…)면 false를 oneshot으로 회신한다(기본 거부).
     Confirm(String, tokio::sync::oneshot::Sender<bool>),
@@ -1047,26 +1052,107 @@ fn highlight_log_lines(text: &Text<'static>, a: usize, b: usize) -> Text<'static
     t
 }
 
-/// status 문자열 끝에 컨텍스트 토큰 추정치를 ` · ctx ~Nk`로 덧붙인다(0이면 생략). 순수 함수.
-/// N = tokens/1000(1000 단위 k 절삭). `~`로 추정 표기(provider usage가 아닌 문자수/4 추정).
-fn status_with_ctx(status: &str, ctx_tokens: usize) -> String {
-    match ctx_label(ctx_tokens) {
-        None => status.to_string(),
-        Some(ctx) => format!("{status} · ctx {ctx}"),
+/// status bar **좌측(세션)** 정보 — "나와 에이전트는 지금 어떤 상태인가"에 대한 답.
+///
+/// 우측 시스템 지표와 갱신 주기가 다르다: `model`은 세션당 1회, `last_turn`은 턴마다, `ctx_tokens`는
+/// 메시지마다. 그래서 sampler가 미는 `SysMetrics`와 섞지 않고 별도로 들고 있다.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct SessionInfo {
+    /// 현재 대화 중인 모델명(provider가 등록된 경우에만). `ctx` 비율의 분모를 여기서 찾는다.
+    model: Option<String>,
+    /// 컨텍스트 토큰 **추정치**(history 문자수/4 — provider usage가 아니다).
+    ctx_tokens: usize,
+    /// 직전 턴이 걸린 시간. 응답이 느려지는 걸 눈으로 알아채는 유일한 지표다.
+    last_turn: Option<std::time::Duration>,
+}
+
+/// ctx 사용률 경고선 — 한계를 **아는 모델일 때만** 판정한다(모르면 비율 자체가 없다).
+const CTX_WARN_PCT: usize = 70;
+const CTX_CRIT_PCT: usize = 90;
+
+impl SessionInfo {
+    /// 세션 세그먼트 (라벨, 단계) 목록 — 시스템 세그먼트와 같은 타입이라 그대로 이어 붙일 수 있다.
+    /// 값이 없는 항목은 아예 만들지 않는다(빈 자리를 차지하지 않는다).
+    fn segments(&self) -> Vec<(String, Severity)> {
+        let mut segs = Vec::new();
+        if let Some(model) = &self.model {
+            segs.push((model.clone(), Severity::Normal));
+        }
+        if let Some((label, sev)) = self.ctx_segment() {
+            segs.push((label, sev));
+        }
+        if let Some(d) = self.last_turn {
+            segs.push((format!("{:.1}s", d.as_secs_f64()), Severity::Normal));
+        }
+        segs
+    }
+
+    /// ctx 세그먼트 — 모델 한계를 알면 **비율**(`ctx 6%`), 모르면 추정 토큰수(`ctx ~12k`).
+    ///
+    /// `12k`만으로는 여유인지 알 수 없고 `6%`는 그 자체로 답이다. 다만 한계를 모르는 모델에서
+    /// 비율을 지어내면 그럴싸하게 틀린 값이 되므로(`cpu --%`와 같은 원칙) 그때는 추정치를 그대로 낸다.
+    /// 한계를 모르면 단계 판정도 하지 않는다 — 기준이 없는 값으로 경보하지 않는다.
+    fn ctx_segment(&self) -> Option<(String, Severity)> {
+        if self.ctx_tokens == 0 {
+            return None;
+        }
+        let limit = self.model.as_deref().and_then(ctx_limit_for);
+        match limit {
+            Some(lim) if lim > 0 => {
+                let pct = (self.ctx_tokens * 100 / lim).min(100);
+                let sev = if pct >= CTX_CRIT_PCT {
+                    Severity::Crit
+                } else if pct >= CTX_WARN_PCT {
+                    Severity::Warn
+                } else {
+                    Severity::Normal
+                };
+                Some((format!("ctx {pct}%"), sev))
+            }
+            _ => {
+                let n = if self.ctx_tokens >= 1000 {
+                    format!("~{}k", self.ctx_tokens / 1000)
+                } else {
+                    format!("~{}", self.ctx_tokens)
+                };
+                Some((format!("ctx {n}"), Severity::Normal))
+            }
+        }
     }
 }
 
-/// ctx 토큰 추정치 라벨(`~Nk`/`~N`). 0이면 None. 1000 미만은 정확한 수, 이상은 k 절삭.
-/// `status_with_ctx`(plain)와 `build_status_line`(colored)이 공유한다.
-fn ctx_label(ctx_tokens: usize) -> Option<String> {
-    if ctx_tokens == 0 {
-        return None;
+/// 모델별 컨텍스트 창 크기(토큰). `ctx N%`의 분모다.
+///
+/// **확실한 것만 넣는다.** 모르는 모델에 그럴듯한 기본값을 주면 비율이 조용히 틀리고, 사용자는 그걸
+/// 근거로 대화를 자르거나 이어간다 — 틀린 비율은 정직한 토큰수보다 나쁘다. 미등록 모델은 `None`이
+/// 되어 `ctx ~12k` 형태로 폴백한다. OpenAI 호환 provider에는 로컬 모델(ollama 등)이 임의 이름으로
+/// 들어오므로 폴백이 기본 경로에 가깝다.
+fn ctx_limit_for(model: &str) -> Option<usize> {
+    let m = model.to_ascii_lowercase();
+    // Claude 계열(3/4/5, haiku 포함) — 200k.
+    if m.starts_with("claude-") {
+        return Some(200_000);
     }
-    Some(if ctx_tokens >= 1000 {
-        format!("~{}k", ctx_tokens / 1000)
-    } else {
-        format!("~{ctx_tokens}")
-    })
+    // OpenAI gpt-4 계열(4o/4.1/4-turbo) — 128k. 그 밖의 gpt-*는 창 크기가 제각각이라 넣지 않는다.
+    if m.starts_with("gpt-4") {
+        return Some(128_000);
+    }
+    None
+}
+
+/// status 문자열 끝에 세션 세그먼트를 ` · `로 덧붙인다(없으면 그대로). 순수 함수.
+/// 색이 없는 plain 경로(Direct status bar 등)용 — 컬러 경로는 `build_status_line`이 쓴다.
+fn status_with_ctx(status: &str, info: &SessionInfo) -> String {
+    let segs = info.segments();
+    if segs.is_empty() {
+        return status.to_string();
+    }
+    let tail = segs
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>()
+        .join(" · ");
+    format!("{status} · {tail}")
 }
 
 /// status bar 색: 정상=dim · warn=주황 · crit=빨강(굵게). 단일 출처(named).
@@ -1110,30 +1196,100 @@ fn format_webhook_alert_line(a: &WebhookAlert, hms: &str) -> String {
 /// 시스템 지표 세그먼트를 단계별 색(정상 dim/warn 주황/crit 빨강)으로 칠한 status bar 한 줄을 만든다.
 /// 구분선(` · `)·선두 `· `·ctx 접미는 dim. `recording`이면 선두에 빨강 `● REC`를 붙여 자동 기록 활성을
 /// 한눈에 보인다. 순수 함수(TestBackend로 테스트). 임계 위반 자원만 눈에 띈다.
+/// 세그먼트 사이 구분자. 폭 계산과 렌더가 **같은 문자열**을 써야 예측이 어긋나지 않는다.
+const SEG_SEP: &str = " · ";
+
+/// 세그먼트 목록을 한 줄로 폈을 때의 표시 폭(구분자 포함). 순수 함수.
+///
+/// 구분자 폭도 **byte가 아닌 display width**로 잰다 — `" · "`는 4바이트지만 화면에서는 3칸이다.
+/// `.len()`을 쓰면 세그먼트 하나당 1칸씩 과대 계산돼 우측 정렬이 줄 끝에 못 닿고, 세그먼트를 필요
+/// 이상으로 버린다.
+fn seg_width(segs: &[(String, Severity)]) -> usize {
+    if segs.is_empty() {
+        return 0;
+    }
+    let text: usize = segs
+        .iter()
+        .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
+        .sum();
+    text + UnicodeWidthStr::width(SEG_SEP) * (segs.len() - 1)
+}
+
+/// 세그먼트를 `budget` 폭에 맞춘다 — **심각도가 순서를 이긴다**. 순수 함수.
+///
+/// 버리는 순서는 목록의 **뒤에서부터**다. `status_segments`가 load·cpu·mem을 앞에, io·net을 뒤에
+/// 두므로 이 규칙만으로 "덜 중요한 것부터"가 성립한다(별도 우선순위 표를 두면 세그먼트가 추가될 때마다
+/// 두 곳을 고쳐야 하고, 그 어긋남이 곧 버그다 — `SEG_*` 인덱스에서 이미 겪었다).
+///
+/// 단 **Warn 이상인 세그먼트는 먼저 버리지 않는다.** 좁은 화면일수록 문제만 남아야지, 문제부터
+/// 사라지면 안 된다. 그래도 안 들어가면 그때는 뒤에서부터(최후 수단).
+fn fit_segments(segs: &[(String, Severity)], budget: usize) -> Vec<(String, Severity)> {
+    let mut kept = segs.to_vec();
+    // 1차: 정상 세그먼트를 뒤에서부터 덜어낸다.
+    while seg_width(&kept) > budget {
+        let Some(pos) = kept.iter().rposition(|(_, s)| *s == Severity::Normal) else {
+            break;
+        };
+        kept.remove(pos);
+    }
+    // 2차: 전부 경보인데도 넘치면 어쩔 수 없이 뒤에서부터. 최소 1개는 남긴다.
+    while seg_width(&kept) > budget && kept.len() > 1 {
+        kept.pop();
+    }
+    // 하나도 못 담는 폭이면 빈 줄이 낫다(잘린 라벨은 오독을 부른다).
+    if kept.len() == 1 && seg_width(&kept) > budget {
+        kept.clear();
+    }
+    kept
+}
+
 fn build_status_line(
     segs: &[(String, Severity)],
-    ctx_tokens: usize,
+    info: &SessionInfo,
     recording: bool,
+    width: u16,
 ) -> Line<'static> {
     let dim = sev_style(Severity::Normal);
-    let mut spans: Vec<Span<'static>> = vec![Span::styled("· ", dim)];
-    let mut first = true;
+    let total = width.max(1) as usize;
+
+    // 좌측 = 세션("나와 에이전트"). REC는 기록 중이라는 가장 강한 상태라 맨 앞에 둔다.
+    let mut left: Vec<(String, Severity)> = Vec::new();
     if recording {
-        spans.push(Span::styled(
-            "● REC",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ));
-        first = false;
+        left.push(("● REC".to_string(), Severity::Crit));
     }
-    for (text, sev) in segs.iter() {
-        if !first {
-            spans.push(Span::styled(" · ", dim));
+    left.extend(info.segments());
+
+    // 좌측을 먼저 확보한다 — model·ctx는 폭이 아무리 좁아도 마지막까지 남아야 하는 값이다.
+    // (좌측 목록도 model→ctx→turn 순이라 뒤에서부터 버리면 turn이 먼저 빠진다.)
+    if seg_width(&left) > total {
+        left = fit_segments(&left, total);
+    }
+    let left_w = seg_width(&left);
+    // 우측 = 호스트 지표. 남은 폭(최소 간격 1칸 제외)에 맞춰 접는다.
+    let right = fit_segments(segs, total.saturating_sub(left_w + 1));
+    let right_w = seg_width(&right);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let push_segs = |spans: &mut Vec<Span<'static>>, segs: &[(String, Severity)]| {
+        for (i, (text, sev)) in segs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(SEG_SEP, dim));
+            }
+            spans.push(Span::styled(text.clone(), sev_style(*sev)));
         }
-        first = false;
-        spans.push(Span::styled(text.clone(), sev_style(*sev)));
-    }
-    if let Some(ctx) = ctx_label(ctx_tokens) {
-        spans.push(Span::styled(format!(" · ctx {ctx}"), dim));
+    };
+
+    if left.is_empty() {
+        // 세션 정보가 아직 없으면(모델 미등록·첫 턴 전) 예전처럼 선두 마커 + 왼쪽 정렬.
+        // 좌측이 빈 채로 우측만 오른쪽에 붙이면 줄 왼쪽이 통째로 비어 어색하다.
+        spans.push(Span::styled("· ", dim));
+        push_segs(&mut spans, &right);
+    } else {
+        push_segs(&mut spans, &left);
+        // 좌우 사이를 공백으로 채워 호스트 지표를 오른쪽 끝에 정렬한다.
+        let gap = total.saturating_sub(left_w + right_w).max(1);
+        spans.push(Span::raw(" ".repeat(gap)));
+        push_segs(&mut spans, &right);
     }
     Line::from(spans)
 }
@@ -1432,8 +1588,8 @@ async fn chat_loop(
     let mut draft = String::new();
     // slash 자동완성 popup 선택 인덱스(후보는 매 루프 입력에서 재계산).
     let mut popup_sel: usize = 0;
-    // 컨텍스트 토큰 추정치(session이 OutMsg::Ctx로 push). status bar 끝에 ` · ctx ~Nk`로 표시.
-    let mut ctx_tokens: usize = 0;
+    // status bar 좌측(세션) 정보 — session이 OutMsg::{Ctx,Model,TurnDone}으로 밀어넣는다.
+    let mut session_info = SessionInfo::default();
     // 로그 검색 모드(Ctrl+F): Some=검색 중(쿼리), hits=매칭 log 인덱스, idx=현재 hit.
     let mut search: Option<String> = None;
     let mut search_hits: Vec<usize> = Vec::new();
@@ -1488,16 +1644,17 @@ async fn chat_loop(
             scroll = scroll.min(max);
         }
         let draw_scroll = scroll;
-        // status 끝에 컨텍스트 토큰 추정치를 덧붙인다(0이면 생략).
+        // status 끝에 세션 세그먼트(model·ctx·turn)를 덧붙인다(값이 없는 항목은 생략).
         // 지표가 있으면 단계별 색(주황/빨강) Line, 없으면(첫 sample 전) help 텍스트를 plain dim으로.
         let status_line: Line = match &status_segs {
             Some(segs) => build_status_line(
                 segs,
-                ctx_tokens,
+                &session_info,
                 recording.load(std::sync::atomic::Ordering::Relaxed),
+                area.width,
             ),
             None => Line::from(Span::styled(
-                status_with_ctx(&status, ctx_tokens),
+                status_with_ctx(&status, &session_info),
                 sev_style(Severity::Normal),
             )),
         };
@@ -2080,7 +2237,13 @@ async fn chat_loop(
                         spin = None;
                     }
                     Some(OutMsg::Ctx(n)) => {
-                        ctx_tokens = n;
+                        session_info.ctx_tokens = n;
+                    }
+                    Some(OutMsg::Model(name)) => {
+                        session_info.model = Some(name);
+                    }
+                    Some(OutMsg::TurnDone(d)) => {
+                        session_info.last_turn = Some(d);
                     }
                     Some(OutMsg::Confirm(prompt, tx)) => {
                         // 확인 모드 진입 — 입력 줄을 prompt로 대체하고 다음 키 입력을 y/n으로 소비한다.
@@ -2583,17 +2746,97 @@ mod tests {
         assert!(row1.contains("load 1.0"), "status row(아래): {row1:?}");
     }
 
+    /// ctx 토큰만 담은 SessionInfo(모델 미상) — 한계를 모르니 추정 토큰수로 폴백하는 경로.
+    fn sinfo(tokens: usize) -> super::SessionInfo {
+        super::SessionInfo {
+            ctx_tokens: tokens,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn status_with_ctx_appends_token_estimate() {
         // 0이면 status 그대로(표시 생략), >0이면 ` · ctx ~Nk`(1000 단위 절삭).
-        assert_eq!(super::status_with_ctx("· load 1.0", 0), "· load 1.0");
         assert_eq!(
-            super::status_with_ctx("· load", 12_345),
+            super::status_with_ctx("· load 1.0", &sinfo(0)),
+            "· load 1.0"
+        );
+        assert_eq!(
+            super::status_with_ctx("· load", &sinfo(12_345)),
             "· load · ctx ~12k"
         );
         // 1000 미만은 정확한 수(~512), 1000 이상은 ~Nk.
-        assert_eq!(super::status_with_ctx("s", 999), "s · ctx ~999");
-        assert_eq!(super::status_with_ctx("s", 1000), "s · ctx ~1k");
+        assert_eq!(super::status_with_ctx("s", &sinfo(999)), "s · ctx ~999");
+        assert_eq!(super::status_with_ctx("s", &sinfo(1000)), "s · ctx ~1k");
+    }
+
+    /// 모델 한계를 알면 ctx가 **비율**이 되고, 모르면 추정 토큰수로 폴백한다.
+    ///
+    /// 이 폴백이 핵심이다 — 모르는 모델(로컬 ollama 등)에 그럴듯한 기본 한계를 씌우면 비율이 조용히
+    /// 틀리고, 사용자는 그 숫자를 보고 대화를 자를지 말지 정한다. `cpu --%`와 같은 원칙이다.
+    #[test]
+    fn ctx_shows_percent_only_when_model_limit_is_known() {
+        let known = super::SessionInfo {
+            model: Some("claude-sonnet-5".to_string()),
+            ctx_tokens: 12_000,
+            ..Default::default()
+        };
+        // 12k / 200k = 6%.
+        assert_eq!(
+            super::status_with_ctx("s", &known),
+            "s · claude-sonnet-5 · ctx 6%"
+        );
+
+        let unknown = super::SessionInfo {
+            model: Some("llama3.2:custom-local".to_string()),
+            ctx_tokens: 12_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::status_with_ctx("s", &unknown),
+            "s · llama3.2:custom-local · ctx ~12k"
+        );
+    }
+
+    #[test]
+    fn ctx_severity_rises_with_usage() {
+        use super::Severity;
+        let at = |tokens: usize| {
+            super::SessionInfo {
+                model: Some("claude-opus-5".to_string()),
+                ctx_tokens: tokens,
+                ..Default::default()
+            }
+            .segments()
+            .into_iter()
+            .find(|(l, _)| l.starts_with("ctx "))
+            .expect("ctx 세그먼트")
+        };
+        assert_eq!(at(20_000).1, Severity::Normal); // 10%
+        assert_eq!(at(150_000).1, Severity::Warn); // 75% >= 70
+        assert_eq!(at(190_000).1, Severity::Crit); // 95% >= 90
+
+        // 한계를 모르는 모델은 단계 판정도 하지 않는다 — 기준 없는 값으로 경보하지 않는다.
+        let unknown = super::SessionInfo {
+            model: Some("mystery-model".to_string()),
+            ctx_tokens: 999_999,
+            ..Default::default()
+        };
+        assert_eq!(unknown.segments()[1].1, Severity::Normal);
+    }
+
+    #[test]
+    fn session_segments_skip_missing_values() {
+        // 값이 없는 항목은 빈 자리를 차지하지 않는다(모델 미등록·첫 턴 전).
+        assert!(super::SessionInfo::default().segments().is_empty());
+
+        let only_turn = super::SessionInfo {
+            last_turn: Some(std::time::Duration::from_millis(3_240)),
+            ..Default::default()
+        };
+        let segs = only_turn.segments();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0, "3.2s");
     }
 
     #[test]
@@ -2641,6 +2884,105 @@ mod tests {
         assert!(!line2.contains("()"));
     }
 
+    /// 세션은 왼쪽, 호스트 지표는 오른쪽 끝에 정렬된다.
+    #[test]
+    fn status_line_splits_session_left_and_host_right() {
+        use super::Severity::Normal;
+        let segs = vec![("cpu 45%".to_string(), Normal)];
+        let info = super::SessionInfo {
+            model: Some("claude-sonnet-5".to_string()),
+            ctx_tokens: 12_000,
+            last_turn: Some(std::time::Duration::from_millis(3_200)),
+        };
+        let line = super::build_status_line(&segs, &info, false, 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+
+        // 좌측이 먼저, 우측이 나중 — 그리고 폭을 정확히 채운다(오른쪽 끝 정렬).
+        let left_end = text.find("3.2s").expect("turn") + "3.2s".len();
+        let right_start = text.find("cpu 45%").expect("cpu");
+        assert!(left_end < right_start, "좌/우 순서: {text:?}");
+        assert_eq!(
+            super::UnicodeWidthStr::width(text.as_str()),
+            80,
+            "우측이 오른쪽 끝에 붙어야 한다: {text:?}"
+        );
+    }
+
+    /// **심각도가 드롭 순서를 이긴다** — 좁은 화면일수록 문제만 남는다.
+    ///
+    /// 이 규칙이 없으면 폭이 줄 때 뒤쪽(io·net)부터 사라지는 건 맞지만, 경보 중인 세그먼트가 그
+    /// 뒤에 있으면 같이 사라진다. 좁은 화면에서 문제부터 없어지는 건 정확히 반대로 가는 동작이다.
+    #[test]
+    fn narrow_width_drops_normal_first_and_keeps_alerts() {
+        use super::Severity::{Crit, Normal};
+        let segs = vec![
+            ("load 0.20 (0.02×)".to_string(), Normal),
+            ("cpu 12%".to_string(), Normal),
+            ("mem 30%".to_string(), Normal),
+            ("io 1.0M/s".to_string(), Normal),
+            // 목록 **맨 뒤**의 경보 — 드롭 순서(뒤에서부터)대로면 가장 먼저 사라질 자리다.
+            ("disk 2.0G · 4h→crit".to_string(), Crit),
+        ];
+        let wide: String =
+            super::build_status_line(&segs, &super::SessionInfo::default(), false, 200)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+        assert!(wide.contains("io 1.0M/s") && wide.contains("4h→crit"));
+
+        let narrow: String =
+            super::build_status_line(&segs, &super::SessionInfo::default(), false, 30)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+        assert!(
+            narrow.contains("4h→crit"),
+            "Crit 세그먼트가 살아남아야 한다: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("io 1.0M/s"),
+            "정상 세그먼트부터 버려야 한다: {narrow:?}"
+        );
+    }
+
+    /// 좌측(model·ctx)은 폭이 좁아도 마지막까지 남고, turn이 먼저 빠진다.
+    #[test]
+    fn session_keeps_model_and_ctx_when_cramped() {
+        use super::Severity::Normal;
+        let segs = vec![("cpu 45%".to_string(), Normal)];
+        let info = super::SessionInfo {
+            model: Some("claude-sonnet-5".to_string()),
+            ctx_tokens: 12_000,
+            last_turn: Some(std::time::Duration::from_millis(3_200)),
+        };
+        let text: String = super::build_status_line(&segs, &info, false, 26)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("claude-sonnet-5"), "model 불가침: {text:?}");
+        assert!(text.contains("ctx 6%"), "ctx 불가침: {text:?}");
+        assert!(!text.contains("3.2s"), "turn이 먼저 빠져야 한다: {text:?}");
+    }
+
+    #[test]
+    fn fit_segments_respects_budget_and_never_splits_labels() {
+        use super::Severity::Normal;
+        let segs = vec![
+            ("aaaa".to_string(), Normal),
+            ("bbbb".to_string(), Normal),
+            ("cccc".to_string(), Normal),
+        ];
+        // 4 + 3 + 4 = 11 → 두 개까지만.
+        let kept = super::fit_segments(&segs, 11);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(super::seg_width(&kept), 11);
+        // 라벨 하나도 못 담는 폭이면 빈 목록 — 잘린 라벨은 오독을 부른다.
+        assert!(super::fit_segments(&segs, 3).is_empty());
+    }
+
     #[test]
     fn build_status_line_colors_by_severity() {
         use super::Severity::{Crit, Normal, Warn};
@@ -2649,14 +2991,14 @@ mod tests {
             ("cpu 88%".to_string(), Warn),
             ("mem 99%".to_string(), Crit),
         ];
-        let line = super::build_status_line(&segs, 1500, false);
+        let line = super::build_status_line(&segs, &sinfo(1500), false, 200);
         // 텍스트는 status_line과 동일 토큰 + ctx 접미.
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("load 1.0") && text.contains("cpu 88%") && text.contains("mem 99%"));
         assert!(text.contains("ctx ~1k"), "ctx 접미: {text}");
         assert!(!text.contains("REC"), "recording=false면 REC 없음: {text}");
         // recording=true면 선두에 ● REC.
-        let rec = super::build_status_line(&segs, 0, true);
+        let rec = super::build_status_line(&segs, &sinfo(0), true, 200);
         let rtext: String = rec.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             rtext.contains("● REC"),
@@ -2739,7 +3081,7 @@ mod tests {
         // status 끝에 ctx 토큰이 합쳐져 그려지는지(status_line 합성 후 draw_full로).
         let log = Text::from("x");
         let ta = super::textarea_with("hi");
-        let status = super::status_with_ctx("· load", 12_000);
+        let status = super::status_with_ctx("· load", &sinfo(12_000));
         let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
         term.draw(|f| {
             super::draw_full(
@@ -2771,7 +3113,7 @@ mod tests {
             ("load 1.0".to_string(), Normal),
             ("mem 99%".to_string(), Crit),
         ];
-        let status = super::build_status_line(&segs, 0, false);
+        let status = super::build_status_line(&segs, &sinfo(0), false, 200);
         let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
         term.draw(|f| super::draw_full(f, &log, 0, status, &ta, "you ❯ ", &[], 0, None, None))
             .unwrap();
