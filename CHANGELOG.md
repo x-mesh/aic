@@ -4,7 +4,33 @@
 
 ## [Unreleased]
 
-## [0.32.0] - 2026-07-26
+## [0.32.1] - 2026-07-26
+
+### Fixed
+- **비정상 종료 뒤 터미널이 깨지던 문제 — 이제 raw mode를 반드시 되돌린다** — TUI(`aic top`,
+  전면 채팅 TUI, REPL 입력)가 외부 시그널이나 패닉으로 죽으면, 그 뒤 셸에서 실행하는 **모든**
+  명령의 출력이 줄마다 오른쪽으로 밀리는 계단 모양이 됐다:
+
+  ```text
+  line one
+           line two
+                    line three
+  ```
+
+  원인은 raw mode가 끄는 `OPOST`(출력 후처리)다. `OPOST`가 없으면 `\n`에 CR이 붙지 않아 커서가
+  아래로만 가고 맨 왼쪽으로 돌아오지 않는다. 프로세스가 시그널로 죽어도 커널은 termios를 원복해
+  주지 않으므로, **죽는 쪽이 나가면서 직접 되돌려야 한다.**
+
+  이전 시그널 핸들러는 alternate screen과 마우스 모드만 되돌리고 termios는 "복귀한 셸의 line
+  editor가 자체 복원한다"는 가정 아래 일부러 건드리지 않았는데, 그 가정이 틀렸다. zsh는 line
+  editor 진입 시점의 termios를 저장해 두었다가 외부 명령 실행 직전에 되씌운다 — 오염된 상태에서
+  프롬프트가 뜨면 오염된 값이 저장되고, 그 뒤 모든 명령이 그 값을 물려받는다. **프롬프트와 입력만
+  멀쩡해 보여서 원인을 찾기도 어려웠다.**
+
+  이제 raw 진입 **이전** 의 termios를 미리 떠 두고, SIGINT/SIGTERM/SIGHUP/SIGQUIT 핸들러가
+  async-signal-safe한 `tcsetattr`로 그 값을 되쓴다. 패닉 훅도 함께 설치한다. `aic top`은 가드가
+  아예 없었고(초기화 실패 시 raw가 새는 경로도 있었다), REPL의 reedline 입력도 무방비였다 — 세
+  진입점 모두 같은 가드를 공유한다.
 
 ### Added
 - **이름별 프로세스 그룹 집계 — `/local`의 `proc_groups` 섹션과 `aic proc-groups`** — 같은 이름
