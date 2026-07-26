@@ -20,11 +20,26 @@ use ratatui::Terminal;
 use std::time::{Duration, Instant};
 
 pub async fn run_top(client: UdsClient, interval_secs: u64) -> anyhow::Result<()> {
+    // 패닉·외부 시그널로 죽어도 alternate screen과 raw termios를 되돌린다. raw mode 진입
+    // *이전* 에 불러야 원본 termios 스냅샷이 유효하다(crate::term_restore 모듈 문서 참고).
+    crate::term_restore::install();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // 여기서부터는 raw가 켜진 상태라, 조기 반환 전에 직접 되돌려야 한다 — `?`로 그냥 나가면
+    // 셸이 raw인 채로 남는다.
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e.into());
+    }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
+    };
 
     let interval = Duration::from_secs(interval_secs.max(1));
     let mut snap: Option<MetricsSnapshot> = client.get_metrics().await.ok();
