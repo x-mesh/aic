@@ -3072,7 +3072,7 @@ async fn handle_daemon_restart(if_running: bool) {
     match aic_client::daemon_install::restart_via_unit() {
         Ok(true) => {
             println!("{COL_GREEN}✓{COL_RESET} aicd 재시작 (autostart unit 경유)");
-            wait_for_daemon_up(&client).await;
+            wait_for_daemon_up(&client, UNIT_RESTART_WAIT_MS).await;
             return;
         }
         Ok(false) => {} // unit 미설치 — 아래 수동 경로로.
@@ -3118,23 +3118,55 @@ async fn handle_daemon_restart(if_running: bool) {
     handle_daemon_start(false).await;
 }
 
+/// unit 매니저 경유 재시작을 기다리는 상한.
+///
+/// 기동 시간은 상황에 따라 두 자릿수 배로 벌어진다 — 실측(macOS/launchd): 평상시 재시작은
+/// **0.1~0.5초**지만, **바이너리를 방금 교체한 직후의 첫 기동은 5초를 넘겼다**(새 실행 파일의
+/// 코드서명 검증·dyld 캐시 미스). 하필 이 느린 경우가 업그레이드 직후, 즉 사람이 `daemon restart`를
+/// 가장 많이 부르는 순간이다. 이전 상한 5초는 정확히 거기서 걸려 **정상 재시작을 실패로 보고**했다 —
+/// 진짜 실패와 구분되지 않는 경고는 없느니만 못하다.
+///
+/// 또한 우리는 프로세스를 직접 spawn하지 않고 unit 매니저에 맡기므로(KeepAlive 경쟁을 피하려고),
+/// 언제 뜨는지는 매니저 스케줄링에 달려 있다. 상한은 넉넉히 두고, 오래 걸릴 때만 안내한다.
+/// (`launchctl kickstart -k`는 `ThrottleInterval`을 우회하므로 연속 재시작도 지연되지 않는다 —
+/// 실측으로 확인했다.)
+const UNIT_RESTART_WAIT_MS: u64 = 20_000;
+
+/// 침묵하며 기다리는 한계. 평상시 재시작(0.5초 미만)에는 아무것도 출력하지 않고, 느린 경우에만
+/// 한 번 알려 준다 — 안내 없이 20초를 기다리게 하면 멈춘 것처럼 보인다.
+const RESTART_HINT_AFTER_MS: u64 = 3_000;
+
 /// unit 매니저에 재시작을 맡긴 뒤, 새 aicd가 socket을 다시 잡을 때까지 기다린다.
 /// 재시작 직후엔 잠깐 socket이 비어 있어, 곧바로 이어지는 status/ping이 "stopped"로
 /// 보이는 것을 막는다.
-async fn wait_for_daemon_up(client: &UdsClient) {
-    const MAX_WAIT_MS: u64 = 5000;
+async fn wait_for_daemon_up(client: &UdsClient, max_wait_ms: u64) {
     const POLL_MS: u64 = 100;
     let mut waited = 0u64;
+    let mut hinted = false;
     loop {
         if matches!(client.ping().await, Ok(true)) {
+            if hinted {
+                println!(
+                    "{COL_GREEN}✓{COL_RESET} aicd 기동 완료 ({}s)",
+                    waited / 1000
+                );
+            }
             return;
         }
-        if waited >= MAX_WAIT_MS {
+        if waited >= max_wait_ms {
             eprintln!(
-                "{COL_YELLOW}⚠{COL_RESET} aicd가 {MAX_WAIT_MS}ms 내에 올라오지 않았습니다 — \
+                "{COL_YELLOW}⚠{COL_RESET} aicd가 {max_wait_ms}ms 내에 올라오지 않았습니다 — \
                  {COL_BOLD}aic daemon status{COL_RESET}로 확인하세요."
             );
             return;
+        }
+        if !hinted && waited >= RESTART_HINT_AFTER_MS {
+            hinted = true;
+            println!(
+                "{COL_DIM}  기동이 평소보다 느립니다 (바이너리를 막 교체했다면 첫 실행 검증 때문) — \
+                 최대 {}초까지 기다립니다…{COL_RESET}",
+                max_wait_ms / 1000
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
         waited += POLL_MS;
@@ -9972,12 +10004,40 @@ mod tests {
         apply_config_set, apply_provider_override, chat_run_command_enabled, hooks_to_regenerate,
         is_destructive_command, parse_duration_arg, parse_session_capture_mode, resolve_init_modes,
         resolve_provider, validate_bind, validate_config_toml, Cli, Commands, ATTACH_SNIPPET,
+        RESTART_HINT_AFTER_MS, UNIT_RESTART_WAIT_MS,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
         AppConfig, BoundaryStrategyConfig, LlmConfig, ProviderConfig, ProviderType, ServerConfig,
         SessionCaptureMode, SessionConfig,
     };
+
+    /// 재시작 대기 상한은 "바이너리 교체 직후 첫 기동"을 흡수해야 한다. 실측으로 그 경우가 5초를
+    /// 넘겼으므로, 상한을 그 언저리로 되돌리면 업그레이드 직후마다 정상 재시작이 실패로 보고된다.
+    #[test]
+    fn restart_wait_absorbs_slow_first_boot_after_binary_swap() {
+        const OBSERVED_SLOW_BOOT_MS: u64 = 5_000;
+        assert!(
+            UNIT_RESTART_WAIT_MS > OBSERVED_SLOW_BOOT_MS * 2,
+            "재시작 상한({UNIT_RESTART_WAIT_MS}ms)이 실측 느린 기동({OBSERVED_SLOW_BOOT_MS}ms)에 \
+             비해 여유가 없다 — 업그레이드 직후 정상 재시작이 실패로 보고된다"
+        );
+    }
+
+    /// 안내는 평상시 재시작(실측 0.1~0.5초)에는 뜨지 않고, 상한에 닿기 훨씬 전에 떠야 한다.
+    /// 상한과 붙어 있으면 안내와 실패 경고가 거의 동시에 나와 안내 의미가 없다.
+    #[test]
+    fn restart_hint_fires_between_normal_boot_and_timeout() {
+        const NORMAL_BOOT_MS: u64 = 500;
+        assert!(
+            RESTART_HINT_AFTER_MS > NORMAL_BOOT_MS,
+            "평상시 재시작에도 안내가 떠 잡음이 된다"
+        );
+        assert!(
+            RESTART_HINT_AFTER_MS * 2 < UNIT_RESTART_WAIT_MS,
+            "안내가 상한에 너무 붙어 있어 기다릴 여지를 알려 주지 못한다"
+        );
+    }
 
     #[test]
     fn parse_duration_arg_units_and_errors() {
