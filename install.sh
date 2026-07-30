@@ -126,18 +126,18 @@ install_all_to() {
   mkdir -p "$dir" 2>/dev/null || true
   for bin in $BINS; do
     src="$tmp/$bin"
-    [ -f "$src" ] || err "archive에 $bin이 없음"
+    [ -f "$src" ] || err "archive에 ${bin}이 없음"
     install_one "$src" "$dir" || return 1
   done
 }
 
 if [ "$target_dir" = "$default_dir" ] && [ ! -w "$default_dir" ] && command -v sudo >/dev/null 2>&1; then
-  info "$default_dir에 쓰기 권한 없음 — sudo로 설치"
+  info "${default_dir}에 쓰기 권한 없음 — sudo로 설치"
 fi
 
 if ! install_all_to "$target_dir"; then
   fallback="$HOME/.local/bin"
-  info "$target_dir에 설치 실패 — $fallback로 fallback"
+  info "${target_dir}에 설치 실패 — ${fallback}로 fallback"
   install_all_to "$fallback" || err "설치 실패 (쓸 수 있는 위치 없음)"
   target_dir=$fallback
 fi
