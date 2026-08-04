@@ -96,6 +96,7 @@ pub async fn run_all_checks(socket: &std::path::Path) -> Vec<CheckResult> {
         results.push(check_socket_path(socket));
         results.push(check_daemon_alive(socket).await);
         results.push(check_aicd_supervisor().await);
+        results.push(check_rca_agent(&cfg.rca_agent).await);
         results.push(check_shell_hooks());
         if let Some(provider) = cfg.llm.providers.get(&cfg.llm.default_provider) {
             results.push(check_llm_endpoint(provider).await);
@@ -517,6 +518,114 @@ async fn check_aicd_supervisor() -> CheckResult {
             "백그라운드 supervisor를 쓰려면 `aic daemon start`",
         ),
     }
+}
+
+/// rca-agent(커널 eBPF collector) 도달성 체크 — aicd supervisor와 같은 **optional 등급**이다.
+///
+/// rca-agent는 aic가 생명주기를 소유하지 않는 별도 system 데몬이라, 없거나 죽어 있어도
+/// aic의 다른 기능에는 영향이 없다. 그래서 미기동은 FAIL이 아니라 WARN이다.
+/// config `[rca_agent] enabled=false`(기본)면 아예 스킵한다 — 안 쓰는 기능으로 진단을
+/// 어지럽히지 않는다.
+///
+/// `/healthz`로 도달성을, `/featuresz`로 실제 측정 능력(활성 신호 수, attach 실패 목록)을
+/// 본다. 신호가 전부 opt-in 비활성이거나 attach가 깨져 있으면 프로세스가 살아 있어도
+/// 수집되는 게 없으므로 그 사실을 드러낸다.
+async fn check_rca_agent(cfg: &aic_common::RcaAgentConfig) -> CheckResult {
+    const NAME: &str = "rca-agent";
+    if !cfg.enabled {
+        return CheckResult::pass(NAME, "비활성 (config [rca_agent] enabled=false — 스킵)");
+    }
+
+    let client = match crate::agent::rca_agent::RcaAgentClient::new(cfg) {
+        Ok(Some(c)) => c,
+        // enabled=true인데 None은 나올 수 없지만, 방어적으로 설정 문제로 취급한다.
+        Ok(None) => {
+            return CheckResult::warn(
+                NAME,
+                "클라이언트가 만들어지지 않음",
+                "config [rca_agent]의 enabled/url을 확인하세요",
+            )
+        }
+        Err(e) => {
+            return CheckResult::warn(
+                NAME,
+                format!("설정 오류: {e}"),
+                "config [rca_agent] url은 loopback(http://127.0.0.1:9090)이어야 합니다",
+            )
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), client.health()).await {
+        Ok(Ok(_)) => {}
+        _ => {
+            return CheckResult::warn(
+                NAME,
+                format!(
+                    "{}에 도달할 수 없음 (선택사항 — 커널 evidence 없이 동작)",
+                    client.base()
+                ),
+                "커널 신호를 쓰려면 rca-agent를 기동하세요: `sudo systemctl status rca-agent`",
+            )
+        }
+    }
+
+    // 도달은 하므로, 실제로 무엇을 측정할 수 있는지까지 본다.
+    match tokio::time::timeout(Duration::from_secs(2), client.features()).await {
+        Ok(Ok(body)) => match summarize_features(&body) {
+            Some((0, _)) => CheckResult::warn(
+                NAME,
+                "도달 가능하나 활성 신호 0개 (전부 opt-in 비활성)",
+                "rca-agent config에서 필요한 signals.<name>.optin을 켜세요",
+            ),
+            Some((active, failed)) if !failed.is_empty() => CheckResult::warn(
+                NAME,
+                format!("활성 신호 {active}개, attach 실패: {}", failed.join(", ")),
+                "커널/권한 조건을 확인하세요 (rca-agent 로그 + CAP_BPF/CAP_PERFMON)",
+            ),
+            Some((active, _)) => CheckResult::pass(
+                NAME,
+                format!("도달 가능, 활성 신호 {active}개 ({})", client.base()),
+            ),
+            None => CheckResult::pass(NAME, format!("도달 가능 ({})", client.base())),
+        },
+        _ => CheckResult::pass(
+            NAME,
+            format!(
+                "도달 가능 (featuresz 조회 실패 — 상태 요약 생략, {})",
+                client.base()
+            ),
+        ),
+    }
+}
+
+/// `/featuresz` JSON → (활성 신호 수, attach가 깨진 신호 이름들).
+///
+/// 순수 함수 — 파싱 실패나 예상 밖 구조면 `None`으로 물러나 진단을 죽이지 않는다.
+/// `kernel_capabilities`는 신호가 아니라 커널 능력 맵이라 집계에서 뺀다.
+fn summarize_features(body: &str) -> Option<(usize, Vec<String>)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = v.as_object()?;
+    let mut active = 0usize;
+    let mut failed = Vec::new();
+    for (name, entry) in obj {
+        if name == "kernel_capabilities" {
+            continue;
+        }
+        let Some(e) = entry.as_object() else { continue };
+        if e.get("enabled").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        active += 1;
+        // enabled인데 attach가 비었거나 disabled면 실제로는 수집되지 않는다.
+        let attach = e
+            .get("attach")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if attach.is_empty() || attach == "disabled" {
+            failed.push(name.clone());
+        }
+    }
+    Some((active, failed))
 }
 
 fn check_shell_hooks() -> CheckResult {
@@ -1028,5 +1137,61 @@ mod tests {
         assert_eq!(report.dropped_bytes, 0);
         assert_eq!(report.attach_reconnect_total, 0);
         assert!(report.session_metrics_error.is_some());
+    }
+
+    #[test]
+    fn summarize_features_counts_enabled_and_flags_broken_attach() {
+        // 실제 /featuresz 응답 형태. kernel_capabilities는 신호가 아니라 집계에서 빠진다.
+        let body = r#"{
+            "process_lifecycle": {"enabled": true, "attach": "sched_process_fork+sched_process_exit", "disabled_reason": ""},
+            "oom":               {"enabled": true, "attach": "oom/mark_victim + event:fentry", "disabled_reason": ""},
+            "scheduler":         {"enabled": false, "attach": "disabled", "disabled_reason": "opt-in disabled"},
+            "block_io":          {"enabled": true, "attach": "disabled", "disabled_reason": "attach failed"},
+            "kernel_capabilities": {"btf": true, "tracing": true}
+        }"#;
+        let (active, failed) = summarize_features(body).unwrap();
+        // enabled 3개(process_lifecycle/oom/block_io) — 비활성 scheduler와 capability 맵은 제외.
+        assert_eq!(active, 3);
+        // enabled인데 attach가 disabled면 실제로 수집되지 않으므로 드러낸다.
+        assert_eq!(failed, vec!["block_io".to_string()]);
+    }
+
+    #[test]
+    fn summarize_features_degrades_on_unparseable_body() {
+        // 파싱 실패는 진단을 죽이지 않고 None으로 물러난다.
+        assert!(summarize_features("not json").is_none());
+        assert!(summarize_features("[1,2,3]").is_none());
+    }
+
+    #[tokio::test]
+    async fn check_rca_agent_skips_when_disabled() {
+        // 기본값(enabled=false)은 스킵 — 안 쓰는 기능으로 진단을 어지럽히지 않는다.
+        let r = check_rca_agent(&aic_common::RcaAgentConfig::default()).await;
+        assert_eq!(r.status, Status::Pass);
+        assert!(r.detail.contains("비활성"));
+    }
+
+    #[tokio::test]
+    async fn check_rca_agent_warns_when_unreachable() {
+        // 미기동은 FAIL이 아니라 WARN — aic가 생명주기를 소유하지 않는 optional 의존성이다.
+        let cfg = aic_common::RcaAgentConfig {
+            enabled: true,
+            // 아무도 듣지 않는 loopback 포트.
+            url: "http://127.0.0.1:9".to_string(),
+        };
+        let r = check_rca_agent(&cfg).await;
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.fix_hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_rca_agent_warns_on_non_loopback_url() {
+        let cfg = aic_common::RcaAgentConfig {
+            enabled: true,
+            url: "http://10.0.0.5:9090".to_string(),
+        };
+        let r = check_rca_agent(&cfg).await;
+        assert_eq!(r.status, Status::Warn);
+        assert!(r.detail.contains("설정 오류"));
     }
 }
