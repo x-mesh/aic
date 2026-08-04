@@ -1648,6 +1648,30 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     // RCA가 선택한 provider/model을 기본값으로 반영한다. 서버가 endpoint/credential을
     // 함께 내려주면(fleet 게이트웨이 관리 시) 그대로 적용해 설치가 무설정으로 끝나고,
     // 내려주지 않은 필드는 호스트의 기존 값을 보존한다.
+    //
+    // provider_type/endpoint/api_key는 한 게이트웨이를 가리키는 한 묶음이라 전부
+    // 적용하거나 전부 건너뛴다. 타입만 모르는 채 endpoint·key를 적용하면 (예: 호스트에
+    // 남아 있던 Anthropic 타입 + OpenAI-compat 게이트웨이) 다른 wire format으로 요청을
+    // 보내 조용히 실패한다. 건너뛰어도 telemetry 등록은 그대로 살아 있으므로 일회용
+    // key를 다시 발급받을 필요는 없다.
+    let rca_type = enrolled
+        .llm_provider_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    let parsed_type = rca_type.and_then(parse_rca_provider_type);
+    let unknown_type = rca_type.filter(|_| parsed_type.is_none());
+    let llm_endpoint = enrolled
+        .llm_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let llm_api_key = enrolled
+        .llm_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+
     let provider = config
         .llm
         .providers
@@ -1661,14 +1685,21 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
             cli_args: None,
         });
     provider.model = Some(enrolled.model.clone());
-    if let Some(pt) = enrolled.llm_provider_type.as_deref().and_then(parse_rca_provider_type) {
-        provider.provider_type = pt;
-    }
-    if let Some(ep) = enrolled.llm_endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
-        provider.endpoint = Some(ep.to_string());
-    }
-    if let Some(key) = enrolled.llm_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-        provider.api_key = Some(key.to_string());
+    if let Some(raw) = unknown_type {
+        eprintln!(
+            "{COL_YELLOW}⚠{COL_RESET} 이 aic 버전이 모르는 LLM provider type입니다 ({raw}) — \
+             LLM 설정은 건드리지 않았습니다. `aic update` 후 다시 `aic enroll` 하세요."
+        );
+    } else {
+        if let Some(pt) = parsed_type {
+            provider.provider_type = pt;
+        }
+        if let Some(ep) = llm_endpoint {
+            provider.endpoint = Some(ep.to_string());
+        }
+        if let Some(key) = llm_api_key {
+            provider.api_key = Some(key.to_string());
+        }
     }
     config.llm.default_provider = enrolled.provider.clone();
     save_config(&config)?;
@@ -1683,11 +1714,18 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     println!("  host:     {}", enrolled.host_name);
     println!("  endpoint: {}", config.aicd.exporter.endpoint);
     println!("  provider: {} ({})", enrolled.provider, enrolled.model);
-    if let Some(ep) = &enrolled.llm_endpoint {
-        // key 원문은 절대 출력하지 않는다 — 수신 여부만.
+    // 실제로 config에 반영된 것만 보고한다 — 출력 조건은 위 적용 조건과 같아야 한다.
+    // (공백만 온 endpoint는 저장되지 않으므로 출력도 하지 않고, endpoint 없이 key만
+    // 와도 저장은 됐으니 반드시 알린다.) key 원문은 절대 출력하지 않는다 — 수신 여부만.
+    if unknown_type.is_none() && (llm_endpoint.is_some() || llm_api_key.is_some()) {
         println!(
-            "  llm:      {ep} ({})",
-            if enrolled.llm_api_key.is_some() { "api_key 수신·저장됨" } else { "api_key 미포함" }
+            "  llm:      {} ({})",
+            llm_endpoint.unwrap_or("endpoint 기존 값 유지"),
+            if llm_api_key.is_some() {
+                "api_key 수신·저장됨"
+            } else {
+                "api_key 미포함"
+            }
         );
     }
     println!(
@@ -1732,6 +1770,10 @@ fn print_enroll_dry_run(server: &str) -> anyhow::Result<()> {
         config.llm.default_provider
     );
     println!("  llm.providers.<RCA provider>.model: → <RCA model>");
+    // RCA가 fleet 게이트웨이를 관리하면 provider_type/endpoint/api_key까지 덮어쓴다.
+    // 미리보기가 실제 변경 범위보다 좁으면 안 된다 — 이미 값이 있는 호스트일수록 그렇다.
+    println!("  llm.providers.<RCA provider>.provider_type/endpoint/api_key:");
+    println!("            기존 값 → <RCA가 함께 내려주면 덮어씀>");
     println!("  aicd: install + restart 예정");
     println!("  RCA server: {server}");
     println!("  note: provider/model/endpoint의 실제 값은 key 교환 전에는 알 수 없습니다");
@@ -1762,7 +1804,12 @@ fn validate_enrollment_response(response: &EnrollmentResponse) -> anyhow::Result
     }
     // llm_endpoint는 선택 필드지만, 왔다면 telemetry endpoint와 같은 이유로 scheme을
     // 검증한다 — 잘못된 값을 config에 넣고 나면 key는 이미 소비된 뒤다.
-    if let Some(ep) = response.llm_endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+    if let Some(ep) = response
+        .llm_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
         let parsed = reqwest::Url::parse(ep)
             .map_err(|_| anyhow::anyhow!("RCA가 유효하지 않은 LLM endpoint를 반환했습니다"))?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -5762,13 +5809,31 @@ mod enrollment_response_tests {
         assert!(validate_enrollment_response(&r).is_ok());
     }
 
+    /// `parse_rca_provider_type`이 `ProviderType`의 serde 표현과 어긋나지 않는지 왕복 검증.
+    /// 아래 match는 variant가 추가되면 컴파일 에러를 내서 파서 갱신을 강제한다 — 빠뜨리면
+    /// 새 타입이 조용히 None이 되고 LLM 설정이 통째로 skip된다.
     #[test]
-    fn provider_type_parsing_is_conservative() {
+    fn provider_type_parsing_covers_every_variant() {
         use super::parse_rca_provider_type;
         use aic_common::ProviderType;
-        assert_eq!(parse_rca_provider_type("OpenAiCompatible"), Some(ProviderType::OpenAiCompatible));
-        assert_eq!(parse_rca_provider_type("Anthropic"), Some(ProviderType::Anthropic));
-        // 모르는 타입은 None — 기존 provider_type을 보존해야 한다.
+
+        for pt in [
+            ProviderType::OpenAiCompatible,
+            ProviderType::Groq,
+            ProviderType::Anthropic,
+            ProviderType::CliBackend,
+        ] {
+            match pt {
+                ProviderType::OpenAiCompatible
+                | ProviderType::Groq
+                | ProviderType::Anthropic
+                | ProviderType::CliBackend => {}
+            }
+            let wire = serde_json::to_value(&pt).unwrap();
+            let wire = wire.as_str().expect("unit variant는 문자열로 직렬화된다");
+            assert_eq!(parse_rca_provider_type(wire), Some(pt.clone()), "{wire}");
+        }
+        // 모르는 타입은 None — 호출부는 LLM 설정 전체를 건너뛴다.
         assert_eq!(parse_rca_provider_type("QuantumBackend"), None);
     }
 }
