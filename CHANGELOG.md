@@ -4,7 +4,7 @@
 
 ## [Unreleased]
 
-## [0.33.0] - 2026-08-04
+## [0.34.0] - 2026-08-04
 
 ### Added
 - **`aic enroll` 한 번으로 LLM 설정까지 끝난다** — 지금까지 enrollment는 telemetry(exporter
