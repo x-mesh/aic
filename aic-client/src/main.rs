@@ -810,6 +810,17 @@ enum RcaOp {
         #[arg(long)]
         json: bool,
     },
+    /// 로컬 rca-agent(커널 eBPF collector)에서 evidence bundle을 수집해 incident에 붙인다. config [rca_agent] 연동 필요.
+    Collect {
+        /// incident id 또는 prefix. 생략 시 최근 incident.
+        id: Option<String>,
+        /// 수집 window(예: 30s, 2m). 기본 30s, 범위 5s..5m — window만큼 블록된다.
+        #[arg(long)]
+        window: Option<String>,
+        /// JSON 출력.
+        #[arg(long)]
+        json: bool,
+    },
     /// 후보 root cause(가설)를 관리한다 — 추가/support/refute/confirm/reject로 원인에 수렴시킨다.
     Hypothesis {
         #[command(subcommand)]
@@ -6504,6 +6515,7 @@ fn default_config() -> AppConfig {
         mcp: aic_common::McpConfig::default(),
         rca: aic_common::RcaConfig::default(),
         outbound: aic_common::OutboundConfig::default(),
+        rca_agent: aic_common::RcaAgentConfig::default(),
     }
 }
 
@@ -8243,6 +8255,7 @@ async fn handle_chat(
                 )
                 .allow_run_command(run_command_enabled)
                 .with_observability(&config.observability)
+                .with_rca_agent(&config.rca_agent)
                 .with_mcp(&config.mcp)
                 .llm_available(llm_registered);
                 // provider/model 표시는 실제 등록된 경우에만 — 미등록이면 배너에 잘못된 default를 안 띄운다.
@@ -8601,6 +8614,9 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
             json,
         } => {
             rca_observe(id, backend, query, before, step, limit, json).await?;
+        }
+        RcaOp::Collect { id, window, json } => {
+            rca_collect(id, window, json).await?;
         }
         RcaOp::Hypothesis { op } => {
             handle_rca_hypothesis(op)?;
@@ -9116,6 +9132,60 @@ async fn rca_observe(
     } else {
         println!(
             "{COL_GREEN}✔{COL_RESET} 관측 evidence 저장: [{}] {label} ({start} .. {end})",
+            ev.id
+        );
+        println!("{result}");
+    }
+    Ok(())
+}
+
+/// `aic rca collect` — 로컬 rca-agent(커널 eBPF collector)의 `/collectz`에서
+/// `rca.evidence.v1` bundle을 pull해 Observability evidence로 붙인다.
+/// bounded·redacted·loopback 강제는 RcaAgentClient가 담당. window만큼 블록된다.
+async fn rca_collect(id: Option<String>, window: Option<String>, json: bool) -> anyhow::Result<()> {
+    let resolved = aic_client::rca::resolve_id(id.as_deref())?;
+    let mut meta = aic_client::rca::load_meta(&resolved)?;
+
+    let config = ConfigManager::load()?;
+    let client = aic_client::agent::rca_agent::RcaAgentClient::new(&config.rca_agent)
+        .map_err(|e| anyhow::anyhow!("rca-agent 클라이언트 생성 실패: {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "rca-agent 연동이 비활성입니다. config [rca_agent]에 enabled = true를 설정하세요."
+            )
+        })?;
+
+    let secs = parse_duration_arg(window.as_deref().unwrap_or("30s"))
+        .filter(|d| d.num_seconds() > 0)
+        .ok_or_else(|| anyhow::anyhow!("--window 형식 오류(예: 30s, 2m)"))?
+        .num_seconds() as u64;
+
+    let result = client
+        .collect(secs)
+        .await
+        .map_err(|e| anyhow::anyhow!("커널 evidence 수집 실패: {e}"))?;
+
+    let ev = aic_client::rca::append_evidence(
+        &mut meta,
+        aic_client::rca::EvidenceKind::Observability,
+        &format!("rca-agent: kernel evidence ({secs}s window)"),
+        // base URL(127.0.0.1)은 redaction이 IPv4로 마스킹해 노이즈만 되므로 경로만 표기한다.
+        "aic rca collect (rca-agent /collectz)",
+        &result,
+        &["rca-agent", "kernel"],
+    )?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "incident": meta.id,
+                "evidence": ev,
+            }))?
+        );
+    } else {
+        println!(
+            "{COL_GREEN}✔{COL_RESET} 커널 evidence 저장: [{}] rca-agent ({secs}s window)",
             ev.id
         );
         println!("{result}");
@@ -10484,6 +10554,7 @@ source /root/.aic/hook-events.bash
             mcp: aic_common::McpConfig::default(),
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
+            rca_agent: aic_common::RcaAgentConfig::default(),
         }
     }
 

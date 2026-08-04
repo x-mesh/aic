@@ -32,7 +32,10 @@ pub(crate) mod markdown;
 pub(crate) mod mcp;
 // SRE R1: 관측 백엔드(Prometheus/Loki/Elasticsearch) read-only HTTP 질의 도구.
 pub mod obs_tools;
+// RCA-eBPF Phase 1: rca-agent(커널 eBPF collector) localhost evidence pull 도구.
+// main.rs(`aic rca collect`)가 RcaAgentClient를 직접 쓰므로 pub.
 pub(crate) mod probes;
+pub mod rca_agent;
 // `/local`의 proc_changes 섹션 + `/procs` — 최근 프로세스 생성/소멸. probe가 `aic proc-changes`로
 // 호출하므로 proc_fd와 같은 이유로 pub.
 pub mod proc_changes;

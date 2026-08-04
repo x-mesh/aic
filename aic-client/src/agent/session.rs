@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use super::debug::adbg;
 use super::obs_tools::ObsClient;
+use super::rca_agent::RcaAgentClient;
 use super::sandbox::Sandbox;
 use super::tool_record::{self, ToolRecord};
 use super::tools;
@@ -266,6 +267,9 @@ pub struct AgentSession {
     /// 관측 백엔드(Prometheus/Loki/ES) 질의 클라이언트(SRE R1). config에 등록 백엔드가
     /// 있을 때만 Some. 등록된 백엔드만 질의 가능 — endpoint allowlist.
     obs: Option<ObsClient>,
+    /// rca-agent(커널 eBPF collector) evidence pull 클라이언트 — config `[rca_agent]`가
+    /// enabled이고 URL이 loopback일 때만 Some.
+    rca_agent: Option<RcaAgentClient>,
     /// MCP 클라이언트 — config `[mcp.servers.*]`에 enabled 서버가 있을 때만 Some. 발견된 tool을
     /// chat tool-calling에 노출하고, 변경 도구는 confirm 후 실행한다. 연결은 `run()`에서 비동기로 수행.
     mcp: Option<super::mcp::McpClient>,
@@ -320,6 +324,7 @@ impl AgentSession {
             active_rca_id: None,
             out: ChatOut::Direct { spinner: None },
             obs: None,
+            rca_agent: None,
             mcp: None,
             snapshot_recording: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             recording_lane_live: false,
@@ -349,6 +354,19 @@ impl AgentSession {
                 Ok(client) => self.obs = Some(client),
                 Err(e) => adbg!("obs client 생성 실패 — 관측 도구 비활성: {}", e),
             }
+        }
+        self
+    }
+
+    /// rca-agent(커널 eBPF collector) evidence pull 도구를 설정한다.
+    /// config `[rca_agent]`가 enabled일 때만 활성화되며, loopback 검증 실패 시 비활성.
+    pub fn with_rca_agent(mut self, cfg: &aic_common::RcaAgentConfig) -> Self {
+        match RcaAgentClient::new(cfg) {
+            Ok(client) => self.rca_agent = client,
+            Err(e) => adbg!(
+                "rca-agent client 생성 실패 — 커널 evidence 도구 비활성: {}",
+                e
+            ),
         }
         self
     }
@@ -694,6 +712,10 @@ impl AgentSession {
         if let Some(obs) = &self.obs {
             specs.extend(obs.specs());
         }
+        // rca-agent 커널 evidence 도구도 read-only loopback pull이라 run_command 게이트와 무관.
+        if let Some(rca) = &self.rca_agent {
+            specs.extend(rca.specs());
+        }
         // MCP 서버 tool(mem-mesh 등)은 namespaced 이름(server__tool)으로 노출한다. read-only는 자동,
         // 변경 도구는 exec_tool에서 confirm 게이팅.
         if let Some(mcp) = &self.mcp {
@@ -946,6 +968,17 @@ impl AgentSession {
                 Some(obs) => obs.run(&call.name, &args).await,
                 None => Ok("[tool error] 관측 백엔드가 설정되지 않았습니다. \
                     config [observability.backends.<name>]에 추가하세요."
+                    .to_string()),
+            }
+        } else if matches!(
+            call.name.as_str(),
+            "rca_agent_collect" | "rca_agent_features"
+        ) {
+            // rca-agent 커널 evidence pull: loopback 전용 read-only HTTP.
+            match &self.rca_agent {
+                Some(rca) => rca.run(&call.name, &args).await,
+                None => Ok("[tool error] rca-agent 연동이 설정되지 않았습니다. \
+                    config [rca_agent]에 enabled = true를 설정하세요."
                     .to_string()),
             }
         } else if self.mcp.as_ref().is_some_and(|m| m.is_tool(&call.name)) {
