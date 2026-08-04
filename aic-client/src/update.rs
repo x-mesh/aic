@@ -14,7 +14,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const REPO: &str = "x-mesh/aic";
+/// release 자산(tag/archive/checksums)이 올라가는 **공개 미러 repo**. 소스 repo
+/// (`parametacorp/aic`)가 private로 전환되어 미인증 redirect/직링크가 404가 되므로,
+/// update 경로는 전부 이 공개 릴리스 repo를 본다.
+const REPO: &str = "parametacorp/aic-releases";
+/// private 소스 repo — cargo 설치 안내 전용(접근 권한이 있는 개발자 경로).
+const SOURCE_REPO: &str = "parametacorp/aic";
 const BREW_TAP: &str = "x-mesh/tap/aic";
 /// release archive에 포함된 모든 binary. `aic-session`/`aicd`는 나란히 갱신된다.
 const BINARIES: &[&str] = &["aic", "aic-session", "aicd"];
@@ -596,8 +601,9 @@ fn run_brew_upgrade() -> Result<()> {
 
 fn print_cargo_hint() -> Result<()> {
     println!(
-        "cargo로 설치된 binary는 자동 교체하지 않습니다. 다음 명령으로 갱신하세요:\n\
-         \n  cargo install --git https://github.com/{REPO} --bins\n"
+        "cargo로 설치된 binary는 자동 교체하지 않습니다. 다음 명령으로 갱신하세요 \
+         (private repo — 접근 권한 필요):\n\
+         \n  cargo install --git https://github.com/{SOURCE_REPO} --bins\n"
     );
     Ok(())
 }
@@ -666,17 +672,25 @@ mod tests {
     #[test]
     fn tag_from_location_extracts_tag() {
         assert_eq!(
-            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v0.8.0").as_deref(),
+            tag_from_location("https://github.com/parametacorp/aic-releases/releases/tag/v0.8.0")
+                .as_deref(),
             Some("v0.8.0")
         );
         // trailing slash 허용.
         assert_eq!(
-            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v1.2.3/").as_deref(),
+            tag_from_location("https://github.com/parametacorp/aic-releases/releases/tag/v1.2.3/")
+                .as_deref(),
             Some("v1.2.3")
         );
         // `/tag/`가 없으면(release 없어 releases 페이지로 redirect 등) None.
-        assert_eq!(tag_from_location("https://github.com/x-mesh/aic/releases"), None);
-        assert_eq!(tag_from_location("https://github.com/x-mesh/aic/releases/tag/"), None);
+        assert_eq!(
+            tag_from_location("https://github.com/parametacorp/aic-releases/releases"),
+            None
+        );
+        assert_eq!(
+            tag_from_location("https://github.com/parametacorp/aic-releases/releases/tag/"),
+            None
+        );
     }
 
     #[test]

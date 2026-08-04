@@ -32,10 +32,24 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
   - **darwin** `x86_64/aarch64-apple-darwin` → `cargo build` (**native, Apple ld** — 프레임워크 링크)
 - 각 (os, arch)별 `aic_<version>_<os>_<arch>.tar.gz`에 `aic`·`aic-session`·`aicd` + LICENSE/README/CHANGELOG 묶음
 - `checksums.txt` SHA256 생성
-- GitHub Release 게시 (`gh release create`; 있으면 `gh release upload --clobber`)
+- **공개 미러 repo(`parametacorp/aic-releases`)**에 GitHub Release 게시 (`gh release create -R`; 있으면 `upload --clobber`) + `install.sh` 동기화 — 노트는 CHANGELOG의 해당 버전 섹션에서 추출
 - `x-mesh/homebrew-tap/Formula/aic.rb` 재생성·push (4 OS/arch url + sha256 + bin.install 3개)
 
 ## 사전 준비 (1회)
+
+### `parametacorp/aic-releases` 공개 미러 repo + `RELEASES_REPO_TOKEN` secret
+
+소스 repo(`parametacorp/aic`)가 private라 미인증 다운로드(`aic update`, install.sh, brew)가
+404가 된다. release 자산과 install.sh는 **공개 미러 repo**로 서빙한다:
+
+1. `parametacorp/aic-releases` **public** repo 생성(빈 README면 충분 — release CI가
+   자산 업로드와 `install.sh` 동기화를 자동으로 한다).
+2. Fine-grained PAT 발급: **Resource owner** `parametacorp` / **Repository access**
+   only `parametacorp/aic-releases` / **Permissions** Contents (write).
+3. `parametacorp/aic` repo Secrets → Actions에 **Name**: `RELEASES_REPO_TOKEN`으로 등록.
+
+> release는 미러 repo에 태그를 새로 만들며(소스 태그와 이름만 같음), 노트는 소스
+> CHANGELOG의 해당 버전 섹션에서 추출된다. 소스 repo에는 release가 생기지 않는다.
 
 ### `HOMEBREW_TAP_GITHUB_TOKEN` secret
 
@@ -44,7 +58,7 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 1. GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens
 2. **Resource owner**: `x-mesh` / **Repository access**: only `x-mesh/homebrew-tap`
 3. **Permissions**: Contents (write), Metadata (read, 자동)
-4. 등록: org level(권장, `x-mesh` org Secrets → Actions) 또는 repo level(`x-mesh/aic` Secrets → Actions)
+4. 등록: org level(권장, `x-mesh` org Secrets → Actions) 또는 repo level(`parametacorp/aic` Secrets → Actions)
 5. **Name**: `HOMEBREW_TAP_GITHUB_TOKEN`
 
 > 커스텀 스크립트는 tap을 clone → `Formula/aic.rb` 덮어쓰기 → commit(author `aic-bot <bot@x-mesh.dev>`) → push한다. Contents write면 충분(PR을 열지 않고 main에 직접 push).
@@ -92,7 +106,8 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 | linux zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. `mlugg/setup-zig` 버전과 `cargo-zigbuild --version`을 함께 bump. |
 | Formula가 안 갱신됨 | secret 권한 부족(Contents write). tap push 로그 확인. |
 | **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 ref_name이 브랜치라 어긋난다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
-| Release notes가 휑함 | `--notes-from-tag`가 tag 메시지를 쓴다. 필요하면 release.yml의 notes 소스를 CHANGELOG 섹션 추출로 바꾼다. |
+| Release notes가 휑함 | notes는 CHANGELOG의 `## [X.Y.Z]` 섹션에서 추출된다(미러 repo엔 소스 tag가 없어 `--notes-from-tag` 불가). CHANGELOG에 해당 버전 섹션이 있는지 확인. |
+| `RELEASES_REPO_TOKEN: required` 또는 미러 업로드 403 | `parametacorp/aic-releases` PAT 미등록/권한 부족. 위 사전 준비 확인. |
 
 ## 왜 GoReleaser가 아닌가
 
@@ -100,4 +115,4 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 
 그래서 GoReleaser를 걷어내고(`.goreleaser.yaml` 삭제), `macos-latest` runner에서 **darwin은 native cargo(Apple ld=프레임워크 링크), linux는 cargo-zigbuild**로 직접 빌드·아카이브·릴리스·Formula 갱신을 한다. binary 다운로드 방식(brew에 Rust toolchain 불필요, 빠른 설치)과 multi-arch 분기는 그대로 유지된다.
 
-toolchain만 있는 환경에서 binary 없이 빌드하려면 `cargo install --git https://github.com/x-mesh/aic`로 우회.
+toolchain만 있는 환경에서 binary 없이 빌드하려면 `cargo install --git https://github.com/parametacorp/aic`로 우회(private — 접근 권한 필요).

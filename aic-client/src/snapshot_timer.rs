@@ -157,7 +157,7 @@ pub fn render_linux_service(aic_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"[Unit]
 Description=aic periodic snapshot capture (oneshot)
-Documentation=https://github.com/x-mesh/aic
+Documentation=https://github.com/parametacorp/aic
 
 [Service]
 Type=oneshot
@@ -179,7 +179,7 @@ pub fn render_linux_timer(interval_secs: u64) -> String {
     format!(
         r#"[Unit]
 Description=aic periodic snapshot capture timer
-Documentation=https://github.com/x-mesh/aic
+Documentation=https://github.com/parametacorp/aic
 
 [Timer]
 OnActiveSec=0

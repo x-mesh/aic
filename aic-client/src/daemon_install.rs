@@ -169,7 +169,7 @@ pub fn render_linux_service(aicd_path: &Path, log_dir: &Path) -> String {
     format!(
         r#"[Unit]
 Description=aic supervisor daemon (aicd)
-Documentation=https://github.com/x-mesh/aic
+Documentation=https://github.com/parametacorp/aic
 After=default.target
 
 [Service]
