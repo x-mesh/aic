@@ -161,6 +161,23 @@ impl RcaAgentClient {
     }
 }
 
+/// `/featuresz` JSON에서 활성 신호 수를 센다(pure). `kernel_capabilities`는 신호가 아니라 제외.
+/// 파싱 실패나 예상 밖 구조면 `None` — 호출부(진단·요약)를 죽이지 않는다.
+///
+/// web 신선도 스트립과 chat `/doctor`가 같은 숫자를 보여야 해서 여기 한 곳에 둔다.
+pub(crate) fn count_active_signals(body: &str) -> Option<usize> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let obj = v.as_object()?;
+    Some(
+        obj.iter()
+            .filter(|(name, e)| {
+                *name != "kernel_capabilities"
+                    && e.get("enabled").and_then(Value::as_bool) == Some(true)
+            })
+            .count(),
+    )
+}
+
 /// host가 loopback(127.0.0.0/8, ::1) 또는 `localhost`인지 강제한다.
 fn ensure_loopback(url: &reqwest::Url) -> Result<(), ToolError> {
     let host = url.host_str().unwrap_or_default();

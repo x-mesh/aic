@@ -184,11 +184,14 @@ pub(crate) enum SlashCommand {
     /// `/procs [N]` — aicd가 관측한 최근 프로세스 생성/소멸 N개(기본 [`PROCS_DEFAULT`]).
     /// `/local`의 `proc_changes` 섹션과 같은 데이터지만 더 많이·관측 시각까지 본다. LLM 미호출.
     Procs(Option<usize>),
-    /// `/diagnose [--raw|-r|--analyze|-a] [<증상 rest-of-line>]` — read-only SRE 진단.
+    /// `/diagnose [--raw|-r|--analyze|-a] [--kernel|-k] [<증상 rest-of-line>]` — read-only SRE 진단.
     /// 기본 `analyze=true`. no-arg면 일반 health 진단. symptom은 quote strip된 자유 텍스트.
     Diagnose {
         symptom: Option<String>,
         analyze: bool,
+        /// `--kernel`/`-k` — 로컬 rca-agent에서 짧은 window 커널 evidence를 함께 수집한다.
+        /// 기본 false: 수집이 그 시간만큼 블록하고, 연동이 꺼져 있으면 아무 값도 없기 때문이다.
+        kernel: bool,
     },
     /// `/explain-last [--raw|-r] [seq|corr]` — 최근(또는 지정) tool 기록을 증거로 원인/다음확인 분석.
     ExplainLast {
@@ -396,7 +399,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
         "local" => "로컬 sysinfo 스냅샷 LLM 분석 (--raw=원본만; alias: sys, snapshot)",
         "sys" => "로컬 sysinfo 스냅샷 LLM 분석 (alias of local)",
         "snapshot" => "로컬 sysinfo 스냅샷 LLM 분석 (alias of local)",
-        "diagnose" => "증상 기반 read-only 진단 (가설/증거/다음확인; --raw=증거만)",
+        "diagnose" => "증상 기반 read-only 진단 (--raw=증거만, --kernel=커널신호)",
         "explain-last" => "최근(또는 지정) tool 기록 분석 (원인/증거/다음확인; --raw=증거만)",
         "incident" => "인시던트 진단: 시스템+git+최근기록 (--raw=증거만)",
         "doctor" => "AIC 자체 상태 점검 (provider/도구/플래그 presence, secret 미노출)",
@@ -442,7 +445,7 @@ pub(crate) fn slash_usage(name: &str) -> &'static str {
         "last" | "timeline" | "trend" | "snapshots" | "procs" => "[N]",
         "raw" => "[seq|corr]",
         "local" | "sys" | "snapshot" => "[section ...] [--raw|-r|--analyze|-a]",
-        "diagnose" => "[--raw|-r] [<증상>]",
+        "diagnose" => "[--raw|-r] [--kernel|-k] [<증상>]",
         "explain-last" => "[--raw|-r] [seq|corr]",
         "incident" => "[--raw|-r] [name]",
         "record" => "[on|off|now [메모]]",
@@ -515,9 +518,14 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
             SlashCommand::Local { sections, analyze }
         }
         "diagnose" => {
-            // 선행 플래그(--raw/-r/--analyze/-a)만 소비하고, 나머지 rest-of-line을 증상으로(quote strip).
-            let (analyze, symptom) = parse_diagnose_args(rest);
-            SlashCommand::Diagnose { symptom, analyze }
+            // 선행 플래그(--raw/-r, --analyze/-a, --kernel/-k)만 소비하고, 나머지 rest-of-line을
+            // 증상으로(quote strip).
+            let (analyze, kernel, symptom) = parse_diagnose_args_full(rest);
+            SlashCommand::Diagnose {
+                symptom,
+                analyze,
+                kernel,
+            }
         }
         "explain-last" | "explain" => {
             // [--raw|-r] [seq|corr]. target은 rest-of-line(따옴표 strip).
@@ -773,7 +781,15 @@ fn parse_watch_args(rest: &str) -> SlashCommand {
 /// `/diagnose` 인자 파싱 — 선행 플래그(--raw/-r=off, --analyze/-a=on)를 소비한 뒤
 /// 남은 rest-of-line을 증상으로(둘러싼 따옴표 제거). 빈 증상은 None(=일반 health).
 fn parse_diagnose_args(rest: &str) -> (bool, Option<String>) {
+    let (analyze, _kernel, symptom) = parse_diagnose_args_full(rest);
+    (analyze, symptom)
+}
+
+/// `/diagnose` 인자 파서 — `--kernel`까지 본다. `/explain-last`·`/incident`는 커널 개념이
+/// 없어 [`parse_diagnose_args`]를 그대로 쓰고, 이 함수는 diagnose만 호출한다.
+fn parse_diagnose_args_full(rest: &str) -> (bool, bool, Option<String>) {
     let mut analyze = true;
+    let mut kernel = false;
     let mut s = rest.trim_start();
     loop {
         let tok = s.split_whitespace().next().unwrap_or("");
@@ -786,6 +802,10 @@ fn parse_diagnose_args(rest: &str) -> (bool, Option<String>) {
                 analyze = true;
                 s = s[tok.len()..].trim_start();
             }
+            "--kernel" | "-k" => {
+                kernel = true;
+                s = s[tok.len()..].trim_start();
+            }
             _ => break,
         }
     }
@@ -795,7 +815,7 @@ fn parse_diagnose_args(rest: &str) -> (bool, Option<String>) {
     } else {
         Some(sym.to_string())
     };
-    (analyze, symptom)
+    (analyze, kernel, symptom)
 }
 
 /// 양끝의 짝맞는 따옴표(`"` 또는 `'`)를 한 겹 제거.
@@ -1116,6 +1136,9 @@ pub(crate) fn build_doctor_report(
     run_command_on: bool,
     audit_key_backend: &str,
     env_flags: &[(&str, bool)],
+    // 커널 evidence 연동 상태 한 줄(None이면 연동 자체가 비활성 — 줄을 넣지 않는다).
+    // 상태 문자열은 호출부가 실제 조회로 만든다(이 함수는 순수 문자열 조립).
+    rca_agent: Option<&str>,
 ) -> String {
     let mut lines = vec!["## aic chat 상태".to_string()];
     lines.push(format!("- provider: {}", provider.unwrap_or("(미설정)")));
@@ -1137,6 +1160,11 @@ pub(crate) fn build_doctor_report(
         }
     ));
     lines.push(format!("- audit key backend: {audit_key_backend}"));
+    // 커널 evidence(rca-agent)는 aic가 생명주기를 소유하지 않는 외부 데몬이라, 켜 뒀는데 죽어
+    // 있으면 `/diagnose --kernel`이 조용히 빈 값을 낸다 — 그 사실을 여기서 먼저 보여 준다.
+    if let Some(state) = rca_agent {
+        lines.push(format!("- rca-agent(커널 evidence): {state}"));
+    }
     lines.push("## env flags (set/unset only)".to_string());
     for (name, present) in env_flags {
         lines.push(format!(
@@ -1712,13 +1740,54 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn parse_slash_diagnose_kernel_flag() {
+        // --kernel/-k는 증상 앞 플래그로 소비되고 증상 텍스트에 섞이지 않는다.
+        assert_eq!(
+            parse_slash("/diagnose --kernel 메모리 누수"),
+            Some(SlashCommand::Diagnose {
+                symptom: Some("메모리 누수".to_string()),
+                analyze: true,
+                kernel: true
+            })
+        );
+        // 짧은 형태 + --raw 조합.
+        assert_eq!(
+            parse_slash("/diagnose -r -k disk full"),
+            Some(SlashCommand::Diagnose {
+                symptom: Some("disk full".to_string()),
+                analyze: false,
+                kernel: true
+            })
+        );
+        // 기본은 off — 수집이 window만큼 블록하므로 opt-in이다.
+        assert_eq!(
+            parse_slash("/diagnose 느림"),
+            Some(SlashCommand::Diagnose {
+                symptom: Some("느림".to_string()),
+                analyze: true,
+                kernel: false
+            })
+        );
+        // 플래그만 주면 증상 없음(일반 health).
+        assert_eq!(
+            parse_slash("/diagnose --kernel"),
+            Some(SlashCommand::Diagnose {
+                symptom: None,
+                analyze: true,
+                kernel: true
+            })
+        );
+    }
+
     fn parse_slash_diagnose_args() {
         // rest-of-line 증상(공백 보존), 기본 analyze=true.
         assert_eq!(
             parse_slash("/diagnose memory pressure"),
             Some(SlashCommand::Diagnose {
                 symptom: Some("memory pressure".to_string()),
-                analyze: true
+                analyze: true,
+                kernel: false
             })
         );
         // 따옴표 strip.
@@ -1726,7 +1795,8 @@ mod tests {
             parse_slash("/diagnose \"맥이 느림\""),
             Some(SlashCommand::Diagnose {
                 symptom: Some("맥이 느림".to_string()),
-                analyze: true
+                analyze: true,
+                kernel: false
             })
         );
         // --raw 선행 플래그 + 증상.
@@ -1734,7 +1804,8 @@ mod tests {
             parse_slash("/diagnose --raw 느림"),
             Some(SlashCommand::Diagnose {
                 symptom: Some("느림".to_string()),
-                analyze: false
+                analyze: false,
+                kernel: false
             })
         );
         // no-arg → generic(symptom None).
@@ -1742,7 +1813,8 @@ mod tests {
             parse_slash("/diagnose"),
             Some(SlashCommand::Diagnose {
                 symptom: None,
-                analyze: true
+                analyze: true,
+                kernel: false
             })
         );
         // -r alias.
@@ -1750,7 +1822,8 @@ mod tests {
             parse_slash("/diagnose -r"),
             Some(SlashCommand::Diagnose {
                 symptom: None,
-                analyze: false
+                analyze: false,
+                kernel: false
             })
         );
     }
@@ -2080,20 +2153,25 @@ mod tests {
             true,
             "file (default)",
             &flags,
+            Some("도달 가능, 활성 신호 4개 (http://127.0.0.1:9090)"),
         );
         assert!(r.contains("provider: ai-mesh"));
         assert!(r.contains("model: kiro/auto"));
         assert!(r.contains("tool-calling: 지원"));
         assert!(r.contains("run_command: on"));
         assert!(r.contains("audit key backend: file (default)"));
+        // 연동이 켜져 있으면 커널 evidence 상태가 한 줄로 보인다.
+        assert!(r.contains("rca-agent(커널 evidence): 도달 가능, 활성 신호 4개"));
         assert!(r.contains("AIC_DEBUG: set"));
         assert!(r.contains("AIC_AGENT_NO_RUN: unset"));
         // env flag는 set/unset만 — 값(예: 1/true)이나 dump가 없어야 한다.
         assert!(r.contains("SECRET_TOKEN: set"));
         assert!(!r.contains("SECRET_TOKEN: 1") && !r.contains("SECRET_TOKEN=true"));
         // 미설정 표시.
-        let r2 = build_doctor_report(None, None, false, false, "file (default)", &[]);
+        let r2 = build_doctor_report(None, None, false, false, "file (default)", &[], None);
         assert!(r2.contains("provider: (미설정)") && r2.contains("run_command: off"));
+        // 연동이 꺼져 있으면 줄 자체가 없다 — 안 쓰는 기능으로 진단을 어지럽히지 않는다.
+        assert!(!r2.contains("rca-agent"));
     }
 
     #[test]
