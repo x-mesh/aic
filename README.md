@@ -2,7 +2,7 @@
 
 > A Rust terminal LLM assistant: shell-error analysis + an SRE chat agent that runs bounded, sandboxed read-only diagnostics. Works with OpenAI-compatible, Groq, Anthropic, and CLI backends.
 
-[![CI](https://github.com/parametacorp/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/parametacorp/aic/actions/workflows/ci.yml)
+[![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
 **Languages:** English · [한국어](./README.ko.md)
 
@@ -107,7 +107,7 @@ graph LR
 #### One-line installer (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/parametacorp/aic-releases/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
 ```
 
 Detects OS/arch (`linux`/`darwin` × `amd64`/`arm64`), downloads the
@@ -128,7 +128,7 @@ After installing, enable autostart once: `aic daemon install`
 #### Build from source
 
 ```bash
-git clone https://github.com/parametacorp/aic.git && cd aic
+git clone https://github.com/x-mesh/aic.git && cd aic
 cargo build --workspace --release
 cargo install --path aic-server   # installs aic-session + aicd
 cargo install --path aic-client   # installs aic
