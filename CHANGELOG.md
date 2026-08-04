@@ -27,6 +27,12 @@
   수신 여부만 알린다. `--dry-run`도 이 덮어쓰기 범위를 함께 보여주므로, 이미 endpoint·key가
   들어 있는 호스트에서 무엇이 바뀔지 미리 확인할 수 있다.
 
+### Fixed
+- **사설 CA 뒤의 RCA collector에 TLS로 접속할 수 없던 문제** — reqwest가 번들 webpki 루트만
+  신뢰해서, 운영자가 사내 CA를 OS 신뢰 저장소에 설치해도 aicd가 인증서 오류로 거부했다.
+  `rustls-tls-native-roots`로 전환해 "호스트가 신뢰하는 CA는 aic도 신뢰한다"가 성립한다 —
+  exporter fleet을 평문 :8080에서 TLS로 옮기기 위한 선행 조건.
+
 ## [0.32.2] - 2026-07-30
 
 ### Fixed

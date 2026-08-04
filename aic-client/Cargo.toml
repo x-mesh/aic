@@ -32,7 +32,11 @@ thiserror = "2"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# rustls-tls-native-roots (not plain rustls-tls = bundled webpki roots): the
+# RCA server may sit behind a private CA, and webpki roots ignore the OS trust
+# store entirely — an operator installing their CA system-wide would still get
+# certificate errors. Native roots make "trust what the host trusts" hold.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream"] }
 # `aic web` 읽기 전용 대시보드(MVP-0). aic-server와 동일한 axum 0.8. query: /web/local 증분 폴링(?since=).
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 clap = { version = "4", features = ["derive", "env"] }
