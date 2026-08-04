@@ -24,6 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # ubuntu 러너 디스크 고갈 방지(test 잡과 같은 이유).
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -145,6 +152,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      # ubuntu 러너 디스크 고갈 방지(test 잡과 같은 이유).
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
 
