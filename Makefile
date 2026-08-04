@@ -338,7 +338,7 @@ ci-quick: lint test
 #
 # release VERSION=0.3.0
 #   tag VERSION=... + push origin main + push tag. CI가 GoReleaser 발화.
-#   첫 사용 전에 origin remote가 git@github.com:x-mesh/aic.git을 가리키는지 확인.
+#   첫 사용 전에 origin remote가 git@github.com:parametacorp/aic.git을 가리키는지 확인.
 
 .PHONY: bump-version
 bump-version:
@@ -372,7 +372,7 @@ tag: bump-version
 release-publish: tag
 	@git push origin main && git push origin v$(VERSION)
 	@echo "✓ push 완료. Actions 탭에서 release workflow 확인:"
-	@echo "  https://github.com/x-mesh/aic/actions"
+	@echo "  https://github.com/parametacorp/aic/actions"
 
 # ─── 도움말 ─────────────────────────────────────────────────
 
