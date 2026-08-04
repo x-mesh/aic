@@ -1569,6 +1569,28 @@ struct EnrollmentResponse {
     ingest_token: String,
     provider: String,
     model: String,
+    /// RCA가 fleet LLM 게이트웨이를 관리할 때 함께 내려주는 provider 상세.
+    /// 구버전 서버 응답에는 없으므로 전부 Option — 없으면 기존 동작
+    /// (provider 이름/모델만 반영, endpoint/credential은 호스트 값 보존).
+    #[serde(default)]
+    llm_provider_type: Option<String>,
+    #[serde(default)]
+    llm_endpoint: Option<String>,
+    #[serde(default)]
+    llm_api_key: Option<String>,
+}
+
+/// RCA가 보낸 provider_type 문자열 → [`ProviderType`]. 모르는 값은 None —
+/// 호출부는 그때 기존 provider_type을 보존한다 (더 새로운 서버가 이 클라이언트가
+/// 모르는 타입을 내려도 config를 망가뜨리지 않는다).
+fn parse_rca_provider_type(s: &str) -> Option<ProviderType> {
+    match s.trim() {
+        "OpenAiCompatible" => Some(ProviderType::OpenAiCompatible),
+        "Groq" => Some(ProviderType::Groq),
+        "Anthropic" => Some(ProviderType::Anthropic),
+        "CliBackend" => Some(ProviderType::CliBackend),
+        _ => None,
+    }
 }
 
 /// `aic enroll`: 일회용 RCA key를 telemetry token으로 교환하고, 성공한 응답만 설정에 반영한다.
@@ -1623,8 +1645,9 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     config.aicd.exporter.token = Some(enrolled.ingest_token);
     // 어떤 등록으로 연결됐는지 남긴다 — 화면 출력만으로는 사용자가 그때 기억해야 한다.
     config.aicd.exporter.enrollment_id = Some(enrolled.enrollment_id.clone());
-    // RCA가 선택한 provider/model을 기본값으로 반영한다. credential은 enrollment 응답에
-    // 포함되지 않으므로 기존 provider의 api_key/endpoint는 보존한다.
+    // RCA가 선택한 provider/model을 기본값으로 반영한다. 서버가 endpoint/credential을
+    // 함께 내려주면(fleet 게이트웨이 관리 시) 그대로 적용해 설치가 무설정으로 끝나고,
+    // 내려주지 않은 필드는 호스트의 기존 값을 보존한다.
     let provider = config
         .llm
         .providers
@@ -1638,6 +1661,15 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
             cli_args: None,
         });
     provider.model = Some(enrolled.model.clone());
+    if let Some(pt) = enrolled.llm_provider_type.as_deref().and_then(parse_rca_provider_type) {
+        provider.provider_type = pt;
+    }
+    if let Some(ep) = enrolled.llm_endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        provider.endpoint = Some(ep.to_string());
+    }
+    if let Some(key) = enrolled.llm_api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        provider.api_key = Some(key.to_string());
+    }
     config.llm.default_provider = enrolled.provider.clone();
     save_config(&config)?;
 
@@ -1651,6 +1683,13 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     println!("  host:     {}", enrolled.host_name);
     println!("  endpoint: {}", config.aicd.exporter.endpoint);
     println!("  provider: {} ({})", enrolled.provider, enrolled.model);
+    if let Some(ep) = &enrolled.llm_endpoint {
+        // key 원문은 절대 출력하지 않는다 — 수신 여부만.
+        println!(
+            "  llm:      {ep} ({})",
+            if enrolled.llm_api_key.is_some() { "api_key 수신·저장됨" } else { "api_key 미포함" }
+        );
+    }
     println!(
         "  aicd:     {}",
         if report.loaded {
@@ -1720,6 +1759,15 @@ fn validate_enrollment_response(response: &EnrollmentResponse) -> anyhow::Result
         || response.model.trim().is_empty()
     {
         anyhow::bail!("RCA enrollment 응답에 필수 필드가 없습니다");
+    }
+    // llm_endpoint는 선택 필드지만, 왔다면 telemetry endpoint와 같은 이유로 scheme을
+    // 검증한다 — 잘못된 값을 config에 넣고 나면 key는 이미 소비된 뒤다.
+    if let Some(ep) = response.llm_endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        let parsed = reqwest::Url::parse(ep)
+            .map_err(|_| anyhow::anyhow!("RCA가 유효하지 않은 LLM endpoint를 반환했습니다"))?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            anyhow::bail!("RCA가 유효하지 않은 LLM endpoint를 반환했습니다");
+        }
     }
     Ok(())
 }
@@ -5630,6 +5678,9 @@ mod enrollment_response_tests {
             ingest_token: "tok_abc".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
+            llm_provider_type: None,
+            llm_endpoint: None,
+            llm_api_key: None,
         }
     }
 
@@ -5694,6 +5745,31 @@ mod enrollment_response_tests {
         let mut r = valid();
         r.model = " ".to_string();
         assert!(validate_enrollment_response(&r).is_err(), "model");
+    }
+
+    /// llm_endpoint는 없어도 되고(구버전 서버), 있으면 http(s)여야 한다.
+    #[test]
+    fn llm_endpoint_optional_but_scheme_checked() {
+        let mut r = valid();
+        r.llm_endpoint = Some("https://ai-mesh.24x365.online/v1/chat/completions".to_string());
+        assert!(validate_enrollment_response(&r).is_ok());
+
+        r.llm_endpoint = Some("file:///etc/passwd".to_string());
+        assert!(validate_enrollment_response(&r).is_err());
+
+        // 빈 문자열은 "없음"과 동치 — 서버가 필드를 비워 보내도 실패하지 않는다.
+        r.llm_endpoint = Some("  ".to_string());
+        assert!(validate_enrollment_response(&r).is_ok());
+    }
+
+    #[test]
+    fn provider_type_parsing_is_conservative() {
+        use super::parse_rca_provider_type;
+        use aic_common::ProviderType;
+        assert_eq!(parse_rca_provider_type("OpenAiCompatible"), Some(ProviderType::OpenAiCompatible));
+        assert_eq!(parse_rca_provider_type("Anthropic"), Some(ProviderType::Anthropic));
+        // 모르는 타입은 None — 기존 provider_type을 보존해야 한다.
+        assert_eq!(parse_rca_provider_type("QuantumBackend"), None);
     }
 }
 
