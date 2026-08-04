@@ -170,8 +170,10 @@ run-config: build
 .PHONY: install
 install:
 	@mkdir -p "$(BINDIR)"
-	cargo install --path aic-server --root "$(PREFIX)"
-	cargo install --path aic-client --root "$(PREFIX)"
+	# --force: 이 타겟은 재설치가 정상 흐름(고치고 다시 깔기)인데, cargo install은 같은 이름
+	# binary가 이미 있으면 기본적으로 거부한다 — 없으면 두 번째 `make install`부터 늘 실패한다.
+	cargo install --force --path aic-server --root "$(PREFIX)"
+	cargo install --force --path aic-client --root "$(PREFIX)"
 	@echo "설치 경로: $(BINDIR)"
 	@"$(BINDIR)/aic" daemon restart --if-running
 
