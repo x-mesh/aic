@@ -635,6 +635,25 @@ async fn push(
     if !status.is_success() {
         return Err(classify(status));
     }
+    // 200이어도 collector가 일부(또는 전부)를 버렸을 수 있다 — 그 사실은 body의
+    // `partial_success`에만 담긴다. 안 읽으면 "보냈는데 수신측에 없는" 상태를 영영 모른다
+    // (실측: aic.kernel.*가 catalog에 안 뜨는데 발신 로그는 깨끗했다).
+    //
+    // 재전송해도 같은 결과라 **성공으로 유지**한다 — 재시도·spool 대상이 아니다. 대신 소리를
+    // 낸다: 폐기는 설정/배포 문제(미등록 scope·미지원 타입)이지 일시 장애가 아니므로, 운영자가
+    // 보고 고칠 수 있게 WARN으로 올린다.
+    let Ok(resp_body) = resp.bytes().await else {
+        return Ok(()); // body 읽기 실패 — push 자체는 성공(200)이라 재시도하지 않는다.
+    };
+    let (rejected, reason) = encode::decode_metrics_partial_reject(&resp_body);
+    if rejected > 0 {
+        tracing::warn!(
+            rejected,
+            reason = %reason,
+            url = %url,
+            "collector가 metric data point를 폐기했다 — 수신측 등록/스키마를 확인하세요"
+        );
+    }
     Ok(())
 }
 
