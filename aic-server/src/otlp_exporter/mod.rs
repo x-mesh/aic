@@ -46,6 +46,8 @@ mod events;
 mod health;
 mod host_extra;
 mod host_metrics;
+// PRD Lane C: rca-agent 커널 카운터 delta 릴레이(aic.kernel.*).
+mod kernel;
 pub mod logs;
 pub mod logs_proto;
 mod ntp;
@@ -60,6 +62,7 @@ pub use dns::{serve_dns, DnsConfig};
 pub use docker::{resolve_docker_bin, serve_docker, DockerConfig};
 pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;
+pub use kernel::{ensure_loopback, serve_kernel, KernelConfig};
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
 pub use spool::{SignalKind, Spool};
 
@@ -144,7 +147,9 @@ async fn drain_spool(
                 // partial_success 폐기 수(Ok(u64))는 드레인 성패와 무관하므로 버린다(신규 push
                 // 경로에서만 게이지에 반영한다 — 드레인은 과거 배치 재전송이라 이중 계수 방지).
                 SignalKind::Logs | SignalKind::AppLogs => {
-                    push_logs(client, logs_endpoint, token, batch_body).await.map(|_| ())
+                    push_logs(client, logs_endpoint, token, batch_body)
+                        .await
+                        .map(|_| ())
                 }
             }
         })
@@ -181,7 +186,8 @@ pub async fn serve(
     let mut process_dropped_last = false;
     // 프로세스 인벤토리 CDC의 diff 상태(이전 tick 인벤토리). tick 간 delta를 계산한다 — config가
     // 꺼져 있으면 diff를 아예 돌리지 않으므로 prev가 낡을 일이 없다(config는 실행 중 불변).
-    let mut inv_tracker = process_inventory::InventoryTracker::new(PROCESS_INVENTORY_KEYFRAME_TICKS);
+    let mut inv_tracker =
+        process_inventory::InventoryTracker::new(PROCESS_INVENTORY_KEYFRAME_TICKS);
     let mut inv_dropped_last = false;
     // 직전 인벤토리 스캔 시각(unix 초). `remove` 레코드의 **종료 시각 하한**으로 실린다 — diff가
     // 직전 스냅샷 대비이므로 사라진 프로세스는 그 시점엔 살아 있었던 게 확정이다. 첫 tick에는
