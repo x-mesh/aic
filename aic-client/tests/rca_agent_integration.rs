@@ -85,6 +85,13 @@ async fn features_returns_attach_status() {
     assert!(out.contains("kernel_capabilities"));
 }
 
+/// 비-2xx 응답이 삼켜지지 않고 상태코드·본문과 함께 올라오는지 검증한다.
+///
+/// **409는 실제 rca-agent의 계약이 아니다.** 동시 collect를 막는 가드가 서버에 없고
+/// (`internal/control/collector.go`에 mutex 0건, "collect already in progress" 문자열도
+/// 저장소 전체에 0건), 여기서는 임의의 비-2xx 오류를 대표시키는 목일 뿐이다.
+/// 따라서 이 목을 근거로 "서버가 경합을 막아 준다"고 설계하면 안 된다 —
+/// aicd 주기 수집을 붙일 때는 수집 중 tick을 건너뛰는 **자체 상호배제**가 필요하다.
 #[tokio::test]
 async fn agent_error_status_is_surfaced() {
     let server = MockServer::start().await;
