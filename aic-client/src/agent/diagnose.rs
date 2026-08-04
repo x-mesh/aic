@@ -165,7 +165,7 @@ pub struct DiagnoseOptions {
 
 /// `--kernel` 수집 window. diagnose는 단발 분석이라 이 시간만큼 사용자를 붙잡아 두므로
 /// 도구 기본값(30s)이 아니라 UX 상한인 5초를 쓴다.
-const KERNEL_WINDOW_SECS: u64 = 5;
+pub(crate) const KERNEL_WINDOW_SECS: u64 = 5;
 
 /// `rca.evidence.v1` 번들 → 커널 finding 목록. **결정적 매핑, LLM 무관, 순수 함수.**
 ///

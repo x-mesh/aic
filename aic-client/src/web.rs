@@ -2483,7 +2483,7 @@ async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
                 .features()
                 .await
                 .ok()
-                .and_then(|b| count_active_signals(&b))
+                .and_then(|b| crate::agent::rca_agent::count_active_signals(&b))
         } else {
             None
         };
@@ -2526,21 +2526,6 @@ fn rca_agent_freshness(reachable: bool, active_signals: Option<usize>) -> Value 
         "age_secs": Value::Null,
         "active_signals": active_signals,
     })
-}
-
-/// `/featuresz` JSON에서 활성 신호 수를 센다(pure). `kernel_capabilities`는 신호가 아니라 제외.
-/// 파싱 실패/예상 밖 구조면 `None` — 요약을 죽이지 않는다.
-fn count_active_signals(body: &str) -> Option<usize> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    let obj = v.as_object()?;
-    Some(
-        obj.iter()
-            .filter(|(name, e)| {
-                *name != "kernel_capabilities"
-                    && e.get("enabled").and_then(Value::as_bool) == Some(true)
-            })
-            .count(),
-    )
 }
 
 /// D3: 한 데이터 소스의 신선도를 노출용 JSON으로(pure — 단위 테스트 대상). last_ts가 없으면
@@ -2935,6 +2920,7 @@ mod tests {
             "scheduler": {"enabled": false, "attach": "disabled"},
             "kernel_capabilities": {"btf": true, "tracing": true}
         }"#;
+        use crate::agent::rca_agent::count_active_signals;
         assert_eq!(count_active_signals(body), Some(2));
         assert_eq!(count_active_signals("not json"), None);
         assert_eq!(count_active_signals("[]"), None);

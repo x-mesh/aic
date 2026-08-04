@@ -1082,8 +1082,13 @@ impl AgentSession {
             SlashCommand::Local { sections, analyze } => {
                 self.handle_local(&sections, analyze).await
             }
-            SlashCommand::Diagnose { symptom, analyze } => {
-                self.handle_diagnose(symptom.as_deref(), analyze).await
+            SlashCommand::Diagnose {
+                symptom,
+                analyze,
+                kernel,
+            } => {
+                self.handle_diagnose(symptom.as_deref(), analyze, kernel)
+                    .await
             }
             SlashCommand::ExplainLast { target, analyze } => {
                 self.handle_explain_last(target.as_deref(), analyze).await
@@ -1433,7 +1438,7 @@ impl AgentSession {
 
     /// `/diagnose` — 증상→결정적 Safe probe 선택→수집→가설/증거/다음확인 분석(read-only).
     /// `/local`과 동일 철학: probe 선택은 호스트가 결정, 분석은 tool-less·stateless 단발(history 미push).
-    async fn handle_diagnose(&mut self, symptom: Option<&str>, analyze: bool) {
+    async fn handle_diagnose(&mut self, symptom: Option<&str>, analyze: bool, kernel: bool) {
         if !self.allow_run_command {
             self.out
                 .note(
@@ -1454,7 +1459,42 @@ impl AgentSession {
         let mut snapshot = self.collect_local_snapshot(probes, !do_analyze).await;
         // 결정적 임계 스캔(LLM 무관 즉시 신호) — 대화형에도 노출(headless와 동등). 발견을 사용자에게
         // 표시하고, analyze면 LLM evidence 상단에도 prepend해 진단을 그 신호 위에서 시작하게 한다.
-        let findings = super::diagnose::scan_findings(&snapshot);
+        let mut findings = super::diagnose::scan_findings(&snapshot);
+        // `--kernel`: 로컬 rca-agent에서 짧은 window로 커널 delta를 재 evidence·finding에 얹는다.
+        // CLI `aic diagnose --kernel`과 같은 결정적 매핑(외부 출처·Medium 신뢰도 고정)을 쓰되,
+        // 여기서는 세션이 이미 들고 있는 클라이언트를 재사용한다. 연동이 꺼져 있거나 수집이
+        // 실패하면 한 줄만 알리고 로컬 진단은 그대로 진행한다 — 커널 신호는 부가 정보다.
+        if kernel {
+            match &self.rca_agent {
+                Some(client) => {
+                    self.out
+                        .note(&format!(
+                            "  (커널 신호 {}초 측정 중…)",
+                            super::diagnose::KERNEL_WINDOW_SECS
+                        ))
+                        .await;
+                    match client.collect(super::diagnose::KERNEL_WINDOW_SECS).await {
+                        Ok(bundle) => {
+                            findings.extend(super::diagnose::kernel_findings(&bundle));
+                            snapshot.push_str(&format!(
+                                "\n## {}\n{bundle}\n",
+                                super::diagnose::KERNEL_SECTION
+                            ));
+                        }
+                        Err(e) => {
+                            self.out
+                                .note(&format!("  (커널 신호 건너뜀: {})", e.message))
+                                .await;
+                        }
+                    }
+                }
+                None => {
+                    self.out
+                        .note("  (커널 신호 건너뜀: config [rca_agent]에 enabled = true가 필요합니다)")
+                        .await;
+                }
+            }
+        }
         super::diagnose::emit_findings(&findings);
         let block = super::diagnose::render_findings_block(&findings);
         if !block.is_empty() {
@@ -1600,6 +1640,18 @@ impl AgentSession {
             ("NO_COLOR", std::env::var_os("NO_COLOR").is_some()),
             ("AIC_REDACT", std::env::var_os("AIC_REDACT").is_some()),
         ];
+        // 연동이 켜져 있을 때만 실제로 찔러 본다(loopback·짧은 timeout). 켜 뒀는데 죽어 있으면
+        // `/diagnose --kernel`이 조용히 빈 값을 내므로, 진단 전에 여기서 드러나야 한다.
+        let rca_state: Option<String> = match &self.rca_agent {
+            Some(client) => Some(match client.features().await {
+                Ok(body) => {
+                    let n = super::rca_agent::count_active_signals(&body).unwrap_or(0);
+                    format!("도달 가능, 활성 신호 {n}개 ({})", client.base())
+                }
+                Err(e) => format!("도달 불가 — {}", e.message),
+            }),
+            None => None,
+        };
         let report = tool_record::build_doctor_report(
             self.provider.as_deref(),
             self.model.as_deref(),
@@ -1607,6 +1659,7 @@ impl AgentSession {
             self.allow_run_command,
             crate::audit::audit_key_backend(),
             &flags,
+            rca_state.as_deref(),
         );
         let body = if ui::is_tty() {
             super::markdown::render_markdown(&report, ui::render_width(), ui::color_enabled())
