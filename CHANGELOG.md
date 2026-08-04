@@ -4,6 +4,35 @@
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-08-04
+
+### Added
+- **`aic doctor`가 rca-agent 상태를 함께 본다** — config `[rca_agent]`를 켜 두면 커널
+  evidence collector의 도달성(`/healthz`)과 실제 측정 능력(`/featuresz`: 활성 신호 수,
+  attach가 깨진 신호 목록)을 진단에 포함한다. 프로세스가 살아 있어도 신호가 전부
+  opt-in 비활성이거나 attach가 실패했으면 수집되는 게 없으므로 그 사실을 드러낸다.
+  aicd supervisor와 같은 **optional 등급**이라 미기동은 WARN이고, 비활성이면 스킵한다 —
+  rca-agent는 aic가 생명주기를 소유하지 않는 별도 데몬이다.
+- **`aic diagnose --kernel`** — 로컬 rca-agent에서 5초짜리 커널 evidence를 수집해 증거와
+  finding에 편입한다. 번들의 관측 항목은 결정적 매핑으로 `외부` 출처 배지가 붙은 finding이
+  되며, LLM을 거치지 않는다. 임계값 없는 delta를 심각으로 승격하지 않아 "에이전트는 판정하지
+  않는다"는 경계를 그대로 지킨다. opt-in이며, rca-agent가 없거나 꺼져 있으면 조용히 건너뛰고
+  기존 로컬 진단은 그대로 진행된다.
+
+### Fixed
+- **성공한 enrollment가 실패로 보고되던 문제** — `aic enroll`은 일회용 key 교환과 config
+  저장이 모두 끝난 뒤 aicd를 자동 시작 등록하는데, 이 마지막 단계가 실패하면 명령 전체가
+  `✗ enrollment 실패`가 됐다. 실제로는 등록이 끝나 호스트 수집이 시작된 뒤였고, 운영자는
+  멀쩡한 등록을 실패로 읽고 새 key를 발급해 재시도했다. 이제 이 단계의 실패는 경고로
+  격하되고 "enrollment는 완료됐고 aicd 등록만 남았다 — `aic daemon install`로 마저
+  진행하라"고 안내한다.
+- **로그인 셸 밖에서 daemon/타이머 등록이 D-Bus 오류로 죽던 문제** — `curl … | sh` 설치
+  스크립트나 cron처럼 로그인 세션 밖에서 실행하면 `/run/user/<uid>`가 실재해도
+  `XDG_RUNTIME_DIR`가 비어 있어 systemd user 세션에 붙지 못했다. 런타임 디렉터리가 실재할
+  때 이를 채워 주고, 그래도 실패하면 raw D-Bus 문구 대신 `XDG_RUNTIME_DIR` 설정이나
+  `loginctl enable-linger` 같은 다음 행동을 안내한다. `aic daemon install`과
+  `aic snapshot install` 양쪽에 적용된다.
+
 ## [0.34.0] - 2026-08-04
 
 ### Added
