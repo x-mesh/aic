@@ -54,9 +54,11 @@ prost = "0.13"
 # host metrics 수집 — aic-client와 동일 버전/feature(system/disk/network). aic-server용 최소
 # 샘플러를 새로 작성하므로 aic-client에 의존하지 않는다(sys_sampler는 pub(crate)).
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
-# OTLP protobuf를 HTTP POST. aic-client와 동일한 reqwest 0.12(rustls-tls). protobuf bytes만 보내므로
+# OTLP protobuf를 HTTP POST. aic-client와 동일한 reqwest 0.12. protobuf bytes만 보내므로
 # json feature는 불필요. redirect는 기본값(collector는 보통 단일 endpoint).
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# native-roots인 이유는 aic-client/Cargo.toml의 동일 의존성 주석 참고 — 사설 CA 뒤의
+# RCA collector를 OS 신뢰 저장소로 신뢰할 수 있어야 exporter TLS 전환이 가능하다.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 # SRE t8: OTLP spool 드레인 backoff jitter. aic-common이 이미 rand 0.8을 쓰고 있어 동일 버전으로 맞춘다.
 rand = "0.8"
 
