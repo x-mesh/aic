@@ -83,6 +83,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                     mcp: McpConfig::default(),
                     rca: RcaConfig::default(),
                     outbound: OutboundConfig::default(),
+                    rca_agent: RcaAgentConfig::default(),
                 }
             },
         )
