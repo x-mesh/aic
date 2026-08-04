@@ -319,9 +319,6 @@ pub struct AppConfig {
     /// 외부 전송(팀 공유) 설정 (Phase 2 O3). 레거시 호환 default — 미설정 시 등록 목적지 없음.
     #[serde(default)]
     pub outbound: OutboundConfig,
-    /// rca-agent(커널 eBPF evidence collector) pull 연동 설정. 레거시 호환 default — 미설정 시 비활성.
-    #[serde(default)]
-    pub rca_agent: RcaAgentConfig,
 }
 
 /// RCA 워크플로 설정 (SRE).
@@ -331,35 +328,6 @@ pub struct RcaConfig {
     /// 기본 false — incident-memory 배선은 명시적 opt-in을 유지한다.
     #[serde(default)]
     pub auto_remember: bool,
-}
-
-/// rca-agent(RCA-eBPF 커널 eBPF evidence collector) localhost pull 연동 설정.
-///
-/// rca-agent는 CAP_BPF가 필요한 별도 system 데몬이다 — 생명주기는 system systemd가
-/// 소유하고 aic/aicd는 control API의 소비자다(부모-자식이 아니라 소비자-생산자).
-/// evidence bundle(`rca.evidence.v1`)은 PID/comm/cgroup entity를 담으므로 URL은
-/// loopback만 허용한다 — 원격 전송은 rca-agent 쪽 opt-in push(ADR-0048)의 몫이다.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RcaAgentConfig {
-    /// 연동 활성화. 기본 false — 명시적 opt-in.
-    #[serde(default)]
-    pub enabled: bool,
-    /// control API base URL(loopback 전용). rca-agent 기본 health port는 9090.
-    #[serde(default = "default_rca_agent_url")]
-    pub url: String,
-}
-
-impl Default for RcaAgentConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: default_rca_agent_url(),
-        }
-    }
-}
-
-fn default_rca_agent_url() -> String {
-    "http://127.0.0.1:9090".to_string()
 }
 
 /// 외부 전송 설정 (Phase 2 O3). 목적지 이름 → 설정. 미설정 시 빈 맵(전송 불가 — deny-by-default).
