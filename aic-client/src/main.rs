@@ -432,6 +432,10 @@ enum Commands {
         /// 게이트: probe catalog/템플릿 전용 + 인자 증거-실존 + risk_guard Safe + validator.
         #[arg(long)]
         follow_up: bool,
+        /// 로컬 rca-agent에서 5초짜리 커널 evidence를 수집해 증거·finding에 편입한다.
+        /// config [rca_agent] 활성 필요 — 비활성이거나 에이전트가 없으면 조용히 건너뛴다.
+        #[arg(long)]
+        kernel: bool,
         /// 결과를 `~/.aic/bundles/`에 번들 파일로도 저장한다.
         #[arg(long)]
         bundle: bool,
@@ -1417,6 +1421,7 @@ async fn main() {
             symptom,
             no_analyze,
             follow_up,
+            kernel,
             bundle,
             name,
             json,
@@ -1426,6 +1431,7 @@ async fn main() {
                 symptom,
                 no_analyze,
                 follow_up,
+                kernel,
                 bundle,
                 json,
                 name,
@@ -8311,10 +8317,14 @@ async fn handle_chat(
 ///
 /// AgentSession(대화형 UI) 없이 `diagnose::run_headless_diagnose`를 호출해 증거+분석을 stdout에
 /// markdown으로 출력한다. webhook 자동 초동 진단(R2)의 spawn 타깃이자, cron/스크립트용 독립 기능.
+// CLI 플래그를 그대로 받는 어댑터라 인자 수는 서브커맨드 필드 수를 따라간다 —
+// 중간 구조체를 끼우면 clap 정의와 이중 관리가 된다.
+#[allow(clippy::too_many_arguments)]
 async fn handle_diagnose_cli(
     symptom_parts: Vec<String>,
     no_analyze: bool,
     follow_up: bool,
+    kernel: bool,
     bundle: bool,
     json: bool,
     name: Option<String>,
@@ -8343,7 +8353,7 @@ async fn handle_diagnose_cli(
         &sandbox,
         dispatcher_ref,
         &corr,
-        aic_client::agent::diagnose::DiagnoseOptions { follow_up },
+        aic_client::agent::diagnose::DiagnoseOptions { follow_up, kernel },
     )
     .await;
 
@@ -8407,7 +8417,10 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                     &sandbox,
                     dispatcher_ref,
                     &corr,
-                    aic_client::agent::diagnose::DiagnoseOptions { follow_up },
+                    aic_client::agent::diagnose::DiagnoseOptions {
+                        follow_up,
+                        kernel: false,
+                    },
                 )
                 .await;
                 let md = result.to_markdown();
@@ -8460,7 +8473,10 @@ async fn handle_rca(op: RcaOp, global_provider: Option<String>) -> anyhow::Resul
                 &sandbox,
                 dispatcher_ref,
                 &corr,
-                aic_client::agent::diagnose::DiagnoseOptions { follow_up },
+                aic_client::agent::diagnose::DiagnoseOptions {
+                    follow_up,
+                    kernel: false,
+                },
             )
             .await;
             let md = result.to_markdown();

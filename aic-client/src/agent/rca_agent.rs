@@ -126,6 +126,14 @@ impl RcaAgentClient {
         self.send(req).await
     }
 
+    /// `GET /healthz` — 도달성만 확인하는 논블로킹 프로브(doctor 헬스체크용).
+    /// collect와 달리 window를 잡지 않으므로 짧은 timeout으로 충분하다.
+    pub async fn health(&self) -> Result<String, ToolError> {
+        let url = format!("{}/healthz", self.base);
+        let req = self.http.get(&url).timeout(Duration::from_secs(2));
+        self.send(req).await
+    }
+
     /// `GET /featuresz` — 신호별 attach 상태 + kernel capability.
     pub async fn features(&self) -> Result<String, ToolError> {
         let url = format!("{}/featuresz", self.base);

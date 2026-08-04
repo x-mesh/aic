@@ -156,6 +156,106 @@ pub struct DiagnoseOptions {
     /// LLM이 제안한 follow-up probe를 1라운드 자동 실행해 재분석한다(opt-in).
     /// 게이트: catalog/템플릿 전용 + 인자 증거-실존 + risk_guard Safe + validator(직렬).
     pub follow_up: bool,
+    /// 로컬 rca-agent에서 짧은 window(`KERNEL_WINDOW_SECS`) 커널 evidence를 수집해
+    /// 증거·finding에 편입한다(opt-in, `aic diagnose --kernel`). config `[rca_agent]`가
+    /// 비활성이거나 에이전트가 없으면 조용히 건너뛴다 — 커널 신호는 부가 정보이지
+    /// 진단의 전제가 아니다.
+    pub kernel: bool,
+}
+
+/// `--kernel` 수집 window. diagnose는 단발 분석이라 이 시간만큼 사용자를 붙잡아 두므로
+/// 도구 기본값(30s)이 아니라 UX 상한인 5초를 쓴다.
+const KERNEL_WINDOW_SECS: u64 = 5;
+
+/// `rca.evidence.v1` 번들 → 커널 finding 목록. **결정적 매핑, LLM 무관, 순수 함수.**
+///
+/// 에이전트는 판정하지 않는 collector라 번들의 `observations.findings[]`는 임계값 없는
+/// "관측된 delta" 나열이다. 그래서 여기서 두 가지를 고정한다:
+/// - `source`는 항상 [`SourceQuality::External`] — 로컬에서 직접 잰 값이 아니라 외부
+///   프로세스가 커널에서 받아 넘긴 값이다.
+/// - `confidence`는 항상 `Medium` — 에이전트가 귀속(attribution)을 증명하지 않으므로
+///   로컬 임계 스캔(High)과 같은 급으로 취급하면 안 된다.
+///
+/// severity는 번들의 문자열을 따르되(`warning`→Warn, 그 외→Normal) **임계값이 없는 신호를
+/// Crit으로 승격하지 않는다** — 판정은 소비자 몫이라는 경계(ADR-0007)를 여기서도 지킨다.
+/// 파싱 실패나 예상 밖 구조면 빈 목록으로 물러나 진단 전체를 죽이지 않는다.
+pub(crate) fn kernel_findings(bundle_json: &str) -> Vec<Finding> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(bundle_json) else {
+        return Vec::new();
+    };
+    let Some(items) = v
+        .get("observations")
+        .and_then(|o| o.get("findings"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for it in items {
+        let signal = it
+            .get("signal")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let metric = it
+            .get("metric")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if signal.is_empty() {
+            continue;
+        }
+        let interpretation = it
+            .get("interpretation")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("커널 신호 변화");
+        let severity = match it.get("severity").and_then(serde_json::Value::as_str) {
+            Some("warning") | Some("critical") => Severity::Warn,
+            _ => Severity::Normal,
+        };
+        // 값은 있으면 붙인다 — rate가 더 읽기 쉬우므로 있으면 우선한다.
+        let magnitude = match (
+            it.get("rate_per_sec").and_then(serde_json::Value::as_f64),
+            it.get("value").and_then(serde_json::Value::as_f64),
+        ) {
+            (Some(rate), _) if rate > 0.0 => format!(" ({rate:.1}/s)"),
+            (_, Some(value)) => format!(" ({value:.0})"),
+            _ => String::new(),
+        };
+        let metric_label = if metric.is_empty() {
+            String::new()
+        } else {
+            format!(".{metric}")
+        };
+        out.push(Finding {
+            severity,
+            confidence: Confidence::Medium,
+            source: SourceQuality::External,
+            probe_id: KERNEL_SECTION.to_string(),
+            message: format!("kernel/{signal}{metric_label}: {interpretation}{magnitude}"),
+            suggested_followup: None,
+        });
+    }
+    out
+}
+
+/// 커널 evidence가 들어가는 섹션 이름 — finding의 `probe_id`이자 evidence 헤더다.
+pub(crate) const KERNEL_SECTION: &str = "rca_agent_kernel";
+
+/// 로컬 rca-agent에서 `KERNEL_WINDOW_SECS`짜리 evidence 번들을 당긴다.
+///
+/// 실패는 전부 `None` — 비활성(기본), 미기동, 설정 오류, 타임아웃 어느 쪽이든 진단은
+/// 로컬 probe만으로 계속된다. 사용자가 `--kernel`을 줬는데 왜 비었는지는
+/// `aic doctor`의 rca-agent 체크가 설명한다(중복 진단 문구를 여기 두지 않는다).
+async fn collect_kernel_evidence() -> Option<String> {
+    let cfg = crate::config::ConfigManager::load().ok()?;
+    let client = super::rca_agent::RcaAgentClient::new(&cfg.rca_agent).ok()??;
+    match client.collect(KERNEL_WINDOW_SECS).await {
+        Ok(bundle) => Some(bundle),
+        Err(e) => {
+            crate::agent::debug::log(format_args!("kernel evidence 수집 건너뜀: {}", e.message));
+            None
+        }
+    }
 }
 
 /// follow-up bounds(council 합의) — 1라운드 고정·명령 수·출력 합산 상한.
@@ -284,9 +384,21 @@ pub async fn run_headless_diagnose_opts(
 ) -> HeadlessDiagnosis {
     let mut evidence = collect_probe_evidence(symptom, sandbox, corr_prefix);
 
+    // (B2) 커널 evidence 편입 — opt-in. rca-agent는 aic가 소유하지 않는 별도 데몬이라
+    // 비활성·미기동·오류는 전부 **조용히 건너뛴다**: 커널 신호는 부가 정보이지 진단의
+    // 전제가 아니므로, 없다고 로컬 probe 진단까지 실패시키면 안 된다.
+    let mut kernel_extra: Vec<Finding> = Vec::new();
+    if opts.kernel {
+        if let Some(bundle) = collect_kernel_evidence().await {
+            kernel_extra = kernel_findings(&bundle);
+            evidence.push_str(&format!("\n## {KERNEL_SECTION}\n{bundle}\n"));
+        }
+    }
+
     // 결정적 임계 스캔 — LLM 호출 0으로 확실한 위반(디스크 full·OOM kill·좀비·실패 unit)을 추출해
     // evidence 상단에 고정한다. dispatcher가 없어도(오프라인/--no-analyze) 동작하는 유일 신호.
-    let auto_findings = scan_findings(&evidence);
+    let mut auto_findings = scan_findings(&evidence);
+    auto_findings.extend(kernel_extra);
     // finding은 severity를 가진 사건의 시작점이라 서버로 넘긴다. `scan_findings` 자체는 순수
     // 함수로 두고(테스트가 매 호출마다 IPC를 시도하지 않도록) 여기 호출부에서 발화한다.
     emit_findings(&auto_findings);
@@ -1082,7 +1194,11 @@ fn scan_proc_fd(body: &str) -> Vec<String> {
             continue;
         };
         let name = it.collect::<Vec<_>>().join(" ");
-        let name = if name.is_empty() { "?".to_string() } else { name };
+        let name = if name.is_empty() {
+            "?".to_string()
+        } else {
+            name
+        };
 
         let pct = limit.map(|m| fd.saturating_mul(100) / m);
         if let Some(p) = pct.filter(|p| *p >= PROC_FD_PCT_WARN) {
@@ -2158,5 +2274,42 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
                                          // no-arg → 일반 health 문구.
         let g = build_diagnose_prompt(None, "evi");
         assert!(g.contains("일반 health"));
+    }
+
+    #[test]
+    fn kernel_findings_maps_bundle_deterministically() {
+        // 실제 rca.evidence.v1 번들의 observations.findings 형태.
+        let bundle = r#"{
+          "schema_version": "rca.evidence.v1",
+          "observations": { "findings": [
+            {"signal":"context_switch","metric":"switches","severity":"info",
+             "interpretation":"context switches increased during the collection window",
+             "value":105959,"rate_per_sec":17659.8},
+            {"signal":"oom","metric":"kills","severity":"warning",
+             "interpretation":"OOM kills occurred","value":2,"rate_per_sec":0.4}
+          ]}
+        }"#;
+        let f = kernel_findings(bundle);
+        assert_eq!(f.len(), 2);
+        // 커널 신호는 전부 외부 출처이고, 귀속을 증명하지 않으므로 신뢰도는 Medium 고정.
+        assert!(f.iter().all(|x| x.source == SourceQuality::External));
+        assert!(f.iter().all(|x| x.confidence == Confidence::Medium));
+        assert!(f.iter().all(|x| x.probe_id == KERNEL_SECTION));
+        // info는 승격하지 않는다 — 임계값 없는 delta를 Crit으로 올리면 판정 경계를 넘는다.
+        assert_eq!(f[0].severity, Severity::Normal);
+        assert!(f[0].message.contains("kernel/context_switch.switches"));
+        assert!(f[0].message.contains("/s"));
+        // warning만 Warn으로. Crit으로는 절대 올리지 않는다.
+        assert_eq!(f[1].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn kernel_findings_degrades_on_bad_input() {
+        // 파싱 실패/구조 불일치는 빈 목록 — 진단 전체를 죽이지 않는다.
+        assert!(kernel_findings("not json").is_empty());
+        assert!(kernel_findings("{}").is_empty());
+        assert!(kernel_findings(r#"{"observations":{"findings":"nope"}}"#).is_empty());
+        // signal 없는 항목은 건너뛴다.
+        assert!(kernel_findings(r#"{"observations":{"findings":[{"metric":"x"}]}}"#).is_empty());
     }
 }
