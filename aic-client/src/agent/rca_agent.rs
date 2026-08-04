@@ -13,6 +13,11 @@
 //! 해석 주의(도구 description에도 명시): rca-agent는 판정하지 않는 collector다.
 //! `findings`는 임계값 없는 관측 delta, `correlation_hint`는 rule 기반 참고 힌트,
 //! `baseline.available`은 "이전 저장 이력 있음"일 뿐이다 — 판정은 소비자(aic) 몫.
+//!
+//! **동시 collect는 서버가 막아 주지 않는다.** rca-agent에는 collect 상호배제 가드가
+//! 없어(`internal/control/collector.go`에 mutex 0건) 겹쳐 호출해도 409 같은 거절이
+//! 오지 않는다. 지금은 호출이 사용자 주도(도구/CLI 1회)라 문제가 없지만, 주기 수집을
+//! 붙이는 쪽에서는 수집 중 tick을 건너뛰는 자체 상호배제를 스스로 넣어야 한다.
 
 use std::net::IpAddr;
 use std::time::Duration;
