@@ -1162,6 +1162,7 @@ mod tests {
             mcp: McpConfig::default(),
             rca: RcaConfig::default(),
             outbound: OutboundConfig::default(),
+            rca_agent: RcaAgentConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
