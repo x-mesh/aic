@@ -199,9 +199,8 @@ async fn main() -> anyhow::Result<()> {
     // 때만 의미가 있기 때문이다. exporter가 꺼져 있으면 `flush_tx = None` → `FlushSpool`은 "꺼짐" 에러.
     // 프로세스 인벤토리 변화 링 — exporter tick이 채우고 chat이 IPC로 읽는다. exporter task가
     // 안 뜨면 아무도 채우지 않으므로 ControlContext에는 `None`을 넘겨 "수집 안 함"을 표현한다.
-    let process_inventory_store = Arc::new(
-        aic_server::process_inventory_store::ProcessInventoryStore::new(),
-    );
+    let process_inventory_store =
+        Arc::new(aic_server::process_inventory_store::ProcessInventoryStore::new());
     let exporter_cfg = load_exporter_config(
         exporter_section.clone(),
         exporter_spool.clone(),
@@ -370,6 +369,25 @@ async fn main() -> anyhow::Result<()> {
             Some(tokio::spawn(async move {
                 if let Err(e) = aic_server::otlp_exporter::serve_docker(cfg, dk_shutdown).await {
                     tracing::warn!(error = %e, "OTLP docker exporter 종료(에러)");
+                }
+            }))
+        }
+        None => None,
+    };
+
+    // OTLP kernel exporter (opt-in, [aicd.exporter] enabled=true + kernel_enabled=true).
+    // 로컬 rca-agent에서 커널 카운터 delta를 당겨 `aic.kernel.*` metric으로 릴레이한다.
+    // 수집이 window만큼 블록하므로 host metrics tick과 섞이지 않게 독립 task로 뜬다.
+    let kernel_handle = match load_kernel_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+    ) {
+        Some(cfg) => {
+            let kn_shutdown = shutdown.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = aic_server::otlp_exporter::serve_kernel(cfg, kn_shutdown).await {
+                    tracing::warn!(error = %e, "OTLP kernel exporter 종료(에러)");
                 }
             }))
         }
@@ -572,6 +590,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
     if let Some(h) = docker_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = kernel_handle {
         let _ = h.await;
     }
     // RFC-006 로그 수집기도 동일 shutdown watch를 구독하므로 graceful 종료된다.
@@ -994,6 +1015,57 @@ fn load_changes_config(
 /// **못 찾아도 task는 띄운다** — `serve_docker`가 매 tick 재탐색하다가 docker가 설치되면 그때부터
 /// 캡처를 시작한다(aicd 기동 뒤 docker를 깐 사람이 재시작 없이 살아나야 한다). WARN 폭주는 여전히
 /// 없다: 기동 시 한 번만 WARN이고, 못 찾은 동안의 tick 로그는 debug다.
+/// kernel exporter 설정 로더. docker와 동일한 게이트(부모 `enabled` + 자기 플래그 + endpoint +
+/// spool/health)에 더해 **rca-agent URL의 loopback 검증**을 통과해야 한다 — 원격 URL이면 task를
+/// 띄우지 않고 WARN만 남긴다(커널 evidence는 호스트 경계를 넘지 않는다).
+///
+/// window >= interval이면 수집이 다음 tick을 계속 밀어내므로 기동 시 거부한다 — 설정 실수를
+/// 런타임 내내 조용히 끌고 가지 않는다.
+fn load_kernel_config(
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+) -> Option<aic_server::otlp_exporter::KernelConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.kernel_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — kernel exporter 비활성");
+        return None;
+    }
+    let agent_url = match aic_server::otlp_exporter::ensure_loopback(&ex.kernel_url) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(error = %e, "kernel_url 검증 실패 — kernel exporter 비활성");
+            return None;
+        }
+    };
+    let interval_secs = ex.kernel_interval_secs.max(1);
+    let window_secs = ex.kernel_window_secs.max(1);
+    if window_secs >= interval_secs {
+        tracing::warn!(
+            interval_secs,
+            window_secs,
+            "kernel_window_secs가 kernel_interval_secs 이상 — kernel exporter 비활성"
+        );
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::KernelConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_url,
+        interval: std::time::Duration::from_secs(interval_secs),
+        window: std::time::Duration::from_secs(window_secs),
+        spool,
+        health,
+    })
+}
+
 fn load_docker_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
@@ -1172,7 +1244,79 @@ method = "prompt_marker"
             Arc::new(DropCounters::new()),
             None,
         );
-        assert!(cfg.is_none(), "enabled=false면 endpoint가 있어도 비활성이어야 한다");
+        assert!(
+            cfg.is_none(),
+            "enabled=false면 endpoint가 있어도 비활성이어야 한다"
+        );
+    }
+
+    /// kernel exporter는 부모 게이트 + 자기 플래그를 모두 통과해야 뜬다(기본 off).
+    #[test]
+    fn load_kernel_config_requires_both_gates() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let base = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        // 기본값(kernel_enabled=false)이면 뜨지 않는다.
+        assert!(load_kernel_config(
+            Some(base.clone()),
+            Some(spool.clone()),
+            Some(health.clone())
+        )
+        .is_none());
+        // 자기 플래그만 켜고 부모를 끄면 역시 뜨지 않는다.
+        let child_only = AicdExporterConfig {
+            enabled: false,
+            kernel_enabled: true,
+            ..base.clone()
+        };
+        assert!(
+            load_kernel_config(Some(child_only), Some(spool.clone()), Some(health.clone()))
+                .is_none()
+        );
+        // 둘 다 켜면 뜬다.
+        let both = AicdExporterConfig {
+            kernel_enabled: true,
+            ..base
+        };
+        let cfg = load_kernel_config(Some(both), Some(spool), Some(health))
+            .expect("두 게이트를 통과하면 config가 만들어져야 한다");
+        assert_eq!(cfg.agent_url, "http://127.0.0.1:9090");
+        assert!(cfg.window < cfg.interval);
+    }
+
+    /// 원격 rca-agent URL은 거부한다 — 커널 evidence는 호스트 경계를 넘지 않는다.
+    #[test]
+    fn load_kernel_config_rejects_non_loopback_url() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            kernel_enabled: true,
+            kernel_url: "http://10.0.0.5:9090".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        assert!(load_kernel_config(Some(ex), Some(spool), Some(health)).is_none());
+    }
+
+    /// window >= interval이면 수집이 다음 tick을 계속 밀어낸다 — 기동 시 거부한다.
+    #[test]
+    fn load_kernel_config_rejects_window_not_shorter_than_interval() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let ex = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            kernel_enabled: true,
+            kernel_interval_secs: 30,
+            kernel_window_secs: 30,
+            ..AicdExporterConfig::default()
+        };
+        assert!(load_kernel_config(Some(ex), Some(spool), Some(health)).is_none());
     }
 
     /// 반대 조합 — 켜져 있어도 endpoint가 없으면 보낼 곳이 없어 비활성이다.
@@ -1192,7 +1336,10 @@ method = "prompt_marker"
             Arc::new(DropCounters::new()),
             None,
         );
-        assert!(cfg.is_none(), "endpoint가 비면 enabled여도 비활성이어야 한다");
+        assert!(
+            cfg.is_none(),
+            "endpoint가 비면 enabled여도 비활성이어야 한다"
+        );
     }
 
     /// 두 게이트를 모두 통과하면 config가 만들어진다(`aic enroll`이 만드는 상태).

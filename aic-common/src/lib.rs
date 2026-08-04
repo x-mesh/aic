@@ -696,6 +696,31 @@ pub struct AicdExporterConfig {
     /// no-op이다.
     #[serde(default)]
     pub dns_enabled: bool,
+    /// 로컬 rca-agent(커널 eBPF collector)의 카운터 delta를 `aic.kernel.*` metric으로 push할지.
+    /// **기본 false**(opt-in) — 별도 데몬이 있어야 의미가 있고, 없으면 매 tick 연결 실패만 쌓인다
+    /// (docker_enabled와 같은 이유의 명시적 opt-in).
+    ///
+    /// CLI/chat용 `[rca_agent]`와 **별도 게이트**다: 그쪽은 사용자가 부를 때만 도는 단발 pull이고,
+    /// 이쪽은 aicd가 상시 도는 송신 경로라 켜는 판단이 다르다. 다만 endpoint/token은 이 exporter
+    /// 섹션의 것을 그대로 재사용한다(같은 collector로 나가는 또 하나의 신호원일 뿐).
+    ///
+    /// 보내는 것은 **카운터 delta 숫자뿐**이다 — PID/comm/cgroup entity를 담은 top·findings·
+    /// correlation_hint는 호스트 밖으로 내보내지 않는다(전송 표면 최소화).
+    #[serde(default)]
+    pub kernel_enabled: bool,
+    /// rca-agent control API base URL(loopback 전용). 기본 `http://127.0.0.1:9090`.
+    #[serde(default = "default_rca_agent_url")]
+    pub kernel_url: String,
+    /// 커널 수집 tick 간격(초). 기본 60 — host metrics와 별개 주기다(수집이 window만큼 블록하므로).
+    #[serde(default = "default_kernel_interval")]
+    pub kernel_interval_secs: u64,
+    /// 한 tick에서 커널 delta를 재는 window(초). 기본 10.
+    ///
+    /// `/collectz`는 이 시간만큼 **블록**하므로 interval보다 반드시 짧아야 한다. 서버가 동시
+    /// collect를 막아 주지 않으므로(가드 없음) 겹치지 않게 하는 건 소비자 책임인데, 이 태스크는
+    /// 단일 루프에서 순차로 await하므로 구조적으로 인플라이트가 1이다.
+    #[serde(default = "default_kernel_window")]
+    pub kernel_window_secs: u64,
     /// 프로세스별 리소스 top-N(scope=`aic.process`, CPU/메모리 상위 소비자) push 활성화 여부.
     /// 기본 true — host metrics tick에 편승해 이미 refresh한 프로세스 목록을 재사용하므로 추가
     /// 열거 비용이 없고, "누가 자원을 먹고 있나"는 SRE의 기본 질문이라 항상 수집한다(events/
@@ -741,6 +766,10 @@ impl Default for AicdExporterConfig {
             docker_interval_secs: default_docker_interval(),
             docker_bin: None,
             dns_enabled: false,
+            kernel_enabled: false,
+            kernel_url: default_rca_agent_url(),
+            kernel_interval_secs: default_kernel_interval(),
+            kernel_window_secs: default_kernel_window(),
             process_enabled: true,
             process_inventory_enabled: false,
             // 손으로 설정한 config는 enrollment을 거치지 않았다는 뜻이라 None이 기본이다.
@@ -763,6 +792,15 @@ fn default_changes_interval() -> u64 {
 
 fn default_docker_interval() -> u64 {
     60
+}
+
+fn default_kernel_interval() -> u64 {
+    60
+}
+
+/// 수집 window는 tick 간격보다 짧아야 한다(수집이 그만큼 블록한다).
+fn default_kernel_window() -> u64 {
+    10
 }
 
 fn default_spool_max_bytes() -> u64 {
