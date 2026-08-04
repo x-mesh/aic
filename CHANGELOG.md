@@ -4,6 +4,29 @@
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-08-04
+
+### Added
+- **`aic enroll` 한 번으로 LLM 설정까지 끝난다** — 지금까지 enrollment는 telemetry(exporter
+  endpoint/token)만 붙여 줬다. RCA가 고른 provider 이름과 model은 반영했지만 **endpoint와 API
+  key는 사람이 직접 채워야 했다** — 설치 스크립트를 돌린 직후의 호스트는 LLM 호출이 그냥
+  실패했고, `config.toml`을 열어 손으로 채워야 비로소 동작했다.
+
+  이제 RCA가 fleet LLM 게이트웨이를 관리하는 경우 exchange 응답에 provider type·endpoint·API
+  key를 함께 내려주고, `aic enroll`이 그대로 설정에 반영한다. 설치 → enroll → 바로 사용.
+
+  이 세 값은 **한 게이트웨이를 가리키는 한 묶음이라 전부 적용하거나 전부 건너뛴다.** 이 버전이
+  모르는 provider type이 내려오면(서버가 더 새로운 경우) endpoint·key도 손대지 않고 경고만
+  띄운다 — 타입만 어긋난 채 endpoint가 바뀌면 **다른 wire format으로 요청을 보내 조용히
+  실패**하기 때문이다. 이때도 telemetry 등록 자체는 완료되므로 일회용 key를 다시 받을 필요는
+  없고, `aic update` 뒤 다시 `aic enroll` 하면 된다.
+
+  구버전 RCA(이 필드들을 모르는 서버)와도 그대로 호환된다 — 필드가 없으면 기존 동작대로
+  provider 이름과 model만 반영하고 호스트의 endpoint·key는 보존한다. 응답으로 온 LLM endpoint는
+  telemetry endpoint와 똑같이 http(s) scheme을 검증하며, API key는 원문을 절대 출력하지 않고
+  수신 여부만 알린다. `--dry-run`도 이 덮어쓰기 범위를 함께 보여주므로, 이미 endpoint·key가
+  들어 있는 호스트에서 무엇이 바뀔지 미리 확인할 수 있다.
+
 ## [0.32.2] - 2026-07-30
 
 ### Fixed
