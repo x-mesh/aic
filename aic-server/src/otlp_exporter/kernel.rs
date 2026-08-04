@@ -136,6 +136,90 @@ fn metric_name(signal: &str, metric: &str) -> Option<&'static str> {
     })
 }
 
+/// OOM kill 이산 이벤트 하나 — victim별 집계.
+///
+/// 카운터(metric)와 달리 "누가 죽었나"가 핵심이라 comm을 싣는다. **이것이 이 경로에서 유일하게
+/// 나가는 entity**이고, 인코더의 redaction 게이트를 값 단위로 통과한 뒤 송신된다
+/// (`logs_proto::string_value` → `redact_str`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OomEvent {
+    /// victim 프로세스명. 번들에 귀속 정보가 없으면 `unknown`.
+    pub comm: String,
+    /// 이 window에서 이 victim이 죽은 횟수.
+    pub kills: u64,
+}
+
+/// 번들 → OOM 이산 이벤트. **순수 함수.**
+///
+/// `delta.oom.kills`가 0이면 빈 목록이다 — 카운터는 0도 보내지만(결측과 구분), 이벤트는 "일어난
+/// 일"이라 없으면 보내지 않는다. victim은 `top.oom.by_comm`(`[{comm, kills, …}]`)에서 얻고,
+/// 귀속이 불가능한 경우(top이 `available:false`)에도 **사건 자체는 버리지 않고** comm을
+/// `unknown`으로 채워 총 kill 수를 보낸다 — OOM이 났다는 사실이 누가 죽었는지보다 먼저다.
+pub fn build_oom_events(bundle_json: &str) -> Vec<OomEvent> {
+    let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
+        return Vec::new();
+    };
+    let obs = match v.get("observations") {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+    let total = obs
+        .get("delta")
+        .and_then(|d| d.get("oom"))
+        .and_then(|o| o.get("kills"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let by_comm = obs
+        .get("top")
+        .and_then(|t| t.get("oom"))
+        .and_then(|o| o.get("by_comm"))
+        .and_then(Value::as_array);
+
+    let mut events: Vec<OomEvent> = by_comm
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let comm = e.get("comm").and_then(Value::as_str)?.trim();
+                    if comm.is_empty() {
+                        return None;
+                    }
+                    let kills = e.get("kills").and_then(Value::as_u64).unwrap_or(1);
+                    Some(OomEvent {
+                        comm: comm.to_string(),
+                        kills,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if events.is_empty() {
+        events.push(OomEvent {
+            comm: "unknown".to_string(),
+            kills: total,
+        });
+    }
+    events.sort_by(|a, b| b.kills.cmp(&a.kills).then_with(|| a.comm.cmp(&b.comm)));
+    events
+}
+
+/// 재전송 중복을 수신측 ReplacingMergeTree가 흡수하도록 하는 idempotency 키.
+/// changes exporter와 같은 방식(host + subject + action + bucket)이다.
+fn oom_record_id(host: &str, comm: &str, bucket: u64) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    host.hash(&mut h);
+    comm.hash(&mut h);
+    "oom_kill".hash(&mut h);
+    bucket.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// 커널 카운터 수집 루프. shutdown 신호까지 tick마다 collect → encode → push한다.
 pub async fn serve_kernel(
     cfg: KernelConfig,
@@ -154,6 +238,7 @@ async fn serve_kernel_with(
     client: &reqwest::Client,
 ) -> anyhow::Result<()> {
     let url = super::metrics_url(&cfg.endpoint);
+    let logs_url = super::logs_url(&cfg.endpoint);
     let collect_url = format!(
         "{}/collectz?profile=incident&duration={}s",
         cfg.agent_url,
@@ -207,6 +292,23 @@ async fn serve_kernel_with(
                         continue;
                     }
                 };
+
+                // 이산 이벤트(OOM)는 카운터와 독립적으로 먼저 내보낸다 — metric이 비어도
+                // (미지원 신호만 켠 경우) 사건은 보내야 하고, 반대도 마찬가지다.
+                let oom_events = build_oom_events(&bundle);
+                if !oom_events.is_empty() {
+                    push_oom_events(
+                        client,
+                        &cfg,
+                        &logs_url,
+                        &oom_events,
+                        &host_name,
+                        &host_id,
+                        &os_type,
+                        &mut backoff,
+                    )
+                    .await;
+                }
 
                 let points = build_metric_points(&bundle);
                 if points.is_empty() {
@@ -263,6 +365,84 @@ async fn serve_kernel_with(
     }
     tracing::info!("OTLP kernel exporter 종료");
     Ok(())
+}
+
+/// OOM 이산 이벤트를 `aic.changes` scope LogRecord로 내보낸다.
+///
+/// scope를 새로 만들지 않고 재사용하는 이유: 수신측에 이미 라우팅과 `event_pattern` 룰이 있어
+/// **배포 순서 함정(미등록 scope는 200 OK 무음 폐기)을 피하면서 즉시 소비**된다.
+/// `change_type=kernel`이 커널 출처임을 구분한다.
+#[allow(clippy::too_many_arguments)]
+async fn push_oom_events(
+    client: &reqwest::Client,
+    cfg: &KernelConfig,
+    logs_url: &str,
+    events: &[OomEvent],
+    host_name: &str,
+    host_id: &str,
+    os_type: &str,
+    backoff: &mut Backoff,
+) {
+    use super::logs_proto::{self, ChangeEntry};
+
+    let now_ns = super::unix_nanos_now();
+    // 재전송 멱등 키의 시각 버킷 — changes exporter와 같은 분 단위 해상도.
+    let bucket = now_ns / 60_000_000_000;
+    let ids: Vec<String> = events
+        .iter()
+        .map(|e| oom_record_id(host_name, &e.comm, bucket))
+        .collect();
+    let states: Vec<String> = events.iter().map(|e| e.kills.to_string()).collect();
+    let summaries: Vec<String> = events
+        .iter()
+        .map(|e| format!("OOM kill: {} ({}회)", e.comm, e.kills))
+        .collect();
+
+    let entries: Vec<ChangeEntry<'_>> = events
+        .iter()
+        .enumerate()
+        .map(|(i, e)| ChangeEntry {
+            change_type: "kernel",
+            subject: &e.comm,
+            action: "oom_kill",
+            prev_state: None,
+            new_state: Some(&states[i]),
+            // 커널이 직접 관측한 사건이지만 victim 귀속은 증명이 아니다(ring 집계 기반).
+            confidence: "observed",
+            source: "collector:rca-agent",
+            record_id: &ids[i],
+            summary: &summaries[i],
+        })
+        .collect();
+
+    let resource = logs_proto::ResourceAttrs {
+        host_name,
+        host_id,
+        os_type,
+        host_ip: None,
+    };
+    let body = logs_proto::encode_changes(&entries, &resource, &cfg.service_version, now_ns);
+
+    if !backoff.ready() {
+        if let Err(e) = cfg.spool.append(SignalKind::Logs, &body) {
+            tracing::warn!(error = %e, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
+        }
+        return;
+    }
+    match super::push_logs(client, logs_url, cfg.token.as_deref(), body.clone()).await {
+        Ok(_) => {
+            backoff.on_success();
+            cfg.health.record_ok();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OTLP kernel OOM push 실패 — spool에 적재");
+            if let Err(e2) = cfg.spool.append(SignalKind::Logs, &body) {
+                tracing::warn!(error = %e2, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
+            }
+            backoff.on_failure();
+            cfg.health.record_fail();
+        }
+    }
 }
 
 /// 한 번의 `/collectz` 수집. window만큼 블록하므로 timeout은 window + 여유다.
@@ -350,6 +530,69 @@ mod tests {
         assert!(build_metric_points("not json").is_empty());
         assert!(build_metric_points("{}").is_empty());
         assert!(build_metric_points(r#"{"observations":{"delta":42}}"#).is_empty());
+    }
+
+    #[test]
+    fn build_oom_events_maps_victims_from_by_comm() {
+        // 실제 번들 모양: top.oom.by_comm = [{rank, kills, pids, comm}, ...]
+        let b = r#"{"observations":{
+          "delta":{"oom":{"kills":3}},
+          "top":{"oom":{"by_comm":[
+            {"rank":1,"kills":2,"pids":2,"comm":"python"},
+            {"rank":2,"kills":1,"pids":1,"comm":"node"}
+          ]}}
+        }}"#;
+        let ev = build_oom_events(b);
+        assert_eq!(
+            ev,
+            vec![
+                OomEvent {
+                    comm: "python".into(),
+                    kills: 2
+                },
+                OomEvent {
+                    comm: "node".into(),
+                    kills: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_oom_events_keeps_event_when_attribution_unavailable() {
+        // top이 available:false여도 "OOM이 났다"는 사실은 버리지 않는다 — comm만 unknown.
+        let b = r#"{"observations":{
+          "delta":{"oom":{"kills":2}},
+          "top":{"oom":{"available":false,"reason":"top_n_attribution_unavailable"}}
+        }}"#;
+        assert_eq!(
+            build_oom_events(b),
+            vec![OomEvent {
+                comm: "unknown".into(),
+                kills: 2
+            }]
+        );
+    }
+
+    #[test]
+    fn build_oom_events_empty_when_no_kills() {
+        // 카운터는 0도 보내지만(결측과 구분) 이벤트는 "일어난 일"이라 없으면 안 보낸다.
+        let b = r#"{"observations":{"delta":{"oom":{"kills":0}},"top":{}}}"#;
+        assert!(build_oom_events(b).is_empty());
+        assert!(build_oom_events(BUNDLE).is_empty());
+        assert!(build_oom_events("not json").is_empty());
+        assert!(build_oom_events("{}").is_empty());
+    }
+
+    #[test]
+    fn oom_record_id_is_stable_within_bucket_and_differs_across() {
+        // 같은 (host, victim, bucket)이면 재전송해도 같은 키 — 수신측이 중복을 흡수한다.
+        let a = oom_record_id("h1", "python", 100);
+        assert_eq!(a, oom_record_id("h1", "python", 100));
+        // 버킷/호스트/victim이 다르면 다른 사건이다.
+        assert_ne!(a, oom_record_id("h1", "python", 101));
+        assert_ne!(a, oom_record_id("h2", "python", 100));
+        assert_ne!(a, oom_record_id("h1", "node", 100));
     }
 
     #[test]
