@@ -1,6 +1,6 @@
 # Releasing aic
 
-> 새 버전을 GitHub Release로 게시하고 [`x-mesh/homebrew-tap`](https://github.com/x-mesh/homebrew-tap)의 Formula를 자동 갱신한다. **GoReleaser가 아니라 `.github/workflows/release.yml`의 커스텀 빌드/릴리스 스크립트**를 쓴다(이유는 맨 아래 "왜 GoReleaser가 아닌가" 참고).
+> 새 버전을 공개 미러 repo(`parametacorp/aic-releases`)의 GitHub Release로 게시한다. **GoReleaser가 아니라 `.github/workflows/release.yml`의 커스텀 빌드/릴리스 스크립트**를 쓴다(이유는 맨 아래 "왜 GoReleaser가 아닌가" 참고). Homebrew 배포는 v0.34.0을 마지막으로 중단 — 설치·업데이트는 install.sh 단일 경로다.
 
 ## TL;DR
 
@@ -12,7 +12,7 @@
 #    tag push로 트리거될 release.yml까지 스킵한다(v0.29.0에서 release가 안 떴다 → 아래 트러블슈팅).
 git commit -am "chore(release): vX.Y.Z"
 git push origin develop && git push origin develop:main   # main은 tag가 가리킬 커밋(FF)
-# 5. tag push → release.yml(커스텀 빌드 + GitHub Release + brew) 발화
+# 5. tag push → release.yml(커스텀 빌드 + GitHub Release + install.sh 동기화) 발화
 git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
 # 6. release run 확인
 gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status
@@ -33,7 +33,6 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 - 각 (os, arch)별 `aic_<version>_<os>_<arch>.tar.gz`에 `aic`·`aic-session`·`aicd` + LICENSE/README/CHANGELOG 묶음
 - `checksums.txt` SHA256 생성
 - **공개 미러 repo(`parametacorp/aic-releases`)**에 GitHub Release 게시 (`gh release create -R`; 있으면 `upload --clobber`) + `install.sh` 동기화 — 노트는 CHANGELOG의 해당 버전 섹션에서 추출
-- `x-mesh/homebrew-tap/Formula/aic.rb` 재생성·push (4 OS/arch url + sha256 + bin.install 3개)
 
 ## 사전 준비 (1회)
 
@@ -51,22 +50,6 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 > release는 미러 repo에 태그를 새로 만들며(소스 태그와 이름만 같음), 노트는 소스
 > CHANGELOG의 해당 버전 섹션에서 추출된다. 소스 repo에는 release가 생기지 않는다.
 
-### `HOMEBREW_TAP_GITHUB_TOKEN` secret
-
-`x-mesh` org에 `gk` release용 동일 이름 secret이 있으면 **추가 작업 불필요**(org-level은 모든 repo 접근). 없으면:
-
-1. GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens
-2. **Resource owner**: `x-mesh` / **Repository access**: only `x-mesh/homebrew-tap`
-3. **Permissions**: Contents (write), Metadata (read, 자동)
-4. 등록: org level(권장, `x-mesh` org Secrets → Actions) 또는 repo level(`parametacorp/aic` Secrets → Actions)
-5. **Name**: `HOMEBREW_TAP_GITHUB_TOKEN`
-
-> 커스텀 스크립트는 tap을 clone → `Formula/aic.rb` 덮어쓰기 → commit(author `aic-bot <bot@x-mesh.dev>`) → push한다. Contents write면 충분(PR을 열지 않고 main에 직접 push).
-
-### `x-mesh/homebrew-tap`은 seed 불필요
-
-release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. placeholder 불필요.
-
 ## 정상 흐름
 
 1. 작업(develop)을 릴리스 가능한 상태로.
@@ -83,7 +66,7 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
 5. `git commit -am "chore(release): vX.Y.Z"` — **`[skip ci]`를 넣지 말 것.** 이 커밋이 곧 tag 대상이라, `[skip ci]`가 있으면 tag push로 떠야 할 release.yml까지 스킵된다(v0.29.0 실측).
 6. `git push origin develop` 후 `git push origin develop:main` — main은 tag가 가리킬 커밋(FF). main push로 ci.yml이 한 번 도는 건 무해하니 그대로 둔다.
 7. `git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` — release.yml 발화.
-8. `gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status` — 그린이면 끝. `brew update && brew info x-mesh/tap/aic`로 새 버전 노출 확인.
+8. `gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status` — 그린이면 끝. `gh release view vX.Y.Z -R parametacorp/aic-releases`로 에셋 5개 노출 확인.
 
 > **재릴리스(같은 버전)**: bump/CHANGELOG는 그대로 두고, 워크플로/빌드 수정만 커밋한 뒤 tag를 그 커밋으로 옮긴다 — `git tag -d vX.Y.Z; git push origin :refs/tags/vX.Y.Z; git tag vX.Y.Z <commit>; git push origin vX.Y.Z`. release.yml의 `mode: replace`(있으면 upload --clobber)라 에셋이 멱등하게 덮어써진다.
 
@@ -101,10 +84,8 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 
 | 증상 | 원인 / 해결 |
 |---|---|
-| `HOMEBREW_TAP_GITHUB_TOKEN: required` | org/repo secret 미등록. 위 사전 준비 확인. |
 | **darwin 빌드 `undefined symbol: _SecKeychain*`/`_IOBSDNameMatching`** | zig 링커가 macOS 프레임워크(Security/CoreFoundation/IOKit)를 못 링크. **darwin은 반드시 native `cargo build`**(release.yml이 이미 그렇게 함). zigbuild로 darwin을 빌드하면 재발한다 — v0.27.0~v0.28.0에서 이걸로 5번 실패했다. |
 | linux zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. `mlugg/setup-zig` 버전과 `cargo-zigbuild --version`을 함께 bump. |
-| Formula가 안 갱신됨 | secret 권한 부족(Contents write). tap push 로그 확인. |
 | **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 ref_name이 브랜치라 어긋난다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
 | Release notes가 휑함 | notes는 CHANGELOG의 `## [X.Y.Z]` 섹션에서 추출된다(미러 repo엔 소스 tag가 없어 `--notes-from-tag` 불가). CHANGELOG에 해당 버전 섹션이 있는지 확인. |
 | `RELEASES_REPO_TOKEN: required` 또는 미러 업로드 403 | `parametacorp/aic-releases` PAT 미등록/권한 부족. 위 사전 준비 확인. |
