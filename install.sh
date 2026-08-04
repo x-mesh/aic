@@ -2,10 +2,7 @@
 # aic installer — POSIX sh
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/parametacorp/aic-releases/main/install.sh | sh
-#
-# 소스 repo(parametacorp/aic)는 private — release 자산과 이 스크립트는 공개 미러
-# repo(parametacorp/aic-releases)에서 서빙된다(release CI가 동기화).
+#   curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
 #
 # Env overrides:
 #   AIC_VERSION=v0.3.0       특정 버전 고정 (default: latest)
@@ -25,7 +22,7 @@
 
 set -eu
 
-REPO="parametacorp/aic-releases"
+REPO="x-mesh/aic"
 BINS="aic aic-session aicd"
 enroll_server=""
 enroll_key=""

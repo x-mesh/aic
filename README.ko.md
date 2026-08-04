@@ -2,7 +2,7 @@
 
 > Rust 터미널 LLM 어시스턴트: 셸 에러 분석 + bounded·sandbox read-only 진단을 실행하는 SRE chat 에이전트. OpenAI 호환·Groq·Anthropic·CLI 백엔드 지원.
 
-[![CI](https://github.com/parametacorp/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/parametacorp/aic/actions/workflows/ci.yml)
+[![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
 **Languages:** [English](./README.md) · 한국어
 
@@ -105,7 +105,7 @@ graph LR
 #### 원라이너 installer (macOS / Linux)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/parametacorp/aic-releases/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
 ```
 
 OS/아키텍처(`linux`/`darwin` × `amd64`/`arm64`)를 감지해서 맞는 release
@@ -126,7 +126,7 @@ AIC_INSTALL_DIR=$HOME/.local/bin sh ...  # 사용자 디렉토리에 설치
 #### Source 빌드
 
 ```bash
-git clone https://github.com/parametacorp/aic.git && cd aic
+git clone https://github.com/x-mesh/aic.git && cd aic
 cargo build --workspace --release
 cargo install --path aic-server   # aic-session + aicd 설치
 cargo install --path aic-client   # aic 설치
