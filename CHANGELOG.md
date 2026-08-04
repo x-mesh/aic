@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-08-04
+
+### Added
+- **`aic enroll`이 LLM 게이트웨이까지 자동 구성** — RCA 서버가 fleet LLM 게이트웨이를 관리하는
+  경우(RCA Settings → 에이전트 LLM), enrollment 교환 응답에 실려 온 provider 유형·endpoint·API
+  키가 `[llm.providers.<name>]`에 그대로 반영된다. **설치 한 줄로 telemetry와 LLM이 동시에
+  동작한다** — 설치 후 config를 손으로 고칠 일이 없다. 구버전 RCA 서버(해당 필드 미전송)와는
+  기존과 완전히 동일하게 동작하고, 모르는 provider 유형은 기존 값을 보존하며, LLM endpoint는
+  telemetry endpoint와 같은 http(s) 검증을 거친다. API 키 원문은 화면에 출력하지 않는다.
+
+### Fixed
+- **사설 CA 뒤의 RCA collector에 TLS로 접속할 수 없던 문제** — reqwest가 번들 webpki 루트만
+  신뢰해서, 운영자가 사내 CA를 OS 신뢰 저장소에 설치해도 aicd가 인증서 오류로 거부했다.
+  `rustls-tls-native-roots`로 전환해 "호스트가 신뢰하는 CA는 aic도 신뢰한다"가 성립한다 —
+  exporter fleet을 평문 :8080에서 TLS로 옮기기 위한 선행 조건.
+
 ## [0.32.2] - 2026-07-30
 
 ### Fixed
