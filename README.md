@@ -122,17 +122,8 @@ AIC_VERSION=v0.4.0 sh install.sh        # pin a specific tag
 AIC_INSTALL_DIR=$HOME/.local/bin sh ... # install to a user dir
 ```
 
-#### Homebrew (macOS / Linux)
-
-```bash
-brew tap x-mesh/tap
-brew install aic
-# Enable autostart, once after install:
-aic daemon install     # auto-branches between macOS launchd and Linux systemd user unit
-```
-
-`brew services` works well with macOS launchd but its Linux-systemd
-support is spotty, so `aic daemon install` handles both OSes consistently.
+After installing, enable autostart once: `aic daemon install`
+(auto-branches between macOS launchd and Linux systemd user unit).
 
 #### Build from source
 
@@ -170,7 +161,7 @@ aic update --force     # reinstall even if already on the latest version
 
 | Install source | Action |
 |---|---|
-| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | forwards to `brew upgrade x-mesh/tap/aic` |
+| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | distribution discontinued — prints install.sh migration instructions |
 | Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | downloads + verifies sha256 + atomic-replaces all 3 binaries (sudo fallback for `/usr/local/bin`) |
 | `cargo install` (`~/.cargo/bin`) | refuses self-replace, prints the equivalent `cargo install` command |
 

@@ -3,8 +3,8 @@
 //! - **Manual**(install.sh, /usr/local/bin, ~/.local/bin): GitHub release archive를
 //!   직접 받아 sha256 검증 후 세 binary(`aic`, `aic-session`, `aicd`)를 atomic
 //!   rename으로 교체. 디렉토리 권한이 없으면 `sudo install`로 fallback.
-//! - **Brew**(`/opt/homebrew`, `/usr/local/Cellar`, `linuxbrew`): `brew upgrade
-//!   x-mesh/tap/aic`로 위임.
+//! - **Brew**(`/opt/homebrew`, `/usr/local/Cellar`, `linuxbrew`): **배포 중단** —
+//!   v0.34.0을 마지막으로 tap 갱신이 끝났으므로 install.sh 재설치를 안내한다.
 //! - **Cargo**(`~/.cargo/bin`): 자동 교체 거부 — `cargo install` 재실행 안내.
 //!
 //! 디자인은 `x-mesh/gk`의 update 모듈을 거의 그대로 옮긴 것으로, 같은 release
@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 const REPO: &str = "parametacorp/aic-releases";
 /// private 소스 repo — cargo 설치 안내 전용(접근 권한이 있는 개발자 경로).
 const SOURCE_REPO: &str = "parametacorp/aic";
-const BREW_TAP: &str = "x-mesh/tap/aic";
+/// 원라이너 installer — brew 배포 중단 후 유일한 바이너리 설치 경로.
+const INSTALL_SH_URL: &str =
+    "https://raw.githubusercontent.com/parametacorp/aic-releases/main/install.sh";
 /// release archive에 포함된 모든 binary. `aic-session`/`aicd`는 나란히 갱신된다.
 const BINARIES: &[&str] = &["aic", "aic-session", "aicd"];
 
@@ -505,7 +507,7 @@ pub struct UpdateOptions {
 /// 이미 떠 있는 데몬은 옛 코드로 계속 돌기 때문이다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// binary가 교체되었다(Manual), 또는 외부 매니저가 교체했을 수 있다(Brew).
+    /// binary가 교체되었다(Manual).
     Replaced,
     /// binary는 그대로다 — `--check`, 이미 최신, cargo 설치(자동 교체 거부).
     Unchanged,
@@ -516,7 +518,7 @@ pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
     let current = current_version();
 
     // 최신 태그: Manual은 다운로드 URL 구성에 **필수**라 실패 시 중단한다.
-    // Brew/Cargo는 `brew upgrade`/cargo가 최신을 알아서 가져오므로 태그는 출력·--check 용 best-effort —
+    // Brew(마이그레이션 안내)/Cargo(cargo가 최신을 가져옴)는 태그가 출력·--check 용 best-effort —
     // 조회가 실패해도(네트워크 등) 업그레이드를 막지 않는다. 조회는 github.com redirect라 rate limit 무관.
     let target: Option<String> = match opts.pinned.clone() {
         Some(t) => Some(t),
@@ -540,10 +542,7 @@ pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
                 std::process::exit(1);
             }
             None => {
-                let hint = match install.source {
-                    Source::Brew => "brew outdated",
-                    _ => "잠시 후 재시도",
-                };
+                let hint = "잠시 후 재시도";
                 println!(
                     "최신 버전 확인 실패 (네트워크) — source {}, `{hint}`로 확인하세요.",
                     install.source.label()
@@ -574,7 +573,7 @@ pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
     }
 
     match install.source {
-        Source::Brew => run_brew_upgrade().map(|()| Outcome::Replaced),
+        Source::Brew => print_brew_migration_hint().map(|()| Outcome::Unchanged),
         Source::Cargo => print_cargo_hint().map(|()| Outcome::Unchanged),
         // Manual은 위에서 target이 Some임이 보장된다(None이면 fetch_latest_tag가 이미 중단).
         Source::Manual => run_manual_upgrade(&install, target.as_deref().unwrap())
@@ -583,19 +582,15 @@ pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
     }
 }
 
-fn run_brew_upgrade() -> Result<()> {
-    if which("brew").is_none() {
-        bail!("PATH에 brew가 없습니다. install.sh로 재설치하거나 brew를 직접 실행하세요.");
-    }
-    println!("→ brew upgrade {BREW_TAP}");
-    let status = std::process::Command::new("brew")
-        .arg("upgrade")
-        .arg(BREW_TAP)
-        .status()
-        .context("brew upgrade 실행 실패")?;
-    if !status.success() {
-        bail!("brew upgrade 실패 (exit {:?})", status.code());
-    }
+/// brew 배포는 v0.34.0을 마지막으로 중단됐다 — tap Formula가 더는 갱신되지 않으므로
+/// `brew upgrade`는 영원히 "최신"이라고 답한다. install.sh로의 이주만이 업그레이드 경로다.
+fn print_brew_migration_hint() -> Result<()> {
+    println!(
+        "brew 배포는 중단되었습니다 — tap Formula가 더 이상 갱신되지 않아 brew로는 \
+         새 버전을 받을 수 없습니다. install.sh로 이주하세요:\n\
+         \n  brew uninstall aic\n  curl -fsSL {INSTALL_SH_URL} | sh\n\
+         \n이후에는 `aic update`가 직접 새 버전을 받습니다."
+    );
     Ok(())
 }
 

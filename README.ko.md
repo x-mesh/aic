@@ -120,17 +120,8 @@ AIC_VERSION=v0.4.0 sh install.sh         # 특정 tag 고정
 AIC_INSTALL_DIR=$HOME/.local/bin sh ...  # 사용자 디렉토리에 설치
 ```
 
-#### Homebrew (macOS / Linux)
-
-```bash
-brew tap x-mesh/tap
-brew install aic
-# 자동 시작은 설치 후 한 번:
-aic daemon install     # macOS launchd / Linux systemd user unit 자동 분기
-```
-
-`brew services`는 macOS launchd만 잘 붙고 Linux systemd 쪽은 좀 부실해서,
-`aic daemon install`이 양 OS 모두 일관되게 처리합니다.
+설치 후 자동 시작은 한 번만: `aic daemon install`
+(macOS launchd / Linux systemd user unit 자동 분기).
 
 #### Source 빌드
 
@@ -168,7 +159,7 @@ aic update --force     # 같은 버전이어도 강제 재설치
 
 | 설치 출처 | 동작 |
 |---|---|
-| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | `brew upgrade x-mesh/tap/aic`로 위임 |
+| Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | 배포 중단 — install.sh 이주 안내를 출력 |
 | Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | release archive 다운 + sha256 검증 + 세 binary atomic 교체 (`/usr/local/bin`은 필요 시 sudo) |
 | `cargo install` (`~/.cargo/bin`) | 자동 교체 거부, 동일 동작의 `cargo install` 명령 안내 |
 
