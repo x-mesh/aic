@@ -224,6 +224,8 @@ pub struct WebConfig {
     pub obs_config: aic_common::ObservabilityConfig,
     /// (opt-in) 프로세스 스택 샘플 허용. 기본 false면 `/web/process/{pid}/sample`은 403.
     pub allow_stack_sample: bool,
+    /// (B3) rca-agent 연동 설정. 활성이면 요약의 신선도 스트립에 커널 수집 소스가 추가된다.
+    pub rca_agent: aic_common::RcaAgentConfig,
 }
 
 struct WebState {
@@ -241,6 +243,9 @@ struct WebState {
     allow_stack_sample: bool,
     /// 진행 중인 sample pid 집합(single-flight) — 같은 pid 동시 샘플/연타 폭주를 막는다.
     sampling: Arc<Mutex<HashSet<u32>>>,
+    /// (B3) rca-agent pull 클라이언트. config `[rca_agent]`가 활성일 때만 Some —
+    /// 요약의 신선도 스트립이 커널 수집 소스의 생존을 즉석 확인하는 데만 쓴다.
+    rca_agent: Option<crate::agent::rca_agent::RcaAgentClient>,
 }
 
 /// 대시보드를 `cfg.bind`에 바인드하고 Ctrl+C까지 서빙한다. 동시에 로컬 자원 샘플러를 백그라운드로 돌린다.
@@ -270,6 +275,7 @@ pub async fn serve(cfg: WebConfig) -> anyhow::Result<()> {
         obs,
         allow_stack_sample: cfg.allow_stack_sample,
         sampling: Arc::new(Mutex::new(HashSet::new())),
+        rca_agent: crate::agent::rca_agent::RcaAgentClient::new(&cfg.rca_agent).unwrap_or(None),
     });
 
     let app = Router::new()
@@ -2464,12 +2470,34 @@ async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
     let local_src = data_source_freshness("local", local_last_ts, now, FRESHNESS_STALE_SECS);
     // webhook은 항상 도는 소스가 아니라, 파일이 없으면 stale이 아니라 "미수신"으로 present:false.
     let webhook_src = data_source_freshness("webhook", webhook_last_ts, now, i64::MAX);
-    let sources = vec![local_src.clone(), webhook_src.clone()];
+    let mut sources = vec![local_src.clone(), webhook_src.clone()];
+
+    // (B3) rca-agent: 상시 도는 별도 데몬이라 "마지막 수집 시각"보다 **지금 살아 있는지**가 곧
+    // 신선도다. 연동이 켜져 있을 때만 소스로 낸다 — 안 쓰는 기능으로 스트립을 어지럽히지 않는다.
+    // 조회는 loopback이고 짧은 timeout이라 요약 TTFB에 실질 영향이 없다.
+    let mut rca_agent_live = true;
+    if let Some(client) = state.rca_agent.as_ref() {
+        let reachable = client.health().await.is_ok();
+        let active = if reachable {
+            client
+                .features()
+                .await
+                .ok()
+                .and_then(|b| count_active_signals(&b))
+        } else {
+            None
+        };
+        let src = rca_agent_freshness(reachable, active);
+        rca_agent_live = src.get("stale").and_then(|v| v.as_bool()) == Some(false);
+        sources.push(src);
+    }
     // all-clear는 로컬 수집이 **실제로 살아있을 때만**(present && !stale) 유효 — 수집이 아예 없거나(present:false)
     // 멈춘(stale) 상태에서 초록 "이상 없음"을 세우면 수집 실패를 정상으로 위장하게 되므로 금지한다.
     let local_live = local_src.get("present").and_then(|v| v.as_bool()) == Some(true)
         && local_src.get("stale").and_then(|v| v.as_bool()) == Some(false);
-    let all_clear = open_count == 0 && recent_alerts == 0 && local_live;
+    // rca-agent를 켜 뒀는데 죽었거나 아무 신호도 안 붙었다면 all-clear를 세우지 않는다 — 켠 수집이
+    // 조용한 것은 "이상 없음"이 아니라 "모르는 상태"다(D3가 막으려는 바로 그 위장).
+    let all_clear = open_count == 0 && recent_alerts == 0 && local_live && rca_agent_live;
 
     Json(json!({
         "now": now,
@@ -2481,6 +2509,38 @@ async fn summary(State(state): State<Arc<WebState>>) -> Json<Value> {
         "sources": sources,
         "all_clear": all_clear,
     }))
+}
+
+/// (B3) rca-agent 소스의 신선도 JSON(pure — 단위 테스트 대상).
+///
+/// 시각이 아니라 **생존과 측정 능력**으로 판정한다: 도달 못 하면 stale, 도달해도 활성 신호가
+/// 0이면 stale(프로세스는 살아 있지만 아무것도 수집되지 않는 상태 — 가장 위장되기 쉬운 실패다).
+/// `active_signals`가 `None`이면 featuresz 조회에 실패한 것이라, 도달 자체는 됐으므로 stale로
+/// 올리지 않고 수만 비운다.
+fn rca_agent_freshness(reachable: bool, active_signals: Option<usize>) -> Value {
+    let stale = !reachable || active_signals == Some(0);
+    json!({
+        "name": "rca-agent",
+        "present": reachable,
+        "stale": stale,
+        "age_secs": Value::Null,
+        "active_signals": active_signals,
+    })
+}
+
+/// `/featuresz` JSON에서 활성 신호 수를 센다(pure). `kernel_capabilities`는 신호가 아니라 제외.
+/// 파싱 실패/예상 밖 구조면 `None` — 요약을 죽이지 않는다.
+fn count_active_signals(body: &str) -> Option<usize> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let obj = v.as_object()?;
+    Some(
+        obj.iter()
+            .filter(|(name, e)| {
+                *name != "kernel_capabilities"
+                    && e.get("enabled").and_then(Value::as_bool) == Some(true)
+            })
+            .count(),
+    )
 }
 
 /// D3: 한 데이터 소스의 신선도를 노출용 JSON으로(pure — 단위 테스트 대상). last_ts가 없으면
@@ -2841,6 +2901,43 @@ mod tests {
             .collect();
         let out = group_webhooks_by_fingerprint(&events, now, 24, 3);
         assert_eq!(out.len(), 3); // top-N 상한
+    }
+
+    #[test]
+    fn rca_agent_freshness_flags_dead_and_silent_collectors() {
+        // 살아 있고 신호도 붙었으면 fresh.
+        let ok = rca_agent_freshness(true, Some(3));
+        assert_eq!(ok["present"], json!(true));
+        assert_eq!(ok["stale"], json!(false));
+        assert_eq!(ok["active_signals"], json!(3));
+
+        // 도달 불가 = stale(수집이 죽었는데 화면이 조용한 것을 막는다).
+        let dead = rca_agent_freshness(false, None);
+        assert_eq!(dead["present"], json!(false));
+        assert_eq!(dead["stale"], json!(true));
+
+        // 살아 있어도 활성 신호 0이면 아무것도 안 쌓인다 — 가장 위장되기 쉬운 실패라 stale.
+        let silent = rca_agent_freshness(true, Some(0));
+        assert_eq!(silent["present"], json!(true));
+        assert_eq!(silent["stale"], json!(true));
+
+        // featuresz 조회만 실패한 경우는 도달 자체는 됐으므로 stale로 올리지 않는다.
+        let partial = rca_agent_freshness(true, None);
+        assert_eq!(partial["stale"], json!(false));
+        assert_eq!(partial["active_signals"], Value::Null);
+    }
+
+    #[test]
+    fn count_active_signals_excludes_capabilities_and_disabled() {
+        let body = r#"{
+            "process_lifecycle": {"enabled": true, "attach": "fork+exit"},
+            "oom": {"enabled": true, "attach": "mark_victim"},
+            "scheduler": {"enabled": false, "attach": "disabled"},
+            "kernel_capabilities": {"btf": true, "tracing": true}
+        }"#;
+        assert_eq!(count_active_signals(body), Some(2));
+        assert_eq!(count_active_signals("not json"), None);
+        assert_eq!(count_active_signals("[]"), None);
     }
 
     #[test]

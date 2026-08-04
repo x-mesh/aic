@@ -2335,16 +2335,17 @@ async fn handle_web(
         .ok_or_else(|| {
             anyhow::anyhow!("--token 또는 AIC_WEB_TOKEN이 필요합니다 — web 노출은 인증 필수입니다.")
         })?;
-    // 관측 백엔드(Prometheus/Loki)는 config에서 읽어 metrics/logs 질의에 재사용한다(없으면 503).
-    let obs_config = ConfigManager::load()
-        .map(|c| c.observability)
-        .unwrap_or_default();
+    // 관측 백엔드(Prometheus/Loki)와 rca-agent는 config에서 읽어 재사용한다(없으면 각각 503/스킵).
+    let config = ConfigManager::load().unwrap_or_else(|_| ConfigManager::default_config());
+    let obs_config = config.observability;
+    let rca_agent = config.rca_agent;
     eprintln!("aic web (read-only) → http://{bind}  ·  auth: Bearer <token>  ·  Ctrl+C 종료");
     aic_client::web::serve(aic_client::web::WebConfig {
         bind,
         token,
         obs_config,
         allow_stack_sample,
+        rca_agent,
     })
     .await
 }
