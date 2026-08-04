@@ -334,9 +334,7 @@ fn parse_interval(platform: Platform, body: &str) -> Option<u64> {
             for (i, l) in lines.iter().enumerate() {
                 if l.contains("<key>StartInterval</key>") {
                     let next = lines.get(i + 1)?.trim();
-                    let inner = next
-                        .strip_prefix("<integer>")?
-                        .strip_suffix("</integer>")?;
+                    let inner = next.strip_prefix("<integer>")?.strip_suffix("</integer>")?;
                     return inner.trim().parse().ok();
                 }
             }
@@ -406,42 +404,44 @@ fn launchctl_unload(plist: &Path) -> Result<()> {
     Ok(())
 }
 
+// `systemctl --user` 호출은 daemon_install의 헬퍼를 공유한다 — 로그인 셸 밖에서
+// XDG_RUNTIME_DIR가 비어 user bus 연결이 깨지는 문제와 그 안내 문구를 한 곳에서 다룬다.
+use crate::daemon_install::{systemctl_user_command, with_user_bus_hint};
+
 fn systemctl_enable_now() -> Result<bool> {
-    let reload = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
+    let reload = systemctl_user_command()
+        .arg("daemon-reload")
         .output()
         .with_context(|| "systemctl --user daemon-reload 실행 실패 (systemd가 있는지 확인)")?;
     if !reload.status.success() {
         return Err(anyhow!(
             "systemctl --user daemon-reload 실패: {}",
-            String::from_utf8_lossy(&reload.stderr)
+            with_user_bus_hint(&String::from_utf8_lossy(&reload.stderr))
         ));
     }
     // 타이머만 enable --now (서비스는 발화 때마다 끌려온다).
-    let enable = Command::new("systemctl")
-        .args(["--user", "enable", "--now", TIMER_UNIT])
+    let enable = systemctl_user_command()
+        .args(["enable", "--now", TIMER_UNIT])
         .output()
         .with_context(|| "systemctl --user enable --now 실행 실패")?;
     if !enable.status.success() {
         return Err(anyhow!(
             "systemctl --user enable --now {TIMER_UNIT} 실패: {}",
-            String::from_utf8_lossy(&enable.stderr)
+            with_user_bus_hint(&String::from_utf8_lossy(&enable.stderr))
         ));
     }
     Ok(true)
 }
 
 fn systemctl_disable_now() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", TIMER_UNIT])
+    let _ = systemctl_user_command()
+        .args(["disable", "--now", TIMER_UNIT])
         .output();
     Ok(())
 }
 
 fn systemctl_daemon_reload() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output();
+    let _ = systemctl_user_command().arg("daemon-reload").output();
     Ok(())
 }
 
@@ -457,7 +457,10 @@ mod tests {
         // one-shot 타이머: StartInterval 있고 KeepAlive 없음(있으면 tight-loop 재spawn).
         assert!(p.contains("<key>StartInterval</key>"));
         assert!(p.contains("<integer>300</integer>"));
-        assert!(!p.contains("KeepAlive"), "타이머에 KeepAlive가 있으면 안 됨");
+        assert!(
+            !p.contains("KeepAlive"),
+            "타이머에 KeepAlive가 있으면 안 됨"
+        );
         // aic(자기 자신) + snapshot capture 서브커맨드.
         assert!(p.contains("<string>/opt/bin/aic</string>"));
         assert!(p.contains("<string>snapshot</string>"));
@@ -480,7 +483,10 @@ mod tests {
         assert!(timer.contains("OnUnitActiveSec=300"));
         // 첫 발화는 활성화 즉시(OnActiveSec=0) — 로그인 기준 OnBootSec은 쓰지 않는다.
         assert!(timer.contains("OnActiveSec=0"));
-        assert!(!timer.contains("OnBootSec"), "OnBootSec은 로그인 기준이라 쓰면 안 됨");
+        assert!(
+            !timer.contains("OnBootSec"),
+            "OnBootSec은 로그인 기준이라 쓰면 안 됨"
+        );
         assert!(timer.contains(&format!("Unit={SERVICE_UNIT}")));
         assert!(timer.contains("WantedBy=timers.target"));
     }
@@ -490,7 +496,10 @@ mod tests {
         assert_eq!(clamp_interval(1), SNAPSHOT_INTERVAL_MIN_SECS);
         assert_eq!(clamp_interval(0), SNAPSHOT_INTERVAL_MIN_SECS);
         assert_eq!(clamp_interval(300), 300);
-        assert_eq!(clamp_interval(SNAPSHOT_INTERVAL_MIN_SECS), SNAPSHOT_INTERVAL_MIN_SECS);
+        assert_eq!(
+            clamp_interval(SNAPSHOT_INTERVAL_MIN_SECS),
+            SNAPSHOT_INTERVAL_MIN_SECS
+        );
     }
 
     #[test]
