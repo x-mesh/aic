@@ -4,6 +4,28 @@
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-08-04
+
+### Added
+- **커널 계층 RCA 증거 수집 — rca-agent 연동(Phase 1)** — 지금까지 aic의 증거는 셸 출력,
+  Safe probe, 관측 백엔드 질의 등 userspace 표면에 머물렀다. 같은 호스트에 eBPF 기반
+  `rca-agent`(별도 system 데몬)가 돌고 있으면, 이제 `aic rca collect [--window 30s]` 한 번으로
+  커널 신호(context switch·fork/exit·OOM 등)의 evidence bundle(`rca.evidence.v1`)을 당겨
+  incident에 Observability 증거로 붙일 수 있다. chat agent에도 read-only 도구 2종
+  (`rca_agent_collect`/`rca_agent_features`)이 생겨 조사 중 커널 delta를 바로 확인할 수 있다.
+
+  연동은 config `[rca_agent]`의 명시적 opt-in(기본 비활성)이며 URL은 **loopback만 허용**한다 —
+  bundle에 담기는 PID/comm/cgroup entity가 aic를 통해 호스트 밖으로 나가는 일은 없다. 응답은
+  기존 관측 도구와 동일하게 bounded + redaction을 거친다. rca-agent의 생명주기는 systemd가
+  소유하고 aic는 읽기만 한다 — rca-agent가 없거나 죽어 있어도 다른 기능에는 영향이 없다.
+
+### Fixed
+- **소스 repo가 private로 전환되며 설치·업데이트가 404 나던 문제** — release 자산과
+  install.sh를 공개 미러 repo(`parametacorp/aic-releases`)에서 서빙하도록 전환했다.
+  `aic update`, 원라이너 installer, brew Formula가 모두 미러를 바라본다. 기존에 설치된
+  구버전 바이너리는 옛 좌표를 보므로, 새 install.sh(원라이너)로 한 번 재설치하면 이후
+  `aic update`가 다시 동작한다.
+
 ## [0.33.0] - 2026-08-04
 
 ### Added
