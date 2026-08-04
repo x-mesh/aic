@@ -340,37 +340,73 @@ fn launchctl_unload(plist: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `systemctl --user` 실행용 Command. 자식 프로세스의 `XDG_RUNTIME_DIR`를 보정한다.
+///
+/// 로그인 셸 밖(`curl … | sh` 설치 스크립트, cron, ssh 단발 명령)에서는 `/run/user/<uid>`가
+/// 실제로 존재해도 이 변수가 비어 있어 systemd user bus에 붙지 못하고
+/// "Failed to connect to bus: No medium found"로 죽는다. 디렉터리가 실재할 때만 채운다 —
+/// 없는 경로를 가리키면 더 알아보기 힘든 실패가 되기 때문이다.
+pub(crate) fn systemctl_user_command() -> Command {
+    let mut cmd = Command::new("systemctl");
+    cmd.arg("--user");
+    let unset = match std::env::var_os("XDG_RUNTIME_DIR") {
+        None => true,
+        Some(v) => v.is_empty(),
+    };
+    if unset {
+        let uid = unsafe { libc::getuid() };
+        let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+        if runtime_dir.is_dir() {
+            cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+        }
+    }
+    cmd
+}
+
+/// user bus 연결 실패는 원인이 환경(로그인 세션/linger)이라 raw D-Bus 문구만 보여 주면
+/// 다음에 뭘 해야 할지 알 수 없다. 그 경우에만 실행 가능한 안내를 덧붙인다.
+pub(crate) fn with_user_bus_hint(stderr: &str) -> String {
+    let stderr = stderr.trim();
+    if stderr.contains("Failed to connect to bus") {
+        format!(
+            "{stderr}\n  → systemd user 세션에 연결하지 못했습니다. \
+             `XDG_RUNTIME_DIR=/run/user/$(id -u)`를 설정한 뒤 다시 실행하거나, \
+             `loginctl enable-linger $(id -un)`으로 user 세션을 상주시키세요."
+        )
+    } else {
+        stderr.to_string()
+    }
+}
+
 fn systemctl_user_enable_now() -> Result<bool> {
-    let reload = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
+    let reload = systemctl_user_command()
+        .arg("daemon-reload")
         .output()
         .with_context(|| "systemctl --user daemon-reload 실행 실패 (systemd가 있는지 확인)")?;
     if !reload.status.success() {
         return Err(anyhow!(
             "systemctl --user daemon-reload 실패: {}",
-            String::from_utf8_lossy(&reload.stderr)
+            with_user_bus_hint(&String::from_utf8_lossy(&reload.stderr))
         ));
     }
-    let enable = Command::new("systemctl")
-        .args(["--user", "enable", "--now", SYSTEMD_UNIT])
+    let enable = systemctl_user_command()
+        .args(["enable", "--now", SYSTEMD_UNIT])
         .output()
         .with_context(|| "systemctl --user enable --now 실행 실패")?;
     if !enable.status.success() {
         return Err(anyhow!(
             "systemctl --user enable --now {SYSTEMD_UNIT} 실패: {}",
-            String::from_utf8_lossy(&enable.stderr)
+            with_user_bus_hint(&String::from_utf8_lossy(&enable.stderr))
         ));
     }
     Ok(true)
 }
 
 fn systemctl_user_disable_now() -> Result<()> {
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", SYSTEMD_UNIT])
+    let _ = systemctl_user_command()
+        .args(["disable", "--now", SYSTEMD_UNIT])
         .output();
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output();
+    let _ = systemctl_user_command().arg("daemon-reload").output();
     Ok(())
 }
 
@@ -408,14 +444,14 @@ pub fn restart_via_unit() -> Result<bool> {
             Ok(true)
         }
         Platform::Linux => {
-            let out = Command::new("systemctl")
-                .args(["--user", "restart", SYSTEMD_UNIT])
+            let out = systemctl_user_command()
+                .args(["restart", SYSTEMD_UNIT])
                 .output()
                 .with_context(|| "systemctl --user restart 실행 실패")?;
             if !out.status.success() {
                 return Err(anyhow!(
                     "systemctl --user restart {SYSTEMD_UNIT} 실패: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    with_user_bus_hint(&String::from_utf8_lossy(&out.stderr))
                 ));
             }
             Ok(true)
@@ -494,5 +530,51 @@ mod tests {
         let p = macos_plist_path().unwrap();
         let s = p.to_string_lossy();
         assert!(s.ends_with("Library/LaunchAgents/com.x-mesh.aicd.plist"));
+    }
+
+    #[test]
+    fn user_bus_hint_only_augments_bus_failures() {
+        // D-Bus 연결 실패에는 다음 행동이 붙는다.
+        let hinted = with_user_bus_hint("Failed to connect to bus: No medium found");
+        assert!(hinted.contains("XDG_RUNTIME_DIR"));
+        assert!(hinted.contains("loginctl enable-linger"));
+        // 그 외 오류는 원문 그대로 — 무관한 안내로 원인을 흐리지 않는다.
+        let plain = with_user_bus_hint("Unit aicd.service not found.");
+        assert_eq!(plain, "Unit aicd.service not found.");
+    }
+
+    #[test]
+    fn systemctl_user_command_targets_user_manager() {
+        let cmd = systemctl_user_command();
+        assert_eq!(cmd.get_program(), "systemctl");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, vec!["--user"]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn systemctl_user_command_fills_runtime_dir_when_unset() {
+        // 로그인 셸 밖(`curl | sh`)에서는 XDG_RUNTIME_DIR가 비어 user bus 연결이 깨진다.
+        // 런타임 디렉터리가 실재하면 채워 주고, 없으면 손대지 않아야 한다.
+        let uid = unsafe { libc::getuid() };
+        let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+        let prev = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_RUNTIME_DIR");
+
+        let cmd = systemctl_user_command();
+        let injected = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("XDG_RUNTIME_DIR"))
+            .map(|(_, v)| v.map(|v| v.to_os_string()));
+
+        if runtime_dir.is_dir() {
+            assert_eq!(injected, Some(Some(runtime_dir.into_os_string())));
+        } else {
+            assert!(injected.is_none(), "없는 경로를 주입하면 안 된다");
+        }
+
+        if let Some(prev) = prev {
+            std::env::set_var("XDG_RUNTIME_DIR", prev);
+        }
     }
 }

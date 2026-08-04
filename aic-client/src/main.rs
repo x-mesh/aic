@@ -1717,10 +1717,26 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
 
     // install은 unit을 없으면 만들고 시작한다. 이미 떠 있던 aicd는 config를 메모리에
     // 들고 있으므로, unit 경유 kickstart/restart로 반드시 새 token을 읽게 한다.
-    let report = aic_client::daemon_install::install(false)?;
-    if report.loaded {
-        let _ = aic_client::daemon_install::restart_via_unit()?;
-    }
+    //
+    // **여기서부터는 실패해도 enrollment 자체는 이미 끝났다** — 일회용 key는 소비됐고
+    // config는 디스크에 저장됐다. 되돌릴 수 없는 작업이 모두 성공한 뒤의 편의 단계
+    // 하나로 명령 전체를 실패로 보고하면, 운영자는 멀쩡한 등록을 실패로 읽고 새 key를
+    // 발급해 재시도한다(로그인 셸 밖 `curl | sh` 설치에서 실측). 그래서 여기서는
+    // 에러를 삼키지 않고 **경고로 격하한 뒤 남은 한 걸음을 안내**한다.
+    let daemon_status = match aic_client::daemon_install::install(false) {
+        Ok(report) => {
+            if report.loaded {
+                if let Err(e) = aic_client::daemon_install::restart_via_unit() {
+                    Err(e)
+                } else {
+                    Ok(report)
+                }
+            } else {
+                Ok(report)
+            }
+        }
+        Err(e) => Err(e),
+    };
     println!("{COL_GREEN}✓{COL_RESET} RCA enrollment 완료");
     println!("  host:     {}", enrolled.host_name);
     println!("  endpoint: {}", config.aicd.exporter.endpoint);
@@ -1739,15 +1755,27 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
             }
         );
     }
-    println!(
-        "  aicd:     {}",
-        if report.loaded {
-            "started"
-        } else {
-            "unit written (--no-load)"
-        }
-    );
+    match &daemon_status {
+        Ok(report) => println!(
+            "  aicd:     {}",
+            if report.loaded {
+                "started"
+            } else {
+                "unit written (--no-load)"
+            }
+        ),
+        Err(e) => println!("  aicd:     {COL_YELLOW}등록 실패{COL_RESET} — {e}"),
+    }
     println!("  enrollment_id: {}", enrolled.enrollment_id);
+    if let Err(e) = &daemon_status {
+        eprintln!(
+            "\n{COL_YELLOW}⚠{COL_RESET} enrollment는 완료됐습니다 \
+             (key 교환·config 저장 성공) — aicd 자동 시작 등록만 남았습니다.\n\
+             \x20 원인: {e}\n\
+             \x20 조치: 위 문제를 해결한 뒤 `aic daemon install`을 실행하세요. \
+             enroll을 다시 하거나 새 key를 발급할 필요는 없습니다."
+        );
+    }
     Ok(())
 }
 
