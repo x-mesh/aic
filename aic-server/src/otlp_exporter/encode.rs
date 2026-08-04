@@ -160,6 +160,45 @@ pub struct ExportMetricsServiceRequest {
     pub resource_metrics: Vec<ResourceMetrics>,
 }
 
+/// collector가 200으로 응답한 body에서 `(버려진 data point 수, 사유)`를 뽑는다.
+///
+/// **왜 필요한가**: OTLP는 요청을 받아도 일부를 **조용히 버릴 수 있다**(미지 metric·미지원 타입
+/// 등) — 그때 HTTP는 200이고, 버린 사실은 `partial_success`에만 담긴다. 발신 측이 이 body를
+/// 안 읽으면 자기 텔레메트리가 수신측에서 사라지는 걸 **영영 모른다**. logs 경로는 이미 같은
+/// 창구(`logs_proto::decode_logs_partial_reject`)를 갖고 있었는데 metrics에는 없어서,
+/// `aic.kernel.*`가 catalog에 안 뜨는데도 로그는 깨끗한 상황이 생겼다.
+///
+/// 재전송해도 결과가 같으므로 **재시도 대상이 아니다**(4xx 거부와 다른 범주 — 그쪽은 요청 자체
+/// 거부, 이쪽은 수락 후 일부 폐기). 디코드 실패나 `partial_success` 부재는 `(0, "")`로 본다
+/// (구 collector 호환 — 응답이 비었거나 형식이 달라도 push는 성공으로 유지한다).
+pub fn decode_metrics_partial_reject(body: &[u8]) -> (u64, String) {
+    match ExportMetricsServiceResponse::decode(body) {
+        Ok(resp) => match resp.partial_success {
+            Some(ps) if ps.rejected_data_points > 0 => {
+                (ps.rejected_data_points as u64, ps.error_message)
+            }
+            _ => (0, String::new()),
+        },
+        Err(_) => (0, String::new()),
+    }
+}
+
+/// collector/metrics/v1/metrics_service.proto — `ExportMetricsServiceResponse`. 성공(200) 응답 body.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportMetricsServiceResponse {
+    #[prost(message, optional, tag = "1")]
+    pub partial_success: Option<ExportMetricsPartialSuccess>,
+}
+
+/// collector/metrics/v1/metrics_service.proto — `ExportMetricsPartialSuccess`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ExportMetricsPartialSuccess {
+    #[prost(int64, tag = "1")]
+    pub rejected_data_points: i64,
+    #[prost(string, tag = "2")]
+    pub error_message: String,
+}
+
 /// metrics/v1/metrics.proto — `ResourceMetrics`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResourceMetrics {
@@ -287,6 +326,59 @@ pub enum AnyValueOneof {
 }
 
 #[cfg(test)]
+mod partial_success_tests {
+    use super::*;
+
+    /// collector가 일부를 버렸다고 알리면 그 수와 사유를 그대로 읽어야 한다.
+    #[test]
+    fn decodes_rejected_data_points_with_reason() {
+        let resp = ExportMetricsServiceResponse {
+            partial_success: Some(ExportMetricsPartialSuccess {
+                rejected_data_points: 7,
+                error_message: "unknown metric aic.kernel.forks".to_string(),
+            }),
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf).unwrap();
+        let (n, reason) = decode_metrics_partial_reject(&buf);
+        assert_eq!(n, 7);
+        assert_eq!(reason, "unknown metric aic.kernel.forks");
+    }
+
+    /// 정상 응답(빈 body 포함)과 형식이 다른 응답은 (0, "")로 — 구 collector 호환.
+    #[test]
+    fn treats_clean_or_unknown_response_as_no_reject() {
+        let clean = ExportMetricsServiceResponse {
+            partial_success: None,
+        };
+        let mut buf = Vec::new();
+        clean.encode(&mut buf).unwrap();
+        assert_eq!(decode_metrics_partial_reject(&buf), (0, String::new()));
+        // 빈 body(대부분의 collector가 이렇게 답한다).
+        assert_eq!(decode_metrics_partial_reject(&[]), (0, String::new()));
+        // 디코드 불가 — push는 성공으로 유지한다.
+        assert_eq!(
+            decode_metrics_partial_reject(&[0xff, 0xff, 0xff]),
+            (0, String::new())
+        );
+    }
+
+    /// rejected=0인 partial_success는 폐기가 아니다(경고를 내면 안 된다).
+    #[test]
+    fn zero_rejected_is_not_a_drop() {
+        let resp = ExportMetricsServiceResponse {
+            partial_success: Some(ExportMetricsPartialSuccess {
+                rejected_data_points: 0,
+                error_message: "warning only".to_string(),
+            }),
+        };
+        let mut buf = Vec::new();
+        resp.encode(&mut buf).unwrap();
+        assert_eq!(decode_metrics_partial_reject(&buf), (0, String::new()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::otlp_exporter::host_metrics::{MetricPoint, ResourceAttrs};
@@ -355,13 +447,13 @@ mod tests {
     #[test]
     fn redaction_holds_for_each_secret_kind_in_hostname() {
         let cases: &[&str] = &[
-            "AKIAIOSFODNN7EXAMPLE",                     // aws_key
+            "AKIAIOSFODNN7EXAMPLE", // aws_key
             // 커밋 훅의 secret scan 오탐을 피하려고 접두사를 쪼갠다(값은 concat 후 동일).
             concat!("gh", "p_AbC123XyZ789DeF456GhI012JkL345MnO678"), // github_token
-            "user@example.com",                         // email
-            "010-1234-5678",                            // kr_phone
-            "192.168.10.20",                            // ipv4
-            "postgres://app:s3cr3tPass@db:5432/orders", // conn_string
+            "user@example.com",                                      // email
+            "010-1234-5678",                                         // kr_phone
+            "192.168.10.20",                                         // ipv4
+            "postgres://app:s3cr3tPass@db:5432/orders",              // conn_string
         ];
         for secret in cases {
             let sample = sample_with_resource(secret, "id", "linux");
@@ -492,7 +584,9 @@ mod tests {
         // 로그를 아무도 못 본다 — poison batch 방어의 유일한 가시화 수단이다.
         counters.by_rejected.fetch_add(55, Ordering::Relaxed);
         // 200인데 partial_success로 조용히 버려진 레코드(미지 scope 등).
-        counters.by_collector_dropped.fetch_add(66, Ordering::Relaxed);
+        counters
+            .by_collector_dropped
+            .fetch_add(66, Ordering::Relaxed);
 
         let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&counters));
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
