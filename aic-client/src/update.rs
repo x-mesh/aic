@@ -662,14 +662,12 @@ mod tests {
     #[test]
     fn tag_from_location_extracts_tag() {
         assert_eq!(
-            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v0.8.0")
-                .as_deref(),
+            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v0.8.0").as_deref(),
             Some("v0.8.0")
         );
         // trailing slash 허용.
         assert_eq!(
-            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v1.2.3/")
-                .as_deref(),
+            tag_from_location("https://github.com/x-mesh/aic/releases/tag/v1.2.3/").as_deref(),
             Some("v1.2.3")
         );
         // `/tag/`가 없으면(release 없어 releases 페이지로 redirect 등) None.
