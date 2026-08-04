@@ -63,6 +63,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # ubuntu 러너는 여유 디스크가 ~14GB뿐이라 cargo 캐시 + workspace 전체 debug 빌드가
+      # 디스크를 채워 "No space left on device"로 죽는다(v0.34.0 게이트에서 2회 연속 실측).
+      # 프리인스톨 대형 툴체인을 걷어내 ~25GB를 확보한다. macos 러너는 여유가 커서 불필요.
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry & build
@@ -95,6 +104,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      # test job과 동일한 이유(ubuntu 러너 디스크 고갈 방지).
+      - name: Free disk space (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: dtolnay/rust-toolchain@stable
 
