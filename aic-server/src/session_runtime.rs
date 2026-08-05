@@ -535,7 +535,7 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
 
     let session_id = aic_common::generate_unused_session_id(16)
         .ok_or_else(|| anyhow::anyhow!("충돌 없는 Session_ID를 생성하지 못했습니다"))?;
-    let sock = aic_common::session_socket_path(&session_id);
+    let sock = aic_common::session_socket_path_for_bind(&session_id);
     let lock_path = sock.with_extension("pid");
 
     // 세션별 PID lock 획득 — 동일 Session_ID의 중복 실행만 방지

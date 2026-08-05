@@ -25,19 +25,24 @@ const AICD_RPC_TIMEOUT: Duration = Duration::from_millis(100);
 ///
 /// 실패 시 trace 로그만 남기고 Ok(())를 반환한다 — 호출자는 결과를 무시해도 된다.
 pub async fn register_session(info: SessionInfo) {
-    if let Err(e) = send(&aicd_socket_path(), IpcRequest::RegisterSession(info)).await {
+    register_session_at(&aicd_socket_path(), info).await
+}
+
+/// 소켓 경로를 주입받는 변형. 테스트가 사용자 환경의 실제 aicd에 붙지 않게 하려고 분리했다.
+async fn register_session_at(socket: &Path, info: SessionInfo) {
+    if let Err(e) = send(socket, IpcRequest::RegisterSession(info)).await {
         tracing::debug!(error = %e, "aicd register 실패 (무시) — aicd가 미실행이거나 응답 없음");
     }
 }
 
 /// 세션을 `aicd` registry에서 제거한다 (best-effort).
 pub async fn unregister_session(id: &str) {
-    if let Err(e) = send(
-        &aicd_socket_path(),
-        IpcRequest::UnregisterSession { id: id.to_string() },
-    )
-    .await
-    {
+    unregister_session_at(&aicd_socket_path(), id).await
+}
+
+/// 소켓 경로를 주입받는 변형 ([`register_session_at`]와 같은 이유).
+async fn unregister_session_at(socket: &Path, id: &str) {
+    if let Err(e) = send(socket, IpcRequest::UnregisterSession { id: id.to_string() }).await {
         tracing::debug!(error = %e, "aicd unregister 실패 (무시)");
     }
 }
@@ -71,8 +76,13 @@ pub async fn heartbeat_session(id: &str, cwd: Option<std::path::PathBuf>) {
 /// - `record`: 이미 id 가 부여된 `CommandRecord`. 빈 id 여도 aicd 측에서 auto-assign 하지만,
 ///   local store 와 id를 일치시키려면 호출 전에 id를 확정해 두는 것을 권장한다 (P2 전제).
 pub async fn register_record(session_id: &str, record: CommandRecord) {
+    register_record_at(&aicd_socket_path(), session_id, record).await
+}
+
+/// 소켓 경로를 주입받는 변형 ([`register_session_at`]와 같은 이유).
+async fn register_record_at(socket: &Path, session_id: &str, record: CommandRecord) {
     if let Err(e) = send(
-        &aicd_socket_path(),
+        socket,
         IpcRequest::RegisterRecordForSession {
             session_id: session_id.to_string(),
             record,
@@ -135,9 +145,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 존재하지 않는 소켓 경로. **테스트는 절대 `aicd_socket_path()`를 쓰지 않는다** —
+    /// 그 경로는 사용자 환경에 실제로 떠 있는 aicd를 가리킬 수 있고, 그러면 이 테스트들이
+    /// 진짜 registry에 유령 세션을 등록한다(실제로 `deadbeef` 세션이 그렇게 새어 들어갔다).
+    fn missing_socket(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("no-aicd.sock")
+    }
+
+    fn sample_record(command: &str) -> aic_common::CommandRecord {
+        aic_common::CommandRecord {
+            command: Some(command.to_string()),
+            capture_mode: aic_common::CaptureMode::Pty,
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn register_session_silent_when_aicd_down() {
         // aicd가 없는 상태에서도 panic 없이 반환해야 한다.
+        let dir = tempfile::tempdir().unwrap();
         let now = chrono::Utc::now();
         let info = SessionInfo {
             id: "deadbeef".to_string(),
@@ -151,39 +177,34 @@ mod tests {
             cwd: None,
             label: None,
         };
-        // socket path가 사용자 환경의 실제 aicd_socket_path()를 가리킬 수 있지만,
-        // CI에서 aicd가 떠 있지 않다고 가정하면 silent skip 확인 가능.
-        register_session(info).await;
+        register_session_at(&missing_socket(&dir), info).await;
     }
 
     #[tokio::test]
     async fn unregister_session_silent_when_aicd_down() {
-        unregister_session("missing").await;
+        let dir = tempfile::tempdir().unwrap();
+        unregister_session_at(&missing_socket(&dir), "missing").await;
     }
 
     #[tokio::test]
     async fn register_record_silent_when_aicd_down() {
         // aicd 미실행 상태에서도 panic 없이 반환해야 한다 (R3.3).
-        let record = aic_common::CommandRecord {
-            command: Some("ls".to_string()),
-            capture_mode: aic_common::CaptureMode::Pty,
-            ..Default::default()
-        };
-        register_record("deadbeef", record).await;
+        let dir = tempfile::tempdir().unwrap();
+        register_record_at(&missing_socket(&dir), "deadbeef", sample_record("ls")).await;
     }
 
     #[tokio::test]
     async fn register_record_completes_within_timeout() {
         // aicd 소켓이 없는 환경에서 register_record 전체가 100ms 안에 끝나는지 확인한다.
         // AICD_RPC_TIMEOUT(100ms)이 상한이므로 여유를 둔 500ms 안에 반드시 완료되어야 한다.
-        let record = aic_common::CommandRecord {
-            command: Some("cargo build".to_string()),
-            capture_mode: aic_common::CaptureMode::Pty,
-            ..Default::default()
-        };
+        let dir = tempfile::tempdir().unwrap();
         let completed = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            register_record("abcd1234", record),
+            register_record_at(
+                &missing_socket(&dir),
+                "abcd1234",
+                sample_record("cargo build"),
+            ),
         )
         .await;
         assert!(
