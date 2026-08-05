@@ -7,17 +7,19 @@
 
 use std::path::{Path, PathBuf};
 
-/// UDS 소켓 경로를 결정한다.
-/// 현재 OS를 자동 감지하여 플랫폼 관례에 따른 경로를 반환한다.
+/// legacy 단일 UDS 소켓(`session.sock`)을 **찾을** 때의 경로.
+/// 정규 경로에 없고 대체 후보에 있으면 그쪽을 쓴다 (`session_dir_candidates_for_os` 참고).
 pub fn default_socket_path() -> PathBuf {
-    resolve_socket_path(std::env::consts::OS)
+    discover_file(LEGACY_SOCKET_FILE)
 }
 
-/// 지정된 OS 문자열에 따라 소켓 경로를 결정한다.
+/// 지정된 OS 문자열에 따라 **정규** 소켓 경로를 결정한다 (탐색 없음).
 /// 테스트에서 OS를 주입할 수 있도록 분리.
 pub fn resolve_socket_path(os: &str) -> PathBuf {
-    session_dir_for_os(os).join("session.sock")
+    session_dir_for_os(os).join(LEGACY_SOCKET_FILE)
 }
+
+const LEGACY_SOCKET_FILE: &str = "session.sock";
 
 // ── 세션별 경로 함수 ──────────────────────────────────────────
 
@@ -112,10 +114,52 @@ fn aicd_dir() -> PathBuf {
     resolve_aicd_dir(&session_dir_candidates_for_os(std::env::consts::OS))
 }
 
-/// Session_ID를 인자로 받아 세션별 소켓 경로를 반환한다.
+/// 후보를 순서대로 훑어 `file`이 실제로 있는 첫 경로. 없으면 정규 경로(= 종전 동작).
+///
+/// aicd는 `aicd.sock` 하나를 디렉토리 기준점으로 삼지만(`resolve_aicd_dir`), 세션 소켓은
+/// 파일마다 주인이 달라 기준점으로 쓸 단일 파일이 없다. 그래서 파일 단위로 훑는다.
+fn resolve_file_in(candidates: &[PathBuf], file: &str) -> PathBuf {
+    let canonical = candidates.first().cloned().unwrap_or_else(session_dir);
+    candidates
+        .iter()
+        .map(|dir| dir.join(file))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| canonical.join(file))
+}
+
+fn discover_file(file: &str) -> PathBuf {
+    resolve_file_in(&session_dir_candidates_for_os(std::env::consts::OS), file)
+}
+
+fn session_socket_file(session_id: &str) -> String {
+    format!("session-{}.sock", session_id)
+}
+
+/// Session_ID의 세션 소켓을 **찾을** 때의 경로.
 /// 예: `/tmp/aic-{uid}/session-a1b2c3d4.sock`
+///
+/// aicd와 같은 이유로 두 후보를 훑는다 — 로그인 셸에서 띄운 세션(XDG 있음 → `/run/user`)을
+/// XDG 없는 셸의 `aic`가 못 찾으면 `aic history` 같은 명령이 조용히 빈손이 된다.
 pub fn session_socket_path(session_id: &str) -> PathBuf {
-    session_dir().join(format!("session-{}.sock", session_id))
+    discover_file(&session_socket_file(session_id))
+}
+
+/// 세션 소켓을 **만들** 때의 정규 경로. 탐색과 달리 파일 존재 여부를 보지 않는다.
+pub fn session_socket_path_for_bind(session_id: &str) -> PathBuf {
+    session_dir().join(session_socket_file(session_id))
+}
+
+/// Session_ID가 후보 디렉토리 어디에서든 이미 쓰이고 있는지.
+///
+/// 소켓과 PID lock을 모두 본다 — 비정상 종료로 lock만 남은 id를 재사용하면
+/// `DaemonLock::acquire`가 뒤늦게 실패한다. 정규 경로만 보면 다른 런타임 디렉토리에
+/// 살아 있는 세션과 같은 id를 뽑아, 탐색이 남의 세션을 가리키게 된다.
+pub fn session_id_in_use(session_id: &str) -> bool {
+    let socket = session_socket_file(session_id);
+    let lock = format!("session-{}.pid", session_id);
+    session_dir_candidates_for_os(std::env::consts::OS)
+        .iter()
+        .any(|dir| dir.join(&socket).exists() || dir.join(&lock).exists())
 }
 
 /// `aicd` supervisor daemon의 control UDS 소켓 경로 (탐색).
@@ -260,18 +304,49 @@ pub fn extract_session_id(socket_path: &Path) -> Option<String> {
     Some(id.to_string())
 }
 
-/// `session_dir()` 안의 모든 `session-*.sock` 파일을 mtime 내림차순(최신 우선)으로 반환.
+/// 후보 디렉토리 전체의 `session-*.sock`을 mtime 내림차순(최신 우선)으로 반환.
+///
+/// 한 디렉토리만 보면 XDG 유무가 갈리는 셸에서 세션 목록이 통째로 비어 보인다.
 pub fn list_session_sockets() -> Vec<PathBuf> {
-    list_session_sockets_in(&session_dir())
+    list_session_sockets_in_all(&session_dir_candidates_for_os(std::env::consts::OS))
+}
+
+/// 여러 디렉토리를 합쳐 최신 우선으로 정렬한다. 같은 파일명이 두 곳에 있으면 최신 것만 남긴다
+/// (같은 Session_ID가 양쪽에 있는 건 비정상이라, 오래된 잔해가 최신 세션을 가리는 걸 막는다).
+///
+/// 디렉토리별로 정렬한 결과를 이어 붙이면 안 된다 — 뒤 디렉토리의 최신 세션이 앞 디렉토리의
+/// 오래된 세션 뒤로 밀려, `resolve_active_socket`이 엉뚱한 세션을 고른다.
+pub fn list_session_sockets_in_all(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut all: Vec<(PathBuf, std::time::SystemTime)> = dirs
+        .iter()
+        .flat_map(|dir| stat_session_sockets(dir))
+        .collect();
+    all.sort_by_key(|p| std::cmp::Reverse(p.1));
+    let mut seen = std::collections::HashSet::new();
+    all.into_iter()
+        .filter_map(|(path, _)| {
+            let name = path.file_name()?.to_owned();
+            seen.insert(name).then_some(path)
+        })
+        .collect()
 }
 
 /// 테스트 가능한 inner helper — 임의 디렉토리에서 `session-*.sock` 파일 enumerate.
 pub fn list_session_sockets_in(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = stat_session_sockets(dir);
+    // mtime 내림차순(최신 우선). clippy::unnecessary_sort_by 회피용 sort_by_key + Reverse.
+    paths.sort_by_key(|p| std::cmp::Reverse(p.1));
+    paths.into_iter().map(|(p, _)| p).collect()
+}
+
+/// `session-*.sock`을 mtime과 함께 수집한다(정렬 없음). 여러 디렉토리를 합칠 때
+/// 전역 정렬을 하려면 mtime이 살아 있어야 해서 분리했다.
+fn stat_session_sockets(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
-    let mut paths: Vec<(PathBuf, std::time::SystemTime)> = entries
+    entries
         .flatten()
         .filter_map(|e| {
             let p = e.path();
@@ -282,10 +357,7 @@ pub fn list_session_sockets_in(dir: &Path) -> Vec<PathBuf> {
             let mtime = e.metadata().ok().and_then(|m| m.modified().ok())?;
             Some((p, mtime))
         })
-        .collect();
-    // mtime 내림차순(최신 우선). clippy::unnecessary_sort_by 회피용 sort_by_key + Reverse.
-    paths.sort_by_key(|p| std::cmp::Reverse(p.1));
-    paths.into_iter().map(|(p, _)| p).collect()
+        .collect()
 }
 
 /// 활성 세션 소켓 경로를 우선순위에 따라 결정한다.
@@ -382,9 +454,12 @@ mod tests {
         assert!(path.ends_with("session-a1b2c3d4.sock"));
     }
 
+    /// 탐색은 "어느 후보에도 없으면 정규 경로"가 계약이다. 실재하지 않는 id를 써서
+    /// 대체 후보의 우연한 파일에 결과가 흔들리지 않게 한다.
     #[test]
-    fn session_socket_path_under_session_dir() {
-        let path = session_socket_path("deadbeef");
+    fn session_socket_path_defaults_to_session_dir_when_absent() {
+        let path = session_socket_path("ffffffff");
+        assert!(!path.exists(), "테스트 전제: 이 id의 소켓은 없어야 한다");
         assert_eq!(path.parent().unwrap(), session_dir());
     }
 
@@ -592,6 +667,88 @@ mod tests {
         assert!(paths[1].to_string_lossy().ends_with("session-mid.sock"));
         assert!(paths[2].to_string_lossy().ends_with("session-old.sock"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── 세션 소켓: bind(정규) vs 탐색 ──────────────────────────
+
+    #[test]
+    fn session_socket_bind_path_is_pinned_to_session_dir() {
+        let path = session_socket_path_for_bind("deadbeef");
+        assert_eq!(path.parent().unwrap(), session_dir());
+        assert!(path.ends_with("session-deadbeef.sock"));
+    }
+
+    #[test]
+    fn resolve_file_in_falls_back_to_alt_then_canonical() {
+        let canonical = unique_temp_dir("sess-canon");
+        let alt = unique_temp_dir("sess-alt");
+        let dirs = [canonical.clone(), alt.clone()];
+        let file = "session-abc.sock";
+
+        // 어디에도 없으면 정규 경로
+        assert_eq!(resolve_file_in(&dirs, file), canonical.join(file));
+
+        // 대체 후보에만 있으면 그쪽 — 이게 XDG 없는 셸에서 세션을 찾아내는 동작이다
+        fs::write(alt.join(file), b"").unwrap();
+        assert_eq!(resolve_file_in(&dirs, file), alt.join(file));
+
+        // 양쪽에 있으면 정규 경로가 이긴다
+        fs::write(canonical.join(file), b"").unwrap();
+        assert_eq!(resolve_file_in(&dirs, file), canonical.join(file));
+
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    /// 디렉토리별로 정렬한 뒤 이어 붙이면 깨지는 케이스: 대체 후보의 최신 세션이
+    /// 정규 경로의 오래된 세션보다 앞에 와야 한다.
+    #[test]
+    fn list_session_sockets_in_all_sorts_across_dirs() {
+        let canonical = unique_temp_dir("all-canon");
+        let alt = unique_temp_dir("all-alt");
+        fs::write(canonical.join("session-old.sock"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(alt.join("session-new.sock"), b"").unwrap();
+
+        let paths = list_session_sockets_in_all(&[canonical.clone(), alt.clone()]);
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("session-new.sock"), "{paths:?}");
+        assert!(paths[1].ends_with("session-old.sock"), "{paths:?}");
+
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    #[test]
+    fn list_session_sockets_in_all_dedupes_by_name_keeping_newest() {
+        let canonical = unique_temp_dir("dup-canon");
+        let alt = unique_temp_dir("dup-alt");
+        fs::write(canonical.join("session-dup.sock"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(alt.join("session-dup.sock"), b"").unwrap();
+
+        let paths = list_session_sockets_in_all(&[canonical.clone(), alt.clone()]);
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths[0].starts_with(&alt),
+            "최신 쪽이 남아야 한다: {paths:?}"
+        );
+
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    #[test]
+    fn list_session_sockets_in_all_skips_missing_dirs() {
+        let live = unique_temp_dir("skip-live");
+        let missing = std::env::temp_dir().join("aic-paths-test-absent-98765");
+        let _ = fs::remove_dir_all(&missing);
+        fs::write(live.join("session-x.sock"), b"").unwrap();
+
+        let paths = list_session_sockets_in_all(&[missing, live.clone()]);
+        assert_eq!(paths.len(), 1);
+
+        let _ = fs::remove_dir_all(&live);
     }
 
     #[test]

@@ -43,9 +43,9 @@ pub fn is_valid_record_id(id: &str) -> bool {
 pub fn generate_unused_session_id(max_attempts: usize) -> Option<String> {
     for _ in 0..max_attempts {
         let id = generate_session_id();
-        let socket_path = crate::paths::session_socket_path(&id);
-        let lock_path = socket_path.with_extension("pid");
-        if !socket_path.exists() && !lock_path.exists() {
+        // 정규 경로만 보면 다른 런타임 디렉토리에 살아 있는 세션과 같은 id를 뽑을 수 있고,
+        // 그러면 탐색(`session_socket_path`)이 남의 세션을 가리킨다. 후보 전체를 본다.
+        if !crate::paths::session_id_in_use(&id) {
             return Some(id);
         }
     }
