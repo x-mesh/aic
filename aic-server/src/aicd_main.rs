@@ -9,7 +9,10 @@
 //! 의도적으로 비범위:
 //! - session registry, attach relay, PTY ownership — 이후 sub-step에서 추가.
 
-use aic_common::{aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path};
+use aic_common::{
+    aicd_attach_socket_path_for_bind, aicd_lock_path_for_bind, aicd_registry_path_for_bind,
+    aicd_socket_path_for_bind,
+};
 use aic_common::{AicdExporterConfig, AicdLogsConfig, AppConfig, LogLine};
 use aic_server::agent_event_bus::AgentEventBus;
 use aic_server::attach_server::AttachServer;
@@ -102,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // singleton lock — 이미 실행 중이면 즉시 실패한다.
-    let lock_path = aicd_lock_path();
+    let lock_path = aicd_lock_path_for_bind();
     let _lock = DaemonLock::acquire(&lock_path).map_err(|e| {
         eprintln!("aicd 시작 실패: {e}");
         e
@@ -110,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %lock_path.display(), "aicd lock 획득");
 
     // control UDS bind
-    let sock_path = aicd_socket_path();
+    let sock_path = aicd_socket_path_for_bind();
     let server = ControlServer::bind(&sock_path).await?;
     tracing::info!(path = %server.socket_path().display(), "aicd control 소켓 바인드");
 
@@ -131,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         signal_shutdown.send_replace(true);
     });
 
-    let registry_path = aicd_registry_path();
+    let registry_path = aicd_registry_path_for_bind();
     let registry = match SessionRegistry::load_snapshot(&registry_path, chrono::Utc::now()) {
         Ok(registry) => {
             tracing::info!(path = %registry_path.display(), count = registry.len().await, "registry snapshot 로드");
@@ -156,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // bind 에 실패하면 aicd 전체 기동을 abort — attach 가 없으면 Phase 3.4
     // 빌드의 aic-session 은 Local_Fallback 으로 내려가 RSS 개선이 사라진다.
-    let attach_sock_path = aicd_attach_socket_path();
+    let attach_sock_path = aicd_attach_socket_path_for_bind();
     let attach_pool = Arc::new(SessionProcessorPool::new());
     let attach_server = AttachServer::bind(
         &attach_sock_path,

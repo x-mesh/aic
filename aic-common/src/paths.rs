@@ -48,37 +48,121 @@ fn tmp_session_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/aic-{}", uid))
 }
 
+/// systemd `--user` 세션의 표준 런타임 디렉토리 아래 aic 디렉토리 (`/run/user/{uid}/aic`).
+/// `XDG_RUNTIME_DIR`이 비어 있을 때의 대체 후보로만 쓴다.
+fn run_user_session_dir() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{}/aic", uid))
+}
+
+// ── aicd 경로: 만드는 쪽과 찾는 쪽의 분리 ────────────────────────
+//
+// `session_dir()`는 **현재 프로세스의 환경**만 보고 한 곳을 정하는데, 그 환경이 데몬의
+// 환경과 다를 수 있다. systemd `--user`로 뜬 aicd에는 `XDG_RUNTIME_DIR`이 있어 소켓이
+// `/run/user/{uid}/aic`에 생기지만, 로그인 셸이 아닌 곳(`make`, cron, 에이전트 셸)에는
+// 그 변수가 없어 `session_dir()`가 `/tmp/aic-{uid}`로 갈린다. 그러면 클라이언트는 멀쩡히
+// 도는 데몬을 "실행 중이 아님"으로 본다 — `aic daemon restart --if-running`이 조용히
+// skip돼 `make install`/`aic update` 뒤에도 구버전 데몬이 계속 도는 사고가 여기서 났다.
+//
+// 그래서 **찾을 때만**(`aicd_*_path`) 두 관례를 순서대로 훑어 실제 소켓이 있는 쪽을 쓴다.
+// 만드는 쪽(`aicd_*_path_for_bind`)은 `session_dir()` 한 곳으로 고정한다 — 파일 잔해에
+// 따라 데몬이 매번 다른 곳에 bind하면 그게 더 찾기 어려운 문제가 된다.
+
+const AICD_SOCKET_FILE: &str = "aicd.sock";
+const AICD_LOCK_FILE: &str = "aicd.pid";
+const AICD_ATTACH_SOCKET_FILE: &str = "aicd-attach.sock";
+const AICD_REGISTRY_FILE: &str = "aicd-registry.json";
+
+/// aicd를 찾을 때 훑을 세션 디렉토리 후보. 0번이 정규 경로(`session_dir()`)다.
+fn session_dir_candidates_for_os(os: &str) -> Vec<PathBuf> {
+    let canonical = session_dir_for_os(os);
+    if os != "linux" {
+        return vec![canonical];
+    }
+    // linux의 두 관례를 서로의 대체 후보로 둔다. XDG가 **설정돼 있으면** `/run/user/{uid}`는
+    // 후보에 넣지 않는다 — 격리 환경(테스트/컨테이너)이 의도적으로 다른 런타임 디렉토리를
+    // 가리킨 상황이라, 거기서 시스템 데몬으로 새는 편이 못 찾는 것보다 나쁘다.
+    let alt = if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
+        tmp_session_dir()
+    } else {
+        run_user_session_dir()
+    };
+    if alt == canonical {
+        vec![canonical]
+    } else {
+        vec![canonical, alt]
+    }
+}
+
+/// 후보 중 실제 `aicd.sock`이 있는 첫 디렉토리. 아무 데도 없으면 정규 경로(= 종전 동작).
+///
+/// 소켓 하나를 기준점으로 삼아 lock·registry·attach까지 같은 디렉토리에서 뽑는다 —
+/// 파일마다 따로 탐색하면 `aic daemon status`가 한쪽의 socket과 다른 쪽의 pid를 섞어
+/// 보여줄 수 있다.
+fn resolve_aicd_dir(candidates: &[PathBuf]) -> PathBuf {
+    candidates
+        .iter()
+        .find(|dir| dir.join(AICD_SOCKET_FILE).exists())
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_else(session_dir)
+}
+
+fn aicd_dir() -> PathBuf {
+    resolve_aicd_dir(&session_dir_candidates_for_os(std::env::consts::OS))
+}
+
 /// Session_ID를 인자로 받아 세션별 소켓 경로를 반환한다.
 /// 예: `/tmp/aic-{uid}/session-a1b2c3d4.sock`
 pub fn session_socket_path(session_id: &str) -> PathBuf {
     session_dir().join(format!("session-{}.sock", session_id))
 }
 
-/// `aicd` supervisor daemon의 control UDS 소켓 경로.
+/// `aicd` supervisor daemon의 control UDS 소켓 경로 (탐색).
 /// 사용자당 하나만 존재한다.
 pub fn aicd_socket_path() -> PathBuf {
-    session_dir().join("aicd.sock")
+    aicd_dir().join(AICD_SOCKET_FILE)
 }
 
-/// `aicd` supervisor daemon의 PID lock 파일 경로.
+/// `aicd` supervisor daemon의 PID lock 파일 경로 (탐색).
 pub fn aicd_lock_path() -> PathBuf {
-    session_dir().join("aicd.pid")
+    aicd_dir().join(AICD_LOCK_FILE)
 }
 
-/// `aicd` supervisor daemon의 Attach_UDS 소켓 경로 (Phase 3.3).
+/// `aicd` supervisor daemon의 Attach_UDS 소켓 경로 (Phase 3.3, 탐색).
 ///
 /// `aic-session` 이 PTY raw byte stream 을 `aicd` 로 보낼 때 사용한다.
 /// Control_UDS(`aicd.sock`) 와 같은 부모 디렉토리(0700) 아래에 두며,
 /// 소켓 파일 자체 권한은 0600 (R15.3).
 pub fn aicd_attach_socket_path() -> PathBuf {
-    session_dir().join("aicd-attach.sock")
+    aicd_dir().join(AICD_ATTACH_SOCKET_FILE)
 }
 
-/// `aicd` supervisor daemon의 registry snapshot 경로.
+/// `aicd` supervisor daemon의 registry snapshot 경로 (탐색).
 ///
-/// 런타임 세션 복구용이므로 control socket/lock과 같은 session_dir 아래에 둔다.
+/// 런타임 세션 복구용이므로 control socket/lock과 같은 디렉토리 아래에 둔다.
 pub fn aicd_registry_path() -> PathBuf {
-    session_dir().join("aicd-registry.json")
+    aicd_dir().join(AICD_REGISTRY_FILE)
+}
+
+/// aicd가 control UDS를 **만들** 때 쓰는 정규 경로. 탐색과 달리 파일 존재 여부를 보지 않는다.
+pub fn aicd_socket_path_for_bind() -> PathBuf {
+    session_dir().join(AICD_SOCKET_FILE)
+}
+
+/// aicd가 PID lock을 **만들** 때 쓰는 정규 경로.
+pub fn aicd_lock_path_for_bind() -> PathBuf {
+    session_dir().join(AICD_LOCK_FILE)
+}
+
+/// aicd가 Attach_UDS를 **만들** 때 쓰는 정규 경로.
+pub fn aicd_attach_socket_path_for_bind() -> PathBuf {
+    session_dir().join(AICD_ATTACH_SOCKET_FILE)
+}
+
+/// aicd가 registry snapshot을 **쓸** 때의 정규 경로.
+pub fn aicd_registry_path_for_bind() -> PathBuf {
+    session_dir().join(AICD_REGISTRY_FILE)
 }
 
 /// daemonless mode에서 `aic`가 읽는 마지막 command record 경로.
@@ -304,18 +388,111 @@ mod tests {
         assert_eq!(path.parent().unwrap(), session_dir());
     }
 
+    // ── aicd 경로: bind(정규) vs 탐색 ──────────────────────────
+
+    /// 만드는 쪽은 환경만 보고 `session_dir()` 한 곳으로 고정돼야 한다.
     #[test]
-    fn aicd_registry_path_under_session_dir() {
-        let path = aicd_registry_path();
-        assert_eq!(path.parent().unwrap(), session_dir());
-        assert!(path.ends_with("aicd-registry.json"));
+    fn aicd_bind_paths_are_pinned_to_session_dir() {
+        for (path, name) in [
+            (aicd_socket_path_for_bind(), "aicd.sock"),
+            (aicd_lock_path_for_bind(), "aicd.pid"),
+            (aicd_attach_socket_path_for_bind(), "aicd-attach.sock"),
+            (aicd_registry_path_for_bind(), "aicd-registry.json"),
+        ] {
+            assert_eq!(path.parent().unwrap(), session_dir(), "{name}");
+            assert!(path.ends_with(name));
+        }
+    }
+
+    /// 탐색 결과는 네 경로가 **같은** 디렉토리에서 나와야 한다 — socket은 이쪽,
+    /// pid는 저쪽으로 갈리면 `aic daemon status`가 섞인 정보를 보여준다.
+    #[test]
+    fn aicd_discovered_paths_share_one_dir() {
+        let dir = aicd_socket_path().parent().unwrap().to_path_buf();
+        assert_eq!(aicd_lock_path().parent().unwrap(), dir);
+        assert_eq!(aicd_attach_socket_path().parent().unwrap(), dir);
+        assert_eq!(aicd_registry_path().parent().unwrap(), dir);
     }
 
     #[test]
-    fn aicd_attach_socket_path_under_session_dir() {
-        let path = aicd_attach_socket_path();
-        assert_eq!(path.parent().unwrap(), session_dir());
-        assert!(path.ends_with("aicd-attach.sock"));
+    fn resolve_aicd_dir_prefers_canonical_when_socket_is_there() {
+        let canonical = unique_temp_dir("aicd-canonical");
+        let alt = unique_temp_dir("aicd-alt");
+        fs::write(canonical.join(AICD_SOCKET_FILE), b"").unwrap();
+        fs::write(alt.join(AICD_SOCKET_FILE), b"").unwrap();
+        assert_eq!(
+            resolve_aicd_dir(&[canonical.clone(), alt.clone()]),
+            canonical
+        );
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    /// 이 테스트가 지키는 것: systemd로 뜬 aicd(대체 후보)를 XDG 없는 셸(정규=/tmp)에서
+    /// 찾아내는 동작. 깨지면 `make install` 후 재시작이 조용히 skip된다.
+    #[test]
+    fn resolve_aicd_dir_falls_back_to_alt_when_canonical_is_empty() {
+        let canonical = unique_temp_dir("aicd-empty");
+        let alt = unique_temp_dir("aicd-live");
+        fs::write(alt.join(AICD_SOCKET_FILE), b"").unwrap();
+        assert_eq!(resolve_aicd_dir(&[canonical.clone(), alt.clone()]), alt);
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    /// 어디에도 소켓이 없으면 종전대로 정규 경로 — 데몬 미실행 시 표시할 경로가 필요하다.
+    #[test]
+    fn resolve_aicd_dir_defaults_to_canonical_when_nothing_found() {
+        let canonical = unique_temp_dir("aicd-none-a");
+        let alt = unique_temp_dir("aicd-none-b");
+        assert_eq!(
+            resolve_aicd_dir(&[canonical.clone(), alt.clone()]),
+            canonical
+        );
+        let _ = fs::remove_dir_all(&canonical);
+        let _ = fs::remove_dir_all(&alt);
+    }
+
+    #[test]
+    fn session_dir_candidates_without_xdg_include_run_user() {
+        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let candidates = session_dir_candidates_for_os("linux");
+        assert_eq!(candidates[0], tmp_session_dir(), "0번은 정규 경로");
+        assert_eq!(
+            candidates[1],
+            run_user_session_dir(),
+            "systemd --user 쪽 대체"
+        );
+        if let Some(v) = prev {
+            std::env::set_var("XDG_RUNTIME_DIR", v);
+        }
+    }
+
+    /// XDG가 잡혀 있으면 `/run/user/{uid}`는 후보가 아니다 — 격리 환경이 의도적으로
+    /// 다른 런타임 디렉토리를 가리킨 것이라, 시스템 데몬으로 새면 안 된다.
+    #[test]
+    fn session_dir_candidates_with_xdg_do_not_leak_to_run_user() {
+        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::set_var("XDG_RUNTIME_DIR", "/tmp/isolated-runtime");
+        let candidates = session_dir_candidates_for_os("linux");
+        assert_eq!(candidates[0], PathBuf::from("/tmp/isolated-runtime/aic"));
+        assert_eq!(candidates[1], tmp_session_dir());
+        assert!(!candidates.contains(&run_user_session_dir()));
+        match prev {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn session_dir_candidates_on_macos_has_only_tmp() {
+        assert_eq!(
+            session_dir_candidates_for_os("macos"),
+            vec![tmp_session_dir()]
+        );
     }
 
     #[test]

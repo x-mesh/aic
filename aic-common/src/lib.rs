@@ -22,10 +22,11 @@ pub use ipc::{
     AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
 };
 pub use paths::{
-    aicd_attach_socket_path, aicd_lock_path, aicd_registry_path, aicd_socket_path,
-    default_socket_path, extract_session_id, list_session_sockets, local_command_record_path,
-    local_hook_pending_path, resolve_active_socket, resolve_socket_path, session_dir,
-    session_socket_path,
+    aicd_attach_socket_path, aicd_attach_socket_path_for_bind, aicd_lock_path,
+    aicd_lock_path_for_bind, aicd_registry_path, aicd_registry_path_for_bind, aicd_socket_path,
+    aicd_socket_path_for_bind, default_socket_path, extract_session_id, list_session_sockets,
+    local_command_record_path, local_hook_pending_path, resolve_active_socket, resolve_socket_path,
+    session_dir, session_socket_path,
 };
 pub use session::{
     generate_record_id, generate_session_id, generate_unused_session_id, is_valid_record_id,
