@@ -8,13 +8,19 @@
 //! 변환한다. PID/comm/cgroup entity를 담은 `top`·`findings`·`correlation_hint`는 **호스트 밖으로
 //! 내보내지 않는다** — 전송 표면을 최소화하고, 판정 힌트는 로컬 해석층(chat/diagnose)에 남긴다.
 //!
-//! **수집 방식(fallback 경로)**: 논블로킹 `GET /countersz`가 rca-agent에 아직 없어서, 짧은
-//! window의 `POST /collectz`로 delta를 받는다. 서버는 동시 collect를 막지도 거부하지도 않으므로
-//! (`internal/control/collector.go`에 가드 없음) 겹치지 않게 하는 건 소비자 책임인데, 이 태스크는
-//! 단일 루프에서 순차로 await하고 tick도 `MissedTickBehavior::Skip`이라 **인플라이트가 구조적으로
-//! 1**이다. 다만 사용자가 같은 시각에 chat/CLI로 collect를 부르면 window가 겹칠 수 있다 —
-//! 서버가 각자 window를 돌려 각자 답하므로 오류는 없고, 문서화된 한계다.
+//! **수집 방식 — `duration=0` 논블로킹 폴링.** `POST /collectz?duration=0`은 대기 없이
+//! 즉시 스냅샷만 돌려준다(rca-agent `observations.go`의 `if duration > 0`이 대기 블록을 감싼다;
+//! 실측 13~18ms vs `duration=5s`의 5017ms). aicd는 응답의 **누적 카운터(`observations.end`)를
+//! 두 폴에 걸쳐 차분**해 이번 틱의 증가분을 만든다.
+//!
+//! 짧은 window를 블로킹으로 재던 이전 방식은 **틱 간격의 일부만 관측**했다(60초 중 10초 = 5/6
+//! 미관측). 그 사이 fork storm이 나면 통째로 안 보인다. 폴링은 두 폴 사이 전 구간을 담고,
+//! 블로킹이 없어 동시 collect 경합도 사라진다.
+//!
+//! **감수 사항**: `duration=0` 동작은 실측으로 확인했지만 rca-agent의 문서화된 계약은 아직
+//! 아니다(그쪽 PRD Q3). 계약이 확정되기 전까지는 이 전제가 바뀔 수 있다.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +34,8 @@ use super::spool::{SignalKind, Spool};
 
 /// `/collectz` 응답 상한 — 신호를 많이 켠 호스트도 수백 KB 수준이다.
 const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
-/// window 위에 얹는 요청 timeout 여유.
-const REQUEST_MARGIN: Duration = Duration::from_secs(15);
+/// 폴 요청 timeout. 대기가 없어 실측 13~18ms지만, 부하 상황의 여유를 크게 둔다.
+const POLL_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct KernelConfig {
     /// OTLP collector base URL. `/v1/metrics`가 append된다.
@@ -40,10 +46,8 @@ pub struct KernelConfig {
     pub service_version: String,
     /// rca-agent control API base URL(loopback 검증을 통과한 값).
     pub agent_url: String,
-    /// 수집 tick 간격.
+    /// 폴 간격. 두 폴 사이의 카운터 증가분이 곧 보고 단위다.
     pub interval: Duration,
-    /// 한 tick의 측정 window. `interval`보다 짧아야 한다.
-    pub window: Duration,
     /// 오프라인 spool(SRE t8). 다른 exporter task와 동일 인스턴스를 공유한다.
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. 다른 exporter task와 공유한다.
@@ -85,20 +89,19 @@ pub fn ensure_loopback(raw: &str) -> anyhow::Result<String> {
 /// 숫자가 아닌 값이나 예상 밖 구조는 조용히 건너뛴다(파싱 실패 = 빈 목록). metric 이름은 OTLP
 /// 인코더가 `&'static str`을 요구하므로 알려진 신호·메트릭 조합만 상수로 매핑한다 — 모르는
 /// 조합은 버린다(rca-agent가 신호를 추가하면 여기 한 줄이 늘어난다).
-pub fn build_metric_points(bundle_json: &str) -> Vec<MetricPoint> {
+pub fn read_counters(bundle_json: &str) -> BTreeMap<&'static str, i64> {
+    let mut out = BTreeMap::new();
     let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
-        return Vec::new();
+        return out;
     };
-    let Some(delta) = v
+    let Some(end) = v
         .get("observations")
-        .and_then(|o| o.get("delta"))
+        .and_then(|o| o.get("end"))
         .and_then(Value::as_object)
     else {
-        return Vec::new();
+        return out;
     };
-
-    let mut points = Vec::new();
-    for (signal, metrics) in delta {
+    for (signal, metrics) in end {
         let Some(metrics) = metrics.as_object() else {
             continue;
         };
@@ -107,14 +110,43 @@ pub fn build_metric_points(bundle_json: &str) -> Vec<MetricPoint> {
                 continue;
             };
             let Some(n) = value.as_i64() else { continue };
-            points.push(MetricPoint {
-                name,
-                unit: "1",
-                value: MetricValue::Int(n),
-            });
+            out.insert(name, n);
         }
     }
-    // 인코딩 결과를 결정적으로 만들어 골든 비교와 디버깅을 쉽게 한다.
+    out
+}
+
+/// 두 폴의 누적 카운터 차분 → metric points. **순수 함수.**
+///
+/// `prev`가 없으면(첫 폴) 빈 목록이다 — 기준선이 없으면 "이번 틱에 얼마나 늘었나"를 말할 수
+/// 없고, 누적값을 그대로 보내면 시계열이 첫 점에서 거대한 계단을 만든다.
+///
+/// **카운터가 후퇴하면 그 항목을 버린다.** rca-agent가 재시작하면 커널 맵이 0부터 다시 세므로
+/// `cur - prev`가 음수가 되는데, 그걸 보내면 존재하지 않은 감소가 시계열에 남는다. 그 한 구간만
+/// 폐기하고 다음 틱부터 새 기준선으로 정상 재개한다.
+///
+/// 값이 0인 항목도 보낸다 — "이 구간에 아무 일도 없었다"와 "수집이 멈췄다"는 다른 사실이다.
+pub fn diff_counters(
+    prev: Option<&BTreeMap<&'static str, i64>>,
+    cur: &BTreeMap<&'static str, i64>,
+) -> Vec<MetricPoint> {
+    let Some(prev) = prev else { return Vec::new() };
+    let mut points = Vec::new();
+    for (name, cur_v) in cur {
+        let Some(prev_v) = prev.get(name) else {
+            continue;
+        };
+        let d = cur_v - prev_v;
+        if d < 0 {
+            continue; // 카운터 후퇴(에이전트 재시작) — 이 구간 폐기.
+        }
+        points.push(MetricPoint {
+            name,
+            unit: "1",
+            value: MetricValue::Int(d),
+        });
+    }
+    // BTreeMap 순회라 이미 이름순이지만, 인코딩 결정성을 명시적으로 고정한다.
     points.sort_by_key(|p| p.name);
     points
 }
@@ -136,86 +168,81 @@ fn metric_name(signal: &str, metric: &str) -> Option<&'static str> {
     })
 }
 
-/// OOM kill 이산 이벤트 하나 — victim별 집계.
+/// OOM kill 이산 이벤트 하나 — ring buffer의 개별 사건.
 ///
 /// 카운터(metric)와 달리 "누가 죽었나"가 핵심이라 comm을 싣는다. **이것이 이 경로에서 유일하게
 /// 나가는 entity**이고, 인코더의 redaction 게이트를 값 단위로 통과한 뒤 송신된다
 /// (`logs_proto::string_value` → `redact_str`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OomEvent {
-    /// victim 프로세스명. 번들에 귀속 정보가 없으면 `unknown`.
+    /// ring buffer가 매긴 단조 증가 sequence. 중복 발행 방지의 기준이다.
+    pub seq: u64,
+    /// victim 프로세스명. 비어 있으면 `unknown`.
     pub comm: String,
-    /// 이 window에서 이 victim이 죽은 횟수.
-    pub kills: u64,
 }
 
-/// 번들 → OOM 이산 이벤트. **순수 함수.**
+/// 번들 → **아직 보내지 않은** OOM 이산 이벤트와 이번에 본 최대 seq.
 ///
-/// `delta.oom.kills`가 0이면 빈 목록이다 — 카운터는 0도 보내지만(결측과 구분), 이벤트는 "일어난
-/// 일"이라 없으면 보내지 않는다. victim은 `top.oom.by_comm`(`[{comm, kills, …}]`)에서 얻고,
-/// 귀속이 불가능한 경우(top이 `available:false`)에도 **사건 자체는 버리지 않고** comm을
-/// `unknown`으로 채워 총 kill 수를 보낸다 — OOM이 났다는 사실이 누가 죽었는지보다 먼저다.
-pub fn build_oom_events(bundle_json: &str) -> Vec<OomEvent> {
+/// **왜 seq가 필요한가**: `duration=0` 폴에서 `top.oom.events`는 window가 아니라 **ring buffer
+/// 전체**를 돌려준다(실측: 821초 전 이벤트도 그대로 들어 있다). 매 폴마다 같은 사건이 다시
+/// 오므로, seq로 걸러내지 않으면 한 번의 OOM이 틱마다 재발행된다.
+///
+/// 그래서 `after_seq`보다 큰 것만 새 사건으로 본다. 반환하는 최대 seq는 **필터 전 전체 기준**이라,
+/// 호출부가 그대로 저장하면 다음 폴에서 같은 사건을 다시 보지 않는다.
+///
+/// ring 용량(실측 16)을 넘겨 유실된 사건은 번들의 `dropped_events`가 알려 주지만, 그건 카운터
+/// (`aic.kernel.oom_kills`)가 이미 총량으로 담고 있어 여기서 따로 복원하지 않는다.
+pub fn build_oom_events(bundle_json: &str, after_seq: u64) -> (Vec<OomEvent>, u64) {
     let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
-        return Vec::new();
+        return (Vec::new(), after_seq);
     };
-    let obs = match v.get("observations") {
-        Some(o) => o,
-        None => return Vec::new(),
-    };
-    let total = obs
-        .get("delta")
-        .and_then(|d| d.get("oom"))
-        .and_then(|o| o.get("kills"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if total == 0 {
-        return Vec::new();
-    }
-
-    let by_comm = obs
-        .get("top")
+    let Some(items) = v
+        .get("observations")
+        .and_then(|o| o.get("top"))
         .and_then(|t| t.get("oom"))
-        .and_then(|o| o.get("by_comm"))
-        .and_then(Value::as_array);
+        .and_then(|o| o.get("events"))
+        .and_then(Value::as_array)
+    else {
+        return (Vec::new(), after_seq);
+    };
 
-    let mut events: Vec<OomEvent> = by_comm
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    let comm = e.get("comm").and_then(Value::as_str)?.trim();
-                    if comm.is_empty() {
-                        return None;
-                    }
-                    let kills = e.get("kills").and_then(Value::as_u64).unwrap_or(1);
-                    Some(OomEvent {
-                        comm: comm.to_string(),
-                        kills,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if events.is_empty() {
+    let mut max_seq = after_seq;
+    let mut events = Vec::new();
+    for e in items {
+        let Some(seq) = e.get("seq").and_then(Value::as_u64) else {
+            continue;
+        };
+        max_seq = max_seq.max(seq);
+        if seq <= after_seq {
+            continue;
+        }
+        let comm = e
+            .get("comm")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("unknown");
         events.push(OomEvent {
-            comm: "unknown".to_string(),
-            kills: total,
+            seq,
+            comm: comm.to_string(),
         });
     }
-    events.sort_by(|a, b| b.kills.cmp(&a.kills).then_with(|| a.comm.cmp(&b.comm)));
-    events
+    events.sort_by_key(|e| e.seq);
+    (events, max_seq)
 }
 
 /// 재전송 중복을 수신측 ReplacingMergeTree가 흡수하도록 하는 idempotency 키.
-/// changes exporter와 같은 방식(host + subject + action + bucket)이다.
-fn oom_record_id(host: &str, comm: &str, bucket: u64) -> String {
+///
+/// changes exporter의 방식(host + subject + action + bucket)에 **ring seq를 더한다** — 같은
+/// victim이 같은 분에 여러 번 죽으면 별개 사건인데, seq가 없으면 하나로 접혀 유실된다.
+fn oom_record_id(host: &str, comm: &str, seq: u64, bucket: u64) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     host.hash(&mut h);
     comm.hash(&mut h);
     "oom_kill".hash(&mut h);
+    seq.hash(&mut h);
     bucket.hash(&mut h);
     format!("{:016x}", h.finish())
 }
@@ -239,16 +266,13 @@ async fn serve_kernel_with(
 ) -> anyhow::Result<()> {
     let url = super::metrics_url(&cfg.endpoint);
     let logs_url = super::logs_url(&cfg.endpoint);
-    let collect_url = format!(
-        "{}/collectz?profile=incident&duration={}s",
-        cfg.agent_url,
-        cfg.window.as_secs()
-    );
+    // duration=0 — 대기 없이 스냅샷만 받는다(모듈 doc 참고).
+    let collect_url = format!("{}/collectz?profile=incident&duration=0", cfg.agent_url);
     tracing::info!(
         url = %url,
         agent = %cfg.agent_url,
         interval_secs = cfg.interval.as_secs(),
-        window_secs = cfg.window.as_secs(),
+        mode = "duration=0 polling",
         "OTLP kernel exporter 시작"
     );
 
@@ -265,6 +289,13 @@ async fn serve_kernel_with(
     let mut backoff = Backoff::new();
     // 연결 실패는 rca-agent 미기동이라는 흔한 정상 상태다 — 상태 전이에서만 WARN하고 그 뒤엔 조용히.
     let mut collect_failing = false;
+    // 직전 폴의 누적 카운터. 첫 폴은 기준선만 잡고 아무것도 보내지 않는다.
+    let mut prev_counters: Option<BTreeMap<&'static str, i64>> = None;
+    // 이미 내보낸 OOM 이벤트의 최대 seq. ring은 매 폴마다 통째로 오므로(오래된 이벤트 포함)
+    // 이 값보다 큰 것만 새 사건이다. 첫 폴에서는 기준선만 잡는다(아래 oom_baseline).
+    let mut last_oom_seq: u64 = 0;
+    // 첫 tick을 지났는지. OOM 기준선 판정에 쓴다(카운터는 prev_counters로 같은 판정을 한다).
+    let mut first_seen = false;
 
     loop {
         if *shutdown.borrow() {
@@ -272,7 +303,7 @@ async fn serve_kernel_with(
         }
         tokio::select! {
             _ = ticker.tick() => {
-                let bundle = match collect_once(client, &collect_url, cfg.window).await {
+                let bundle = match collect_once(client, &collect_url).await {
                     Ok(b) => {
                         if collect_failing {
                             tracing::info!("rca-agent 커널 수집 복구");
@@ -293,10 +324,19 @@ async fn serve_kernel_with(
                     }
                 };
 
-                // 이산 이벤트(OOM)는 카운터와 독립적으로 먼저 내보낸다 — metric이 비어도
-                // (미지원 신호만 켠 경우) 사건은 보내야 하고, 반대도 마찬가지다.
-                let oom_events = build_oom_events(&bundle);
-                if !oom_events.is_empty() {
+                // 이산 이벤트(OOM)는 카운터와 독립적으로 내보낸다 — 한쪽이 비어도 다른 쪽은 보낸다.
+                //
+                // **첫 폴은 seq 기준선만 잡고 보내지 않는다.** ring은 window가 아니라 버퍼 전체를
+                // 돌려주므로(실측: 821초 전 사건도 들어 있다), 기준선 없이 보내면 aicd가 재시작될
+                // 때마다 옛 사건이 되살아난다. record_id의 시각 버킷이 재시작 시각으로 달라져
+                // 수신측 중복 제거도 통과해 버린다. 그 대가로 재시작 구간의 사건은 놓치지만,
+                // 없는 사건을 만들어 내는 것보다 낫다(카운터의 첫 폴 규칙과 같은 판단).
+                let (oom_events, max_seq) = build_oom_events(&bundle, last_oom_seq);
+                let oom_baseline = !first_seen;
+                if oom_baseline && max_seq > 0 {
+                    tracing::debug!(max_seq, "첫 폴 — OOM ring seq 기준선만 잡는다");
+                }
+                if !oom_baseline && !oom_events.is_empty() {
                     push_oom_events(
                         client,
                         &cfg,
@@ -309,10 +349,21 @@ async fn serve_kernel_with(
                     )
                     .await;
                 }
+                // 전송 실패해도 seq는 전진시킨다 — 실패한 배치는 spool이 보관하므로, 되돌리면
+                // 다음 폴에서 같은 사건을 중복 발행하게 된다.
+                last_oom_seq = last_oom_seq.max(max_seq);
 
-                let points = build_metric_points(&bundle);
+                let cur = read_counters(&bundle);
+                let points = diff_counters(prev_counters.as_ref(), &cur);
+                let first_poll = prev_counters.is_none();
+                prev_counters = Some(cur);
+                first_seen = true;
                 if points.is_empty() {
-                    tracing::debug!("커널 delta 없음(활성 신호 0 또는 미지원 신호) — 이번 tick 생략");
+                    if first_poll {
+                        tracing::debug!("첫 폴 — 누적 카운터 기준선만 잡고 전송은 다음 tick부터");
+                    } else {
+                        tracing::debug!("커널 증가분 없음(활성 신호 0 또는 카운터 후퇴) — 이번 tick 생략");
+                    }
                     continue;
                 }
                 let sample = HostSample {
@@ -390,12 +441,12 @@ async fn push_oom_events(
     let bucket = now_ns / 60_000_000_000;
     let ids: Vec<String> = events
         .iter()
-        .map(|e| oom_record_id(host_name, &e.comm, bucket))
+        .map(|e| oom_record_id(host_name, &e.comm, e.seq, bucket))
         .collect();
-    let states: Vec<String> = events.iter().map(|e| e.kills.to_string()).collect();
+    let states: Vec<String> = events.iter().map(|e| e.seq.to_string()).collect();
     let summaries: Vec<String> = events
         .iter()
-        .map(|e| format!("OOM kill: {} ({}회)", e.comm, e.kills))
+        .map(|e| format!("OOM kill: {} (seq {})", e.comm, e.seq))
         .collect();
 
     let entries: Vec<ChangeEntry<'_>> = events
@@ -445,15 +496,11 @@ async fn push_oom_events(
     }
 }
 
-/// 한 번의 `/collectz` 수집. window만큼 블록하므로 timeout은 window + 여유다.
-async fn collect_once(
-    client: &reqwest::Client,
-    url: &str,
-    window: Duration,
-) -> anyhow::Result<String> {
+/// 한 번의 `/collectz?duration=0` 폴. 대기가 없으므로 timeout은 짧게 잡는다.
+async fn collect_once(client: &reqwest::Client, url: &str) -> anyhow::Result<String> {
     let resp = client
         .post(url)
-        .timeout(window + REQUEST_MARGIN)
+        .timeout(POLL_TIMEOUT)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("rca-agent 요청 실패: {e}"))?;
@@ -472,127 +519,145 @@ async fn collect_once(
 mod tests {
     use super::*;
 
-    const BUNDLE: &str = r#"{
+    /// `duration=0` 폴의 실제 응답 모양 — 서버가 계산한 `delta`는 10ms 창이라 무의미하고,
+    /// 우리가 쓰는 건 누적 `end`와 ring 전체를 담은 `top.oom.events`다.
+    const POLL: &str = r#"{
       "schema_version": "rca.evidence.v1",
       "observations": {
-        "delta": {
-          "context_switch": {"switches": 105959},
-          "process_lifecycle": {"fork": 17, "exit": 14},
-          "oom": {"kills": 0}
+        "delta": {"context_switch": {"switches": 3}, "process_lifecycle": {"fork": 0}},
+        "end": {
+          "context_switch": {"switches": 272950998},
+          "process_lifecycle": {"fork": 384327, "exit": 384000},
+          "oom": {"kills": 3}
         },
-        "top": {"oom": {"by_comm": {"python": 3}}},
-        "findings": [{"signal":"oom","severity":"warning"}]
+        "top": {"oom": {"available": true, "basis": "event_ring_window", "ring_capacity": 16,
+          "events": [
+            {"seq": 1, "comm": "python3", "pid": 2338843, "age_seconds": 821.5},
+            {"seq": 2, "comm": "node", "pid": 2338999, "age_seconds": 12.0}
+          ]}}
       }
     }"#;
 
+    fn counters(pairs: &[(&'static str, i64)]) -> BTreeMap<&'static str, i64> {
+        pairs.iter().copied().collect()
+    }
+
     #[test]
-    fn build_metric_points_flattens_delta_only() {
-        let pts = build_metric_points(BUNDLE);
+    fn read_counters_takes_cumulative_end_not_delta() {
+        let c = read_counters(POLL);
+        // delta(3)가 아니라 end(272950998)를 읽어야 한다 — duration=0의 delta는 10ms 창이다.
+        assert_eq!(c.get("aic.kernel.context_switches"), Some(&272_950_998));
+        assert_eq!(c.get("aic.kernel.forks"), Some(&384_327));
+        assert_eq!(c.get("aic.kernel.oom_kills"), Some(&3));
+        // 모르는 신호는 버린다(metric 이름이 &'static str이라 allowlist가 필요).
+        assert!(read_counters(r#"{"observations":{"end":{"future":{"x":1}}}}"#).is_empty());
+        assert!(read_counters("not json").is_empty());
+    }
+
+    #[test]
+    fn diff_counters_reports_increase_between_polls() {
+        let prev = counters(&[("aic.kernel.forks", 100), ("aic.kernel.oom_kills", 2)]);
+        let cur = counters(&[("aic.kernel.forks", 161), ("aic.kernel.oom_kills", 2)]);
+        let pts = diff_counters(Some(&prev), &cur);
+        let get = |n: &str| {
+            pts.iter().find(|p| p.name == n).map(|p| match p.value {
+                MetricValue::Int(v) => v,
+                MetricValue::Double(_) => panic!("커널 카운터는 Int여야 한다"),
+            })
+        };
+        assert_eq!(get("aic.kernel.forks"), Some(61));
+        // 변화가 없어도 0을 보낸다 — "아무 일 없었다"와 "수집이 멈췄다"는 다른 사실이다.
+        assert_eq!(get("aic.kernel.oom_kills"), Some(0));
+    }
+
+    #[test]
+    fn diff_counters_first_poll_emits_nothing() {
+        // 기준선이 없으면 증가분을 말할 수 없다. 누적값을 그대로 보내면 첫 점이 거대한 계단이 된다.
+        let cur = counters(&[("aic.kernel.forks", 384_327)]);
+        assert!(diff_counters(None, &cur).is_empty());
+    }
+
+    #[test]
+    fn diff_counters_drops_backwards_counter() {
+        // rca-agent가 재시작하면 커널 맵이 0부터 다시 센다 — 음수 증가분을 보내면 안 된다.
+        let prev = counters(&[("aic.kernel.forks", 500), ("aic.kernel.exits", 10)]);
+        let cur = counters(&[("aic.kernel.forks", 7), ("aic.kernel.exits", 12)]);
+        let pts = diff_counters(Some(&prev), &cur);
         let names: Vec<&str> = pts.iter().map(|p| p.name).collect();
         assert_eq!(
             names,
-            vec![
-                "aic.kernel.context_switches",
-                "aic.kernel.exits",
-                "aic.kernel.forks",
-                "aic.kernel.oom_kills",
-            ]
+            vec!["aic.kernel.exits"],
+            "후퇴한 forks는 이 구간 폐기"
         );
-        // entity를 담은 top/findings는 metric으로 새어 나가지 않는다.
-        assert!(!names
-            .iter()
-            .any(|n| n.contains("comm") || n.contains("top")));
     }
 
     #[test]
-    fn build_metric_points_keeps_zero_values() {
-        // 0은 결측과 다르다 — "이 window엔 OOM이 없었다"는 사실을 보낸다.
-        let pts = build_metric_points(BUNDLE);
-        let oom = pts
-            .iter()
-            .find(|p| p.name == "aic.kernel.oom_kills")
-            .expect("oom point");
-        match oom.value {
-            MetricValue::Int(v) => assert_eq!(v, 0),
-            MetricValue::Double(_) => panic!("커널 카운터는 Int여야 한다"),
-        }
-    }
-
-    #[test]
-    fn build_metric_points_drops_unknown_signals() {
-        // 모르는 신호/메트릭은 버린다(metric 이름이 &'static str이라 allowlist가 필요).
-        let b = r#"{"observations":{"delta":{"future_signal":{"whatever":5}}}}"#;
-        assert!(build_metric_points(b).is_empty());
-    }
-
-    #[test]
-    fn build_metric_points_degrades_on_bad_input() {
-        assert!(build_metric_points("not json").is_empty());
-        assert!(build_metric_points("{}").is_empty());
-        assert!(build_metric_points(r#"{"observations":{"delta":42}}"#).is_empty());
-    }
-
-    #[test]
-    fn build_oom_events_maps_victims_from_by_comm() {
-        // 실제 번들 모양: top.oom.by_comm = [{rank, kills, pids, comm}, ...]
-        let b = r#"{"observations":{
-          "delta":{"oom":{"kills":3}},
-          "top":{"oom":{"by_comm":[
-            {"rank":1,"kills":2,"pids":2,"comm":"python"},
-            {"rank":2,"kills":1,"pids":1,"comm":"node"}
-          ]}}
-        }}"#;
-        let ev = build_oom_events(b);
+    fn build_oom_events_returns_only_unseen_seqs() {
+        // 첫 폴: ring 전체가 새 사건이다.
+        let (ev, max) = build_oom_events(POLL, 0);
+        assert_eq!(max, 2);
         assert_eq!(
             ev,
             vec![
                 OomEvent {
-                    comm: "python".into(),
-                    kills: 2
+                    seq: 1,
+                    comm: "python3".into()
                 },
                 OomEvent {
-                    comm: "node".into(),
-                    kills: 1
+                    seq: 2,
+                    comm: "node".into()
                 },
             ]
         );
+        // 같은 ring을 다시 폴해도 재발행하지 않는다(중복 방지의 핵심).
+        let (ev2, max2) = build_oom_events(POLL, 2);
+        assert!(ev2.is_empty());
+        assert_eq!(max2, 2);
+        // 일부만 본 상태면 그 뒤만 새 사건이다.
+        let (ev3, _) = build_oom_events(POLL, 1);
+        assert_eq!(ev3.len(), 1);
+        assert_eq!(ev3[0].seq, 2);
     }
 
     #[test]
-    fn build_oom_events_keeps_event_when_attribution_unavailable() {
-        // top이 available:false여도 "OOM이 났다"는 사실은 버리지 않는다 — comm만 unknown.
-        let b = r#"{"observations":{
-          "delta":{"oom":{"kills":2}},
-          "top":{"oom":{"available":false,"reason":"top_n_attribution_unavailable"}}
-        }}"#;
+    fn build_oom_events_degrades_on_bad_input() {
+        // 파싱 실패·구조 불일치는 빈 목록 + seq 유지(전진시키면 사건을 잃는다).
+        for bad in [
+            "not json",
+            "{}",
+            r#"{"observations":{"top":{"oom":{"events":"nope"}}}}"#,
+        ] {
+            let (ev, max) = build_oom_events(bad, 7);
+            assert!(ev.is_empty());
+            assert_eq!(max, 7);
+        }
+        // seq 없는 항목은 건너뛴다.
+        let (ev, _) = build_oom_events(
+            r#"{"observations":{"top":{"oom":{"events":[{"comm":"x"}]}}}}"#,
+            0,
+        );
+        assert!(ev.is_empty());
+        // comm이 비면 unknown — 사건 자체는 버리지 않는다.
+        let (ev, _) = build_oom_events(
+            r#"{"observations":{"top":{"oom":{"events":[{"seq":9,"comm":"  "}]}}}}"#,
+            0,
+        );
         assert_eq!(
-            build_oom_events(b),
+            ev,
             vec![OomEvent {
-                comm: "unknown".into(),
-                kills: 2
+                seq: 9,
+                comm: "unknown".into()
             }]
         );
     }
 
     #[test]
-    fn build_oom_events_empty_when_no_kills() {
-        // 카운터는 0도 보내지만(결측과 구분) 이벤트는 "일어난 일"이라 없으면 안 보낸다.
-        let b = r#"{"observations":{"delta":{"oom":{"kills":0}},"top":{}}}"#;
-        assert!(build_oom_events(b).is_empty());
-        assert!(build_oom_events(BUNDLE).is_empty());
-        assert!(build_oom_events("not json").is_empty());
-        assert!(build_oom_events("{}").is_empty());
-    }
-
-    #[test]
-    fn oom_record_id_is_stable_within_bucket_and_differs_across() {
-        // 같은 (host, victim, bucket)이면 재전송해도 같은 키 — 수신측이 중복을 흡수한다.
-        let a = oom_record_id("h1", "python", 100);
-        assert_eq!(a, oom_record_id("h1", "python", 100));
-        // 버킷/호스트/victim이 다르면 다른 사건이다.
-        assert_ne!(a, oom_record_id("h1", "python", 101));
-        assert_ne!(a, oom_record_id("h2", "python", 100));
-        assert_ne!(a, oom_record_id("h1", "node", 100));
+    fn oom_record_id_separates_events_by_seq() {
+        // 같은 victim이 같은 분에 두 번 죽으면 별개 사건이다 — seq가 없으면 하나로 접힌다.
+        let a = oom_record_id("h1", "python3", 1, 100);
+        assert_eq!(a, oom_record_id("h1", "python3", 1, 100));
+        assert_ne!(a, oom_record_id("h1", "python3", 2, 100));
+        assert_ne!(a, oom_record_id("h2", "python3", 1, 100));
     }
 
     #[test]

@@ -1042,14 +1042,13 @@ fn load_kernel_config(
         }
     };
     let interval_secs = ex.kernel_interval_secs.max(1);
-    let window_secs = ex.kernel_window_secs.max(1);
-    if window_secs >= interval_secs {
-        tracing::warn!(
-            interval_secs,
-            window_secs,
-            "kernel_window_secs가 kernel_interval_secs 이상 — kernel exporter 비활성"
+    // kernel_window_secs는 duration=0 폴링 전환으로 더 이상 쓰이지 않는다. 설정에 남아 있으면
+    // 조용히 무시하지 않고 한 번 알린다 — "설정했는데 왜 안 먹지"를 막는다.
+    if ex.kernel_window_secs != aic_common::default_kernel_window_secs() {
+        tracing::info!(
+            kernel_window_secs = ex.kernel_window_secs,
+            "kernel_window_secs는 더 이상 사용되지 않습니다(duration=0 폴링) — 무시하고 진행합니다"
         );
-        return None;
     }
     let spool = spool?;
     let health = health?;
@@ -1060,7 +1059,6 @@ fn load_kernel_config(
         service_version: env!("CARGO_PKG_VERSION").to_string(),
         agent_url,
         interval: std::time::Duration::from_secs(interval_secs),
-        window: std::time::Duration::from_secs(window_secs),
         spool,
         health,
     })
@@ -1285,7 +1283,6 @@ method = "prompt_marker"
         let cfg = load_kernel_config(Some(both), Some(spool), Some(health))
             .expect("두 게이트를 통과하면 config가 만들어져야 한다");
         assert_eq!(cfg.agent_url, "http://127.0.0.1:9090");
-        assert!(cfg.window < cfg.interval);
     }
 
     /// 원격 rca-agent URL은 거부한다 — 커널 evidence는 호스트 경계를 넘지 않는다.
@@ -1298,22 +1295,6 @@ method = "prompt_marker"
             endpoint: "http://127.0.0.1:4318".to_string(),
             kernel_enabled: true,
             kernel_url: "http://10.0.0.5:9090".to_string(),
-            ..AicdExporterConfig::default()
-        };
-        assert!(load_kernel_config(Some(ex), Some(spool), Some(health)).is_none());
-    }
-
-    /// window >= interval이면 수집이 다음 tick을 계속 밀어낸다 — 기동 시 거부한다.
-    #[test]
-    fn load_kernel_config_rejects_window_not_shorter_than_interval() {
-        let (_dir, spool) = test_spool();
-        let health = test_health(spool.clone());
-        let ex = AicdExporterConfig {
-            enabled: true,
-            endpoint: "http://127.0.0.1:4318".to_string(),
-            kernel_enabled: true,
-            kernel_interval_secs: 30,
-            kernel_window_secs: 30,
             ..AicdExporterConfig::default()
         };
         assert!(load_kernel_config(Some(ex), Some(spool), Some(health)).is_none());
