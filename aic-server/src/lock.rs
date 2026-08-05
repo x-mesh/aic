@@ -181,6 +181,31 @@ fn is_pid_alive(pid: u32, expected_path: Option<&str>) -> bool {
     true
 }
 
+/// 정규 경로 **밖의** 후보에서 살아 있는 aicd를 찾는다. 있으면 `(lock 경로, PID)`.
+///
+/// lock은 정규 경로 한 곳에만 잡는다(`aicd_lock_path_for_bind`). 그래서 `XDG_RUNTIME_DIR`
+/// 유무가 갈리는 두 프로세스는 서로의 lock 파일을 아예 보지 못하고, `DaemonLock::acquire`가
+/// 각자 성공해 aicd가 둘 뜬다. 두 데몬이 같은 세션·spool·exporter를 두고 경합하는데
+/// 어느 쪽도 에러를 내지 않아 알아채기 어렵다. 그래서 기동 전에 후보를 훑는다.
+///
+/// flock을 잡아 보지 않고 파일 내용만 읽는다 — 살아 있는 데몬은 이미 lock을 쥐고 있어
+/// 시도해 봐야 실패하고, PID·exe 경로만으로 판정이 충분하다(`is_pid_alive`가 PID 재활용도
+/// 걸러낸다). stale 파일은 무시한다.
+pub fn find_live_daemon_outside(
+    canonical: &Path,
+    candidates: &[PathBuf],
+) -> Option<(PathBuf, u32)> {
+    candidates
+        .iter()
+        .filter(|path| path.as_path() != canonical)
+        .find_map(|path| {
+            let content = std::fs::read_to_string(path).ok()?;
+            let (pid, recorded_path) = parse_pid_and_path(&content);
+            let pid = pid?;
+            is_pid_alive(pid, recorded_path.as_deref()).then(|| (path.clone(), pid))
+        })
+}
+
 /// 기록된 exe 경로(`expected`)와 실제 `/proc/<pid>/exe` 경로(`actual`)가 같은 바이너리를
 /// 가리키는지 판정한다.
 ///
@@ -417,10 +442,84 @@ mod tests {
         assert!(!is_pid_alive(pid, Some("/totally/wrong/path/binary")));
     }
 
+    // ── find_live_daemon_outside ─────────────────────────────
+    //
+    // 살아 있는 PID로는 이 테스트 프로세스 자신을 쓴다. lock 파일 형식은
+    // `write_pid_and_path`와 같은 "PID\n exe 경로" 두 줄이다.
+
+    fn write_lock_file(path: &Path, pid: u32, exe: Option<&str>) {
+        let body = match exe {
+            Some(e) => format!("{pid}\n{e}\n"),
+            None => format!("{pid}\n"),
+        };
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// 죽은 PID = 잔해. 이걸 살아있다고 오판하면 정상 기동을 영영 막는다.
+    #[test]
+    fn find_live_daemon_outside_ignores_stale_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.pid");
+        let alt = dir.path().join("alt.pid");
+        write_lock_file(&alt, 4_294_967_290, None); // 존재할 수 없는 PID
+        assert_eq!(
+            find_live_daemon_outside(&canonical, &[canonical.clone(), alt]),
+            None
+        );
+    }
+
+    /// 이 테스트가 지키는 것: XDG가 갈려 다른 경로에 뜬 데몬을 찾아내는 동작.
+    /// 깨지면 aicd가 중복 기동한다.
+    #[test]
+    fn find_live_daemon_outside_finds_live_lock_in_alt_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.pid");
+        let alt = dir.path().join("alt.pid");
+        let me = std::process::id();
+        write_lock_file(&alt, me, current_exe_path().as_deref());
+        assert_eq!(
+            find_live_daemon_outside(&canonical, &[canonical.clone(), alt.clone()]),
+            Some((alt, me))
+        );
+    }
+
+    /// 정규 경로는 건너뛴다 — 그건 `DaemonLock::acquire`가 flock으로 판정할 몫이고,
+    /// 여기서 걸면 자기 자신의 잔해에 막혀 기동이 안 된다.
+    #[test]
+    fn find_live_daemon_outside_skips_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.pid");
+        write_lock_file(
+            &canonical,
+            std::process::id(),
+            current_exe_path().as_deref(),
+        );
+        assert_eq!(
+            find_live_daemon_outside(&canonical, &[canonical.clone()]),
+            None
+        );
+    }
+
+    #[test]
+    fn find_live_daemon_outside_tolerates_missing_and_garbage_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("canonical.pid");
+        let missing = dir.path().join("absent.pid");
+        let garbage = dir.path().join("garbage.pid");
+        std::fs::write(&garbage, "not-a-pid\n").unwrap();
+        assert_eq!(
+            find_live_daemon_outside(&canonical, &[canonical.clone(), missing, garbage]),
+            None
+        );
+    }
+
     #[test]
     fn exe_path_matches_handles_in_place_upgrade() {
         // 동일 경로 → 일치
-        assert!(exe_path_matches("/usr/local/bin/aicd", "/usr/local/bin/aicd"));
+        assert!(exe_path_matches(
+            "/usr/local/bin/aicd",
+            "/usr/local/bin/aicd"
+        ));
         // Linux in-place 업그레이드: /proc/<pid>/exe 가 "(deleted)" suffix 를 단다.
         // 같은 데몬이므로 일치로 봐야 한다 (이게 핵심 — 중복 aicd 방지).
         assert!(exe_path_matches(

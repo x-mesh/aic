@@ -199,6 +199,18 @@ pub fn aicd_lock_path_for_bind() -> PathBuf {
     session_dir().join(AICD_LOCK_FILE)
 }
 
+/// aicd PID lock의 후보 경로 전체 (0번이 정규 경로).
+///
+/// 중복 기동 검사용이다. lock은 정규 경로 한 곳에만 잡으므로, XDG 유무가 갈리는 두
+/// 프로세스는 서로의 lock을 못 보고 각자 데몬을 띄운다. 기동 전에 이 목록을 훑어
+/// 살아 있는 aicd가 있는지 본다.
+pub fn aicd_lock_path_candidates() -> Vec<PathBuf> {
+    session_dir_candidates_for_os(std::env::consts::OS)
+        .into_iter()
+        .map(|dir| dir.join(AICD_LOCK_FILE))
+        .collect()
+}
+
 /// aicd가 Attach_UDS를 **만들** 때 쓰는 정규 경로.
 pub fn aicd_attach_socket_path_for_bind() -> PathBuf {
     session_dir().join(AICD_ATTACH_SOCKET_FILE)
