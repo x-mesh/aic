@@ -714,11 +714,9 @@ pub struct AicdExporterConfig {
     /// 커널 수집 tick 간격(초). 기본 60 — host metrics와 별개 주기다(수집이 window만큼 블록하므로).
     #[serde(default = "default_kernel_interval")]
     pub kernel_interval_secs: u64,
-    /// 한 tick에서 커널 delta를 재는 window(초). 기본 10.
-    ///
-    /// `/collectz`는 이 시간만큼 **블록**하므로 interval보다 반드시 짧아야 한다. 서버가 동시
-    /// collect를 막아 주지 않으므로(가드 없음) 겹치지 않게 하는 건 소비자 책임인데, 이 태스크는
-    /// 단일 루프에서 순차로 await하므로 구조적으로 인플라이트가 1이다.
+    /// **(구) 사용되지 않음.** duration=0 논블로킹 폴링으로 전환하면서, 보고 단위가 "짧은 window의
+    /// 증가분"에서 "두 폴 사이 전체의 증가분"으로 바뀌었다. 하위 호환을 위해 필드는 남기지만
+    /// 값은 무시하며, 기본값과 다르면 기동 시 한 번 알린다.
     #[serde(default = "default_kernel_window")]
     pub kernel_window_secs: u64,
     /// 프로세스별 리소스 top-N(scope=`aic.process`, CPU/메모리 상위 소비자) push 활성화 여부.
@@ -798,9 +796,14 @@ fn default_kernel_interval() -> u64 {
     60
 }
 
-/// 수집 window는 tick 간격보다 짧아야 한다(수집이 그만큼 블록한다).
-fn default_kernel_window() -> u64 {
+/// (구) 수집 window 기본값. duration=0 폴링 전환 후 더 이상 쓰이지 않지만, 설정에 남은 값이
+/// 기본값과 다른지 판별해 안내하기 위해 공개한다.
+pub fn default_kernel_window_secs() -> u64 {
     10
+}
+
+fn default_kernel_window() -> u64 {
+    default_kernel_window_secs()
 }
 
 fn default_spool_max_bytes() -> u64 {
