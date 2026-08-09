@@ -23,15 +23,38 @@ const LEGACY_SOCKET_FILE: &str = "session.sock";
 
 // ── 세션별 경로 함수 ──────────────────────────────────────────
 
+/// 명시적 런타임 디렉토리 지정 환경변수.
+///
+/// **왜 필요한가**: 자동 후보 탐색은 "XDG 유무가 갈린 같은 사용자의 두 셸"을 이어 주려는
+/// 휴리스틱이라, `/tmp/aic-{uid}`를 모든 후보 집합의 공통 원소로 둔다. 그 덕에 중복 기동을
+/// 막을 수 있지만, `/tmp`와 uid를 공유하는 **다른 컨테이너**끼리도 서로를 막게 된다 —
+/// 의도적으로 격리한 인스턴스가 남의 lock에 걸려 못 뜨는 것은 오탐이다(PID namespace 때문에
+/// `is_pid_alive` 판정도 신뢰할 수 없다).
+///
+/// 이 변수가 설정되면 **자동 탐색을 끄고** 지정된 디렉토리 하나만 쓴다. "여기가 내 런타임
+/// 디렉토리다"라는 명시 계약이므로, 다른 관례를 훑어 남의 인스턴스를 찾을 이유가 없다.
+const RUNTIME_DIR_ENV: &str = "AIC_RUNTIME_DIR";
+
+/// `AIC_RUNTIME_DIR`이 지정한 디렉토리. 비어 있는 값은 미설정으로 본다.
+fn explicit_runtime_dir() -> Option<PathBuf> {
+    std::env::var_os(RUNTIME_DIR_ENV)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
 /// 플랫폼별 세션 디렉토리를 반환한다.
-/// macOS: `/tmp/aic-{uid}/`
-/// Linux: `$XDG_RUNTIME_DIR/aic/` (설정 시) 또는 `/tmp/aic-{uid}/`
+/// - `AIC_RUNTIME_DIR` 설정 시: 그 경로 (탐색 없음)
+/// - macOS: `/tmp/aic-{uid}/`
+/// - Linux: `$XDG_RUNTIME_DIR/aic/` (설정 시) 또는 `/tmp/aic-{uid}/`
 pub fn session_dir() -> PathBuf {
     session_dir_for_os(std::env::consts::OS)
 }
 
 /// OS 문자열을 주입받아 세션 디렉토리를 결정한다 (테스트용).
 fn session_dir_for_os(os: &str) -> PathBuf {
+    if let Some(dir) = explicit_runtime_dir() {
+        return dir;
+    }
     match os {
         "linux" => {
             if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -97,6 +120,12 @@ pub fn runtime_dir_is_trusted(dir: &Path) -> bool {
 /// 소켓·lock을 만들기 **전에** 부르는 쪽에서 쓴다. 검사에 실패하면 만들지 않고 에러 —
 /// 남이 선점한 디렉토리에 데몬을 띄우면 그 자체가 사고다.
 pub fn ensure_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    ensure_runtime_dir_inner(dir, 1)
+}
+
+/// `retries_left`는 생성 경합(`AlreadyExists`) 재확인 횟수의 상한이다. 무한 재귀를 막는다 —
+/// 누가 계속 만들었다 지우면 상한 없이 도는 코드가 된다.
+fn ensure_runtime_dir_inner(dir: &Path, retries_left: u32) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -125,8 +154,8 @@ pub fn ensure_runtime_dir(dir: &Path) -> std::io::Result<()> {
     {
         Ok(()) => {}
         // 경합으로 누가 먼저 만들었으면 그게 우리 것인지 다시 본다.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return ensure_runtime_dir(dir);
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && retries_left > 0 => {
+            return ensure_runtime_dir_inner(dir, retries_left - 1);
         }
         Err(e) => return Err(e),
     }
@@ -155,6 +184,11 @@ const AICD_REGISTRY_FILE: &str = "aicd-registry.json";
 /// aicd를 찾을 때 훑을 세션 디렉토리 후보. 0번이 정규 경로(`session_dir()`)다.
 fn session_dir_candidates_for_os(os: &str) -> Vec<PathBuf> {
     let canonical = session_dir_for_os(os);
+    // 명시 계약이 있으면 자동 탐색을 하지 않는다 — 격리하겠다고 선언한 인스턴스가 관례 경로를
+    // 훑어 남의 데몬을 찾아내면 격리가 아니다(`RUNTIME_DIR_ENV` 주석 참고).
+    if explicit_runtime_dir().is_some() {
+        return vec![canonical];
+    }
     if os != "linux" {
         return vec![canonical];
     }
@@ -166,26 +200,40 @@ fn session_dir_candidates_for_os(os: &str) -> Vec<PathBuf> {
     } else {
         run_user_session_dir()
     };
-    let candidates = if alt == canonical {
+    if alt == canonical {
         vec![canonical]
     } else {
         vec![canonical, alt]
-    };
-    // 남이 선점한 디렉토리는 후보에서 뺀다. 여기서 거르지 않으면 `/tmp/aic-{uid}`를 먼저
-    // 만들어 둔 다른 로컬 사용자의 소켓으로 연결이 새어 나간다. 정규 경로도 예외가 아니다 —
-    // XDG 없는 셸에서는 정규 경로가 곧 `/tmp/aic-{uid}`다.
+    }
+}
+
+/// 탐색에 실제로 쓸 후보 — 관례 후보에서 **남이 선점한 디렉토리를 뺀 것**.
+///
+/// 관례 계산(`session_dir_candidates_for_os`)은 환경변수만 보는 순수 함수로 두고, 파일시스템
+/// 상태를 보는 필터는 여기서만 건다. 섞어 두면 같은 입력이 머신 상태에 따라 다른 값을 내
+/// 테스트가 흔들린다.
+///
+/// **이 필터는 방어의 전부가 아니다.** 검사와 연결 사이의 틈(TOCTOU)은 닫지 못하고, 후보가
+/// 전부 걸러진 폴백에서는 정규 경로를 그대로 남긴다 — 경로를 아예 못 만들면 "데몬 없음"조차
+/// 보고할 수 없기 때문이다. 실제로 남의 소켓에 붙는 것을 막는 것은 연결 후의 uid 검사
+/// (`peercred::ensure_peer_is_self`)이고, 이 필터는 거기 도달하기 전에 명백한 선점을 걸러내는
+/// 1차 방어다.
+fn trusted_candidates(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
     let trusted: Vec<PathBuf> = candidates
         .iter()
         .filter(|dir| runtime_dir_is_trusted(dir))
         .cloned()
         .collect();
-    // 전부 걸러졌다면 정규 경로를 남긴다 — 빈 목록은 호출부의 `first()` 폴백을 무너뜨리고,
-    // 어차피 bind 시점의 `ensure_runtime_dir`이 같은 검사로 다시 막는다.
     if trusted.is_empty() {
         candidates.into_iter().take(1).collect()
     } else {
         trusted
     }
+}
+
+/// 이 프로세스가 탐색에 쓸 후보 목록 (관례 + 신뢰성 필터).
+fn discovery_candidates() -> Vec<PathBuf> {
+    trusted_candidates(session_dir_candidates_for_os(std::env::consts::OS))
 }
 
 /// 후보 중 실제 `aicd.sock`이 있는 첫 디렉토리. 아무 데도 없으면 정규 경로(= 종전 동작).
@@ -203,7 +251,7 @@ fn resolve_aicd_dir(candidates: &[PathBuf]) -> PathBuf {
 }
 
 fn aicd_dir() -> PathBuf {
-    resolve_aicd_dir(&session_dir_candidates_for_os(std::env::consts::OS))
+    resolve_aicd_dir(&discovery_candidates())
 }
 
 /// 후보를 순서대로 훑어 `file`이 실제로 있는 첫 경로. 없으면 정규 경로(= 종전 동작).
@@ -220,7 +268,7 @@ fn resolve_file_in(candidates: &[PathBuf], file: &str) -> PathBuf {
 }
 
 fn discover_file(file: &str) -> PathBuf {
-    resolve_file_in(&session_dir_candidates_for_os(std::env::consts::OS), file)
+    resolve_file_in(&discovery_candidates(), file)
 }
 
 fn session_socket_file(session_id: &str) -> String {
@@ -249,7 +297,7 @@ pub fn session_socket_path_for_bind(session_id: &str) -> PathBuf {
 pub fn session_id_in_use(session_id: &str) -> bool {
     let socket = session_socket_file(session_id);
     let lock = format!("session-{}.pid", session_id);
-    session_dir_candidates_for_os(std::env::consts::OS)
+    discovery_candidates()
         .iter()
         .any(|dir| dir.join(&socket).exists() || dir.join(&lock).exists())
 }
@@ -297,7 +345,7 @@ pub fn aicd_lock_path_for_bind() -> PathBuf {
 /// 프로세스는 서로의 lock을 못 보고 각자 데몬을 띄운다. 기동 전에 이 목록을 훑어
 /// 살아 있는 aicd가 있는지 본다.
 pub fn aicd_lock_path_candidates() -> Vec<PathBuf> {
-    session_dir_candidates_for_os(std::env::consts::OS)
+    discovery_candidates()
         .into_iter()
         .map(|dir| dir.join(AICD_LOCK_FILE))
         .collect()
@@ -412,7 +460,7 @@ pub fn extract_session_id(socket_path: &Path) -> Option<String> {
 ///
 /// 한 디렉토리만 보면 XDG 유무가 갈리는 셸에서 세션 목록이 통째로 비어 보인다.
 pub fn list_session_sockets() -> Vec<PathBuf> {
-    list_session_sockets_in_all(&session_dir_candidates_for_os(std::env::consts::OS))
+    list_session_sockets_in_all(&discovery_candidates())
 }
 
 /// 여러 디렉토리를 합쳐 최신 우선으로 정렬한다. 같은 파일명이 두 곳에 있으면 최신 것만 남긴다
@@ -732,6 +780,84 @@ mod tests {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    /// 이 테스트가 지키는 것: `AIC_RUNTIME_DIR`의 격리 계약. 깨지면 `/tmp`를 공유하는
+    /// 다른 컨테이너의 lock·소켓에 걸려, 격리하겠다고 선언한 인스턴스가 못 뜬다.
+    #[test]
+    fn explicit_runtime_dir_disables_candidate_discovery() {
+        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+        let prev_explicit = std::env::var(RUNTIME_DIR_ENV).ok();
+
+        // XDG가 잡혀 있어도 명시 지정이 이긴다.
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        std::env::set_var(RUNTIME_DIR_ENV, "/srv/aic-isolated");
+
+        assert_eq!(
+            session_dir_for_os("linux"),
+            PathBuf::from("/srv/aic-isolated")
+        );
+        assert_eq!(
+            session_dir_candidates_for_os("linux"),
+            vec![PathBuf::from("/srv/aic-isolated")],
+            "명시 계약이 있으면 관례 경로를 훑지 않는다"
+        );
+        assert_eq!(
+            session_dir_candidates_for_os("macos"),
+            vec![PathBuf::from("/srv/aic-isolated")]
+        );
+
+        // 빈 값은 미설정으로 본다 — 스크립트가 빈 변수를 export 하는 흔한 사고 방어.
+        std::env::set_var(RUNTIME_DIR_ENV, "");
+        assert_eq!(
+            session_dir_for_os("linux"),
+            PathBuf::from("/run/user/1000/aic")
+        );
+
+        match prev_explicit {
+            Some(v) => std::env::set_var(RUNTIME_DIR_ENV, v),
+            None => std::env::remove_var(RUNTIME_DIR_ENV),
+        }
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    /// 신뢰 필터는 주입된 목록만 보는 순수 함수 — 머신의 `/tmp` 상태에 흔들리지 않는다.
+    #[test]
+    fn trusted_candidates_drops_hijacked_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("trusted-filter");
+        let good = tmp.join("good");
+        let hijacked = tmp.join("hijacked");
+        fs::create_dir(&good).unwrap();
+        fs::create_dir(&hijacked).unwrap();
+        fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&hijacked, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert_eq!(
+            trusted_candidates(vec![good.clone(), hijacked.clone()]),
+            vec![good.clone()]
+        );
+
+        // 정규 경로가 선점당하고 대체 후보가 멀쩡하면 대체 쪽으로 탐색이 넘어간다.
+        assert_eq!(
+            trusted_candidates(vec![hijacked.clone(), good.clone()]),
+            vec![good]
+        );
+
+        // 전부 걸러졌을 때만 정규 경로(0번)를 남긴다 — 경로를 못 만들면 "데몬 없음"조차
+        // 말할 수 없다. 실제 차단은 연결 후 uid 검사가 한다.
+        let hijacked2 = tmp.join("hijacked2");
+        fs::create_dir(&hijacked2).unwrap();
+        fs::set_permissions(&hijacked2, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            trusted_candidates(vec![hijacked.clone(), hijacked2]),
+            vec![hijacked],
+            "폴백은 정규 경로 하나만 남긴다"
+        );
     }
 
     #[test]
