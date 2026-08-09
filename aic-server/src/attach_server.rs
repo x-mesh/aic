@@ -53,35 +53,13 @@ impl AttachServer {
         pool: Arc<SessionProcessorPool>,
         store: CommandRecordStore,
     ) -> anyhow::Result<Self> {
+        // R15.1: 부모 디렉토리는 이 사용자 소유의 0700이어야 한다. 없으면 0700으로 만들고,
+        // 있으면 소유자·권한·symlink를 검사해 실패 시 bind하지 않는다 — 종전처럼 경고만 찍고
+        // 진행하면 남이 선점한 디렉토리에 attach 소켓을 얹게 된다.
         if let Some(parent) = socket_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("Attach_UDS 부모 디렉토리 생성 실패: {}", parent.display())
-                })?;
-                // 새로 만들 때에만 0700 으로 설정 — 기존 디렉토리는 건드리지 않는다.
-                let perms = std::fs::Permissions::from_mode(0o700);
-                let _ = std::fs::set_permissions(parent, perms);
-            } else {
-                match std::fs::metadata(parent) {
-                    Ok(md) => {
-                        let mode = md.permissions().mode() & 0o777;
-                        if mode != 0o700 {
-                            tracing::warn!(
-                                path = %parent.display(),
-                                actual_mode = format!("{:o}", mode),
-                                "Attach_UDS 부모 디렉토리 권한이 0700 이 아닙니다 (R15.1)"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %parent.display(),
-                            error = %e,
-                            "Attach_UDS 부모 디렉토리 stat 실패"
-                        );
-                    }
-                }
-            }
+            aic_common::ensure_runtime_dir(parent).with_context(|| {
+                format!("Attach_UDS 부모 디렉토리 준비 실패: {}", parent.display())
+            })?;
         }
 
         let _ = std::fs::remove_file(socket_path);
