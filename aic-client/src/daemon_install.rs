@@ -127,6 +127,14 @@ pub fn render_macos_plist(aicd_path: &Path, log_dir: &Path) -> String {
     let aicd = aicd_path.display();
     let stdout = log_dir.join("aicd.out.log");
     let stderr = log_dir.join("aicd.err.log");
+    // systemd unit과 같은 이유로 명시 계약을 plist에 굳혀 넣는다
+    // (`render_linux_service` 주석 참고).
+    let runtime_dir_env = match effective_runtime_dir_env() {
+        Some(dir) => {
+            format!("\n        <key>AIC_RUNTIME_DIR</key>\n        <string>{dir}</string>")
+        }
+        None => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -151,7 +159,7 @@ pub fn render_macos_plist(aicd_path: &Path, log_dir: &Path) -> String {
     <key>EnvironmentVariables</key>
     <dict>
         <key>AIC_LOG</key>
-        <string>info</string>
+        <string>info</string>{runtime_dir_env}
     </dict>
 </dict>
 </plist>
@@ -162,10 +170,20 @@ pub fn render_macos_plist(aicd_path: &Path, log_dir: &Path) -> String {
 }
 
 /// Linux systemd user unit (INI). `Restart=on-failure`로 keep-alive.
+///
+/// **`AIC_RUNTIME_DIR`을 설치 시점에 굳혀 넣는다.** 이 변수는 "런타임 디렉토리는 여기"라는
+/// 명시 계약이라 자동 후보 탐색을 끈다 — unit에 옮겨 적지 않으면 systemd가 띄운 aicd는
+/// 관례 경로(`$XDG_RUNTIME_DIR/aic`)에 bind하는데 셸의 `aic`는 지정 경로만 보고 "데몬 없음"
+/// 으로 판단해 **두 번째 aicd를 띄운다**. 서로 다른 디렉토리라 lock도 겹치지 않아 아무도
+/// 에러를 내지 않는다 — 정확히 중복 기동 방지가 막으려던 그 상황이다.
 pub fn render_linux_service(aicd_path: &Path, log_dir: &Path) -> String {
     let aicd = aicd_path.display();
     let stdout = log_dir.join("aicd.out.log");
     let stderr = log_dir.join("aicd.err.log");
+    let runtime_dir_env = match effective_runtime_dir_env() {
+        Some(dir) => format!("\nEnvironment=AIC_RUNTIME_DIR={dir}"),
+        None => String::new(),
+    };
     format!(
         r#"[Unit]
 Description=aic supervisor daemon (aicd)
@@ -177,7 +195,7 @@ Type=simple
 ExecStart={aicd}
 Restart=on-failure
 RestartSec=2
-Environment=AIC_LOG=info
+Environment=AIC_LOG=info{runtime_dir_env}
 StandardOutput=append:{stdout}
 StandardError=append:{stderr}
 
@@ -187,6 +205,19 @@ WantedBy=default.target
         stdout = stdout.display(),
         stderr = stderr.display(),
     )
+}
+
+/// 설치 시점의 `AIC_RUNTIME_DIR` 값. 미설정이거나 빈 값이면 `None`.
+///
+/// unit 파일에 그대로 들어가므로 개행이 섞인 값은 거른다 — INI/plist를 깨뜨리거나 다른
+/// 지시자를 주입할 수 있다.
+fn effective_runtime_dir_env() -> Option<String> {
+    let raw = std::env::var("AIC_RUNTIME_DIR").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 // ── install / uninstall ────────────────────────────────────────
@@ -473,6 +504,56 @@ pub fn current_unit_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    /// `AIC_RUNTIME_DIR`을 만지는 테스트끼리의 직렬화. 프로세스 전역 상태라 병렬 실행에서
+    /// 서로의 값을 덮어쓴다.
+    static RUNTIME_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// 이 테스트가 지키는 것: 명시 런타임 디렉토리가 unit 파일로 넘어가는 것.
+    /// 깨지면 systemd가 띄운 aicd와 셸의 `aic`가 서로 다른 디렉토리를 봐, 아무 에러 없이
+    /// aicd가 둘 뜬다(중복 기동 방지가 lock으로는 못 잡는 경로다).
+    #[test]
+    fn unit_files_carry_explicit_runtime_dir() {
+        let _guard = RUNTIME_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AIC_RUNTIME_DIR").ok();
+
+        std::env::set_var("AIC_RUNTIME_DIR", "/srv/aic-isolated");
+        let unit =
+            render_linux_service(Path::new("/usr/local/bin/aicd"), Path::new("/var/log/aic"));
+        assert!(
+            unit.contains("Environment=AIC_RUNTIME_DIR=/srv/aic-isolated"),
+            "unit에 런타임 디렉토리가 빠졌다:\n{unit}"
+        );
+        let plist = render_macos_plist(Path::new("/opt/bin/aicd"), Path::new("/var/log/aic"));
+        assert!(plist.contains("<key>AIC_RUNTIME_DIR</key>"));
+        assert!(plist.contains("<string>/srv/aic-isolated</string>"));
+
+        // 미설정이면 아무것도 넣지 않는다 — 기본 동작(관례 탐색)은 그대로.
+        std::env::remove_var("AIC_RUNTIME_DIR");
+        let unit =
+            render_linux_service(Path::new("/usr/local/bin/aicd"), Path::new("/var/log/aic"));
+        assert!(!unit.contains("AIC_RUNTIME_DIR"));
+        assert!(unit.contains("Environment=AIC_LOG=info"));
+        let plist = render_macos_plist(Path::new("/opt/bin/aicd"), Path::new("/var/log/aic"));
+        assert!(!plist.contains("AIC_RUNTIME_DIR"));
+
+        // 개행이 섞인 값은 unit 문법을 깨뜨리므로 무시한다(지시자 주입 방어).
+        std::env::set_var("AIC_RUNTIME_DIR", "/srv/x\nExecStart=/bin/sh");
+        let unit =
+            render_linux_service(Path::new("/usr/local/bin/aicd"), Path::new("/var/log/aic"));
+        assert!(
+            !unit.contains("/bin/sh"),
+            "개행 주입이 unit에 들어갔다:\n{unit}"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("AIC_RUNTIME_DIR", v),
+            None => std::env::remove_var("AIC_RUNTIME_DIR"),
+        }
+    }
 
     #[test]
     fn macos_plist_contains_label_and_paths() {
