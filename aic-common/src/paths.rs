@@ -57,6 +57,83 @@ fn run_user_session_dir() -> PathBuf {
     PathBuf::from(format!("/run/user/{}/aic", uid))
 }
 
+// ── 런타임 디렉토리 신뢰성 검사 ────────────────────────────────
+//
+// `/tmp/aic-{uid}`는 sticky 비트가 붙은 공용 `/tmp` 아래에 있어 **누구나 먼저 만들 수 있다**.
+// 다른 로컬 사용자가 `aic-0/`을 선점해 `aicd.sock`·`session-*.sock`을 심어 두면, 그 경로를
+// 후보로 훑는 root의 `aic`가 공격자 소켓에 연결한다(명령 노출·위조 응답). 위조 `aicd.pid`에
+// 남의 살아 있는 PID를 적어 두면 `is_pid_alive`가 alive로 읽어 aicd 기동을 영구 차단할 수도
+// 있다. 그래서 후보를 **쓰기 전에** 소유자·권한·symlink를 확인하고, 만들 때는 0700으로
+// 고정한다.
+
+/// 런타임 디렉토리 권한 — 소유자만 접근(0700). group/other 비트가 있으면 신뢰하지 않는다.
+const RUNTIME_DIR_MODE: u32 = 0o700;
+
+/// `dir`이 이 사용자가 소유한 0700 실제 디렉토리인지. 없는 경로는 "아직 안전"으로 본다
+/// (만들 때 `ensure_runtime_dir`이 0700으로 만든다).
+///
+/// `symlink_metadata`(lstat)로 본다 — `metadata`는 symlink를 따라가므로, 공격자가 심어 둔
+/// symlink가 자기 소유 디렉토리를 가리키면 검사를 통과해 버린다.
+pub fn runtime_dir_is_trusted(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    if meta.uid() != unsafe { libc::getuid() } {
+        return false;
+    }
+    meta.permissions().mode() & 0o077 == 0
+}
+
+/// 런타임 디렉토리를 0700으로 보장한다. 이미 있으면 소유자·권한·symlink를 검사한다.
+///
+/// 소켓·lock을 만들기 **전에** 부르는 쪽에서 쓴다. 검사에 실패하면 만들지 않고 에러 —
+/// 남이 선점한 디렉토리에 데몬을 띄우면 그 자체가 사고다.
+pub fn ensure_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    if !runtime_dir_is_trusted(dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "런타임 디렉토리를 신뢰할 수 없습니다: {} — 다른 사용자 소유이거나 \
+                 symlink이거나 권한이 0700이 아닙니다. 선점된 디렉토리일 수 있으니 \
+                 확인 후 제거하세요.",
+                dir.display()
+            ),
+        ));
+    }
+    if dir.exists() {
+        return Ok(());
+    }
+    // 부모까지는 관례대로 만들고(`/run/user/{uid}` 등 이미 있는 게 보통), 마지막 요소만
+    // 0700으로 만든다. mode는 umask의 영향을 받으므로 생성 후 명시적으로 다시 설정한다.
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new()
+        .mode(RUNTIME_DIR_MODE)
+        .create(dir)
+    {
+        Ok(()) => {}
+        // 경합으로 누가 먼저 만들었으면 그게 우리 것인지 다시 본다.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return ensure_runtime_dir(dir);
+        }
+        Err(e) => return Err(e),
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(RUNTIME_DIR_MODE))?;
+    Ok(())
+}
+
 // ── aicd 경로: 만드는 쪽과 찾는 쪽의 분리 ────────────────────────
 //
 // `session_dir()`는 **현재 프로세스의 환경**만 보고 한 곳을 정하는데, 그 환경이 데몬의
@@ -89,10 +166,25 @@ fn session_dir_candidates_for_os(os: &str) -> Vec<PathBuf> {
     } else {
         run_user_session_dir()
     };
-    if alt == canonical {
+    let candidates = if alt == canonical {
         vec![canonical]
     } else {
         vec![canonical, alt]
+    };
+    // 남이 선점한 디렉토리는 후보에서 뺀다. 여기서 거르지 않으면 `/tmp/aic-{uid}`를 먼저
+    // 만들어 둔 다른 로컬 사용자의 소켓으로 연결이 새어 나간다. 정규 경로도 예외가 아니다 —
+    // XDG 없는 셸에서는 정규 경로가 곧 `/tmp/aic-{uid}`다.
+    let trusted: Vec<PathBuf> = candidates
+        .iter()
+        .filter(|dir| runtime_dir_is_trusted(dir))
+        .cloned()
+        .collect();
+    // 전부 걸러졌다면 정규 경로를 남긴다 — 빈 목록은 호출부의 `first()` 폴백을 무너뜨리고,
+    // 어차피 bind 시점의 `ensure_runtime_dir`이 같은 검사로 다시 막는다.
+    if trusted.is_empty() {
+        candidates.into_iter().take(1).collect()
+    } else {
+        trusted
     }
 }
 
@@ -398,6 +490,74 @@ mod tests {
     fn default_socket_path_is_absolute() {
         let path = default_socket_path();
         assert!(path.is_absolute());
+    }
+
+    // ── 런타임 디렉토리 신뢰성 ────────────────────────────────
+
+    /// 이 테스트가 지키는 것: 공용 `/tmp` 아래 후보를 남이 선점했을 때 거부하는 동작.
+    /// 깨지면 다른 로컬 사용자가 심어 둔 `aicd.sock`으로 연결이 새어 나간다.
+    #[test]
+    fn runtime_dir_is_trusted_rejects_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("trust-perm");
+        let dir = tmp.join("aic-0");
+        std::fs::create_dir(&dir).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runtime_dir_is_trusted(&dir));
+
+        for loose in [0o755, 0o770, 0o707, 0o777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(loose)).unwrap();
+            assert!(
+                !runtime_dir_is_trusted(&dir),
+                "0{loose:o}는 group/other에 열려 있어 신뢰할 수 없다"
+            );
+        }
+    }
+
+    /// symlink는 lstat으로 걸러야 한다 — 따라가서 검사하면 공격자가 자기 소유 디렉토리를
+    /// 가리키는 링크를 심어 검사를 통과시킬 수 있다.
+    #[test]
+    fn runtime_dir_is_trusted_rejects_symlink_and_non_dir() {
+        let tmp = unique_temp_dir("trust-link");
+        let real = tmp.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(!runtime_dir_is_trusted(&link));
+
+        let file = tmp.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!runtime_dir_is_trusted(&file));
+    }
+
+    /// 없는 경로는 "아직 안전" — `ensure_runtime_dir`이 0700으로 만든다.
+    #[test]
+    fn ensure_runtime_dir_creates_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("ensure-create");
+        let dir = tmp.join("nested/aic");
+        assert!(runtime_dir_is_trusted(&dir), "없는 경로는 통과");
+
+        ensure_runtime_dir(&dir).expect("생성 실패");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "umask와 무관하게 0700이어야 한다");
+
+        // 재호출은 멱등.
+        ensure_runtime_dir(&dir).expect("재호출 실패");
+    }
+
+    /// 선점된 디렉토리에는 만들지도, 쓰지도 않는다.
+    #[test]
+    fn ensure_runtime_dir_refuses_untrusted_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("ensure-untrusted");
+        let dir = tmp.join("aic-0");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = ensure_runtime_dir(&dir).expect_err("0777 디렉토리를 받아들이면 안 된다");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]
