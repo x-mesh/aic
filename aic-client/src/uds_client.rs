@@ -351,6 +351,11 @@ impl UdsClient {
             })?
             .map_err(|_| AicError::ServerNotRunning)?;
 
+        // 붙은 상대가 정말 나인지 확인한다. 소켓 **경로**는 탐색 결과일 뿐이라, 다른 로컬
+        // 사용자가 선점한 디렉토리의 소켓을 가리킬 수 있다(`/tmp/aic-{uid}`). 그 경우 명령과
+        // 응답이 통째로 남에게 넘어가므로, 요청을 쓰기 전에 끊는다.
+        aic_common::ensure_peer_is_self(&stream).map_err(AicError::IpcError)?;
+
         // 요청 직렬화 + length-prefixed 프레임 전송
         let request_json = serde_json::to_vec(&request)
             .map_err(|e| AicError::ConfigError(format!("요청 직렬화 실패: {e}")))?;
