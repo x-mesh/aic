@@ -16,6 +16,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// 데몬 PID lock 핸들. drop 시 자동으로 lock 해제 + 파일 제거.
+#[derive(Debug)]
 pub struct DaemonLock {
     file: File,
     path: PathBuf,
@@ -38,8 +39,10 @@ impl DaemonLock {
 
     fn acquire_inner(path: PathBuf, retries_left: u32) -> Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("락 디렉토리 생성 실패: {}", parent.display()))?;
+            // 0700 보장 + 소유자·symlink 검사. 남이 선점한 디렉토리에 lock을 잡으면 위조
+            // PID 파일 하나로 기동이 영구 차단될 수 있다.
+            aic_common::ensure_runtime_dir(parent)
+                .with_context(|| format!("락 디렉토리 준비 실패: {}", parent.display()))?;
         }
 
         let file = OpenOptions::new()
@@ -93,6 +96,93 @@ impl DaemonLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// 후보 경로 **전체**에 대한 aicd 단일 인스턴스 lock 묶음.
+///
+/// 왜 묶음인가: `XDG_RUNTIME_DIR` 유무가 갈리는 두 프로세스는 정규 lock 경로가 서로 달라
+/// (`/run/user/{uid}/aic/aicd.pid` vs `/tmp/aic-{uid}/aicd.pid`) 각자 acquire에 성공한다.
+/// "다른 후보에 살아 있는 데몬이 있는지 먼저 읽어 본다"는 사전 조회는 **검사와 획득 사이가
+/// 원자적이지 않아** 동시 기동을 막지 못한다 — 두 프로세스가 나란히 조회를 통과한 뒤 각자
+/// 다른 lock을 잡으면 exporter·registry가 이중으로 돈다.
+///
+/// 그래서 후보를 하나라도 남기지 않고 **전부** 잡는다. 획득 순서는 경로 문자열 정렬로
+/// 고정한다 — 모든 프로세스가 같은 순서로 진입하므로 서로 다른 후보를 엇갈려 잡는 교착이
+/// 생기지 않고, 먼저 도착한 쪽이 첫 후보에서 이긴다. 잡은 lock은 프로세스 수명 동안 들고
+/// 있다가 drop에서 함께 풀린다.
+#[derive(Debug)]
+pub struct DaemonLockSet {
+    /// 정렬 순서대로 획득한 lock들. drop 순서는 역순이 아니어도 무방하다(모두 advisory).
+    locks: Vec<DaemonLock>,
+    canonical: PathBuf,
+}
+
+impl DaemonLockSet {
+    /// 정규 경로와 대체 후보 전체를 고정 순서로 획득한다.
+    ///
+    /// - 정규 경로는 반드시 획득해야 한다. 실패하면 그대로 에러.
+    /// - 대체 후보는 **부모 디렉토리를 만들 수 없으면** 건너뛴다(예: 다른 사용자 소유의
+    ///   `/run/user/{uid}`). 그 경로에는 이 프로세스가 데몬을 띄울 수도 없으므로 경합 대상이
+    ///   아니다. 반대로 잡을 수 있는 후보에서 lock이 이미 잡혀 있으면 중복 기동으로 판정한다.
+    pub fn acquire_all(canonical: &Path, candidates: &[PathBuf]) -> Result<Self> {
+        let mut ordered: Vec<PathBuf> = candidates.to_vec();
+        ordered.push(canonical.to_path_buf());
+        ordered.sort();
+        ordered.dedup();
+
+        let mut locks = Vec::with_capacity(ordered.len());
+        for path in ordered {
+            let is_canonical = path == canonical;
+            if !is_canonical && !parent_dir_is_usable(&path) {
+                tracing::debug!(
+                    path = %path.display(),
+                    "대체 lock 후보의 디렉토리를 쓸 수 없어 건너뜀"
+                );
+                continue;
+            }
+            match DaemonLock::acquire(&path) {
+                Ok(lock) => locks.push(lock),
+                Err(e) if is_canonical => return Err(e),
+                Err(e) => {
+                    // 대체 후보가 잡혀 있다 = 다른 런타임 디렉토리에 이미 aicd가 산다.
+                    bail!(
+                        "이미 실행 중인 aicd가 있습니다 (lock {}). 이 프로세스는 {}에 \
+                         lock을 잡으려 했습니다 — XDG_RUNTIME_DIR이 서로 달라 경로가 \
+                         갈렸습니다. 기존 데몬을 쓰려면 그대로 두고, 새로 띄우려면 먼저 \
+                         종료하세요: aic daemon stop ({e})",
+                        path.display(),
+                        canonical.display()
+                    );
+                }
+            }
+        }
+
+        Ok(Self {
+            locks,
+            canonical: canonical.to_path_buf(),
+        })
+    }
+
+    /// 실제로 잡은 lock 경로들 (정렬 순서).
+    #[allow(dead_code)]
+    pub fn paths(&self) -> Vec<&Path> {
+        self.locks.iter().map(|l| l.path()).collect()
+    }
+
+    /// 정규 lock 경로.
+    #[allow(dead_code)]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical
+    }
+}
+
+/// lock 후보의 부모 디렉토리를 이 프로세스가 안전하게 만들거나 쓸 수 있는지.
+/// 남이 선점한 디렉토리(다른 소유자·0700 아님·symlink)도 여기서 걸러 후보에서 빠진다.
+fn parent_dir_is_usable(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    aic_common::ensure_runtime_dir(parent).is_ok()
 }
 
 impl Drop for DaemonLock {
@@ -498,6 +588,144 @@ mod tests {
             find_live_daemon_outside(&canonical, std::slice::from_ref(&canonical)),
             None
         );
+    }
+
+    // ── DaemonLockSet (동시 기동 차단) ────────────────────────
+    //
+    // fcntl(F_SETLK) lock은 **프로세스** 단위라, 같은 프로세스의 스레드 둘로는 배제가
+    // 검증되지 않는다(둘 다 성공한다). 그래서 진짜 하위 프로세스를 띄워 "먼저 뜬 aicd"를
+    // 만든다 — 테스트 바이너리 자신을 `--ignored` 헬퍼 테스트로 재실행하는 방식이다.
+
+    /// 부모 테스트가 하위 프로세스로 실행하는 헬퍼. `AIC_TEST_HOLD_LOCK` 경로에 lock을 잡고
+    /// `LOCKED`를 찍은 뒤, stdin이 닫힐 때까지(= 부모가 끝날 때까지) 들고 있는다.
+    #[test]
+    #[ignore = "부모 테스트가 하위 프로세스로 실행하는 헬퍼"]
+    fn hold_lock_helper() {
+        let Ok(path) = std::env::var("AIC_TEST_HOLD_LOCK") else {
+            return;
+        };
+        let _lock = DaemonLock::acquire(PathBuf::from(path)).expect("헬퍼 lock 획득 실패");
+        println!("LOCKED");
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+    }
+
+    /// lock을 쥔 하위 프로세스 핸들. stdout 파이프를 함께 들고 있어야 자식이 나중에 쓰는
+    /// 하네스 출력이 `Broken pipe`로 깨지지 않는다.
+    struct LockHolder {
+        child: std::process::Child,
+        _stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+
+    /// `path`에 lock을 쥔 하위 프로세스를 띄우고, 실제로 잡을 때까지 기다린다.
+    ///
+    /// 정상 경로의 회수는 `stop_lock_holder`가 한다. 여기서 panic하면(=테스트 실패) 자식이
+    /// 남지만, 부모가 죽으면 stdin이 닫혀 헬퍼도 곧 빠져나온다.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_lock_holder(path: &Path) -> LockHolder {
+        use std::io::BufRead;
+        let exe = std::env::current_exe().expect("테스트 바이너리 경로");
+        let mut child = std::process::Command::new(exe)
+            // `--nocapture`가 없으면 libtest가 헬퍼의 stdout을 삼켜 `LOCKED`가 파이프로
+            // 나오지 않는다 — 부모는 읽기에서, 자식은 stdin에서 서로를 기다리며 교착한다.
+            .args([
+                "--exact",
+                "lock::tests::hold_lock_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("AIC_TEST_HOLD_LOCK", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("lock holder 기동 실패");
+
+        let stdout = child.stdout.take().expect("holder stdout");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .expect("holder stdout 읽기 실패");
+            assert!(n > 0, "holder가 lock을 잡지 못하고 종료했다");
+            if line.trim() == "LOCKED" {
+                return LockHolder {
+                    child,
+                    _stdout: reader,
+                };
+            }
+        }
+    }
+
+    fn stop_lock_holder(mut holder: LockHolder) {
+        drop(holder.child.stdin.take()); // stdin 닫힘 → 헬퍼 종료
+        let _ = holder.child.wait();
+    }
+
+    /// 이 테스트가 지키는 것: 후보 lock을 **전부** 잡는 동작. 하나라도 빠지면 그 경로를
+    /// 정규 경로로 삼은 다른 프로세스가 나란히 기동한다.
+    #[test]
+    fn acquire_all_holds_every_candidate_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("run-user/aicd.pid");
+        let alt = dir.path().join("tmp/aicd.pid");
+
+        let set = DaemonLockSet::acquire_all(&canonical, &[canonical.clone(), alt.clone()])
+            .expect("acquire_all 실패");
+
+        let held = set.paths();
+        assert_eq!(held.len(), 2, "후보 lock을 전부 잡아야 한다: {held:?}");
+        assert!(held.contains(&canonical.as_path()));
+        assert!(held.contains(&alt.as_path()));
+        assert!(canonical.exists() && alt.exists());
+    }
+
+    /// 이 테스트가 지키는 것: XDG_RUNTIME_DIR이 갈린 두 프로세스의 **동시** 기동 차단.
+    /// 사전 조회만 하던 종전 구현은 검사-획득 사이가 원자적이지 않아 여기서 통과해 버렸다.
+    /// 정규 경로가 정렬상 앞이든 뒤든 모두 막아야 한다.
+    #[test]
+    fn acquire_all_blocks_start_when_other_runtime_dir_is_locked() {
+        for (canonical_rel, alt_rel) in [
+            ("run-user/aicd.pid", "tmp/aicd.pid"),
+            ("tmp/aicd.pid", "run-user/aicd.pid"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let canonical = dir.path().join(canonical_rel);
+            let alt = dir.path().join(alt_rel);
+            std::fs::create_dir_all(alt.parent().unwrap()).unwrap();
+
+            // 먼저 뜬 aicd — alt를 자기 정규 경로로 삼은 다른 프로세스.
+            let holder = spawn_lock_holder(&alt);
+
+            let err = DaemonLockSet::acquire_all(&canonical, &[canonical.clone(), alt.clone()])
+                .expect_err("다른 런타임 디렉토리의 aicd를 막지 못했다");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&alt.display().to_string()),
+                "에러가 충돌한 lock 경로를 알려야 한다: {msg}"
+            );
+
+            stop_lock_holder(holder);
+        }
+    }
+
+    /// 만들 수 없는 후보 디렉토리(다른 사용자 소유의 `/run/user/{uid}` 등)는 건너뛴다 —
+    /// 거기엔 이 프로세스가 데몬을 띄울 수도 없으므로 경합 대상이 아니다.
+    #[test]
+    fn acquire_all_skips_unusable_candidate_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("run-user/aicd.pid");
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file, not a directory").unwrap();
+        let alt = blocker.join("aicd.pid"); // 부모가 파일 → create_dir_all 실패
+
+        let set = DaemonLockSet::acquire_all(&canonical, &[canonical.clone(), alt])
+            .expect("쓸 수 없는 후보 때문에 기동이 막히면 안 된다");
+        assert_eq!(set.paths(), vec![canonical.as_path()]);
+        assert_eq!(set.canonical_path(), canonical.as_path());
     }
 
     #[test]

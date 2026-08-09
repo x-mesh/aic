@@ -18,7 +18,7 @@ use aic_server::agent_event_bus::AgentEventBus;
 use aic_server::attach_server::AttachServer;
 use aic_server::command_record_store::CommandRecordStore;
 use aic_server::control_server::{spawn_reconcile_loop, ControlContext, ControlServer};
-use aic_server::lock::DaemonLock;
+use aic_server::lock::DaemonLockSet;
 use aic_server::otlp_exporter::logs::checkpoint::CheckpointStore;
 use aic_server::otlp_exporter::logs::container::{
     ContainerCollectorConfig, ContainerParseCounters,
@@ -107,30 +107,15 @@ async fn main() -> anyhow::Result<()> {
     // singleton lock — 이미 실행 중이면 즉시 실패한다.
     let lock_path = aicd_lock_path_for_bind();
 
-    // lock은 정규 경로 한 곳에만 잡으므로, XDG_RUNTIME_DIR 유무가 갈리는 두 프로세스는
-    // 서로의 lock을 못 보고 각자 데몬을 띄운다(둘 다 acquire에 성공한다). 그래서 lock을
-    // 잡기 전에 다른 후보 경로에 살아 있는 aicd가 있는지 먼저 본다.
-    if let Some((other_lock, pid)) =
-        aic_server::lock::find_live_daemon_outside(&lock_path, &aicd_lock_path_candidates())
-    {
-        eprintln!(
-            "aicd 시작 실패: 이미 실행 중인 aicd가 있습니다 (PID {pid}, lock {}).\n\
-             이 프로세스는 {}에 lock을 잡으려 했습니다 — XDG_RUNTIME_DIR이 서로 달라 \
-             경로가 갈렸습니다.\n\
-             기존 데몬을 쓰려면 그대로 두고, 새로 띄우려면 먼저 종료하세요: aic daemon stop",
-            other_lock.display(),
-            lock_path.display()
-        );
-        anyhow::bail!(
-            "중복 aicd 기동 차단 (PID {pid}, lock {})",
-            other_lock.display()
-        );
-    }
-
-    let _lock = DaemonLock::acquire(&lock_path).map_err(|e| {
-        eprintln!("aicd 시작 실패: {e}");
-        e
-    })?;
+    // lock은 정규 경로 한 곳에만 잡으면 XDG_RUNTIME_DIR 유무가 갈리는 두 프로세스가 서로의
+    // lock을 못 보고 각자 데몬을 띄운다. "다른 후보를 먼저 읽어 본다"는 사전 조회는 검사와
+    // 획득 사이가 원자적이지 않아 동시 기동을 막지 못하므로, 후보 lock을 고정 순서로 **전부**
+    // 잡고 프로세스 수명 동안 들고 있는다 (`DaemonLockSet`).
+    let _locks =
+        DaemonLockSet::acquire_all(&lock_path, &aicd_lock_path_candidates()).map_err(|e| {
+            eprintln!("aicd 시작 실패: {e}");
+            e
+        })?;
     tracing::info!(path = %lock_path.display(), "aicd lock 획득");
 
     // control UDS bind
