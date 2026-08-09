@@ -6,6 +6,8 @@ pub mod central_store_flag;
 pub mod error;
 pub mod ipc;
 pub mod paths;
+/// UDS 상대편 uid 검증 — 경로·권한 검사가 못 막는 구간을 커널 판정으로 닫는다.
+pub mod peercred;
 // 프로세스 단위 OS 조회(fd 수 등). aic-server(OTLP exporter의 top-N)와 aic-client(`/local` probe)가
 // 같은 숫자를 보고해야 하므로 단일 원천으로 둔다.
 pub mod proc;
@@ -29,6 +31,7 @@ pub use paths::{
     local_hook_pending_path, resolve_active_socket, resolve_socket_path, runtime_dir_is_trusted,
     session_dir, session_id_in_use, session_socket_path, session_socket_path_for_bind,
 };
+pub use peercred::{ensure_peer_is_self, peer_uid};
 pub use session::{
     generate_record_id, generate_session_id, generate_unused_session_id, is_valid_record_id,
     is_valid_session_id,
