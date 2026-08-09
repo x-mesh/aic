@@ -190,11 +190,15 @@ pub struct OomEvent {
 /// 그래서 `after_seq`보다 큰 것만 새 사건으로 본다. 반환하는 최대 seq는 **필터 전 전체 기준**이라,
 /// 호출부가 그대로 저장하면 다음 폴에서 같은 사건을 다시 보지 않는다.
 ///
+/// 두 번째 반환값은 ring에서 **실제로 관측한** 최대 seq다(사건이 없으면 0). `after_seq`로
+/// 클램프하지 않는다 — 클램프하면 rca-agent 재시작으로 seq가 1부터 다시 매겨진 상황(후퇴)을
+/// 호출부가 구분할 수 없어, 새 OOM이 전부 옛 커서에 걸려 영구 누락된다.
+///
 /// ring 용량(실측 16)을 넘겨 유실된 사건은 번들의 `dropped_events`가 알려 주지만, 그건 카운터
 /// (`aic.kernel.oom_kills`)가 이미 총량으로 담고 있어 여기서 따로 복원하지 않는다.
 pub fn build_oom_events(bundle_json: &str, after_seq: u64) -> (Vec<OomEvent>, u64) {
     let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
-        return (Vec::new(), after_seq);
+        return (Vec::new(), 0);
     };
     let Some(items) = v
         .get("observations")
@@ -203,10 +207,10 @@ pub fn build_oom_events(bundle_json: &str, after_seq: u64) -> (Vec<OomEvent>, u6
         .and_then(|o| o.get("events"))
         .and_then(Value::as_array)
     else {
-        return (Vec::new(), after_seq);
+        return (Vec::new(), 0);
     };
 
-    let mut max_seq = after_seq;
+    let mut max_seq = 0u64;
     let mut events = Vec::new();
     for e in items {
         let Some(seq) = e.get("seq").and_then(Value::as_u64) else {
@@ -331,13 +335,32 @@ async fn serve_kernel_with(
                 // 때마다 옛 사건이 되살아난다. record_id의 시각 버킷이 재시작 시각으로 달라져
                 // 수신측 중복 제거도 통과해 버린다. 그 대가로 재시작 구간의 사건은 놓치지만,
                 // 없는 사건을 만들어 내는 것보다 낫다(카운터의 첫 폴 규칙과 같은 판단).
-                let (oom_events, max_seq) = build_oom_events(&bundle, last_oom_seq);
+                let (mut oom_events, max_seq) = build_oom_events(&bundle, last_oom_seq);
                 let oom_baseline = !first_seen;
                 if oom_baseline && max_seq > 0 {
                     tracing::debug!(max_seq, "첫 폴 — OOM ring seq 기준선만 잡는다");
                 }
+                // rca-agent가 재시작하면 ring seq가 1부터 다시 매겨진다. 커서를 `max`로만
+                // 전진시키면 재시작 뒤의 사건이 전부 `seq <= last_oom_seq`에 걸려 **aicd가 사는
+                // 동안 영구 누락**된다(카운터 쪽은 `diff_counters`가 후퇴를 이미 처리한다).
+                // 관측 최대 seq가 커서보다 작으면 ring이 리셋된 것이다. 이때 ring에 남은 사건은
+                // 재시작 **이후**의 새 사건이므로(옛 ring은 에이전트와 함께 사라졌다) 커서를
+                // 무시하고 전부 새로 잡는다 — aicd 첫 폴의 기준선 규칙과 달리 여기서는 옛 사건이
+                // 되살아날 여지가 없다.
+                let ring_restarted = max_seq > 0 && max_seq < last_oom_seq;
+                if ring_restarted {
+                    tracing::info!(
+                        max_seq,
+                        last_oom_seq,
+                        "OOM ring seq 후퇴 — rca-agent 재시작으로 보고 커서를 재설정한다"
+                    );
+                    let (fresh, _) = build_oom_events(&bundle, 0);
+                    oom_events = fresh;
+                }
+
+                let mut delivered = true;
                 if !oom_baseline && !oom_events.is_empty() {
-                    push_oom_events(
+                    delivered = push_oom_events(
                         client,
                         &cfg,
                         &logs_url,
@@ -349,9 +372,21 @@ async fn serve_kernel_with(
                     )
                     .await;
                 }
-                // 전송 실패해도 seq는 전진시킨다 — 실패한 배치는 spool이 보관하므로, 되돌리면
-                // 다음 폴에서 같은 사건을 중복 발행하게 된다.
-                last_oom_seq = last_oom_seq.max(max_seq);
+                // 전송 실패라도 **spool에 적재됐으면** seq를 전진시킨다 — 되돌리면 다음 폴에서
+                // 같은 사건을 중복 발행한다. 반대로 spool 적재까지 실패했으면 그 배치는 어디에도
+                // 남지 않았으므로 커서를 붙잡아 다음 폴에서 다시 시도한다(중복은 record_id가
+                // 흡수한다).
+                if !delivered {
+                    tracing::warn!(
+                        max_seq,
+                        last_oom_seq,
+                        "OOM 배치가 전송·spool 모두 실패 — seq 커서를 전진시키지 않는다"
+                    );
+                } else if ring_restarted {
+                    last_oom_seq = max_seq;
+                } else {
+                    last_oom_seq = last_oom_seq.max(max_seq);
+                }
 
                 let cur = read_counters(&bundle);
                 let points = diff_counters(prev_counters.as_ref(), &cur);
@@ -423,6 +458,10 @@ async fn serve_kernel_with(
 /// scope를 새로 만들지 않고 재사용하는 이유: 수신측에 이미 라우팅과 `event_pattern` 룰이 있어
 /// **배포 순서 함정(미등록 scope는 200 OK 무음 폐기)을 피하면서 즉시 소비**된다.
 /// `change_type=kernel`이 커널 출처임을 구분한다.
+///
+/// 반환값은 이 배치가 **어딘가에 남았는지**다 — push 성공이거나 spool 적재 성공이면 `true`,
+/// 둘 다 실패해 배치가 사라졌으면 `false`. 호출부는 `false`일 때 seq 커서를 붙잡아 다음 폴에서
+/// 다시 시도한다(중복은 `record_id`가 흡수한다).
 #[allow(clippy::too_many_arguments)]
 async fn push_oom_events(
     client: &reqwest::Client,
@@ -433,7 +472,7 @@ async fn push_oom_events(
     host_id: &str,
     os_type: &str,
     backoff: &mut Backoff,
-) {
+) -> bool {
     use super::logs_proto::{self, ChangeEntry};
 
     let now_ns = super::unix_nanos_now();
@@ -475,23 +514,32 @@ async fn push_oom_events(
     let body = logs_proto::encode_changes(&entries, &resource, &cfg.service_version, now_ns);
 
     if !backoff.ready() {
-        if let Err(e) = cfg.spool.append(SignalKind::Logs, &body) {
-            tracing::warn!(error = %e, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
-        }
-        return;
+        return match cfg.spool.append(SignalKind::Logs, &body) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
+                false
+            }
+        };
     }
     match super::push_logs(client, logs_url, cfg.token.as_deref(), body.clone()).await {
         Ok(_) => {
             backoff.on_success();
             cfg.health.record_ok();
+            true
         }
         Err(e) => {
             tracing::warn!(error = %e, "OTLP kernel OOM push 실패 — spool에 적재");
-            if let Err(e2) = cfg.spool.append(SignalKind::Logs, &body) {
-                tracing::warn!(error = %e2, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
-            }
+            let spooled = match cfg.spool.append(SignalKind::Logs, &body) {
+                Ok(()) => true,
+                Err(e2) => {
+                    tracing::warn!(error = %e2, "OTLP kernel OOM spool append 실패 — 이 배치 유실");
+                    false
+                }
+            };
             backoff.on_failure();
             cfg.health.record_fail();
+            spooled
         }
     }
 }
@@ -613,6 +661,12 @@ mod tests {
         let (ev2, max2) = build_oom_events(POLL, 2);
         assert!(ev2.is_empty());
         assert_eq!(max2, 2);
+        // 이 테스트가 지키는 것: 커서보다 **작은** 관측 최대값이 그대로 보인다.
+        // 클램프하면 rca-agent 재시작(seq 리셋)을 폴 루프가 구분하지 못해, 재시작 뒤의 OOM이
+        // 전부 옛 커서에 걸려 영구 누락된다.
+        let (ev4, max4) = build_oom_events(POLL, 100);
+        assert!(ev4.is_empty(), "커서보다 작은 seq는 아직 새 사건이 아니다");
+        assert_eq!(max4, 2, "후퇴 감지를 위해 관측값을 그대로 돌려줘야 한다");
         // 일부만 본 상태면 그 뒤만 새 사건이다.
         let (ev3, _) = build_oom_events(POLL, 1);
         assert_eq!(ev3.len(), 1);
@@ -621,7 +675,8 @@ mod tests {
 
     #[test]
     fn build_oom_events_degrades_on_bad_input() {
-        // 파싱 실패·구조 불일치는 빈 목록 + seq 유지(전진시키면 사건을 잃는다).
+        // 파싱 실패·구조 불일치는 빈 목록 + "관측 없음"(0). 호출부는 0을 커서 유지로 읽는다
+        // — 여기서 `after_seq`를 되돌려주면 관측 없음과 후퇴를 구분할 수 없다.
         for bad in [
             "not json",
             "{}",
@@ -629,7 +684,7 @@ mod tests {
         ] {
             let (ev, max) = build_oom_events(bad, 7);
             assert!(ev.is_empty());
-            assert_eq!(max, 7);
+            assert_eq!(max, 0, "관측이 없으면 0 — after_seq로 클램프하지 않는다");
         }
         // seq 없는 항목은 건너뛴다.
         let (ev, _) = build_oom_events(
