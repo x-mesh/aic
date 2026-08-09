@@ -71,10 +71,12 @@ pub struct ControlServer {
 impl ControlServer {
     /// control 소켓을 바인드한다. 기존 소켓 파일은 정리 후 재생성한다.
     pub async fn bind(socket_path: &Path) -> anyhow::Result<Self> {
-        let _ = std::fs::remove_file(socket_path);
+        // 부모 디렉토리는 0700으로 만들고, 이미 있으면 소유자·권한·symlink를 검사한다 —
+        // 남이 선점한 `/tmp/aic-{uid}`에 control 소켓을 얹으면 그 자체가 사고다.
         if let Some(parent) = socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            aic_common::ensure_runtime_dir(parent)?;
         }
+        let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
         Ok(Self {
             listener,
