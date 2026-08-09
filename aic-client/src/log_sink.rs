@@ -307,6 +307,9 @@ fn blocking_push(socket_path: &Path, lines: Vec<LogLine>) -> std::io::Result<()>
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut sock = UnixStream::connect(socket_path)?;
+    // 소켓 경로는 탐색 결과라 남이 선점한 디렉토리를 가리킬 수 있다 — 로그를 쓰기 전에
+    // 상대 uid를 확인한다(실패는 호출부가 조용히 무시하는 best-effort 경로다).
+    aic_common::ensure_peer_is_self(&sock)?;
     sock.set_write_timeout(Some(IO_TIMEOUT))?;
     sock.set_read_timeout(Some(IO_TIMEOUT))?;
     sock.write_all(&encode_frame(&payload))?;

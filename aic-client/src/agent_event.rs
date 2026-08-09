@@ -814,6 +814,11 @@ fn query_at(socket: &std::path::Path, req: &IpcRequest, timeout: Duration) -> Ro
     let Ok(mut stream) = connect_unix_timeout(socket, timeout) else {
         return Roundtrip::SendFailed;
     };
+    // 소켓 경로는 탐색 결과라 남이 선점한 디렉토리를 가리킬 수 있다. 이벤트를 쓰기 전에
+    // 상대 uid를 확인한다 — 여기서 나가는 건 명령·판정 이벤트라 노출되면 그대로 정보 유출이다.
+    if aic_common::ensure_peer_is_self(&stream).is_err() {
+        return Roundtrip::SendFailed;
+    }
 
     // write: 남은 예산으로. 만료면 아직 안 보냈으니 SendFailed. `remaining()`은 0(만료)을 `None`으로
     // 주므로 `set_write_timeout(Some(0))`(= 플랫폼상 "무한 대기") 함정에 빠지지 않는다.
