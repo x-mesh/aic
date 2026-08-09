@@ -93,6 +93,13 @@ impl ControlServer {
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
+                            // 상대편 uid 검사 — attach 소켓(R15.2)과 같은 판정을 control에도
+                            // 건다. 소켓 파일 권한(0600)은 이미 열린 fd를 넘겨받은 프로세스나
+                            // 디렉토리 선점 상황을 막지 못한다. 커널이 답하는 uid만이 근거다.
+                            if let Err(e) = aic_common::ensure_peer_is_self(&stream) {
+                                tracing::warn!(error = %e, "control 연결 거부 — peer uid 불일치");
+                                continue;
+                            }
                             let ctx = ctx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_client(stream, ctx).await {
