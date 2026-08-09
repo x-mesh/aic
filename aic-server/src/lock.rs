@@ -70,9 +70,13 @@ impl DaemonLock {
 
                 match pid {
                     Some(pid) if is_pid_alive(pid, recorded_path.as_deref()) => {
+                        // 이 lock은 aicd와 aic-session이 함께 쓴다 — 어느 쪽인지 단정하지
+                        // 않는다. 종전 문구("aic-session이 있습니다")는 aicd 기동 실패에도
+                        // 그대로 나와 엉뚱한 프로세스를 찾게 만들었다.
                         bail!(
-                            "이미 실행 중인 aic-session이 있습니다 (PID {pid}). \
-                             단일 인스턴스만 허용됩니다."
+                            "이미 lock을 쥔 프로세스가 있습니다 (PID {pid}, lock {}). \
+                             단일 인스턴스만 허용됩니다.",
+                            path.display()
                         );
                     }
                     _ => {
@@ -144,12 +148,40 @@ impl DaemonLockSet {
                 Ok(lock) => locks.push(lock),
                 Err(e) if is_canonical => return Err(e),
                 Err(e) => {
-                    // 대체 후보가 잡혀 있다 = 다른 런타임 디렉토리에 이미 aicd가 산다.
+                    // 대체 후보가 잡혀 있다 = 이미 다른 aicd가 산다.
+                    //
+                    // **경로가 갈렸다고 단정하지 않는다.** 살아 있는 aicd는 후보 lock을 전부
+                    // 쥐고 있으므로, 환경이 똑같은 평범한 중복 기동도 정렬상 첫 후보(대체
+                    // 경로)에서 먼저 걸린다. 그 상황에 "XDG_RUNTIME_DIR이 갈렸다"고 적으면
+                    // 멀쩡한 환경을 의심하게 만든다 — 실측에서 실제로 그렇게 나왔다.
+                    // 갈림은 두 경로의 **디렉토리가 다를 때만** 가능성으로 덧붙인다.
+                    let holder = read_lock_holder_pid(&path);
+                    // **경로 갈림 판정은 부모 디렉토리 비교로는 안 된다.** 환경이 같아도
+                    // 정렬상 첫 후보는 대체 경로라, 평범한 중복 기동도 "다른 디렉토리"에서
+                    // 걸린다(실측). 진짜 구분점은 **우리 정규 경로도 같은 데몬이 쥐고 있는가**
+                    // 다 — 쥐고 있으면 그냥 같은 환경의 중복 기동이고, 비어 있으면 그쪽
+                    // 데몬은 다른 런타임 디렉토리에 산다.
+                    let same_daemon_holds_canonical =
+                        match (holder, read_lock_holder_pid(canonical)) {
+                            (Some(a), Some(b)) => a == b,
+                            _ => false,
+                        };
+                    let holder_label = holder
+                        .map(|pid| format!("PID {pid}"))
+                        .unwrap_or_else(|| "PID 불명".to_string());
+                    if same_daemon_holds_canonical {
+                        bail!(
+                            "이미 실행 중인 aicd가 있습니다 ({holder_label}, lock {}). \
+                             단일 인스턴스만 허용됩니다 — 새로 띄우려면 먼저 종료하세요: \
+                             aic daemon stop",
+                            canonical.display()
+                        );
+                    }
                     bail!(
-                        "이미 실행 중인 aicd가 있습니다 (lock {}). 이 프로세스는 {}에 \
-                         lock을 잡으려 했습니다 — XDG_RUNTIME_DIR이 서로 달라 경로가 \
-                         갈렸습니다. 기존 데몬을 쓰려면 그대로 두고, 새로 띄우려면 먼저 \
-                         종료하세요: aic daemon stop ({e})",
+                        "이미 실행 중인 aicd가 있습니다 ({holder_label}, lock {}). 이 \
+                         프로세스는 {}에 lock을 잡으려 했습니다 — XDG_RUNTIME_DIR이 서로 \
+                         달라 런타임 경로가 갈린 것으로 보입니다.\n기존 데몬을 쓰려면 그대로 \
+                         두고, 새로 띄우려면 먼저 종료하세요: aic daemon stop\n(원인: {e})",
                         path.display(),
                         canonical.display()
                     );
@@ -174,6 +206,15 @@ impl DaemonLockSet {
     pub fn canonical_path(&self) -> &Path {
         &self.canonical
     }
+}
+
+/// lock 파일에 기록된 PID — **살아 있을 때만**. 에러 메시지에 "누가 쥐고 있는지"를 넣으려고
+/// 쓴다. 잔해에서 읽은 죽은 PID를 보여 주면 엉뚱한 프로세스를 찾게 되므로 생존 확인을 거친다.
+fn read_lock_holder_pid(path: &Path) -> Option<u32> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let (pid, recorded_path) = parse_pid_and_path(&content);
+    let pid = pid?;
+    is_pid_alive(pid, recorded_path.as_deref()).then_some(pid)
 }
 
 /// lock 후보의 부모 디렉토리를 이 프로세스가 안전하게 만들거나 쓸 수 있는지.
@@ -601,10 +642,15 @@ mod tests {
     #[test]
     #[ignore = "부모 테스트가 하위 프로세스로 실행하는 헬퍼"]
     fn hold_lock_helper() {
-        let Ok(path) = std::env::var("AIC_TEST_HOLD_LOCK") else {
+        let Ok(paths) = std::env::var("AIC_TEST_HOLD_LOCK") else {
             return;
         };
-        let _lock = DaemonLock::acquire(PathBuf::from(path)).expect("헬퍼 lock 획득 실패");
+        // `:`로 여러 경로를 받는다 — 실제 aicd는 후보 lock을 **전부** 쥐므로, 그 상황을
+        // 재현해야 "정규 경로도 같은 데몬이 쥐었나" 판정을 검증할 수 있다.
+        let _locks: Vec<DaemonLock> = paths
+            .split(':')
+            .map(|p| DaemonLock::acquire(PathBuf::from(p)).expect("헬퍼 lock 획득 실패"))
+            .collect();
         println!("LOCKED");
         use std::io::Write;
         std::io::stdout().flush().unwrap();
@@ -619,12 +665,26 @@ mod tests {
         _stdout: std::io::BufReader<std::process::ChildStdout>,
     }
 
-    /// `path`에 lock을 쥔 하위 프로세스를 띄우고, 실제로 잡을 때까지 기다린다.
+    /// `paths` 전부에 lock을 쥔 하위 프로세스를 띄우고, 실제로 잡을 때까지 기다린다.
     ///
     /// 정상 경로의 회수는 `stop_lock_holder`가 한다. 여기서 panic하면(=테스트 실패) 자식이
     /// 남지만, 부모가 죽으면 stdin이 닫혀 헬퍼도 곧 빠져나온다.
     #[allow(clippy::zombie_processes)]
     fn spawn_lock_holder(path: &Path) -> LockHolder {
+        spawn_lock_holder_multi(&[path])
+    }
+
+    fn spawn_lock_holder_multi(paths: &[&Path]) -> LockHolder {
+        let joined = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        spawn_lock_holder_raw(&joined)
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn spawn_lock_holder_raw(paths: &str) -> LockHolder {
         use std::io::BufRead;
         let exe = std::env::current_exe().expect("테스트 바이너리 경로");
         let mut child = std::process::Command::new(exe)
@@ -636,7 +696,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("AIC_TEST_HOLD_LOCK", path)
+            .env("AIC_TEST_HOLD_LOCK", paths)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -710,6 +770,52 @@ mod tests {
 
             stop_lock_holder(holder);
         }
+    }
+
+    /// 이 테스트가 지키는 것: 평범한 중복 기동을 **경로 갈림으로 오진하지 않는 것**.
+    /// 살아 있는 aicd는 후보 lock을 전부 쥐므로 환경이 같아도 정렬상 첫 후보(대체 경로)에서
+    /// 걸린다 — 부모 디렉토리 비교로는 구분되지 않는다. 판정 기준은 "정규 경로도 같은
+    /// 데몬이 쥐고 있는가"다.
+    #[test]
+    fn acquire_all_error_does_not_blame_xdg_for_plain_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("run-user/aicd.pid");
+        let alt = dir.path().join("tmp/aicd.pid");
+
+        // 실제 aicd처럼 후보 lock을 전부 쥔 홀더.
+        let holder = spawn_lock_holder_multi(&[&canonical, &alt]);
+
+        let err = DaemonLockSet::acquire_all(&canonical, &[canonical.clone(), alt.clone()])
+            .expect_err("잡힌 후보가 있으면 실패해야 한다");
+        let msg = err.to_string();
+
+        assert!(msg.contains("PID "), "홀더 PID가 있어야 한다: {msg}");
+        assert!(
+            !msg.contains("XDG_RUNTIME_DIR"),
+            "정규 경로까지 같은 데몬이 쥐고 있으면 경로 갈림이 아니다: {msg}"
+        );
+        stop_lock_holder(holder);
+    }
+
+    /// 반대 경우 — 정규 경로는 비어 있고 대체 후보만 잡혀 있다. 진짜로 다른 런타임
+    /// 디렉토리에 데몬이 산다는 뜻이므로 그렇게 안내해야 한다.
+    #[test]
+    fn acquire_all_error_reports_split_when_canonical_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("run-user/aicd.pid");
+        let alt = dir.path().join("tmp/aicd.pid");
+        let holder = spawn_lock_holder(&alt);
+
+        let err = DaemonLockSet::acquire_all(&canonical, &[canonical.clone(), alt.clone()])
+            .expect_err("잡힌 후보가 있으면 실패해야 한다");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("XDG_RUNTIME_DIR"),
+            "다른 런타임 디렉토리의 데몬이면 그 사실을 알려야 한다: {msg}"
+        );
+        assert!(msg.contains(&alt.display().to_string()));
+        stop_lock_holder(holder);
     }
 
     /// 만들 수 없는 후보 디렉토리(다른 사용자 소유의 `/run/user/{uid}` 등)는 건너뛴다 —
