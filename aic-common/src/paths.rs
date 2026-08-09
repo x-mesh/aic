@@ -35,11 +35,23 @@ const LEGACY_SOCKET_FILE: &str = "session.sock";
 /// 디렉토리다"라는 명시 계약이므로, 다른 관례를 훑어 남의 인스턴스를 찾을 이유가 없다.
 const RUNTIME_DIR_ENV: &str = "AIC_RUNTIME_DIR";
 
-/// `AIC_RUNTIME_DIR`이 지정한 디렉토리. 비어 있는 값은 미설정으로 본다.
+/// `AIC_RUNTIME_DIR`이 지정한 디렉토리. 빈 값과 **상대 경로**는 미설정으로 본다.
+///
+/// 상대 경로를 받아들이면 cwd가 다른 프로세스마다 다른 곳을 가리킨다 — 셸에서 띄운 aicd와
+/// 다른 디렉토리에서 실행한 `aic`가 조용히 갈려, 이 변수가 막으려던 바로 그 상황(서로를 못
+/// 찾는 두 인스턴스)을 만든다. 절대 경로만 계약으로 인정한다.
 fn explicit_runtime_dir() -> Option<PathBuf> {
-    std::env::var_os(RUNTIME_DIR_ENV)
+    let dir = std::env::var_os(RUNTIME_DIR_ENV)
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|p| !p.as_os_str().is_empty())?;
+    if !dir.is_absolute() {
+        tracing::debug!(
+            path = %dir.display(),
+            "{RUNTIME_DIR_ENV}가 상대 경로라 무시한다 — 절대 경로만 인정한다"
+        );
+        return None;
+    }
+    Some(dir)
 }
 
 /// 플랫폼별 세션 디렉토리를 반환한다.
@@ -813,6 +825,14 @@ mod tests {
         assert_eq!(
             session_dir_for_os("linux"),
             PathBuf::from("/run/user/1000/aic")
+        );
+
+        // 상대 경로도 무시한다 — cwd에 따라 프로세스마다 다른 곳을 가리키면 계약이 아니다.
+        std::env::set_var(RUNTIME_DIR_ENV, "runtime/aic");
+        assert_eq!(
+            session_dir_for_os("linux"),
+            PathBuf::from("/run/user/1000/aic"),
+            "상대 경로는 관례 경로로 되돌아가야 한다"
         );
 
         match prev_explicit {
