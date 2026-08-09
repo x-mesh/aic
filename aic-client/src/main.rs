@@ -6584,15 +6584,11 @@ struct SessionInfo {
 /// `session_dir()` 내의 `session-*.sock` 파일을 스캔하여 세션 목록을 반환한다.
 /// 각 소켓에 `UnixStream::connect`를 시도하여 활성 여부를 판별한다.
 fn list_sessions() -> Vec<SessionInfo> {
-    let dir = aic_common::session_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-
+    // 정규 경로 한 곳만 훑으면 XDG_RUNTIME_DIR이 갈린 셸에서 `/run/user`의 세션이 통째로
+    // 안 보인다 — aicd가 안 떠 있을 때 이 폴백이 곧 `aic sessions`의 답이므로, 탐색은
+    // 공용 후보 API(`list_session_sockets`)와 같은 규칙을 써야 한다.
     let mut sessions = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in aic_common::list_session_sockets() {
         if let Some(id) = aic_common::extract_session_id(&path) {
             // connect 후 즉시 정상 종료하여 서버 측 early eof 경고 방지
             let is_alive = match std::os::unix::net::UnixStream::connect(&path) {
