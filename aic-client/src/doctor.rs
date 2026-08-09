@@ -96,6 +96,7 @@ pub async fn run_all_checks(socket: &std::path::Path) -> Vec<CheckResult> {
         results.push(check_socket_path(socket));
         results.push(check_daemon_alive(socket).await);
         results.push(check_aicd_supervisor().await);
+        results.push(check_runtime_dir_contract());
         results.push(check_rca_agent(&cfg.rca_agent).await);
         results.push(check_shell_hooks());
         if let Some(provider) = cfg.llm.providers.get(&cfg.llm.default_provider) {
@@ -494,6 +495,62 @@ async fn check_daemon_alive(path: &std::path::Path) -> CheckResult {
     }
 }
 
+/// 런타임 디렉토리 계약 진단.
+///
+/// `AIC_RUNTIME_DIR`은 자동 후보 탐색을 끄는 명시 계약이라, **셸에만 설정하고 자동 시작
+/// unit에는 빠뜨리면** systemd/launchd가 띄운 aicd와 셸의 `aic`가 서로 다른 디렉토리를 본다.
+/// 둘 다 자기 경로에서는 정상이고 lock도 겹치지 않아 아무 에러가 안 난다 — aicd만 조용히 둘
+/// 뜬다. 파일 검사로 잡히지 않는 종류의 어긋남이라 여기서 명시적으로 본다.
+fn check_runtime_dir_contract() -> CheckResult {
+    let Ok(explicit) = std::env::var("AIC_RUNTIME_DIR") else {
+        return CheckResult::pass(
+            "런타임 디렉토리",
+            format!("{} (관례 탐색)", aic_common::session_dir().display()),
+        );
+    };
+    let explicit = explicit.trim().to_string();
+    if explicit.is_empty() {
+        return CheckResult::pass(
+            "런타임 디렉토리",
+            format!(
+                "{} (관례 탐색 — 빈 AIC_RUNTIME_DIR 무시)",
+                aic_common::session_dir().display()
+            ),
+        );
+    }
+    if !std::path::Path::new(&explicit).is_absolute() {
+        return CheckResult::warn(
+            "런타임 디렉토리",
+            format!("AIC_RUNTIME_DIR이 상대 경로라 무시됨: {explicit}"),
+            "절대 경로로 지정하세요 (cwd에 따라 갈리면 계약이 성립하지 않습니다)",
+        );
+    }
+
+    // unit이 설치돼 있는데 그 안에 같은 값이 없으면, 데몬은 관례 경로에 bind한다.
+    match crate::daemon_install::current_unit_path() {
+        Some(unit) if unit.exists() => match std::fs::read_to_string(&unit) {
+            Ok(body) if body.contains(&explicit) => {
+                CheckResult::pass("런타임 디렉토리", format!("{explicit} (unit에도 반영됨)"))
+            }
+            Ok(_) => CheckResult::warn(
+                "런타임 디렉토리",
+                format!(
+                    "AIC_RUNTIME_DIR={explicit} 인데 자동 시작 unit({})에는 없습니다 — \
+                     unit이 띄운 aicd는 관례 경로에 bind하므로 aicd가 둘 뜰 수 있습니다",
+                    unit.display()
+                ),
+                "`aic daemon install`을 다시 실행해 unit에 반영하세요",
+            ),
+            Err(e) => CheckResult::warn(
+                "런타임 디렉토리",
+                format!("unit 파일을 읽지 못했습니다: {e}"),
+                "권한을 확인하세요",
+            ),
+        },
+        _ => CheckResult::pass("런타임 디렉토리", format!("{explicit} (unit 미설치)")),
+    }
+}
+
 /// `aicd` supervisor 진단 (Phase 1.5).
 ///
 /// 정책:
@@ -752,6 +809,10 @@ async fn check_llm_endpoint(provider: &ProviderConfig) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `AIC_RUNTIME_DIR`을 만지는 테스트끼리의 직렬화 — 프로세스 전역 상태다.
+    static RUNTIME_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn check_result_pass_constructor() {
@@ -935,6 +996,29 @@ mod tests {
         assert!(result.detail.contains("retire"));
         let hint = result.fix_hint.unwrap();
         assert!(hint.contains("claude-sonnet-4-6"));
+    }
+
+    /// 이 테스트가 지키는 것: 셸에만 설정하고 unit에는 빠뜨린 상태를 doctor가 짚어 주는 것.
+    /// 이 어긋남은 양쪽 다 "정상"으로 보여 파일 검사로는 안 잡힌다.
+    #[test]
+    fn runtime_dir_contract_flags_relative_path() {
+        let _guard = RUNTIME_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AIC_RUNTIME_DIR").ok();
+
+        std::env::set_var("AIC_RUNTIME_DIR", "relative/aic");
+        let r = check_runtime_dir_contract();
+        assert_eq!(r.status, Status::Warn, "상대 경로는 경고여야 한다");
+
+        std::env::remove_var("AIC_RUNTIME_DIR");
+        let r = check_runtime_dir_contract();
+        assert_eq!(r.status, Status::Pass, "미설정은 관례 탐색으로 PASS");
+
+        match prev {
+            Some(v) => std::env::set_var("AIC_RUNTIME_DIR", v),
+            None => std::env::remove_var("AIC_RUNTIME_DIR"),
+        }
     }
 
     #[test]
