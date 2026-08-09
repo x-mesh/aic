@@ -235,6 +235,31 @@ pub fn build_oom_events(bundle_json: &str, after_seq: u64) -> (Vec<OomEvent>, u6
     (events, max_seq)
 }
 
+/// ring seq가 되돌아갔는지 — rca-agent 재시작으로 ring이 리셋된 신호.
+///
+/// 관측값 0은 "이번 폴에 사건이 없었다"이지 후퇴가 아니다. 여기서 0을 후퇴로 읽으면
+/// 사건 없는 평범한 폴마다 커서가 0으로 밀려 이미 보낸 사건을 전부 재발행한다.
+pub fn oom_ring_restarted(last_seq: u64, observed_max: u64) -> bool {
+    observed_max > 0 && observed_max < last_seq
+}
+
+/// 폴 한 번의 OOM seq 커서 전이. **순수 함수** — 상태 전이만 따로 검증할 수 있게 분리했다.
+///
+/// - `delivered == false`: 배치가 push도 spool도 못 됐다 = 어디에도 남지 않았다. 커서를
+///   붙잡아 다음 폴에서 다시 시도한다(중복은 `record_id`가 흡수한다).
+/// - ring 리셋: 관측값을 그대로 새 기준선으로 삼는다. `max`로 올리면 옛 커서가 남아 재시작
+///   이후의 사건이 영구히 걸러진다.
+/// - 그 외: 단조 증가.
+pub fn next_oom_cursor(last_seq: u64, observed_max: u64, delivered: bool) -> u64 {
+    if !delivered {
+        return last_seq;
+    }
+    if oom_ring_restarted(last_seq, observed_max) {
+        return observed_max;
+    }
+    last_seq.max(observed_max)
+}
+
 /// 재전송 중복을 수신측 ReplacingMergeTree가 흡수하도록 하는 idempotency 키.
 ///
 /// changes exporter의 방식(host + subject + action + bucket)에 **ring seq를 더한다** — 같은
@@ -347,7 +372,7 @@ async fn serve_kernel_with(
                 // 재시작 **이후**의 새 사건이므로(옛 ring은 에이전트와 함께 사라졌다) 커서를
                 // 무시하고 전부 새로 잡는다 — aicd 첫 폴의 기준선 규칙과 달리 여기서는 옛 사건이
                 // 되살아날 여지가 없다.
-                let ring_restarted = max_seq > 0 && max_seq < last_oom_seq;
+                let ring_restarted = oom_ring_restarted(last_oom_seq, max_seq);
                 if ring_restarted {
                     tracing::info!(
                         max_seq,
@@ -382,11 +407,8 @@ async fn serve_kernel_with(
                         last_oom_seq,
                         "OOM 배치가 전송·spool 모두 실패 — seq 커서를 전진시키지 않는다"
                     );
-                } else if ring_restarted {
-                    last_oom_seq = max_seq;
-                } else {
-                    last_oom_seq = last_oom_seq.max(max_seq);
                 }
+                last_oom_seq = next_oom_cursor(last_oom_seq, max_seq, delivered);
 
                 let cur = read_counters(&bundle);
                 let points = diff_counters(prev_counters.as_ref(), &cur);
@@ -671,6 +693,35 @@ mod tests {
         let (ev3, _) = build_oom_events(POLL, 1);
         assert_eq!(ev3.len(), 1);
         assert_eq!(ev3[0].seq, 2);
+    }
+
+    /// 이 테스트가 지키는 것: 폴 루프의 커서 상태 전이 전체. 순수 함수로 뽑아 두지 않으면
+    /// 이 로직은 네트워크가 있는 async 루프 안에만 있어 아무도 검증하지 못한다.
+    #[test]
+    fn next_oom_cursor_covers_every_transition() {
+        // 정상 전진.
+        assert_eq!(next_oom_cursor(5, 9, true), 9);
+        // 사건 없음(관측 0) — 커서 유지. 여기서 0으로 밀리면 보낸 사건이 전부 재발행된다.
+        assert_eq!(next_oom_cursor(5, 0, true), 5);
+        // 같은 ring 재관측 — 제자리.
+        assert_eq!(next_oom_cursor(5, 5, true), 5);
+        // ring 리셋(rca-agent 재시작): 관측값이 새 기준선. `max`였다면 5로 남아 재시작 이후의
+        // 사건(seq 1..2)이 영구 누락된다.
+        assert_eq!(next_oom_cursor(5, 2, true), 2);
+        // 전송·spool 모두 실패 — 어디에도 안 남았으니 커서를 붙잡는다.
+        assert_eq!(next_oom_cursor(5, 9, false), 5);
+        // 실패 + ring 리셋: 커서를 유지해 다음 폴에서 리셋을 다시 감지하고 재시도한다.
+        assert_eq!(next_oom_cursor(5, 2, false), 5);
+        // 첫 폴(기준선) — 0에서 시작해 관측값을 그대로 잡는다.
+        assert_eq!(next_oom_cursor(0, 7, true), 7);
+    }
+
+    #[test]
+    fn oom_ring_restarted_ignores_empty_ring() {
+        assert!(oom_ring_restarted(10, 3), "관측값이 커서보다 작으면 리셋");
+        assert!(!oom_ring_restarted(10, 0), "사건 없음은 리셋이 아니다");
+        assert!(!oom_ring_restarted(10, 10));
+        assert!(!oom_ring_restarted(0, 5), "첫 폴은 리셋이 아니다");
     }
 
     #[test]
