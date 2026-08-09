@@ -216,10 +216,20 @@ impl UdsClient {
 
     /// 연결 가능 여부를 확인한다 (health check).
     pub async fn ping(&self) -> Result<bool, AicError> {
+        Ok(matches!(self.ping_detailed().await, Ok(true)))
+    }
+
+    /// `ping`과 같지만 **실패 원인을 보존한다.**
+    ///
+    /// `ping`은 모든 에러를 `Ok(false)`로 접어 "데몬 없음"과 구분되지 않게 만든다. 대부분의
+    /// 호출부에는 그게 맞지만, 진단(`aic daemon status`)은 "안 떠 있다"와 "떠 있는데 거부당했다"
+    /// (다른 uid의 데몬 — peer uid 검사)를 구분해야 한다. 둘을 같게 보고하면 사용자는 멀쩡히
+    /// 도는 데몬을 두고 `aic daemon start`를 시도하게 된다.
+    pub async fn ping_detailed(&self) -> Result<bool, AicError> {
         match self.send_request(IpcRequest::Ping).await {
             Ok(IpcResponse::Pong) => Ok(true),
             Ok(_) => Ok(false),
-            Err(_) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 

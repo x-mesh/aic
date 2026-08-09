@@ -2132,7 +2132,8 @@ async fn handle_daemon_status() {
     println!("  lock:   {}", lock_path.display());
 
     let client = UdsClient::new(sock.clone());
-    match client.ping().await {
+    // `ping`이 아니라 `ping_detailed` — 거부(다른 uid의 데몬)와 미기동을 구분해야 한다.
+    match client.ping_detailed().await {
         Ok(true) => {
             // PID는 lock 파일에서 읽는다 — aicd가 ping에 응답한다면 lock도 살아있을 것.
             let pid = std::fs::read_to_string(&lock_path)
@@ -2146,6 +2147,19 @@ async fn handle_daemon_status() {
                 Ok(sessions) => println!("  sessions: {}", sessions.len()),
                 Err(e) => println!("  sessions: {COL_YELLOW}조회 실패{COL_RESET} ({e})"),
             }
+        }
+        // uid 불일치는 "없음"이 아니다 — 데몬은 멀쩡히 돌고 있고 우리가 거부당한 것이다.
+        // 이걸 stopped로 뭉개면 사용자는 `aic daemon start`를 시도하게 되는데, 그건 남의
+        // 런타임 디렉토리에 데몬을 띄우려다 또 다른 에러로 실패한다.
+        Err(aic_common::AicError::IpcError(e))
+            if e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            println!("  status: {COL_YELLOW}접근 거부{COL_RESET} (다른 uid의 데몬)");
+            println!("  {COL_DIM}{e}{COL_RESET}");
+            println!(
+                "  같은 사용자로 실행하거나, {COL_BOLD}AIC_RUNTIME_DIR{COL_RESET}로 \
+                 자기 런타임 디렉토리를 지정하세요"
+            );
         }
         _ => {
             println!("  status: {COL_DIM}stopped{COL_RESET}");
