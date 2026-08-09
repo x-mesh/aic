@@ -6587,8 +6587,15 @@ fn list_sessions() -> Vec<SessionInfo> {
     // 정규 경로 한 곳만 훑으면 XDG_RUNTIME_DIR이 갈린 셸에서 `/run/user`의 세션이 통째로
     // 안 보인다 — aicd가 안 떠 있을 때 이 폴백이 곧 `aic sessions`의 답이므로, 탐색은
     // 공용 후보 API(`list_session_sockets`)와 같은 규칙을 써야 한다.
+    list_sessions_from(aic_common::list_session_sockets())
+}
+
+/// `list_sessions()`의 소켓 목록 주입 가능 변형. 탐색 규칙(공용 API)과 생존 판정을 분리해
+/// 테스트가 tempdir로 검증할 수 있게 한다 — 종전엔 `session_dir()` 한 곳을 직접 열어
+/// 주입할 지점이 없었고, 그래서 폴백이 정규 경로만 보던 회귀를 아무 테스트도 잡지 못했다.
+fn list_sessions_from(socket_paths: Vec<std::path::PathBuf>) -> Vec<SessionInfo> {
     let mut sessions = Vec::new();
-    for path in aic_common::list_session_sockets() {
+    for path in socket_paths {
         if let Some(id) = aic_common::extract_session_id(&path) {
             // connect 후 즉시 정상 종료하여 서버 측 early eof 경고 방지
             let is_alive = match std::os::unix::net::UnixStream::connect(&path) {
@@ -10254,9 +10261,9 @@ fn print_command_block(title: &str, cmd: &str) {
 mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled, hooks_to_regenerate,
-        is_destructive_command, parse_duration_arg, parse_session_capture_mode, resolve_init_modes,
-        resolve_provider, validate_bind, validate_config_toml, Cli, Commands, ATTACH_SNIPPET,
-        RESTART_HINT_AFTER_MS, UNIT_RESTART_WAIT_MS,
+        is_destructive_command, list_sessions_from, parse_duration_arg, parse_session_capture_mode,
+        resolve_init_modes, resolve_provider, validate_bind, validate_config_toml, Cli, Commands,
+        ATTACH_SNIPPET, RESTART_HINT_AFTER_MS, UNIT_RESTART_WAIT_MS,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -10683,5 +10690,44 @@ source /root/.aic/hook-events.bash
             err.to_string().contains("(없음)"),
             "msg should show (없음) when providers map is empty: {err}"
         );
+    }
+
+    /// 이 테스트가 지키는 것: daemonless 폴백이 **여러 런타임 디렉토리**의 세션을 모두 본다.
+    /// 깨지면 aicd가 안 떠 있는 XDG 없는 셸에서 `aic sessions`가 조용히 빈손이 된다 —
+    /// 74a1bb7이 고치려던 증상이 정확히 이 경로에 남아 있었다.
+    #[test]
+    fn list_sessions_from_merges_sockets_across_dirs() {
+        let base = std::env::temp_dir().join(format!(
+            "aic-list-sessions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let run_user = base.join("run-user");
+        let tmp_dir = base.join("tmp");
+        std::fs::create_dir_all(&run_user).unwrap();
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        // 한쪽엔 살아 있는 세션(listener가 있어 connect 성공), 다른 쪽엔 stale 소켓 파일.
+        let live = run_user.join("session-aaaa1111.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        let stale = tmp_dir.join("session-bbbb2222.sock");
+        std::fs::write(&stale, b"").unwrap();
+        // 세션 소켓이 아닌 파일은 무시해야 한다.
+        std::fs::write(tmp_dir.join("aicd.sock"), b"").unwrap();
+
+        let sessions =
+            list_sessions_from(vec![live.clone(), stale.clone(), tmp_dir.join("aicd.sock")]);
+
+        assert_eq!(sessions.len(), 2, "두 디렉토리의 세션이 모두 보여야 한다");
+        assert_eq!(sessions[0].session_id, "aaaa1111");
+        assert!(sessions[0].is_alive, "listener가 있는 세션은 alive");
+        assert_eq!(sessions[1].session_id, "bbbb2222");
+        assert!(!sessions[1].is_alive, "stale 소켓은 dead");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
