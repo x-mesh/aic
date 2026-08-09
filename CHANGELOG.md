@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Homebrew 설치 경로를 되살렸다** — tap Formula가 사라진 미러 repo
+  (`parametacorp/aic-releases`)의 v0.34.0 에셋을 가리켜 `brew install/upgrade aic`가
+  404로 죽어 있었다. release.yml의 tap 갱신 스텝을 되살리고 URL을 이 repo
+  (`x-mesh/aic`, public이라 미인증 직링크가 그대로 된다)로 바꿨다. brew 설치본의
+  `aic update`도 install.sh 이주 안내 대신 `brew upgrade x-mesh/tap/aic` 위임으로
+  되돌렸다.
+
 ## [0.35.0] - 2026-08-04
 
 ### Added
