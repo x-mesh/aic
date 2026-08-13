@@ -93,12 +93,11 @@ fn arb_byte_chunks() -> impl Strategy<Value = Vec<Vec<u8>>> {
 /// 각 원소는 `[0, MAX_CHUNKS)` 에 있는 chunk 인덱스. producer 가 해당 index 의
 /// chunk 를 보낸 직후 `yield_now()` 를 부른다. 실제 chunk 수보다 큰 인덱스는 무시된다.
 fn arb_yield_schedule() -> impl Strategy<Value = Vec<usize>> {
-    prop::collection::vec(0..MAX_CHUNKS, 0..=MAX_YIELDS)
-        .prop_map(|mut v| {
-            v.sort_unstable();
-            v.dedup();
-            v
-        })
+    prop::collection::vec(0..MAX_CHUNKS, 0..=MAX_YIELDS).prop_map(|mut v| {
+        v.sort_unstable();
+        v.dedup();
+        v
+    })
 }
 
 // ── Harness ────────────────────────────────────────────────────
@@ -159,9 +158,7 @@ impl BackpressureHarness {
             guard.extend_from_slice(chunk);
         }
         // (2) attach tee.
-        let outcome = self
-            .channel
-            .try_send(Bytes::copy_from_slice(chunk));
+        let outcome = self.channel.try_send(Bytes::copy_from_slice(chunk));
         self.send_log.push((chunk.len(), outcome));
         outcome
     }

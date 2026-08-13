@@ -283,12 +283,7 @@ mod tests {
         // [preexec, "file1\n", "file2\n", precmd] — body 를 라인별로 분할.
         let preexec = chunks[0].clone();
         let precmd = chunks[2].clone();
-        let pieces: Vec<Vec<u8>> = vec![
-            preexec,
-            b"file1\n".to_vec(),
-            b"file2\n".to_vec(),
-            precmd,
-        ];
+        let pieces: Vec<Vec<u8>> = vec![preexec, b"file1\n".to_vec(), b"file2\n".to_vec(), precmd];
 
         let mut pool_all = Vec::new();
         let mut ref_all = Vec::new();
@@ -305,7 +300,10 @@ mod tests {
         let rec = &pool_all[0];
         assert_eq!(rec.command.as_deref(), Some("ls"));
         assert_eq!(rec.exit_code, 0);
-        assert_eq!(rec.output_lines, vec!["file1".to_string(), "file2".to_string()]);
+        assert_eq!(
+            rec.output_lines,
+            vec!["file1".to_string(), "file2".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -331,7 +329,10 @@ mod tests {
         assert_eq!(beta_records.len(), 1);
         assert_eq!(beta_records[0].command.as_deref(), Some("ls"));
         assert_eq!(beta_records[0].exit_code, 0);
-        assert_eq!(beta_records[0].output_lines, vec!["beta-line-1".to_string()]);
+        assert_eq!(
+            beta_records[0].output_lines,
+            vec!["beta-line-1".to_string()]
+        );
 
         // 이제 alpha 에 D 마커를 feed. alpha 의 누적 상태가 보존되어 있었어야 한다.
         let alpha_end = b"\x1b]133;D;2\x07".to_vec();

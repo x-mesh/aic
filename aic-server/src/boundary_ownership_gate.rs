@@ -436,13 +436,7 @@ mod tests {
         ];
         for (i, exp) in expected.iter().enumerate() {
             d = next_backoff(d);
-            assert_eq!(
-                d, *exp,
-                "스텝 {}: 기대 {:?}, 실제 {:?}",
-                i + 1,
-                exp,
-                d
-            );
+            assert_eq!(d, *exp, "스텝 {}: 기대 {:?}, 실제 {:?}", i + 1, exp, d);
         }
     }
 

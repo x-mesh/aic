@@ -135,7 +135,11 @@ mod tests {
             Some(""),
             None,
         ] {
-            assert_eq!(pty_hostile_terminal(tp), None, "{tp:?} 은 PTY 호환이어야 한다");
+            assert_eq!(
+                pty_hostile_terminal(tp),
+                None,
+                "{tp:?} 은 PTY 호환이어야 한다"
+            );
         }
     }
 }

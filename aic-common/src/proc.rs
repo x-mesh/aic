@@ -64,7 +64,13 @@ pub fn process_fd_count(pid: i64) -> Option<u32> {
         let mut buf = vec![0u8; usize::try_from(bytes).ok()?];
         // SAFETY: buf는 bytes만큼 소유하고, 커널에 넘기는 길이도 정확히 bytes다.
         let filled = unsafe {
-            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, buf.as_mut_ptr().cast(), bytes)
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDLISTFDS,
+                0,
+                buf.as_mut_ptr().cast(),
+                bytes,
+            )
         };
         if filled <= 0 {
             return None;

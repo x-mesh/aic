@@ -51,12 +51,12 @@ fn arb_attach_open() -> impl Strategy<Value = AttachClientFrame> {
     // session_id 는 아이디 포맷 (16자 hex) 보다 넓게 잡아 wire codec 자체의
     // 일반성을 검증한다. protocol_version 도 임의 u32 값을 허용한다 (wire
     // 수준에서는 숫자 필드일 뿐이며 버전 협상은 상위 layer 책임).
-    (".*", any::<u32>()).prop_map(|(session_id, protocol_version)| {
-        AttachClientFrame::AttachOpen {
+    (".*", any::<u32>()).prop_map(
+        |(session_id, protocol_version)| AttachClientFrame::AttachOpen {
             session_id,
             protocol_version,
-        }
-    })
+        },
+    )
 }
 
 fn arb_pty_bytes() -> impl Strategy<Value = AttachClientFrame> {

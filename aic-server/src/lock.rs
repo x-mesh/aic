@@ -495,7 +495,7 @@ mod tests {
             current_exe_path().as_deref(),
         );
         assert_eq!(
-            find_live_daemon_outside(&canonical, &[canonical.clone()]),
+            find_live_daemon_outside(&canonical, std::slice::from_ref(&canonical)),
             None
         );
     }

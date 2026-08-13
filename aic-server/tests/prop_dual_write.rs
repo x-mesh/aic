@@ -67,10 +67,7 @@ fn arb_command_record() -> impl Strategy<Value = CommandRecord> {
     (
         proptest::option::of("[a-zA-Z0-9 _\\-]{0,30}"),
         any::<i32>(),
-        prop::collection::vec(
-            "[a-zA-Z0-9 ]{0,30}",
-            0..=MAX_OUTPUT_LINES_PER_RECORD,
-        ),
+        prop::collection::vec("[a-zA-Z0-9 ]{0,30}", 0..=MAX_OUTPUT_LINES_PER_RECORD),
         arb_pushable_capture_mode(),
     )
         .prop_map(
@@ -133,12 +130,10 @@ async fn simulate_dual_write(
         // 2) central CommandRecordStore.
         match record.capture_mode {
             CaptureMode::Pty => store.push_pty(session_id, record.clone()).await,
-            CaptureMode::ExplicitCapture => {
-                store.push_explicit(session_id, record.clone()).await
+            CaptureMode::ExplicitCapture => store.push_explicit(session_id, record.clone()).await,
+            CaptureMode::Hook => {
+                unreachable!("arb_pushable_capture_mode generates only Pty / ExplicitCapture")
             }
-            CaptureMode::Hook => unreachable!(
-                "arb_pushable_capture_mode generates only Pty / ExplicitCapture"
-            ),
         }
 
         assigned.push(record);

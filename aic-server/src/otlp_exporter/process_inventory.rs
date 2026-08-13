@@ -258,16 +258,12 @@ mod tests {
     fn added_and_removed_are_emitted_as_delta() {
         let mut t = InventoryTracker::new(0);
         t.diff(&[inv(10, 100, "a"), inv(20, 200, "b")], no_enrich); // seq 1 keyframe
-        // b가 죽고 c가 태어남.
+                                                                    // b가 죽고 c가 태어남.
         let cs = t.diff(&[inv(10, 100, "a"), inv(30, 300, "c")], no_enrich);
         assert!(!cs.keyframe);
         assert!(cs.emit);
         assert_eq!(cs.sequence, 2);
-        let mut ops: Vec<_> = cs
-            .records
-            .iter()
-            .map(|r| (r.op, r.pid))
-            .collect();
+        let mut ops: Vec<_> = cs.records.iter().map(|r| (r.op, r.pid)).collect();
         ops.sort_by_key(|(_, pid)| *pid);
         assert_eq!(ops, vec![(ChangeOp::Removed, 20), (ChangeOp::Added, 30)]);
     }
@@ -309,8 +305,15 @@ mod tests {
         let cs4 = t.diff(&cur, counting);
         assert!(cs4.keyframe);
         assert!(cs4.emit);
-        assert_eq!(cs4.sequence, 2, "방출된 batch는 keyframe1, keyframe4 두 번뿐");
-        assert_eq!(enrich_calls.get(), before, "keyframe이라도 아는 프로세스는 재-enrich 안 함");
+        assert_eq!(
+            cs4.sequence, 2,
+            "방출된 batch는 keyframe1, keyframe4 두 번뿐"
+        );
+        assert_eq!(
+            enrich_calls.get(),
+            before,
+            "keyframe이라도 아는 프로세스는 재-enrich 안 함"
+        );
     }
 
     #[test]
@@ -334,7 +337,7 @@ mod tests {
     fn same_pid_reused_after_exit_is_add_not_change() {
         let mut t = InventoryTracker::new(0);
         t.diff(&[inv(10, 100, "old")], no_enrich); // keyframe
-        // pid 10이 죽고 같은 pid가 새 start_time으로 재사용됨 → (pid,start) 키가 달라 remove+add.
+                                                   // pid 10이 죽고 같은 pid가 새 start_time으로 재사용됨 → (pid,start) 키가 달라 remove+add.
         let cs = t.diff(&[inv(10, 555, "new")], no_enrich);
         let mut ops: Vec<_> = cs.records.iter().map(|r| (r.op, r.start_time)).collect();
         ops.sort_by_key(|(_, st)| *st);

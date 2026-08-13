@@ -421,7 +421,10 @@ pub fn encode_process_samples(
                 // disk IO는 창(window) delta라 0도 "이번 창엔 IO 없음"이라는 실제 값이다
                 // (connection bytes와 동일 취지) — 그래서 부재가 아니라 항상 싣는다.
                 attr_int("process.disk.read_bytes", saturating_i64(p.disk_read_bytes)),
-                attr_int("process.disk.write_bytes", saturating_i64(p.disk_write_bytes)),
+                attr_int(
+                    "process.disk.write_bytes",
+                    saturating_i64(p.disk_write_bytes),
+                ),
             ];
             // 아래 네 개는 "모르면 생략"(빈 값 금지, connections/dns 규약). start_time은 0(rest
             // 버킷·미측정)이면 생략, uid/container/fd는 None이면 생략한다.
@@ -1243,7 +1246,8 @@ mod tests {
         let resp = ExportLogsServiceResponse {
             partial_success: Some(ExportLogsPartialSuccess {
                 rejected_log_records: 23,
-                error_message: "dropped 23 record(s) from unknown scope(s): aic.process".to_string(),
+                error_message: "dropped 23 record(s) from unknown scope(s): aic.process"
+                    .to_string(),
             }),
         };
         let (rejected, reason) = decode_logs_partial_reject(&resp.encode_to_vec());
@@ -1257,10 +1261,16 @@ mod tests {
         let ok = ExportLogsServiceResponse {
             partial_success: None,
         };
-        assert_eq!(decode_logs_partial_reject(&ok.encode_to_vec()), (0, String::new()));
+        assert_eq!(
+            decode_logs_partial_reject(&ok.encode_to_vec()),
+            (0, String::new())
+        );
         // 빈 body / 디코드 불가 → (0, "") (구 collector 호환, push는 성공 유지).
         assert_eq!(decode_logs_partial_reject(&[]), (0, String::new()));
-        assert_eq!(decode_logs_partial_reject(b"not-protobuf"), (0, String::new()));
+        assert_eq!(
+            decode_logs_partial_reject(b"not-protobuf"),
+            (0, String::new())
+        );
         // rejected=0이면 사유가 있어도 (0, "")로 본다(폐기 없음).
         let zero = ExportLogsServiceResponse {
             partial_success: Some(ExportLogsPartialSuccess {
@@ -1268,7 +1278,10 @@ mod tests {
                 error_message: "noise".to_string(),
             }),
         };
-        assert_eq!(decode_logs_partial_reject(&zero.encode_to_vec()), (0, String::new()));
+        assert_eq!(
+            decode_logs_partial_reject(&zero.encode_to_vec()),
+            (0, String::new())
+        );
     }
 
     #[test]
@@ -1283,7 +1296,9 @@ mod tests {
                 disk_write_bytes: 8192,
                 start_time: 1_700_000_000,
                 uid: Some(1000),
-                container_id: Some("abc123def456abc123def456abc123def456abc123def456abc123def4560000"),
+                container_id: Some(
+                    "abc123def456abc123def456abc123def456abc123def456abc123def4560000",
+                ),
                 fd_count: Some(237),
             },
             ProcessEntry {
@@ -1316,7 +1331,10 @@ mod tests {
         assert!(
             matches!(get("process.executable.name"), Some(AnyValueOneof::StringValue(v)) if v == "aicd")
         );
-        assert!(matches!(get("process.pid"), Some(AnyValueOneof::IntValue(1234))));
+        assert!(matches!(
+            get("process.pid"),
+            Some(AnyValueOneof::IntValue(1234))
+        ));
         assert!(
             matches!(get("process.cpu_utilization"), Some(AnyValueOneof::DoubleValue(v)) if (v - 42.5).abs() < 1e-9)
         );
@@ -1379,7 +1397,9 @@ mod tests {
         assert!(!attrs2.iter().any(|kv| kv.key == "process.start_time"));
         assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
         assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
-        assert!(!attrs2.iter().any(|kv| kv.key == "process.file_descriptor.count"));
+        assert!(!attrs2
+            .iter()
+            .any(|kv| kv.key == "process.file_descriptor.count"));
     }
 
     #[test]
@@ -1392,15 +1412,17 @@ mod tests {
                 name: "postgres",
                 start_time: 1_700_000_500,
                 uid: Some(70),
-                container_id: Some("beef00beef00beef00beef00beef00beef00beef00beef00beef00beef000000"),
+                container_id: Some(
+                    "beef00beef00beef00beef00beef00beef00beef00beef00beef00beef000000",
+                ),
             },
             InventoryChange {
                 op: "remove",
                 pid: 9,
-                ppid: 0,           // 생략돼야 한다
+                ppid: 0, // 생략돼야 한다
                 name: "gone",
-                start_time: 0,     // 생략돼야 한다
-                uid: None,         // 생략
+                start_time: 0,      // 생략돼야 한다
+                uid: None,          // 생략
                 container_id: None, // 생략
             },
         ];
@@ -1417,7 +1439,10 @@ mod tests {
         );
         let req = ExportLogsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
         let scope_logs = &req.resource_logs[0].scope_logs[0];
-        assert_eq!(scope_logs.scope.as_ref().unwrap().name, "aic.process.inventory");
+        assert_eq!(
+            scope_logs.scope.as_ref().unwrap().name,
+            "aic.process.inventory"
+        );
         assert_eq!(scope_logs.log_records.len(), 2);
 
         let attrs = &scope_logs.log_records[0].attributes;
@@ -1429,8 +1454,14 @@ mod tests {
                 .and_then(|v| v.value)
         };
         assert!(matches!(get("aic.process.op"), Some(AnyValueOneof::StringValue(v)) if v == "add"));
-        assert!(matches!(get("process.pid"), Some(AnyValueOneof::IntValue(4242))));
-        assert!(matches!(get("process.parent_pid"), Some(AnyValueOneof::IntValue(1))));
+        assert!(matches!(
+            get("process.pid"),
+            Some(AnyValueOneof::IntValue(4242))
+        ));
+        assert!(matches!(
+            get("process.parent_pid"),
+            Some(AnyValueOneof::IntValue(1))
+        ));
         assert!(
             matches!(get("process.executable.name"), Some(AnyValueOneof::StringValue(v)) if v == "postgres")
         );
@@ -1438,8 +1469,13 @@ mod tests {
             get("process.start_time"),
             Some(AnyValueOneof::IntValue(1_700_000_500))
         ));
-        assert!(matches!(get("process.owner.uid"), Some(AnyValueOneof::IntValue(70))));
-        assert!(matches!(get("container.id"), Some(AnyValueOneof::StringValue(v)) if v.len() == 64));
+        assert!(matches!(
+            get("process.owner.uid"),
+            Some(AnyValueOneof::IntValue(70))
+        ));
+        assert!(
+            matches!(get("container.id"), Some(AnyValueOneof::StringValue(v)) if v.len() == 64)
+        );
         assert!(matches!(
             get("aic.process.inventory.sequence"),
             Some(AnyValueOneof::IntValue(7))
@@ -1459,7 +1495,9 @@ mod tests {
         assert!(!attrs2.iter().any(|kv| kv.key == "process.start_time"));
         assert!(!attrs2.iter().any(|kv| kv.key == "process.owner.uid"));
         assert!(!attrs2.iter().any(|kv| kv.key == "container.id"));
-        assert!(attrs2.iter().any(|kv| kv.key == "aic.process.inventory.sequence"));
+        assert!(attrs2
+            .iter()
+            .any(|kv| kv.key == "aic.process.inventory.sequence"));
         // remove 레코드에는 종료 시각 **하한**이 실린다 — 수신측이 점 추정 대신 구간을 갖게 한다.
         let get2 = |k: &str| {
             attrs2

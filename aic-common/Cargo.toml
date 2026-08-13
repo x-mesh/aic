@@ -2,13 +2,15 @@
 name = "aic-common"
 version = "0.35.0"
 edition = "2021"
+rust-version = "1.89"
+license = "MIT"
 build = "build.rs"
 
 [features]
 # Phase lock: 정확히 하나의 phase-3_N만 활성이어야 한다 (build.rs에서 assert).
-# 기본값은 phase-3_1 (레거시 호환 — Central_Store_Flag default = false).
+# 기본값은 phase-3_4 (공식 릴리스와 동일 — Central_Store_Flag default = true).
 # 다른 Phase를 선택할 때는 `cargo build --no-default-features --features phase-3_2` 형태로 지정.
-default = ["phase-3_1"]
+default = ["phase-3_4"]
 phase-3_1 = []
 phase-3_2 = []
 phase-3_3 = []

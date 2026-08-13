@@ -497,10 +497,7 @@ mod tests {
         let frame = read_attach_frame(&mut reader).await.expect("read error");
         match frame {
             AttachFrameKind::Server(AttachServerFrame::AttachError { message }) => {
-                assert!(
-                    message.contains("protocol_version"),
-                    "message = {message}"
-                );
+                assert!(message.contains("protocol_version"), "message = {message}");
             }
             other => panic!("AttachError 를 기대 — actual: {other:?}"),
         }

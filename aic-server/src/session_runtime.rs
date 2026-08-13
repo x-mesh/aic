@@ -23,11 +23,11 @@ use crate::output_processor::OutputProcessor;
 use crate::pty_manager::{HookPolicy, PtyManager};
 #[cfg(not(feature = "phase-3_5"))]
 use crate::ring_buffer::RingBuffer;
+use crate::uds_server::UdsServer;
 #[cfg(not(feature = "phase-3_5"))]
 use crate::uds_server::UdsServerMode;
-use crate::uds_server::UdsServer;
-use aic_common::central_store_flag::resolve_central_store_flag;
 use aic_common::aicd_attach_socket_path;
+use aic_common::central_store_flag::resolve_central_store_flag;
 #[cfg(not(feature = "phase-3_5"))]
 use aic_common::{generate_record_id, CommandRecord};
 use bytes::Bytes;
@@ -661,12 +661,8 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
     #[cfg(not(feature = "phase-3_5"))]
     let attach_client: Option<Arc<AttachClient>> = if runtime_state.central_store_flag {
         let attach_socket = aicd_attach_socket_path();
-        match attach_with_autostart_retry(
-            &attach_socket,
-            &session_id,
-            Arc::clone(&attach_metrics),
-        )
-        .await
+        match attach_with_autostart_retry(&attach_socket, &session_id, Arc::clone(&attach_metrics))
+            .await
         {
             Ok(client) => {
                 tracing::info!(
@@ -694,12 +690,8 @@ pub async fn run(config: SessionRuntimeConfig) -> anyhow::Result<()> {
     #[cfg(feature = "phase-3_5")]
     let attach_client: Arc<AttachClient> = {
         let attach_socket = aicd_attach_socket_path();
-        match attach_with_autostart_retry(
-            &attach_socket,
-            &session_id,
-            Arc::clone(&attach_metrics),
-        )
-        .await
+        match attach_with_autostart_retry(&attach_socket, &session_id, Arc::clone(&attach_metrics))
+            .await
         {
             Ok(client) => {
                 tracing::info!(
@@ -1353,7 +1345,8 @@ mod tests {
                         ring_buffer: &rb_for_task,
                     }),
                     "sess-tee",
-                    /*central_store_flag=*/ false, // flag=false 로 두어 aicd 호출은 배제.
+                    /*central_store_flag=*/
+                    false, // flag=false 로 두어 aicd 호출은 배제.
                 );
             }
             stdout
@@ -1445,7 +1438,11 @@ mod tests {
         // local ring 에 record 1 개 (command="ls", exit_code=0).
         let guard = rb.read().await;
         let recs = guard.recent_records(10);
-        assert_eq!(recs.len(), 1, "local ring 에 record 1 개 기대 — got {recs:?}");
+        assert_eq!(
+            recs.len(),
+            1,
+            "local ring 에 record 1 개 기대 — got {recs:?}"
+        );
         assert_eq!(recs[0].command.as_deref(), Some("ls"));
         assert_eq!(recs[0].exit_code, 0);
         drop(guard);
@@ -1660,14 +1657,10 @@ mod tests {
             Err("aicd 바이너리를 찾을 수 없음".to_string())
         };
 
-        let err = attach_with_autostart_retry_inner(
-            &missing,
-            "s-no-aicd",
-            Arc::clone(&metrics),
-            starter,
-        )
-        .await
-        .expect_err("소켓도 없고 autostart 도 실패하면 Err 기대");
+        let err =
+            attach_with_autostart_retry_inner(&missing, "s-no-aicd", Arc::clone(&metrics), starter)
+                .await
+                .expect_err("소켓도 없고 autostart 도 실패하면 Err 기대");
         // 에러 분류는 1 차 connect 실패를 그대로 반환 — Io 분류가 가장 흔하다.
         match err {
             crate::attach_client::AttachConnectError::Io(_) => {}
@@ -1824,7 +1817,10 @@ mod tests {
             .await;
 
         // 원본 세션의 record 는 그대로 남아야 한다.
-        let preserved = store.last(session_id).await.expect("record 가 유지되어야 함");
+        let preserved = store
+            .last(session_id)
+            .await
+            .expect("record 가 유지되어야 함");
         assert_eq!(preserved.id, "deadbeef12345678");
         assert_eq!(preserved.command.as_deref(), Some("cargo test"));
         assert_eq!(preserved.exit_code, 0);
@@ -1980,11 +1976,7 @@ mod phase_3_5_tests {
         let collected = tokio::task::spawn_blocking(move || {
             let mut stdout: Vec<u8> = Vec::new();
             for chunk in &chunks_for_task {
-                fan_out_chunk_central_only(
-                    chunk,
-                    &mut stdout,
-                    Some(attach_for_task.as_ref()),
-                );
+                fan_out_chunk_central_only(chunk, &mut stdout, Some(attach_for_task.as_ref()));
             }
             stdout
         })
@@ -1992,7 +1984,10 @@ mod phase_3_5_tests {
         .expect("spawn_blocking");
 
         let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
-        assert_eq!(collected, expected, "stdout passthrough 가 byte-exact 가 아님");
+        assert_eq!(
+            collected, expected,
+            "stdout passthrough 가 byte-exact 가 아님"
+        );
 
         drop(attach);
         let received = server.finish().await;
