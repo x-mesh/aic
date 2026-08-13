@@ -785,8 +785,7 @@ mod tests {
     #[test]
     fn write_file_creates_nested_parent_dirs() {
         let (dir, sb) = sandbox_with_files();
-        let out =
-            write_file(&json!({ "path": "a/b/c.txt", "content": "deep" }), &sb).unwrap();
+        let out = write_file(&json!({ "path": "a/b/c.txt", "content": "deep" }), &sb).unwrap();
         assert!(out.contains("a/b/c.txt"));
         let written = fs::read_to_string(dir.path().join("a").join("b").join("c.txt")).unwrap();
         assert_eq!(written, "deep");
@@ -795,11 +794,7 @@ mod tests {
     #[test]
     fn write_file_overwrites_existing() {
         let (dir, sb) = sandbox_with_files();
-        let out = write_file(
-            &json!({ "path": "hello.txt", "content": "replaced" }),
-            &sb,
-        )
-        .unwrap();
+        let out = write_file(&json!({ "path": "hello.txt", "content": "replaced" }), &sb).unwrap();
         assert!(out.contains("wrote"));
         let written = fs::read_to_string(dir.path().join("hello.txt")).unwrap();
         assert_eq!(written, "replaced");
@@ -808,22 +803,15 @@ mod tests {
     #[test]
     fn write_file_outside_tree_rejected() {
         let (_d, sb) = sandbox_with_files();
-        let err = write_file(
-            &json!({ "path": "../escape.txt", "content": "x" }),
-            &sb,
-        )
-        .unwrap_err();
+        let err = write_file(&json!({ "path": "../escape.txt", "content": "x" }), &sb).unwrap_err();
         assert!(err.message.contains("'..'") || err.message.contains("샌드박스 밖"));
     }
 
     #[test]
     fn write_file_secret_rejected() {
         let (dir, sb) = sandbox_with_files();
-        let err = write_file(
-            &json!({ "path": ".env", "content": "API_KEY=leak" }),
-            &sb,
-        )
-        .unwrap_err();
+        let err =
+            write_file(&json!({ "path": ".env", "content": "API_KEY=leak" }), &sb).unwrap_err();
         assert!(err.message.contains("secrets"));
         // 기존 .env는 변경되지 않아야 한다.
         let kept = fs::read_to_string(dir.path().join(".env")).unwrap();
@@ -932,7 +920,10 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("wrote"));
-        assert_eq!(fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(), "y");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(),
+            "y"
+        );
 
         let out2 = execute(
             "edit_file",
@@ -941,6 +932,9 @@ mod tests {
         )
         .unwrap();
         assert!(out2.contains("edited"));
-        assert_eq!(fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(), "z");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("viaexec.txt")).unwrap(),
+            "z"
+        );
     }
 }

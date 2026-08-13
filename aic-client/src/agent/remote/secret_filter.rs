@@ -124,6 +124,9 @@ mod tests {
     fn does_not_mangle_words_starting_with_password_substring() {
         // 'PASSWORD_HASH=...'는 password 토큰이 들어가서 매칭됨(보수적). 거짓 양성은 §7 Risk.
         let (_, hits) = redact("PASSWORD_HASH=$2a$10$abc");
-        assert_eq!(hits, 1, "보수적 match — 거짓 양성 가능, 운영자가 audit으로 확인");
+        assert_eq!(
+            hits, 1,
+            "보수적 match — 거짓 양성 가능, 운영자가 audit으로 확인"
+        );
     }
 }

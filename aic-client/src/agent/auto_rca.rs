@@ -54,7 +54,10 @@ pub(crate) fn capture_incident(crit_msgs: &[String]) -> anyhow::Result<Option<St
     let symptom = (!crit_msgs.is_empty()).then(|| crit_msgs.join(" | "));
     let evidence = super::diagnose::collect_comprehensive_evidence(&sandbox, "auto-rca");
     let findings = super::diagnose::scan_findings(&evidence);
-    let block = super::diagnose::render_findings_block_with(&findings, "auto-detected findings (Crit onset)");
+    let block = super::diagnose::render_findings_block_with(
+        &findings,
+        "auto-detected findings (Crit onset)",
+    );
 
     let title = crit_msgs
         .first()
@@ -146,9 +149,21 @@ mod tests {
     #[test]
     fn trigger_predicate_crit_onset_only() {
         // Crit Onset만 트리거(L1보다 엄격). Warn Onset·Crit Recovered·빈 배치는 아님.
-        assert!(alerts_trigger_rca(&[alert(AlertKind::Onset, Severity::Crit, "x")]));
-        assert!(!alerts_trigger_rca(&[alert(AlertKind::Onset, Severity::Warn, "x")]));
-        assert!(!alerts_trigger_rca(&[alert(AlertKind::Recovered, Severity::Crit, "x")]));
+        assert!(alerts_trigger_rca(&[alert(
+            AlertKind::Onset,
+            Severity::Crit,
+            "x"
+        )]));
+        assert!(!alerts_trigger_rca(&[alert(
+            AlertKind::Onset,
+            Severity::Warn,
+            "x"
+        )]));
+        assert!(!alerts_trigger_rca(&[alert(
+            AlertKind::Recovered,
+            Severity::Crit,
+            "x"
+        )]));
         assert!(!alerts_trigger_rca(&[]));
         // 여러 개 중 하나라도 Crit Onset이면 트리거.
         assert!(alerts_trigger_rca(&[
@@ -225,7 +240,9 @@ mod tests {
         unsafe {
             std::env::remove_var("AIC_AUTO_RCA");
         }
-        assert!(capture_incident(&["cpu 99%".to_string()]).unwrap().is_none());
+        assert!(capture_incident(&["cpu 99%".to_string()])
+            .unwrap()
+            .is_none());
         assert!(crate::rca::list_incidents().unwrap().is_empty());
     }
 
@@ -248,8 +265,10 @@ mod tests {
         assert_eq!(meta.symptom.as_deref(), Some("memory 98% critical"));
         // Note 증거에 raw 진단 본문(## 섹션)이 들어갔는지.
         let events = crate::rca::load_events(&id).unwrap();
-        assert!(events.iter().any(|e| e.kind == crate::rca::EvidenceKind::Note
-            && e.tags.iter().any(|t| t == "snapshot")));
+        assert!(events
+            .iter()
+            .any(|e| e.kind == crate::rca::EvidenceKind::Note
+                && e.tags.iter().any(|t| t == "snapshot")));
     }
 
     #[test]

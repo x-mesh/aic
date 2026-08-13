@@ -29,11 +29,7 @@ const PROCFS_ALLOWLIST: &[&str] = &[
 ];
 
 /// 기본 차단 접두사. `/proc/`는 별도 allowlist 반전 로직, 그 외는 단순 prefix.
-const FORBIDDEN_PREFIXES: &[&str] = &[
-    "/dev/",
-    "/sys/firmware/",
-    "/run/secrets/",
-];
+const FORBIDDEN_PREFIXES: &[&str] = &["/dev/", "/sys/firmware/", "/run/secrets/"];
 
 /// 파일명/경로 substring 기반 secret 패턴(대소문자 무관).
 const FORBIDDEN_PATTERNS: &[&str] = &[
@@ -45,7 +41,7 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     ".key",
     ".env",
     "credentials",
-    "shadow",      // /etc/shadow, /etc/gshadow
+    "shadow", // /etc/shadow, /etc/gshadow
     "sudoers",
     ".aws/",
     ".kube/",

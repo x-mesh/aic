@@ -676,7 +676,13 @@ mod tests {
     #[test]
     fn read_local_records_parses_and_extracts_host() {
         let (_dir, log, key) = setup();
-        append_to(&log, &key, "run_command_auto", serde_json::json!({"cmd": "df -h"})).unwrap();
+        append_to(
+            &log,
+            &key,
+            "run_command_auto",
+            serde_json::json!({"cmd": "df -h"}),
+        )
+        .unwrap();
         append_to(
             &log,
             &key,
@@ -705,38 +711,62 @@ mod tests {
         // kind 일치/불일치
         assert!(record_matches(
             &rec,
-            &SearchFilter { kind: Some("run_command_blocked".into()), ..Default::default() }
+            &SearchFilter {
+                kind: Some("run_command_blocked".into()),
+                ..Default::default()
+            }
         ));
         assert!(!record_matches(
             &rec,
-            &SearchFilter { kind: Some("other".into()), ..Default::default() }
+            &SearchFilter {
+                kind: Some("other".into()),
+                ..Default::default()
+            }
         ));
         // host
         assert!(record_matches(
             &rec,
-            &SearchFilter { host: Some("db1".into()), ..Default::default() }
+            &SearchFilter {
+                host: Some("db1".into()),
+                ..Default::default()
+            }
         ));
         assert!(!record_matches(
             &rec,
-            &SearchFilter { host: Some("web1".into()), ..Default::default() }
+            &SearchFilter {
+                host: Some("web1".into()),
+                ..Default::default()
+            }
         ));
         // grep(대소문자 무시, raw JSON 대상)
         assert!(record_matches(
             &rec,
-            &SearchFilter { grep: Some("DANGEROUS".into()), ..Default::default() }
+            &SearchFilter {
+                grep: Some("DANGEROUS".into()),
+                ..Default::default()
+            }
         ));
         assert!(!record_matches(
             &rec,
-            &SearchFilter { grep: Some("nomatch".into()), ..Default::default() }
+            &SearchFilter {
+                grep: Some("nomatch".into()),
+                ..Default::default()
+            }
         ));
         // since/until 경계
         assert!(record_matches(
             &rec,
-            &SearchFilter { since: Some(base - chrono::Duration::seconds(1)), ..Default::default() }
+            &SearchFilter {
+                since: Some(base - chrono::Duration::seconds(1)),
+                ..Default::default()
+            }
         ));
         assert!(!record_matches(
             &rec,
-            &SearchFilter { since: Some(base + chrono::Duration::seconds(1)), ..Default::default() }
+            &SearchFilter {
+                since: Some(base + chrono::Duration::seconds(1)),
+                ..Default::default()
+            }
         ));
     }
 

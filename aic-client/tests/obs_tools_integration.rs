@@ -39,7 +39,10 @@ async fn prometheus_instant_query_roundtrip() {
 
     let client = ObsClient::new(&cfg("prom", BackendType::Prometheus, &server.uri())).unwrap();
     let out = client
-        .run("prometheus_query", &json!({ "backend": "prom", "query": "up" }))
+        .run(
+            "prometheus_query",
+            &json!({ "backend": "prom", "query": "up" }),
+        )
         .await
         .expect("query should succeed");
     assert!(out.contains("success"));
@@ -137,7 +140,10 @@ async fn redirect_is_not_followed() {
 
     let client = ObsClient::new(&cfg("prom", BackendType::Prometheus, &server.uri())).unwrap();
     let result = client
-        .run("prometheus_query", &json!({ "backend": "prom", "query": "up" }))
+        .run(
+            "prometheus_query",
+            &json!({ "backend": "prom", "query": "up" }),
+        )
         .await;
     // redirect를 따라가지 않으므로 302 응답이 그대로 비-성공 에러로 반환된다(메타데이터 fetch 안 함).
     let err = result.expect_err("302 must not be followed");
@@ -180,9 +186,13 @@ async fn victoriametrics_promql_compatibility() {
 
 #[tokio::test]
 async fn unregistered_backend_rejected_before_network() {
-    let client = ObsClient::new(&cfg("prom", BackendType::Prometheus, "http://127.0.0.1:1")).unwrap();
+    let client =
+        ObsClient::new(&cfg("prom", BackendType::Prometheus, "http://127.0.0.1:1")).unwrap();
     let err = client
-        .run("prometheus_query", &json!({ "backend": "ghost", "query": "up" }))
+        .run(
+            "prometheus_query",
+            &json!({ "backend": "ghost", "query": "up" }),
+        )
         .await
         .expect_err("unregistered backend must be rejected");
     assert!(err.message.contains("등록되지 않은"));

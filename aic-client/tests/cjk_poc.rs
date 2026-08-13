@@ -34,7 +34,11 @@ fn cjk_render_display_width() {
     let buf = term.backend().buffer();
     // 한글은 2 cell 폭: "가"=cell0(다음 cell은 wide 연속), "나"=cell2.
     assert_eq!(buf[(0, 0)].symbol(), "가", "cell0 should be 가");
-    assert_eq!(buf[(2, 0)].symbol(), "나", "cell2 should be 나 (가 takes 2 cells)");
+    assert_eq!(
+        buf[(2, 0)].symbol(),
+        "나",
+        "cell2 should be 나 (가 takes 2 cells)"
+    );
 }
 
 /// 영문/한글 혼용 + 삭제(backspace) — grapheme 경계.

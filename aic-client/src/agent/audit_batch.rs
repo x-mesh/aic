@@ -359,8 +359,7 @@ fn read_last_hash(path: &Path) -> Result<String> {
     if !path.exists() {
         return Ok(String::new());
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let Some(last_line) = body.lines().rfind(|l| !l.trim().is_empty()) else {
         return Ok(String::new());
     };
@@ -443,8 +442,7 @@ pub struct VerifyReport {
 
 /// segment 파일의 hash chain을 재계산해 무결성을 검증한다.
 pub fn verify_segment(path: &Path) -> Result<VerifyReport> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut prev = String::new();
     let mut count = 0;
     for (i, line) in body.lines().enumerate() {
@@ -551,8 +549,13 @@ mod tests {
         let audit_dir = dir.path().join("audit");
         let mut a = BatchAppender::open(audit_dir.clone(), "01J-tamper".into()).unwrap();
         a.batch_start("diagnose", "@web", &["h1".into()]).unwrap();
-        a.host_result("h1", "ok", "uptime", 100, 0, false, 0).unwrap();
-        a.batch_end(BatchStats { ok: 1, ..Default::default() }).unwrap();
+        a.host_result("h1", "ok", "uptime", 100, 0, false, 0)
+            .unwrap();
+        a.batch_end(BatchStats {
+            ok: 1,
+            ..Default::default()
+        })
+        .unwrap();
 
         // 파일을 손으로 변조: 가운데 host_result line의 host를 'h1' → 'evil'로.
         let path = today_segment_path(&audit_dir);
@@ -604,8 +607,10 @@ mod tests {
         let mut a = BatchAppender::open(audit_dir.clone(), "cancel-test".into()).unwrap();
         a.batch_start("diagnose", "@all", &["h1".into(), "h2".into(), "h3".into()])
             .unwrap();
-        a.host_result("h1", "ok", "uptime", 100, 0, false, 0).unwrap();
-        a.batch_cancelled(1, vec!["h2".into(), "h3".into()]).unwrap();
+        a.host_result("h1", "ok", "uptime", 100, 0, false, 0)
+            .unwrap();
+        a.batch_cancelled(1, vec!["h2".into(), "h3".into()])
+            .unwrap();
         let report = verify_segment(&today_segment_path(&audit_dir)).unwrap();
         assert!(report.valid);
     }
@@ -626,6 +631,11 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "").unwrap();
         let segs = list_segments(dir.path()).unwrap();
         assert_eq!(segs.len(), 2);
-        assert!(segs[0].file_name().unwrap().to_str().unwrap().contains("2026-05-24"));
+        assert!(segs[0]
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("2026-05-24"));
     }
 }

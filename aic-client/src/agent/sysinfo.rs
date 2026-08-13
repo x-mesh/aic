@@ -58,9 +58,7 @@ pub(crate) fn local_probes_with(docker: bool) -> Vec<(&'static str, String)> {
 
 /// 섹션 이름들로 필터(빈 목록이면 전체). 대소문자 무시, 결과는 요청 순서(중복 제거).
 /// 알 수 없는 섹션이 하나라도 있으면 `Err(그 목록)` — 일부만 조용히 실행하지 않는다(결정적).
-pub(crate) fn probes_for(
-    sections: &[String],
-) -> Result<Vec<(&'static str, String)>, Vec<String>> {
+pub(crate) fn probes_for(sections: &[String]) -> Result<Vec<(&'static str, String)>, Vec<String>> {
     probes_for_with(sections, super::diagnose::docker_available())
 }
 
@@ -134,7 +132,11 @@ mod tests {
         assert_eq!(only[0].0, "disk");
         // 다중 섹션 — 요청 순서 유지 + 대소문자 무시 + 중복 제거.
         let multi = probes_for_with(
-            &["memory".to_string(), "DISK".to_string(), "memory".to_string()],
+            &[
+                "memory".to_string(),
+                "DISK".to_string(),
+                "memory".to_string(),
+            ],
             false,
         )
         .unwrap();
@@ -152,6 +154,9 @@ mod tests {
             "docker_ps"
         );
         // 빈 목록 → 전체.
-        assert_eq!(probes_for_with(&[], false).unwrap().len(), LOCAL_SECTIONS.len());
+        assert_eq!(
+            probes_for_with(&[], false).unwrap().len(),
+            LOCAL_SECTIONS.len()
+        );
     }
 }

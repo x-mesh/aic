@@ -1086,7 +1086,11 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
         let bad_long = args.iter().any(|a| {
             matches!(
                 *a,
-                "--clear" | "--read-clear" | "--console-off" | "--console-on" | "--follow"
+                "--clear"
+                    | "--read-clear"
+                    | "--console-off"
+                    | "--console-on"
+                    | "--follow"
                     | "--follow-new"
             ) || a.starts_with("--console-level")
         });
@@ -1141,8 +1145,13 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     }
     if head == "timedatectl" {
         // 조회 서브커맨드만 Safe. set-time/set-timezone/set-ntp/set-local-rtc는 allowlist 밖 → 제외.
-        const TIMEDATECTL_READ: &[&str] =
-            &["status", "show", "list-timezones", "timesync-status", "show-timesync"];
+        const TIMEDATECTL_READ: &[&str] = &[
+            "status",
+            "show",
+            "list-timezones",
+            "timesync-status",
+            "show-timesync",
+        ];
         match first_subcommand(args) {
             None => return Some(RiskAssessment::safe("timedatectl.read")), // 인자없음=status 출력
             Some(sub) if TIMEDATECTL_READ.contains(&sub) => {
@@ -1154,7 +1163,9 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
     if head == "last" {
         // 로그인/재부팅 이력 read. 임의 wtmp/utmp 파싱은 secret 표면 축소 위해 제외 — 단축 `-f <file>`
         // (묶음 -xf 포함)과 long-form `--file`/`--file=`(분리·첨부)을 모두 막아 wtmp 소스를 기본으로 한정한다.
-        let bad_file = args.iter().any(|a| *a == "--file" || a.starts_with("--file="));
+        let bad_file = args
+            .iter()
+            .any(|a| *a == "--file" || a.starts_with("--file="));
         if bad_file || short_flag_has_char(args, &['f']) {
             return None;
         }
@@ -1175,7 +1186,9 @@ fn match_safe(head: &str, args: &[&str]) -> Option<RiskAssessment> {
             "boot",
             "restoredefaults",
         ];
-        let setter = ["-a", "-b", "-c", "-u", "-d"].iter().any(|f| has_flag(args, f));
+        let setter = ["-a", "-b", "-c", "-u", "-d"]
+            .iter()
+            .any(|f| has_flag(args, f));
         let mutate_sub = first_subcommand(args)
             .map(|s| PMSET_MUTATE_SUB.contains(&s))
             .unwrap_or(false);
@@ -1274,12 +1287,16 @@ mod tests {
             "scutil --proxy",
             "scutil --nwi",
         ] {
-            assert_eq!(lvl(cmd), RiskLevel::Safe, "read form은 Safe여야 함: '{cmd}'");
+            assert_eq!(
+                lvl(cmd),
+                RiskLevel::Safe,
+                "read form은 Safe여야 함: '{cmd}'"
+            );
         }
         // mutation/interactive forms — 절대 Safe면 안 됨(자동 실행 금지).
         for cmd in [
-            "pmset -a disablesleep 1",   // setter scope (first_subcommand 함정: 'disablesleep')
-            "pmset sleepnow",            // mutation 서브커맨드
+            "pmset -a disablesleep 1", // setter scope (first_subcommand 함정: 'disablesleep')
+            "pmset sleepnow",          // mutation 서브커맨드
             "pmset schedule wake 0",
             "launchctl load /tmp/x.plist",
             "launchctl bootout system",
@@ -1293,7 +1310,11 @@ mod tests {
             "scutil",                    // 무인자 대화형(hang)
             "scutil --set HostName foo", // 변경
         ] {
-            assert_ne!(lvl(cmd), RiskLevel::Safe, "mutation/interactive는 Safe면 안 됨: '{cmd}'");
+            assert_ne!(
+                lvl(cmd),
+                RiskLevel::Safe,
+                "mutation/interactive는 Safe면 안 됨: '{cmd}'"
+            );
         }
     }
 
@@ -1320,10 +1341,7 @@ mod tests {
     #[test]
     fn sysctl_read_safe_write_not() {
         // 읽기 전용 조회는 Safe(자동 실행 가능) — `/local` fd probe가 의존.
-        assert_eq!(
-            lvl("sysctl kern.num_files kern.maxfiles"),
-            RiskLevel::Safe
-        );
+        assert_eq!(lvl("sysctl kern.num_files kern.maxfiles"), RiskLevel::Safe);
         assert_eq!(lvl("sysctl -a"), RiskLevel::Safe);
         // write 형태(`-w` 또는 key=value)는 Safe가 아니다(커널 파라미터 변경 → 자동 실행 금지).
         assert_ne!(lvl("sysctl -w kern.maxfiles=400000"), RiskLevel::Safe);
@@ -1353,7 +1371,10 @@ mod tests {
             lvl("journalctl -p err --since today -n 50 --no-pager"),
             RiskLevel::Safe
         );
-        assert_eq!(lvl("journalctl -u nginx.service -n 200 --no-pager"), RiskLevel::Safe);
+        assert_eq!(
+            lvl("journalctl -u nginx.service -n 200 --no-pager"),
+            RiskLevel::Safe
+        );
         // --no-pager 누락 → pager hang 위험 → Safe 제외.
         assert_ne!(lvl("journalctl -p err -n 50"), RiskLevel::Safe);
         // follow(-f)는 무한스트림 → Safe 제외(묶음 단축 -fn도 차단해야 함 — 핵심 우회).
@@ -1362,13 +1383,31 @@ mod tests {
         // mutation(저널 회전·삭제)은 Safe 제외.
         assert_ne!(lvl("journalctl --rotate"), RiskLevel::Safe);
         assert_ne!(lvl("journalctl --flush"), RiskLevel::Safe);
-        assert_ne!(lvl("journalctl --vacuum-size=100M --no-pager"), RiskLevel::Safe);
+        assert_ne!(
+            lvl("journalctl --vacuum-size=100M --no-pager"),
+            RiskLevel::Safe
+        );
         // 임의 파일/루트 소스(임의 read 프리미티브)는 분리·첨부·단축 모두 Safe 제외 — secret read 차단.
-        assert_ne!(lvl("journalctl --file /etc/shadow --no-pager"), RiskLevel::Safe);
-        assert_ne!(lvl("journalctl --file=/etc/shadow --no-pager"), RiskLevel::Safe);
-        assert_ne!(lvl("journalctl --directory=/var/x --no-pager"), RiskLevel::Safe);
-        assert_ne!(lvl("journalctl --root=/mnt/snap --no-pager"), RiskLevel::Safe);
-        assert_ne!(lvl("journalctl -D /var/log/journal --no-pager"), RiskLevel::Safe);
+        assert_ne!(
+            lvl("journalctl --file /etc/shadow --no-pager"),
+            RiskLevel::Safe
+        );
+        assert_ne!(
+            lvl("journalctl --file=/etc/shadow --no-pager"),
+            RiskLevel::Safe
+        );
+        assert_ne!(
+            lvl("journalctl --directory=/var/x --no-pager"),
+            RiskLevel::Safe
+        );
+        assert_ne!(
+            lvl("journalctl --root=/mnt/snap --no-pager"),
+            RiskLevel::Safe
+        );
+        assert_ne!(
+            lvl("journalctl -D /var/log/journal --no-pager"),
+            RiskLevel::Safe
+        );
     }
 
     #[test]
@@ -1412,7 +1451,10 @@ mod tests {
     #[test]
     fn systemctl_read_subcommand_safe_mutation_needs_confirm() {
         // read 서브커맨드/--failed 조회는 Safe carve-out — catalog failed_units probe가 의존.
-        assert_eq!(lvl("systemctl --failed --no-pager --no-legend"), RiskLevel::Safe);
+        assert_eq!(
+            lvl("systemctl --failed --no-pager --no-legend"),
+            RiskLevel::Safe
+        );
         assert_eq!(lvl("systemctl status nginx"), RiskLevel::Safe);
         assert_eq!(lvl("systemctl is-active sshd"), RiskLevel::Safe);
         assert_eq!(lvl("systemctl list-units --state=failed"), RiskLevel::Safe);
@@ -1443,7 +1485,10 @@ mod tests {
         assert_eq!(lvl("last reboot"), RiskLevel::Safe);
         assert_eq!(lvl("last -n 20"), RiskLevel::Safe);
         assert_eq!(lvl("lsblk"), RiskLevel::Safe);
-        assert_eq!(lvl("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO"), RiskLevel::Safe);
+        assert_eq!(
+            lvl("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,RO"),
+            RiskLevel::Safe
+        );
         // last -f <file>(임의 wtmp, 묶음 -xf 포함)·long-form --file은 Safe 제외(secret 표면 축소).
         assert_ne!(lvl("last -f /custom/wtmp"), RiskLevel::Safe);
         assert_ne!(lvl("last -xf /custom/wtmp"), RiskLevel::Safe);
@@ -1557,7 +1602,7 @@ mod tests {
         assert!(!has_overwrite_redirect("make 2>&1"));
         assert!(!has_overwrite_redirect("cmd >&2"));
         assert!(!has_overwrite_redirect("build 2>&1 | tee log")); // stderr→stdout, 파이프는 별개
-        // fd dup 뒤에 실제 파일 overwrite가 있으면 여전히 감지.
+                                                                  // fd dup 뒤에 실제 파일 overwrite가 있으면 여전히 감지.
         assert!(has_overwrite_redirect("cmd 2>&1 > out.txt"));
     }
 
@@ -1588,7 +1633,11 @@ mod tests {
             "aic web --bind 0.0.0.0",
             "aic",
         ] {
-            assert_ne!(lvl(cmd), RiskLevel::Safe, "자동 실행되면 안 되는 명령: {cmd}");
+            assert_ne!(
+                lvl(cmd),
+                RiskLevel::Safe,
+                "자동 실행되면 안 되는 명령: {cmd}"
+            );
         }
     }
 

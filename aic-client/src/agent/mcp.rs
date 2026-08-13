@@ -175,8 +175,18 @@ impl McpClient {
             json!({})
         };
         let params = json!({ "name": tool.name, "arguments": arguments });
-        let result = post_rpc(&self.http, server, "tools/call", params, REQUEST_TIMEOUT_SECS).await?;
-        let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let result = post_rpc(
+            &self.http,
+            server,
+            "tools/call",
+            params,
+            REQUEST_TIMEOUT_SECS,
+        )
+        .await?;
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let text = finalize(&extract_content_text(&result));
         if is_error {
             Ok(format!("[tool error] {text}"))
@@ -204,9 +214,14 @@ async fn connect_server(http: &reqwest::Client, server: &mut McpServer) -> Resul
         "capabilities": {},
         "clientInfo": { "name": "aic", "version": env!("CARGO_PKG_VERSION") }
     });
-    let (init, session_id) =
-        post_rpc_with_session(http, server, "initialize", init_params, HANDSHAKE_TIMEOUT_SECS)
-            .await?;
+    let (init, session_id) = post_rpc_with_session(
+        http,
+        server,
+        "initialize",
+        init_params,
+        HANDSHAKE_TIMEOUT_SECS,
+    )
+    .await?;
     server.session_id = session_id;
     // 협상된 프로토콜 버전을 잡아 이후 요청 헤더로 echo한다(서버가 안 주면 우리가 제안한 버전).
     server.protocol_version = Some(
@@ -269,7 +284,10 @@ fn build_req(
 ) -> Result<reqwest::RequestBuilder, ToolError> {
     let mut req = http
         .post(&server.url)
-        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
         .timeout(Duration::from_secs(timeout_secs))
         .json(body);
     if let Some(sid) = &server.session_id {
@@ -325,11 +343,17 @@ async fn post_rpc_with_session(
     }
     let msg = extract_rpc_message(&text, &content_type)?;
     if let Some(err) = msg.get("error") {
-        let m = err.get("message").and_then(Value::as_str).unwrap_or("unknown");
+        let m = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let safe = crate::redaction::redact(m).0;
         return Err(ToolError::new(format!("MCP error: {safe}")));
     }
-    Ok((msg.get("result").cloned().unwrap_or(Value::Null), session_id))
+    Ok((
+        msg.get("result").cloned().unwrap_or(Value::Null),
+        session_id,
+    ))
 }
 
 async fn post_rpc(
@@ -380,7 +404,9 @@ fn extract_rpc_message(text: &str, content_type: &str) -> Result<Value, ToolErro
                 last = Some(v);
             }
         }
-        last.ok_or_else(|| ToolError::new("MCP SSE 응답에서 JSON-RPC 메시지를 찾지 못함".to_string()))
+        last.ok_or_else(|| {
+            ToolError::new("MCP SSE 응답에서 JSON-RPC 메시지를 찾지 못함".to_string())
+        })
     } else {
         serde_json::from_str::<Value>(text.trim())
             .map_err(|e| ToolError::new(format!("MCP 응답 파싱 실패: {e}")))
@@ -442,13 +468,19 @@ mod tests {
             },
         );
         let cfg = McpConfig { servers };
-        assert!(McpClient::new(&cfg).is_none(), "no valid enabled server → None");
+        assert!(
+            McpClient::new(&cfg).is_none(),
+            "no valid enabled server → None"
+        );
     }
 
     #[test]
     fn extract_rpc_message_parses_plain_json() {
-        let msg = extract_rpc_message(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#, "application/json")
-            .unwrap();
+        let msg = extract_rpc_message(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+            "application/json",
+        )
+        .unwrap();
         assert_eq!(msg["result"]["ok"], json!(true));
     }
 

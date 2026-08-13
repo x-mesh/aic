@@ -111,10 +111,7 @@ where
         fut_set.push(async move {
             // acquire_owned 대신 borrow + move-capture로 누수 차단(R1).
             // FuturesUnordered가 drop되면 이 future도 drop → permit RAII 반환.
-            let _permit = sem
-                .acquire()
-                .await
-                .expect("semaphore not closed");
+            let _permit = sem.acquire().await.expect("semaphore not closed");
             executor.exec(host_ref, cmd_ref).await
         });
     }
@@ -186,11 +183,7 @@ mod tests {
     }
 
     impl RemoteExecutor for DelayExecutor {
-        async fn exec(
-            &self,
-            host: &HostEntry,
-            _cmd: &RemoteCommand,
-        ) -> RemoteResult {
+        async fn exec(&self, host: &HostEntry, _cmd: &RemoteCommand) -> RemoteResult {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             RemoteResult {
