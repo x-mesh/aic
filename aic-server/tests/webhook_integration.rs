@@ -21,7 +21,13 @@ fn isolate_state_dir() {
 
 /// 임의 포트 webhook 서버를 띄우고 base URL을 반환한다.
 async fn start_server(secret: Option<&str>, rate: u32) -> (String, watch::Sender<bool>) {
-    start_server_full(secret, rate, false, std::path::PathBuf::from("/nonexistent-aic")).await
+    start_server_full(
+        secret,
+        rate,
+        false,
+        std::path::PathBuf::from("/nonexistent-aic"),
+    )
+    .await
 }
 
 async fn start_server_full(
@@ -162,10 +168,7 @@ async fn malformed_json_is_bad_request() {
 #[tokio::test]
 async fn auto_diagnose_spawns_once_per_fingerprint() {
     // 동일 fingerprint alert를 2번 보내도 dedup으로 진단(spawn)은 1회만 일어나야 한다.
-    let counter = std::env::temp_dir().join(format!(
-        "aic-wh-counter-{}.log",
-        std::process::id()
-    ));
+    let counter = std::env::temp_dir().join(format!("aic-wh-counter-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&counter);
     let script = fake_aic_script(&counter);
     let (base, _tx) = start_server_full(None, 100, true, script).await;
@@ -193,7 +196,10 @@ async fn auto_diagnose_spawns_once_per_fingerprint() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         count_runs(&counter)
     };
-    assert_eq!(count, 1, "동일 fingerprint는 dedup으로 1회만 spawn (실제 {count})");
+    assert_eq!(
+        count, 1,
+        "동일 fingerprint는 dedup으로 1회만 spawn (실제 {count})"
+    );
     let _ = std::fs::remove_file(&counter);
 }
 
@@ -225,7 +231,10 @@ async fn received_alert_is_recorded_to_events_log() {
 
     let content = std::fs::read_to_string(&events_path).unwrap_or_default();
     assert!(content.lines().count() > before);
-    assert!(content.contains("EventLogTest"), "이벤트 로그에 alertname 기록");
+    assert!(
+        content.contains("EventLogTest"),
+        "이벤트 로그에 alertname 기록"
+    );
 }
 
 #[tokio::test]

@@ -226,11 +226,7 @@ impl CommandRecordStore {
     /// session 내 record id prefix 매칭 결과를 시간순으로 반환한다.
     ///
     /// R1.5: `prefix`가 빈 문자열이면 빈 Vec를 반환한다 (전체 덤프 금지).
-    pub async fn find_by_prefix(
-        &self,
-        session_id: &str,
-        prefix: &str,
-    ) -> Vec<CommandRecord> {
+    pub async fn find_by_prefix(&self, session_id: &str, prefix: &str) -> Vec<CommandRecord> {
         if prefix.is_empty() {
             return Vec::new();
         }
@@ -457,11 +453,8 @@ mod tests {
         let s = CommandRecordStore::new();
         let total = PER_SESSION_CAPACITY + 10;
         for i in 0..total {
-            s.push_pty(
-                "s1",
-                pty_record(&format!("id{i:03}"), &format!("cmd{i}")),
-            )
-            .await;
+            s.push_pty("s1", pty_record(&format!("id{i:03}"), &format!("cmd{i}")))
+                .await;
         }
         assert_eq!(s.len("s1").await, PER_SESSION_CAPACITY);
         let recs = s.recent("s1", PER_SESSION_CAPACITY).await;
@@ -483,8 +476,10 @@ mod tests {
     async fn find_by_prefix_empty_match_and_no_match() {
         let s = CommandRecordStore::new();
         s.push_pty("s1", pty_record("abcd1234aaaa0000", "ls")).await;
-        s.push_pty("s1", pty_record("abcd1234bbbb1111", "grep")).await;
-        s.push_pty("s1", pty_record("ffff0000deadbeef", "cat")).await;
+        s.push_pty("s1", pty_record("abcd1234bbbb1111", "grep"))
+            .await;
+        s.push_pty("s1", pty_record("ffff0000deadbeef", "cat"))
+            .await;
 
         // 빈 prefix → 빈 Vec.
         assert!(s.find_by_prefix("s1", "").await.is_empty());
@@ -583,8 +578,10 @@ mod tests {
         let s = CommandRecordStore::new();
         let id = "cafef00dcafef00d".to_string();
 
-        s.push_explicit("s1", explicit_record(&id, "echo first")).await;
-        s.push_explicit("s1", explicit_record(&id, "echo second")).await;
+        s.push_explicit("s1", explicit_record(&id, "echo first"))
+            .await;
+        s.push_explicit("s1", explicit_record(&id, "echo second"))
+            .await;
 
         assert_eq!(s.len("s1").await, 1);
         assert_eq!(
@@ -645,7 +642,11 @@ mod tests {
             s.push_pty("s1", pty_record("", &format!("cmd{i}"))).await;
         }
         let recs = s.recent("s1", 10).await;
-        assert_eq!(recs.len(), 5, "빈 id 는 dedup 대상이 아니므로 5 개 모두 저장");
+        assert_eq!(
+            recs.len(),
+            5,
+            "빈 id 는 dedup 대상이 아니므로 5 개 모두 저장"
+        );
         // 부여된 id 들은 모두 서로 달라야 한다.
         let mut ids: Vec<&str> = recs.iter().map(|r| r.id.as_str()).collect();
         ids.sort();

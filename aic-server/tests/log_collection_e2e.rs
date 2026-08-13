@@ -353,8 +353,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
     };
     let (msd_tx, msd_rx) = watch::channel(false);
     let metrics_handle = tokio::spawn(async move {
-        let (_ftx, frx) =
-            tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+        let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
         serve(metrics_cfg, msd_rx, frx).await
     });
 

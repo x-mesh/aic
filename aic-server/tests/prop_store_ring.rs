@@ -37,24 +37,21 @@ fn arb_command_record() -> impl Strategy<Value = CommandRecord> {
             Just(CaptureQuality::Unknown),
         ],
     )
-        .prop_map(
-            |(exit_code, output_lines, ts_millis, capture_quality)| {
-                let timestamp =
-                    chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default();
-                CommandRecord {
-                    id: String::new(),
-                    command: None,
-                    exit_code,
-                    output_lines,
-                    timestamp,
-                    capture_mode: CaptureMode::Pty,
-                    capture_quality,
-                    output_metadata: None,
-                    cwd: None,
-                    duration_ms: None,
-                }
-            },
-        )
+        .prop_map(|(exit_code, output_lines, ts_millis, capture_quality)| {
+            let timestamp = chrono::DateTime::from_timestamp_millis(ts_millis).unwrap_or_default();
+            CommandRecord {
+                id: String::new(),
+                command: None,
+                exit_code,
+                output_lines,
+                timestamp,
+                capture_mode: CaptureMode::Pty,
+                capture_quality,
+                output_metadata: None,
+                cwd: None,
+                duration_ms: None,
+            }
+        })
 }
 
 proptest! {

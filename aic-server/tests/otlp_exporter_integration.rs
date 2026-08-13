@@ -94,7 +94,13 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         process_inventory_enabled: false,
         process_inventory_store: None,
     };
-    let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
+    let handle = tokio::spawn(async move {
+        {
+            let (_ftx, frx) =
+                tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+            serve(cfg, sd_rx, frx).await
+        }
+    });
 
     // 첫 수신을 최대 5초 기다린다(실제 sysinfo 수집 + POST).
     let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -159,7 +165,13 @@ async fn exporter_without_token_sends_no_auth_header() {
         process_inventory_enabled: false,
         process_inventory_store: None,
     };
-    let handle = tokio::spawn(async move { { let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1); serve(cfg, sd_rx, frx).await } });
+    let handle = tokio::spawn(async move {
+        {
+            let (_ftx, frx) =
+                tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+            serve(cfg, sd_rx, frx).await
+        }
+    });
 
     let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -251,6 +263,9 @@ async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
     assert_eq!(found.op, "add", "새로 뜬 프로세스는 add여야 한다");
-    assert!(found.observed_at > 0, "observed_at이 0이면 chat이 `-`를 그린다");
+    assert!(
+        found.observed_at > 0,
+        "observed_at이 0이면 chat이 `-`를 그린다"
+    );
     assert!(!found.name.is_empty(), "이름이 비면 chat에 빈 칸이 나간다");
 }

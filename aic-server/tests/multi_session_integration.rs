@@ -13,9 +13,9 @@
 //! `#[cfg(not(feature = "phase-3_5"))]` 로 gate 하고, Ping-only 검증인
 //! `two_sessions_independent_ping` 만 Phase 3.5 에서도 실행한다.
 
-use aic_common::{encode_frame, IpcRequest, IpcResponse};
 #[cfg(not(feature = "phase-3_5"))]
 use aic_common::CommandRecord;
+use aic_common::{encode_frame, IpcRequest, IpcResponse};
 use aic_server::ring_buffer::RingBuffer;
 use aic_server::uds_server::UdsServer;
 

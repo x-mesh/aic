@@ -249,8 +249,7 @@ fn spawn_diagnose(state: &WebhookState, alert: &IncomingAlert) {
         if follow_up {
             cmd.arg("--follow-up");
         }
-        cmd
-            .stdin(std::process::Stdio::null())
+        cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         match cmd.spawn() {
@@ -570,7 +569,8 @@ mod tests {
 
     #[test]
     fn parse_generic_fallback() {
-        let body = json!({ "alertname": "DiskFull", "summary": "/ at 98%", "labels": { "host": "db1" } });
+        let body =
+            json!({ "alertname": "DiskFull", "summary": "/ at 98%", "labels": { "host": "db1" } });
         let alerts = parse_generic(&body);
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].name, "DiskFull");
@@ -606,7 +606,10 @@ mod tests {
 
     #[test]
     fn sanitize_label_keeps_safe_chars() {
-        assert_eq!(sanitize_label("HighCPU,instance=web1"), "HighCPU-instance-web1");
+        assert_eq!(
+            sanitize_label("HighCPU,instance=web1"),
+            "HighCPU-instance-web1"
+        );
         assert_eq!(sanitize_label(""), "alert");
     }
 }

@@ -110,9 +110,9 @@ pub fn try_start() -> Result<(), AutostartError> {
             });
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AutostartError::BinaryNotFound {
-            attempted,
-        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(AutostartError::BinaryNotFound { attempted })
+        }
         Err(e) => Err(AutostartError::SpawnFailed {
             attempted,
             source: e,

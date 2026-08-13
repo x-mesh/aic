@@ -32,7 +32,10 @@ use std::process::Command;
 /// 반환한다. `CARGO_MANIFEST_DIR` 는 `aic-server` 이므로 한 단계 올라간다.
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().expect("aic-server has a parent").to_path_buf()
+    manifest
+        .parent()
+        .expect("aic-server has a parent")
+        .to_path_buf()
 }
 
 fn script(name: &str) -> PathBuf {
@@ -116,8 +119,7 @@ fn phase34_script_produces_valid_json_for_empty_run() {
     assert!(status.success(), "script exited non-zero: {status}");
 
     let raw = std::fs::read_to_string(&output).expect("read output JSON");
-    let value: serde_json::Value =
-        serde_json::from_str(&raw).expect("output is not valid JSON");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("output is not valid JSON");
 
     // 필수 키 확인 — scripts/README.md 스키마와 맞춰야 한다.
     for key in [

@@ -280,10 +280,7 @@ async fn scenario_b_wrong_protocol_version_rejected() {
     // 서버 응답: AttachError (메시지에 "protocol_version" 키워드 포함).
     match read_attach_frame(&mut reader).await.expect("read error") {
         AttachFrameKind::Server(AttachServerFrame::AttachError { message }) => {
-            assert!(
-                message.contains("protocol_version"),
-                "message = {message}"
-            );
+            assert!(message.contains("protocol_version"), "message = {message}");
         }
         other => panic!("AttachError 를 기대 — actual: {other:?}"),
     }
@@ -524,7 +521,11 @@ async fn scenario_e_session_id_reusable_after_close() {
     // 같은 session_id 의 ring 에는 두 record 가 시간순으로 누적되어 있어야 한다.
     // ring 은 session 단위라 재open 후에도 store 는 계속된다.
     let recs = h.store.recent("sess-e", 10).await;
-    assert_eq!(recs.len(), 2, "두 연결의 record 가 같은 ring 에 누적 — got {recs:?}");
+    assert_eq!(
+        recs.len(),
+        2,
+        "두 연결의 record 가 같은 ring 에 누적 — got {recs:?}"
+    );
     assert_eq!(recs[0].command.as_deref(), Some("ls"));
     assert_eq!(recs[1].command.as_deref(), Some("pwd"));
 

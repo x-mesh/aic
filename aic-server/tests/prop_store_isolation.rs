@@ -102,12 +102,12 @@ fn arb_push_op() -> impl Strategy<Value = (SessionChoice, CommandRecord)> {
 /// `find_by_prefix` 에 사용할 임의 prefix. 매치/미매치/경계값을 고르게 섞는다.
 fn arb_prefix_query() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just(String::new()),           // 빈 prefix → 빈 결과 (R1.5)
-        Just("a".to_string()),         // 두 세션의 id 접두와 부분 겹침
+        Just(String::new()),   // 빈 prefix → 빈 결과 (R1.5)
+        Just("a".to_string()), // 두 세션의 id 접두와 부분 겹침
         Just("b".to_string()),
-        Just("aaaa".to_string()),      // 세션 a 전용 prefix
-        Just("bbbb".to_string()),      // 세션 b 전용 prefix
-        Just("aaab".to_string()),      // a prefix 직후 변이 — 아무것도 매치 안 됨
+        Just("aaaa".to_string()), // 세션 a 전용 prefix
+        Just("bbbb".to_string()), // 세션 b 전용 prefix
+        Just("aaab".to_string()), // a prefix 직후 변이 — 아무것도 매치 안 됨
         "[0-9a-f]{1,16}".prop_map(String::from),
         "[a-z]{1,8}".prop_map(String::from),
     ]

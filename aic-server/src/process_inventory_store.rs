@@ -108,8 +108,12 @@ mod tests {
     #[tokio::test]
     async fn recent_returns_newest_first() {
         let s = ProcessInventoryStore::new();
-        s.push_many(vec![change(1, "add"), change(2, "add"), change(3, "remove")])
-            .await;
+        s.push_many(vec![
+            change(1, "add"),
+            change(2, "add"),
+            change(3, "remove"),
+        ])
+        .await;
         let got = s.recent(2).await;
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].pid, 3, "가장 최근이 먼저");
@@ -119,7 +123,9 @@ mod tests {
     #[tokio::test]
     async fn ring_evicts_oldest_beyond_capacity() {
         let s = ProcessInventoryStore::new();
-        let batch: Vec<_> = (0..(CAPACITY as i64 + 10)).map(|i| change(i, "add")).collect();
+        let batch: Vec<_> = (0..(CAPACITY as i64 + 10))
+            .map(|i| change(i, "add"))
+            .collect();
         s.push_many(batch).await;
         assert_eq!(s.len().await, CAPACITY);
         // 가장 오래된 10개가 밀려났으므로 남은 최솟값 pid는 10이다.

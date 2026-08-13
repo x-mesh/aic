@@ -59,8 +59,7 @@ pub struct ControlContext {
     /// 최근 프로세스 인벤토리 변화 링. host metrics exporter task가 채우므로, exporter가 아예
     /// 안 뜨면 `None`이고 `GetRecentProcessChanges`는 빈 목록으로 답한다("변화 없음"과 "수집
     /// 안 함"은 `GetExporterStatus`가 구분해 준다).
-    pub process_inventory:
-        Option<Arc<crate::process_inventory_store::ProcessInventoryStore>>,
+    pub process_inventory: Option<Arc<crate::process_inventory_store::ProcessInventoryStore>>,
 }
 
 /// aicd control UDS 엔드포인트.

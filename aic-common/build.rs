@@ -4,7 +4,7 @@
 //! 하나 이하거나 둘 이상이면 빌드를 중단해 런타임에서 `current_phase()`가
 //! 애매해지는 것을 막는다.
 //!
-//! 기본값은 `phase-3_1` (aic-common Cargo.toml의 `default` feature set).
+//! 기본값은 `phase-3_4` (aic-common Cargo.toml의 `default` feature set).
 
 fn main() {
     let phases = [

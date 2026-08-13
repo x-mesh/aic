@@ -35,9 +35,7 @@ use aic_common::attach::{
     read_attach_frame, write_attach_frame, AttachClientFrame, AttachDecodeError, AttachFrameKind,
     AttachIoError, AttachServerFrame, ATTACH_PROTOCOL_VERSION,
 };
-use aic_common::bounded_byte_channel::{
-    BoundedByteChannel, BoundedByteReceiver, SendOutcome,
-};
+use aic_common::bounded_byte_channel::{BoundedByteChannel, BoundedByteReceiver, SendOutcome};
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -286,7 +284,10 @@ impl std::fmt::Debug for AttachClient {
         f.debug_struct("AttachClient")
             .field("session_id", &self.session_id)
             .field("queued_bytes", &self.tx.queued_bytes())
-            .field("dropped_bytes", &self.dropped_counter.load(Ordering::Relaxed))
+            .field(
+                "dropped_bytes",
+                &self.dropped_counter.load(Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -367,8 +368,8 @@ mod tests {
     use super::*;
 
     use aic_common::attach::{
-        read_attach_frame, write_attach_server_frame, AttachClientFrame,
-        AttachFrameKind, AttachServerFrame, ATTACH_PROTOCOL_VERSION,
+        read_attach_frame, write_attach_server_frame, AttachClientFrame, AttachFrameKind,
+        AttachServerFrame, ATTACH_PROTOCOL_VERSION,
     };
     use bytes::Bytes;
     use std::path::PathBuf;
@@ -558,10 +559,7 @@ mod tests {
 
         let outcome = server.finish().await;
         assert_eq!(outcome.open_session_id.as_deref(), Some("s-happy"));
-        assert_eq!(
-            outcome.open_protocol_version,
-            Some(ATTACH_PROTOCOL_VERSION)
-        );
+        assert_eq!(outcome.open_protocol_version, Some(ATTACH_PROTOCOL_VERSION));
         assert_eq!(outcome.pty_chunks.len(), 3);
         for (i, chunk) in outcome.pty_chunks.iter().enumerate() {
             assert_eq!(chunk.len(), 32);
@@ -617,10 +615,8 @@ mod tests {
         // 원래 tx 를 cap=0 채널로 교체 — writer task 는 새 receiver 에 붙지 않지만
         // try_send 결과만 관찰하는 이 테스트에는 무관하다. warn_latch / dropped_counter
         // 는 동일 metric 인스턴스를 계속 쓴다.
-        let (zero_tx, _zero_rx) = BoundedByteChannel::new_with_dropped_counter(
-            0,
-            metrics.dropped_bytes_handle(),
-        );
+        let (zero_tx, _zero_rx) =
+            BoundedByteChannel::new_with_dropped_counter(0, metrics.dropped_bytes_handle());
         client.tx = zero_tx;
 
         let o1 = client.try_send(Bytes::from(vec![1u8; 10]));
@@ -633,9 +629,7 @@ mod tests {
         // metrics 는 모든 drop 을 누적한다.
         assert_eq!(metrics.dropped_bytes(), 60);
         // warn_latch 는 1 회 set 되어 이후 호출에서 추가로 토글되지 않는다.
-        assert!(client
-            .warn_latch
-            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(client.warn_latch.load(std::sync::atomic::Ordering::Relaxed));
 
         drop(client);
         let _ = server.finish().await;
@@ -763,9 +757,10 @@ mod tests {
         });
 
         let metrics = Arc::new(AttachMetrics::new());
-        let client = AttachClient::connect(&socket_path, "s-fail".to_string(), Arc::clone(&metrics))
-            .await
-            .expect("connect");
+        let client =
+            AttachClient::connect(&socket_path, "s-fail".to_string(), Arc::clone(&metrics))
+                .await
+                .expect("connect");
         let signal = Arc::clone(&client.reconnect_signal);
 
         // 서버 task 가 stream 을 drop 할 시간을 주고 나서 send 시도.

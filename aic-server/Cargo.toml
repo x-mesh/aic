@@ -2,6 +2,8 @@
 name = "aic-server"
 version = "0.35.0"
 edition = "2021"
+rust-version = "1.89"
+license = "MIT"
 
 [[bin]]
 name = "aic-session"
@@ -15,7 +17,7 @@ path = "src/aicd_main.rs"
 # Phase features — aic-common 과 동기화된다. aic-common 이 Phase 의 단일 원천이고,
 # 이곳의 feature 는 해당 feature 를 forwarding 하기만 한다. 빌드 시점에 정확히
 # 하나만 활성이어야 하며, aic-common/build.rs 가 이를 assert 한다.
-default = ["phase-3_1"]
+default = ["phase-3_4"]
 phase-3_1 = ["aic-common/phase-3_1"]
 phase-3_2 = ["aic-common/phase-3_2"]
 phase-3_3 = ["aic-common/phase-3_3"]

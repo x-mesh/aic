@@ -927,7 +927,6 @@ mod tests {
         assert_eq!(top_process_rss([0u64]), None);
     }
 
-
     fn proc(name: &str, pid: i64, cpu_pct: f64, rss_bytes: u64) -> ProcessSample {
         ProcessSample {
             name: name.to_string(),
@@ -1008,7 +1007,10 @@ mod tests {
             proc_fd("small-b", 3, 50),
         ];
         let top = select_top_processes(all, 1);
-        let rest = top.iter().find(|p| p.pid == 0).expect("rest 버킷이 있어야 한다");
+        let rest = top
+            .iter()
+            .find(|p| p.pid == 0)
+            .expect("rest 버킷이 있어야 한다");
         // fd 축도 n=1이라 small-a(100)만 뽑히고 small-b(50)가 rest로 접힌다.
         assert_eq!(rest.fd_count, Some(50));
 
@@ -1019,7 +1021,10 @@ mod tests {
             proc("y", 3, 0.0, 5),
         ];
         let top = select_top_processes(all, 1);
-        let rest = top.iter().find(|p| p.pid == 0).expect("rest 버킷이 있어야 한다");
+        let rest = top
+            .iter()
+            .find(|p| p.pid == 0)
+            .expect("rest 버킷이 있어야 한다");
         assert_eq!(rest.fd_count, None);
     }
 
@@ -1056,7 +1061,10 @@ mod tests {
         let pids: Vec<i64> = top.iter().map(|p| p.pid).collect();
         // top2 cpu = {1,3}, top2 mem = {2,3} → 합집합 {1,2,3}, idle(4)은 제외.
         assert!(pids.contains(&1) && pids.contains(&2) && pids.contains(&3));
-        assert!(!pids.contains(&4), "cpu·rss 둘 다 0인 idle은 실리면 안 된다");
+        assert!(
+            !pids.contains(&4),
+            "cpu·rss 둘 다 0인 idle은 실리면 안 된다"
+        );
         assert_eq!(top.len(), 3);
         // cpu 내림차순 정렬: cpu-hog(95) > both(80) > mem-hog(0).
         assert_eq!(top[0].pid, 1);
@@ -1177,8 +1185,16 @@ mod tests {
         // (실제 Process 인스턴스는 sysinfo 내부 생성자라 여기서 만들 수 없으므로 규칙만 검증한다.)
         let cases = [
             (None, false, "진짜 프로세스는 유지"),
-            (Some(sysinfo::ThreadKind::Kernel), false, "커널 스레드는 유지 — Tgid==Pid인 독립 항목"),
-            (Some(sysinfo::ThreadKind::Userland), true, "유저랜드 스레드만 제외"),
+            (
+                Some(sysinfo::ThreadKind::Kernel),
+                false,
+                "커널 스레드는 유지 — Tgid==Pid인 독립 항목",
+            ),
+            (
+                Some(sysinfo::ThreadKind::Userland),
+                true,
+                "유저랜드 스레드만 제외",
+            ),
         ];
         for (kind, expect_excluded, why) in cases {
             let excluded = matches!(kind, Some(sysinfo::ThreadKind::Userland));
@@ -1221,7 +1237,10 @@ mod tests {
         let sample = s.sample();
         for p in &sample.top_processes {
             assert!(
-                p.cpu_pct > 0.0 || p.rss_bytes > 0 || p.disk_read_bytes > 0 || p.disk_write_bytes > 0,
+                p.cpu_pct > 0.0
+                    || p.rss_bytes > 0
+                    || p.disk_read_bytes > 0
+                    || p.disk_write_bytes > 0,
                 "cpu·rss·disk 모두 0인 프로세스가 top-N에 실렸다: {} pid={}",
                 p.name,
                 p.pid
