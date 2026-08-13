@@ -118,7 +118,10 @@ mod tests {
     #[test]
     fn table_has_header_and_one_row_per_change() {
         let out = render_table(
-            &[change("add", 10, "postgres", 1_700_000_100), change("remove", 20, "gone", 1_700_000_200)],
+            &[
+                change("add", 10, "postgres", 1_700_000_100),
+                change("remove", 20, "gone", 1_700_000_200),
+            ],
             false,
         );
         let lines: Vec<&str> = out.lines().collect();

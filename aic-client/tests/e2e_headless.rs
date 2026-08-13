@@ -45,8 +45,15 @@ fn audit_subcommands_run_headless() {
         .unwrap();
 
     // verify: 빈/유효 로그 → exit 0.
-    let verify = aic_cmd(tmp.path()).args(["audit", "verify"]).output().unwrap();
-    assert!(verify.status.success(), "audit verify exit: {:?}", verify.status);
+    let verify = aic_cmd(tmp.path())
+        .args(["audit", "verify"])
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "audit verify exit: {:?}",
+        verify.status
+    );
 
     // tail --json: 유효한 JSON 배열.
     let tail = aic_cmd(tmp.path())
@@ -54,7 +61,8 @@ fn audit_subcommands_run_headless() {
         .output()
         .unwrap();
     assert!(tail.status.success());
-    let parsed: serde_json::Value = serde_json::from_slice(&tail.stdout).expect("tail --json은 JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&tail.stdout).expect("tail --json은 JSON");
     assert!(parsed.is_array(), "tail --json은 배열: {parsed}");
 
     // search --kind: headless 동작.
@@ -63,7 +71,8 @@ fn audit_subcommands_run_headless() {
         .output()
         .unwrap();
     assert!(search.status.success());
-    let s: serde_json::Value = serde_json::from_slice(&search.stdout).expect("search --json은 JSON");
+    let s: serde_json::Value =
+        serde_json::from_slice(&search.stdout).expect("search --json은 JSON");
     assert!(s.is_array());
 }
 
@@ -75,7 +84,8 @@ fn webhook_list_runs_headless() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).expect("webhook list --json은 JSON");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("webhook list --json은 JSON");
     assert!(parsed.is_array());
 }
 

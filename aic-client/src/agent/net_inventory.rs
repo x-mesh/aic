@@ -364,7 +364,11 @@ pub(crate) fn parse_lsof(text: &str) -> Vec<ConnectionInfo> {
         let (state, name, proto) = if has_state {
             let name = fields[fields.len() - 2];
             let proto = fields[fields.len() - 3];
-            (last.trim_matches(|c| c == '(' || c == ')').to_string(), name, proto)
+            (
+                last.trim_matches(|c| c == '(' || c == ')').to_string(),
+                name,
+                proto,
+            )
         } else {
             let name = last;
             let proto = fields[fields.len() - 2];
@@ -413,7 +417,10 @@ mod tests {
 
     #[test]
     fn split_host_port_handles_ipv4_wildcard_and_ipv6() {
-        assert_eq!(split_host_port("0.0.0.0:22"), ("0.0.0.0".to_string(), Some(22)));
+        assert_eq!(
+            split_host_port("0.0.0.0:22"),
+            ("0.0.0.0".to_string(), Some(22))
+        );
         assert_eq!(split_host_port("0.0.0.0:*"), ("0.0.0.0".to_string(), None));
         assert_eq!(split_host_port("[::1]:22"), ("::1".to_string(), Some(22)));
         assert_eq!(split_host_port("[::]:*"), ("::".to_string(), None));
@@ -438,7 +445,10 @@ tcp    ESTAB      0      0            192.168.1.5:22          192.168.1.10:54321
     #[test]
     fn parse_ss_listen_has_no_peer() {
         let conns = parse_ss(SS_FIXTURE);
-        let listen = conns.iter().find(|c| c.local_port == 22 && c.protocol == "tcp" && c.local_addr == "0.0.0.0").unwrap();
+        let listen = conns
+            .iter()
+            .find(|c| c.local_port == 22 && c.protocol == "tcp" && c.local_addr == "0.0.0.0")
+            .unwrap();
         assert_eq!(listen.state, "LISTEN");
         assert_eq!(listen.peer_addr, None);
         assert_eq!(listen.peer_port, None);
@@ -505,7 +515,10 @@ tcp    ESTAB   0      0            192.168.1.5:51234       140.82.113.4:443
             .unwrap();
         assert_eq!(listen.process.as_deref(), Some("sshd"));
         // 여러 프로세스가 한 소켓을 공유해도 첫 항목만.
-        let estab = conns.iter().find(|c| c.local_port == 22 && c.state == "ESTAB").unwrap();
+        let estab = conns
+            .iter()
+            .find(|c| c.local_port == 22 && c.state == "ESTAB")
+            .unwrap();
         assert_eq!(estab.process.as_deref(), Some("sshd"));
     }
 
@@ -557,7 +570,10 @@ tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443
             Some("sshd")
         );
         // 구 iproute2 형식.
-        assert_eq!(parse_ss_process("users:((\"sshd\",1234,3))").as_deref(), Some("sshd"));
+        assert_eq!(
+            parse_ss_process("users:((\"sshd\",1234,3))").as_deref(),
+            Some("sshd")
+        );
         assert_eq!(parse_ss_process(""), None);
         assert_eq!(parse_ss_process("garbage"), None);
         assert_eq!(parse_ss_process("users:((\"\",pid=1,fd=2))"), None);
@@ -582,7 +598,10 @@ tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443
         assert_eq!(listen.direction, Direction::Listen);
 
         // local_port 22가 서비스 포트 → 우리가 accept한 연결.
-        let inbound = conns.iter().find(|c| c.local_port == 22 && c.state == "ESTAB").unwrap();
+        let inbound = conns
+            .iter()
+            .find(|c| c.local_port == 22 && c.state == "ESTAB")
+            .unwrap();
         assert_eq!(inbound.direction, Direction::Inbound);
 
         // ephemeral source port → 우리가 건 연결.
@@ -604,7 +623,11 @@ tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443
             .iter()
             .find(|c| c.protocol == "udp" && c.peer_port.is_some())
             .unwrap();
-        assert_eq!(inbound.direction, Direction::Inbound, "udp/53 must be a server port");
+        assert_eq!(
+            inbound.direction,
+            Direction::Inbound,
+            "udp/53 must be a server port"
+        );
     }
 
     #[test]
@@ -613,7 +636,10 @@ tcp ESTAB 0 0 10.0.0.5:51234 10.0.0.8:443
         let conns = directions_of(SS_P_FIXTURE);
         let v6_listen = conns.iter().find(|c| c.local_addr == "::").unwrap();
         assert_eq!(v6_listen.direction, Direction::Listen);
-        let inbound = conns.iter().find(|c| c.local_port == 22 && c.state == "ESTAB").unwrap();
+        let inbound = conns
+            .iter()
+            .find(|c| c.local_port == 22 && c.state == "ESTAB")
+            .unwrap();
         assert_eq!(inbound.direction, Direction::Inbound);
     }
 

@@ -74,18 +74,28 @@ fn force_capture_writes_record_and_list_status_reflect_it() {
         .args(["snapshot", "capture", "--force", "--kind", "e2e"])
         .output()
         .expect("capture --force 실행 실패");
-    assert!(out.status.success(), "capture --force exit: {:?}", out.status);
+    assert!(
+        out.status.success(),
+        "capture --force exit: {:?}",
+        out.status
+    );
 
     // 레코드 1건, kind=e2e, sections 비어있지 않음, 본문 존재.
     let recs = load_records(tmp.path());
     assert_eq!(recs.len(), 1, "레코드 1건이어야: {recs:?}");
     assert_eq!(recs[0]["kind"], "e2e");
     assert!(
-        recs[0]["sections"].as_array().map(|a| !a.is_empty()).unwrap_or(false),
+        recs[0]["sections"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
         "sections가 비어있음: {}",
         recs[0]
     );
-    assert!(recs[0]["body"].as_str().map(|b| b.contains("## ")).unwrap_or(false));
+    assert!(recs[0]["body"]
+        .as_str()
+        .map(|b| b.contains("## "))
+        .unwrap_or(false));
 
     // list --json: schema_version 봉투, 메타만(본문 필드 미유출).
     let list = aic_cmd(tmp.path())
@@ -99,7 +109,11 @@ fn force_capture_writes_record_and_list_status_reflect_it() {
     let snaps = lv["snapshots"].as_array().expect("snapshots 배열");
     assert_eq!(snaps.len(), 1);
     assert_eq!(snaps[0]["kind"], "e2e");
-    assert!(snaps[0].get("body").is_none(), "list --json에 본문이 유출됨: {}", snaps[0]);
+    assert!(
+        snaps[0].get("body").is_none(),
+        "list --json에 본문이 유출됨: {}",
+        snaps[0]
+    );
 
     // status --json: store + 게이트(record_enabled=false, --force는 게이트를 안 켠다) + 타이머 미설치.
     let status = aic_cmd(tmp.path())
@@ -107,9 +121,13 @@ fn force_capture_writes_record_and_list_status_reflect_it() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status --json은 JSON");
+    let sv: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json은 JSON");
     assert_eq!(sv["record_count"], 1);
-    assert_eq!(sv["record_enabled"], false, "--force는 게이트를 켜지 않는다");
+    assert_eq!(
+        sv["record_enabled"], false,
+        "--force는 게이트를 켜지 않는다"
+    );
     assert_eq!(sv["timer"]["installed"], false);
 }
 
@@ -124,11 +142,18 @@ fn timer_install_status_uninstall_roundtrip() {
         .args(["snapshot", "install", "--interval", "123", "--no-load"])
         .output()
         .expect("snapshot install 실행 실패");
-    assert!(install.status.success(), "install exit: {:?}\n{}", install.status, String::from_utf8_lossy(&install.stderr));
+    assert!(
+        install.status.success(),
+        "install exit: {:?}\n{}",
+        install.status,
+        String::from_utf8_lossy(&install.stderr)
+    );
 
     // 플랫폼별 unit 경로 + 공통 불변식(opt-in env 주입·snapshot capture 실행·interval 반영).
     #[cfg(target_os = "macos")]
-    let unit = tmp.path().join("Library/LaunchAgents/com.x-mesh.aic-snapshot.plist");
+    let unit = tmp
+        .path()
+        .join("Library/LaunchAgents/com.x-mesh.aic-snapshot.plist");
     #[cfg(target_os = "linux")]
     let unit = tmp.path().join("cfg/systemd/user/aic-snapshot.timer");
 
@@ -138,9 +163,14 @@ fn timer_install_status_uninstall_roundtrip() {
         let body = std::fs::read_to_string(&unit).unwrap();
         assert!(body.contains("<key>StartInterval</key>"));
         assert!(body.contains("<integer>123</integer>"));
-        assert!(!body.contains("KeepAlive"), "one-shot 타이머에 KeepAlive 금지");
+        assert!(
+            !body.contains("KeepAlive"),
+            "one-shot 타이머에 KeepAlive 금지"
+        );
         assert!(body.contains("AIC_SNAPSHOT_RECORD"));
-        assert!(body.contains("<string>snapshot</string>") && body.contains("<string>capture</string>"));
+        assert!(
+            body.contains("<string>snapshot</string>") && body.contains("<string>capture</string>")
+        );
     }
     #[cfg(target_os = "linux")]
     {
@@ -148,10 +178,9 @@ fn timer_install_status_uninstall_roundtrip() {
         assert!(timer.contains("OnActiveSec=0"), "활성화 즉시 첫 발화");
         assert!(timer.contains("OnUnitActiveSec=123"));
         assert!(!timer.contains("OnBootSec"), "로그인 기준 OnBootSec 금지");
-        let service = std::fs::read_to_string(
-            tmp.path().join("cfg/systemd/user/aic-snapshot.service"),
-        )
-        .expect(".service 미생성");
+        let service =
+            std::fs::read_to_string(tmp.path().join("cfg/systemd/user/aic-snapshot.service"))
+                .expect(".service 미생성");
         assert!(service.contains("Type=oneshot"));
         assert!(service.contains("Environment=AIC_SNAPSHOT_RECORD=1"));
         assert!(service.contains("snapshot capture"));
@@ -162,16 +191,25 @@ fn timer_install_status_uninstall_roundtrip() {
         .args(["snapshot", "status", "--json"])
         .output()
         .unwrap();
-    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status --json은 JSON");
+    let sv: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status --json은 JSON");
     assert_eq!(sv["timer"]["installed"], true);
-    assert_eq!(sv["timer"]["interval_secs"], 123, "간격 역파싱 실패: {}", sv["timer"]);
+    assert_eq!(
+        sv["timer"]["interval_secs"], 123,
+        "간격 역파싱 실패: {}",
+        sv["timer"]
+    );
 
     // uninstall → 파일 제거(launchctl/systemctl 미로드 상태에서도 best-effort).
     let uninstall = aic_cmd(tmp.path())
         .args(["snapshot", "uninstall"])
         .output()
         .expect("snapshot uninstall 실행 실패");
-    assert!(uninstall.status.success(), "uninstall exit: {:?}", uninstall.status);
+    assert!(
+        uninstall.status.success(),
+        "uninstall exit: {:?}",
+        uninstall.status
+    );
     assert!(!unit.exists(), "uninstall 후에도 unit 파일 잔존");
 }
 
@@ -216,7 +254,12 @@ fn concurrent_processes_capture_without_lost_writes() {
 
     // trim 후 정확히 MAX, 그리고 동시 추가한 manual 6건이 **모두** 보존(잃은 쓰기 0).
     let recs = load_records(tmp.path());
-    assert_eq!(recs.len(), 200, "trim 후 정확히 MAX(200)여야: {}", recs.len());
+    assert_eq!(
+        recs.len(),
+        200,
+        "trim 후 정확히 MAX(200)여야: {}",
+        recs.len()
+    );
     let manual = recs.iter().filter(|r| r["kind"] == "manual").count();
     assert_eq!(
         manual, PROCS,
@@ -232,10 +275,21 @@ fn rca_start_with_diagnose_creates_incident_with_evidence() {
 
     // create_incident + headless diagnose 증거 첨부(LLM 없음). L3 auto_rca::capture_incident와 동형 머신리.
     let start = aic_cmd(tmp.path())
-        .args(["rca", "start", "disk pressure", "--diagnose", "--no-analyze"])
+        .args([
+            "rca",
+            "start",
+            "disk pressure",
+            "--diagnose",
+            "--no-analyze",
+        ])
         .output()
         .expect("rca start 실행 실패");
-    assert!(start.status.success(), "rca start exit: {:?}\n{}", start.status, String::from_utf8_lossy(&start.stderr));
+    assert!(
+        start.status.success(),
+        "rca start exit: {:?}\n{}",
+        start.status,
+        String::from_utf8_lossy(&start.stderr)
+    );
 
     // status --json(id 생략 → 목록): incident 1건 + evidence ≥ 2(lifecycle + diagnosis).
     let status = aic_cmd(tmp.path())
@@ -243,7 +297,8 @@ fn rca_start_with_diagnose_creates_incident_with_evidence() {
         .output()
         .unwrap();
     assert!(status.status.success());
-    let sv: serde_json::Value = serde_json::from_slice(&status.stdout).expect("rca status --json은 JSON");
+    let sv: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("rca status --json은 JSON");
     let list = sv.as_array().expect("rca status --json(목록)은 배열");
     assert_eq!(list.len(), 1, "incident 1건이어야: {sv}");
     let evidence_count = list[0]["evidence_count"].as_u64().unwrap_or(0);
@@ -259,5 +314,8 @@ fn rca_start_with_diagnose_creates_incident_with_evidence() {
         .unwrap();
     assert!(report.status.success());
     let rtext = String::from_utf8_lossy(&report.stdout);
-    assert!(rtext.contains("disk pressure"), "report에 제목 누락: {rtext}");
+    assert!(
+        rtext.contains("disk pressure"),
+        "report에 제목 누락: {rtext}"
+    );
 }

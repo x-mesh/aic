@@ -158,11 +158,16 @@ impl ObsClient {
         }
     }
 
-    fn resolve_backend(&self, name: &str, expect: BackendType) -> Result<&BackendConfig, ToolError> {
+    fn resolve_backend(
+        &self,
+        name: &str,
+        expect: BackendType,
+    ) -> Result<&BackendConfig, ToolError> {
         let b = self.backends.get(name).ok_or_else(|| {
             let known = self.backend_names();
             let hint = if known.is_empty() {
-                "등록된 백엔드가 없습니다. config [observability.backends.<name>]에 추가하세요".to_string()
+                "등록된 백엔드가 없습니다. config [observability.backends.<name>]에 추가하세요"
+                    .to_string()
             } else {
                 format!("등록된 백엔드: {}", known.join(", "))
             };
@@ -358,7 +363,9 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
             // — fe80::/10이나 169.254.0.0/16을 IPv6 표기로 우회하는 SSRF를 막는다.
             v6.is_unspecified()
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.to_ipv4_mapped().is_some_and(|m| is_blocked_ip(&IpAddr::V4(m)))
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|m| is_blocked_ip(&IpAddr::V4(m)))
         }
     }
 }

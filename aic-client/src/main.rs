@@ -10273,11 +10273,12 @@ mod tests {
     #[test]
     fn restart_wait_absorbs_slow_first_boot_after_binary_swap() {
         const OBSERVED_SLOW_BOOT_MS: u64 = 5_000;
-        assert!(
-            UNIT_RESTART_WAIT_MS > OBSERVED_SLOW_BOOT_MS * 2,
-            "재시작 상한({UNIT_RESTART_WAIT_MS}ms)이 실측 느린 기동({OBSERVED_SLOW_BOOT_MS}ms)에 \
-             비해 여유가 없다 — 업그레이드 직후 정상 재시작이 실패로 보고된다"
-        );
+        const {
+            assert!(
+                UNIT_RESTART_WAIT_MS > OBSERVED_SLOW_BOOT_MS * 2,
+                "재시작 상한이 실측 느린 기동에 비해 여유가 없다"
+            );
+        }
     }
 
     /// 안내는 평상시 재시작(실측 0.1~0.5초)에는 뜨지 않고, 상한에 닿기 훨씬 전에 떠야 한다.
@@ -10285,14 +10286,16 @@ mod tests {
     #[test]
     fn restart_hint_fires_between_normal_boot_and_timeout() {
         const NORMAL_BOOT_MS: u64 = 500;
-        assert!(
-            RESTART_HINT_AFTER_MS > NORMAL_BOOT_MS,
-            "평상시 재시작에도 안내가 떠 잡음이 된다"
-        );
-        assert!(
-            RESTART_HINT_AFTER_MS * 2 < UNIT_RESTART_WAIT_MS,
-            "안내가 상한에 너무 붙어 있어 기다릴 여지를 알려 주지 못한다"
-        );
+        const {
+            assert!(
+                RESTART_HINT_AFTER_MS > NORMAL_BOOT_MS,
+                "평상시 재시작에도 안내가 떠 잡음이 된다"
+            );
+            assert!(
+                RESTART_HINT_AFTER_MS * 2 < UNIT_RESTART_WAIT_MS,
+                "안내가 상한에 너무 붙어 있어 기다릴 여지를 알려 주지 못한다"
+            );
+        }
     }
 
     #[test]

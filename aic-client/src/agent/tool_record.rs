@@ -1740,7 +1740,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn parse_slash_diagnose_kernel_flag() {
         // --kernel/-k는 증상 앞 플래그로 소비되고 증상 텍스트에 섞이지 않는다.
         assert_eq!(
@@ -1780,6 +1779,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn parse_slash_diagnose_args() {
         // rest-of-line 증상(공백 보존), 기본 analyze=true.
         assert_eq!(

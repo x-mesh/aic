@@ -67,14 +67,22 @@ impl RemoteExecutor for SshProcessExecutor {
 
         let mut command = tokio::process::Command::new("ssh");
         command.args([
-            "-o", "BatchMode=yes",
-            "-o", "ForwardAgent=no",
-            "-o", &format!("ConnectTimeout={}", host.connect_timeout_secs),
-            "-o", &format!("StrictHostKeyChecking={host_key_check}"),
-            "-o", "ControlMaster=auto",
-            "-o", &format!("ControlPath={control_path}"),
-            "-o", "ControlPersist=60s",
-            "-p", &host.port.to_string(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            &format!("ConnectTimeout={}", host.connect_timeout_secs),
+            "-o",
+            &format!("StrictHostKeyChecking={host_key_check}"),
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            &format!("ControlPath={control_path}"),
+            "-o",
+            "ControlPersist=60s",
+            "-p",
+            &host.port.to_string(),
         ]);
 
         // forward_agent=true(bastion 신뢰 opt-in)면 위 ForwardAgent=no를 override.
@@ -145,7 +153,8 @@ impl RemoteExecutor for SshProcessExecutor {
                 let exit_code = wait_res.ok().and_then(|s| s.code()).unwrap_or(-1);
                 // 분류는 raw stderr 패턴(예: "Permission denied")으로 — redact 후 패턴이 사라지면
                 // 분류 정확도가 떨어진다. 따라서 classify를 먼저, redact를 그 다음.
-                let status = classify_ssh_result(exit_code, &stderr_raw, duration_ms, connect_timeout_ms);
+                let status =
+                    classify_ssh_result(exit_code, &stderr_raw, duration_ms, connect_timeout_ms);
                 // Pre-render secret 필터(R2/S3): stdout/stderr는 redact 후 저장·렌더·audit.
                 let (stdout, redact_out) = secret_filter::redact(&stdout_raw);
                 let (stderr, redact_err) = secret_filter::redact(&stderr_raw);

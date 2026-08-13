@@ -705,14 +705,16 @@ fn is_sensitive_path_str(path: &str) -> bool {
         ".password-store",
         ".gem",
     ];
-    if comps
-        .iter()
-        .any(|c| SENSITIVE_DIR_COMPONENTS.contains(c))
-    {
+    if comps.iter().any(|c| SENSITIVE_DIR_COMPONENTS.contains(c)) {
         return true;
     }
     // 시스템 secret 파일/디렉토리.
-    for prefix in ["/etc/shadow", "/etc/gshadow", "/etc/sudoers", "/etc/ssl/private"] {
+    for prefix in [
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/sudoers",
+        "/etc/ssl/private",
+    ] {
         if lower == prefix || lower.starts_with(&format!("{prefix}/")) {
             return true;
         }

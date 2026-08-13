@@ -106,7 +106,9 @@ impl Sandbox {
             .components()
             .any(|c| matches!(c, Component::ParentDir))
         {
-            return Err(ToolError::new(format!("쓰기 경로에 '..' 사용 거부: {input}")));
+            return Err(ToolError::new(format!(
+                "쓰기 경로에 '..' 사용 거부: {input}"
+            )));
         }
 
         // 존재하는 가장 가까운 조상을 canonicalize해 경계를 검증하고, 나머지(미존재)
@@ -121,9 +123,9 @@ impl Sandbox {
                         ToolError::new(format!("쓰기 대상 경로를 확인할 수 없음: {input}"))
                     })?;
                     tail.push(name.to_os_string());
-                    probe = probe.parent().ok_or_else(|| {
-                        ToolError::new(format!("경로 확인 실패: {input}"))
-                    })?;
+                    probe = probe
+                        .parent()
+                        .ok_or_else(|| ToolError::new(format!("경로 확인 실패: {input}")))?;
                 }
             }
         };
@@ -136,7 +138,9 @@ impl Sandbox {
             target.push(comp);
         }
         if target.file_name().is_none() {
-            return Err(ToolError::new(format!("쓰기 대상 파일명을 확인할 수 없음: {input}")));
+            return Err(ToolError::new(format!(
+                "쓰기 대상 파일명을 확인할 수 없음: {input}"
+            )));
         }
         Ok(target)
     }

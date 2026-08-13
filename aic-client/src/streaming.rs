@@ -325,7 +325,10 @@ fn process_openai_stream_event<F: FnMut(&str)>(
             continue;
         };
         if let Some(err) = json.get("error") {
-            let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let msg = err
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             return Err(AicError::LlmApiError {
                 status: 0,
                 message: format!("API error: {msg}"),
@@ -603,7 +606,10 @@ mod tests {
         process_openai_stream_event(
             br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.txt\"}"}}]}}]}"#,
             &mut on_chunk, &mut text, &mut tools).unwrap();
-        assert!(process_openai_stream_event(b"data: [DONE]", &mut on_chunk, &mut text, &mut tools).unwrap());
+        assert!(
+            process_openai_stream_event(b"data: [DONE]", &mut on_chunk, &mut text, &mut tools)
+                .unwrap()
+        );
         match finish_response(text, tools) {
             ChatResponse::ToolCalls(c) => {
                 assert_eq!(c.len(), 1);
@@ -623,12 +629,23 @@ mod tests {
         let mut on_chunk = |c: &str| chunks.push(c.to_string());
         process_openai_stream_event(
             br#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
-            &mut on_chunk, &mut text, &mut tools).unwrap();
+            &mut on_chunk,
+            &mut text,
+            &mut tools,
+        )
+        .unwrap();
         process_openai_stream_event(
             br#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
-            &mut on_chunk, &mut text, &mut tools).unwrap();
+            &mut on_chunk,
+            &mut text,
+            &mut tools,
+        )
+        .unwrap();
         assert_eq!(chunks, vec!["Hel", "lo"]);
-        assert_eq!(finish_response(text, tools), ChatResponse::Text("Hello".to_string()));
+        assert_eq!(
+            finish_response(text, tools),
+            ChatResponse::Text("Hello".to_string())
+        );
     }
 
     #[test]
@@ -645,7 +662,13 @@ mod tests {
         process_anthropic_stream_event(
             br#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}"#,
             &mut on_chunk, &mut text, &mut tools).unwrap();
-        assert!(process_anthropic_stream_event(br#"data: {"type":"message_stop"}"#, &mut on_chunk, &mut text, &mut tools).unwrap());
+        assert!(process_anthropic_stream_event(
+            br#"data: {"type":"message_stop"}"#,
+            &mut on_chunk,
+            &mut text,
+            &mut tools
+        )
+        .unwrap());
         match finish_response(text, tools.into_values().collect()) {
             ChatResponse::ToolCalls(c) => {
                 assert_eq!(c.len(), 1);
@@ -670,12 +693,19 @@ mod tests {
             br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"there"}}"#,
             &mut on_chunk, &mut text, &mut tools).unwrap();
         assert_eq!(chunks, vec!["Hi ", "there"]);
-        assert_eq!(finish_response(text, tools.into_values().collect()), ChatResponse::Text("Hi there".to_string()));
+        assert_eq!(
+            finish_response(text, tools.into_values().collect()),
+            ChatResponse::Text("Hi there".to_string())
+        );
     }
 
     #[test]
     fn finish_response_empty_args_becomes_braces() {
-        let tools = vec![ToolCallBuilder { id: "c".into(), name: "noargs".into(), args: String::new() }];
+        let tools = vec![ToolCallBuilder {
+            id: "c".into(),
+            name: "noargs".into(),
+            args: String::new(),
+        }];
         match finish_response(String::new(), tools) {
             ChatResponse::ToolCalls(c) => assert_eq!(c[0].arguments, "{}"),
             other => panic!("expected ToolCalls, got {other:?}"),

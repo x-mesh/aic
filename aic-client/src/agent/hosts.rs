@@ -182,8 +182,7 @@ impl Inventory {
         let toml_doc: HostsTomlDoc = if hosts_toml.exists() {
             let s = fs::read_to_string(hosts_toml)
                 .with_context(|| format!("read {}", hosts_toml.display()))?;
-            toml::from_str(&s)
-                .with_context(|| format!("parse {}", hosts_toml.display()))?
+            toml::from_str(&s).with_context(|| format!("parse {}", hosts_toml.display()))?
         } else {
             HostsTomlDoc::default()
         };
@@ -223,9 +222,10 @@ impl Inventory {
                 .ok_or_else(|| anyhow!("group not found: @{group}"))?;
             let mut out = Vec::with_capacity(g.hosts.len());
             for h in &g.hosts {
-                let e = self.hosts.get(h).ok_or_else(|| {
-                    anyhow!("group @{group} references unknown host: {h}")
-                })?;
+                let e = self
+                    .hosts
+                    .get(h)
+                    .ok_or_else(|| anyhow!("group @{group} references unknown host: {h}"))?;
                 out.push(e);
             }
             Ok(out)
@@ -332,11 +332,7 @@ fn parse_host_key_check(s: &str) -> HostKeyCheck {
     }
 }
 
-fn apply_overlay(
-    hosts: &mut BTreeMap<String, HostEntry>,
-    e: &HostsTomlEntry,
-    options: &Options,
-) {
+fn apply_overlay(hosts: &mut BTreeMap<String, HostEntry>, e: &HostsTomlEntry, options: &Options) {
     let default_check = parse_host_key_check(&options.default_host_key_check);
     let was_in_ssh_config = hosts.contains_key(&e.name);
     let entry = hosts.entry(e.name.clone()).or_insert_with(|| HostEntry {
@@ -395,11 +391,8 @@ fn apply_overlay(
 /// Match/Include/ProxyCommand/CanonicalizeHostname은 경고만 남긴다. Wildcard host
 /// 패턴(`*.prod`, `?`, `!`)은 정확한 이름이 아니므로 인벤토리에서 제외(ssh가 해석할
 /// 것이라 가정).
-fn parse_ssh_config(
-    path: &Path,
-) -> Result<(BTreeMap<String, HostEntry>, Vec<String>)> {
-    let s = fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+fn parse_ssh_config(path: &Path) -> Result<(BTreeMap<String, HostEntry>, Vec<String>)> {
+    let s = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut hosts: BTreeMap<String, HostEntry> = BTreeMap::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut current: Option<HostEntry> = None;
@@ -539,9 +532,8 @@ mod tests {
     #[test]
     fn empty_inventory_when_both_files_missing() {
         let dir = tempdir().unwrap();
-        let inv =
-            Inventory::load_from(&dir.path().join("none.toml"), &dir.path().join("none.cfg"))
-                .unwrap();
+        let inv = Inventory::load_from(&dir.path().join("none.toml"), &dir.path().join("none.cfg"))
+            .unwrap();
         assert!(inv.hosts.is_empty());
         assert!(inv.groups.is_empty());
     }
@@ -607,7 +599,9 @@ Host web-01
         assert_eq!(web.hostname, "10.0.1.10");
         assert_eq!(web.proxy_jump.as_deref(), Some("bastion"));
         assert_eq!(
-            web.identity_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            web.identity_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             Some("~/.ssh/web_prod_ed25519".to_string())
         );
         assert!(matches!(web.source, HostSource::SshConfig));
@@ -703,7 +697,10 @@ hosts = ["web-01", "web-99"]
         );
         let inv = Inventory::load_from(&h, &dir.path().join("none.cfg")).unwrap();
         let e = inv.resolve_pattern("@web-tier").unwrap_err();
-        assert!(e.to_string().contains("unknown host: web-01") || e.to_string().contains("unknown host: web-99"));
+        assert!(
+            e.to_string().contains("unknown host: web-01")
+                || e.to_string().contains("unknown host: web-99")
+        );
     }
 
     #[test]
@@ -727,7 +724,10 @@ Host legacy
         );
         let inv = Inventory::load_from(&h, &s).unwrap();
         assert!(inv.ssh_config_warnings.iter().any(|w| w.contains("Match")));
-        assert!(inv.ssh_config_warnings.iter().any(|w| w.contains("Include")));
+        assert!(inv
+            .ssh_config_warnings
+            .iter()
+            .any(|w| w.contains("Include")));
         assert!(inv
             .ssh_config_warnings
             .iter()
@@ -761,8 +761,16 @@ Host web-03
 "#,
         );
         let inv = Inventory::load_from(&h, &s).unwrap();
-        assert_eq!(inv.host("web-02").unwrap().user, "sre", "Match 안 User가 web-02에 누설되면 안 됨");
-        assert_eq!(inv.host("web-03").unwrap().user, "real", "다음 Host 블록은 정상 적용되어야 함");
+        assert_eq!(
+            inv.host("web-02").unwrap().user,
+            "sre",
+            "Match 안 User가 web-02에 누설되면 안 됨"
+        );
+        assert_eq!(
+            inv.host("web-03").unwrap().user,
+            "real",
+            "다음 Host 블록은 정상 적용되어야 함"
+        );
     }
 
     #[test]

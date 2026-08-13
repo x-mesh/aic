@@ -643,8 +643,7 @@ impl FollowupTemplate {
             Some(c) if c.is_ascii_alphanumeric() => {}
             _ => return false,
         }
-        arg.len() <= 64
-            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        arg.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
     }
 
     /// 현재 OS의 템플릿 문자열.

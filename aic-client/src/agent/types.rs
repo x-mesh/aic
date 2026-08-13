@@ -408,7 +408,10 @@ mod tests {
         assert_eq!(j["name"], "grep");
         assert_eq!(j["description"], "search");
         assert_eq!(j["input_schema"]["type"], "object");
-        assert!(j.get("function").is_none(), "Anthropic은 function 래퍼 없음");
+        assert!(
+            j.get("function").is_none(),
+            "Anthropic은 function 래퍼 없음"
+        );
     }
 
     #[test]

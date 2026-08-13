@@ -402,7 +402,9 @@ impl LlmDispatcher {
         let provider = self.resolve_provider()?;
         // Anthropic은 wire format이 달라 전용 경로로 분기(SRE R4).
         if matches!(provider.provider_type, ProviderType::Anthropic) {
-            return self.send_messages_anthropic(provider, messages, tools).await;
+            return self
+                .send_messages_anthropic(provider, messages, tools)
+                .await;
         }
         if !matches!(
             provider.provider_type,
@@ -1565,7 +1567,10 @@ mod tests {
         // 실제 키처럼 보이는 fixture가 secret 스캐너(gk/gitleaks 등 소스 텍스트 스캔)에 걸리지
         // 않도록 prefix를 런타임에 합성한다. redaction 정규식은 합성된 런타임 값에 적용되므로
         // 이 테스트가 검증하는 동작은 그대로다.
-        let text_val = format!("key sk-{}-{}", "ant", "abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+        let text_val = format!(
+            "key sk-{}-{}",
+            "ant", "abcdefghijklmnopqrstuvwxyz0123456789ABCD"
+        );
         let tool_val = format!("token ghp_{}", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ");
         let mut msg = json!({
             "role": "user",

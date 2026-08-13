@@ -200,7 +200,8 @@ mod tests {
     #[ignore]
     async fn fingerprint_sha256_with_real_ssh_keygen() {
         // RFC 5208 ed25519 sample — 실제 ssh-keygen이 SHA256 fingerprint를 반환해야 함.
-        let line = "test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINq6n8j7gqzL+M+1aB0pUe8jKqzbxA6IsBKZ3W0jW5Xv";
+        let line =
+            "test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINq6n8j7gqzL+M+1aB0pUe8jKqzbxA6IsBKZ3W0jW5Xv";
         let fp = fingerprint_sha256(line).await.unwrap();
         assert!(fp.starts_with("SHA256:"), "fingerprint: {fp}");
     }
