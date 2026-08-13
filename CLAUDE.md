@@ -1,85 +1,79 @@
 # CLAUDE.md
 
-> This file is read by Claude Code at the start of every session.
-> Fill in each section — delete placeholder lines when done.
-> Commit this file so the whole team benefits.
+> Repository guidance for coding agents. Git workflow rules are maintained separately
+> in the managed block below.
 
 ## Project
 
-<!-- One-paragraph description of what this project does and why it exists. -->
-TODO: describe the project
+`aic` is a Rust terminal LLM assistant and local SRE diagnostic tool. `aic-session`
+captures terminal command output through a PTY, `aicd` supervises sessions and local
+telemetry, and the `aic` client provides analysis, chat, diagnosis, RCA, and a read-only
+web dashboard.
 
 ## Commands
 
-<!-- The commands Claude should use to build, test, lint, and run this project. -->
-
 ```sh
 # Build
-TODO: e.g.  go build ./...  |  npm run build  |  make build
+cargo build --workspace
 
 # Test (run before every commit)
-TODO: e.g.  go test ./...   |  npm test        |  pytest
+cargo test --workspace
 
 # Lint / format
-TODO: e.g.  golangci-lint run  |  npm run lint  |  ruff check .
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Run locally
-TODO: e.g.  go run ./cmd/app  |  npm run dev
+cargo run -p aic-server --bin aic-session
+cargo run -p aic-client --bin aic -- --help
 ```
 
 ## Architecture
 
-<!-- High-level layout. What lives where, and why. -->
-
 ```
-TODO: e.g.
-cmd/         CLI entry-points
-internal/    private packages (not importable by outside modules)
-pkg/         public/shared packages
+aic-common/  shared IPC, path, session, redaction, and phase policy
+aic-server/  aic-session data plane and aicd supervisor/control plane
+aic-client/  aic CLI, LLM/agent, diagnostics, RCA, and web dashboard
+docs/        design records, PRDs, RFCs, and operational scope
 ```
 
 Key design decisions:
-- TODO: decision 1
-- TODO: decision 2
+- Runtime paths follow XDG on Linux with `/tmp/aic-<uid>` compatibility fallback.
+- Exactly one `phase-3_N` Cargo feature is active; `phase-3_4` is the default and release phase.
+- Agent diagnostics are bounded and secret paths are denied; mutations require explicit gates.
 
 ## Conventions
 
-<!-- Rules Claude must follow when writing or modifying code in this repo. -->
-
-- **Style**: TODO (e.g. gofmt + golangci-lint / eslint + prettier / black + ruff)
-- **Naming**: TODO (e.g. snake_case for files, CamelCase for types)
-- **Error handling**: TODO (e.g. always wrap with fmt.Errorf / never swallow errors)
-- **Tests**: TODO (e.g. table-driven, one assertion per test, no external deps in unit tests)
-- **Commits**: TODO (e.g. Conventional Commits — feat/fix/chore/refactor)
+- **Style**: rustfmt and clippy with warnings denied.
+- **Naming**: standard Rust conventions; keep CLI and configuration names stable.
+- **Error handling**: return contextual errors; never silently discard security or data-integrity failures.
+- **Tests**: add targeted unit/integration coverage and keep host/network effects bounded.
+- **Commits**: Conventional Commits (`feat`, `fix`, `docs`, `test`, `chore`, `refactor`).
 - **No magic numbers** — use named constants
 - **No commented-out code** — delete it or track it in a ticket
 
 ## Key Files
 
-<!-- Point Claude at the files that matter most so it reads them first. -->
-
 | File / Directory | Purpose |
 |------------------|---------|
-| TODO path        | TODO purpose |
-| TODO path        | TODO purpose |
+| `README.md` | User-facing behavior and setup |
+| `ARCHITECTURE.md` | Components, data flows, and security boundaries |
+| `aic-common/src/paths.rs` | Canonical runtime/config paths |
+| `aic-client/src/main.rs` | CLI surface and orchestration |
+| `aic-server/src/aicd_main.rs` | Supervisor entry point |
 
 ## Environment
 
-<!-- Variables required to run or test the project locally. -->
-
 ```sh
-# Copy .env.example and fill in values
-# TODO: list required env vars, e.g.:
-# DATABASE_URL=
-# API_KEY=
+# No environment variables are required for build and unit tests.
+# LLM use requires provider configuration through `aic config` or provider env vars.
+# AIC_CENTRAL_STORE overrides the phase default for central storage.
 ```
 
 ## Out of Scope
 
-<!-- Topics Claude should NOT touch without explicit instruction. -->
-
-- TODO: e.g. "Do not modify the generated protobuf files in pkg/proto/"
-- TODO: e.g. "Do not change the public API surface of pkg/ without a design discussion"
+- Do not weaken redaction, path guards, confirmation gates, or audit-chain integrity.
+- Do not change IPC/config compatibility or the release phase without updating tests and docs.
 
 <!-- gk:agents:begin v20 — managed by `gk agents install`; edit outside this block -->
 ## Git workflow (git-kit)

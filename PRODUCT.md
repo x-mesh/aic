@@ -1,8 +1,7 @@
-# Product
+# Web Dashboard Product Brief
 
-## Register
-
-product
+> This document covers the `aic web` interface only. The repository-wide product and
+> CLI behavior are documented in `README.md` and `ARCHITECTURE.md`.
 
 ## Users
 

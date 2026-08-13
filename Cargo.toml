@@ -8,5 +8,5 @@ resolver = "2"
 # 노출하도록 동기화한다. 정확히 하나의 phase-3_N 만 활성임은 aic-common/build.rs 가
 # 빌드 시점에 assert 한다 (Requirement 8.3).
 #
-# 기본값: phase-3_1 (레거시 호환, Central_Store_Flag default = false).
+# 기본값: phase-3_4 (공식 릴리스와 동일, Central_Store_Flag default = true).
 # 다른 Phase 는 `cargo build --no-default-features --features phase-3_N` 형식으로 선택.

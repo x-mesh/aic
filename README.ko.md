@@ -81,8 +81,6 @@ graph LR
 ### Roadmap
 - 🚧 `aic-proxy` — LLM API 프록시 서버 (개발 예정)
 - 🚧 PTY ownership을 `aicd`로 이동 (PRD-AICD-SUPERVISOR Phase 2 본 구현)
-- 🚧 `aic capture-last` — destructive command 감지 + confirm UX
-- 🚧 launchd/systemd unit 자동 설치
 
 ## 동작 원리
 
@@ -96,7 +94,7 @@ graph LR
 
 ### Prerequisites
 
-- Rust 1.75+ (2021 edition)
+- Rust 1.89+ (2021 edition)
 - macOS 또는 Linux
 - LLM API key (OpenAI, Anthropic, Groq 등) 또는 CLI Backend (kiro-cli, claude-cli)
 
@@ -155,7 +153,7 @@ make install
 ```bash
 cargo check --workspace      # 빠른 타입 체크
 cargo test --workspace       # 테스트 실행 (커밋 전 필수)
-make check                   # fmt + clippy + check (Makefile 참고)
+make check                   # 빠른 workspace 타입 체크
 ```
 
 ### 셀프 업데이트
@@ -637,4 +635,4 @@ make help         # 전체 명령어 목록
 
 ## License
 
-MIT (LICENSE 파일 미동봉)
+MIT. [LICENSE](./LICENSE)를 참고하세요.
