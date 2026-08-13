@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-# ac CLI Tool — Makefile
+# aic CLI Tool — Makefile
 # ─────────────────────────────────────────────────────────────
 # make              빌드 (debug)
 # make release      빌드 (release, 최적화)
@@ -25,10 +25,6 @@ SHELL := /bin/bash
 
 PREFIX    ?= $(HOME)/.local
 BINDIR    := $(PREFIX)/bin
-
-# 소켓 경로 (디버깅용)
-SOCKET_DIR := /tmp/aic-$(shell id -u)
-SOCKET_PATH := $(SOCKET_DIR)/session.sock
 
 # ─── 빌드 ───────────────────────────────────────────────────
 # target/ 누적 방지: 빌드 후 오래된 산출물(7일 이상 미사용)과
@@ -151,7 +147,6 @@ fix:
 
 .PHONY: run-server
 run-server: build
-	@mkdir -p $(SOCKET_DIR)
 	cargo run -p aic-server --bin aic-session
 
 .PHONY: run-client
@@ -186,26 +181,16 @@ uninstall:
 
 .PHONY: socket-status
 socket-status:
-	@echo "소켓 경로: $(SOCKET_PATH)"
-	@if [ -S "$(SOCKET_PATH)" ]; then \
-		echo "상태: ✅ 소켓 파일 존재"; \
-	else \
-		echo "상태: ❌ 소켓 파일 없음 (서버 미실행)"; \
-	fi
+	@cargo run --quiet -p aic-client --bin aic -- status --all
 
 .PHONY: socket-clean
 socket-clean:
-	@rm -f $(SOCKET_PATH)
-	@echo "소켓 파일 삭제 완료: $(SOCKET_PATH)"
+	@echo "socket-clean은 더 이상 소켓을 직접 삭제하지 않습니다."
+	@echo "활성 세션은 'aic sessions'로 확인하고 'aic session stop <id>'로 종료하세요."
 
 .PHONY: ping
 ping: build
-	@echo "서버 ping 테스트..."
-	@if [ -S "$(SOCKET_PATH)" ]; then \
-		echo '{"Ping"}' | cargo run -p aic-client --bin aic 2>&1 || echo "클라이언트 실행 실패"; \
-	else \
-		echo "❌ 서버가 실행 중이지 않습니다 ($(SOCKET_PATH) 없음)"; \
-	fi
+	@cargo run --quiet -p aic-client --bin aic -- status
 
 .PHONY: env-info
 env-info:
@@ -215,8 +200,12 @@ env-info:
 	@echo "Cargo:       $$(cargo --version)"
 	@echo "SHELL:       $(SHELL)"
 	@echo "UID:         $$(id -u)"
-	@echo "소켓 경로:   $(SOCKET_PATH)"
-	@echo "설정 경로:   $${XDG_CONFIG_HOME:-$$HOME/.config}/ac/config.toml"
+	@if [ "$$(uname -s)" = "Linux" ] && [ -n "$${XDG_RUNTIME_DIR:-}" ]; then \
+		echo "런타임 경로: $${XDG_RUNTIME_DIR}/aic"; \
+	else \
+		echo "런타임 경로: /tmp/aic-$$(id -u)"; \
+	fi
+	@echo "설정 경로:   $${XDG_CONFIG_HOME:-$$HOME/.config}/aic/config.toml"
 	@echo ""
 	@echo "── 바이너리 ──"
 	@ls -lh target/debug/aic target/debug/aic-session 2>/dev/null || echo "(빌드 필요: make build)"
@@ -292,8 +281,8 @@ clean:
 	cargo clean
 
 .PHONY: clean-all
-clean-all: clean socket-clean
-	@rm -rf aic-*/proptest-regressions
+clean-all: clean
+	@echo "추적 가능한 proptest 회귀 자료는 보존했습니다."
 
 # 수동 정리: cargo-sweep으로 N일 이상 미사용 산출물 제거
 # 사용: make sweep              (기본 7일)
@@ -381,14 +370,14 @@ release-publish: tag
 .PHONY: help
 help:
 	@echo ""
-	@echo "ac CLI Tool — Makefile 명령어"
+	@echo "aic CLI Tool — Makefile 명령어"
 	@echo "════════════════════════════════════════════"
 	@echo ""
 	@echo "빌드"
 	@echo "  make              debug 빌드"
 	@echo "  make release      release 빌드 (최적화)"
 	@echo "  make check        빠른 컴파일 체크"
-	@echo "  make install      ~/.cargo/bin에 설치"
+	@echo "  make install      $(BINDIR)에 설치"
 	@echo ""
 	@echo "테스트"
 	@echo "  make test         전체 테스트"
@@ -418,7 +407,7 @@ help:
 	@echo ""
 	@echo "디버깅"
 	@echo "  make socket-status  소켓 파일 상태 확인"
-	@echo "  make socket-clean   소켓 파일 삭제"
+	@echo "  make socket-clean   안전한 세션 종료 방법 안내"
 	@echo "  make env-info       환경 정보 출력"
 	@echo "  make tree           프로젝트 소스 구조"
 	@echo ""
