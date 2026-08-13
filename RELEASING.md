@@ -61,7 +61,7 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
 4. **로컬 사전 검증** (release.yml이 게이트라 main CI 대신 여기서 잡는다). CI(`ci.yml`)와 동일 형태로:
 
    ```sh
-   cargo clippy --workspace -- -D warnings   # ci.yml과 동일 (--all-targets 붙이지 말 것 — CI보다 엄격해짐)
+   cargo clippy --workspace --all-targets -- -D warnings   # ci.yml과 동일
    cargo test --workspace --no-default-features --features phase-3_5
    AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
    ```

@@ -60,7 +60,7 @@ PRD [§16 완화책](./PRD-AICD-SUPERVISOR.md#16-리스크)은 “feature flag �
 
 - 본 RFC는 PRD [§11](./PRD-AICD-SUPERVISOR.md#11-mvp-범위) Phase 4(`aic` default flow의 daemon-first 전환)를 정의하지 않는다. CLI 흐름 변경은 별도 PR.
 - 본 RFC는 “완전 단일 데몬 + `SCM_RIGHTS` fd passing” 모델([PRD §13.1](./PRD-AICD-SUPERVISOR.md#131-완전-단일-데몬--fd-passing))을 채택하지 않는다. attach 프로세스는 그대로 두되 PTY fd만 `aicd`로 옮긴다.
-- launchd / systemd unit 자동 설치 자체는 README Roadmap에 위임한다. 본 RFC는 “있으면 리스크 4가 더 줄어든다” 정도로만 참조한다 ([§5.4](#54-리스크-4--aicd-다운의-blast-radius)).
+- launchd / systemd unit 설치 CLI 자체는 구현되어 있으며 본 RFC의 범위 밖이다. 본 RFC는 이를 선택 가능한 리스크 완화 수단으로만 참조한다 ([§5.4](#54-리스크-4--aicd-다운의-blast-radius)).
 - 새 persistence backend (SQLite 등) 도입은 비목표. JSONL append-only + snapshot 컴팩션을 권장한다 ([§5.5](#55-리스크-5--registry-persistence가-새-spof)).
 
 ## 4. 핵심 원칙
@@ -139,7 +139,7 @@ PRD [§16 완화책](./PRD-AICD-SUPERVISOR.md#16-리스크)은 “feature flag �
 - **Bounded local ring.** attach가 daemon 없이도 보유하는 local ring buffer 를 작게(예: 64KB) 유지. daemon 부활 시 backfill. 죽어도 “마지막 명령은 분석 가능” 보장.
 - **Stampede-safe restart.** attach들이 daemon 다운을 감지하면 `aicd.lock` 시도 → **단 하나의** attach만 `aicd` 재시작. 나머지는 polling. 멀티터미널 stampede 회피.
 - **Crash artifact.** `aicd`가 panic / SIGSEGV로 죽으면 마지막 registry snapshot + 마지막 N개 lifecycle 이벤트를 `~/.local/state/aic/crash/<ts>.json`에 남김. 다음 `aicd` 시작 시 “last shutdown reason”으로 노출 ([PRD R10 Observability](./PRD-AICD-SUPERVISOR.md#r10-observability)).
-- **OS service unit 권장(옵션).** README Roadmap의 launchd/systemd user unit 자동 설치는 사실상 본 헷징의 일부. PRD [§3 비목표](./PRD-AICD-SUPERVISOR.md#3-비목표)가 “모든 OS service manager 통합을 필수로 하지 않는다”고 한 것과 충돌하지 않음. 설치는 옵션, 실행은 standalone 가능.
+- **OS service unit 권장(옵션).** 구현된 `aic daemon install`은 launchd/systemd user unit을 설치하며 본 헷징의 일부로 사용할 수 있다. PRD [§3 비목표](./PRD-AICD-SUPERVISOR.md#3-비목표)가 “모든 OS service manager 통합을 필수로 하지 않는다”고 한 것과 충돌하지 않음. 설치는 옵션, 실행은 standalone 가능.
 - **Acceptance gate**:
   - `kill -9 aicd` 직후 active attach 5개 모두 셸 입력 가능
   - daemon 부활까지 p95 < 5s (lock-한 attach 1개가 spawn)

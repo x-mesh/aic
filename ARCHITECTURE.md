@@ -458,7 +458,5 @@ graph LR
 
 자세한 결정 기록은 [CHANGELOG.md](./CHANGELOG.md)의 `Architectural Decisions` 섹션 참조.
 
-- **launchd/systemd unit 자동 설치** — PTY-wrapping 모델 재설계 RFC 후
-- **streaming Anthropic provider** — 현재 OpenAI compat만
-- **ratatui 진정한 TUI** — `aic top`은 현재 polling 텍스트
+- **PTY ownership의 aicd 이전** — 별도 RFC에 따라 attach/recovery 모델 완성
 - **OSC 8 hyperlink** — URL handler 등록 비용 재평가
