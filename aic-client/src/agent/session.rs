@@ -1054,6 +1054,7 @@ impl AgentSession {
         use tool_record::SlashCommand;
         match cmd {
             SlashCommand::Help => self.out.note(&tool_record::help_text()).await,
+            SlashCommand::Health => self.handle_health().await,
             SlashCommand::Clear => {
                 // history[0]=system preface는 유지하고 이후 대화 턴만 비운다(컨텍스트 리셋).
                 self.history.truncate(1);
@@ -1157,6 +1158,68 @@ impl AgentSession {
                         "알 수 없는 명령: /{name}. /help 로 사용법을 확인하세요."
                     ))
                     .await
+            }
+        }
+    }
+
+    /// Fast, deterministic machine verdict. No LLM is called: the input is a fresh status sample
+    /// plus fixed Safe probes. If a chat RCA is explicitly active, the structured report and
+    /// redacted probe evidence are attached to that incident.
+    async fn handle_health(&mut self) {
+        let metrics = self.health_metrics_summary();
+        let probes = super::probes::resolve_ids(super::health::HEALTH_PROBE_IDS);
+        let snapshot = self
+            .collect_snapshot(
+                probes,
+                false,
+                Some(super::health::HEALTH_PROBE_TIMEOUT_SECS),
+            )
+            .await;
+        let deterministic = super::diagnose::scan_findings(&snapshot);
+        super::diagnose::emit_findings(&deterministic);
+        let report = super::health::HealthReport::from_observations(metrics.as_ref(), &snapshot);
+        self.out.note(&report.render()).await;
+
+        let _ = crate::audit::append(
+            "machine_health",
+            serde_json::json!({
+                "run_id": self.run_id,
+                "verdict": report.verdict.label(),
+                "coverage_complete": report.coverage_complete,
+                "checked_axes": report.checked_axes,
+                "total_axes": report.total_axes,
+                "findings": report.findings.len(),
+            }),
+        );
+
+        if let Some(active_id) = self.active_rca_id.clone() {
+            let stored = crate::rca::resolve_id(Some(&active_id)).and_then(|id| {
+                let mut meta = crate::rca::load_meta(&id)?;
+                let structured = serde_json::to_string_pretty(&report)?;
+                let body = format!(
+                    "## structured health verdict\n```json\n{structured}\n```\n\n## redacted probe evidence\n{snapshot}"
+                );
+                let event = crate::rca::append_evidence(
+                    &mut meta,
+                    crate::rca::EvidenceKind::Diagnosis,
+                    "machine health verdict",
+                    "aic chat /health",
+                    &body,
+                    &["health", "chat", "deterministic"],
+                )?;
+                Ok((meta.id, event.id))
+            });
+            match stored {
+                Ok((id, evidence)) => {
+                    self.out
+                        .note(&format!("RCA {id}에 health evidence 자동 저장: {evidence}"))
+                        .await;
+                }
+                Err(error) => {
+                    self.out
+                        .note(&format!("RCA health evidence 저장 실패: {error}"))
+                        .await;
+                }
             }
         }
     }
@@ -1370,6 +1433,15 @@ impl AgentSession {
         probes: Vec<(&'static str, String)>,
         print_bodies: bool,
     ) -> String {
+        self.collect_snapshot(probes, print_bodies, None).await
+    }
+
+    async fn collect_snapshot(
+        &mut self,
+        probes: Vec<(&'static str, String)>,
+        print_bodies: bool,
+        timeout_secs: Option<u64>,
+    ) -> String {
         use std::io::Write;
         let total = probes.len();
         // ephemeral `\r` 진행표시는 insert_before(줄 추가)와 충돌하므로 Direct sink일 때만.
@@ -1388,7 +1460,12 @@ impl AgentSession {
                 eprint!("\r\x1b[K{}", ui::paint(&label, "2"));
                 let _ = std::io::stderr().flush();
             }
-            let args = serde_json::json!({ "command": cmd });
+            let args = match timeout_secs {
+                Some(timeout_secs) => {
+                    serde_json::json!({ "command": cmd, "timeout_secs": timeout_secs })
+                }
+                None => serde_json::json!({ "command": cmd }),
+            };
             // Safe 명령이라 confirm은 호출되지 않지만, 비대화형 안전을 위해 거부 클로저 전달.
             // execute_with_corr가 (AIC_VERBOSE/AIC_DEBUG일 때만) command card를 출력, 결과는 redacted.
             let out =
@@ -1726,15 +1803,30 @@ impl AgentSession {
     /// t3: `handle_record`의 `record_metrics_attrs`가 이 소스로 `/record now <메모>`의 OTLP attrs를
     /// 채운다(None이면 attrs 없이 메모만 기록).
     pub(crate) fn record_metrics_summary(&mut self) -> Option<super::sys_sampler::SysMetrics> {
+        self.refresh_metrics_cache();
+        let now = std::time::Instant::now();
+        self.last_metrics
+            .as_ref()
+            .filter(|m| metrics_cache_usable(m, now))
+            .cloned()
+    }
+
+    fn refresh_metrics_cache(&mut self) {
         if let Some(rx) = &self.metrics_rx {
             if let Some(m) = rx.borrow().clone() {
                 self.last_metrics = Some(m);
             }
         }
+    }
+
+    /// Health can use a fresh cold CPU sample: only CPU becomes UNKNOWN while instantaneous
+    /// load/memory/disk remain useful. `/record now` deliberately keeps the stricter CPU gate.
+    fn health_metrics_summary(&mut self) -> Option<super::sys_sampler::SysMetrics> {
+        self.refresh_metrics_cache();
         let now = std::time::Instant::now();
         self.last_metrics
             .as_ref()
-            .filter(|m| metrics_cache_usable(m, now))
+            .filter(|m| metrics_cache_fresh(m, now))
             .cloned()
     }
 
@@ -2599,9 +2691,12 @@ const METRICS_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs
 ///    막겠다고 한 바로 그 오염값을 통과시킨다.
 /// 2. 신선함 — `sampled_at`이 `METRICS_FRESH_WINDOW` 안. 나이 미상(`None`)은 신선하다고 볼 수 없다.
 fn metrics_cache_usable(m: &super::sys_sampler::SysMetrics, now: std::time::Instant) -> bool {
-    m.cpu_valid
-        && m.sampled_at
-            .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
+    m.cpu_valid && metrics_cache_fresh(m, now)
+}
+
+fn metrics_cache_fresh(m: &super::sys_sampler::SysMetrics, now: std::time::Instant) -> bool {
+    m.sampled_at
+        .is_some_and(|t| now.saturating_duration_since(t) < METRICS_FRESH_WINDOW)
 }
 
 /// CLI `aic snapshot record --memo`가 실제로 하는 일 — **lib에 둔다**.
