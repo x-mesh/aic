@@ -166,6 +166,8 @@ pub(crate) const PROCS_DEFAULT: usize = 40;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
     Help,
+    /// `/health` — 현재 머신의 deterministic health verdict + coverage. LLM 미호출.
+    Health,
     /// `/clear` — 대화 컨텍스트 리셋(시스템 프롬프트 유지). LLM 미호출.
     Clear,
     /// `/resume` — 이전 세션 대화(`~/.aic/sessions/last.json`)를 history에 복원. LLM 미호출.
@@ -338,6 +340,7 @@ fn resolve_slash_command(typed: &str) -> Resolution {
 /// 자동완성·도움말에 쓰는 slash 메타명령 목록(primary 이름).
 pub(crate) const SLASH_COMMANDS: &[&str] = &[
     "help",
+    "health",
     "clear",
     "resume",
     "last",
@@ -368,7 +371,7 @@ pub(crate) const SLASH_COMMANDS: &[&str] = &[
 /// slash 명령의 palette 카테고리(빈 `/` discovery 메뉴 그룹핑용). 표시 순서는 `slash_category_order`.
 pub(crate) fn slash_category(name: &str) -> &'static str {
     match name {
-        "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
+        "health" | "diagnose" | "incident" | "triage" | "doctor" | "fix" => "Diagnostics",
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => {
             "Evidence"
         }
@@ -392,6 +395,7 @@ fn slash_category_order(name: &str) -> u8 {
 pub(crate) fn slash_description(name: &str) -> &'static str {
     match name {
         "help" => "이 도움말 표시",
+        "health" => "현재 머신 health verdict + coverage (LLM 미호출)",
         "clear" => "대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
         "resume" => "이전 세션 대화 복원 (~/.aic/sessions/last.json)",
         "last" => "직전 tool 카드 / 최근 N개 요약",
@@ -441,7 +445,7 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
 /// SLASH_COMMANDS 전 항목의 arm 존재를 이 규약으로 검증한다.
 pub(crate) fn slash_usage(name: &str) -> &'static str {
     match name {
-        "help" | "clear" | "resume" | "doctor" | "fix" | "compare" | "flush" => "",
+        "help" | "health" | "clear" | "resume" | "doctor" | "fix" | "compare" | "flush" => "",
         "last" | "timeline" | "trend" | "snapshots" | "procs" => "[N]",
         "raw" => "[seq|corr]",
         "local" | "sys" | "snapshot" => "[section ...] [--raw|-r|--analyze|-a]",
@@ -499,6 +503,7 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
     };
     Some(match cmd.as_str() {
         "help" | "?" => SlashCommand::Help,
+        "health" => SlashCommand::Health,
         "clear" => SlashCommand::Clear,
         "resume" => SlashCommand::Resume,
         "last" => SlashCommand::Last(parts.next().and_then(|n| n.parse::<usize>().ok())),
@@ -979,6 +984,7 @@ pub(crate) fn help_text() -> String {
     [
         "slash 명령 (대화 history에 안 들어감, 출력은 화면에만):",
         "  /help                이 도움말",
+        "  /health              현재 머신 HEALTHY/DEGRADED/CRITICAL 판정 + UNKNOWN coverage (LLM 미호출)",
         "  /clear               대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
         "  /resume              이전 세션 대화 복원 (~/.aic/sessions/last.json)",
         "  /last [N]            직전 tool 카드 / 최근 N개 요약",
@@ -1633,6 +1639,7 @@ mod tests {
     #[test]
     fn parse_slash_recognizes_commands() {
         assert_eq!(parse_slash("/help"), Some(SlashCommand::Help));
+        assert_eq!(parse_slash("/health"), Some(SlashCommand::Health));
         assert_eq!(parse_slash("/last"), Some(SlashCommand::Last(None)));
         assert_eq!(parse_slash("/last 5"), Some(SlashCommand::Last(Some(5))));
         assert_eq!(parse_slash("/raw"), Some(SlashCommand::Raw(None)));

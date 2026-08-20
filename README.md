@@ -47,6 +47,7 @@ graph LR
 - ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
 - ✅ Proactive chat status bar — the `aic chat` status line samples host metrics in an off-thread task (so a hung mount or an idle prompt never freezes the UI) and surfaces problems live: severity-colored segments, a per-metric sparkline + trend arrow, a gated disk-exhaustion ETA (`disk 4.2G free · ~8m→crit`), and edge-triggered alerts that name the top offending process (`⚠ mem 97% — top: node 12.1G`) with hysteresis/cooldown. Toggle the alert lane with `/watch arm|off`
+- ✅ Deterministic machine health verdict — `/health` answers whether the current machine is healthy, degraded, or critical without an LLM call. It reports explicit per-axis coverage, preserves unavailable checks as `UNKNOWN`, emits stable evidence references, and automatically attaches the structured verdict plus redacted probe evidence when a chat RCA is active
 - ✅ `aic diagnose` — symptom-driven Safe probes → typed **Findings** (severity / confidence / probe_id). A deterministic threshold scan flags disk / inode / fd / swap exhaustion, kernel OOM-kills, and failed systemd units **without an LLM**; `aic diagnose --json` emits a machine-readable envelope
 - ✅ `aic rca` — persistent RCA workspace: incidents under `~/.aic/incidents/<id>/` (`evidence.jsonl` + `report.md`), with `start` / `status` / `timeline` / `report`; `--diagnose` attaches first evidence from the headless `/diagnose` engine
 - ✅ Session snapshot recorder (opt-in) — background system snapshots to `~/.aic/snapshots/`, gated by `AIC_SNAPSHOT_RECORD`: alert-triggered full capture (L1), a periodic timer (L2, `aic snapshot install`), and Crit auto-RCA (L3, `AIC_AUTO_RCA`). See [Session snapshot recorder](#session-snapshot-recorder)
@@ -339,6 +340,7 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | Command | What it does |
 |---------|--------------|
 | `/help` | List the available slash commands |
+| `/health` | Deterministic machine `HEALTHY` / `DEGRADED` / `CRITICAL` verdict with explicit `UNKNOWN` coverage; attaches evidence to the active RCA |
 | `/last [N]` | Show the last tool card, or a compact list of the last N tool calls |
 | `/raw [seq\|corr]` | Full redacted output of the last (or a specific) tool call |
 | `/local [section] [--raw]` | Local sysinfo snapshot → LLM summary (`--raw` = evidence only). alias: `/sys`, `/snapshot` |

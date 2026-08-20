@@ -65,6 +65,15 @@ pub(crate) enum Severity {
     Crit,
 }
 
+/// `/health` view of a status metric. This adapter lives beside the sampler so the health report
+/// and status bar cannot silently develop different thresholds for the same resource.
+pub(crate) struct HealthResourceState {
+    pub axis: &'static str,
+    pub severity: Severity,
+    pub detail: String,
+    pub measured: bool,
+}
+
 impl Severity {
     /// 한 줄 발견·요약 렌더용 글리프(🟢 Normal / 🟡 Warn / 🔴 Crit). ANSI 컬러 비의존(unicode)이라
     /// non-TTY·RCA markdown·LLM evidence 어디서나 안전하다. SRE Finding(`diagnose::Finding`)과 공유한다.
@@ -463,6 +472,51 @@ impl SysSampler {
 }
 
 impl SysMetrics {
+    /// Deterministic health axes backed by the exact status-bar severity functions. Throughput-only
+    /// I/O/network values are excluded because no device/link capacity is available for a truthful
+    /// saturation verdict.
+    pub(crate) fn health_resource_states(&self) -> Vec<HealthResourceState> {
+        vec![
+            HealthResourceState {
+                axis: "load",
+                severity: self.load_sev(),
+                detail: self.load_label(),
+                measured: self.cores > 0,
+            },
+            HealthResourceState {
+                axis: "cpu",
+                severity: self.cpu_sev(),
+                detail: self.cpu_label(),
+                measured: self.cpu_valid,
+            },
+            HealthResourceState {
+                axis: "memory",
+                severity: self.mem_sev(),
+                detail: self.mem_label(),
+                measured: self.mem_total > 0,
+            },
+            HealthResourceState {
+                axis: "swap",
+                severity: self.swap_sev(),
+                detail: if self.swap_total > 0 {
+                    format!(
+                        "swap {:.0}%",
+                        self.swap_used as f64 * 100.0 / self.swap_total as f64
+                    )
+                } else {
+                    "swap off".to_string()
+                },
+                measured: true,
+            },
+            HealthResourceState {
+                axis: "root_disk",
+                severity: self.disk_sev(),
+                detail: self.disk_label(),
+                measured: self.disk_total > 0,
+            },
+        ]
+    }
+
     /// status bar 한 줄(ANSI 없음 — 출력 시 paint). 순수 함수(테스트 가능).
     ///
     /// **`status_segments`에서 파생한다** — 두 경로가 각자 포맷을 조립하던 시절엔 한쪽에만 있는

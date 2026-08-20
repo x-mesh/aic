@@ -17,6 +17,7 @@ pub(crate) mod debug;
 // SRE R2: headless 진단(run_headless_diagnose)을 바이너리(diagnose CLI/webhook spawn)에서 쓰므로 pub.
 pub mod diagnose;
 pub mod gitignore;
+pub(crate) mod health;
 // RFC-005 Phase 1: SSH 멀티호스트 인벤토리(hosts.toml + ssh_config import + overlay).
 pub mod hosts;
 // RFC-005 Phase 2: RemoteExecutor trait + 외부 ssh 프로세스 구현. fan-out은 Phase 3.
