@@ -220,7 +220,69 @@ aic 도구 description에 이미 새겨져 있다.
 측정 파라미터: window 5s~300s(aic가 clamp), 기본 30s. baseline 비교는 500ms 하드 타임아웃
 (초과 시 `baseline_timeout`으로 degrade). `duration=0`은 즉시 스냅샷 diff(의미론 미문서 — §10 Q3).
 
-### 3.3 aic 노출면 (현재)
+### 3.3 aic 수집 범위 계약
+
+aic가 가져올 데이터는 **상태**, **진단 시점 증거**, **상시 변화량**의 세 계층으로 나눈다.
+RCA-eBPF의 BPF map 원본이나 프로파일 파일을 직접 읽지 않고, loopback control API의 버전된
+응답만 소비한다.
+
+#### 상태·실행 문맥 (항상 조회 가능)
+
+| 출처 | 가져올 데이터 | aic 소비처 |
+|---|---|---|
+| `/healthz`, `/readyz` | 생존·준비 여부와 실패 이유 | doctor, 수집 결과 신뢰도 |
+| `/featuresz` | 신호별 enabled/attach/disabled reason, kernel capability, filter/profiling drop | doctor, 데이터 부재 설명, 신선도 |
+| `/snapshotz` | rca-agent 버전, OS/arch, cloud provider/region/AZ/instance type, cloud metadata 신선도 | collect/incident 문맥과 중앙 조인 |
+
+`/snapshotz`는 독립 chat 도구로 노출하지 않는다. `/collectz` 번들에 이미 start/end snapshot이
+들어가므로 doctor와 evidence 문맥에 자동 편입한다. 상태 응답에는 호스트명·계정 ID 같은 새 식별자를
+추가하지 않는다.
+
+#### 진단 시점 증거 (`POST /collectz`)
+
+진단 요청이 있을 때만 window를 잡는다. `diagnose --kernel`은 기본 5초, chat과 CLI는 기본 30초,
+허용 범위는 5~300초다. 다음 항목을 원본 evidence에 보존한다.
+
+| 우선순위 | 신호 | 가져올 값 |
+|---|---|---|
+| P0 | OOM | kill delta, victim PID/comm/cgroup, 메모리 수치, event seq |
+| P0 | scheduler | latency histogram·총 이벤트, PID/comm/cgroup top |
+| P0 | block I/O | latency histogram·총 이벤트, PID/comm/cgroup top |
+| P0 | network·TCP service map | 송수신 bytes/calls, retransmit, RTT, 방향·peer port·연결 수, entity top |
+| P1 | capability check | capability denial delta |
+| P1 | process lifecycle·context switch | fork/exit/switch delta |
+| P1 | syscall·file I/O | latency histogram과 이벤트 delta |
+| P2 | userspace | malloc/free/malloc retry delta |
+
+모든 신호에 window 시각·실제 소요 시간, 활성 신호, 수집 오류, `quality`, baseline 상태, attribution
+수준, drop/누락 정보를 함께 저장한다. 원본 `rca.evidence.v1`은 redaction 후 incident evidence로
+보존하고, chat에 보내는 표현만 64KB로 제한한다.
+
+`findings`, `summary`, `correlation_hint`, `top`은 **해석 보조 데이터**다. aic는 P0 신호부터
+결정적으로 `Finding` 후보로 변환하되 root cause로 채택하지 않는다. PID/comm/cgroup은 활동이 관측된
+entity일 뿐 책임 주체가 아니다. `correlation_hint`는 초기 Finding 매핑에서 제외하고 원본 evidence에만
+남긴다. aic의 프로세스 인벤토리·로그·변경 이력과 교차 검증한 뒤에만 진단 결론에 사용한다.
+
+#### 상시 변화량 (`GET /countersz`, 후속 계약)
+
+현재 RCA-eBPF에는 `/countersz`가 없다. 상시 수집은 블로킹 `/collectz` 번들을 반복 호출하지 않고,
+다음 최소 응답을 제공하는 논블로킹 API가 추가된 뒤 시작한다.
+
+- `schema_version`, `snapshot_at`, agent instance ID와 host boot ID
+- 신호별 누적 카운터와 histogram bucket
+- OOM 등 이산 이벤트 ring과 단조 증가 `seq`
+- 신호별 읽기 오류와 filter/profiling/event drop 수
+
+aicd는 이전 snapshot과 비교해 delta를 계산한다. 카운터가 감소하거나 instance/boot ID가 바뀌면
+재시작으로 보고 해당 구간 delta를 폐기한다. 중앙에는 카운터 delta와 redaction한 이산 이벤트만
+전송한다. `findings`, `summary`, `correlation_hint`, PID별 top은 민감정보와 카디널리티 때문에
+상시 전송하지 않는다. `/countersz`가 합의되기 전 `/collectz` 주기 수집은 실험용 fallback으로만
+허용하며 기본 비활성으로 둔다.
+
+초기 범위에서 제외하는 항목은 profiling 파일, 전체 process dump, BPF map 원본, 임의 원격 호스트의
+evidence다. loopback 전용 접근과 bounded read·redaction 불변식을 유지한다.
+
+### 3.4 aic 노출면 (현재)
 
 | 진입점 | 동작 |
 |---|---|
@@ -229,7 +291,7 @@ aic 도구 description에 이미 새겨져 있다.
 | CLI `aic rca collect [id] [--window 30s] [--json]` | 번들을 incident evidence(`Observability`)로 첨부 |
 | config `[rca_agent]` | `enabled`(기본 false) / `url`(기본 `http://127.0.0.1:9090`, loopback 강제) |
 
-### 3.4 불가능한 것 (설계가 우회해야 하는 제약)
+### 3.5 불가능한 것 (설계가 우회해야 하는 제약)
 
 1. **신호 runtime toggle 불가** — 측정 항목 변경은 rca-agent 재시작. "필요할 때 syscall 신호만 켜서
    재기" 같은 UX는 불가능하고, opt-in 셋은 배포 결정이다(§5 Lane C의 기본셋 합의).
@@ -304,9 +366,9 @@ aic 도구 description에 이미 새겨져 있다.
 - **B3. 신선도(D3) 편입** (우선순위 2): PHASE2 Track D3의 소스 목록(로컬 샘플러, webhook,
   관측 백엔드, sre-agent)에 rca-agent를 추가 — 마지막 성공 pull 시각 + `/featuresz` attach 상태를
   web·chat 브리핑 신선도 스트립에 표시. PHASE2-RCA-PLAN 문서 갱신 포함.
-- **B4. `rca_agent_snapshot` 도구** (우선순위 3, 선택): `GET /snapshotz` 노출 — 논블로킹 컨텍스트
-  (cloud/service/features)로 LLM이 collect 전에 측정 능력을 파악. features와 중복이 크므로
-  Q5에서 채택 여부 결정.
+- **B4. snapshot 자동 문맥 편입** (우선순위 3): `GET /snapshotz`를 별도 LLM 도구로 노출하지 않고
+  doctor와 collect/incident evidence 문맥에 포함. collect 번들의 start/end snapshot을 우선 사용하고,
+  doctor만 논블로킹 endpoint를 직접 조회한다.
 
 Lane B는 전부 read-only·loopback·기존 게이트(redaction/bounded) 재사용 — 경계 논쟁 없음.
 
@@ -354,7 +416,7 @@ integration-plan Phase 3(`obs_tools.rs`에 rca-web 백엔드 타입 추가)과 �
 - [ ] **P2** C1 `[aicd.rca_agent]` config + aicd 수집 태스크 (countersz 또는 fallback 루프)
 - [ ] **P2** C3 송신 매핑 (aic.kernel.* metrics + OOM 이산 이벤트 + record_id 멱등 + redaction)
 - [ ] **P2** B3 신선도 스트립에 rca-agent 소스 추가 (PHASE2-RCA-PLAN D3 문서 갱신 포함)
-- [ ] **P3** B4 snapshot 도구 (Q5 채택 시)
+- [ ] **P3** B4 snapshot 자동 문맥 편입 (doctor + collect/incident evidence, 독립 도구 없음)
 - ⚠ config 필드 추가 시 **테스트 AppConfig 생성부 전부 같은 커밋에서 갱신** — RcaConfig 때 두 번 겪은
   함정(PHASE2-RCA-PLAN §O3 기록). 신규 도구는 `session.rs exec_tool`의 matches! arm 갱신 필수,
   ToolSpec name은 `&'static str`.
@@ -407,7 +469,7 @@ integration-plan Phase 3(`obs_tools.rs`에 rca-web 백엔드 타입 추가)과 �
 - **C 계열**: wiremock rca-agent(countersz/collectz) → aicd delta 계산(후퇴 케이스 포함) 단위 테스트;
   E2E는 rca-web PRD SC1~SC4를 그대로 판정 기준으로 (OOM 유발 실험 → changes 행 → auto-RCA 인용 → 모니터 발화).
 - **경합**: fallback 모드에서 aicd 수집 중 CLI collect 동시 실행 — aicd 자체 상호배제(tick 스킵)
-  동작 확인 (서버는 중첩을 막아주지 않음, §3.4-3).
+  동작 확인 (서버는 중첩을 막아주지 않음, §3.5-3).
 
 ## 9. 성공 기준
 
@@ -423,14 +485,18 @@ integration-plan Phase 3(`obs_tools.rs`에 rca-web 백엔드 타입 추가)과 �
   기각 시 fallback 확정. — *관문, rca-agent 팀 회신 대기*
 - **Q2** 이산 이벤트 scope: `aic.changes` 재사용(rca-web 무변경) vs `aic.kernel.events` 신설
   (라우팅 1건 추가, 의미 분리). 권장: 재사용으로 시작 — 0014가 이미 자리를 파 놨다.
-- **Q3** `duration=0`(즉시 스냅샷 diff)의 의미론이 미문서 — B2/B4에서 활용할지, rca-agent에 문서화 요청할지.
+- **Q3** `duration=0`(즉시 스냅샷 diff)의 의미론이 미문서 — B2에서 활용할지, rca-agent에 문서화 요청할지.
 - **Q4** aic→rca-web 질의용 read 자격증명(agent token은 ingest 전용) — rca-web 설계 과제로 이관 (Lane D 선결).
-- **Q5** `rca_agent_snapshot` 도구 채택 여부 — features와 정보 중복 대비 cloud/service 컨텍스트 가치.
-- **Q6** B2 매핑에서 `correlation_hint`를 finding 보조 텍스트로 노출할지(힌트임을 명시) 제외할지.
+- **Q5 (결정)** `rca_agent_snapshot` 독립 도구는 만들지 않고 doctor와 evidence에 자동 편입한다.
+- **Q6 (결정)** `correlation_hint`는 초기 Finding 매핑에서 제외하고 원본 evidence에만 보존한다.
 
 ## 11. Decision
 
 - (확정) 플랫폼 도달 경로는 **aicd 릴레이 단일** — rca-agent OTLP direct push는 아키텍처 변경이라 비범위 (ADR-0048 D2 경계 유지).
 - (확정) 서버로 나르는 것은 **원시 카운터 delta + 이산 커널 이벤트뿐** — 해석층(findings/hint)은 로컬.
 - (확정) 상시 opt-in 기본셋은 `process_lifecycle + oom + scheduler` (비용 9/14)로 시작.
-- (대기) Q1~Q6.
+- (확정) 상태·실행 문맥은 doctor/evidence에 자동 편입하고 snapshot 전용 chat 도구는 만들지 않는다.
+- (확정) 진단 Finding은 P0(OOM·scheduler·block I/O·network/service map)부터 결정적으로 매핑하며,
+  `correlation_hint`는 원본 evidence에만 보존한다.
+- (확정) 상시 수집은 `/countersz` 합의 후 시작하고 `/collectz` 주기 호출은 기본 비활성 fallback이다.
+- (대기) Q1~Q4.
