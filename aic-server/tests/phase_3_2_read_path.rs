@@ -186,9 +186,22 @@ struct AicdHarness {
     _dir: TempDir,
 }
 
+/// 런타임 디렉토리로 바로 쓸 수 있는 0700 tempdir.
+///
+/// `tempfile::tempdir()`는 umask를 따라 보통 0755로 만들어지는데, 소켓의 부모 디렉토리는
+/// `ensure_runtime_dir`이 0700만 신뢰한다(`/tmp` 선점 방어). 검사를 푸는 대신 테스트가
+/// 실제 런타임 디렉토리와 같은 권한을 갖춘다.
+fn runtime_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("런타임 디렉토리 권한 설정");
+    dir
+}
+
 impl AicdHarness {
     async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let ctx = ControlContext {
@@ -231,7 +244,7 @@ struct SessionHarness {
 
 impl SessionHarness {
     async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("session.sock");
         let server = UdsServer::bind(&sock_path).await.unwrap();
         let buffer = Arc::new(RwLock::new(RingBuffer::new(200)));
