@@ -40,6 +40,7 @@ use std::time::Instant;
 // 프로세스에 다른 숫자를 보고하게 되고, 그러면 어느 쪽이 맞는지 판단할 근거가 사라진다.
 use aic_common::proc::process_fd_count;
 
+use aic_common::disk_io::{canonical_device_identity, DiskIoTracker};
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// 한 metric data point — 이름·단위·값. OTLP Gauge 하나로 인코딩된다.
@@ -137,10 +138,11 @@ pub struct HostSample {
     pub process_inventory: Vec<ProcInv>,
 }
 
-/// stateful host metrics 샘플러. i/o delta 계산을 위해 `Disks`/`Networks`/직전 시각을 보존한다.
+/// stateful host metrics 샘플러. i/o delta 계산을 위해 device counter/`Networks`/직전 시각을 보존한다.
 pub struct HostSampler {
     sys: System,
     disks: Disks,
+    disk_io: DiskIoTracker<std::ffi::OsString>,
     networks: Networks,
     last: Instant,
     host_name: String,
@@ -170,6 +172,7 @@ impl HostSampler {
         Self {
             sys,
             disks: Disks::new_with_refreshed_list(),
+            disk_io: DiskIoTracker::new(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
             host_id: host_id(&host_name),
@@ -209,10 +212,16 @@ impl HostSampler {
         // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음).
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
 
-        let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
-            let u = d.usage();
-            (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
-        });
+        // sysinfo의 디스크 목록은 mount 기반이라 같은 backing device가 여러 번 나타날 수 있다.
+        // device identity별 누적 counter를 공통 tracker에서 dedupe/delta 처리한다.
+        let disk_io = self.disk_io.sample(self.disks.list().iter().map(|disk| {
+            let usage = disk.usage();
+            (
+                canonical_device_identity(disk.name()),
+                usage.total_read_bytes,
+                usage.total_written_bytes,
+            )
+        }));
         // received()/packets_received()/errors_on_received()는 모두 직전 refresh 이후의 delta다
         // (누적값은 total_* 계열). 그래서 elapsed로 나누면 그대로 초당 rate가 된다.
         let (rx, tx) = self.networks.iter().fold((0u64, 0u64), |acc, (_, data)| {
@@ -360,12 +369,16 @@ impl HostSampler {
             MetricPoint {
                 name: "system.disk.io.read",
                 unit: "By/s",
-                value: MetricValue::Int((read as f64 / elapsed) as i64),
+                value: MetricValue::Int(
+                    (disk_io.unwrap_or_default().read_bytes as f64 / elapsed) as i64,
+                ),
             },
             MetricPoint {
                 name: "system.disk.io.write",
                 unit: "By/s",
-                value: MetricValue::Int((write as f64 / elapsed) as i64),
+                value: MetricValue::Int(
+                    (disk_io.unwrap_or_default().written_bytes as f64 / elapsed) as i64,
+                ),
             },
             MetricPoint {
                 name: "system.network.io.receive",
@@ -436,6 +449,11 @@ impl HostSampler {
 
         // t8: host_extra(memory compressor/pressure/fd, t5) 배선. 실패는 개별 point 생략으로
         // 처리되므로(host_extra.rs 모듈 doc) 여기서 추가로 방어할 게 없다.
+        if disk_io.is_none() {
+            points.retain(|point| {
+                !matches!(point.name, "system.disk.io.read" | "system.disk.io.write")
+            });
+        }
         points.extend(super::host_extra::collect(&mut self.extra));
 
         HostSample {
@@ -777,19 +795,32 @@ mod tests {
         let sample = s.sample();
         assert!(!sample.resource.host_name.is_empty());
         assert!(!sample.resource.os_type.is_empty());
-        // host metrics 26종(cpu 5 + mem 4 + swap 3 + fs 4 + disk io 2 + net io/packets/errors 6 +
-        // process 1 + uptime 1)이 항상 나가고, top_process.usage(프로세스 목록 비었을 때만 생략)와
-        // ntp_offset_ms(Linux + 커널 sync 상태일 때만)가 각각 선택적으로 붙는다(26~28).
-        // t8: host_extra(t5) 배선분이 여기에 더해진다 — macOS는 compressor(0~3) + pressure.level(0~1)
-        // + fd count/limit(0~2)로 최대 6종, Linux는 pressure.some/full(0~2) + fd count/limit(0~2)로
-        // 최대 4종, 둘 다 최소 0종(sysctl/procfs 읽기 실패 시 전부 생략 가능). 그래서 상한을
-        // 28+6=34까지 넉넉히 잡는다 — 특정 머신의 우연한 상태(어떤 point가 정확히 몇 개 나오는지)를
-        // 요구하지 않는다(3번째 반복 사고 규칙).
-        assert!(
-            (26..=34).contains(&sample.points.len()),
-            "host metrics 점수는 26~34여야 함, got {}",
-            sample.points.len()
-        );
+        // 첫 disk sample은 cumulative counter의 기준선일 뿐이므로 rate point를 내지 않는다.
+        assert!(!sample
+            .points
+            .iter()
+            .any(|point| matches!(point.name, "system.disk.io.read" | "system.disk.io.write")));
+        // 환경별 optional metric 개수 대신 고정 계약의 대표 지표를 확인한다.
+        for expected in [
+            "system.cpu.utilization",
+            "system.memory.usage",
+            "system.filesystem.available",
+            "system.network.io.receive",
+            "system.process.count",
+            "system.uptime",
+        ] {
+            assert!(
+                sample.points.iter().any(|point| point.name == expected),
+                "필수 host metric 누락: {expected}"
+            );
+        }
+        let second = s.sample();
+        for expected in ["system.disk.io.read", "system.disk.io.write"] {
+            assert!(
+                second.points.iter().any(|point| point.name == expected),
+                "두 번째 sample의 disk metric 누락: {expected}"
+            );
+        }
         // utilization 계열은 항상 0..1 범위.
         for p in &sample.points {
             if p.name.ends_with(".utilization") {
