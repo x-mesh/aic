@@ -211,6 +211,10 @@ aic migrate-keys       # move plaintext API keys into the OS keychain (optional)
 aic doctor             # 9-axis diagnosis — see PASS/WARN/FAIL at a glance
 aic doctor --probe-tools  # opt-in live probe: does the provider actually support tool-calling?
 
+# 원격 host/group에서 같은 read-only 진단을 병렬 실행(원격 LLM 호출 없음)
+aic diagnose --host web-01 "disk full"
+aic diagnose --host @web-tier "high cpu" --json
+
 # 2. (optional) Start the supervisor — central multi-session lifecycle
 aic daemon start       # spawns aicd in the background
 aic daemon status      # check liveness + registered session count
