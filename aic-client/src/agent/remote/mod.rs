@@ -11,6 +11,7 @@
 //! - stdout/stderr 상한 64 KiB 저장 / 8 MiB 드레인 (R2).
 //! - 분기 명확: 8종 [`HostStatus`] + [`classify_ssh_result`] (U2).
 
+pub mod diagnose;
 pub mod fanout;
 pub mod path_guard;
 pub mod secret_filter;

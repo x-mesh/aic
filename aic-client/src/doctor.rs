@@ -40,9 +40,10 @@ pub enum Status {
     Pass,
     Warn,
     Fail,
+    Unknown,
 }
 
-pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 1;
+pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DoctorTarget {
@@ -56,8 +57,42 @@ pub struct DoctorReport {
     pub schema_version: u32,
     pub observed_at: chrono::DateTime<chrono::Utc>,
     pub target: DoctorTarget,
+    pub summary: DoctorSummary,
     pub checks: Vec<CheckResult>,
     pub central_store: CentralStoreReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorSummary {
+    pub pass: usize,
+    pub warn: usize,
+    pub fail: usize,
+    pub unknown: usize,
+    pub total: usize,
+}
+
+impl DoctorSummary {
+    fn from_checks(checks: &[CheckResult]) -> Self {
+        Self {
+            pass: checks
+                .iter()
+                .filter(|check| check.status == Status::Pass)
+                .count(),
+            warn: checks
+                .iter()
+                .filter(|check| check.status == Status::Warn)
+                .count(),
+            fail: checks
+                .iter()
+                .filter(|check| check.status == Status::Fail)
+                .count(),
+            unknown: checks
+                .iter()
+                .filter(|check| check.status == Status::Unknown)
+                .count(),
+            total: checks.len(),
+        }
+    }
 }
 
 impl DoctorReport {
@@ -67,6 +102,7 @@ impl DoctorReport {
         checks: Vec<CheckResult>,
         central_store: CentralStoreReport,
     ) -> Self {
+        let summary = DoctorSummary::from_checks(&checks);
         Self {
             schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
             observed_at: chrono::Utc::now(),
@@ -75,6 +111,7 @@ impl DoctorReport {
                 session_id,
                 socket_path,
             },
+            summary,
             checks,
             central_store,
         }
@@ -121,6 +158,21 @@ impl CheckResult {
             id: id.into(),
             name: name.into(),
             status: Status::Fail,
+            detail: detail.into(),
+            fix_hint: Some(fix.into()),
+        }
+    }
+
+    pub fn unknown_with_id(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            status: Status::Unknown,
             detail: detail.into(),
             fix_hint: Some(fix.into()),
         }
@@ -232,6 +284,8 @@ pub async fn run_all_checks_for_provider(
             results.push(check_llm_endpoint(provider).await);
             results.push(check_keychain_access(cfg, provider));
         }
+    } else if !results.iter().any(|result| result.id == "provider_config") {
+        results.extend(config_dependent_unknowns());
     }
 
     // config가 깨져도 독립적으로 확인할 수 있는 런타임 상태는 계속 수집한다.
@@ -243,6 +297,20 @@ pub async fn run_all_checks_for_provider(
     results.push(check_audit_log());
 
     results
+}
+
+fn config_dependent_unknowns() -> Vec<CheckResult> {
+    const DETAIL: &str = "config를 읽지 못해 점검하지 않음";
+    const FIX: &str = "config 오류를 수정한 뒤 aic doctor를 다시 실행하세요";
+    [
+        ("provider_config", "provider 설정"),
+        ("rca_agent", "rca-agent"),
+        ("llm_endpoint", "LLM endpoint"),
+        ("keychain", "keychain"),
+    ]
+    .into_iter()
+    .map(|(id, name)| CheckResult::unknown_with_id(id, name, DETAIL, FIX))
+    .collect()
 }
 
 fn load_config_for_doctor(path: &Path) -> anyhow::Result<AppConfig> {
@@ -315,12 +383,17 @@ pub fn print_report(results: &[CheckResult]) {
     let pass_count = results.iter().filter(|r| r.status == Status::Pass).count();
     let warn_count = results.iter().filter(|r| r.status == Status::Warn).count();
     let fail_count = results.iter().filter(|r| r.status == Status::Fail).count();
+    let unknown_count = results
+        .iter()
+        .filter(|r| r.status == Status::Unknown)
+        .count();
 
     for r in results {
         let (sym, color) = match r.status {
-            Status::Pass => ("✔", "\x1b[32m"), // green
-            Status::Warn => ("⚠", "\x1b[33m"), // yellow
-            Status::Fail => ("✗", "\x1b[31m"), // red
+            Status::Pass => ("✔", "\x1b[32m"),    // green
+            Status::Warn => ("⚠", "\x1b[33m"),    // yellow
+            Status::Fail => ("✗", "\x1b[31m"),    // red
+            Status::Unknown => ("?", "\x1b[90m"), // gray
         };
         println!(
             "{color}{sym}\x1b[0m \x1b[1m{}\x1b[0m — {}",
@@ -333,7 +406,8 @@ pub fn print_report(results: &[CheckResult]) {
 
     println!();
     println!(
-        "요약: \x1b[32m{pass_count} PASS\x1b[0m, \x1b[33m{warn_count} WARN\x1b[0m, \x1b[31m{fail_count} FAIL\x1b[0m"
+        "요약: \x1b[32m{pass_count} PASS\x1b[0m, \x1b[33m{warn_count} WARN\x1b[0m, \
+         \x1b[31m{fail_count} FAIL\x1b[0m, \x1b[90m{unknown_count} UNKNOWN\x1b[0m"
     );
 }
 
@@ -890,7 +964,7 @@ async fn check_llm_endpoint(provider: &ProviderConfig) -> CheckResult {
         }
     };
 
-    // 호스트 reachability만 체크 (인증 검증 X — provider 체크에서 key 존재만 확인)
+    // 실제 endpoint path의 reachability만 체크한다. 인증·model 호출은 --probe-tools에서 검증한다.
     let url = match reqwest::Url::parse(endpoint) {
         Ok(u) => u,
         Err(e) => {
@@ -902,16 +976,13 @@ async fn check_llm_endpoint(provider: &ProviderConfig) -> CheckResult {
         }
     };
 
-    let host_url = match url.host_str() {
-        Some(h) => format!("{}://{}", url.scheme(), h),
-        None => {
-            return CheckResult::fail(
-                "LLM endpoint",
-                format!("호스트 누락: {endpoint}"),
-                "config.toml의 endpoint를 점검하세요",
-            );
-        }
-    };
+    if url.host_str().is_none() {
+        return CheckResult::fail(
+            "LLM endpoint",
+            format!("호스트 누락: {endpoint}"),
+            "config.toml의 endpoint를 점검하세요",
+        );
+    }
 
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(1))
@@ -928,25 +999,38 @@ async fn check_llm_endpoint(provider: &ProviderConfig) -> CheckResult {
         }
     };
 
-    match client.head(&host_url).send().await {
-        Ok(resp) => CheckResult::pass(
-            "LLM endpoint",
-            format!("{} 응답 (HTTP {})", host_url, resp.status().as_u16()),
-        ),
+    match client.head(url.clone()).send().await {
+        Ok(resp) => classify_endpoint_response(endpoint, resp.status().as_u16()),
         Err(e) => {
             // 일부 endpoint는 HEAD를 허용하지 않음 → GET 재시도
-            match client.get(&host_url).send().await {
-                Ok(resp) => CheckResult::pass(
-                    "LLM endpoint",
-                    format!("{} 응답 (HTTP {})", host_url, resp.status().as_u16()),
-                ),
+            match client.get(url).send().await {
+                Ok(resp) => classify_endpoint_response(endpoint, resp.status().as_u16()),
                 Err(_) => CheckResult::warn(
                     "LLM endpoint",
-                    format!("{host_url} 도달 불가: {e}"),
+                    format!("{endpoint} 도달 불가: {e}"),
                     "네트워크 연결과 endpoint URL을 확인하세요",
                 ),
             }
         }
+    }
+}
+
+fn classify_endpoint_response(endpoint: &str, status: u16) -> CheckResult {
+    match status {
+        404 => CheckResult::warn(
+            "LLM endpoint",
+            format!("{endpoint} 경로 없음 (HTTP 404)"),
+            "config.toml의 endpoint path를 확인하세요",
+        ),
+        500..=599 => CheckResult::warn(
+            "LLM endpoint",
+            format!("{endpoint} 서버 오류 (HTTP {status})"),
+            "provider 상태를 확인하고 잠시 후 다시 시도하세요",
+        ),
+        _ => CheckResult::pass(
+            "LLM endpoint",
+            format!("{endpoint} 도달 가능 (HTTP {status}, 인증/model 미검증)"),
+        ),
     }
 }
 
@@ -997,6 +1081,9 @@ mod tests {
         assert_eq!(value["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
         assert_eq!(value["target"]["kind"], "local");
         assert_eq!(value["target"]["session_id"], "session-1");
+        assert_eq!(value["summary"]["pass"], 1);
+        assert_eq!(value["summary"]["unknown"], 0);
+        assert_eq!(value["summary"]["total"], 1);
         assert_eq!(value["checks"][0]["id"], "config_file");
     }
 
@@ -1008,6 +1095,15 @@ mod tests {
 
         let error = load_config_for_doctor(&path).unwrap_err();
         assert!(error.to_string().contains("TOML parse error"));
+    }
+
+    #[test]
+    fn config_failure_marks_dependent_checks_unknown() {
+        let checks = config_dependent_unknowns();
+        assert_eq!(checks.len(), 4);
+        assert!(checks.iter().all(|check| check.status == Status::Unknown));
+        assert!(checks.iter().any(|check| check.id == "llm_endpoint"));
+        assert!(checks.iter().any(|check| check.id == "provider_config"));
     }
 
     #[tokio::test]
@@ -1198,6 +1294,20 @@ mod tests {
         assert!(result.detail.contains("retire"));
         let hint = result.fix_hint.unwrap();
         assert!(hint.contains("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn llm_endpoint_404_is_warn_not_pass() {
+        let result = classify_endpoint_response("https://example.test/v1/chat/completions", 404);
+        assert_eq!(result.status, Status::Warn);
+        assert!(result.detail.contains("경로 없음"));
+    }
+
+    #[test]
+    fn llm_endpoint_auth_response_proves_reachability_only() {
+        let result = classify_endpoint_response("https://example.test/v1/chat/completions", 401);
+        assert_eq!(result.status, Status::Pass);
+        assert!(result.detail.contains("인증/model 미검증"));
     }
 
     /// 이 테스트가 지키는 것: 셸에만 설정하고 unit에는 빠뜨린 상태를 doctor가 짚어 주는 것.

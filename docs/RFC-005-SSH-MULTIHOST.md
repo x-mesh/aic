@@ -32,13 +32,17 @@
 ### 1.1 Goals (MVP)
 - `/diagnose @group` · `/diagnose --host user@host`로 N개 원격 호스트에서 probe를 병렬 실행하고,
   호스트별 카드를 chat 로그에 표시(severity-sort + collapsed ok).
+- CLI의 관리 대상 진입점은 `aic diagnose --host <name|@group|user@host[:port]> [증상]`이다.
+  원격에서 `aic diagnose --no-analyze --json`만 실행하며, SSH 전송 실패·유효하지 않은 payload·
+  wall-clock 미완료를 정상 진단과 분리한 버전드 envelope로 집계하고 batch audit에 기록한다.
 - read-only `run_command`도 같은 흐름에서 멀티호스트 허용(§4.3 tokenizer 화이트리스트 + 경로 allowlist 통과).
 - 부분 실패에 대해 `continue-and-report` + 8종 상태 태그(§4.4)로 원인을 즉시 식별 가능하게 한다.
 - 멀티호스트 명령은 `batch_id` 단위 audit + daily segment(§4.6)로 추적·검증 가능하게 한다.
 
 ### 1.2 Non-Goals
 - mutation · `write_file` · `edit_file`의 멀티호스트 흐름 → **하드 차단**. 별도 후속 RFC.
-- 원격 `aic` 바이너리 사전 배포(zero-agent 원칙). aic는 로컬에만.
+- 원격 `aic` 자동 배포·설치. `--host` 진단은 aic가 이미 설치된 관리 대상만 지원하며,
+  미설치 호스트는 원격 명령 실패로 명시한다.
 - 원격 호스트에서 daemon(aicd) RPC.
 - **MFA(keyboard-interactive) 호스트의 멀티호스트 지원** — `BatchMode=yes` 아키텍처와 양립 불가(red-team U3 잔존). MFA 호스트는 단일 호스트 흐름으로 사용.
 - Ansible inventory / Kubernetes context 직접 통합 — 후속 옵션.

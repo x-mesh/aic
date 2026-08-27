@@ -449,6 +449,13 @@ enum Commands {
         /// 사용할 provider 이름(config default 대신).
         #[arg(long)]
         provider: Option<String>,
+        /// 등록 host, @group 또는 user@host[:port]에서 read-only 진단을 병렬 실행한다.
+        /// 원격에서는 LLM을 호출하지 않고 aic diagnose --no-analyze --json만 실행한다.
+        #[arg(long, value_name = "HOST|@GROUP")]
+        host: Option<String>,
+        /// ad-hoc/등록 호스트의 SSH identity file을 이 실행에서만 덮어쓴다.
+        #[arg(short = 'i', long, requires = "host")]
+        identity_file: Option<PathBuf>,
     },
     /// RCA workspace 관리 — incident id 아래 evidence/timeline/report를 영속 저장한다.
     Rca {
@@ -1426,7 +1433,25 @@ async fn main() {
             name,
             json,
             provider,
+            host,
+            identity_file,
         }) => {
+            if let Some(target) = host {
+                if follow_up
+                    || kernel
+                    || bundle
+                    || name.is_some()
+                    || provider.is_some()
+                    || cli.provider.is_some()
+                {
+                    eprintln!(
+                        "원격 diagnose는 LLM 분석을 하지 않으며 --follow-up/--kernel/--bundle/--name/--provider와 함께 사용할 수 없습니다"
+                    );
+                    std::process::exit(2);
+                }
+                handle_remote_diagnose(target, symptom, identity_file, json).await;
+                return;
+            }
             if let Err(e) = handle_diagnose_cli(
                 symptom,
                 no_analyze,
@@ -4204,6 +4229,148 @@ fn print_host_detail(inv: &aic_client::agent::hosts::Inventory, name: &str) {
         for w in &inv.ssh_config_warnings {
             println!("  · {w}");
         }
+    }
+}
+
+/// 원격 관리 대상에서 결정적 read-only diagnose를 fan-out하고 버전드 결과를 집계한다.
+/// exit code는 전 호스트 성공 0, 일부 실패 1, wall-clock timeout 2다.
+async fn handle_remote_diagnose(
+    target: String,
+    symptom: Vec<String>,
+    identity_file: Option<PathBuf>,
+    json: bool,
+) {
+    use aic_client::agent::hosts::{parse_ad_hoc, Inventory};
+    use aic_client::agent::remote::diagnose::{command, RemoteDiagnosisReport};
+    use aic_client::agent::remote::{run_fanout, SshProcessExecutor};
+
+    let inv = match Inventory::load() {
+        Ok(inv) => inv,
+        Err(error) => {
+            eprintln!("인벤토리 로드 실패: {error:#}");
+            std::process::exit(2);
+        }
+    };
+    let mut hosts = if target.starts_with('@') || inv.host(&target).is_some() {
+        match inv.resolve_pattern(&target) {
+            Ok(hosts) => hosts.into_iter().cloned().collect::<Vec<_>>(),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(host) = parse_ad_hoc(&target) {
+        vec![host]
+    } else {
+        eprintln!(
+            "host not found: {target}\n인벤토리 등록명, @group 또는 user@host[:port] 형식을 사용하세요"
+        );
+        std::process::exit(1);
+    };
+    if let Some(identity_file) = identity_file {
+        for host in &mut hosts {
+            host.identity_file = Some(identity_file.clone());
+        }
+    }
+
+    let symptom_text = {
+        let joined = symptom.join(" ");
+        let trimmed = joined.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let remote_command = match command(&symptom) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    let batch_id = format!(
+        "diagnose-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0)
+    );
+    let executor = SshProcessExecutor::new(batch_id.clone()).with_timeout(
+        std::time::Duration::from_secs(u64::from(inv.concurrency.per_host_timeout_secs)),
+    );
+    let mut audit = match dirs::home_dir().map(|home| home.join(".aic").join("audit")) {
+        Some(directory) => {
+            match aic_client::agent::audit_batch::BatchAppender::open(directory, batch_id) {
+                Ok(mut appender) => {
+                    let names = hosts
+                        .iter()
+                        .map(|host| host.name.clone())
+                        .collect::<Vec<_>>();
+                    if let Err(error) = appender.batch_start("diagnose", &target, &names) {
+                        eprintln!("원격 diagnose audit 시작 기록 실패: {error:#}");
+                    }
+                    Some(appender)
+                }
+                Err(error) => {
+                    eprintln!("원격 diagnose audit 열기 실패: {error:#}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let result = run_fanout(&executor, &hosts, &remote_command, &inv.concurrency).await;
+    if let Some(appender) = audit.as_mut() {
+        for remote in &result.results {
+            if let Err(error) = appender.host_result(
+                &remote.host,
+                remote.status.label(),
+                "aic diagnose --no-analyze --json",
+                remote.duration_ms,
+                remote.exit_code,
+                remote.truncated,
+                remote.redacted,
+            ) {
+                eprintln!("원격 diagnose host audit 기록 실패: {error:#}");
+            }
+        }
+        if result.wall_timed_out {
+            if let Err(error) =
+                appender.batch_cancelled(result.results.len(), result.incomplete.clone())
+            {
+                eprintln!("원격 diagnose timeout audit 기록 실패: {error:#}");
+            }
+        } else {
+            let counts = result.counts();
+            let stats = aic_client::agent::audit_batch::BatchStats {
+                ok: counts.ok,
+                ok_warn: counts.ok_warn,
+                unreachable: counts.unreachable,
+                timeout: counts.timeout,
+                auth_fail: counts.auth_fail,
+                proxy_fail: counts.proxy_fail,
+                remote_err: counts.remote_err,
+                host_key_mismatch: counts.host_key_mismatch,
+                cancelled: counts.cancelled,
+            };
+            if let Err(error) = appender.batch_end(stats) {
+                eprintln!("원격 diagnose 완료 audit 기록 실패: {error:#}");
+            }
+        }
+    }
+    let report = RemoteDiagnosisReport::from_fanout(target, symptom_text, result);
+
+    if json {
+        match serde_json::to_string_pretty(&report) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("원격 diagnosis JSON 직렬화 실패: {error}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        print!("{}", report.render_text());
+    }
+
+    if !report.all_succeeded() {
+        std::process::exit(if report.wall_timed_out { 2 } else { 1 });
     }
 }
 
@@ -10431,6 +10598,30 @@ mod tests {
                 assert!(symptom.is_empty() && json);
             }
             _ => panic!("expected Diagnose subcommand"),
+        }
+
+        let remote = Cli::try_parse_from([
+            "aic",
+            "diagnose",
+            "high",
+            "cpu",
+            "--host",
+            "@web-tier",
+            "--json",
+        ])
+        .unwrap();
+        match remote.command {
+            Some(Commands::Diagnose {
+                symptom,
+                host,
+                json,
+                ..
+            }) => {
+                assert_eq!(symptom, vec!["high".to_string(), "cpu".to_string()]);
+                assert_eq!(host.as_deref(), Some("@web-tier"));
+                assert!(json);
+            }
+            _ => panic!("expected remote Diagnose subcommand"),
         }
     }
 
