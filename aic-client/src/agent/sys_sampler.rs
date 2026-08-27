@@ -1,10 +1,10 @@
 //! `aic chat` status bar용 시스템 지표 샘플러 — sysinfo crate로 in-process 수집.
 //!
-//! load average와 memory는 순간값이지만 **disk i/o는 누적 카운터의 delta**다. sysinfo의
-//! `DiskUsage::read_bytes`/`written_bytes`가 마지막 refresh 이후 delta를 자동 계산하므로,
-//! `Disks` 인스턴스를 세션 내내 **재사용**해야 정확하다(매번 새로 만들면 0). 따라서 샘플러는
-//! 상태를 들고 다닌다. SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
+//! load average와 memory는 순간값이지만 **disk i/o는 device별 누적 카운터의 delta**다. mount별
+//! 합산은 같은 backing device를 중복 집계하므로 공통 `DiskIoTracker`가 identity별 기준선을 보존한다.
+//! SRE 진단 probe catalog(`agent::probes`)와는 별개 경로다(그쪽은 one-shot 명령).
 
+use aic_common::disk_io::{canonical_device_identity, DiskIoTracker};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 pub(crate) struct SysSampler {
     sys: System,
     disks: Disks,
+    disk_io: DiskIoTracker<std::ffi::OsString>,
     networks: Networks,
     last: Instant,
     /// **마지막으로 cpu를 refresh한 시각** — `new()`의 기준선 refresh를 포함한다. cpu%는 직전 refresh와의
@@ -289,6 +290,7 @@ impl SysSampler {
         Self {
             sys,
             disks: Disks::new_with_refreshed_list(),
+            disk_io: DiskIoTracker::new(),
             networks: Networks::new_with_refreshed_list(),
             last: Instant::now(),
             // 위 refresh_cpu_usage()가 델타의 **기준선**이다 — 그 시각을 기록해 둔다. 덕분에 첫 sample()도
@@ -356,10 +358,17 @@ impl SysSampler {
         // 0으로 나누기 방지(연속 호출 간 간격이 아주 짧을 수 있음). i/o delta 전용 — cpu 판정과는
         // 기준이 다르다(위 참고: `last`는 sample() 끝에 갱신돼 refresh 시간까지 포함한다).
         let elapsed = self.last.elapsed().as_secs_f64().max(0.001);
-        let (read, write) = self.disks.list().iter().fold((0u64, 0u64), |acc, d| {
-            let u = d.usage();
-            (acc.0 + u.read_bytes, acc.1 + u.written_bytes)
-        });
+        let disk_io = self
+            .disk_io
+            .sample(self.disks.list().iter().map(|disk| {
+                let usage = disk.usage();
+                (
+                    canonical_device_identity(disk.name()),
+                    usage.total_read_bytes,
+                    usage.total_written_bytes,
+                )
+            }))
+            .unwrap_or_default();
         // networks.refresh() 이후 received()/transmitted()는 마지막 refresh 이후 delta.
         let (rx, tx) = self.networks.iter().fold((0u64, 0u64), |acc, (_, data)| {
             (acc.0 + data.received(), acc.1 + data.transmitted())
@@ -389,8 +398,9 @@ impl SysSampler {
             swap_total: self.sys.total_swap(),
             disk_avail,
             disk_total,
-            disk_read_bps: (read as f64 / elapsed) as u64,
-            disk_write_bps: (write as f64 / elapsed) as u64,
+            // `SysMetrics` 계약은 non-optional이므로 tracker의 기준선 sample은 0 bps로 노출한다.
+            disk_read_bps: (disk_io.read_bytes as f64 / elapsed) as u64,
+            disk_write_bps: (disk_io.written_bytes as f64 / elapsed) as u64,
             net_rx_bps: (rx as f64 / elapsed) as u64,
             net_tx_bps: (tx as f64 / elapsed) as u64,
             top_mem_proc: None,
@@ -1931,6 +1941,8 @@ mod tests {
         // 실제 시스템 호출 — 패닉 없이 수치를 반환하는지만 확인(값 범위는 환경 의존).
         let mut s = SysSampler::new();
         let m = s.sample();
+        assert_eq!(m.disk_read_bps, 0, "첫 disk sample은 기준선이어야 함");
+        assert_eq!(m.disk_write_bps, 0, "첫 disk sample은 기준선이어야 함");
         assert!(
             m.mem_total > 0,
             "mem_total should be positive on a real host"
