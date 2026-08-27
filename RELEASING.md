@@ -90,6 +90,7 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 | `HOMEBREW_TAP_GITHUB_TOKEN: required` | org/repo secret 미등록. 위 사전 준비 확인. |
 | Formula가 안 갱신됨 | secret 권한 부족(Contents write). tap push 로그 확인. |
 | **darwin 빌드 `undefined symbol: _SecKeychain*`/`_IOBSDNameMatching`** | zig 링커가 macOS 프레임워크(Security/CoreFoundation/IOKit)를 못 링크. **darwin은 반드시 native `cargo build`**(release.yml이 이미 그렇게 함). zigbuild로 darwin을 빌드하면 재발한다 — v0.27.0~v0.28.0에서 이걸로 5번 실패했다. |
+| **linux zigbuild `unsupported linker arg: --fix-cortex-a53-843419`** | rustc가 새 링커 인자를 넘기는데 pin된 zig가 그걸 모른다. release.yml은 `dtolnay/rust-toolchain@stable`(자동 최신)을 쓰면서 zig/cargo-zigbuild만 고정하므로, stable이 올라가면 이 짝이 어긋난다 — rustc 1.98 + zig 0.13.0/cargo-zigbuild 0.20.1에서 실측(v0.36.0). 해결: 두 pin을 함께 올린다(현재 zig 0.16.0 + cargo-zigbuild 0.23.0). 검증은 CI 왕복 대신 로컬에서 `cargo zigbuild --release --target aarch64-unknown-linux-gnu …`로 재현하는 게 빠르다. |
 | linux zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. `mlugg/setup-zig` 버전과 `cargo-zigbuild --version`을 함께 bump. |
 | **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 ref_name이 브랜치라 어긋난다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
 | Release notes가 휑함 | notes는 CHANGELOG의 `## [X.Y.Z]` 섹션에서 추출된다. CHANGELOG에 해당 버전 섹션이 있는지 확인. |
