@@ -224,9 +224,9 @@ enum Commands {
         /// `--fix`와 함께 사용. 실제 변경 없이 적용될 작업만 출력.
         #[arg(long)]
         dry_run: bool,
-        /// opt-in tool-calling live probe (GA Gate G1). 설정된 provider에 최소 tool spec으로
-        /// `send_messages`를 1회 보내 ok/unsupported/degraded/error를 진단한다.
-        /// credential/network 없으면 명확히 skip/fail. 세션 시작 시 자동 수행하지 않는다.
+        /// opt-in tool-calling live probe (GA Gate G1). 일반 doctor 점검을 함께 실행하고,
+        /// 설정된 provider에 최소 tool spec을 1회 보내 결과를 동일한 report에 추가한다.
+        /// credential/network 없으면 fail로 기록한다. 세션 시작 시 자동 수행하지 않는다.
         #[arg(long)]
         probe_tools: bool,
     },
@@ -1313,11 +1313,11 @@ async fn main() {
             probe_tools,
         }) => {
             if probe_tools {
-                handle_doctor_probe_tools(cli.provider).await;
+                handle_doctor(json, session, cli.provider, true).await;
             } else if fix {
                 handle_doctor_fix(dry_run).await;
             } else {
-                handle_doctor(json, session).await;
+                handle_doctor(json, session, cli.provider, false).await;
             }
         }
         Some(Commands::Status {
@@ -3391,7 +3391,7 @@ async fn handle_setup(shell: Option<String>) {
 
     // 4) doctor
     println!("{COL_CYAN}4/4{COL_RESET} 환경 진단 (doctor)...\n");
-    handle_doctor(false, None).await;
+    handle_doctor(false, None, None, false).await;
 
     println!("\n{COL_GREEN}{COL_BOLD}✔ setup 완료{COL_RESET}");
     println!("\n다음 단계:");
@@ -5454,16 +5454,20 @@ fn doctor_fix_stale_artifacts(dry_run: bool) {
 /// `aic doctor --probe-tools` — opt-in tool-calling live probe (GA Gate G1-b).
 ///
 /// 설정된 provider에 최소 tool spec으로 `send_messages`를 1회 보내 결과를 진단한다.
-/// ok / unsupported / degraded / error / skip(credential 없음)으로 분류해 출력한다.
+/// 결과를 일반 doctor check와 같은 PASS/WARN/FAIL 계약으로 반환한다.
 /// 세션 시작 시 자동 수행하지 않으며, 이 명령으로만 실제 네트워크 호출이 발생한다.
-async fn handle_doctor_probe_tools(provider_override: Option<String>) {
+async fn probe_doctor_tools(provider_override: Option<String>) -> aic_client::doctor::CheckResult {
     use aic_client::agent::{ChatMessage, ChatResponse, ToolSpec};
 
     let config = match ConfigManager::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config 로드 실패: {e}");
-            std::process::exit(2);
+            return aic_client::doctor::CheckResult::fail_with_id(
+                "llm_tool_calling",
+                "LLM tool-calling",
+                format!("config 로드 실패: {e}"),
+                "aic config로 설정 파일을 점검하세요",
+            );
         }
     };
     // CLI --provider override를 config(default_provider)에 실제 반영 → probe가 override provider를 검증.
@@ -5471,8 +5475,12 @@ async fn handle_doctor_probe_tools(provider_override: Option<String>) {
         match apply_provider_override(config, provider_override.as_deref()) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(2);
+                return aic_client::doctor::CheckResult::fail_with_id(
+                    "llm_tool_calling",
+                    "LLM tool-calling",
+                    e.to_string(),
+                    "provider 이름과 설정을 확인하세요",
+                );
             }
         };
     let model_name = config
@@ -5483,16 +5491,15 @@ async fn handle_doctor_probe_tools(provider_override: Option<String>) {
         .unwrap_or_else(|| "(provider default)".to_string());
     let dispatcher = LlmDispatcher::from_config(config.llm.clone());
 
-    println!("tool-calling live probe");
-    println!("  provider: {provider_name}");
-    println!("  model: {model_name}");
-
     if !dispatcher.supports_tool_calling() {
-        println!(
-            "  result: unsupported — provider_type가 OpenAI 호환이 아님(정적 판정). \
-             `aic chat`은 ReplSession(단발 send)으로 폴백합니다."
+        return aic_client::doctor::CheckResult::warn_with_id(
+            "llm_tool_calling",
+            "LLM tool-calling",
+            format!(
+                "provider={provider_name} model={model_name} · provider가 tool-calling을 지원하지 않음"
+            ),
+            "일반 대화 fallback을 사용하거나 tool-calling 지원 provider를 선택하세요",
         );
-        return;
     }
 
     // 최소 tool spec + user 메시지로 1회 호출(probe 전용 — 모델이 호출할 필요 없음).
@@ -5504,57 +5511,90 @@ async fn handle_doctor_probe_tools(provider_override: Option<String>) {
     let msgs = vec![ChatMessage::User("reply with: ok".to_string())];
 
     match dispatcher.send_messages(&msgs, &tools).await {
-        Ok(ChatResponse::Text(_)) => {
-            println!("  result: ok — provider가 `tools` 파라미터를 수락하고 텍스트로 응답함.");
-        }
-        Ok(ChatResponse::ToolCalls(_)) => {
-            println!("  result: ok — provider가 tool_calls를 반환함(tool-calling 동작).");
-        }
+        Ok(ChatResponse::Text(_)) => aic_client::doctor::CheckResult::pass_with_id(
+            "llm_tool_calling",
+            "LLM tool-calling",
+            format!(
+                "provider={provider_name} model={model_name} · tools 파라미터 수락 및 응답 성공"
+            ),
+        ),
+        Ok(ChatResponse::ToolCalls(_)) => aic_client::doctor::CheckResult::pass_with_id(
+            "llm_tool_calling",
+            "LLM tool-calling",
+            format!("provider={provider_name} model={model_name} · tool_calls 응답 성공"),
+        ),
         Err(aic_common::AicError::ApiKeyMissing { provider }) => {
-            println!(
-                "  result: skip — API key 미설정({provider}). 네트워크 호출 없이 종료. \
-                 credential 설정 후 다시 실행하세요."
-            );
+            aic_client::doctor::CheckResult::fail_with_id(
+                "llm_tool_calling",
+                "LLM tool-calling",
+                format!("API key 미설정: {provider}"),
+                "credential을 설정한 뒤 다시 실행하세요",
+            )
         }
-        Err(aic_common::AicError::ConfigError(m)) => {
-            println!("  result: unsupported — {m}");
-        }
+        Err(aic_common::AicError::ConfigError(m)) => aic_client::doctor::CheckResult::warn_with_id(
+            "llm_tool_calling",
+            "LLM tool-calling",
+            format!("지원하지 않음: {m}"),
+            "tool-calling 지원 provider를 선택하세요",
+        ),
         Err(aic_common::AicError::LlmApiError { status, message }) => {
             if matches!(status, 400 | 404 | 405 | 415 | 422 | 501) {
-                println!(
-                    "  result: degraded — provider가 `tools`를 거부(HTTP {status}). \
-                     `aic chat`은 런타임에 일반 대화로 degrade합니다."
-                );
+                aic_client::doctor::CheckResult::warn_with_id(
+                    "llm_tool_calling",
+                    "LLM tool-calling",
+                    format!("provider가 tools를 거부함 (HTTP {status})"),
+                    "일반 대화 fallback을 사용하거나 provider 설정을 확인하세요",
+                )
             } else if status == 0 {
-                println!("  result: error — 네트워크 오류: {message} (연결/endpoint 확인).");
+                aic_client::doctor::CheckResult::fail_with_id(
+                    "llm_tool_calling",
+                    "LLM tool-calling",
+                    format!("네트워크 오류: {message}"),
+                    "연결과 endpoint를 확인하세요",
+                )
             } else {
-                println!("  result: error — HTTP {status}: {message} (auth/endpoint 확인).");
+                aic_client::doctor::CheckResult::fail_with_id(
+                    "llm_tool_calling",
+                    "LLM tool-calling",
+                    format!("HTTP {status}: {message}"),
+                    "인증, model과 endpoint를 확인하세요",
+                )
             }
         }
-        Err(e) => {
-            println!("  result: error — {e}");
-        }
+        Err(e) => aic_client::doctor::CheckResult::fail_with_id(
+            "llm_tool_calling",
+            "LLM tool-calling",
+            e.to_string(),
+            "provider 설정과 연결을 확인하세요",
+        ),
     }
 }
 
-async fn handle_doctor(json: bool, session: Option<String>) {
+async fn handle_doctor(
+    json: bool,
+    session: Option<String>,
+    provider_override: Option<String>,
+    probe_tools: bool,
+) {
     let socket = resolve_socket(session.as_deref());
-    let results = aic_client::doctor::run_all_checks(&socket).await;
+    let mut results =
+        aic_client::doctor::run_all_checks_for_provider(&socket, provider_override.as_deref())
+            .await;
+    if probe_tools {
+        results.push(probe_doctor_tools(provider_override).await);
+    }
     // Central Store 섹션 (R14.6): 세션 socket 이 실제로 존재할 때만 GetMetrics 를 시도.
     // 없거나 실패하면 report 내부의 session_metrics_error 에 기록된다.
     let session_socket: Option<&std::path::Path> =
         if socket.exists() { Some(&socket) } else { None };
     let central_store = aic_client::doctor::probe_central_store_default(session_socket).await;
     if json {
-        #[derive(serde::Serialize)]
-        struct DoctorReport<'a> {
-            checks: &'a [aic_client::doctor::CheckResult],
-            central_store: &'a aic_client::doctor::CentralStoreReport,
-        }
-        let report = DoctorReport {
-            checks: &results,
-            central_store: &central_store,
-        };
+        let report = aic_client::doctor::DoctorReport::local(
+            session,
+            socket.clone(),
+            results.clone(),
+            central_store.clone(),
+        );
         match serde_json::to_string_pretty(&report) {
             Ok(s) => println!("{s}"),
             Err(e) => {

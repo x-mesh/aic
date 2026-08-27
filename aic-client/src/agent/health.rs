@@ -17,6 +17,9 @@ pub(crate) const HEALTH_PROBE_IDS: &[&str] = &[
     "proc_states",
     "failed_units",
     "dmesg_oom",
+    "ip",
+    "route",
+    "dns_resolver",
 ];
 pub(crate) const HEALTH_PROBE_TIMEOUT_SECS: u64 = 3;
 
@@ -117,6 +120,9 @@ const PROBE_AXES: &[(&str, &str)] = &[
     ("proc_states", "processes"),
     ("failed_units", "services"),
     ("dmesg_oom", "kernel_oom"),
+    ("ip", "network_interfaces"),
+    ("route", "network_routes"),
+    ("dns_resolver", "dns_configuration"),
 ];
 
 impl HealthReport {
@@ -447,5 +453,18 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e["id"] == "M:cpu"));
+    }
+
+    #[test]
+    fn health_contract_covers_network_configuration() {
+        let report = HealthReport::from_observations(Some(&metrics()), &healthy_snapshot());
+        for axis in ["network_interfaces", "network_routes", "dns_configuration"] {
+            let coverage = report
+                .coverage
+                .iter()
+                .find(|coverage| coverage.axis == axis)
+                .unwrap_or_else(|| panic!("missing health axis: {axis}"));
+            assert_eq!(coverage.state, HealthState::Healthy);
+        }
     }
 }

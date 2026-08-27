@@ -26,6 +26,8 @@ use std::time::Duration;
 /// 단일 체크 결과.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CheckResult {
+    /// 스크립트가 표시 이름과 무관하게 사용할 수 있는 안정 식별자.
+    pub id: String,
     pub name: String,
     pub status: Status,
     pub detail: String,
@@ -40,26 +42,115 @@ pub enum Status {
     Fail,
 }
 
-impl CheckResult {
-    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+pub const DOCTOR_REPORT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DoctorTarget {
+    pub kind: String,
+    pub session_id: Option<String>,
+    pub socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DoctorReport {
+    pub schema_version: u32,
+    pub observed_at: chrono::DateTime<chrono::Utc>,
+    pub target: DoctorTarget,
+    pub checks: Vec<CheckResult>,
+    pub central_store: CentralStoreReport,
+}
+
+impl DoctorReport {
+    pub fn local(
+        session_id: Option<String>,
+        socket_path: PathBuf,
+        checks: Vec<CheckResult>,
+        central_store: CentralStoreReport,
+    ) -> Self {
         Self {
+            schema_version: DOCTOR_REPORT_SCHEMA_VERSION,
+            observed_at: chrono::Utc::now(),
+            target: DoctorTarget {
+                kind: "local".to_string(),
+                session_id,
+                socket_path,
+            },
+            checks,
+            central_store,
+        }
+    }
+}
+
+impl CheckResult {
+    pub fn pass_with_id(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
             name: name.into(),
             status: Status::Pass,
             detail: detail.into(),
             fix_hint: None,
         }
     }
-    fn warn(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+
+    pub fn warn_with_id(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
         Self {
+            id: id.into(),
             name: name.into(),
             status: Status::Warn,
             detail: detail.into(),
             fix_hint: Some(fix.into()),
         }
     }
-    fn fail(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+
+    pub fn fail_with_id(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        fix: impl Into<String>,
+    ) -> Self {
         Self {
+            id: id.into(),
             name: name.into(),
+            status: Status::Fail,
+            detail: detail.into(),
+            fix_hint: Some(fix.into()),
+        }
+    }
+
+    fn pass(name: impl Into<String>, detail: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            id: check_id(&name).to_string(),
+            name,
+            status: Status::Pass,
+            detail: detail.into(),
+            fix_hint: None,
+        }
+    }
+    fn warn(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            id: check_id(&name).to_string(),
+            name,
+            status: Status::Warn,
+            detail: detail.into(),
+            fix_hint: Some(fix.into()),
+        }
+    }
+    fn fail(name: impl Into<String>, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            id: check_id(&name).to_string(),
+            name,
             status: Status::Fail,
             detail: detail.into(),
             fix_hint: Some(fix.into()),
@@ -67,17 +158,44 @@ impl CheckResult {
     }
 }
 
+fn check_id(name: &str) -> &'static str {
+    if name.starts_with("provider '") {
+        return "provider_config";
+    }
+    match name {
+        "config 파일" => "config_file",
+        "UDS 소켓 경로" => "session_socket",
+        "aic-session 데몬" => "session_daemon",
+        "aicd supervisor" => "aicd_supervisor",
+        "런타임 디렉토리" => "runtime_directory",
+        "rca-agent" => "rca_agent",
+        "셸 hooks" => "shell_hooks",
+        "LLM endpoint" => "llm_endpoint",
+        "keychain" => "keychain",
+        "audit log" => "audit_log",
+        _ => "unknown",
+    }
+}
+
 /// 모든 체크를 실행하고 결과 리스트를 반환한다.
 /// `socket`은 호출자(main.rs::resolve_socket)가 결정한 활성 세션 경로를 그대로 사용한다.
 /// status / doctor / top이 동일한 우선순위 체인을 공유해야 H1 회귀가 재발하지 않는다.
 pub async fn run_all_checks(socket: &std::path::Path) -> Vec<CheckResult> {
+    run_all_checks_for_provider(socket, None).await
+}
+
+pub async fn run_all_checks_for_provider(
+    socket: &std::path::Path,
+    provider_override: Option<&str>,
+) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
-    let config = match ConfigManager::load() {
+    let config_path = ConfigManager::config_path();
+    let config = match load_config_for_doctor(&config_path) {
         Ok(c) => {
             results.push(CheckResult::pass(
                 "config 파일",
-                format!("파싱 성공 ({})", ConfigManager::config_path().display()),
+                format!("파싱 성공 ({})", config_path.display()),
             ));
             Some(c)
         }
@@ -91,22 +209,48 @@ pub async fn run_all_checks(socket: &std::path::Path) -> Vec<CheckResult> {
         }
     };
 
+    let config = config.and_then(|mut cfg| {
+        if let Some(name) = provider_override {
+            if !cfg.llm.providers.contains_key(name) {
+                results.push(CheckResult::fail_with_id(
+                    "provider_config",
+                    format!("provider '{name}'"),
+                    format!("--provider '{name}'이 [llm.providers]에 정의되지 않음"),
+                    "등록된 provider 이름을 사용하거나 aic config에서 추가하세요",
+                ));
+                return None;
+            }
+            cfg.llm.default_provider = name.to_string();
+        }
+        Some(cfg)
+    });
+
     if let Some(cfg) = config.as_ref() {
         results.push(check_provider(cfg));
-        results.push(check_socket_path(socket));
-        results.push(check_daemon_alive(socket).await);
-        results.push(check_aicd_supervisor().await);
-        results.push(check_runtime_dir_contract());
         results.push(check_rca_agent(&cfg.rca_agent).await);
-        results.push(check_shell_hooks());
         if let Some(provider) = cfg.llm.providers.get(&cfg.llm.default_provider) {
             results.push(check_llm_endpoint(provider).await);
             results.push(check_keychain_access(cfg, provider));
         }
-        results.push(check_audit_log());
     }
 
+    // config가 깨져도 독립적으로 확인할 수 있는 런타임 상태는 계속 수집한다.
+    results.push(check_socket_path(socket));
+    results.push(check_daemon_alive(socket).await);
+    results.push(check_aicd_supervisor().await);
+    results.push(check_runtime_dir_contract());
+    results.push(check_shell_hooks());
+    results.push(check_audit_log());
+
     results
+}
+
+fn load_config_for_doctor(path: &Path) -> anyhow::Result<AppConfig> {
+    if !path.exists() {
+        return Ok(ConfigManager::default_config());
+    }
+    let content = std::fs::read_to_string(path)?;
+    toml::from_str(&content).map_err(Into::into)
 }
 
 fn check_keychain_access(cfg: &AppConfig, provider: &ProviderConfig) -> CheckResult {
@@ -815,10 +959,70 @@ mod tests {
     #[test]
     fn check_result_pass_constructor() {
         let r = CheckResult::pass("name", "detail");
+        assert_eq!(r.id, "unknown");
         assert_eq!(r.status, Status::Pass);
         assert_eq!(r.name, "name");
         assert_eq!(r.detail, "detail");
         assert!(r.fix_hint.is_none());
+    }
+
+    #[test]
+    fn check_result_uses_stable_ids() {
+        assert_eq!(CheckResult::pass("config 파일", "ok").id, "config_file");
+        assert_eq!(
+            CheckResult::pass("provider 'custom'", "ok").id,
+            "provider_config"
+        );
+    }
+
+    #[test]
+    fn doctor_report_serializes_versioned_target_and_check_ids() {
+        let report = DoctorReport::local(
+            Some("session-1".to_string()),
+            PathBuf::from("/tmp/aic/session-1.sock"),
+            vec![CheckResult::pass("config 파일", "ok")],
+            CentralStoreReport {
+                flag_resolved: false,
+                flag_source: "phase-default".to_string(),
+                phase: "phase-3_4".to_string(),
+                attach_socket_path: PathBuf::from("/tmp/aic/aicd-attach.sock"),
+                attach_connected: false,
+                dropped_bytes: 0,
+                attach_reconnect_total: 0,
+                session_metrics_error: None,
+            },
+        );
+
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["schema_version"], DOCTOR_REPORT_SCHEMA_VERSION);
+        assert_eq!(value["target"]["kind"], "local");
+        assert_eq!(value["target"]["session_id"], "session-1");
+        assert_eq!(value["checks"][0]["id"], "config_file");
+    }
+
+    #[test]
+    fn doctor_config_load_reports_invalid_toml_instead_of_falling_back() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join("config.toml");
+        std::fs::write(&path, "this is not valid toml [[[").unwrap();
+
+        let error = load_config_for_doctor(&path).unwrap_err();
+        assert!(error.to_string().contains("TOML parse error"));
+    }
+
+    #[tokio::test]
+    async fn doctor_provider_override_reports_unknown_provider() {
+        let results = run_all_checks_for_provider(
+            Path::new("/tmp/aic-doctor-provider-override.sock"),
+            Some("does-not-exist"),
+        )
+        .await;
+        let provider = results
+            .iter()
+            .find(|result| result.id == "provider_config")
+            .expect("provider failure should be present");
+        assert_eq!(provider.status, Status::Fail);
+        assert!(provider.detail.contains("does-not-exist"));
     }
 
     #[test]
