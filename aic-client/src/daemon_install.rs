@@ -504,20 +504,15 @@ pub fn current_unit_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::Mutex;
 
-    /// `AIC_RUNTIME_DIR`을 만지는 테스트끼리의 직렬화. 프로세스 전역 상태라 병렬 실행에서
-    /// 서로의 값을 덮어쓴다.
-    static RUNTIME_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::env_lock;
 
     /// 이 테스트가 지키는 것: 명시 런타임 디렉토리가 unit 파일로 넘어가는 것.
     /// 깨지면 systemd가 띄운 aicd와 셸의 `aic`가 서로 다른 디렉토리를 봐, 아무 에러 없이
     /// aicd가 둘 뜬다(중복 기동 방지가 lock으로는 못 잡는 경로다).
     #[test]
     fn unit_files_carry_explicit_runtime_dir() {
-        let _guard = RUNTIME_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         let prev = std::env::var("AIC_RUNTIME_DIR").ok();
 
         std::env::set_var("AIC_RUNTIME_DIR", "/srv/aic-isolated");

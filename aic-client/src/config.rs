@@ -95,15 +95,8 @@ mod tests {
     use aic_common::{LlmConfig, ProviderConfig, ProviderType};
     use proptest::prelude::*;
     use std::collections::HashMap;
-    use std::sync::{Mutex, MutexGuard};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::test_support::env_lock;
 
     #[test]
     fn default_config_has_expected_values() {
@@ -443,9 +436,16 @@ boundary_strategy = { method = "prompt_marker" }
         ) {
             let _guard = env_lock();
             let old = std::env::var("XDG_RUNTIME_DIR").ok();
+            // `AIC_RUNTIME_DIR`은 관례 탐색을 통째로 대체하는 명시 계약이라, 남아 있으면
+            // 이 property가 검사하려는 XDG/`/tmp` 규약 자체가 적용되지 않는다.
+            let old_explicit = std::env::var("AIC_RUNTIME_DIR").ok();
+            std::env::remove_var("AIC_RUNTIME_DIR");
             // XDG_RUNTIME_DIR 설정 후 테스트
             std::env::set_var("XDG_RUNTIME_DIR", &xdg_dir);
             let path = ConfigManager::resolve_socket_path(os);
+            if let Some(old_explicit) = old_explicit {
+                std::env::set_var("AIC_RUNTIME_DIR", old_explicit);
+            }
             if let Some(old) = old {
                 std::env::set_var("XDG_RUNTIME_DIR", old);
             } else {
@@ -487,9 +487,16 @@ boundary_strategy = { method = "prompt_marker" }
         fn socket_path_follows_platform_conventions_without_xdg(os in arb_os()) {
             let _guard = env_lock();
             let old = std::env::var("XDG_RUNTIME_DIR").ok();
+            // `AIC_RUNTIME_DIR`이 남아 있으면 경로가 그쪽으로 고정되어 `/tmp/aic-` 규약을
+            // 검사할 수 없다 — 이 변수는 관례 탐색을 끄는 명시 계약이기 때문이다.
+            let old_explicit = std::env::var("AIC_RUNTIME_DIR").ok();
+            std::env::remove_var("AIC_RUNTIME_DIR");
             // XDG_RUNTIME_DIR 미설정 상태에서 테스트
             std::env::remove_var("XDG_RUNTIME_DIR");
             let path = ConfigManager::resolve_socket_path(os);
+            if let Some(old_explicit) = old_explicit {
+                std::env::set_var("AIC_RUNTIME_DIR", old_explicit);
+            }
             if let Some(old) = old {
                 std::env::set_var("XDG_RUNTIME_DIR", old);
             }

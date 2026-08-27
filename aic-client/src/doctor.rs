@@ -809,10 +809,8 @@ async fn check_llm_endpoint(provider: &ProviderConfig) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// `AIC_RUNTIME_DIR`을 만지는 테스트끼리의 직렬화 — 프로세스 전역 상태다.
-    static RUNTIME_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::env_lock;
 
     #[test]
     fn check_result_pass_constructor() {
@@ -1002,9 +1000,7 @@ mod tests {
     /// 이 어긋남은 양쪽 다 "정상"으로 보여 파일 검사로는 안 잡힌다.
     #[test]
     fn runtime_dir_contract_flags_relative_path() {
-        let _guard = RUNTIME_DIR_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = env_lock();
         let prev = std::env::var("AIC_RUNTIME_DIR").ok();
 
         std::env::set_var("AIC_RUNTIME_DIR", "relative/aic");

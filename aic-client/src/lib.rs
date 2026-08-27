@@ -29,6 +29,8 @@ pub mod snapshot_timer;
 pub mod spinner;
 pub mod streaming;
 pub mod term_restore;
+#[cfg(test)]
+mod test_support;
 pub mod top;
 pub mod uds_client;
 pub mod update;
