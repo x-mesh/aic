@@ -52,3 +52,11 @@
 - 중복 구현은 유지보수 비용 2배 + 동작 불일치 위험. 경계를 코드/문서로 고정.
 - aic의 강점(대화형 진단 + bounded Safe probe + audit)과 sre-agent의 강점(상시 통계 감시 +
   기억)은 **상보적**이다. 연동(aic가 sre-agent를 조회)이 통합보다 낫다.
+
+## 다중 클라이언트 점검 후속 계약
+
+원격 점검은 기존 SSH 인벤토리와 fan-out 실행기를 재사용하되, 로컬 doctor/diagnose와 다른
+임시 출력 형식을 추가하지 않는다. 후속 구현은 각 호스트가 동일한 버전드 결과 계약을 반환하고,
+집계 계층은 healthy를 추정하지 않은 채 호스트별 pass/warn/fail/unknown과 미완료 대상을
+그대로 보존해야 한다. 원격 명령은 bounded read-only probe만 허용하며, 인증 실패, timeout,
+host key 불일치는 진단 결과와 구분되는 연결 상태로 보고한다.
