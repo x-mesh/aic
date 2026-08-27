@@ -559,6 +559,7 @@ fn path_matches_aic_session(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::metrics::AicdMetrics;
+    use crate::test_support::runtime_tempdir;
     use std::time::Duration;
 
     fn ctx() -> ControlContext {
@@ -1542,7 +1543,7 @@ mod tests {
     /// 서버가 연결을 끊거나 panic 하지 않음을 확인한다.
     #[tokio::test]
     async fn malformed_ipc_request_returns_graceful_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let c = ctx();
@@ -1591,7 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_and_ping_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         assert!(sock_path.exists());
@@ -1608,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_request_terminates_server() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let c = ctx();

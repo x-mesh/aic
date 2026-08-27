@@ -136,6 +136,7 @@ pub fn current_tty() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::runtime_tempdir;
 
     #[tokio::test]
     async fn send_to_missing_socket_returns_error() {
@@ -221,7 +222,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::watch;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let sock_path = dir.path().join("aicd.sock");
         let server = ControlServer::bind(&sock_path).await.unwrap();
         let registry = SessionRegistry::new();

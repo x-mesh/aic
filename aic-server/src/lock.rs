@@ -498,10 +498,11 @@ fn is_permission_error(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{create_runtime_dir_all, runtime_tempdir};
 
     #[test]
     fn acquire_creates_lock_file_with_pid_and_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let path = dir.path().join("test.pid");
         let _lock = DaemonLock::acquire(&path).expect("acquire 실패");
         assert!(path.exists());
@@ -517,7 +518,7 @@ mod tests {
     fn drop_keeps_lock_file_to_avoid_race() {
         // C1 fix: drop은 의도적으로 unlink하지 않는다 (다른 프로세스의 새 lock 파일을
         // 지우는 race 회피). stale 파일은 다음 acquire 시 PID 검사로 정리된다.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let path = dir.path().join("test.pid");
         {
             let _lock = DaemonLock::acquire(&path).unwrap();
@@ -752,10 +753,10 @@ mod tests {
             ("run-user/aicd.pid", "tmp/aicd.pid"),
             ("tmp/aicd.pid", "run-user/aicd.pid"),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = runtime_tempdir();
             let canonical = dir.path().join(canonical_rel);
             let alt = dir.path().join(alt_rel);
-            std::fs::create_dir_all(alt.parent().unwrap()).unwrap();
+            create_runtime_dir_all(alt.parent().unwrap());
 
             // 먼저 뜬 aicd — alt를 자기 정규 경로로 삼은 다른 프로세스.
             let holder = spawn_lock_holder(&alt);
@@ -872,7 +873,7 @@ mod tests {
     fn stale_lock_file_is_recovered() {
         // 죽은 PID(자기 자신은 아니지만 프로세스가 없는 PID) 시뮬레이션:
         // 파일에 0x7FFF_FFFE를 PID로 적어두면 stale로 인식되어 정리되어야 함.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = runtime_tempdir();
         let path = dir.path().join("test.pid");
 
         std::fs::write(&path, "2147483646\n").unwrap();

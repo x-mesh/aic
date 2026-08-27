@@ -78,6 +78,19 @@ async fn spawn_mock_collector(logs_tx: Bodies, metrics_tx: Bodies) -> String {
 }
 
 /// TempDir을 반드시 살려서 반환한다 — drop되면 spool 디렉토리가 사라진다.
+/// 런타임 디렉토리로 바로 쓸 수 있는 0700 tempdir.
+///
+/// `tempfile::tempdir()`는 umask를 따라 보통 0755로 만들어지는데, 소켓의 부모 디렉토리는
+/// `ensure_runtime_dir`이 0700만 신뢰한다(`/tmp` 선점 방어). 검사를 푸는 대신 테스트가
+/// 실제 런타임 디렉토리와 같은 권한을 갖춘다.
+fn runtime_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("런타임 디렉토리 권한 설정");
+    dir
+}
+
 fn test_spool() -> (tempfile::TempDir, Arc<Spool>) {
     let dir = tempfile::tempdir().unwrap();
     let quotas = SpoolQuotas {
@@ -243,7 +256,7 @@ async fn ipc_pushed_log_lines_reach_collector() {
     let logs_handle = tokio::spawn(serve_logs(cfg, line_rx, sd_rx));
 
     // aicd control 서버 — aicd_main이 만드는 것과 동일하게 logs_tx를 배선한 ControlContext.
-    let sock_dir = tempfile::tempdir().unwrap();
+    let sock_dir = runtime_tempdir();
     let sock_path = sock_dir.path().join("aicd.sock");
     let server = ControlServer::bind(&sock_path).await.unwrap();
     let (ctl_shutdown, _) = watch::channel(false);

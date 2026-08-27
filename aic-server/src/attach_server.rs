@@ -330,6 +330,7 @@ async fn handle_attach_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::runtime_tempdir;
 
     use aic_common::attach::{
         write_attach_frame, AttachClientFrame, AttachServerFrame, ATTACH_PROTOCOL_VERSION,
@@ -353,7 +354,7 @@ mod tests {
 
     impl Harness {
         async fn start() -> Self {
-            let tempdir = tempfile::tempdir().expect("tempdir");
+            let tempdir = runtime_tempdir();
             let socket_path = tempdir.path().join("aicd-attach.sock");
             let metrics = Arc::new(AicdMetrics::new());
             let pool = Arc::new(SessionProcessorPool::new());
@@ -439,7 +440,7 @@ mod tests {
     /// 여기선 소켓 파일 mode 만 검증한다.
     #[tokio::test]
     async fn bind_creates_socket_with_0600_mode() {
-        let tempdir = tempfile::tempdir().unwrap();
+        let tempdir = runtime_tempdir();
         let socket_path = tempdir.path().join("attach.sock");
         let metrics = Arc::new(AicdMetrics::new());
         let pool = Arc::new(SessionProcessorPool::new());
