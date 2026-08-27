@@ -3,6 +3,7 @@
 pub mod attach;
 pub mod bounded_byte_channel;
 pub mod central_store_flag;
+pub mod disk_io;
 pub mod error;
 pub mod ipc;
 pub mod paths;
