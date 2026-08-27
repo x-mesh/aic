@@ -47,11 +47,16 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # zig + cargo-zigbuild — linux 두 target 전용(darwin은 native cargo).
+      # 이 pin은 `dtolnay/rust-toolchain@stable`과 짝을 이룬다. rustc가 새 링커 인자를
+      # 넘기기 시작하면 낡은 zig가 그것을 거부해 릴리스가 통째로 실패한다 — 실제로
+      # rustc 1.98이 aarch64-linux에 `--fix-cortex-a53-843419`를 넘기면서 zig 0.13.0 +
+      # cargo-zigbuild 0.20.1 조합이 `unsupported linker arg`로 죽었다(v0.36.0 실측).
+      # stable이 올라가면 이 두 pin도 함께 올려야 한다.
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.16.0
       - name: Install cargo-zigbuild
-        run: cargo install --locked cargo-zigbuild --version 0.20.1 || cargo install --locked cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild --version 0.23.0 || cargo install --locked cargo-zigbuild
 
       # 4 triple × 3 binary 빌드 → (os,arch)별 tar.gz + checksums.
       #   linux는 cargo zigbuild(zig cross), darwin은 cargo build(native, Apple ld=framework 링크).
