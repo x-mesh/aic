@@ -101,11 +101,23 @@ fn run_user_session_dir() -> PathBuf {
 // 있다. 그래서 후보를 **쓰기 전에** 소유자·권한·symlink를 확인하고, 만들 때는 0700으로
 // 고정한다.
 
-/// 런타임 디렉토리 권한 — 소유자만 접근(0700). group/other 비트가 있으면 신뢰하지 않는다.
+/// 런타임 디렉토리 권한 — 소유자만 접근(0700). 새로 만들 때와 이어받을 때의 목표값이다.
 const RUNTIME_DIR_MODE: u32 = 0o700;
 
-/// `dir`이 이 사용자가 소유한 0700 실제 디렉토리인지. 없는 경로는 "아직 안전"으로 본다
-/// (만들 때 `ensure_runtime_dir`이 0700으로 만든다).
+/// **다른 사용자에게 쓰기를 허용하는 비트**(group/other write).
+///
+/// 신뢰 판정의 기준이 왜 "0700인가"가 아니라 "남이 쓸 수 있었는가"인지: 공격은 남이 그
+/// 디렉토리에 `aicd.sock`·`aicd.pid`를 **심는** 것이고, 그러려면 디렉토리 쓰기 권한이
+/// 필요하다. group/other에 읽기·실행만 열린 디렉토리(0755)는 목록이 보일 뿐 내용을 심을
+/// 수 없으므로, 소유자가 나 자신이라면 그 안의 소켓은 내가 만든 것이 확실하다.
+///
+/// 이 구분이 실제로 중요한 이유: v0.35.0 이하는 런타임 디렉토리를 umask대로 만들어 보통
+/// 0755였다. 판정을 0700 일치로 두면 업그레이드한 사용자의 멀쩡한 디렉토리가 전부
+/// "선점됨"으로 거부되어 aicd가 뜨지 못한다(v0.36.0 실측).
+const FOREIGN_WRITE_BITS: u32 = 0o022;
+
+/// `dir`이 이 사용자 소유의, 남이 쓸 수 없는 실제 디렉토리인지. 없는 경로는 "아직 안전"으로
+/// 본다 (만들 때 `ensure_runtime_dir`이 0700으로 만든다).
 ///
 /// `symlink_metadata`(lstat)로 본다 — `metadata`는 symlink를 따라가므로, 공격자가 심어 둔
 /// symlink가 자기 소유 디렉토리를 가리키면 검사를 통과해 버린다.
@@ -124,10 +136,61 @@ pub fn runtime_dir_is_trusted(dir: &Path) -> bool {
     if meta.uid() != unsafe { libc::getuid() } {
         return false;
     }
-    meta.permissions().mode() & 0o077 == 0
+    meta.permissions().mode() & FOREIGN_WRITE_BITS == 0
 }
 
-/// 런타임 디렉토리를 0700으로 보장한다. 이미 있으면 소유자·권한·symlink를 검사한다.
+fn untrusted_runtime_dir_err(dir: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "런타임 디렉토리를 신뢰할 수 없습니다: {} — 다른 사용자 소유이거나 \
+             symlink이거나 다른 사용자가 쓸 수 있는 권한입니다. 선점된 디렉토리일 수 \
+             있으니 확인 후 제거하세요.",
+            dir.display()
+        ),
+    )
+}
+
+/// 이미 있는 런타임 디렉토리를 이어받는다 — 필요하면 0700으로 조인다.
+///
+/// 구버전이 umask대로 만든 디렉토리(보통 0755)를 그대로 쓰기 위한 마이그레이션이다.
+/// **남이 쓸 수 있었던 디렉토리는 조이지 않고 거부한다** — 그 시점에 이미 무언가 심겼을 수
+/// 있어, 권한만 조여 봐야 내용의 출처를 되돌릴 수 없기 때문이다.
+///
+/// 검사와 `chmod` 사이에 경로가 바뀌는 것(TOCTOU)을 막으려고 **열린 fd를 고정해** 그 fd로
+/// 검사(`fstat`)하고 그 fd에 적용(`fchmod`)한다. `O_NOFOLLOW`는 마지막 요소가 symlink면,
+/// `O_DIRECTORY`는 디렉토리가 아니면 열기 자체를 실패시킨다.
+fn adopt_runtime_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|_| untrusted_runtime_dir_err(dir))?;
+
+    let meta = handle.metadata()?;
+    if meta.uid() != unsafe { libc::getuid() } {
+        return Err(untrusted_runtime_dir_err(dir));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & FOREIGN_WRITE_BITS != 0 {
+        return Err(untrusted_runtime_dir_err(dir));
+    }
+    if mode == RUNTIME_DIR_MODE {
+        return Ok(());
+    }
+    if unsafe { libc::fchmod(handle.as_raw_fd(), RUNTIME_DIR_MODE as libc::mode_t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// 런타임 디렉토리를 0700으로 보장한다. 이미 있으면 소유자·권한·symlink를 검사하고,
+/// 내 소유이면서 남이 쓸 수 없던 디렉토리는 0700으로 조여 이어받는다.
 ///
 /// 소켓·lock을 만들기 **전에** 부르는 쪽에서 쓴다. 검사에 실패하면 만들지 않고 에러 —
 /// 남이 선점한 디렉토리에 데몬을 띄우면 그 자체가 사고다.
@@ -142,18 +205,10 @@ fn ensure_runtime_dir_inner(dir: &Path, retries_left: u32) -> std::io::Result<()
     use std::os::unix::fs::PermissionsExt;
 
     if !runtime_dir_is_trusted(dir) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "런타임 디렉토리를 신뢰할 수 없습니다: {} — 다른 사용자 소유이거나 \
-                 symlink이거나 권한이 0700이 아닙니다. 선점된 디렉토리일 수 있으니 \
-                 확인 후 제거하세요.",
-                dir.display()
-            ),
-        ));
+        return Err(untrusted_runtime_dir_err(dir));
     }
     if dir.exists() {
-        return Ok(());
+        return adopt_runtime_dir(dir);
     }
     // 부모까지는 관례대로 만들고(`/run/user/{uid}` 등 이미 있는 게 보통), 마지막 요소만
     // 0700으로 만든다. mode는 umask의 영향을 받으므로 생성 후 명시적으로 다시 설정한다.
@@ -556,8 +611,11 @@ mod tests {
 
     /// 이 테스트가 지키는 것: 공용 `/tmp` 아래 후보를 남이 선점했을 때 거부하는 동작.
     /// 깨지면 다른 로컬 사용자가 심어 둔 `aicd.sock`으로 연결이 새어 나간다.
+    ///
+    /// 기준은 "0700인가"가 아니라 **"남이 쓸 수 있는가"**다 — 소켓을 심으려면 디렉토리
+    /// 쓰기 권한이 있어야 하므로, group/other write가 판정선이다.
     #[test]
-    fn runtime_dir_is_trusted_rejects_loose_permissions() {
+    fn runtime_dir_is_trusted_rejects_foreign_writable() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = unique_temp_dir("trust-perm");
         let dir = tmp.join("aic-0");
@@ -566,13 +624,74 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(runtime_dir_is_trusted(&dir));
 
-        for loose in [0o755, 0o770, 0o707, 0o777] {
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(loose)).unwrap();
+        for writable in [0o770, 0o707, 0o777, 0o720, 0o702] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(writable)).unwrap();
             assert!(
                 !runtime_dir_is_trusted(&dir),
-                "0{loose:o}는 group/other에 열려 있어 신뢰할 수 없다"
+                "0{writable:o}는 남이 파일을 심을 수 있어 신뢰할 수 없다"
             );
         }
+    }
+
+    /// 이 테스트가 지키는 것: **업그레이드 경로**. v0.35.0 이하는 런타임 디렉토리를 umask대로
+    /// 만들어 보통 0755였다. 이를 "선점됨"으로 거부하면 업그레이드한 사용자의 aicd가 뜨지
+    /// 못한다(v0.36.0 실측). 남이 쓸 수 없는 권한이면 내 것이 확실하므로 신뢰해야 한다.
+    #[test]
+    fn runtime_dir_is_trusted_accepts_legacy_readable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("trust-legacy");
+        let dir = tmp.join("aic-0");
+        std::fs::create_dir(&dir).unwrap();
+
+        for legacy in [0o755, 0o750, 0o705, 0o711] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(legacy)).unwrap();
+            assert!(
+                runtime_dir_is_trusted(&dir),
+                "0{legacy:o}는 남이 쓸 수 없으므로 내 디렉토리가 확실하다"
+            );
+        }
+    }
+
+    /// 구버전이 남긴 0755 디렉토리를 이어받으며 0700으로 조인다 — 사용자가 손으로
+    /// `chmod 700`을 하지 않아도 업그레이드가 이어져야 한다.
+    #[test]
+    fn ensure_runtime_dir_tightens_legacy_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("ensure-legacy");
+        let dir = tmp.join("aic-0");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // 디렉토리 안의 내용은 보존된다 — 살아 있는 세션 소켓을 지우면 안 된다.
+        let marker = dir.join("aicd.pid");
+        std::fs::write(&marker, b"1234\n").unwrap();
+
+        ensure_runtime_dir(&dir).expect("내 소유 0755는 이어받아야 한다");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "이어받으면서 0700으로 조여야 한다");
+        assert!(marker.exists(), "디렉토리 내용은 그대로 두어야 한다");
+
+        // 재호출은 멱등.
+        ensure_runtime_dir(&dir).expect("재호출 실패");
+    }
+
+    /// symlink는 이어받기 경로에서도 거부해야 한다 — `O_NOFOLLOW`가 그것을 보장한다.
+    /// 검사만 lstat으로 하고 chmod를 경로로 하면 그 사이에 링크로 바꿔치기할 수 있다.
+    #[test]
+    fn ensure_runtime_dir_refuses_symlink_even_when_target_is_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("ensure-link");
+        let real = tmp.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = ensure_runtime_dir(&link).expect_err("symlink는 거부해야 한다");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "거부했으면 대상 권한도 건드리지 않아야 한다");
     }
 
     /// symlink는 lstat으로 걸러야 한다 — 따라가서 검사하면 공격자가 자기 소유 디렉토리를
@@ -626,14 +745,17 @@ mod tests {
         assert!(path.ends_with("session.sock"));
     }
 
-    // XDG_RUNTIME_DIR은 프로세스 전역이라, 이를 set/remove하는 테스트들이 병렬 실행되면
-    // 한 테스트가 assert 하기 전에 다른 테스트가 값을 바꿔 간헐적으로 깨진다(env-race).
-    // 아래 락으로 직렬화하고, 각 테스트는 원래 값을 저장했다가 복원한다.
-    static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `XDG_RUNTIME_DIR`/`AIC_RUNTIME_DIR`은 프로세스 전역이라, 이를 set/remove하는 테스트가
+    // 병렬 실행되면 한 테스트가 assert 하기 전에 다른 테스트가 값을 바꿔 간헐적으로
+    // 깨진다(env-race). 아래 락으로 직렬화하고, 각 테스트는 원래 값을 저장했다가 복원한다.
+    //
+    // **읽기만 하는 테스트도 이 락을 잡아야 한다.** `session_dir()`의 결과가 곧 환경변수의
+    // 함수라, 값을 바꾸지 않아도 남이 바꾼 창에 관측하면 똑같이 깨진다.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn resolve_linux_with_xdg_runtime() {
-        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = resolve_socket_path("linux");
@@ -646,7 +768,7 @@ mod tests {
 
     #[test]
     fn resolve_linux_without_xdg_runtime() {
-        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let path = resolve_socket_path("linux");
@@ -674,6 +796,7 @@ mod tests {
 
     #[test]
     fn session_dir_is_absolute() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(session_dir().is_absolute());
     }
 
@@ -690,6 +813,7 @@ mod tests {
     /// 대체 후보의 우연한 파일에 결과가 흔들리지 않게 한다.
     #[test]
     fn session_socket_path_defaults_to_session_dir_when_absent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = session_socket_path("ffffffff");
         assert!(!path.exists(), "테스트 전제: 이 id의 소켓은 없어야 한다");
         assert_eq!(path.parent().unwrap(), session_dir());
@@ -700,6 +824,7 @@ mod tests {
     /// 만드는 쪽은 환경만 보고 `session_dir()` 한 곳으로 고정돼야 한다.
     #[test]
     fn aicd_bind_paths_are_pinned_to_session_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (path, name) in [
             (aicd_socket_path_for_bind(), "aicd.sock"),
             (aicd_lock_path_for_bind(), "aicd.pid"),
@@ -762,7 +887,7 @@ mod tests {
 
     #[test]
     fn session_dir_candidates_without_xdg_include_run_user() {
-        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let candidates = session_dir_candidates_for_os("linux");
@@ -781,7 +906,7 @@ mod tests {
     /// 다른 런타임 디렉토리를 가리킨 것이라, 시스템 데몬으로 새면 안 된다.
     #[test]
     fn session_dir_candidates_with_xdg_do_not_leak_to_run_user() {
-        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/tmp/isolated-runtime");
         let candidates = session_dir_candidates_for_os("linux");
@@ -798,7 +923,7 @@ mod tests {
     /// 다른 컨테이너의 lock·소켓에 걸려, 격리하겠다고 선언한 인스턴스가 못 뜬다.
     #[test]
     fn explicit_runtime_dir_disables_candidate_discovery() {
-        let _guard = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
         let prev_explicit = std::env::var(RUNTIME_DIR_ENV).ok();
 
@@ -872,7 +997,7 @@ mod tests {
         // 말할 수 없다. 실제 차단은 연결 후 uid 검사가 한다.
         let hijacked2 = tmp.join("hijacked2");
         fs::create_dir(&hijacked2).unwrap();
-        fs::set_permissions(&hijacked2, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&hijacked2, fs::Permissions::from_mode(0o770)).unwrap();
         assert_eq!(
             trusted_candidates(vec![hijacked.clone(), hijacked2]),
             vec![hijacked],
@@ -890,6 +1015,7 @@ mod tests {
 
     #[test]
     fn local_command_record_path_under_session_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = local_command_record_path();
         assert_eq!(path.parent().unwrap(), session_dir());
         assert!(path.ends_with("last-command.json"));
@@ -991,6 +1117,7 @@ mod tests {
 
     #[test]
     fn session_socket_bind_path_is_pinned_to_session_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = session_socket_path_for_bind("deadbeef");
         assert_eq!(path.parent().unwrap(), session_dir());
         assert!(path.ends_with("session-deadbeef.sock"));
