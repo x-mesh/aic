@@ -10711,16 +10711,19 @@ source /root/.aic/hook-events.bash
     /// 74a1bb7이 고치려던 증상이 정확히 이 경로에 남아 있었다.
     #[test]
     fn list_sessions_from_merges_sockets_across_dirs() {
+        // 경로가 짧아야 한다 — UDS 경로는 `sun_path`(macOS 104바이트, Linux 108바이트)에
+        // 들어가야 하는데, macOS의 `TMPDIR`(`/var/folders/…/T/`)만으로 이미 ~49바이트다.
+        // 긴 이름을 쓰면 bind가 `path must be shorter than SUN_LEN`으로 실패한다.
         let base = std::env::temp_dir().join(format!(
-            "aic-list-sessions-{}-{}",
+            "aic-ls-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
+                .map(|d| d.as_nanos() % 100_000)
                 .unwrap_or(0)
         ));
-        let run_user = base.join("run-user");
-        let tmp_dir = base.join("tmp");
+        let run_user = base.join("r");
+        let tmp_dir = base.join("t");
         std::fs::create_dir_all(&run_user).unwrap();
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
