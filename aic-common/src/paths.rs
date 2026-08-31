@@ -116,6 +116,49 @@ const RUNTIME_DIR_MODE: u32 = 0o700;
 /// "선점됨"으로 거부되어 aicd가 뜨지 못한다(v0.36.0 실측).
 const FOREIGN_WRITE_BITS: u32 = 0o022;
 
+/// **다른 사용자의 디렉토리 진입(search)을 허용하는 비트**(group/other execute).
+///
+/// 디렉토리 안에 무언가를 심으려면 그 디렉토리의 쓰기 권한만으로는 부족하고, 부모를
+/// 통과(`x`)해서 도달할 수 있어야 한다. 부모가 소유자에게만 진입을 허용하면 그 아래는
+/// 남이 닿을 수 없다.
+const FOREIGN_SEARCH_BITS: u32 = 0o011;
+
+/// `dir`의 부모가 다른 사용자의 진입을 막고 있는지 — 막고 있으면 `dir` 자신의 group/other
+/// write 비트가 열려 있어도 그 안의 내용은 내가 만든 것이 확실하다.
+///
+/// 왜 이 예외가 필요한가: `FOREIGN_WRITE_BITS`만 보는 판정은 구버전 디렉토리가 0755라고
+/// 가정한다. 그런데 Ubuntu의 기본 umask는 `0002`라 실제로는 **0775**로 만들어진다. 이때
+/// group write가 걸려 `/run/user/{uid}`(0700) 아래의 멀쩡한 디렉토리까지 "선점됨"으로
+/// 거부되고, aicd가 재시작 루프에 갇혀 영구히 뜨지 못한다(v0.36.1 실측).
+///
+/// 부모를 경로 문자열로 `lstat`하지 않고 열린 fd로 `fstat`하는 이유는 `adopt_runtime_dir`과
+/// 같다 — 검사와 사용 사이에 부모가 바뀌면 검사가 무의미해진다. `O_NOFOLLOW`가 symlink
+/// 부모를, `O_DIRECTORY`가 디렉토리가 아닌 부모를 열기 단계에서 막는다. 열지 못하면
+/// "막고 있다고 볼 근거 없음"으로 보아 엄격한 판정으로 되돌아간다.
+fn parent_blocks_foreign_entry(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    let Ok(handle) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(parent)
+    else {
+        return false;
+    };
+    let Ok(meta) = handle.metadata() else {
+        return false;
+    };
+    if meta.uid() != unsafe { libc::getuid() } {
+        return false;
+    }
+    meta.permissions().mode() & FOREIGN_SEARCH_BITS == 0
+}
+
 /// `dir`이 이 사용자 소유의, 남이 쓸 수 없는 실제 디렉토리인지. 없는 경로는 "아직 안전"으로
 /// 본다 (만들 때 `ensure_runtime_dir`이 0700으로 만든다).
 ///
@@ -136,7 +179,10 @@ pub fn runtime_dir_is_trusted(dir: &Path) -> bool {
     if meta.uid() != unsafe { libc::getuid() } {
         return false;
     }
-    meta.permissions().mode() & FOREIGN_WRITE_BITS == 0
+    if meta.permissions().mode() & FOREIGN_WRITE_BITS == 0 {
+        return true;
+    }
+    parent_blocks_foreign_entry(dir)
 }
 
 fn untrusted_runtime_dir_err(dir: &Path) -> std::io::Error {
@@ -153,9 +199,11 @@ fn untrusted_runtime_dir_err(dir: &Path) -> std::io::Error {
 
 /// 이미 있는 런타임 디렉토리를 이어받는다 — 필요하면 0700으로 조인다.
 ///
-/// 구버전이 umask대로 만든 디렉토리(보통 0755)를 그대로 쓰기 위한 마이그레이션이다.
-/// **남이 쓸 수 있었던 디렉토리는 조이지 않고 거부한다** — 그 시점에 이미 무언가 심겼을 수
-/// 있어, 권한만 조여 봐야 내용의 출처를 되돌릴 수 없기 때문이다.
+/// 구버전이 umask대로 만든 디렉토리(umask 022면 0755, Ubuntu 기본 umask 002면 0775)를
+/// 그대로 쓰기 위한 마이그레이션이다. **남이 쓸 수 있었던 디렉토리는 조이지 않고
+/// 거부한다** — 그 시점에 이미 무언가 심겼을 수 있어, 권한만 조여 봐야 내용의 출처를
+/// 되돌릴 수 없기 때문이다. 다만 부모가 남의 진입을 막고 있었다면 group/other write가
+/// 열려 있어도 남이 닿을 수 없었으므로 이어받는다(`parent_blocks_foreign_entry`).
 ///
 /// 검사와 `chmod` 사이에 경로가 바뀌는 것(TOCTOU)을 막으려고 **열린 fd를 고정해** 그 fd로
 /// 검사(`fstat`)하고 그 fd에 적용(`fchmod`)한다. `O_NOFOLLOW`는 마지막 요소가 symlink면,
@@ -177,7 +225,7 @@ fn adopt_runtime_dir(dir: &Path) -> std::io::Result<()> {
         return Err(untrusted_runtime_dir_err(dir));
     }
     let mode = meta.permissions().mode() & 0o777;
-    if mode & FOREIGN_WRITE_BITS != 0 {
+    if mode & FOREIGN_WRITE_BITS != 0 && !parent_blocks_foreign_entry(dir) {
         return Err(untrusted_runtime_dir_err(dir));
     }
     if mode == RUNTIME_DIR_MODE {
@@ -618,6 +666,10 @@ mod tests {
     fn runtime_dir_is_trusted_rejects_foreign_writable() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = unique_temp_dir("trust-perm");
+        // 부모가 남의 진입을 허용해야 "남이 쓸 수 있는가"가 실제 판정선이 된다. 개발자
+        // umask에 따라 `unique_temp_dir`이 0700을 만들면 부모 예외가 걸려 이 테스트의
+        // 전제가 사라지므로 명시적으로 고정한다.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         let dir = tmp.join("aic-0");
         std::fs::create_dir(&dir).unwrap();
 
@@ -650,6 +702,75 @@ mod tests {
                 "0{legacy:o}는 남이 쓸 수 없으므로 내 디렉토리가 확실하다"
             );
         }
+    }
+
+    /// 이 테스트가 지키는 것: **Ubuntu 기본 umask(0002) 업그레이드 경로**. 구버전이 남긴
+    /// 런타임 디렉토리는 0755가 아니라 0775이고, group write만 보고 거부하면
+    /// `/run/user/{uid}`(0700) 아래의 멀쩡한 디렉토리까지 막혀 aicd가 재시작 루프에
+    /// 갇힌다(okrd-rca-central에서 3일 반 다운, v0.36.1 실측).
+    ///
+    /// 부모가 진입을 막고 있으면 남이 애초에 닿을 수 없었으므로 신뢰해야 한다.
+    #[test]
+    fn runtime_dir_is_trusted_accepts_group_writable_under_closed_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("trust-closed-parent");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.join("aic");
+        std::fs::create_dir(&dir).unwrap();
+
+        for umask002 in [0o775, 0o770, 0o777] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(umask002)).unwrap();
+            assert!(
+                runtime_dir_is_trusted(&dir),
+                "0{umask002:o}라도 부모가 0700이면 남이 도달할 수 없다"
+            );
+        }
+    }
+
+    /// 부모 예외는 **부모가 진입을 막을 때만** 열린다. `/tmp/aic-{uid}`처럼 누구나 통과할
+    /// 수 있는 부모 아래에서는 group/other write가 그대로 거부 사유다 — 이게 깨지면
+    /// `/tmp` 선점 방어가 무너진다.
+    #[test]
+    fn runtime_dir_is_trusted_rejects_group_writable_under_open_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("trust-open-parent");
+        let dir = tmp.join("aic-0");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        for parent in [0o755, 0o751, 0o711, 0o777] {
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(parent)).unwrap();
+            assert!(
+                !runtime_dir_is_trusted(&dir),
+                "부모 0{parent:o}는 남의 진입을 허용하므로 0775를 신뢰하면 안 된다"
+            );
+        }
+        // 다음 테스트/정리가 지울 수 있도록 되돌린다.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 부모가 막고 있는 0775 디렉토리는 이어받으면서 0700으로 조이고 내용은 보존한다 —
+    /// 살아 있는 세션 소켓과 registry snapshot을 지우면 안 된다.
+    #[test]
+    fn ensure_runtime_dir_tightens_umask002_dir_under_closed_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("ensure-umask002");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tmp.join("aic");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let marker = dir.join("aicd-registry.json");
+        std::fs::write(&marker, b"{}\n").unwrap();
+
+        ensure_runtime_dir(&dir).expect("부모가 0700이면 0775도 이어받아야 한다");
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "이어받으면서 0700으로 조여야 한다");
+        assert!(marker.exists(), "디렉토리 내용은 그대로 두어야 한다");
+
+        // 재호출은 멱등.
+        ensure_runtime_dir(&dir).expect("재호출 실패");
     }
 
     /// 구버전이 남긴 0755 디렉토리를 이어받으며 0700으로 조인다 — 사용자가 손으로
@@ -731,6 +852,8 @@ mod tests {
     fn ensure_runtime_dir_refuses_untrusted_dir() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = unique_temp_dir("ensure-untrusted");
+        // 부모 예외(`parent_blocks_foreign_entry`)가 걸리지 않도록 진입을 열어 둔다.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         let dir = tmp.join("aic-0");
         std::fs::create_dir(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
