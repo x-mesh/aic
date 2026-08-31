@@ -651,6 +651,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_is_absolute() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = default_socket_path();
         assert!(path.is_absolute());
     }
@@ -864,6 +865,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_ends_with_session_sock() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = default_socket_path();
         assert!(path.ends_with("session.sock"));
     }
@@ -907,6 +909,7 @@ mod tests {
 
     #[test]
     fn resolve_macos() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = resolve_socket_path("macos");
         let uid = unsafe { libc::getuid() };
         assert_eq!(
@@ -927,6 +930,7 @@ mod tests {
 
     #[test]
     fn session_socket_path_format() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = session_socket_path("a1b2c3d4");
         assert!(path.is_absolute());
         assert!(path.ends_with("session-a1b2c3d4.sock"));
@@ -963,6 +967,7 @@ mod tests {
     /// pid는 저쪽으로 갈리면 `aic daemon status`가 섞인 정보를 보여준다.
     #[test]
     fn aicd_discovered_paths_share_one_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = aicd_socket_path().parent().unwrap().to_path_buf();
         assert_eq!(aicd_lock_path().parent().unwrap(), dir);
         assert_eq!(aicd_attach_socket_path().parent().unwrap(), dir);
@@ -1130,6 +1135,7 @@ mod tests {
 
     #[test]
     fn session_dir_candidates_on_macos_has_only_tmp() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             session_dir_candidates_for_os("macos"),
             vec![tmp_session_dir()]
@@ -1146,6 +1152,7 @@ mod tests {
 
     #[test]
     fn local_hook_pending_path_sanitizes_tokens() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = local_hook_pending_path("../bad", "cmd/123!");
         let name = path.file_name().unwrap().to_string_lossy();
         assert_eq!(name, "hook-pending-bad-cmd123.json");
@@ -1155,6 +1162,7 @@ mod tests {
 
     #[test]
     fn extract_session_id_roundtrip() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let id = "a1b2c3d4";
         let path = session_socket_path(id);
         assert_eq!(extract_session_id(&path), Some(id.to_string()));
