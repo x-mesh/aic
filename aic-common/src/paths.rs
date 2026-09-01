@@ -1098,6 +1098,26 @@ mod tests {
         }
     }
 
+    /// 이 테스트가 지키는 것: **테스트 하네스 자체의 전제**. 선점 방어를 검증하는 테스트들은
+    /// "남이 도달할 수 있는 부모"를 전제하는데, `unique_temp_dir`이 권한을 umask에 맡기면
+    /// umask 077 머신에서 부모가 0700이 되어 부모 예외가 걸리고, 그 테스트들이 조용히 반대
+    /// 결과를 낸다(실측: umask 022에서만 통과). 전제가 깨지면 여기서 먼저 실패한다.
+    #[test]
+    fn temp_dir_helper_keeps_parent_open_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = unique_temp_dir("helper-parent-open");
+        let mode = fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "umask와 무관하게 열린 부모여야 한다");
+
+        let child = tmp.join("aic-0");
+        fs::create_dir(&child).unwrap();
+        assert!(
+            !parent_blocks_foreign_entry(&child),
+            "부모가 진입을 막으면 선점 방어 테스트의 전제가 사라진다"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     /// 신뢰 필터는 주입된 목록만 보는 순수 함수 — 머신의 `/tmp` 상태에 흔들리지 않는다.
     #[test]
     fn trusted_candidates_drops_hijacked_dirs() {
