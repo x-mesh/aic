@@ -332,6 +332,72 @@ mod tests {
         assert!(!report.all_succeeded());
     }
 
+    /// 상한은 토큰 길이의 **바이트 합**이다 — 구분자는 세지 않는다. 한국어 증상은 글자당
+    /// 3바이트라 훨씬 적은 글자 수에서 걸리므로, 경계를 못 박아 둔다.
+    #[test]
+    fn remote_diagnose_symptom_cap_is_measured_in_bytes() {
+        let at_cap = "a".repeat(MAX_REMOTE_SYMPTOM_BYTES);
+        assert!(
+            command(&[at_cap]).is_ok(),
+            "상한과 같은 크기는 통과해야 한다"
+        );
+
+        let over_cap = "a".repeat(MAX_REMOTE_SYMPTOM_BYTES + 1);
+        let error = command(&[over_cap]).unwrap_err();
+        assert!(error.contains("bytes 이하"));
+
+        // 토큰이 나뉘어도 합산 기준은 같다 — 구분자 공백은 상한에 포함되지 않는다.
+        let half = "a".repeat(MAX_REMOTE_SYMPTOM_BYTES / 2);
+        assert!(command(&[half.clone(), half]).is_ok());
+
+        // 한글은 글자당 3바이트 — 171자면 513바이트라 상한을 넘는다.
+        let korean = "디".repeat(MAX_REMOTE_SYMPTOM_BYTES / 3 + 1);
+        assert!(
+            command(&[korean]).is_err(),
+            "글자 수가 아니라 바이트로 재야 한다"
+        );
+    }
+
+    /// 사람이 보는 기본 출력. 호스트마다 상태 라벨이 붙고, 성공했지만 발견이 없는 호스트와
+    /// 실패한 호스트가 서로 다른 줄로 구분되어야 "일부만 확인됐다"가 눈에 남는다.
+    #[test]
+    fn remote_diagnose_text_keeps_per_host_state_visible() {
+        let report = RemoteDiagnosisReport::from_fanout(
+            "@web".to_string(),
+            None,
+            FanoutResult {
+                results: vec![
+                    remote(
+                        "clean",
+                        HostStatus::Ok,
+                        r#"{"schema_version":1,"diagnosis":{"auto_findings":[]}}"#,
+                    ),
+                    remote(
+                        "busy",
+                        HostStatus::Ok,
+                        r#"{"schema_version":1,"diagnosis":{"auto_findings":[{"message":"disk 94%"}]}}"#,
+                    ),
+                    remote("offline", HostStatus::Unreachable, ""),
+                ],
+                wall_timed_out: true,
+                incomplete: vec!["slow".to_string()],
+            },
+        );
+
+        let text = report.render_text();
+        assert!(text.starts_with("remote diagnose: @web · 2/4 success\n"));
+        assert!(text.contains("busy [success]"));
+        assert!(text.contains("  - disk 94%"));
+        assert!(text.contains("clean [success]"));
+        assert!(text.contains("  결정적 발견 없음"));
+        assert!(text.contains("offline [transport_error]"));
+        assert!(text.contains("slow [incomplete]"));
+        assert!(
+            text.contains("wall-clock timeout: 일부 호스트 결과가 미완료입니다."),
+            "미완료가 있었다는 사실이 출력에서 사라지면 안 된다"
+        );
+    }
+
     #[test]
     fn remote_diagnose_rejects_unknown_schema() {
         let error =
