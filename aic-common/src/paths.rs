@@ -1103,6 +1103,8 @@ mod tests {
     fn trusted_candidates_drops_hijacked_dirs() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = unique_temp_dir("trusted-filter");
+        // 선점 판정이 실제로 걸리려면 부모가 남의 진입을 허용해야 한다(`/tmp`가 그렇다).
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
         let good = tmp.join("good");
         let hijacked = tmp.join("hijacked");
         fs::create_dir(&good).unwrap();
@@ -1194,6 +1196,8 @@ mod tests {
     use std::time::Duration;
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1201,6 +1205,11 @@ mod tests {
             .unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("aic-paths-test-{tag}-{pid}-{nanos}"));
         fs::create_dir_all(&dir).expect("create_dir_all");
+        // 권한을 umask대로 두면 개발자 환경에 따라 신뢰 판정의 전제가 달라진다. umask 077
+        // 머신에서는 0700이 되어 `parent_blocks_foreign_entry`가 걸리고, "남이 도달할 수
+        // 있는 부모"를 전제하는 테스트가 조용히 반대 결과를 낸다. 남의 진입을 허용하는
+        // 쪽(0755)으로 고정하고, 막힌 부모가 필요한 테스트는 각자 0700으로 좁힌다.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("set_permissions");
         dir
     }
 
