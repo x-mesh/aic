@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 
 use aic_common::ipc::ProcessChange;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 
 /// 링에 보관할 최근 변화 수. 프로세스 기동이 몰리는 순간(부팅 직후·배포)에 한 tick이 수백 건을
 /// 낼 수 있어, 한 tick 분이 통째로 밀려나지 않을 정도로 잡는다. 넘치면 오래된 것부터 버린다.
@@ -32,6 +32,7 @@ const TAP_CAPACITY: usize = 256;
 pub struct ProcessInventoryStore {
     ring: RwLock<VecDeque<ProcessChange>>,
     tap_tx: broadcast::Sender<ProcessChange>,
+    ready_tx: watch::Sender<bool>,
 }
 
 impl Default for ProcessInventoryStore {
@@ -43,9 +44,29 @@ impl Default for ProcessInventoryStore {
 impl ProcessInventoryStore {
     pub fn new() -> Self {
         let (tap_tx, _rx) = broadcast::channel(TAP_CAPACITY);
+        let (ready_tx, _ready_rx) = watch::channel(false);
         Self {
             ring: RwLock::new(VecDeque::with_capacity(CAPACITY)),
             tap_tx,
+            ready_tx,
+        }
+    }
+
+    /// 첫 process inventory scan이 끝났음을 표시한다. keyframe은 ring에 넣지 않으므로 ring이 비었다는
+    /// 사실만으로는 아직 미수집인지, 정상 baseline 완료인지 구분할 수 없다.
+    pub fn mark_ready(&self) {
+        self.ready_tx.send_replace(true);
+    }
+
+    /// 첫 process inventory scan이 끝날 때까지 기다린다. `watch`가 상태를 보존하므로 구독 등록과
+    /// 상태 변경이 겹쳐도 notification을 잃지 않고, 여러 waiter가 동시에 깨어난다.
+    pub async fn wait_ready(&self) {
+        let mut ready_rx = self.ready_tx.subscribe();
+        while !*ready_rx.borrow_and_update() {
+            ready_rx
+                .changed()
+                .await
+                .expect("ProcessInventoryStore가 살아 있는 동안 sender도 유지된다");
         }
     }
 
@@ -156,5 +177,31 @@ mod tests {
         let s = ProcessInventoryStore::new();
         s.push_many(Vec::new()).await;
         assert!(s.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn readiness_is_sticky_and_wakes_all_waiters() {
+        let s = std::sync::Arc::new(ProcessInventoryStore::new());
+        let first = tokio::spawn({
+            let s = s.clone();
+            async move { s.wait_ready().await }
+        });
+        let second = tokio::spawn({
+            let s = s.clone();
+            async move { s.wait_ready().await }
+        });
+
+        s.mark_ready();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            first.await.unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .expect("기존 waiter가 모두 깨어나야 한다");
+
+        // mark 이전에 구독하지 않은 late waiter도 보존된 상태를 즉시 본다.
+        tokio::time::timeout(std::time::Duration::from_millis(100), s.wait_ready())
+            .await
+            .expect("late waiter도 즉시 반환해야 한다");
     }
 }
