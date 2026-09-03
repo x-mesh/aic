@@ -228,8 +228,11 @@ async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
         serve(cfg, sd_rx, frx).await
     });
 
-    // 첫 tick(keyframe)은 즉시 돈다. 다음 tick은 3초 뒤라, 여기서는 keyframe만 지나간 상태다.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // 첫 tick(keyframe) 완료를 실제 신호로 기다린다. 고정 sleep은 전체 suite 부하에서 host process
+    // refresh가 800ms를 넘으면 이후 띄운 child가 baseline에 섞여 delta가 영원히 안 생기는 race였다.
+    tokio::time::timeout(Duration::from_secs(20), store.wait_ready())
+        .await
+        .expect("20초 내에 process inventory baseline이 준비되지 않았다");
     assert!(
         store.is_empty().await,
         "keyframe이 링에 들어갔다 — 기동 직후 전체 프로세스가 add로 밀려들어 진짜 변화를 덮는다"

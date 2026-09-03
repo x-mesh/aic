@@ -344,6 +344,9 @@ pub async fn serve(
                     // emit 여부와 무관하게 갱신한다 — 변화가 없던 tick도 "그때 살아 있었다"는
                     // 관측이므로, 다음 remove의 하한은 그 tick이어야 한다(더 좁은 구간).
                     prev_inventory_scan_unix = Some(scan_unix);
+                    if let Some(store) = &cfg.process_inventory_store {
+                        store.mark_ready();
+                    }
                 }
 
                 if !backoff.ready() {
