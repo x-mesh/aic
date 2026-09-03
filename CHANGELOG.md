@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-09-03
+
+### Added
+
+- **인자 없는 `/diagnose`가 오늘의 journal error를 daemon별로 요약한다.** 최근 error 200건을
+  structured journal field로 묶어 daemon별 건수와 최신 대표 message를 보여 준다. `Error` 문자열이
+  없어도 journal priority가 error인 `Permission denied`, `Failed`, `segfault`를 놓치지 않는다.
+  cron의 system crontab 파싱 실패는 예약 작업이 누락될 수 있다는 구체적 원인으로 표시하며, 증상 기반
+  `/diagnose cron ...`의 기존 text journal fallback도 유지한다. daemon 20개·message 240자·64 KiB
+  출력 상한과 malformed/truncation warning으로 진단 범위를 bounded하게 유지한다.
+
+### Fixed
+
+- **process inventory integration test가 느린 전체 suite에서 baseline race로 간헐 실패하던 문제** —
+  첫 keyframe 완료를 800ms sleep으로 추측하지 않고 exporter가 store에 남기는 readiness 신호를 기다린다.
+  baseline 전에 child process를 띄워 delta가 사라지는 race를 제거했고, readiness는 late/multiple waiter에도
+  상태를 보존하는 `watch` channel로 전달한다.
+
 ## [0.37.0] - 2026-08-31
 
 ### Added
