@@ -8,6 +8,7 @@ use super::sandbox::Sandbox;
 use super::sys_sampler::Severity;
 use crate::llm_dispatcher::LlmDispatcher;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// 결정적 임계 스캔 신호의 신뢰도. 단일 임계 위반은 구성상 확실하므로 보수적으로 High로 둔다.
 /// 교차 상관 룰(로드맵 P1)이 생기면 묶인 신호의 가중·반대증거 감쇄를 표현하는 축으로 쓴다.
@@ -732,6 +733,11 @@ pub(crate) fn select_probes(
     }
     let cat = diagnose_category(symptom);
     let mut sections = category_sections(cat);
+    // 인자 없는 generic 진단은 사용자가 명시적으로 요청한 전체 점검이므로 모든 journal error를
+    // daemon별로 집계한다. 증상 문자열이 있는 targeted 진단과 health/snapshot 경로에는 추가하지 않는다.
+    if symptom.is_none() {
+        push_unique(&mut sections, &["journal_daemon_errors"]);
+    }
     // 카테고리별 흔한 "범인" probe — 가용성 조건 없이(unix 표준 명령) 붙인다.
     // disk: inode 고갈(df -i) + /var/log 누적 + /tmp 비대, network: 연결 상태 폭주 + 재전송,
     // process: 좀비/상태 분포, cpu: 클럭 제한, memory: RSS 상위·압박 신호·swap.
@@ -898,6 +904,12 @@ const PROC_FD_PCT_WARN: u64 = 50;
 const PROC_FD_ABS_WARN: u64 = 10_000;
 /// `proc_fd_top` 한 섹션에서 보고할 프로세스 최대 개수 — 한 번에 수십 줄이 뜨면 신호가 묻힌다.
 const PROC_FD_FINDING_CAP: usize = 3;
+/// 인자 없는 generic `/diagnose`에서 표시할 journal error daemon 최대 수.
+const JOURNAL_DAEMON_CAP: usize = 20;
+/// journal source identifier 최대 문자 수. 비정상 field가 finding 한 줄을 잠식하지 않게 제한한다.
+const JOURNAL_SOURCE_CHAR_CAP: usize = 80;
+/// daemon별 대표 message 최대 문자 수. UTF-8 byte 경계 대신 char 단위로 자른다.
+const JOURNAL_MESSAGE_CHAR_CAP: usize = 240;
 /// 좀비 프로세스 ⚠ 최소 임계. 단발/소수 좀비는 정상이라 누적(부모 미회수)일 때만 신호로 본다.
 const ZOMBIE_WARN_MIN: u32 = 10;
 /// `⚠ 실패한 systemd 유닛` 라벨에 나열할 unit 이름 최대 개수.
@@ -1066,6 +1078,159 @@ fn scan_oom(body: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+#[derive(Debug)]
+struct JournalDaemonError {
+    source: String,
+    count: usize,
+    latest_message: String,
+    crontab_parse_errors: usize,
+}
+
+fn truncate_chars(value: &str, cap: usize) -> String {
+    let mut chars = value.chars();
+    let shortened: String = chars.by_ref().take(cap).collect();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
+}
+
+fn compact_field(value: &str, cap: usize) -> String {
+    truncate_chars(&value.split_whitespace().collect::<Vec<_>>().join(" "), cap)
+}
+
+fn journal_source(value: &serde_json::Value) -> String {
+    let source = ["UNIT", "_SYSTEMD_UNIT", "SYSLOG_IDENTIFIER", "_COMM"]
+        .iter()
+        .find_map(|key| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+        })
+        .unwrap_or("unknown");
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_crontab_parse_error(source: &str, message: &str) -> bool {
+    let source = source.to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    let from_cron = source == "cron"
+        || source == "crond"
+        || source == "cron.service"
+        || source == "crond.service";
+    let reads_system_crontab = message.contains("while reading /etc/crontab")
+        || message.contains("while reading /etc/cron.d/");
+    let ignored_for_syntax =
+        message.contains("syntax error") && message.contains("crontab file will be ignored");
+    from_cron && (reads_system_crontab || ignored_for_syntax)
+}
+
+/// 기존 text `journal_errors` probe에서도 system crontab 파싱 실패를 찾는다. structured probe를
+/// 실행하지 않는 증상 기반 `/diagnose cron ...` 경로를 위한 호환 scanner다.
+fn scan_crontab_parse_errors(body: &str) -> Vec<String> {
+    let count = body
+        .lines()
+        .filter(|line| {
+            let low = line.to_ascii_lowercase();
+            let from_cron = low.split_whitespace().any(|token| {
+                token.starts_with("cron[")
+                    || token.starts_with("crond[")
+                    || token == "cron:"
+                    || token == "crond:"
+            });
+            let reads_system_crontab = low.contains("while reading /etc/crontab")
+                || low.contains("while reading /etc/cron.d/");
+            let ignored_for_syntax =
+                low.contains("syntax error") && low.contains("crontab file will be ignored");
+            from_cron && (reads_system_crontab || ignored_for_syntax)
+        })
+        .count();
+
+    if count == 0 {
+        Vec::new()
+    } else {
+        vec![format!(
+            "cron 설정 파싱 오류 {count}건 — crontab 파일이 무시되어 예약 작업이 실행되지 않았을 수 있음"
+        )]
+    }
+}
+
+/// `journalctl -p err -o json`의 JSONL을 daemon별로 집계한다. journal priority가 이미 error를
+/// 선별하므로 message에 `error` 문자열이 없어도(`Permission denied`, `Failed`, `segfault`) 포함한다.
+/// 입력은 probe에서 최근 200건으로 제한되고, 여기서는 daemon 수와 대표 message 길이를 다시 제한한다.
+fn scan_journal_daemon_errors(body: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: HashMap<String, JournalDaemonError> = HashMap::new();
+    let mut malformed = 0usize;
+    let mut daemon_cap_reached = false;
+
+    for line in body.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            malformed += 1;
+            continue;
+        };
+        let Some(message) = value
+            .get("MESSAGE")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        else {
+            malformed += 1;
+            continue;
+        };
+        let source = journal_source(&value);
+        if !grouped.contains_key(&source) {
+            if order.len() >= JOURNAL_DAEMON_CAP {
+                daemon_cap_reached = true;
+                continue;
+            }
+            order.push(source.clone());
+        }
+        let entry = grouped
+            .entry(source.clone())
+            .or_insert_with(|| JournalDaemonError {
+                source: truncate_chars(&source, JOURNAL_SOURCE_CHAR_CAP),
+                count: 0,
+                latest_message: compact_field(message, JOURNAL_MESSAGE_CHAR_CAP),
+                crontab_parse_errors: 0,
+            });
+        entry.count += 1;
+        if is_crontab_parse_error(&entry.source, message) {
+            entry.crontab_parse_errors += 1;
+        }
+    }
+
+    let mut findings = Vec::new();
+    for source in order {
+        let entry = &grouped[&source];
+        if entry.crontab_parse_errors > 0 {
+            findings.push(format!(
+                "{}: journal error {}건 중 cron 설정 파싱 오류 {}건 — crontab 파일이 무시되어 예약 작업이 실행되지 않았을 수 있음",
+                entry.source, entry.count, entry.crontab_parse_errors
+            ));
+        } else {
+            findings.push(format!(
+                "{}: journal error {}건 — 최근: {}",
+                entry.source, entry.count, entry.latest_message
+            ));
+        }
+    }
+    if malformed > 0 {
+        findings.push(format!(
+            "journal error {malformed}건을 구조화하지 못해 daemon 집계에서 제외함"
+        ));
+    }
+    if daemon_cap_reached {
+        findings.push(format!(
+            "journal error daemon이 표시 상한 {JOURNAL_DAEMON_CAP}개를 넘어 나머지를 생략함"
+        ));
+    }
+    findings
 }
 
 /// proc_states 섹션(`<count> <STAT>`)에서 좀비(Z)가 임계 이상 누적되면 ⚠(단발/소수는 정상이라 제외).
@@ -1268,13 +1433,37 @@ fn scan_swap(body: &str) -> Vec<String> {
 /// 메타(probe_id·severity)는 여기서 입힌다 — 잘 검증된 스캐너 로직을 건드리지 않는다.
 pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for (name, body) in iter_sections(evidence) {
+    let sections = iter_sections(evidence);
+    let has_structured_journal = sections.iter().any(|(name, body)| {
+        *name == "journal_daemon_errors"
+            && section_stdout(body).lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| value.get("MESSAGE").cloned())
+                    .and_then(|message| message.as_str().map(str::to_string))
+                    .is_some()
+            })
+    });
+    for (name, body) in sections {
         // 매처는 run_and_format 래퍼의 stdout 본문만 본다(command:/exit_code= 메타라인 오탐 방지).
         let stdout = section_stdout(&body);
         let (severity, messages) = match name {
             "disk" => (Severity::Warn, scan_disk_full(stdout)),
             "inodes" => (Severity::Warn, scan_inodes(stdout)),
             "dmesg_oom" => (Severity::Crit, scan_oom(stdout)),
+            // no-arg 진단은 structured scanner가 같은 cron 오류를 더 정확히 보고하므로 중복 억제.
+            "journal_errors" if !has_structured_journal => {
+                (Severity::Warn, scan_crontab_parse_errors(stdout))
+            }
+            "journal_daemon_errors" => {
+                let mut messages = scan_journal_daemon_errors(stdout);
+                if body.lines().any(|line| line.contains("truncated=true")) {
+                    messages.push(
+                        "journal error 출력이 64 KiB 상한에서 잘려 최신 일부만 집계됨".to_string(),
+                    );
+                }
+                (Severity::Warn, messages)
+            }
             "proc_states" => (Severity::Warn, scan_zombies(stdout)),
             "failed_units" => (Severity::Warn, scan_failed_units(stdout)),
             "fd" => (Severity::Warn, scan_fd(stdout)),
@@ -1544,6 +1733,22 @@ mod tests {
             .collect();
         assert!(names.contains(&"process"));
         assert!(names.contains(&"uptime"));
+    }
+
+    #[test]
+    fn no_arg_diagnose_alone_collects_structured_daemon_errors() {
+        let no_arg: Vec<&str> = select_probes(None, false)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(no_arg.contains(&"journal_daemon_errors"), "{no_arg:?}");
+
+        // generic 문자열을 포함해 증상이 주어지면 기존 targeted 수집 계약을 유지한다.
+        let with_symptom: Vec<&str> = select_probes(Some("원인 모름"), false)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(!with_symptom.contains(&"journal_daemon_errors"));
     }
 
     #[test]
@@ -1851,6 +2056,118 @@ redis.service loaded failed failed KV\n";
             "{f:?}"
         );
         assert!(f[0].message.contains("nginx.service"));
+    }
+
+    #[test]
+    fn scan_findings_groups_all_journal_priority_errors_by_daemon() {
+        // okrr-intranet-2 실측 구조. message에 `error`가 없는 Permission denied도 journal priority가
+        // err이므로 finding이 되어야 한다. 최신순 입력의 첫 message를 대표로 유지한다.
+        let evidence = r#"## journal_daemon_errors
+command: journalctl -p err --since today -n 200 --no-pager -r -o json
+exit_code=0 duration_ms=20 truncated=false cwd=.
+--- stdout ---
+{"_SYSTEMD_UNIT":"cron.service","SYSLOG_IDENTIFIER":"cron","MESSAGE":"Error: bad username; while reading /etc/crontab"}
+{"UNIT":"motd-news.service","_SYSTEMD_UNIT":"init.scope","SYSLOG_IDENTIFIER":"systemd","MESSAGE":"Failed at step EXEC spawning helper: Permission denied"}
+{"_SYSTEMD_UNIT":"cron.service","SYSLOG_IDENTIFIER":"cron","MESSAGE":"Error: bad minute; while reading /etc/cron.d/backup"}
+--- stderr ---
+
+"#;
+        let findings = scan_findings(evidence);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        let cron = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("cron.service:"))
+            .unwrap();
+        assert!(cron
+            .message
+            .contains("journal error 2건 중 cron 설정 파싱 오류 2건"));
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.message.starts_with("cron.service:"))
+                .count(),
+            1,
+            "known cron finding과 generic finding 중복"
+        );
+        let motd = findings
+            .iter()
+            .find(|finding| finding.message.starts_with("motd-news.service:"))
+            .unwrap();
+        assert!(motd.message.contains("journal error 1건"));
+        assert!(motd.message.contains("Permission denied"));
+    }
+
+    #[test]
+    fn targeted_text_journal_keeps_cron_parse_finding_without_duplicate() {
+        let text_only = "## journal_errors\n\
+Sep 03 08:18:01 host cron[902]: Error: bad username; while reading /etc/crontab\n";
+        let findings = scan_findings(text_only);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].probe_id, "journal_errors");
+        assert!(findings[0].message.contains("cron 설정 파싱 오류 1건"));
+
+        let both = format!(
+            "{text_only}## journal_daemon_errors\n{{\"_SYSTEMD_UNIT\":\"cron.service\",\"MESSAGE\":\"Error: bad username; while reading /etc/crontab\"}}\n"
+        );
+        let findings = scan_findings(&both);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].probe_id, "journal_daemon_errors");
+
+        // structured probe가 실행 실패/빈 출력이면 기존 text scanner를 fallback으로 유지한다.
+        let structured_failed = format!(
+            "{text_only}## journal_daemon_errors\nexit_code=127\n--- stdout ---\n\n--- stderr ---\njournalctl: command not found\n"
+        );
+        let findings = scan_findings(&structured_failed);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].probe_id, "journal_errors");
+    }
+
+    #[test]
+    fn structured_journal_reports_run_command_truncation() {
+        let evidence = "## journal_daemon_errors\n\
+exit_code=0 duration_ms=20 truncated=true cwd=.\n\
+--- stdout ---\n\
+{\"_SYSTEMD_UNIT\":\"app.service\",\"MESSAGE\":\"Failed\"}\n\
+--- stderr ---\n";
+        let findings = scan_findings(evidence);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.message.contains("64 KiB 상한")));
+    }
+
+    #[test]
+    fn scan_journal_daemon_errors_handles_fallback_malformed_and_bounds() {
+        let long = "한".repeat(JOURNAL_MESSAGE_CHAR_CAP + 10);
+        let mut jsonl = format!(
+            "not-json\n{{\"SYSLOG_IDENTIFIER\":\"app\",\"MESSAGE\":\"{long}\"}}\n\
+             {{\"_COMM\":\"worker\\nthread\",\"MESSAGE\":\"segfault\\ncore dumped\"}}\n\
+             {{\"MESSAGE\":\"source missing\"}}\n{{\"_COMM\":\"empty\"}}\n"
+        );
+        for index in 0..=JOURNAL_DAEMON_CAP {
+            jsonl.push_str(&format!(
+                "{{\"_SYSTEMD_UNIT\":\"daemon-{index}.service\",\"MESSAGE\":\"failed\"}}\n"
+            ));
+        }
+        let findings = scan_journal_daemon_errors(&jsonl);
+        assert!(findings.iter().any(|line| line.starts_with("app:")));
+        let worker = findings
+            .iter()
+            .find(|line| line.starts_with("worker thread:"))
+            .unwrap();
+        assert!(worker.contains("segfault core dumped"));
+        assert!(!worker.contains('\n'));
+        assert!(findings.iter().any(|line| line.starts_with("unknown:")));
+        let app = findings
+            .iter()
+            .find(|line| line.starts_with("app:"))
+            .unwrap();
+        assert!(app.ends_with('…'));
+        assert!(findings
+            .iter()
+            .any(|line| line.contains("2건을 구조화하지 못해")));
+        assert!(findings.iter().any(|line| line.contains("표시 상한 20개")));
+        // warning 두 종류를 제외하면 daemon finding은 정확히 cap 이하다.
+        assert!(findings.len() <= JOURNAL_DAEMON_CAP + 2);
     }
 
     #[test]

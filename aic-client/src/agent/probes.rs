@@ -464,6 +464,16 @@ static CATALOG: &[ProbeSpec] = &[
         max_lines: Some(50),
     },
     ProbeSpec {
+        id: "journal_daemon_errors",
+        category: "process",
+        tags: &["log", "journal", "error", "daemon", "systemd"],
+        description: "오늘의 journal error 최근 200건을 daemon별로 집계하기 위한 structured JSONL",
+        linux_command: "journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE",
+        // macOS에는 systemd journal이 없다. no-arg generic 진단의 Linux 전용 보강 probe다.
+        macos_command: "echo",
+        max_lines: Some(200),
+    },
+    ProbeSpec {
         id: "dmesg_oom",
         category: "system",
         tags: &["memory", "oom", "kernel", "process"],
