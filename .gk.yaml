@@ -32,6 +32,8 @@ ai:
             - credentials.json
         trailer: false
         audit: false
+ship:
+    version_files: [aic-common/Cargo.toml, aic-server/Cargo.toml, aic-client/Cargo.toml]
 
 # policies: (commented-out, opt-in)
 #   secret_patterns:
