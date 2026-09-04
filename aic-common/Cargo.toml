@@ -1,6 +1,6 @@
 [package]
 name = "aic-common"
-version = "0.38.0"
+version = "0.38.1"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
