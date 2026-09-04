@@ -1559,6 +1559,11 @@ async fn main() {
                     // command 수집이 조용히 멈춘다(rc는 없는 파일을 source하려다 실패). init한 흔적이
                     // 있는 셸의 hook 파일을 self-heal한다.
                     regenerate_hooks_after_update();
+                    // 구버전이 linger 없이 설치한 호스트는 로그아웃마다 aicd가 죽는데, 그 상태
+                    // 그대로는 재시작해도 다음 로그아웃에 또 죽는다. 재시작보다 **먼저** 보정한다
+                    // — 아래 restart는 aicd가 안 떠 있으면 skip하고 끝나기 때문이다(그 호스트가
+                    // 정확히 그 상태다).
+                    heal_linger_after_update();
                     handle_daemon_restart(true).await;
                 }
                 Ok(aic_client::update::Outcome::Unchanged) => {}
@@ -1798,6 +1803,11 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
         Err(e) => println!("  aicd:     {COL_YELLOW}등록 실패{COL_RESET} — {e}"),
     }
     println!("  enrollment_id: {}", enrolled.enrollment_id);
+    // 등록이 성공해도 linger가 꺼져 있으면 로그아웃과 함께 aicd가 죽는다. `curl | sh` 설치는
+    // 로그인 셸이 없어 이 경로로 끝나는 일이 잦으므로, 성공 출력에도 반드시 실어야 한다.
+    if let Ok(report) = &daemon_status {
+        print_linger_status(&report.linger);
+    }
     if let Err(e) = &daemon_status {
         eprintln!(
             "\n{COL_YELLOW}⚠{COL_RESET} enrollment는 완료됐습니다 \
@@ -2255,6 +2265,57 @@ async fn print_daemon_version(client: &UdsClient) {
     }
 }
 
+/// 이미 설치된 호스트의 linger 미설정을 update 시점에 보정한다.
+///
+/// linger를 켜는 코드가 없던 버전으로 설치된 호스트는 재설치 없이는 복구되지 않는다.
+/// 운영자가 각 호스트에서 `aic daemon install`을 다시 돌리게 하는 대신, 이미 돌리는
+/// `aic update`가 스스로 고친다(hook 파일 self-heal과 같은 성격이다).
+fn heal_linger_after_update() {
+    use aic_client::daemon_install::{self, Linger, Platform};
+
+    // 자동 시작 unit이 없으면 daemon을 쓰지 않는 설치다 — 남의 계정 설정을 건드리지 않는다.
+    let Some(unit) = daemon_install::current_unit_path() else {
+        return;
+    };
+    if !unit.exists() || daemon_install::detect_platform() != Platform::Linux {
+        return;
+    }
+
+    let linger = daemon_install::ensure_linger();
+    // 이미 켜져 있던 호스트에는 아무 말도 하지 않는다 — 정상 update 출력에 잡음을 만들지 않는다.
+    if linger != Linger::AlreadyOn {
+        print_linger_status(&linger);
+    }
+}
+
+/// linger 상태를 사용자에게 알린다.
+///
+/// 켜져 있으면 한 줄로 확인만 주고, 실패는 경고로 올린다 — linger 없이 설치된 호스트는
+/// 로그아웃 순간 조용히 죽고 설치 로그에는 아무 흔적도 남지 않아, 여기서 말하지 않으면
+/// 운영자가 원격 알림을 받기 전까지 알 방법이 없다.
+fn print_linger_status(linger: &aic_client::daemon_install::Linger) {
+    use aic_client::daemon_install::Linger;
+    match linger {
+        Linger::AlreadyOn => {
+            println!("  linger:  {COL_GREEN}yes{COL_RESET} — 로그아웃 후에도 유지");
+        }
+        Linger::Enabled => {
+            println!(
+                "  linger:  {COL_GREEN}yes{COL_RESET} — 이번에 활성화됨 (로그아웃 후에도 유지)"
+            );
+        }
+        Linger::Failed(reason) => {
+            eprintln!(
+                "\n{COL_YELLOW}⚠{COL_RESET} linger를 켜지 못했습니다 — \
+                 로그아웃하면 aicd가 함께 종료됩니다.\n\
+                 \x20 원인: {reason}\n\
+                 \x20 조치: `sudo loginctl enable-linger $(id -un)`을 실행하세요."
+            );
+        }
+        Linger::NotApplicable => {}
+    }
+}
+
 /// `aic daemon install [--no-load]`: OS-native auto-start unit 설치.
 fn handle_daemon_install(no_load: bool) {
     match aic_client::daemon_install::install(no_load) {
@@ -2273,6 +2334,7 @@ fn handle_daemon_install(no_load: bool) {
             );
             if report.loaded {
                 println!("  loaded:  {COL_GREEN}yes{COL_RESET} — 부팅 시 자동 시작 + 즉시 실행");
+                print_linger_status(&report.linger);
             } else {
                 let cmd = match report.platform {
                     aic_client::daemon_install::Platform::Macos => {

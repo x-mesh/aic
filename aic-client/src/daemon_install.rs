@@ -35,6 +35,22 @@ pub fn detect_platform() -> Platform {
     }
 }
 
+/// systemd linger 처리 결과.
+///
+/// linger가 없으면 `systemctl --user enable`은 **부팅 자동 시작을 보장하지 않는다** —
+/// 마지막 로그인 세션이 닫히는 순간 user manager가 내려가고 user 유닛도 같이 죽는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Linger {
+    /// 원래 켜져 있었다 — 건드리지 않았다.
+    AlreadyOn,
+    /// 이번에 켰다.
+    Enabled,
+    /// 켜지 못했다. 사유를 그대로 보여 줘 다음 조치를 판단하게 한다.
+    Failed(String),
+    /// linger 개념이 없다(macOS launchd) 또는 unit을 load하지 않은 설치(`--no-load`).
+    NotApplicable,
+}
+
 /// 설치 결과 요약 — 호출자가 사용자에게 한 줄로 보여줄 수 있게.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReport {
@@ -44,6 +60,8 @@ pub struct InstallReport {
     pub log_dir: PathBuf,
     /// load/enable까지 수행했는지(`--no-load`면 false).
     pub loaded: bool,
+    /// 로그아웃 후에도 유닛이 살아 있게 하는 linger 처리 결과.
+    pub linger: Linger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,12 +291,21 @@ pub fn install(no_load: bool) -> Result<InstallReport> {
         }
     };
 
+    // enable만으로는 로그아웃 후 생존이 보장되지 않는다(위 ensure_linger 주석 참고).
+    // launchd에는 linger 개념이 없고, --no-load는 매니저를 건드리지 않겠다는 뜻이라 둘 다 제외.
+    let linger = if no_load || platform != Platform::Linux {
+        Linger::NotApplicable
+    } else {
+        ensure_linger()
+    };
+
     Ok(InstallReport {
         platform,
         unit_path,
         aicd_path: aicd,
         log_dir: logs,
         loaded,
+        linger,
     })
 }
 
@@ -406,6 +433,81 @@ pub(crate) fn with_user_bus_hint(stderr: &str) -> String {
         )
     } else {
         stderr.to_string()
+    }
+}
+
+/// 현재 uid의 linger 상태. `loginctl`이 없거나 출력을 못 읽으면 `None`(= 알 수 없음).
+///
+/// uid로 조회한다 — 이름 조회가 한 단계 더 실패할 수 있고, `loginctl`은 둘 다 받는다.
+fn linger_is_enabled(uid: u32) -> Option<bool> {
+    let out = Command::new("loginctl")
+        .args(["show-user", &uid.to_string(), "--property=Linger"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_linger_property(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `loginctl show-user --property=Linger` 출력을 판독한다.
+///
+/// 형식이 예상과 다르면 `None` — "yes가 아니다"와 "못 읽었다"를 뭉뚱그리면, 조회가 깨졌을 때
+/// linger를 껐다고 오해해 매번 enable을 재시도하거나 반대로 실패를 성공으로 읽는다.
+fn parse_linger_property(stdout: &str) -> Option<bool> {
+    let value = stdout.trim().strip_prefix("Linger=")?;
+    match value.trim() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// 로그아웃 뒤에도 user 유닛이 살아 있도록 linger를 켠다.
+///
+/// **왜 필요한가**: `systemctl --user enable --now`만으로는 부족하다. linger가 꺼져 있으면
+/// 마지막 로그인 세션이 닫힐 때 user manager(`user@<uid>.service`)가 내려가고 `aicd`도 함께
+/// 죽는다. 그러면 cron 같은 짧은 로그인이 user manager를 잠깐 살리는 동안에만 배치가 나가서,
+/// 원격에서는 호스트가 계속 죽어 있는 것처럼 보인다(설치 로그에는 아무 경고도 남지 않는다).
+///
+/// 실패해도 `Err`를 반환하지 않는다 — 유닛 설치 자체는 이미 성공했고, 되돌릴 수 없는 단계
+/// 뒤의 보정 하나로 명령 전체를 실패시키면 운영자가 멀쩡한 설치를 실패로 읽는다. 대신 사유를
+/// `Linger::Failed`로 돌려주고 호출부가 **반드시** 경고를 출력한다 — 조용히 넘기면 이 버그가
+/// 그대로 재발한다.
+pub fn ensure_linger() -> Linger {
+    let uid = unsafe { libc::getuid() };
+
+    // 이미 켜져 있으면 건드리지 않는다 — 멱등하고, 정상 상태에 잡음을 만들지 않는다.
+    if linger_is_enabled(uid) == Some(true) {
+        return Linger::AlreadyOn;
+    }
+
+    let out = match Command::new("loginctl")
+        .args(["enable-linger", &uid.to_string()])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => return Linger::Failed(format!("loginctl 실행 실패: {e}")),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            format!("exit {}", out.status)
+        } else {
+            stderr.to_string()
+        };
+        return Linger::Failed(format!("loginctl enable-linger {uid} 실패: {detail}"));
+    }
+
+    // 성공 코드만 믿지 않고 실제 상태를 다시 읽는다 — polkit이 거부해도 0을 돌려주는 경로가
+    // 있고, 그 경우 "켰다"고 보고하면 이 버그를 다시 못 잡는다.
+    match linger_is_enabled(uid) {
+        Some(true) => Linger::Enabled,
+        Some(false) => Linger::Failed(
+            "loginctl enable-linger가 성공했지만 Linger=no 그대로입니다 (권한 거부 가능성)".into(),
+        ),
+        None => Linger::Failed("linger 상태를 확인할 수 없습니다 (loginctl 조회 실패)".into()),
     }
 }
 
@@ -617,6 +719,37 @@ mod tests {
         // 그 외 오류는 원문 그대로 — 무관한 안내로 원인을 흐리지 않는다.
         let plain = with_user_bus_hint("Unit aicd.service not found.");
         assert_eq!(plain, "Unit aicd.service not found.");
+    }
+
+    /// 이 테스트가 지키는 것: linger 판독이 "켜짐"/"꺼짐"/"못 읽음"을 구분하는 것.
+    /// 셋을 뭉뚱그리면 조회가 깨진 호스트에서 linger를 켰다고 오해하고, 이 버그(로그아웃 시
+    /// aicd 종료)가 경고 없이 그대로 재발한다.
+    #[test]
+    fn linger_property_distinguishes_unknown_from_disabled() {
+        assert_eq!(parse_linger_property("Linger=yes"), Some(true));
+        assert_eq!(parse_linger_property("Linger=yes\n"), Some(true));
+        assert_eq!(parse_linger_property("Linger=no"), Some(false));
+        // 판독 불가는 "꺼짐"이 아니라 "모름"이다.
+        assert_eq!(parse_linger_property(""), None);
+        assert_eq!(parse_linger_property("Linger="), None);
+        assert_eq!(
+            parse_linger_property("Failed to get user: No such user"),
+            None
+        );
+        assert_eq!(parse_linger_property("Docked=no"), None);
+    }
+
+    /// 이 테스트가 지키는 것: linger 실패가 **실행 가능한 조치**를 들고 오는 것.
+    /// 원래 버그는 안내가 `Failed to connect to bus` 오류 경로에만 있어서, 로그인 세션이 있는
+    /// 정상 설치는 경고를 영영 못 봤다는 것이었다.
+    #[test]
+    fn linger_failure_carries_actionable_reason() {
+        let failed = Linger::Failed("loginctl enable-linger 0 실패: Access denied".into());
+        let Linger::Failed(reason) = failed else {
+            panic!("Failed variant여야 함");
+        };
+        assert!(reason.contains("enable-linger"));
+        assert!(!reason.is_empty());
     }
 
     #[test]
