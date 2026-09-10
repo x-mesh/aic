@@ -107,6 +107,103 @@ fn config_get_runs_headless() {
     );
 }
 
+#[test]
+fn workload_discovery_and_inspect_do_not_create_configuration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("cfg").join("aic");
+    let discover = aic_cmd(tmp.path())
+        .args(["workload", "discover", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        discover.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&discover.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&discover.stdout).unwrap();
+    assert_eq!(report["report"]["schema_version"], 1);
+    assert!(!config_dir.join("workloads.toml").exists());
+    if let Some(candidate_id) = report["report"]["candidates"]
+        .as_array()
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate["id"].as_str())
+    {
+        let inspect = aic_cmd(tmp.path())
+            .args(["workload", "inspect", candidate_id, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            inspect.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        assert!(!config_dir.join("workloads.toml").exists());
+    }
+
+    let failed = aic_cmd(tmp.path())
+        .args(["workload", "enable", "missing", "--fingerprint", "stale"])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(!config_dir.join("workloads.toml").exists());
+}
+
+#[test]
+fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let discover = aic_cmd(tmp.path())
+        .args(["workload", "discover", "--json"])
+        .output()
+        .unwrap();
+    assert!(discover.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&discover.stdout).unwrap();
+    let candidate = report["report"]["candidates"]
+        .as_array()
+        .and_then(|candidates| {
+            candidates.iter().find(|candidate| {
+                !candidate["selector"].is_null()
+                    && candidate["ambiguity"].as_array().is_some_and(Vec::is_empty)
+            })
+        })
+        .expect("현재 aic 프로세스에서 활성화 가능한 workload 후보가 있어야 함");
+    let id = candidate["id"].as_str().unwrap();
+    let fingerprint = candidate["fingerprint"].as_str().unwrap();
+
+    let stale = aic_cmd(tmp.path())
+        .args(["workload", "enable", id, "--fingerprint", "stale"])
+        .output()
+        .unwrap();
+    assert!(!stale.status.success());
+    assert!(!tmp.path().join("cfg/aic/workloads.toml").exists());
+
+    let enabled = aic_cmd(tmp.path())
+        .args([
+            "workload",
+            "enable",
+            id,
+            "--fingerprint",
+            fingerprint,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        enabled.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let saved = std::fs::read_to_string(tmp.path().join("cfg/aic/workloads.toml")).unwrap();
+    assert!(saved.contains(id));
+
+    let listed = aic_cmd(tmp.path())
+        .args(["workload", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let configured: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(configured["configured"][0]["id"], id);
+}
+
 /// 보안 속성: 비대화(TTY 없음)에서 NeedsConfirm 명령은 자동 실행되지 않는다.
 /// webhook/cron이 spawn한 진단이 상태 변경 명령을 자동 실행하면 안 되는 핵심 불변식.
 #[test]
