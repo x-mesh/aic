@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.39.1] - 2026-09-10
+
+### Fixed
+
+- **workload:** LLM 분석 응답 파싱과 제안 상한을 고친다
+- **llm:** 요청 전체 타임아웃 기본값을 120초로 늘린다
+- **workload:** linux cgroup 경로의 needless_return을 제거한다
+
 ## [0.39.0] - 2026-09-10
 
 ### Added
