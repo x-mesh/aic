@@ -41,6 +41,242 @@ const NO_LLM_TURN_HINT: &str =
     "등록된 LLM이 없어 답변할 수 없습니다 — provider 등록 후 다시 시도하세요 \
 (진단 명령 /local·/watch·/metrics 등은 그대로 사용 가능).";
 
+const WORKLOAD_EXPLAIN_MAX_CANDIDATES: usize = 32;
+const WORKLOAD_EXPLAIN_MAX_PROPOSALS: usize = 64;
+const WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES: usize = 16 * 1024;
+const WORKLOAD_EXPLAIN_MAX_AMBIGUITIES: usize = 8;
+const WORKLOAD_EXPLAIN_MAX_AMBIGUITY_BYTES: usize = 128;
+const WORKLOAD_DISPLAY_MAX_CANDIDATES: usize = 32;
+const WORKLOAD_DISPLAY_MAX_PROPOSALS: usize = 64;
+const WORKLOAD_DISPLAY_MAX_BYTES: usize = 64 * 1024;
+const WORKLOAD_EXPLAIN_PREFIX: &str = "Analyze the detected application inventory as an SRE. \
+Infer roles and possible relationships only from the supplied evidence. Inventory evidence does not \
+prove health, traffic, latency, or causality, so state those as unknown monitoring gaps. Rank every \
+registered proposal and explain in Korean what it can observe, why it matters, its cost and effects, \
+and whether it is available now or only planned. Return a JSON array of objects with exactly \
+proposal_id, priority, and summary. Do not invent actions, commands, thresholds, or evidence. Data: ";
+
+fn cap_utf8(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn render_workload_explain_prompt(
+    candidates: &[serde_json::Value],
+    proposals: &[serde_json::Value],
+) -> String {
+    format!(
+        "{WORKLOAD_EXPLAIN_PREFIX}{}",
+        serde_json::json!({
+            "candidates": candidates,
+            "proposals": proposals,
+        })
+    )
+}
+
+/// Build the only workload data that an explanation call can receive. Opaque references keep
+/// selector paths out of the prompt; the returned map restores registered proposal ids for UI.
+fn build_workload_explain_prompt(
+    report: &aic_common::DiscoveryReport,
+    proposals: &[aic_common::WorkloadProposal],
+) -> (
+    String,
+    Vec<aic_common::WorkloadProposal>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut candidate_data = Vec::new();
+    let mut proposal_data = Vec::new();
+    let mut exposed = Vec::new();
+    let mut aliases = std::collections::BTreeMap::new();
+    let mut candidate_refs = std::collections::BTreeMap::new();
+
+    for candidate in report
+        .candidates
+        .iter()
+        .take(WORKLOAD_EXPLAIN_MAX_CANDIDATES)
+    {
+        let candidate_ref = format!("c{}", candidate_data.len() + 1);
+        let ambiguity = candidate
+            .ambiguity
+            .iter()
+            .take(WORKLOAD_EXPLAIN_MAX_AMBIGUITIES)
+            .map(|value| {
+                cap_utf8(
+                    &crate::redaction::redact(value).0,
+                    WORKLOAD_EXPLAIN_MAX_AMBIGUITY_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = serde_json::json!({
+            "candidate_ref": candidate_ref,
+            "adapter": candidate.adapter,
+            "binding_count": candidate.bindings.len(),
+            "ambiguity": ambiguity,
+        });
+        let mut trial_candidates = candidate_data.clone();
+        trial_candidates.push(summary.clone());
+        if render_workload_explain_prompt(&trial_candidates, &proposal_data).len()
+            > WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES
+        {
+            continue;
+        }
+        candidate_data.push(summary);
+        candidate_refs.insert(candidate.id.clone(), candidate_ref);
+    }
+
+    for candidate in report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate_refs.contains_key(&candidate.id))
+    {
+        let candidate_ref = candidate_refs
+            .get(&candidate.id)
+            .expect("filtered candidate reference")
+            .clone();
+        for proposal in proposals
+            .iter()
+            .filter(|proposal| proposal.candidate_id == candidate.id)
+        {
+            if exposed.len() >= WORKLOAD_EXPLAIN_MAX_PROPOSALS {
+                break;
+            }
+            let alias = format!("p{}", exposed.len() + 1);
+            let summary = serde_json::json!({
+                "proposal_id": alias,
+                "candidate_ref": candidate_ref,
+                "kind": proposal.kind,
+                "evidence": proposal.evidence,
+                "reason": proposal.reason,
+                "expected_signals": proposal.expected_signals,
+                "cost": proposal.cost,
+                "effects": proposal.effects,
+                "readiness": proposal.readiness,
+                "related_candidate_refs": proposal.related_candidate_ids.iter().filter_map(|id| candidate_refs.get(id)).collect::<Vec<_>>(),
+            });
+            let mut trial_proposals = proposal_data.clone();
+            trial_proposals.push(summary.clone());
+            if render_workload_explain_prompt(&candidate_data, &trial_proposals).len()
+                > WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES
+            {
+                break;
+            }
+            let mut exposed_proposal = proposal.clone();
+            exposed_proposal.id = alias.clone();
+            exposed_proposal.candidate_id = candidate_ref.clone();
+            aliases.insert(alias, proposal.id.clone());
+            exposed.push(exposed_proposal);
+            proposal_data.push(summary);
+        }
+    }
+
+    let prompt = render_workload_explain_prompt(&candidate_data, &proposal_data);
+    debug_assert!(prompt.len() <= WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES);
+    (prompt, exposed, aliases)
+}
+
+fn render_workload_discovery(
+    report: &aic_common::DiscoveryReport,
+    proposals: &[aic_common::WorkloadProposal],
+) -> String {
+    let visible_candidates = report
+        .candidates
+        .iter()
+        .take(WORKLOAD_DISPLAY_MAX_CANDIDATES)
+        .collect::<Vec<_>>();
+    let visible_ids = visible_candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let cards = visible_candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}\nfingerprint={} adapter={:?} bindings={} ambiguity={:?}",
+                cap_utf8(&candidate.id, 512),
+                cap_utf8(&candidate.fingerprint, 128),
+                candidate.adapter,
+                candidate.bindings.len(),
+                candidate
+                    .ambiguity
+                    .iter()
+                    .take(WORKLOAD_EXPLAIN_MAX_AMBIGUITIES)
+                    .map(|value| cap_utf8(value, WORKLOAD_EXPLAIN_MAX_AMBIGUITY_BYTES))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let matching_proposals = proposals
+        .iter()
+        .filter(|proposal| visible_ids.contains(proposal.candidate_id.as_str()))
+        .collect::<Vec<_>>();
+    let proposal_lines = matching_proposals
+        .iter()
+        .take(WORKLOAD_DISPLAY_MAX_PROPOSALS)
+        .map(|proposal| {
+            let command = proposal
+                .command
+                .as_deref()
+                .map(|value| cap_utf8(value, 768))
+                .unwrap_or_else(|| "(planned: no command)".to_string());
+            format!(
+                "- {}: {:?} readiness={:?} command={}\n  evidence={:?}\n  reason={}\n  expected_signals={:?} cost={:?} persistence={} privilege={} outbound={} related_candidate_ids={:?}",
+                cap_utf8(&proposal.id, 768),
+                proposal.kind,
+                proposal.readiness,
+                command,
+                proposal.evidence,
+                proposal.reason,
+                proposal.expected_signals,
+                proposal.cost,
+                proposal.effects.persistence,
+                proposal.effects.privilege,
+                proposal.effects.outbound,
+                proposal
+                    .related_candidate_ids
+                    .iter()
+                    .take(4)
+                    .map(|id| cap_utf8(id, 512))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omitted_candidates = report
+        .candidates
+        .len()
+        .saturating_sub(visible_candidates.len());
+    let omitted_proposals = matching_proposals
+        .len()
+        .saturating_sub(WORKLOAD_DISPLAY_MAX_PROPOSALS);
+    let rendered = format!(
+        "workload discovery (schema={}): candidates={} shown={} omitted={}\n{}\nproposals: shown={} omitted={}\n{}",
+        report.schema_version,
+        report.candidates.len(),
+        visible_candidates.len(),
+        omitted_candidates,
+        cards,
+        matching_proposals.len().min(WORKLOAD_DISPLAY_MAX_PROPOSALS),
+        omitted_proposals,
+        proposal_lines
+    );
+    if rendered.len() <= WORKLOAD_DISPLAY_MAX_BYTES {
+        rendered
+    } else {
+        format!(
+            "{}\n… workload display capped at {} bytes; use `aic workload discover --json` for machine-readable output.",
+            cap_utf8(&rendered, WORKLOAD_DISPLAY_MAX_BYTES),
+            WORKLOAD_DISPLAY_MAX_BYTES
+        )
+    }
+}
+
 /// SRE 모드(run_command 활성) 전용 시스템 지침. generic preface 뒤에 덧붙인다.
 const SRE_PREFACE: &str = "\n\nYou are operating as an SRE diagnostics assistant with a \
 run_command tool. Behave like an autonomous on-call engineer:\n\
@@ -1053,6 +1289,17 @@ impl AgentSession {
     async fn handle_slash(&mut self, cmd: tool_record::SlashCommand) {
         use tool_record::SlashCommand;
         match cmd {
+            SlashCommand::Discover { raw } => self.handle_workload_discover(raw).await,
+            SlashCommand::WorkloadInspect { candidate_id } => {
+                self.handle_workload_inspect(&candidate_id).await
+            }
+            SlashCommand::WorkloadEnable {
+                candidate_id,
+                fingerprint,
+            } => {
+                self.handle_workload_enable(&candidate_id, &fingerprint)
+                    .await
+            }
             SlashCommand::Help => self.out.note(&tool_record::help_text()).await,
             SlashCommand::Health => self.handle_health().await,
             SlashCommand::Clear => {
@@ -1157,6 +1404,143 @@ impl AgentSession {
                     .note(&format!(
                         "알 수 없는 명령: /{name}. /help 로 사용법을 확인하세요."
                     ))
+                    .await
+            }
+        }
+    }
+
+    async fn handle_workload_discover(&mut self, raw: bool) {
+        let result = crate::workload::discover().map(|report| {
+            let proposals = crate::workload::proposals(&report);
+            let rendered = render_workload_discovery(&report, &proposals);
+            (rendered, report, proposals)
+        });
+        match result {
+            Ok((text, report, proposals)) => {
+                self.out.note(&text).await;
+                if raw {
+                    return;
+                }
+                if !self.llm_available {
+                    self.out
+                        .note("workload analysis unavailable: 등록된 LLM provider가 없습니다.")
+                        .await;
+                    return;
+                }
+                {
+                    let (prompt, exposed_proposals, aliases) =
+                        build_workload_explain_prompt(&report, &proposals);
+                    if exposed_proposals.is_empty() {
+                        return;
+                    }
+                    match self.dispatcher.send(&prompt).await.and_then(|raw| {
+                        crate::workload::validate_llm_explanations(&raw, &exposed_proposals)
+                            .map_err(|error| AicError::ConfigError(error.to_string()))
+                    }) {
+                        Ok(explanations) if !explanations.is_empty() => {
+                            let lines = explanations
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(index, (alias, summary))| {
+                                    aliases
+                                        .get(&alias)
+                                        .map(|id| format!("{id}: {summary}"))
+                                        .map(|line| format!("{}. {line}", index + 1))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.out
+                                .note(&format!("LLM workload monitoring analysis:\n{lines}"))
+                                .await;
+                        }
+                        Ok(_) => {
+                            self.out
+                                .note("workload analysis failed: 빈 분석 결과입니다.")
+                                .await
+                        }
+                        Err(error) => {
+                            self.out
+                                .note(&format!("workload analysis failed: {error}"))
+                                .await
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                self.out
+                    .note(&format!("workload discovery error: {error}"))
+                    .await
+            }
+        }
+    }
+
+    async fn handle_workload_inspect(&mut self, candidate_id: &str) {
+        let result = crate::workload::inspect(candidate_id).map(|(report, candidate)| {
+            let proposals = crate::workload::proposals(&report)
+                .into_iter()
+                .filter(|proposal| proposal.candidate_id == candidate.id)
+                .map(|proposal| proposal.id)
+                .collect::<Vec<_>>();
+            format!("{}\nfingerprint={}\nselector={:?}\nadapter={:?}\nbindings={:?}\nambiguity={:?}\nproposals={:?}", candidate.id, candidate.fingerprint, candidate.selector, candidate.adapter, candidate.bindings, candidate.ambiguity, proposals)
+        });
+        match result {
+            Ok(text) => self.out.note(&text).await,
+            Err(error) => {
+                self.out
+                    .note(&format!("workload inspect error: {error}"))
+                    .await
+            }
+        }
+    }
+
+    async fn handle_workload_enable(&mut self, candidate_id: &str, fingerprint: &str) {
+        if !self.allow_run_command {
+            self.out
+                .note("workload enable은 read-only 세션에서 거부됩니다.")
+                .await;
+            return;
+        }
+        let preview = match crate::workload::inspect(candidate_id) {
+            Ok((_, candidate))
+                if candidate.fingerprint == fingerprint
+                    && candidate.selector.is_some()
+                    && candidate.ambiguity.is_empty() =>
+            {
+                candidate
+            }
+            Ok(_) => {
+                self.out
+                    .note("workload enable 거부: 후보 fingerprint가 변경됐거나 모호합니다.")
+                    .await;
+                return;
+            }
+            Err(error) => {
+                self.out
+                    .note(&format!("workload enable error: {error}"))
+                    .await;
+                return;
+            }
+        };
+        let prompt = format!(
+            "workload enable: id={} fingerprint={} selector={:?} path={} persistence=true privilege=false outbound=false. 저장할까요? [y/N]",
+            preview.id,
+            preview.fingerprint,
+            preview.selector,
+            crate::config::ConfigManager::config_path().with_file_name("workloads.toml").display()
+        );
+        if !self.out.confirm(&prompt).await {
+            self.out.note("workload enable을 취소했습니다.").await;
+            return;
+        }
+        match crate::workload::enable(candidate_id, fingerprint) {
+            Ok(definition) => {
+                self.out
+                    .note(&format!("configured {}", definition.id))
+                    .await
+            }
+            Err(error) => {
+                self.out
+                    .note(&format!("workload enable error: {error}"))
                     .await
             }
         }
@@ -3177,6 +3561,77 @@ mod tests {
     use crate::agent::types::parse_openai_response;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn workload_explain_prompt_is_bounded_and_uses_opaque_references() {
+        let candidates = (0..100)
+            .map(|index| aic_common::WorkloadCandidate {
+                id: format!("exe:/secret/path/{index}"),
+                fingerprint: format!("fingerprint-{index}"),
+                selector: Some(aic_common::WorkloadSelector::Executable {
+                    path: format!("/secret/path/{index}"),
+                }),
+                adapter: aic_common::WorkloadAdapter::Generic,
+                bindings: vec![aic_common::RuntimeBinding {
+                    pid: index + 1,
+                    start_time: index as u64,
+                }],
+                ambiguity: vec!["가".repeat(256)],
+            })
+            .collect::<Vec<_>>();
+        let report = aic_common::DiscoveryReport {
+            schema_version: aic_common::WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "sensitive coverage".to_string(),
+            candidates,
+        };
+        let proposals = crate::workload::proposals(&report);
+
+        let (prompt, exposed, aliases) = build_workload_explain_prompt(&report, &proposals);
+        assert!(prompt.len() <= WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES);
+        assert!(exposed.len() <= WORKLOAD_EXPLAIN_MAX_PROPOSALS);
+        assert!(aliases.len() <= WORKLOAD_EXPLAIN_MAX_PROPOSALS);
+        assert!(!prompt.contains("/secret/path"));
+        assert!(!prompt.contains("fingerprint-"));
+        assert!(!prompt.contains("sensitive coverage"));
+        assert!(
+            exposed
+                .iter()
+                .all(|proposal| proposal.id.starts_with('p')
+                    && proposal.candidate_id.starts_with('c'))
+        );
+        assert!(aliases
+            .iter()
+            .all(|(alias, original)| alias.starts_with('p') && original.contains("exe:/secret")));
+    }
+
+    #[test]
+    fn workload_discovery_display_is_bounded_and_reports_omissions() {
+        let candidates = (0..100)
+            .map(|index| aic_common::WorkloadCandidate {
+                id: format!("exe:/very/long/path/{index}/{}", "x".repeat(1024)),
+                fingerprint: format!("fingerprint-{index}"),
+                selector: Some(aic_common::WorkloadSelector::Executable {
+                    path: format!("/very/long/path/{index}"),
+                }),
+                adapter: aic_common::WorkloadAdapter::Generic,
+                bindings: vec![aic_common::RuntimeBinding {
+                    pid: index + 1,
+                    start_time: index as u64,
+                }],
+                ambiguity: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let report = aic_common::DiscoveryReport {
+            schema_version: aic_common::WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "test".to_string(),
+            candidates,
+        };
+        let proposals = crate::workload::proposals(&report);
+        let rendered = render_workload_discovery(&report, &proposals);
+        assert!(rendered.len() <= WORKLOAD_DISPLAY_MAX_BYTES + 160);
+        assert!(rendered.contains("candidates=100 shown=32 omitted=68"));
+        assert!(rendered.contains("proposals: shown=64"));
+    }
 
     #[test]
     fn cap_bytes_truncates_large() {

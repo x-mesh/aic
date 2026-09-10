@@ -165,6 +165,18 @@ pub(crate) const PROCS_DEFAULT: usize = 40;
 /// 인식된 slash command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SlashCommand {
+    /// `/discover [--raw]` — workload discovery with optional LLM analysis.
+    Discover {
+        raw: bool,
+    },
+    /// `/workload inspect <candidate-id>` or `/workload enable <candidate-id> <fingerprint>`.
+    WorkloadInspect {
+        candidate_id: String,
+    },
+    WorkloadEnable {
+        candidate_id: String,
+        fingerprint: String,
+    },
     Help,
     /// `/health` — 현재 머신의 deterministic health verdict + coverage. LLM 미호출.
     Health,
@@ -339,6 +351,8 @@ fn resolve_slash_command(typed: &str) -> Resolution {
 
 /// 자동완성·도움말에 쓰는 slash 메타명령 목록(primary 이름).
 pub(crate) const SLASH_COMMANDS: &[&str] = &[
+    "discover",
+    "workload",
     "help",
     "health",
     "clear",
@@ -375,8 +389,8 @@ pub(crate) fn slash_category(name: &str) -> &'static str {
         "last" | "raw" | "timeline" | "trend" | "compare" | "bundle" | "rca" | "explain-last" => {
             "Evidence"
         }
-        "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs" | "record" | "snapshots"
-        | "procs" | "flush" => "System",
+        "discover" | "workload" | "local" | "sys" | "snapshot" | "watch" | "metrics" | "logs"
+        | "record" | "snapshots" | "procs" | "flush" => "System",
         _ => "Meta", // help 등
     }
 }
@@ -394,6 +408,8 @@ fn slash_category_order(name: &str) -> u8 {
 /// 명령/섹션의 한 줄 설명(자동완성 패널 display·도움말에 공유).
 pub(crate) fn slash_description(name: &str) -> &'static str {
     match name {
+        "discover" => "workload 발견 후 LLM 상태 분석·모니터링 제안 (--raw=분석 생략)",
+        "workload" => "workload 후보 inspect 또는 enable (enable은 확인 후 저장)",
         "help" => "이 도움말 표시",
         "health" => "현재 머신 health verdict + coverage (LLM 미호출)",
         "clear" => "대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
@@ -445,6 +461,8 @@ pub(crate) fn slash_description(name: &str) -> &'static str {
 /// SLASH_COMMANDS 전 항목의 arm 존재를 이 규약으로 검증한다.
 pub(crate) fn slash_usage(name: &str) -> &'static str {
     match name {
+        "discover" => "[--raw]",
+        "workload" => "inspect <candidate-id> | enable <candidate-id> <fingerprint>",
         "help" | "health" | "clear" | "resume" | "doctor" | "fix" | "compare" | "flush" => "",
         "last" | "timeline" | "trend" | "snapshots" | "procs" => "[N]",
         "raw" => "[seq|corr]",
@@ -502,6 +520,23 @@ pub(crate) fn parse_slash(input: &str) -> Option<SlashCommand> {
         }
     };
     Some(match cmd.as_str() {
+        "discover" => match (parts.next(), parts.next()) {
+            (None, None) => SlashCommand::Discover { raw: false },
+            (Some("--raw"), None) => SlashCommand::Discover { raw: true },
+            _ => SlashCommand::Unknown("discover".to_string()),
+        },
+        "workload" => match (parts.next(), parts.next(), parts.next()) {
+            (Some("inspect"), Some(candidate_id), None) => SlashCommand::WorkloadInspect {
+                candidate_id: candidate_id.to_string(),
+            },
+            (Some("enable"), Some(candidate_id), Some(fingerprint)) => {
+                SlashCommand::WorkloadEnable {
+                    candidate_id: candidate_id.to_string(),
+                    fingerprint: fingerprint.to_string(),
+                }
+            }
+            _ => SlashCommand::Unknown("workload".to_string()),
+        },
         "help" | "?" => SlashCommand::Help,
         "health" => SlashCommand::Health,
         "clear" => SlashCommand::Clear,
@@ -983,6 +1018,9 @@ pub(crate) fn slash_completion_entries(
 pub(crate) fn help_text() -> String {
     [
         "slash 명령 (대화 history에 안 들어감, 출력은 화면에만):",
+        "  /discover [--raw]     workload 발견→LLM 상태 분석·모니터링 제안 (--raw=원본만)",
+        "  /workload inspect <id>  workload 후보 상세 표시 (LLM 미호출)",
+        "  /workload enable <id> <fingerprint>  확인 후 workload 정의 저장",
         "  /help                이 도움말",
         "  /health              현재 머신 HEALTHY/DEGRADED/CRITICAL 판정 + UNKNOWN coverage (LLM 미호출)",
         "  /clear               대화 컨텍스트 리셋 (시스템 프롬프트 유지)",
@@ -1650,6 +1688,35 @@ mod tests {
         assert_eq!(
             parse_slash("/bogus"),
             Some(SlashCommand::Unknown("bogus".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_slash_workload_commands() {
+        assert_eq!(
+            parse_slash("/discover"),
+            Some(SlashCommand::Discover { raw: false })
+        );
+        assert_eq!(
+            parse_slash("/discover --raw"),
+            Some(SlashCommand::Discover { raw: true })
+        );
+        assert_eq!(
+            parse_slash("/discover --explain"),
+            Some(SlashCommand::Unknown("discover".into()))
+        );
+        assert_eq!(
+            parse_slash("/workload inspect exe:/usr/sbin/nginx"),
+            Some(SlashCommand::WorkloadInspect {
+                candidate_id: "exe:/usr/sbin/nginx".to_string()
+            })
+        );
+        assert_eq!(
+            parse_slash("/workload enable exe:/usr/sbin/nginx fingerprint"),
+            Some(SlashCommand::WorkloadEnable {
+                candidate_id: "exe:/usr/sbin/nginx".to_string(),
+                fingerprint: "fingerprint".to_string()
+            })
         );
     }
 
@@ -2409,7 +2476,8 @@ mod tests {
         assert_eq!(slash_completion("/loc", 4).1, vec!["local".to_string()]);
         assert_eq!(slash_completion("/log", 4).1, vec!["logs".to_string()]);
         assert_eq!(slash_completion("/m", 2).1, vec!["metrics".to_string()]);
-        assert_eq!(slash_completion("/di", 3).1, vec!["diagnose".to_string()]);
+        // discover 추가로 /di는 discover/diagnose 사이에서 모호하다.
+        assert!(slash_completion("/di", 3).1.is_empty());
         assert_eq!(slash_completion("/do", 3).1, vec!["doctor".to_string()]);
         // ambiguous → 빈 후보(첫 후보 오실행 방지).
         assert!(slash_completion("/d", 2).1.is_empty()); // diagnose/doctor
