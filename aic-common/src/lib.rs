@@ -17,6 +17,7 @@ pub mod proc;
 pub mod redaction;
 pub mod session;
 pub mod shell_hooks;
+pub mod workload;
 
 pub use error::AicError;
 pub use ipc::{
@@ -38,6 +39,11 @@ pub use session::{
     is_valid_session_id,
 };
 pub use shell_hooks::generate_shell_hooks;
+pub use workload::{
+    DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
+    WorkloadCandidate, WorkloadDefinition, WorkloadProposal, WorkloadSelector,
+    WORKLOAD_SCHEMA_VERSION,
+};
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
 

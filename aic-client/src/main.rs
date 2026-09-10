@@ -192,6 +192,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// 로컬 프로세스 기반 workload 후보를 발견하고 명시적으로 구성한다.
+    Workload {
+        #[command(subcommand)]
+        op: WorkloadOp,
+    },
     /// RCA enrollment key를 교환해 이 호스트의 telemetry exporter를 연결한다.
     Enroll {
         /// RCA 공개 base URL (예: https://rca.example.com)
@@ -612,6 +617,34 @@ enum Commands {
         /// 특정 세션 ID 명시.
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkloadOp {
+    /// 로컬 workload 후보와 deterministic 제안을 표시한다.
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 후보 한 개와 제안을 표시한다.
+    Inspect {
+        candidate_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// 명시적으로 저장된 workload 정의를 표시한다.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 현재 후보 fingerprint가 일치할 때만 정의를 저장한다.
+    Enable {
+        candidate_id: String,
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1268,6 +1301,88 @@ enum ConfigOp {
     },
 }
 
+fn handle_workload(op: WorkloadOp) {
+    use aic_client::workload;
+    let result = match op {
+        WorkloadOp::Discover { json } => workload::discover().map(|report| {
+            let proposals = workload::proposals(&report);
+            if json {
+                serde_json::json!({ "report": report, "proposals": proposals }).to_string()
+            } else {
+                format!(
+                    "schema={} coverage={}\n{}",
+                    report.schema_version,
+                    report.evidence_coverage,
+                    report
+                        .candidates
+                        .iter()
+                        .map(|candidate| format!(
+                            "{} {} {} {:?}\n",
+                            candidate.id,
+                            candidate.fingerprint,
+                            format!("{:?}", candidate.adapter).to_lowercase(),
+                            candidate.ambiguity
+                        ))
+                        .collect::<String>()
+                )
+            }
+        }),
+        WorkloadOp::Inspect { candidate_id, json } => {
+            workload::inspect(&candidate_id).map(|(report, candidate)| {
+                let proposals = workload::proposals(&report)
+                    .into_iter()
+                    .filter(|proposal| proposal.candidate_id == candidate.id)
+                    .collect::<Vec<_>>();
+                if json {
+                    serde_json::json!({ "candidate": candidate, "proposals": proposals })
+                        .to_string()
+                } else {
+                    format!(
+                        "{}\nfingerprint={}\nadapter={:?}\nambiguity={:?}\nproposals={:?}",
+                        candidate.id,
+                        candidate.fingerprint,
+                        candidate.adapter,
+                        candidate.ambiguity,
+                        proposals
+                    )
+                }
+            })
+        }
+        WorkloadOp::List { json } => workload::list_configured().map(|definitions| {
+            if json {
+                serde_json::json!({ "configured": definitions }).to_string()
+            } else if definitions.is_empty() {
+                "configured workloads: none".to_string()
+            } else {
+                definitions
+                    .into_iter()
+                    .map(|definition| {
+                        format!("configured {} {:?}\n", definition.id, definition.adapter)
+                    })
+                    .collect()
+            }
+        }),
+        WorkloadOp::Enable {
+            candidate_id,
+            fingerprint,
+            json,
+        } => workload::enable(&candidate_id, &fingerprint).map(|definition| {
+            if json {
+                serde_json::json!({ "configured": definition }).to_string()
+            } else {
+                format!("configured {}", definition.id)
+            }
+        }),
+    };
+    match result {
+        Ok(output) => println!("{output}"),
+        Err(error) => {
+            eprintln!("workload error: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // sysinfo의 `/proc/<pid>/stat` fd 캐시를 끈다 — aicd(`aicd_main.rs`)와 같은 이유이고, 거기에
@@ -1306,6 +1421,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Commands::Workload { op }) => handle_workload(op),
         Some(Commands::Config { op }) => match op {
             None => handle_config(),
             Some(ConfigOp::Show { json, show_secrets }) => handle_config_show(json, show_secrets),
