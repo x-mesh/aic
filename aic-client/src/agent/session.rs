@@ -42,7 +42,8 @@ const NO_LLM_TURN_HINT: &str =
 (진단 명령 /local·/watch·/metrics 등은 그대로 사용 가능).";
 
 const WORKLOAD_EXPLAIN_MAX_CANDIDATES: usize = 32;
-const WORKLOAD_EXPLAIN_MAX_PROPOSALS: usize = 64;
+/// Keep one analysis response below the provider's 4096-token output limit.
+const WORKLOAD_EXPLAIN_MAX_PROPOSALS: usize = 12;
 const WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES: usize = 16 * 1024;
 const WORKLOAD_EXPLAIN_MAX_AMBIGUITIES: usize = 8;
 const WORKLOAD_EXPLAIN_MAX_AMBIGUITY_BYTES: usize = 128;
@@ -53,8 +54,10 @@ const WORKLOAD_EXPLAIN_PREFIX: &str = "Analyze the detected application inventor
 Infer roles and possible relationships only from the supplied evidence. Inventory evidence does not \
 prove health, traffic, latency, or causality, so state those as unknown monitoring gaps. Rank every \
 registered proposal and explain in Korean what it can observe, why it matters, its cost and effects, \
-and whether it is available now or only planned. Return a JSON array of objects with exactly \
-proposal_id, priority, and summary. Do not invent actions, commands, thresholds, or evidence. Data: ";
+and whether it is available now or only planned. Rank every supplied proposal. Return a JSON array \
+of objects with exactly proposal_id, priority, and summary. Keep each summary within 160 UTF-8 \
+bytes. Do not add text before or after the JSON array. Do not invent actions, commands, thresholds, \
+or evidence. Data: ";
 
 fn cap_utf8(value: &str, max: usize) -> String {
     if value.len() <= max {
@@ -1435,9 +1438,14 @@ impl AgentSession {
                     }
                     match self.dispatcher.send(&prompt).await.and_then(|raw| {
                         crate::workload::validate_llm_explanations(&raw, &exposed_proposals)
-                            .map_err(|error| AicError::ConfigError(error.to_string()))
+                            .map_err(|error| {
+                                AicError::UserMessage(format!(
+                                    "workload analysis response error: {error}"
+                                ))
+                            })
                     }) {
                         Ok(explanations) if !explanations.is_empty() => {
+                            let omitted = proposals.len().saturating_sub(exposed_proposals.len());
                             let lines = explanations
                                 .into_iter()
                                 .enumerate()
@@ -1450,7 +1458,11 @@ impl AgentSession {
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             self.out
-                                .note(&format!("LLM workload monitoring analysis:\n{lines}"))
+                                .note(&format!(
+                                    "LLM workload monitoring analysis: analyzed={} omitted={}\n{lines}",
+                                    exposed_proposals.len(),
+                                    omitted
+                                ))
                                 .await;
                         }
                         Ok(_) => {
@@ -3590,6 +3602,7 @@ mod tests {
         assert!(prompt.len() <= WORKLOAD_EXPLAIN_MAX_PROMPT_BYTES);
         assert!(exposed.len() <= WORKLOAD_EXPLAIN_MAX_PROPOSALS);
         assert!(aliases.len() <= WORKLOAD_EXPLAIN_MAX_PROPOSALS);
+        assert!(prompt.contains("within 160 UTF-8 bytes"));
         assert!(!prompt.contains("/secret/path"));
         assert!(!prompt.contains("fingerprint-"));
         assert!(!prompt.contains("sensitive coverage"));

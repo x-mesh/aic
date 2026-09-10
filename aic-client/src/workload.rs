@@ -571,8 +571,7 @@ pub fn validate_llm_explanations(
     raw: &str,
     proposals: &[WorkloadProposal],
 ) -> Result<Vec<(String, String)>> {
-    let explanations: Vec<Explanation> =
-        serde_json::from_str(raw).context("invalid workload explanation JSON")?;
+    let explanations = parse_llm_explanations(raw)?;
     let valid = proposals
         .iter()
         .map(|proposal| proposal.id.as_str())
@@ -617,6 +616,22 @@ pub fn validate_llm_explanations(
             )
         })
         .collect())
+}
+
+fn parse_llm_explanations(raw: &str) -> Result<Vec<Explanation>> {
+    if let Ok(explanations) = serde_json::from_str(raw) {
+        return Ok(explanations);
+    }
+
+    for (start, _) in raw.match_indices('[') {
+        let mut values =
+            serde_json::Deserializer::from_str(&raw[start..]).into_iter::<Vec<Explanation>>();
+        if let Some(Ok(explanations)) = values.next() {
+            return Ok(explanations);
+        }
+    }
+
+    bail!("invalid workload explanation JSON")
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -812,6 +827,13 @@ mod tests {
         )
         .unwrap();
         assert!(validate_llm_explanations(&valid, &proposals).is_ok());
+        assert!(validate_llm_explanations(
+            &format!("Analysis follows.\n{valid}\nEnd of analysis."),
+            &proposals
+        )
+        .is_ok());
+        assert!(validate_llm_explanations(&format!("```json\n{valid}\n```"), &proposals).is_ok());
+        assert!(validate_llm_explanations("analysis without JSON", &proposals).is_err());
         assert!(validate_llm_explanations(
             r#"[{"proposal_id":"unknown","priority":1,"summary":"x"}]"#,
             &proposals
