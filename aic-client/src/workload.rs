@@ -245,7 +245,7 @@ fn read_systemd_unit(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
             ambiguity.push("cgroup_unavailable".to_string());
             return None;
         }
-        return systemd_unit_from_cgroup(&text);
+        systemd_unit_from_cgroup(&text)
     }
     #[cfg(not(target_os = "linux"))]
     {
