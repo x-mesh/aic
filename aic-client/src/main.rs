@@ -6822,8 +6822,8 @@ default_provider = "openai"
 lang = "korean"
 # TCP 연결 타임아웃(초) — endpoint reachability 확인. 기본 5
 connect_timeout_secs = 5
-# 요청 전체 타임아웃(초) — LLM 응답 대기 포함. 405b 같은 큰 모델은 60+ 권장. 기본 30
-request_timeout_secs = 30
+# 요청 전체 타임아웃(초) — LLM 응답 대기 포함. 기본 120
+request_timeout_secs = 120
 
 # OpenAI 설정
 [llm.providers.openai]
@@ -6933,7 +6933,7 @@ fn default_config() -> AppConfig {
             providers: HashMap::new(),
             lang: "korean".to_string(),
             connect_timeout_secs: 5,
-            request_timeout_secs: 30,
+            request_timeout_secs: 120,
         },
         server: ServerConfig {
             max_buffer_lines: 500,

@@ -432,7 +432,7 @@ pub struct LlmConfig {
     /// TCP 연결 타임아웃(초) — endpoint reachability 확인용. 기본 5초.
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
-    /// 요청 전체 타임아웃(초) — connect + LLM 응답 대기 포함. 기본 30초.
+    /// 요청 전체 타임아웃(초) — connect + LLM 응답 대기 포함. 기본 120초.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 }
@@ -471,7 +471,7 @@ fn default_connect_timeout_secs() -> u64 {
 }
 
 fn default_request_timeout_secs() -> u64 {
-    30
+    120
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1653,5 +1653,16 @@ spool_max_age_secs = 3600
         let json = serde_json::to_string(&result).unwrap();
         let deserialized: AnalysisResult = serde_json::from_str(&json).unwrap();
         assert_eq!(result, deserialized);
+    }
+
+    #[test]
+    fn llm_request_timeout_defaults_to_120_seconds() {
+        let config: LlmConfig = toml::from_str(
+            r#"
+default_provider = "openai"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.request_timeout_secs, 120);
     }
 }

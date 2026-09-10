@@ -68,7 +68,7 @@ impl ConfigManager {
                 providers: HashMap::new(),
                 lang: "korean".to_string(),
                 connect_timeout_secs: 5,
-                request_timeout_secs: 30,
+                request_timeout_secs: 120,
             },
             server: ServerConfig {
                 max_buffer_lines: 500,
@@ -103,6 +103,7 @@ mod tests {
         let config = ConfigManager::default_config();
         assert_eq!(config.llm.default_provider, "openai");
         assert!(config.llm.providers.is_empty());
+        assert_eq!(config.llm.request_timeout_secs, 120);
         assert_eq!(config.server.max_buffer_lines, 500);
         assert!(config.server.socket_path.is_none());
         assert_eq!(config.server.boundary_strategy.method, "prompt_marker");

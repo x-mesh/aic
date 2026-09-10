@@ -144,7 +144,7 @@ impl LlmDispatcher {
     ///
     /// `connect_timeout`(TCP 연결까지)과 `timeout`(요청 전체 — LLM 응답 대기 포함)을
     /// 분리해서 적용한다. connect는 짧게(기본 5s) 잡아 unreachable endpoint를 빠르게 감지하고,
-    /// 전체 timeout은 LLM 응답 대기 시간을 포함하므로 더 길게(기본 30s) 잡는다.
+    /// 전체 timeout은 LLM 응답 대기 시간을 포함하므로 더 길게(기본 120s) 잡는다.
     pub fn from_config(config: LlmConfig) -> Self {
         let http_client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))

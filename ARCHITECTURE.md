@@ -216,7 +216,7 @@ PtyManager를 `Arc<Mutex<...>>`로 공유했을 때 wait_handle이 `wait_for_exi
 | 정책 | 임계 | 위치 |
 |---|---|---|
 | Connect timeout | 5s | `LlmDispatcher::from_config` |
-| Request timeout | 30s | 동일 |
+| Request timeout | 120s | 동일 |
 | Retry | 5회, 0.5s/1s/2s/4s exponential backoff | `LlmDispatcher::send` |
 | Retry 대상 | HTTP 5xx, 429, network (status=0) | `AicError::is_retryable` |
 | Circuit breaker | 60s window 5회 실패 → 30s open | `CircuitBreaker::record_failure` |
