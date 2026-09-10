@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-09-10
+
+### Added
+
+- add workload driver readiness states
+- add service workload discovery and TTY selection
+
 ## [0.39.1] - 2026-09-10
 
 ### Fixed
