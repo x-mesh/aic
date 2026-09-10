@@ -47,6 +47,7 @@ graph LR
 - ✅ `aic status` — 데몬 PID/ping/마지막 명령어 1회 출력
 - ✅ `aic diagnose` — 증상 기반 Safe probe → typed **Finding**(severity/confidence/probe_id). 결정적 임계 스캔이 disk/inode/fd/swap 고갈·커널 OOM-kill·실패 systemd 유닛을 **LLM 없이** 표시하고, `aic diagnose --json`은 machine-readable 봉투로 출력
 - ✅ `aic rca` — persistent RCA workspace: `~/.aic/incidents/<id>/`(`evidence.jsonl` + `report.md`)에 incident 영속 저장, `start`/`status`/`timeline`/`report`. `--diagnose`는 headless `/diagnose` 엔진의 초동 증거를 첨부
+- ✅ workload discovery — `/discover`가 지원 서비스 프로세스를 식별하고 모니터링 제안을 정렬한다. TTY에서는 정의를 고른 뒤 한 번 확인하고 저장한다.
 - ✅ 세션 스냅샷 레코더 (opt-in) — `~/.aic/snapshots/`에 백그라운드 시스템 스냅샷 기록, `AIC_SNAPSHOT_RECORD`로 게이트: alert 트리거 전체 캡처(L1), 주기 타이머(L2, `aic snapshot install`), Crit auto-RCA(L3, `AIC_AUTO_RCA`). 아래 [세션 스냅샷 레코더](#세션-스냅샷-레코더) 참고
 
 ### 보안 baseline
@@ -346,6 +347,23 @@ Tab 순환, Enter 선택, Esc 닫기).
 | `/rca start\|use\|add\|timeline\|report` | persistent RCA workspace에 chat 증거 저장. 예: `/rca start api-latency`, `/rca add last 3`, `/rca add note ...`, `/rca report --write` |
 | `/triage [--run] [topic]` | 토픽 체크리스트 + Probe Catalog 후보 probe; `--run`이면 실행(LLM 미호출). topics: `mac-slow web disk memory cpu network build-fail docker generic` (`disk` 토픽은 docker 디스크 사용량·큰 `/tmp` 파일도 점검) |
 | `/watch [target] [--count N] [--every Ns]` | probe를 몇 번 다시 실행해 tick마다 변화량을 요약(LLM 미호출). bounded: 기본 3회(최대 20), 간격 1s. `target`은 Probe Catalog id — LOCAL 섹션, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — 예: `/watch tmp_recent`는 `/tmp`에서 늘어나는 파일을 추적. 생략하면 compact 세트 |
+
+### Workload discovery
+
+`/discover`는 지원 서비스 workload만 표시하며, 설정을 바꾸지 않습니다. 대화형 세션에서는 하나 이상의
+정의를 고른 뒤 `workloads.toml`에 저장할 때 한 번 확인합니다.
+
+지원 adapter는 Nginx, JVM, Redis 또는 Valkey, PostgreSQL, MySQL 또는 MariaDB, MongoDB, Kafka,
+RabbitMQ, Elasticsearch, OpenSearch, HAProxy, Prometheus, ClickHouse, etcd, Consul, Memcached입니다.
+프로세스 이름 또는 실행 파일 이름으로 분류하며, Java 서비스는 main class를 함께 확인합니다. RabbitMQ는
+RabbitMQ를 실행한 Erlang VM 명령행도 분류합니다.
+
+`/discover --raw`는 전체 프로세스 인벤토리를 표시합니다. Generic 프로세스는 기본 발견, LLM 분석,
+모니터링 제안, 대화형 선택에서 제외합니다. CPU·메모리·재시작 상태는 볼 수 있지만 서비스 수준의
+의미를 판단할 수 없기 때문입니다.
+
+현재 서비스 adapter 제안은 workload 정의와 모니터링 계획을 저장합니다. 프로토콜별 지표는 수집하지
+않습니다. Redis `INFO`, PostgreSQL `pg_stat_*` 등의 서비스별 질의는 후속 adapter 구현이 필요합니다.
 
 probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다: local
 sysinfo 섹션(`fd`=열린 파일 디스크립터 현재/최대 포함) + `process` + git read-only + `docker`

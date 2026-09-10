@@ -37,6 +37,20 @@ impl WorkloadSelector {
 pub enum WorkloadAdapter {
     Nginx,
     Jvm,
+    Redis,
+    PostgreSql,
+    MySql,
+    MongoDb,
+    Kafka,
+    Elasticsearch,
+    OpenSearch,
+    RabbitMq,
+    HaProxy,
+    Prometheus,
+    ClickHouse,
+    Etcd,
+    Consul,
+    Memcached,
     Generic,
 }
 
@@ -79,6 +93,7 @@ pub enum ProposalKind {
     ProcessResourceMonitoring,
     NginxAdapterMonitoring,
     JvmAdapterMonitoring,
+    ServiceAdapterMonitoring,
     NginxJvmTopologyCorrelation,
     RcaEvidenceAttachment,
     LocalRetention,

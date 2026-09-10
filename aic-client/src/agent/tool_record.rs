@@ -1018,7 +1018,7 @@ pub(crate) fn slash_completion_entries(
 pub(crate) fn help_text() -> String {
     [
         "slash 명령 (대화 history에 안 들어감, 출력은 화면에만):",
-        "  /discover [--raw]     workload 발견→LLM 상태 분석·모니터링 제안 (--raw=원본만)",
+        "  /discover [--raw]     지원 workload 발견→분석·설정 제안 (--raw=전체 인벤토리)",
         "  /workload inspect <id>  workload 후보 상세 표시 (LLM 미호출)",
         "  /workload enable <id> <fingerprint>  확인 후 workload 정의 저장",
         "  /help                이 도움말",

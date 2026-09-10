@@ -83,6 +83,19 @@ fn render_workload_explain_prompt(
     )
 }
 
+fn supported_workload_report(report: &aic_common::DiscoveryReport) -> aic_common::DiscoveryReport {
+    aic_common::DiscoveryReport {
+        schema_version: report.schema_version,
+        evidence_coverage: report.evidence_coverage.clone(),
+        candidates: report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.adapter != aic_common::WorkloadAdapter::Generic)
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Build the only workload data that an explanation call can receive. Opaque references keep
 /// selector paths out of the prompt; the returned map restores registered proposal ids for UI.
 fn build_workload_explain_prompt(
@@ -186,11 +199,22 @@ fn build_workload_explain_prompt(
 fn render_workload_discovery(
     report: &aic_common::DiscoveryReport,
     proposals: &[aic_common::WorkloadProposal],
+    raw: bool,
 ) -> String {
-    let visible_candidates = report
+    let supported_candidates = report
         .candidates
         .iter()
+        .filter(|candidate| candidate.adapter != aic_common::WorkloadAdapter::Generic)
+        .collect::<Vec<_>>();
+    let candidates = if raw {
+        report.candidates.iter().collect::<Vec<_>>()
+    } else {
+        supported_candidates.clone()
+    };
+    let visible_candidates = candidates
+        .iter()
         .take(WORKLOAD_DISPLAY_MAX_CANDIDATES)
+        .copied()
         .collect::<Vec<_>>();
     let visible_ids = visible_candidates
         .iter()
@@ -251,19 +275,18 @@ fn render_workload_discovery(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let omitted_candidates = report
-        .candidates
-        .len()
-        .saturating_sub(visible_candidates.len());
+    let omitted_candidates = candidates.len().saturating_sub(visible_candidates.len());
     let omitted_proposals = matching_proposals
         .len()
         .saturating_sub(WORKLOAD_DISPLAY_MAX_PROPOSALS);
     let rendered = format!(
-        "workload discovery (schema={}): candidates={} shown={} omitted={}\n{}\nproposals: shown={} omitted={}\n{}",
+        "workload discovery (schema={}): supported={} total={} shown={} omitted={}{}\n{}\nproposals: shown={} omitted={}\n{}",
         report.schema_version,
+        supported_candidates.len(),
         report.candidates.len(),
         visible_candidates.len(),
         omitted_candidates,
+        if raw { " (raw)" } else { "" },
         cards,
         matching_proposals.len().min(WORKLOAD_DISPLAY_MAX_PROPOSALS),
         omitted_proposals,
@@ -278,6 +301,17 @@ fn render_workload_discovery(
             WORKLOAD_DISPLAY_MAX_BYTES
         )
     }
+}
+
+fn render_workload_next_steps(omitted_proposals: usize, interactive_selection: bool) -> String {
+    let selection = if interactive_selection {
+        "적용 가능한 정의를 고르는 선택 화면이 이어집니다. Space로 선택하고 Enter를 누르세요."
+    } else {
+        "`/workload enable <candidate-id> <fingerprint>`를 실행해 적용할 수 있습니다."
+    };
+    format!(
+        "다음 단계:\n\n1. 발견만으로 설정은 바뀌지 않습니다. 운영하는 workload는 `/workload inspect <candidate-id>`로 확인하세요.\n2. {selection} 저장 전에는 선택한 전체 정의와 영속 저장 영향을 다시 확인합니다.\n3. 기본 발견은 지원 adapter만 표시합니다. Generic 프로세스는 앱 의미 기반 모니터링을 지원하지 않으므로 `/discover --raw`에서만 확인할 수 있습니다.\n4. 분석에서 {omitted_proposals}개 제안을 생략했습니다. `/discover --raw` 또는 `aic workload discover --json`으로 전체를 확인하세요."
+    )
 }
 
 /// SRE 모드(run_command 활성) 전용 시스템 지침. generic preface 뒤에 덧붙인다.
@@ -392,6 +426,10 @@ impl ChatOut {
         matches!(self, ChatOut::Direct { .. })
     }
 
+    fn is_tui(&self) -> bool {
+        matches!(self, ChatOut::Tui(_))
+    }
+
     /// 컨텍스트 토큰 추정치를 status bar에 전달한다. Tui면 `OutMsg::Ctx`, Direct면 no-op
     /// (Direct status bar는 시스템 지표만 표시하며 토큰 표시 자리가 없다).
     async fn send_ctx(&self, tokens: usize) {
@@ -466,6 +504,30 @@ impl ChatOut {
                 rrx.await.unwrap_or(false)
             }
         }
+    }
+
+    /// TUI에서만 workload 정의를 고른다. 비-TTY는 기존 명시적 slash 명령 흐름을 유지한다.
+    async fn select_workloads(
+        &self,
+        items: Vec<super::chat_tui::MultiSelectItem>,
+    ) -> Option<Vec<String>> {
+        let ChatOut::Tui(tx) = self else {
+            return None;
+        };
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(super::chat_tui::OutMsg::MultiSelect {
+                title: "적용할 workload 정의를 고르세요".to_string(),
+                help: "↑/↓ 이동 · Space 선택 · Enter 적용 검토 · Esc 취소".to_string(),
+                items,
+                tx: rtx,
+            })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rrx.await.ok()
     }
 }
 
@@ -1415,19 +1477,40 @@ impl AgentSession {
     async fn handle_workload_discover(&mut self, raw: bool) {
         let result = crate::workload::discover().map(|report| {
             let proposals = crate::workload::proposals(&report);
-            let rendered = render_workload_discovery(&report, &proposals);
+            let rendered = render_workload_discovery(&report, &proposals, raw);
             (rendered, report, proposals)
         });
         match result {
             Ok((text, report, proposals)) => {
                 self.out.note(&text).await;
                 if raw {
+                    self.out
+                        .note("전체 인벤토리입니다. Generic 후보는 앱 의미 기반 모니터링과 자동 설정 제안에서 제외됩니다.")
+                        .await;
                     return;
                 }
+                let report = supported_workload_report(&report);
+                let proposals = proposals
+                    .into_iter()
+                    .filter(|proposal| {
+                        report
+                            .candidates
+                            .iter()
+                            .any(|candidate| candidate.id == proposal.candidate_id)
+                    })
+                    .collect::<Vec<_>>();
+                let interactive_selection = self.allow_run_command && self.out.is_tui();
                 if !self.llm_available {
                     self.out
                         .note("workload analysis unavailable: 등록된 LLM provider가 없습니다.")
                         .await;
+                    self.out
+                        .note(&render_workload_next_steps(
+                            proposals.len(),
+                            interactive_selection,
+                        ))
+                        .await;
+                    self.select_discovered_workloads(&report, &proposals).await;
                     return;
                 }
                 {
@@ -1464,6 +1547,9 @@ impl AgentSession {
                                     omitted
                                 ))
                                 .await;
+                            self.out
+                                .note(&render_workload_next_steps(omitted, interactive_selection))
+                                .await;
                         }
                         Ok(_) => {
                             self.out
@@ -1477,11 +1563,110 @@ impl AgentSession {
                         }
                     }
                 }
+                self.select_discovered_workloads(&report, &proposals).await;
             }
             Err(error) => {
                 self.out
                     .note(&format!("workload discovery error: {error}"))
                     .await
+            }
+        }
+    }
+
+    async fn select_discovered_workloads(
+        &mut self,
+        report: &aic_common::DiscoveryReport,
+        proposals: &[aic_common::WorkloadProposal],
+    ) {
+        if !self.allow_run_command || !self.out.is_tui() {
+            return;
+        }
+        let items = proposals
+            .iter()
+            .filter(|proposal| {
+                proposal.kind == aic_common::ProposalKind::Enable
+                    && proposal.readiness == aic_common::workload::ProposalReadiness::Available
+            })
+            .filter_map(|proposal| {
+                let candidate = report
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.id == proposal.candidate_id)?;
+                Some(super::chat_tui::MultiSelectItem {
+                    id: candidate.id.clone(),
+                    label: format!(
+                        "{} ({:?}, bindings={}) · workloads.toml에 저장",
+                        candidate.id,
+                        candidate.adapter,
+                        candidate.bindings.len()
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            self.out.note("적용 가능한 workload 정의가 없습니다.").await;
+            return;
+        }
+        let Some(selected) = self.out.select_workloads(items).await else {
+            return;
+        };
+        if selected.is_empty() {
+            self.out.note("workload 적용을 취소했습니다.").await;
+            return;
+        }
+        self.apply_selected_workloads(report, selected).await;
+    }
+
+    async fn apply_selected_workloads(
+        &mut self,
+        report: &aic_common::DiscoveryReport,
+        selected: Vec<String>,
+    ) {
+        let mut candidates = Vec::new();
+        for id in selected {
+            let Some(candidate) = report
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == id)
+            else {
+                self.out
+                    .note("workload 적용을 취소했습니다: 발견 결과가 변경됐습니다.")
+                    .await;
+                return;
+            };
+            if candidate.selector.is_none() || !candidate.ambiguity.is_empty() {
+                self.out.note("workload 적용을 취소했습니다: 확인되지 않았거나 모호한 후보가 포함돼 있습니다.").await;
+                return;
+            }
+            candidates.push(candidate);
+        }
+        let preview = candidates
+            .iter()
+            .map(|candidate| format!("{} selector={:?}", candidate.id, candidate.selector))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let prompt = format!(
+            "선택한 workload {}개를 {}에 저장합니다. {} persistence=true privilege=false outbound=false. 저장할까요? [y/N]",
+            candidates.len(),
+            crate::config::ConfigManager::config_path().with_file_name("workloads.toml").display(),
+            preview
+        );
+        if !self.out.confirm(&prompt).await {
+            self.out.note("workload 적용을 취소했습니다.").await;
+            return;
+        }
+        for candidate in candidates {
+            match crate::workload::enable(&candidate.id, &candidate.fingerprint) {
+                Ok(definition) => {
+                    self.out
+                        .note(&format!("configured {}", definition.id))
+                        .await
+                }
+                Err(error) => {
+                    self.out
+                        .note(&format!("workload enable error: {error}"))
+                        .await
+                }
             }
         }
     }
@@ -3612,9 +3797,17 @@ mod tests {
                 .all(|proposal| proposal.id.starts_with('p')
                     && proposal.candidate_id.starts_with('c'))
         );
-        assert!(aliases
-            .iter()
-            .all(|(alias, original)| alias.starts_with('p') && original.contains("exe:/secret")));
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn workload_next_steps_require_explicit_enable_confirmation() {
+        let text = render_workload_next_steps(7, true);
+        assert!(text.contains("발견만으로 설정은 바뀌지 않습니다"));
+        assert!(text.contains("Space로 선택하고 Enter"));
+        assert!(text.contains("저장 전"));
+        assert!(text.contains("지원 adapter"));
+        assert!(text.contains("7개 제안을 생략"));
     }
 
     #[test]
@@ -3640,10 +3833,40 @@ mod tests {
             candidates,
         };
         let proposals = crate::workload::proposals(&report);
-        let rendered = render_workload_discovery(&report, &proposals);
+        let rendered = render_workload_discovery(&report, &proposals, false);
         assert!(rendered.len() <= WORKLOAD_DISPLAY_MAX_BYTES + 160);
-        assert!(rendered.contains("candidates=100 shown=32 omitted=68"));
-        assert!(rendered.contains("proposals: shown=64"));
+        assert!(rendered.contains("supported=0 total=100 shown=0 omitted=0"));
+        let raw = render_workload_discovery(&report, &proposals, true);
+        assert!(raw.contains("supported=0 total=100 shown=32 omitted=68 (raw)"));
+    }
+
+    #[test]
+    fn supported_workload_report_excludes_generic_candidates() {
+        let report = aic_common::DiscoveryReport {
+            schema_version: aic_common::WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "test".to_string(),
+            candidates: vec![
+                aic_common::WorkloadCandidate {
+                    id: "nginx".to_string(),
+                    fingerprint: "n".to_string(),
+                    selector: None,
+                    adapter: aic_common::WorkloadAdapter::Nginx,
+                    bindings: Vec::new(),
+                    ambiguity: Vec::new(),
+                },
+                aic_common::WorkloadCandidate {
+                    id: "helper".to_string(),
+                    fingerprint: "g".to_string(),
+                    selector: None,
+                    adapter: aic_common::WorkloadAdapter::Generic,
+                    bindings: Vec::new(),
+                    ambiguity: Vec::new(),
+                },
+            ],
+        };
+        let filtered = supported_workload_report(&report);
+        assert_eq!(filtered.candidates.len(), 1);
+        assert_eq!(filtered.candidates[0].id, "nginx");
     }
 
     #[test]

@@ -48,6 +48,7 @@ graph LR
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
 - ✅ Proactive chat status bar — the `aic chat` status line samples host metrics in an off-thread task (so a hung mount or an idle prompt never freezes the UI) and surfaces problems live: severity-colored segments, a per-metric sparkline + trend arrow, a gated disk-exhaustion ETA (`disk 4.2G free · ~8m→crit`), and edge-triggered alerts that name the top offending process (`⚠ mem 97% — top: node 12.1G`) with hysteresis/cooldown. Toggle the alert lane with `/watch arm|off`
 - ✅ Deterministic machine health verdict — `/health` answers whether the current machine is healthy, degraded, or critical without an LLM call. It reports explicit per-axis coverage, preserves unavailable checks as `UNKNOWN`, emits stable evidence references, and automatically attaches the structured verdict plus redacted probe evidence when a chat RCA is active
+- ✅ Workload discovery — `/discover` identifies supported service processes, ranks monitoring proposals, and lets a TTY user select explicit workload definitions before one confirmation.
 - ✅ `aic diagnose` — symptom-driven Safe probes → typed **Findings** (severity / confidence / probe_id). A deterministic threshold scan flags disk / inode / fd / swap exhaustion, kernel OOM-kills, and failed systemd units **without an LLM**; `aic diagnose --json` emits a machine-readable envelope
 - ✅ `aic rca` — persistent RCA workspace: incidents under `~/.aic/incidents/<id>/` (`evidence.jsonl` + `report.md`), with `start` / `status` / `timeline` / `report`; `--diagnose` attaches first evidence from the headless `/diagnose` engine
 - ✅ Session snapshot recorder (opt-in) — background system snapshots to `~/.aic/snapshots/`, gated by `AIC_SNAPSHOT_RECORD`: alert-triggered full capture (L1), a periodic timer (L2, `aic snapshot install`), and Crit auto-RCA (L3, `AIC_AUTO_RCA`). See [Session snapshot recorder](#session-snapshot-recorder)
@@ -345,6 +346,9 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 |---------|--------------|
 | `/help` | List the available slash commands |
 | `/health` | Deterministic machine `HEALTHY` / `DEGRADED` / `CRITICAL` verdict with explicit `UNKNOWN` coverage; attaches evidence to the active RCA |
+| `/discover [--raw]` | Find supported workloads and show monitoring proposals. In a TTY with command execution enabled, select definitions with ↑↓ and Space, then confirm persistence with `y`. `--raw` shows the complete process inventory without Generic monitoring proposals. |
+| `/workload inspect <id>` | Show a discovered workload candidate, its selector, bindings, ambiguity, and proposals. |
+| `/workload enable <id> <fingerprint>` | Save one explicit workload definition after confirmation. The candidate must keep the same fingerprint and have a stable, unambiguous selector. |
 | `/last [N]` | Show the last tool card, or a compact list of the last N tool calls |
 | `/raw [seq\|corr]` | Full redacted output of the last (or a specific) tool call |
 | `/local [section] [--raw]` | Local sysinfo snapshot → LLM summary (`--raw` = evidence only). alias: `/sys`, `/snapshot` |
@@ -361,6 +365,29 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/triage [--run] [topic]` | Topic checklist + candidate probes from the Probe Catalog; `--run` executes them (no LLM). topics: `mac-slow web disk memory cpu network build-fail docker generic` (the `disk` topic also checks docker disk usage and big `/tmp` files) |
 | `/watch [target] [--count N] [--every Ns]` | Re-run probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is any Probe Catalog id — LOCAL sections, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — e.g. `/watch tmp_recent` tracks files growing under `/tmp`; omit it for a compact set |
 | `/watch arm` \| `/watch off` | Toggle the proactive alert lane (default on). When armed, a worsening resource transition (Normal→Warn/Crit) drops a one-line ambient note into the chat (Crit also rings a bell) and recovery prints a `✓` line. `off`/`mute` silences it. Distinct from the bounded-probe `/watch <target>` above |
+
+### Workload discovery
+
+`/discover` shows supported service workloads. It does not change configuration.
+
+In an interactive session, select definitions. Then confirm the write to `workloads.toml`.
+
+The supported adapters are Nginx, JVM, Redis or Valkey, PostgreSQL, MySQL or MariaDB, MongoDB,
+Kafka, RabbitMQ, Elasticsearch, OpenSearch, HAProxy, Prometheus, ClickHouse, etcd, Consul, and
+Memcached. Discovery checks the process name and executable name.
+
+Java services use the main class. RabbitMQ also checks an Erlang VM command line.
+
+`/discover --raw` shows the complete process inventory.
+
+Generic processes stay out of default discovery, LLM analysis, monitoring proposals, and interactive
+selection. A generic process can expose CPU, memory, and restart state. It does not provide
+service-level meaning.
+
+The current service adapter proposal records a workload definition and a monitoring plan.
+
+It does not collect protocol-specific metrics. Redis `INFO`, PostgreSQL `pg_stat_*`, and similar
+service queries need a future adapter.
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
 local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +

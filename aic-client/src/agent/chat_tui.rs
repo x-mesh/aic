@@ -11,6 +11,7 @@
 //! 미사용이나, height 계산·테스트 자산으로 보존한다(모듈 `#[allow(dead_code)]`). non-TTY는 호출
 //! 측(session)이 `ChatOut::Direct`(reedline/stdin)로 fallback한다.
 
+use std::collections::BTreeSet;
 use std::io::{self};
 use std::time::{Duration, Instant};
 
@@ -188,10 +189,32 @@ pub(crate) enum OutMsg {
     /// NeedsConfirm 명령 확인 요청. prompt(예: `⚠ … 실행? [y/N]`)를 입력 줄에 띄우고,
     /// y/Y면 true·그 외 키(n/N/Esc/Enter/…)면 false를 oneshot으로 회신한다(기본 거부).
     Confirm(String, tokio::sync::oneshot::Sender<bool>),
+    /// 여러 workload 정의를 고르는 선택 화면. Space로 토글하고 Enter로 선택 id를 돌려준다.
+    MultiSelect {
+        title: String,
+        help: String,
+        items: Vec<MultiSelectItem>,
+        tx: tokio::sync::oneshot::Sender<Vec<String>>,
+    },
     /// proactive 알림 레인(C7) on/off — `/watch arm|off`가 보낸다. ChatLoop의 alert tracker를 토글한다.
     AlertsArmed(bool),
     /// 루프 종료 — raw mode 복원 후 task 종료.
     Shutdown,
+}
+
+/// TUI 다중 선택 항목. `id`는 session만 해석하고 화면에는 `label`만 표시한다.
+pub(crate) struct MultiSelectItem {
+    pub id: String,
+    pub label: String,
+}
+
+struct MultiSelectState {
+    title: String,
+    help: String,
+    items: Vec<MultiSelectItem>,
+    selected: BTreeSet<String>,
+    cursor: usize,
+    tx: tokio::sync::oneshot::Sender<Vec<String>>,
 }
 
 /// session이 ChatLoop와 통신하는 핸들. terminal은 task가 소유하므로 여기엔 채널만 있다.
@@ -909,6 +932,43 @@ fn draw_full(
     f.render_widget(Paragraph::new(status), rows[4]);
 }
 
+fn draw_multi_select(f: &mut Frame, state: &MultiSelectState) {
+    let area = f.area();
+    let item_rows = state
+        .items
+        .len()
+        .min(area.height.saturating_sub(3) as usize);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(item_rows as u16),
+        Constraint::Min(1),
+    ])
+    .split(area);
+    f.render_widget(
+        Paragraph::new(state.title.as_str()).style(Style::default().fg(Color::Yellow)),
+        rows[0],
+    );
+    let items = state
+        .items
+        .iter()
+        .take(item_rows)
+        .map(|item| {
+            let mark = if state.selected.contains(&item.id) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            ListItem::new(format!(" {mark} {}", item.label))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    let mut list_state = ListState::default();
+    list_state.select((item_rows > 0).then_some(state.cursor.min(item_rows - 1)));
+    f.render_stateful_widget(list, rows[1], &mut list_state);
+    f.render_widget(Paragraph::new(state.help.as_str()).dim(), rows[2]);
+}
+
 /// thinking 표시: spinner 줄(위) + status 줄(아래). `draw_viewport`의 입력 줄을 대체한다.
 /// 레이아웃은 draw_viewport와 동일하게 status를 맨 아래에 둔다(claude CLI 스타일).
 fn draw_thinking(f: &mut Frame, status: &str, spin: &SpinState) {
@@ -1550,6 +1610,7 @@ async fn chat_loop(
     // NeedsConfirm 확인 모드: Some(tx)면 확인 대기 중(입력 줄을 confirm_prompt로 대체, 키는 y/n 전용).
     let mut confirm_pending: Option<tokio::sync::oneshot::Sender<bool>> = None;
     let mut confirm_prompt = String::new();
+    let mut multi_select: Option<MultiSelectState> = None;
     // 드래그 선택(로그 줄 단위 복사): Some((anchor 줄, 현재 줄, drag 발생 여부)). 마우스 캡처 중에도
     // 터미널 네이티브 선택 없이 드래그→복사가 되도록 TUI가 직접 선택을 구현한다(라인 단위).
     // MouseUp에서 drag가 있었으면 선택 줄들을 클립보드에 복사하고 해제한다. 클릭만은 no-op.
@@ -1573,7 +1634,11 @@ async fn chat_loop(
         // 어긋나는 것을 막는다(codex P2: take(pop_n) 표시 vs popup[popup_sel] 제출 불일치).
         let area = terminal.get_frame().area();
         // 검색/확인 모드에선 slash popup을 막는다(우선순위: 확인>검색>popup, 입력 줄을 대체).
-        let pop_n = if spin.is_some() || search.is_some() || confirm_pending.is_some() {
+        let pop_n = if spin.is_some()
+            || search.is_some()
+            || confirm_pending.is_some()
+            || multi_select.is_some()
+        {
             0
         } else {
             popup.len().min(area.height.saturating_sub(4) as usize)
@@ -1638,18 +1703,22 @@ async fn chat_loop(
         if should_draw {
             let draw_ok = terminal
                 .draw(|f| {
-                    draw_full(
-                        f,
-                        draw_text,
-                        draw_scroll,
-                        status_line,
-                        draw_ta,
-                        draw_prompt,
-                        &popup,
-                        popup_sel,
-                        spin_ref,
-                        confirm_ref,
-                    )
+                    if let Some(state) = multi_select.as_ref() {
+                        draw_multi_select(f, state);
+                    } else {
+                        draw_full(
+                            f,
+                            draw_text,
+                            draw_scroll,
+                            status_line,
+                            draw_ta,
+                            draw_prompt,
+                            &popup,
+                            popup_sel,
+                            spin_ref,
+                            confirm_ref,
+                        );
+                    }
                 })
                 .is_ok();
             if !draw_ok {
@@ -1670,6 +1739,38 @@ async fn chat_loop(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(Event::Key(k))) if !is_key_press(k) => {}
+                    Some(Ok(Event::Key(k))) if multi_select.is_some() => {
+                        let mut finish = None;
+                        if let Some(state) = multi_select.as_mut() {
+                            match (k.code, k.modifiers) {
+                                (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
+                                    state.cursor = state.cursor.saturating_sub(1);
+                                }
+                                (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                                    state.cursor = (state.cursor + 1).min(state.items.len().saturating_sub(1));
+                                }
+                                (KeyCode::Char(' '), _) => {
+                                    if let Some(item) = state.items.get(state.cursor) {
+                                        if !state.selected.insert(item.id.clone()) {
+                                            state.selected.remove(&item.id);
+                                        }
+                                    }
+                                }
+                                (KeyCode::Enter, _) => {
+                                    finish = Some(state.selected.iter().cloned().collect::<Vec<_>>());
+                                }
+                                (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                    finish = Some(Vec::new());
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(selected) = finish {
+                            if let Some(state) = multi_select.take() {
+                                let _ = state.tx.send(selected);
+                            }
+                        }
+                    }
                     // NeedsConfirm 확인 모드(최우선): y/Y면 승인(true), 그 외 모든 키(n/N/Esc/Enter/…)는
                     // 거부(false). 입력 줄은 confirm_prompt로 대체되어 있고, textarea/slash/history/search는
                     // 전부 비활성이다. Ctrl+C/D도 확인을 거부(false)로 닫아 안전 기본값을 유지한다.
@@ -2203,6 +2304,16 @@ async fn chat_loop(
                         confirm_prompt = prompt;
                         confirm_pending = Some(tx);
                     }
+                    Some(OutMsg::MultiSelect { title, help, items, tx }) => {
+                        multi_select = Some(MultiSelectState {
+                            title,
+                            help,
+                            items,
+                            selected: BTreeSet::new(),
+                            cursor: 0,
+                            tx,
+                        });
+                    }
                     Some(OutMsg::AlertsArmed(on)) => {
                         // C7: 알림 레인 토글. 켜면 새 tracker(상태 초기화), 끄면 None(metrics arm이
                         // 더 이상 alert를 내지 않는다). sampler task는 이제 statusbar와 무관하게 항상
@@ -2614,6 +2725,32 @@ mod tests {
             !all.contains("diagnose"),
             "confirm 중 popup 미표시: {all:?}"
         );
+    }
+
+    #[test]
+    fn draw_multi_select_marks_selected_item() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut selected = BTreeSet::new();
+        selected.insert("nginx".to_string());
+        let state = MultiSelectState {
+            title: "적용할 workload 정의를 고르세요".to_string(),
+            help: "Space 선택".to_string(),
+            items: vec![MultiSelectItem {
+                id: "nginx".to_string(),
+                label: "nginx (Nginx)".to_string(),
+            }],
+            selected,
+            cursor: 0,
+            tx,
+        };
+        let backend = TestBackend::new(50, 5);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| super::draw_multi_select(f, &state)).unwrap();
+        let row: String = (0..50)
+            .map(|x| term.backend().buffer()[(x, 1)].symbol())
+            .collect();
+        assert!(row.contains("[x]"), "선택 표식 없음: {row:?}");
+        assert!(row.contains("nginx"), "항목 라벨 없음: {row:?}");
     }
 
     #[test]

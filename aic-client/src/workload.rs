@@ -181,7 +181,21 @@ fn adapter_priority(adapter: WorkloadAdapter) -> u8 {
     match adapter {
         WorkloadAdapter::Nginx => 0,
         WorkloadAdapter::Jvm => 1,
-        WorkloadAdapter::Generic => 2,
+        WorkloadAdapter::Redis
+        | WorkloadAdapter::PostgreSql
+        | WorkloadAdapter::MySql
+        | WorkloadAdapter::MongoDb
+        | WorkloadAdapter::Kafka
+        | WorkloadAdapter::Elasticsearch
+        | WorkloadAdapter::OpenSearch
+        | WorkloadAdapter::RabbitMq
+        | WorkloadAdapter::HaProxy
+        | WorkloadAdapter::Prometheus
+        | WorkloadAdapter::ClickHouse
+        | WorkloadAdapter::Etcd
+        | WorkloadAdapter::Consul
+        | WorkloadAdapter::Memcached => 2,
+        WorkloadAdapter::Generic => 3,
     }
 }
 
@@ -190,15 +204,58 @@ fn classify(row: &ProcessRow) -> (Option<WorkloadSelector>, WorkloadAdapter, Vec
     let Some(exe) = &row.exe else {
         return (None, WorkloadAdapter::Generic, ambiguity);
     };
-    if row.name == "nginx" || exe.ends_with("/nginx") {
-        return (
-            row.systemd_unit
-                .clone()
-                .map(|unit| WorkloadSelector::SystemdUnit { unit })
-                .or_else(|| Some(WorkloadSelector::Executable { path: exe.clone() })),
-            WorkloadAdapter::Nginx,
-            ambiguity,
-        );
+    let executable = exe.rsplit('/').next().unwrap_or(exe);
+    let service_selector = || {
+        row.systemd_unit
+            .clone()
+            .map(|unit| WorkloadSelector::SystemdUnit { unit })
+            .or_else(|| Some(WorkloadSelector::Executable { path: exe.clone() }))
+    };
+    let named_service = |names: &[&str], adapter| {
+        names
+            .iter()
+            .any(|name| row.name == *name || executable == *name)
+            .then(|| (service_selector(), adapter, ambiguity.clone()))
+    };
+    if let Some(result) = named_service(&["nginx"], WorkloadAdapter::Nginx) {
+        return result;
+    }
+    if let Some(result) = named_service(&["redis-server", "valkey-server"], WorkloadAdapter::Redis)
+    {
+        return result;
+    }
+    if let Some(result) = named_service(&["postgres", "postmaster"], WorkloadAdapter::PostgreSql) {
+        return result;
+    }
+    if let Some(result) = named_service(&["mysqld", "mariadbd"], WorkloadAdapter::MySql) {
+        return result;
+    }
+    if let Some(result) = named_service(&["mongod"], WorkloadAdapter::MongoDb) {
+        return result;
+    }
+    if let Some(result) = named_service(&["rabbitmq-server"], WorkloadAdapter::RabbitMq) {
+        return result;
+    }
+    if let Some(result) = named_service(&["haproxy"], WorkloadAdapter::HaProxy) {
+        return result;
+    }
+    if let Some(result) = named_service(&["prometheus"], WorkloadAdapter::Prometheus) {
+        return result;
+    }
+    if let Some(result) = named_service(&["clickhouse-server"], WorkloadAdapter::ClickHouse) {
+        return result;
+    }
+    if let Some(result) = named_service(&["etcd"], WorkloadAdapter::Etcd) {
+        return result;
+    }
+    if let Some(result) = named_service(&["consul"], WorkloadAdapter::Consul) {
+        return result;
+    }
+    if let Some(result) = named_service(&["memcached"], WorkloadAdapter::Memcached) {
+        return result;
+    }
+    if row.name == "beam.smp" && row.cmd.iter().any(|token| token.contains("rabbitmq")) {
+        return (service_selector(), WorkloadAdapter::RabbitMq, ambiguity);
     }
     if row.name == "java" || exe.ends_with("/java") {
         if let Some(main) = row
@@ -206,12 +263,21 @@ fn classify(row: &ProcessRow) -> (Option<WorkloadSelector>, WorkloadAdapter, Vec
             .iter()
             .find(|token| !token.starts_with('-') && !token.ends_with("java"))
         {
+            let java_adapter = if main.contains("kafka.Kafka") {
+                WorkloadAdapter::Kafka
+            } else if main.contains("org.elasticsearch") {
+                WorkloadAdapter::Elasticsearch
+            } else if main.contains("org.opensearch") {
+                WorkloadAdapter::OpenSearch
+            } else {
+                WorkloadAdapter::Jvm
+            };
             return (
                 Some(WorkloadSelector::JvmMain {
                     executable: exe.clone(),
                     main_class: main.clone(),
                 }),
-                WorkloadAdapter::Jvm,
+                java_adapter,
                 ambiguity,
             );
         }
@@ -276,6 +342,9 @@ pub fn inspect(candidate_id: &str) -> Result<(DiscoveryReport, WorkloadCandidate
 pub fn proposals(report: &DiscoveryReport) -> Vec<WorkloadProposal> {
     let mut proposals = Vec::new();
     for candidate in &report.candidates {
+        if candidate.adapter == WorkloadAdapter::Generic {
+            continue;
+        }
         proposals.push(available_proposal(
             candidate,
             ProposalSpec {
@@ -520,6 +589,35 @@ fn candidate_proposals(candidate: &WorkloadCandidate) -> Vec<CandidateProposal> 
             "jvm-monitoring",
             "Monitor JVM adapter signals.",
             vec!["heap", "gc pauses", "thread count"],
+            ProposalCost::Medium,
+            ProposalEffects {
+                persistence: true,
+                privilege: false,
+                outbound: false,
+            },
+        )),
+        WorkloadAdapter::Redis
+        | WorkloadAdapter::PostgreSql
+        | WorkloadAdapter::MySql
+        | WorkloadAdapter::MongoDb
+        | WorkloadAdapter::Kafka
+        | WorkloadAdapter::Elasticsearch
+        | WorkloadAdapter::OpenSearch
+        | WorkloadAdapter::RabbitMq
+        | WorkloadAdapter::HaProxy
+        | WorkloadAdapter::Prometheus
+        | WorkloadAdapter::ClickHouse
+        | WorkloadAdapter::Etcd
+        | WorkloadAdapter::Consul
+        | WorkloadAdapter::Memcached => proposals.push((
+            ProposalKind::ServiceAdapterMonitoring,
+            "service-monitoring",
+            "Monitor service adapter signals.",
+            vec![
+                "process availability",
+                "resource use",
+                "service-specific metrics",
+            ],
             ProposalCost::Medium,
             ProposalEffects {
                 persistence: true,
@@ -773,11 +871,91 @@ mod tests {
     }
 
     #[test]
+    fn discovery_classifies_major_service_processes() {
+        let report = discover_rows(vec![
+            row(1, 1, "redis-server", Some("/usr/bin/redis-server"), &[]),
+            row(2, 1, "postgres", Some("/usr/lib/postgresql/postgres"), &[]),
+            row(3, 1, "mysqld", Some("/usr/sbin/mysqld"), &[]),
+            row(4, 1, "mongod", Some("/usr/bin/mongod"), &[]),
+            row(5, 1, "haproxy", Some("/usr/sbin/haproxy"), &[]),
+            row(6, 1, "prometheus", Some("/usr/local/bin/prometheus"), &[]),
+            row(
+                7,
+                1,
+                "clickhouse-server",
+                Some("/usr/bin/clickhouse-server"),
+                &[],
+            ),
+            row(8, 1, "etcd", Some("/usr/local/bin/etcd"), &[]),
+            row(9, 1, "consul", Some("/usr/bin/consul"), &[]),
+            row(10, 1, "memcached", Some("/usr/bin/memcached"), &[]),
+        ]);
+        let adapters = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.adapter)
+            .collect::<Vec<_>>();
+        for adapter in [
+            WorkloadAdapter::Redis,
+            WorkloadAdapter::PostgreSql,
+            WorkloadAdapter::MySql,
+            WorkloadAdapter::MongoDb,
+            WorkloadAdapter::HaProxy,
+            WorkloadAdapter::Prometheus,
+            WorkloadAdapter::ClickHouse,
+            WorkloadAdapter::Etcd,
+            WorkloadAdapter::Consul,
+            WorkloadAdapter::Memcached,
+        ] {
+            assert!(adapters.contains(&adapter), "missing {adapter:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_classifies_java_service_main_classes() {
+        let report = discover_rows(vec![
+            row(1, 1, "java", Some("/usr/bin/java"), &["kafka.Kafka"]),
+            row(
+                2,
+                1,
+                "java",
+                Some("/usr/bin/java"),
+                &["org.elasticsearch.bootstrap.Elasticsearch"],
+            ),
+            row(
+                3,
+                1,
+                "java",
+                Some("/usr/bin/java"),
+                &["org.opensearch.bootstrap.OpenSearch"],
+            ),
+        ]);
+        assert!(report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.adapter == WorkloadAdapter::Kafka));
+        assert!(report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.adapter == WorkloadAdapter::Elasticsearch));
+        assert!(report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.adapter == WorkloadAdapter::OpenSearch));
+    }
+
+    #[test]
     fn ambiguous_candidates_have_no_enable_proposal() {
         let report = discover_rows(vec![row(1, 1, "java", Some("/usr/bin/java"), &["-Xmx1g"])]);
         assert!(proposals(&report)
             .iter()
             .all(|proposal| proposal.kind != ProposalKind::Enable));
+    }
+
+    #[test]
+    fn generic_candidates_have_no_discovery_proposals() {
+        let report = discover_rows(vec![row(1, 1, "helper", Some("/usr/bin/helper"), &[])]);
+        assert!(proposals(&report).is_empty());
     }
 
     #[test]
