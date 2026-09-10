@@ -41,7 +41,7 @@ pub use session::{
 pub use shell_hooks::generate_shell_hooks;
 pub use workload::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
-    WorkloadCandidate, WorkloadDefinition, WorkloadProposal, WorkloadSelector,
+    WorkloadCandidate, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
     WORKLOAD_SCHEMA_VERSION,
 };
 

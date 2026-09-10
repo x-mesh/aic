@@ -384,10 +384,18 @@ Generic processes stay out of default discovery, LLM analysis, monitoring propos
 selection. A generic process can expose CPU, memory, and restart state. It does not provide
 service-level meaning.
 
-The current service adapter proposal records a workload definition and a monitoring plan.
+Each workload has a driver mode: `detect_only`, `inspect_ready`, or `monitor_ready`.
 
-It does not collect protocol-specific metrics. Redis `INFO`, PostgreSQL `pg_stat_*`, and similar
-service queries need a future adapter.
+Discovery creates `detect_only` drivers. Nginx checks known local configuration paths. Redis sends a
+bounded `INFO SERVER` request to a local socket or `127.0.0.1:6379`. PostgreSQL sends an
+unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successful check sets
+`inspect_ready`. The checks do not read configuration content, credentials, or remote endpoints.
+
+`/workload inspect` shows the local evidence and pending driver checks.
+
+The current implementation does not collect service metrics. `inspect_ready` only confirms local
+read-only access. Redis `INFO` collection and PostgreSQL `pg_stat_*` queries need a
+`monitor_ready` driver.
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
 local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +

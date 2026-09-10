@@ -224,10 +224,11 @@ fn render_workload_discovery(
         .iter()
         .map(|candidate| {
             format!(
-                "{}\nfingerprint={} adapter={:?} bindings={} ambiguity={:?}",
+                "{}\nfingerprint={} adapter={:?} driver_mode={:?} bindings={} ambiguity={:?}",
                 cap_utf8(&candidate.id, 512),
                 cap_utf8(&candidate.fingerprint, 128),
                 candidate.adapter,
+                candidate.driver_mode,
                 candidate.bindings.len(),
                 candidate
                     .ambiguity
@@ -1595,9 +1596,10 @@ impl AgentSession {
                 Some(super::chat_tui::MultiSelectItem {
                     id: candidate.id.clone(),
                     label: format!(
-                        "{} ({:?}, bindings={}) · workloads.toml에 저장",
+                        "{} ({:?}, driver={:?}, bindings={}) · workloads.toml에 저장",
                         candidate.id,
                         candidate.adapter,
+                        candidate.driver_mode,
                         candidate.bindings.len()
                     ),
                 })
@@ -1642,7 +1644,12 @@ impl AgentSession {
         }
         let preview = candidates
             .iter()
-            .map(|candidate| format!("{} selector={:?}", candidate.id, candidate.selector))
+            .map(|candidate| {
+                format!(
+                    "{} selector={:?} driver={:?}",
+                    candidate.id, candidate.selector, candidate.driver_mode
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         let prompt = format!(
@@ -1673,12 +1680,13 @@ impl AgentSession {
 
     async fn handle_workload_inspect(&mut self, candidate_id: &str) {
         let result = crate::workload::inspect(candidate_id).map(|(report, candidate)| {
+            let driver = crate::workload::inspect_driver(&candidate);
             let proposals = crate::workload::proposals(&report)
                 .into_iter()
                 .filter(|proposal| proposal.candidate_id == candidate.id)
                 .map(|proposal| proposal.id)
                 .collect::<Vec<_>>();
-            format!("{}\nfingerprint={}\nselector={:?}\nadapter={:?}\nbindings={:?}\nambiguity={:?}\nproposals={:?}", candidate.id, candidate.fingerprint, candidate.selector, candidate.adapter, candidate.bindings, candidate.ambiguity, proposals)
+            format!("{}\nfingerprint={}\nselector={:?}\nadapter={:?}\ndriver_mode={:?}\ndriver_evidence={:?}\ndriver_pending_checks={:?}\nbindings={:?}\nambiguity={:?}\nproposals={:?}", candidate.id, candidate.fingerprint, candidate.selector, candidate.adapter, driver.mode, driver.evidence, driver.pending_checks, candidate.bindings, candidate.ambiguity, proposals)
         });
         match result {
             Ok(text) => self.out.note(&text).await,
@@ -3769,6 +3777,7 @@ mod tests {
                     path: format!("/secret/path/{index}"),
                 }),
                 adapter: aic_common::WorkloadAdapter::Generic,
+                driver_mode: None,
                 bindings: vec![aic_common::RuntimeBinding {
                     pid: index + 1,
                     start_time: index as u64,
@@ -3820,6 +3829,7 @@ mod tests {
                     path: format!("/very/long/path/{index}"),
                 }),
                 adapter: aic_common::WorkloadAdapter::Generic,
+                driver_mode: None,
                 bindings: vec![aic_common::RuntimeBinding {
                     pid: index + 1,
                     start_time: index as u64,
@@ -3851,6 +3861,7 @@ mod tests {
                     fingerprint: "n".to_string(),
                     selector: None,
                     adapter: aic_common::WorkloadAdapter::Nginx,
+                    driver_mode: Some(aic_common::WorkloadDriverMode::DetectOnly),
                     bindings: Vec::new(),
                     ambiguity: Vec::new(),
                 },
@@ -3859,6 +3870,7 @@ mod tests {
                     fingerprint: "g".to_string(),
                     selector: None,
                     adapter: aic_common::WorkloadAdapter::Generic,
+                    driver_mode: None,
                     bindings: Vec::new(),
                     ambiguity: Vec::new(),
                 },

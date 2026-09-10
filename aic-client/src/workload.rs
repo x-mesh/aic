@@ -4,7 +4,7 @@ use crate::config::ConfigManager;
 use aic_common::workload::{ProposalCost, ProposalReadiness};
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
-    WorkloadCandidate, WorkloadDefinition, WorkloadProposal, WorkloadSelector,
+    WorkloadCandidate, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
     WORKLOAD_SCHEMA_VERSION,
 };
 use anyhow::{bail, Context, Result};
@@ -12,10 +12,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-#[cfg(target_os = "linux")]
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const MAX_PROCESSES: usize = 4096;
@@ -26,6 +30,23 @@ const MAX_TOKEN_BYTES: usize = 256;
 const MAX_CGROUP_BYTES: u64 = 8 * 1024;
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
+const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+const DRIVER_RESPONSE_BYTES: usize = 1024;
+const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
+const POSTGRES_LOOPBACK_ENDPOINT: &str = "127.0.0.1:5432";
+const NGINX_CONFIG_PATHS: &[&str] = &["/etc/nginx/nginx.conf", "/usr/local/etc/nginx/nginx.conf"];
+#[cfg(unix)]
+const REDIS_SOCKET_PATHS: &[&str] = &[
+    "/run/redis/redis-server.sock",
+    "/var/run/redis/redis-server.sock",
+    "/tmp/redis.sock",
+];
+#[cfg(unix)]
+const POSTGRES_SOCKET_PATHS: &[&str] = &[
+    "/run/postgresql/.s.PGSQL.5432",
+    "/var/run/postgresql/.s.PGSQL.5432",
+    "/tmp/.s.PGSQL.5432",
+];
 
 #[derive(Debug, Clone)]
 struct ProcessRow {
@@ -45,15 +66,6 @@ type CandidateGroup = (
     Vec<String>,
 );
 
-type CandidateProposal = (
-    ProposalKind,
-    &'static str,
-    &'static str,
-    Vec<&'static str>,
-    ProposalCost,
-    ProposalEffects,
-);
-
 struct ProposalSpec {
     id: String,
     kind: ProposalKind,
@@ -62,6 +74,15 @@ struct ProposalSpec {
     cost: ProposalCost,
     effects: ProposalEffects,
     related_candidate_ids: Vec<String>,
+}
+
+/// Evidence from a bounded local access check. It never contains configuration content or
+/// credentials, and it does not imply that metric collection is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverInspection {
+    pub mode: WorkloadDriverMode,
+    pub evidence: Vec<String>,
+    pub pending_checks: Vec<String>,
 }
 
 pub fn discover() -> Result<DiscoveryReport> {
@@ -112,7 +133,13 @@ pub fn discover() -> Result<DiscoveryReport> {
             .then_with(|| a.pid.cmp(&b.pid))
     });
     rows.truncate(MAX_PROCESSES);
-    Ok(discover_rows(rows))
+    let mut report = discover_rows(rows);
+    for candidate in &mut report.candidates {
+        if candidate.driver_mode.is_some() {
+            candidate.driver_mode = Some(inspect_driver(candidate).mode);
+        }
+    }
+    Ok(report)
 }
 
 fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
@@ -152,6 +179,7 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
                 fingerprint,
                 selector,
                 adapter,
+                driver_mode: driver_mode(adapter),
                 bindings,
                 ambiguity,
             }
@@ -174,6 +202,191 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
         evidence_coverage:
             "process_name, executable, bounded_command, pid, start_time, linux_cgroup".to_string(),
         candidates,
+    }
+}
+
+fn driver_mode(adapter: WorkloadAdapter) -> Option<WorkloadDriverMode> {
+    match adapter {
+        WorkloadAdapter::Generic => None,
+        _ => Some(WorkloadDriverMode::DetectOnly),
+    }
+}
+
+/// Perform the small read-only local check that is available for this adapter.
+///
+/// This function intentionally supports only endpoints with a fixed local default. It never
+/// reads configuration contents, accepts remote endpoints, or attempts authentication.
+pub fn inspect_driver(candidate: &WorkloadCandidate) -> DriverInspection {
+    let evidence = match candidate.adapter {
+        WorkloadAdapter::Nginx => probe_nginx_config(),
+        WorkloadAdapter::Redis => probe_redis(),
+        WorkloadAdapter::PostgreSql => probe_postgres(),
+        _ => None,
+    };
+    let mode = if evidence.is_some() {
+        WorkloadDriverMode::InspectReady
+    } else {
+        WorkloadDriverMode::DetectOnly
+    };
+    DriverInspection {
+        mode,
+        evidence: evidence.into_iter().collect(),
+        pending_checks: if mode == WorkloadDriverMode::InspectReady {
+            vec!["monitoring driver implementation".to_string()]
+        } else {
+            driver_next_checks(candidate.adapter)
+                .iter()
+                .map(|check| (*check).to_string())
+                .collect()
+        },
+    }
+}
+
+fn probe_nginx_config() -> Option<String> {
+    NGINX_CONFIG_PATHS.iter().find_map(|path| {
+        File::open(path)
+            .ok()
+            .map(|_| format!("nginx configuration is readable at {path}"))
+    })
+}
+
+fn probe_redis() -> Option<String> {
+    #[cfg(unix)]
+    for path in REDIS_SOCKET_PATHS {
+        if probe_redis_unix_socket(Path::new(path)).is_ok() {
+            return Some(format!("Redis INFO SERVER accepted at local socket {path}"));
+        }
+    }
+
+    let endpoint = REDIS_LOOPBACK_ENDPOINT
+        .parse()
+        .expect("valid Redis endpoint");
+    probe_redis_tcp(endpoint)
+        .ok()
+        .map(|_| format!("Redis INFO SERVER accepted at {REDIS_LOOPBACK_ENDPOINT}"))
+}
+
+fn probe_postgres() -> Option<String> {
+    #[cfg(unix)]
+    for path in POSTGRES_SOCKET_PATHS {
+        if probe_postgres_unix_socket(Path::new(path)).is_ok() {
+            return Some(format!(
+                "PostgreSQL accepted a local socket connection at {path}"
+            ));
+        }
+    }
+
+    let endpoint = POSTGRES_LOOPBACK_ENDPOINT
+        .parse()
+        .expect("valid PostgreSQL endpoint");
+    probe_postgres_tcp(endpoint)
+        .ok()
+        .map(|_| format!("PostgreSQL startup accepted at {POSTGRES_LOOPBACK_ENDPOINT}"))
+}
+
+fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&endpoint, DRIVER_CONNECT_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    probe_postgres_stream(&mut stream)
+}
+
+fn probe_redis_tcp(endpoint: SocketAddr) -> Result<(), String> {
+    let mut stream = TcpStream::connect_timeout(&endpoint, DRIVER_CONNECT_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    probe_redis_stream(&mut stream)
+}
+
+#[cfg(unix)]
+fn probe_redis_unix_socket(path: &Path) -> Result<(), String> {
+    let mut stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    probe_redis_stream(&mut stream)
+}
+
+fn probe_redis_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
+    stream
+        .write_all(b"INFO SERVER\r\n")
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let mut response = [0_u8; DRIVER_RESPONSE_BYTES];
+    let read = stream
+        .read(&mut response)
+        .map_err(|error| error.to_string())?;
+    let response = std::str::from_utf8(&response[..read]).map_err(|error| error.to_string())?;
+    if response.contains("# Server") {
+        Ok(())
+    } else {
+        Err("Redis INFO SERVER was not accepted".to_string())
+    }
+}
+
+fn probe_postgres_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
+    // PostgreSQL protocol v3 startup packet with no credentials. An `R` authentication request
+    // or an `E` error response proves that the endpoint speaks PostgreSQL without authenticating.
+    stream
+        .write_all(b"\0\0\0\t\0\x03\0\0\0")
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let mut response = [0_u8; 1];
+    stream
+        .read_exact(&mut response)
+        .map_err(|error| error.to_string())?;
+    match response[0] {
+        b'R' | b'E' => Ok(()),
+        _ => Err("PostgreSQL startup was not accepted".to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn probe_postgres_unix_socket(path: &Path) -> Result<(), String> {
+    let mut stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    probe_postgres_stream(&mut stream)
+}
+
+/// Return the read-only prerequisites that a driver must verify before it can collect service data.
+pub fn driver_next_checks(adapter: WorkloadAdapter) -> &'static [&'static str] {
+    match adapter {
+        WorkloadAdapter::Nginx => &["config access", "stub status or logs"],
+        WorkloadAdapter::Redis => &["local socket or TCP access", "INFO permission"],
+        WorkloadAdapter::PostgreSql => &["local socket or DSN", "pg_isready"],
+        WorkloadAdapter::Jvm => &["JMX or process access", "runtime metrics access"],
+        WorkloadAdapter::Kafka => &["broker endpoint", "admin API access"],
+        WorkloadAdapter::Elasticsearch | WorkloadAdapter::OpenSearch => {
+            &["local HTTP endpoint", "cluster API access"]
+        }
+        WorkloadAdapter::RabbitMq => &["management endpoint", "read-only API access"],
+        WorkloadAdapter::MySql => &["local socket or DSN", "read-only status access"],
+        WorkloadAdapter::MongoDb => &["local endpoint", "read-only server status access"],
+        WorkloadAdapter::HaProxy => &["stats socket or endpoint", "read-only stats access"],
+        WorkloadAdapter::Prometheus => &["local HTTP endpoint", "read-only query access"],
+        WorkloadAdapter::ClickHouse => &["local endpoint", "read-only system query access"],
+        WorkloadAdapter::Etcd => &["local endpoint", "read-only status access"],
+        WorkloadAdapter::Consul => &["local endpoint", "read-only API access"],
+        WorkloadAdapter::Memcached => &["local socket", "stats command access"],
+        WorkloadAdapter::Generic => &[],
     }
 }
 
@@ -362,6 +575,27 @@ pub fn proposals(report: &DiscoveryReport) -> Vec<WorkloadProposal> {
             },
             format!("/workload inspect {}", candidate.id),
         ));
+        if candidate.driver_mode == Some(WorkloadDriverMode::DetectOnly) {
+            proposals.push(planned_proposal(
+                candidate,
+                ProposalSpec {
+                    id: format!("driver-inspect:{}", candidate.id),
+                    kind: ProposalKind::DriverInspect,
+                    reason: format!(
+                        "Verify read-only access before advancing the {:?} driver.",
+                        candidate.adapter
+                    ),
+                    expected_signals: strings(driver_next_checks(candidate.adapter).to_vec()),
+                    cost: ProposalCost::Low,
+                    effects: ProposalEffects {
+                        persistence: false,
+                        privilege: false,
+                        outbound: false,
+                    },
+                    related_candidate_ids: Vec::new(),
+                },
+            ));
+        }
         if candidate.selector.is_some() && candidate.ambiguity.is_empty() {
             proposals.push(available_proposal(
                 candidate,
@@ -384,41 +618,10 @@ pub fn proposals(report: &DiscoveryReport) -> Vec<WorkloadProposal> {
                 ),
             ));
         }
-        proposals.push(planned_proposal(
-            candidate,
-            ProposalSpec {
-                id: format!("process-resource:{}", candidate.id),
-                kind: ProposalKind::ProcessResourceMonitoring,
-                reason: "Track bounded process resource signals for this workload.".into(),
-                expected_signals: strings(vec!["cpu", "memory", "process restarts"]),
-                cost: ProposalCost::Low,
-                effects: ProposalEffects {
-                    persistence: true,
-                    privilege: false,
-                    outbound: false,
-                },
-                related_candidate_ids: Vec::new(),
-            },
-        ));
-        if candidate.selector.is_some() && candidate.ambiguity.is_empty() {
-            for (kind, prefix, reason, signals, cost, effects) in candidate_proposals(candidate) {
-                proposals.push(planned_proposal(
-                    candidate,
-                    ProposalSpec {
-                        id: format!("{prefix}:{}", candidate.id),
-                        kind,
-                        reason: reason.into(),
-                        expected_signals: strings(signals),
-                        cost,
-                        effects,
-                        related_candidate_ids: Vec::new(),
-                    },
-                ));
-            }
-        }
     }
     let nginx = report.candidates.iter().filter(|candidate| {
         candidate.adapter == WorkloadAdapter::Nginx
+            && candidate.driver_mode == Some(WorkloadDriverMode::MonitorReady)
             && candidate.selector.is_some()
             && candidate.ambiguity.is_empty()
     });
@@ -427,6 +630,7 @@ pub fn proposals(report: &DiscoveryReport) -> Vec<WorkloadProposal> {
         .iter()
         .filter(|candidate| {
             candidate.adapter == WorkloadAdapter::Jvm
+                && candidate.driver_mode == Some(WorkloadDriverMode::MonitorReady)
                 && candidate.selector.is_some()
                 && candidate.ambiguity.is_empty()
         })
@@ -520,116 +724,6 @@ fn strings(values: Vec<&str>) -> Vec<String> {
     values.into_iter().map(str::to_string).collect()
 }
 
-fn candidate_proposals(candidate: &WorkloadCandidate) -> Vec<CandidateProposal> {
-    let mut proposals = vec![
-        (
-            ProposalKind::RcaEvidenceAttachment,
-            "rca-evidence",
-            "Attach bounded workload evidence to RCA records.",
-            vec!["process evidence", "configuration context"],
-            ProposalCost::Low,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: false,
-            },
-        ),
-        (
-            ProposalKind::LocalRetention,
-            "local-retention",
-            "Retain local monitoring evidence for later RCA.",
-            vec!["retention window", "storage use"],
-            ProposalCost::Low,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: false,
-            },
-        ),
-        (
-            ProposalKind::RcaWebExport,
-            "rca-web-export",
-            "Prepare an opt-in RCA web export.",
-            vec!["export readiness", "outbound confirmation"],
-            ProposalCost::Medium,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: true,
-            },
-        ),
-        (
-            ProposalKind::BoundedOnDemandProfiling,
-            "bounded-profiling",
-            "Prepare bounded on-demand profiling.",
-            vec!["profile duration", "resource overhead"],
-            ProposalCost::High,
-            ProposalEffects {
-                persistence: false,
-                privilege: true,
-                outbound: false,
-            },
-        ),
-    ];
-    match candidate.adapter {
-        WorkloadAdapter::Nginx => proposals.push((
-            ProposalKind::NginxAdapterMonitoring,
-            "nginx-monitoring",
-            "Monitor nginx adapter signals.",
-            vec!["request rate", "upstream errors", "latency"],
-            ProposalCost::Medium,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: false,
-            },
-        )),
-        WorkloadAdapter::Jvm => proposals.push((
-            ProposalKind::JvmAdapterMonitoring,
-            "jvm-monitoring",
-            "Monitor JVM adapter signals.",
-            vec!["heap", "gc pauses", "thread count"],
-            ProposalCost::Medium,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: false,
-            },
-        )),
-        WorkloadAdapter::Redis
-        | WorkloadAdapter::PostgreSql
-        | WorkloadAdapter::MySql
-        | WorkloadAdapter::MongoDb
-        | WorkloadAdapter::Kafka
-        | WorkloadAdapter::Elasticsearch
-        | WorkloadAdapter::OpenSearch
-        | WorkloadAdapter::RabbitMq
-        | WorkloadAdapter::HaProxy
-        | WorkloadAdapter::Prometheus
-        | WorkloadAdapter::ClickHouse
-        | WorkloadAdapter::Etcd
-        | WorkloadAdapter::Consul
-        | WorkloadAdapter::Memcached => proposals.push((
-            ProposalKind::ServiceAdapterMonitoring,
-            "service-monitoring",
-            "Monitor service adapter signals.",
-            vec![
-                "process availability",
-                "resource use",
-                "service-specific metrics",
-            ],
-            ProposalCost::Medium,
-            ProposalEffects {
-                persistence: true,
-                privilege: false,
-                outbound: false,
-            },
-        )),
-        WorkloadAdapter::Generic => {}
-    }
-    proposals
-}
-
 pub fn list_configured() -> Result<Vec<WorkloadDefinition>> {
     let path = workloads_path();
     if !path.exists() {
@@ -652,6 +746,7 @@ pub fn enable(candidate_id: &str, expected_fingerprint: &str) -> Result<Workload
         id: candidate.id,
         selector: candidate.selector.unwrap(),
         adapter: candidate.adapter,
+        driver_mode: candidate.driver_mode.unwrap_or_default(),
     };
     save_definition(&definition)?;
     Ok(definition)
@@ -1027,21 +1122,29 @@ mod tests {
     }
 
     #[test]
-    fn catalog_marks_only_inspect_and_enable_as_available() {
+    fn detect_only_drivers_propose_access_checks_not_monitoring() {
         let report = discover_rows(vec![
             row(1, 1, "nginx", Some("/usr/sbin/nginx"), &[]),
             row(2, 1, "java", Some("/usr/bin/java"), &["example.Main"]),
         ]);
         let proposals = proposals(&report);
+        assert_eq!(
+            report.candidates[0].driver_mode,
+            Some(WorkloadDriverMode::DetectOnly)
+        );
         assert!(proposals
             .iter()
-            .any(|proposal| proposal.kind == ProposalKind::NginxAdapterMonitoring));
-        assert!(proposals
-            .iter()
-            .any(|proposal| proposal.kind == ProposalKind::JvmAdapterMonitoring));
-        assert!(proposals
-            .iter()
-            .any(|proposal| proposal.kind == ProposalKind::NginxJvmTopologyCorrelation));
+            .filter(|proposal| proposal.kind == ProposalKind::DriverInspect)
+            .all(|proposal| proposal.readiness == ProposalReadiness::Planned));
+        assert!(proposals.iter().all(|proposal| {
+            !matches!(
+                proposal.kind,
+                ProposalKind::NginxAdapterMonitoring
+                    | ProposalKind::JvmAdapterMonitoring
+                    | ProposalKind::ServiceAdapterMonitoring
+                    | ProposalKind::NginxJvmTopologyCorrelation
+            )
+        }));
         for proposal in &proposals {
             let executable = matches!(proposal.kind, ProposalKind::Inspect | ProposalKind::Enable);
             assert_eq!(
@@ -1052,5 +1155,91 @@ mod tests {
             assert!(!proposal.evidence.is_empty());
             assert!(!proposal.expected_signals.is_empty());
         }
+    }
+
+    #[test]
+    fn redis_driver_declares_read_only_prerequisites() {
+        assert_eq!(
+            driver_next_checks(WorkloadAdapter::Redis),
+            ["local socket or TCP access", "INFO permission"]
+        );
+    }
+
+    #[test]
+    fn unsupported_driver_stays_detect_only() {
+        let candidate = WorkloadCandidate {
+            id: "exe:/usr/bin/java".into(),
+            fingerprint: "test".into(),
+            selector: Some(WorkloadSelector::Executable {
+                path: "/usr/bin/java".into(),
+            }),
+            adapter: WorkloadAdapter::Jvm,
+            driver_mode: Some(WorkloadDriverMode::DetectOnly),
+            bindings: Vec::new(),
+            ambiguity: Vec::new(),
+        };
+        let inspection = inspect_driver(&candidate);
+        assert_eq!(inspection.mode, WorkloadDriverMode::DetectOnly);
+        assert!(inspection.evidence.is_empty());
+        assert_eq!(
+            inspection.pending_checks,
+            ["JMX or process access", "runtime metrics access"]
+        );
+    }
+
+    #[test]
+    fn inspect_ready_driver_does_not_repeat_its_access_proposal() {
+        let report = DiscoveryReport {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "test".into(),
+            candidates: vec![WorkloadCandidate {
+                id: "exe:/usr/bin/redis-server".into(),
+                fingerprint: "test".into(),
+                selector: Some(WorkloadSelector::Executable {
+                    path: "/usr/bin/redis-server".into(),
+                }),
+                adapter: WorkloadAdapter::Redis,
+                driver_mode: Some(WorkloadDriverMode::InspectReady),
+                bindings: Vec::new(),
+                ambiguity: Vec::new(),
+            }],
+        };
+        assert!(proposals(&report)
+            .iter()
+            .all(|proposal| proposal.kind != ProposalKind::DriverInspect));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redis_probe_accepts_only_the_info_server_response() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut peer, mut client) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut request = [0_u8; 13];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"INFO SERVER\r\n");
+            peer.write_all(b"$10\r\n# Server\r\n").unwrap();
+        });
+        assert!(probe_redis_stream(&mut client).is_ok());
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_probe_uses_an_unauthenticated_startup_packet() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut peer, mut client) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut request = [0_u8; 9];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(request, [0, 0, 0, 9, 0, 3, 0, 0, 0]);
+            peer.write_all(b"R").unwrap();
+        });
+        assert!(probe_postgres_stream(&mut client).is_ok());
+        server.join().unwrap();
     }
 }

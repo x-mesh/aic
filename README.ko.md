@@ -362,8 +362,17 @@ RabbitMQ를 실행한 Erlang VM 명령행도 분류합니다.
 모니터링 제안, 대화형 선택에서 제외합니다. CPU·메모리·재시작 상태는 볼 수 있지만 서비스 수준의
 의미를 판단할 수 없기 때문입니다.
 
-현재 서비스 adapter 제안은 workload 정의와 모니터링 계획을 저장합니다. 프로토콜별 지표는 수집하지
-않습니다. Redis `INFO`, PostgreSQL `pg_stat_*` 등의 서비스별 질의는 후속 adapter 구현이 필요합니다.
+각 workload에는 `detect_only`, `inspect_ready`, `monitor_ready` driver mode가 있습니다.
+
+발견 단계는 `detect_only` driver를 만듭니다. Nginx는 알려진 로컬 설정 파일의 읽기 접근을, Redis는
+로컬 socket 또는 `127.0.0.1:6379`의 bounded `INFO SERVER` 요청을, PostgreSQL은 로컬 socket 또는
+`127.0.0.1:5432` 연결을 확인합니다. 검사에 성공하면 해당 후보를 `inspect_ready`로 표시합니다.
+이 검사는 설정 내용, 자격 증명, 원격 endpoint를 읽거나 사용하지 않습니다.
+
+`/workload inspect`는 확인 근거와 아직 필요한 조건을 표시합니다.
+
+현재는 서비스 지표를 수집하지 않습니다. `inspect_ready`는 read-only 접근 조건만 확인한 상태입니다.
+Redis `INFO`의 지속 수집과 PostgreSQL `pg_stat_*` 질의는 `monitor_ready` driver 구현이 필요합니다.
 
 probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다: local
 sysinfo 섹션(`fd`=열린 파일 디스크립터 현재/최대 포함) + `process` + git read-only + `docker`

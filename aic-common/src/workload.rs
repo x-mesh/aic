@@ -54,6 +54,19 @@ pub enum WorkloadAdapter {
     Generic,
 }
 
+/// Driver capability that the local evidence has established for a workload.
+///
+/// A detected process does not prove that AIC can access a service socket, credentials, or
+/// protocol metrics. Drivers must advance this state only after their own read-only checks pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadDriverMode {
+    #[default]
+    DetectOnly,
+    InspectReady,
+    MonitorReady,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBinding {
     pub pid: u32,
@@ -66,6 +79,9 @@ pub struct WorkloadCandidate {
     pub fingerprint: String,
     pub selector: Option<WorkloadSelector>,
     pub adapter: WorkloadAdapter,
+    /// `None` means that no workload driver is available for this process type.
+    #[serde(default)]
+    pub driver_mode: Option<WorkloadDriverMode>,
     pub bindings: Vec<RuntimeBinding>,
     #[serde(default)]
     pub ambiguity: Vec<String>,
@@ -76,6 +92,9 @@ pub struct WorkloadDefinition {
     pub id: String,
     pub selector: WorkloadSelector,
     pub adapter: WorkloadAdapter,
+    /// Older workload definitions predate drivers and default to detect-only.
+    #[serde(default)]
+    pub driver_mode: WorkloadDriverMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +108,7 @@ pub struct DiscoveryReport {
 #[serde(rename_all = "snake_case")]
 pub enum ProposalKind {
     Inspect,
+    DriverInspect,
     Enable,
     ProcessResourceMonitoring,
     NginxAdapterMonitoring,
@@ -169,6 +189,7 @@ mod tests {
                 main_class: "example.Main".to_string(),
             },
             adapter: WorkloadAdapter::Jvm,
+            driver_mode: WorkloadDriverMode::DetectOnly,
         };
         let json = serde_json::to_string(&definition).unwrap();
         assert_eq!(
@@ -180,6 +201,17 @@ mod tests {
             toml::from_str::<WorkloadDefinition>(&toml).unwrap(),
             definition
         );
+    }
+
+    #[test]
+    fn old_definition_defaults_to_detect_only_driver() {
+        let json = r#"{
+            "id": "exe:/usr/sbin/nginx",
+            "selector": { "executable": { "path": "/usr/sbin/nginx" } },
+            "adapter": "nginx"
+        }"#;
+        let definition: WorkloadDefinition = serde_json::from_str(json).unwrap();
+        assert_eq!(definition.driver_mode, WorkloadDriverMode::DetectOnly);
     }
 
     #[test]

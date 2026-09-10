@@ -1329,6 +1329,7 @@ fn handle_workload(op: WorkloadOp) {
         }),
         WorkloadOp::Inspect { candidate_id, json } => {
             workload::inspect(&candidate_id).map(|(report, candidate)| {
+                let driver = workload::inspect_driver(&candidate);
                 let proposals = workload::proposals(&report)
                     .into_iter()
                     .filter(|proposal| proposal.candidate_id == candidate.id)
@@ -1338,10 +1339,13 @@ fn handle_workload(op: WorkloadOp) {
                         .to_string()
                 } else {
                     format!(
-                        "{}\nfingerprint={}\nadapter={:?}\nambiguity={:?}\nproposals={:?}",
+                        "{}\nfingerprint={}\nadapter={:?}\ndriver_mode={:?}\ndriver_evidence={:?}\ndriver_pending_checks={:?}\nambiguity={:?}\nproposals={:?}",
                         candidate.id,
                         candidate.fingerprint,
                         candidate.adapter,
+                        driver.mode,
+                        driver.evidence,
+                        driver.pending_checks,
                         candidate.ambiguity,
                         proposals
                     )
