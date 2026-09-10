@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-09-10
+
+### Added
+
+- **chat:** /discover와 /workload slash command를 추가한다
+- **workload:** 로컬 workload 발견과 명시적 구성 CLI를 추가한다
+
 ## [0.38.1] - 2026-09-04
 
 ### Fixed
