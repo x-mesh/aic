@@ -666,9 +666,9 @@ $ aic audit verify --date 2026-05-24
 
 ## 8. References
 
-- council artifact: [`.xm/op/council-2026-05-25-ssh-multihost.json`](../.xm/op/council-2026-05-25-ssh-multihost.json) — 1차 합의
-- **red-team artifact: [`.xm/op/red-team-2026-05-25-rfc-005-ssh-multihost.json`](../.xm/op/red-team-2026-05-25-rfc-005-ssh-multihost.json) — 2차 검증(Critical 12 fix)**
-- brainstorm artifact: [`.xm/op/brainstorm-2026-05-25-aic-additional-features.json`](../.xm/op/brainstorm-2026-05-25-aic-additional-features.json) — T1.1 후보 도출
+- council artifact: `.xm/op/council-2026-05-25-ssh-multihost.json` — 1차 합의
+- **red-team artifact: `.xm/op/red-team-2026-05-25-rfc-005-ssh-multihost.json` — 2차 검증(Critical 12 fix)**
+- brainstorm artifact: `.xm/op/brainstorm-2026-05-25-aic-additional-features.json` — T1.1 후보 도출
 - RFC-002 §7.1 — sandbox `resolve_for_write` / risk_guard 분류(재사용)
 - RFC-004 — Ctrl+C 중단 메커니즘(`cancel_token` 동일 모델)
 
