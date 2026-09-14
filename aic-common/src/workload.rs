@@ -265,6 +265,20 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("Nginx workload connections do not support database fields");
                 }
             }
+            WorkloadAdapter::HaProxy => {
+                if !matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("HAProxy workload connections require a Unix endpoint");
+                }
+                if self.username.is_some()
+                    || self.secret_ref.is_some()
+                    || self.database.is_some()
+                    || self.auth_source.is_some()
+                {
+                    anyhow::bail!(
+                        "HAProxy workload connections do not support configuration fields"
+                    );
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -619,6 +633,20 @@ pub struct NginxMetrics {
     pub waiting: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaProxyMetrics {
+    pub current_sessions: u64,
+    pub sessions_total: u64,
+    pub bytes_in_total: u64,
+    pub bytes_out_total: u64,
+    pub denied_requests_total: u64,
+    pub denied_responses_total: u64,
+    pub failed_connections_total: u64,
+    pub retry_warnings_total: u64,
+    pub servers_down: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -637,6 +665,7 @@ pub enum WorkloadMetrics {
     OpenSearch(OpenSearchMetrics),
     RabbitMq(RabbitMqMetrics),
     Nginx(NginxMetrics),
+    HaProxy(HaProxyMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -718,6 +747,7 @@ search_report!(ElasticsearchMonitorReport, ElasticsearchMetrics);
 search_report!(OpenSearchMonitorReport, OpenSearchMetrics);
 search_report!(RabbitMqMonitorReport, RabbitMqMetrics);
 search_report!(NginxMonitorReport, NginxMetrics);
+search_report!(HaProxyMonitorReport, HaProxyMetrics);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -734,6 +764,7 @@ pub enum WorkloadMonitorReport {
     OpenSearch(OpenSearchMonitorReport),
     RabbitMq(RabbitMqMonitorReport),
     Nginx(NginxMonitorReport),
+    HaProxy(HaProxyMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -762,6 +793,8 @@ pub const SEARCH_RESPONSE_BYTES: usize = 64 * 1024;
 pub const RABBITMQ_LOOPBACK_ENDPOINT: &str = "127.0.0.1:15672";
 pub const RABBITMQ_RESPONSE_BYTES: usize = 64 * 1024;
 pub const NGINX_RESPONSE_BYTES: usize = 16 * 1024;
+pub const HAPROXY_RESPONSE_BYTES: usize = 256 * 1024;
+pub const HAPROXY_STATS_COMMAND: &[u8] = b"show stat\n";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -772,6 +805,7 @@ pub const ETCD_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SEARCH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const RABBITMQ_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const NGINX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const HAPROXY_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -873,6 +907,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::OpenSearch, WorkloadMetrics::OpenSearch(_))
                     | (WorkloadAdapter::RabbitMq, WorkloadMetrics::RabbitMq(_))
                     | (WorkloadAdapter::Nginx, WorkloadMetrics::Nginx(_))
+                    | (WorkloadAdapter::HaProxy, WorkloadMetrics::HaProxy(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -2589,6 +2624,177 @@ fn parse_nginx_stub_status(body: &str) -> std::result::Result<NginxMetrics, Work
     })
 }
 
+pub fn monitor_haproxy_with_connection(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<(String, HaProxyMetrics), WorkloadProbeError> {
+    connection
+        .validate_for(WorkloadAdapter::HaProxy)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("HAProxy connection configuration is invalid".into())
+        })?;
+    #[cfg(unix)]
+    {
+        let WorkloadEndpoint::Unix(path) = connection
+            .endpoint()
+            .map_err(|_| WorkloadProbeError::Malformed("HAProxy endpoint is invalid".into()))?
+        else {
+            unreachable!()
+        };
+        let metrics = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(path).map_err(unreachable)?;
+            stream
+                .set_read_timeout(Some(HAPROXY_PROBE_TIMEOUT))
+                .map_err(unreachable)?;
+            stream
+                .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+                .map_err(unreachable)?;
+            monitor_haproxy_stream(&mut stream)
+        })
+        .join()
+        .map_err(|_| WorkloadProbeError::Unreachable("HAProxy probe runtime failed".into()))??;
+        Ok(("local-unix-socket".into(), metrics))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = connection;
+        Err(WorkloadProbeError::Unreachable(
+            "Unix sockets are unavailable".into(),
+        ))
+    }
+}
+
+fn monitor_haproxy_stream(
+    stream: &mut (impl Read + Write),
+) -> std::result::Result<HaProxyMetrics, WorkloadProbeError> {
+    stream
+        .write_all(HAPROXY_STATS_COMMAND)
+        .map_err(unreachable)?;
+    stream.flush().map_err(unreachable)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(size) => {
+                if bytes.len().saturating_add(size) > HAPROXY_RESPONSE_BYTES {
+                    return Err(WorkloadProbeError::Malformed(
+                        "HAProxy response exceeds the size limit".into(),
+                    ));
+                }
+                bytes.extend_from_slice(&chunk[..size]);
+                if bytes.ends_with(b"\n\n") || bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(error) => return Err(unreachable(error)),
+        }
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| WorkloadProbeError::Malformed("HAProxy response is not UTF-8".into()))?;
+    parse_haproxy_stats(text)
+}
+
+fn parse_haproxy_stats(text: &str) -> std::result::Result<HaProxyMetrics, WorkloadProbeError> {
+    let text = text.trim_end_matches(['\r', '\n']);
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .trim(csv::Trim::All)
+        .from_reader(text.as_bytes());
+    let headers = reader
+        .headers()
+        .map_err(|_| WorkloadProbeError::Malformed("HAProxy CSV header is invalid".into()))?
+        .clone();
+    const REQUIRED: [&str; 11] = [
+        "pxname", "svname", "scur", "stot", "bin", "bout", "dreq", "dresp", "econ", "wretr",
+        "status",
+    ];
+    let mut indices = BTreeMap::new();
+    for name in REQUIRED {
+        let matches = headers
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| {
+                if *index == 0 {
+                    value.trim_start_matches('#').trim() == name
+                } else {
+                    *value == name
+                }
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(WorkloadProbeError::Malformed(
+                "HAProxy CSV required header is missing or duplicate".into(),
+            ));
+        }
+        indices.insert(name, matches[0]);
+    }
+    let mut metrics = HaProxyMetrics {
+        current_sessions: 0,
+        sessions_total: 0,
+        bytes_in_total: 0,
+        bytes_out_total: 0,
+        denied_requests_total: 0,
+        denied_responses_total: 0,
+        failed_connections_total: 0,
+        retry_warnings_total: 0,
+        servers_down: 0,
+    };
+    let mut aggregates = 0_u64;
+    for record in reader.records() {
+        let record = record
+            .map_err(|_| WorkloadProbeError::Malformed("HAProxy CSV record is invalid".into()))?;
+        let get = |name| {
+            record.get(indices[name]).ok_or_else(|| {
+                WorkloadProbeError::Malformed("HAProxy CSV record is incomplete".into())
+            })
+        };
+        let svname = get("svname")?;
+        let status = get("status")?;
+        let number = |name| {
+            let value = get(name)?;
+            if value.is_empty() {
+                Ok(0)
+            } else {
+                value.parse::<u64>().map_err(|_| {
+                    WorkloadProbeError::Malformed(format!("HAProxy metric is not a u64: {name}"))
+                })
+            }
+        };
+        let add = |target: &mut u64, value: u64| {
+            *target = target.checked_add(value).ok_or_else(|| {
+                WorkloadProbeError::Malformed("HAProxy metric sum overflowed".into())
+            })?;
+            Ok::<(), WorkloadProbeError>(())
+        };
+        match svname {
+            "FRONTEND" => {
+                aggregates += 1;
+                add(&mut metrics.current_sessions, number("scur")?)?;
+                add(&mut metrics.sessions_total, number("stot")?)?;
+                add(&mut metrics.bytes_in_total, number("bin")?)?;
+                add(&mut metrics.bytes_out_total, number("bout")?)?;
+                add(&mut metrics.denied_requests_total, number("dreq")?)?;
+            }
+            "BACKEND" => {
+                aggregates += 1;
+                add(&mut metrics.denied_responses_total, number("dresp")?)?;
+                add(&mut metrics.failed_connections_total, number("econ")?)?;
+                add(&mut metrics.retry_warnings_total, number("wretr")?)?;
+            }
+            _ if matches!(status, "DOWN" | "MAINT") => add(&mut metrics.servers_down, 1)?,
+            _ => {}
+        }
+    }
+    if aggregates == 0 {
+        return Err(WorkloadProbeError::Malformed(
+            "HAProxy CSV has no aggregate rows".into(),
+        ));
+    }
+    Ok(metrics)
+}
+
 fn postgresql_metrics_from_rows(
     rows: &[Row],
 ) -> std::result::Result<PostgreSqlMetrics, WorkloadProbeError> {
@@ -4232,6 +4438,96 @@ path = "/usr/bin/redis-server"
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("redis".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    fn haproxy_csv() -> &'static str {
+        "# pxname,svname,scur,stot,bin,bout,dreq,dresp,econ,wretr,status\n\"front,end\",FRONTEND,2,3,4,5,6,,,,OPEN\nbackend,BACKEND,,,,,,7,8,9,UP\nbackend,server1,,,,,,,,,DOWN\nbackend,server2,,,,,,,,,MAINT\n\n"
+    }
+
+    #[test]
+    fn haproxy_requires_an_explicit_unix_endpoint_without_other_fields() {
+        let valid = WorkloadConnectionConfig {
+            endpoint: "unix:///run/haproxy/admin.sock".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        valid.validate_for(WorkloadAdapter::HaProxy).unwrap();
+        for invalid in [
+            WorkloadConnectionConfig {
+                endpoint: "tcp://127.0.0.1:8404".into(),
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                username: Some("monitor".into()),
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                secret_ref: Some("env:HAPROXY_PASSWORD".into()),
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("stats".into()),
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..valid
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::HaProxy).is_err());
+        }
+    }
+
+    #[test]
+    fn haproxy_csv_parser_handles_quotes_aggregates_and_down_servers() {
+        let metrics = parse_haproxy_stats(haproxy_csv()).unwrap();
+        assert_eq!(metrics.current_sessions, 2);
+        assert_eq!(metrics.sessions_total, 3);
+        assert_eq!(metrics.denied_responses_total, 7);
+        assert_eq!(metrics.retry_warnings_total, 9);
+        assert_eq!(metrics.servers_down, 2);
+        let reordered = "status,wretr,econ,dresp,dreq,bout,bin,stot,scur,svname,pxname\r\nOPEN,,,,6,5,4,3,2,FRONTEND,front\r\nUP,9,8,7,,,,,,BACKEND,back\r\n";
+        assert_eq!(
+            parse_haproxy_stats(reordered)
+                .unwrap()
+                .failed_connections_total,
+            8
+        );
+        for invalid in [
+            "# pxname,svname,scur,stot,bin,bout,dreq,dresp,econ,wretr,status\n",
+            "# pxname,svname,scur,stot,bin,bout,dreq,dresp,econ,wretr,status\na,FRONTEND,no,1,1,1,1,,,,OPEN\n",
+            "# pxname,svname,scur,stot,bin,bout,dreq,dresp,econ,wretr\na,FRONTEND,1,1,1,1,1,,,\n",
+        ] { assert!(parse_haproxy_stats(invalid).is_err()); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn haproxy_stream_sends_fixed_command() {
+        let mut stream = TestStream::response(haproxy_csv());
+        assert_eq!(monitor_haproxy_stream(&mut stream).unwrap().servers_down, 2);
+        assert_eq!(stream.output, HAPROXY_STATS_COMMAND);
+    }
+
+    #[test]
+    fn haproxy_metric_variant_round_trips_without_socket_path() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "haproxy".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::HaProxy,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "local-unix-socket".into(),
+                metrics: WorkloadMetrics::HaProxy(parse_haproxy_stats(haproxy_csv()).unwrap()),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert!(!json.contains("/run/haproxy"));
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
     }
 
     #[test]

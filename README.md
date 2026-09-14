@@ -482,6 +482,14 @@ Optional Basic authentication requires both credential fields. TLS uses native h
 Nginx returns `active_connections`, `accepts_total`, `handled_total`, `requests_total`, `reading`, `writing`, and `waiting`.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 16 KiB limit.
 The client does not follow redirects. AIC does not change or reload Nginx configuration. Custom status paths are unsupported.
+The HAProxy adapter requires an explicit Unix stats socket with user-level read and write access.
+It sends only `show stat` and stores `local-unix-socket` as the history endpoint label.
+It aggregates frontend counters and counts server rows with a down status.
+HAProxy returns `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
+`denied_requests_total`, `denied_responses_total`, `failed_connections_total`,
+`retry_warnings_total`, and `servers_down`.
+Socket operations use 200 ms, each probe has a three-second limit, and responses have a 256 KiB limit.
+The adapter does not support TCP, HTTP stats pages, authentication, custom commands, configuration changes, permission changes, or reloads.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses

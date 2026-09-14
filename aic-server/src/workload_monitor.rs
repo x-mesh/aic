@@ -93,6 +93,10 @@ pub fn load_nginx_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::Nginx)
 }
 
+pub fn load_haproxy_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::HaProxy)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -115,6 +119,7 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
             | WorkloadAdapter::MySql
             | WorkloadAdapter::MongoDb
             | WorkloadAdapter::Nginx
+            | WorkloadAdapter::HaProxy
     ) && store
         .workloads
         .iter()
@@ -125,6 +130,7 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
             WorkloadAdapter::MySql => "MySQL",
             WorkloadAdapter::MongoDb => "MongoDB",
             WorkloadAdapter::Nginx => "Nginx",
+            WorkloadAdapter::HaProxy => "HAProxy",
             _ => unreachable!("only database monitor adapters require connections"),
         };
         return DefinitionsState::Malformed(format!(
@@ -213,6 +219,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::OpenSearch => "OpenSearch endpoint is unavailable",
         WorkloadAdapter::RabbitMq => "RabbitMQ management endpoint is unavailable",
         WorkloadAdapter::Nginx => "Nginx status endpoint is unavailable",
+        WorkloadAdapter::HaProxy => "HAProxy socket is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -231,6 +238,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::OpenSearch => "OpenSearch rejected the cluster stats request",
         WorkloadAdapter::RabbitMq => "RabbitMQ rejected the overview request",
         WorkloadAdapter::Nginx => "Nginx rejected the stub status request",
+        WorkloadAdapter::HaProxy => "HAProxy rejected the stats request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -249,6 +257,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::OpenSearch => "OpenSearch returned invalid cluster stats",
         WorkloadAdapter::RabbitMq => "RabbitMQ returned an invalid overview response",
         WorkloadAdapter::Nginx => "Nginx returned an invalid stub status response",
+        WorkloadAdapter::HaProxy => "HAProxy returned an invalid stats response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -353,6 +362,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::OpenSearch,
                     WorkloadAdapter::RabbitMq,
                     WorkloadAdapter::Nginx,
+                    WorkloadAdapter::HaProxy,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -598,6 +608,28 @@ fn start_collection_thread(
                         Utc::now(),
                     ),
                 },
+                WorkloadAdapter::HaProxy => match definition.connection.as_ref() {
+                    Some(connection) => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            aic_common::workload::monitor_haproxy_with_connection(connection).map(
+                                |(endpoint, metrics)| (endpoint, WorkloadMetrics::HaProxy(metrics)),
+                            )
+                        },
+                        Utc::now(),
+                    ),
+                    None => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            Err(WorkloadProbeError::Malformed(
+                                "HAProxy connection is missing".into(),
+                            ))
+                        },
+                        Utc::now(),
+                    ),
+                },
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -625,9 +657,10 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics,
-        NginxMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics,
-        RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
+        ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, HaProxyMetrics, MongoDbMetrics,
+        MySqlMetrics, NginxMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics,
+        RabbitMqMetrics, RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode,
+        WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -931,6 +964,38 @@ mod tests {
             reading: 1,
             writing: 1,
             waiting: 1,
+        }
+    }
+
+    fn haproxy_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "haproxy".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/sbin/haproxy".into(),
+            },
+            adapter: WorkloadAdapter::HaProxy,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: Some(WorkloadConnectionConfig {
+                endpoint: "unix:///run/haproxy/stats.sock".into(),
+                username: None,
+                secret_ref: None,
+                database: None,
+                auth_source: None,
+            }),
+        }
+    }
+
+    fn haproxy_metrics() -> HaProxyMetrics {
+        HaProxyMetrics {
+            current_sessions: 1,
+            sessions_total: 2,
+            bytes_in_total: 3,
+            bytes_out_total: 4,
+            denied_requests_total: 5,
+            denied_responses_total: 6,
+            failed_connections_total: 7,
+            retry_warnings_total: 8,
+            servers_down: 1,
         }
     }
 
@@ -1249,6 +1314,44 @@ mod tests {
         assert_eq!(
             load_redis_definition(&path),
             DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn haproxy_requires_connection_and_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        let mut missing = haproxy_definition();
+        missing.connection = None;
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![missing, definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_haproxy_definition(&path),
+            DefinitionsState::Malformed(
+                "HAProxy workload definitions require an explicit connection".into()
+            )
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![haproxy_definition(), haproxy_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_haproxy_definition(&path),
+            DefinitionsState::Ambiguous(2)
         );
     }
 
@@ -1916,6 +2019,56 @@ mod tests {
         };
         assert_eq!(detail, "Nginx rejected the stub status request");
         assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn haproxy_collection_hides_path_and_uses_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &haproxy_definition(),
+            || {
+                Ok((
+                    "local-unix-socket".into(),
+                    WorkloadMetrics::HaProxy(haproxy_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(sample) = collected else {
+            panic!("expected HAProxy sample")
+        };
+        let WorkloadSampleOutcome::Collected { endpoint, .. } = sample.outcome else {
+            panic!("expected collected")
+        };
+        assert_eq!(endpoint, "local-unix-socket");
+        assert!(!endpoint.contains("/run/"));
+        let failed = collect_once(
+            &cfg,
+            &haproxy_definition(),
+            || {
+                Err(WorkloadProbeError::Malformed(
+                    "/run/haproxy/stats.sock secret".into(),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed")
+        };
+        assert_eq!(detail, "HAProxy returned an invalid stats response");
+        assert!(!detail.contains("/run/"));
     }
 
     #[test]

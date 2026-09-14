@@ -449,6 +449,12 @@ TLS는 native host root를 사용합니다. `active_connections`, `accepts_total
 `reading`, `writing`, `waiting`을 반환합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은
 16KiB입니다. redirect는 따르지 않습니다. AIC는 Nginx 설정을 변경하거나 reload하지 않습니다. custom status
 path는 지원하지 않습니다.
+HAProxy adapter는 사용자 수준의 읽기·쓰기 권한이 있는 explicit Unix stats socket이 필요합니다. `show stat`만
+전송하고 history endpoint에는 socket path 대신 `local-unix-socket`을 저장합니다. frontend counter를 합산하고
+down 상태인 server row를 셉니다. `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
+`denied_requests_total`, `denied_responses_total`, `failed_connections_total`, `retry_warnings_total`,
+`servers_down`을 반환합니다. socket 작업 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은 256KiB입니다.
+TCP, HTTP stats page, 인증, custom command, 설정 변경, 권한 변경, reload는 지원하지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
