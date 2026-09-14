@@ -395,7 +395,7 @@ Redis는
 `cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. PostgreSQL은 `numbackends`, `xact_commit`,
 `xact_rollback`, `blks_read`, `blks_hit`, `tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`,
 `tup_deleted`, `conflicts`, `temp_files`, `temp_bytes`, `deadlocks`를 반환합니다. `pg_stat_database`에서 현재
-database의 scalar row 하나만 읽습니다. read-only transaction mode, statement timeout, lock timeout을 적용합니다.
+database의 scalar row 하나만 읽습니다. PostgreSQL connection에 read-only transaction mode, statement timeout, lock timeout을 적용합니다.
 MySQL은 `threads_connected`, `threads_running`, `connections`, `aborted_connects`, `questions`, `slow_queries`,
 `bytes_received`, `bytes_sent`를 반환합니다. 고정 `SHOW GLOBAL STATUS` query로 이 지표 8개만 요청합니다.
 MongoDB는 `connections_current`, `connections_available`, `connections_total_created`, `opcounters_query`,
