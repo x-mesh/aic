@@ -2725,15 +2725,11 @@ fn connect_unix_with_timeout(
     for (target, source) in address.sun_path.iter_mut().zip(bytes) {
         *target = *source as libc::c_char;
     }
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    let fd = create_cloexec_unix_socket()?;
     if fd < 0 {
         return Err(unreachable(std::io::Error::last_os_error()));
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(unreachable(std::io::Error::last_os_error()));
-    }
     let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
     #[cfg(any(
         target_os = "macos",
@@ -2794,6 +2790,46 @@ fn connect_unix_with_timeout(
     }
     stream.set_nonblocking(false).map_err(unreachable)?;
     Ok(stream)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn create_cloexec_unix_socket() -> std::result::Result<i32, WorkloadProbeError> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        Err(unreachable(std::io::Error::last_os_error()))
+    } else {
+        Ok(fd)
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+fn create_cloexec_unix_socket() -> std::result::Result<i32, WorkloadProbeError> {
+    Err(WorkloadProbeError::Unreachable(
+        "atomic close-on-exec Unix sockets are unavailable on this platform".into(),
+    ))
 }
 
 fn monitor_haproxy_stream(
