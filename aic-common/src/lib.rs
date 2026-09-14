@@ -41,10 +41,10 @@ pub use session::{
 };
 pub use shell_hooks::generate_shell_hooks;
 pub use workload::{
-    DiscoveryReport, MySqlMetrics, MySqlMonitorReport, PostgreSqlMetrics, PostgreSqlMonitorReport,
-    ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter, WorkloadCandidate,
-    WorkloadConnectionConfig, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal,
-    WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
+    DiscoveryReport, MongoDbMetrics, MongoDbMonitorReport, MySqlMetrics, MySqlMonitorReport,
+    PostgreSqlMetrics, PostgreSqlMonitorReport, ProposalEffects, ProposalKind, RuntimeBinding,
+    WorkloadAdapter, WorkloadCandidate, WorkloadConnectionConfig, WorkloadDefinition,
+    WorkloadDriverMode, WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
 };
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.

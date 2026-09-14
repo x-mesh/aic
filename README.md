@@ -410,6 +410,9 @@ The secret is optional because PostgreSQL can use trust authentication.
 MySQL requires an explicit TCP or TLS endpoint and `--username`.
 MySQL accepts an optional `--database`.
 Use `--auth-env NAME` or `--auth-keychain ACCOUNT` for MySQL password authentication.
+MongoDB requires an explicit TCP or TLS endpoint. URI, SRV, and Unix endpoints are unsupported.
+For MongoDB authentication, set `--username` with one secret option.
+Use `--auth-source NAME` to override the default `admin` authentication database.
 The probe resolves the secret only when it connects.
 Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
 `instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
@@ -419,6 +422,9 @@ PostgreSQL returns `numbackends`, `xact_commit`, `xact_rollback`, `blks_read`, `
 `temp_files`, `temp_bytes`, and `deadlocks`.
 MySQL returns `threads_connected`, `threads_running`, `connections`, `aborted_connects`,
 `questions`, `slow_queries`, `bytes_received`, and `bytes_sent`.
+MongoDB returns `connections_current`, `connections_available`, `connections_total_created`,
+`opcounters_query`, `opcounters_get_more`, `opcounters_command`, `network_bytes_in`,
+`network_bytes_out`, `network_num_requests`, and `uptime_seconds`.
 PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
 MySQL runs one fixed `SHOW GLOBAL STATUS` query for the eight listed metrics.
 The PostgreSQL connection sets read-only transaction mode and bounded statement and lock timeouts.
@@ -426,15 +432,18 @@ The monitor opens one connection for each probe. It does not use a connection po
 The PostgreSQL library does not expose a response byte limit. Its fixed query returns one scalar row.
 The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
 MySQL TLS uses native host roots only and verifies the endpoint host.
+MongoDB runs one fixed `serverStatus` command with a three-second total timeout.
+The MongoDB client limits its internal pool to one connection. MongoDB TLS uses OpenSSL system roots.
+The MongoDB probe applies its 64 KiB limit after BSON decode. The driver can receive a larger response first.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis, Memcached, PostgreSQL, and MySQL definition every 60 seconds.
+`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, and MongoDB definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
-MySQL and PostgreSQL require saved connections. Multiple definitions make only that adapter ambiguous.
+MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

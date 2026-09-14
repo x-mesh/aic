@@ -3,6 +3,9 @@
 use crate::paths;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use mongodb::bson::{doc, Bson, Document};
+use mongodb::options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions};
+use mongodb::Client as MongoDbClient;
 use mysql_async::prelude::Queryable;
 use mysql_async::{Conn as MySqlConnection, OptsBuilder as MySqlOptsBuilder, SslOpts};
 use rustls::pki_types::ServerName;
@@ -129,6 +132,8 @@ pub struct WorkloadConnectionConfig {
     pub secret_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +151,9 @@ impl WorkloadConnectionConfig {
         }
         if self.database.as_deref().is_some_and(str::is_empty) {
             anyhow::bail!("workload database must not be empty");
+        }
+        if self.auth_source.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("workload auth_source must not be empty");
         }
         if let Some(secret_ref) = &self.secret_ref {
             crate::secret::parse_secret_reference(secret_ref).map_err(anyhow::Error::msg)?;
@@ -173,6 +181,20 @@ impl WorkloadConnectionConfig {
                 }
                 if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("MySQL workload connections require a TCP or TLS endpoint");
+                }
+            }
+            WorkloadAdapter::MongoDb => {
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("MongoDB workload connections require a TCP or TLS endpoint");
+                }
+                if self.database.is_some() {
+                    anyhow::bail!("MongoDB workload connections do not support database");
+                }
+                if self.username.is_some() != self.secret_ref.is_some() {
+                    anyhow::bail!("MongoDB username and secret_ref must be provided together");
+                }
+                if self.auth_source.is_some() && self.username.is_none() {
+                    anyhow::bail!("MongoDB auth_source requires credentials");
                 }
             }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
@@ -238,6 +260,8 @@ impl<'de> Deserialize<'de> for WorkloadConnectionConfig {
             secret_ref: Option<String>,
             #[serde(default)]
             database: Option<String>,
+            #[serde(default)]
+            auth_source: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let config = Self {
@@ -245,6 +269,7 @@ impl<'de> Deserialize<'de> for WorkloadConnectionConfig {
             username: wire.username,
             secret_ref: wire.secret_ref,
             database: wire.database,
+            auth_source: wire.auth_source,
         };
         config.endpoint().map_err(serde::de::Error::custom)?;
         if config.username.as_deref().is_some_and(str::is_empty) {
@@ -255,6 +280,11 @@ impl<'de> Deserialize<'de> for WorkloadConnectionConfig {
         if config.database.as_deref().is_some_and(str::is_empty) {
             return Err(serde::de::Error::custom(
                 "workload database must not be empty",
+            ));
+        }
+        if config.auth_source.as_deref().is_some_and(str::is_empty) {
+            return Err(serde::de::Error::custom(
+                "workload auth_source must not be empty",
             ));
         }
         if let Some(secret_ref) = &config.secret_ref {
@@ -412,6 +442,22 @@ pub struct MySqlMetrics {
     pub bytes_sent: u64,
 }
 
+/// Numeric metrics returned by one bounded MongoDB `serverStatus` probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MongoDbMetrics {
+    pub connections_current: u64,
+    pub connections_available: u64,
+    pub connections_total_created: u64,
+    pub opcounters_query: u64,
+    pub opcounters_get_more: u64,
+    pub opcounters_command: u64,
+    pub network_bytes_in: u64,
+    pub network_bytes_out: u64,
+    pub network_num_requests: u64,
+    pub uptime_seconds: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -422,6 +468,7 @@ pub enum WorkloadMetrics {
     Memcached(MemcachedMetrics),
     PostgreSql(PostgreSqlMetrics),
     MySql(MySqlMetrics),
+    MongoDb(MongoDbMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -457,12 +504,21 @@ pub struct MySqlMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MongoDbMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: MongoDbMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
     Memcached(MemcachedMonitorReport),
     PostgreSql(PostgreSqlMonitorReport),
     MySql(MySqlMonitorReport),
+    MongoDb(MongoDbMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -478,9 +534,11 @@ pub const MEMCACHED_STATS_REQUEST: &[u8] = b"stats\r\n";
 pub const MEMCACHED_LOOPBACK_ENDPOINT: &str = "127.0.0.1:11211";
 pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_commit::bigint, xact_rollback::bigint, blks_read::bigint, blks_hit::bigint, tup_returned::bigint, tup_fetched::bigint, tup_inserted::bigint, tup_updated::bigint, tup_deleted::bigint, conflicts::bigint, temp_files::bigint, temp_bytes::bigint, deadlocks::bigint FROM pg_stat_database WHERE datname = current_database()";
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
+pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MONGODB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -556,6 +614,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::Memcached, WorkloadMetrics::Memcached(_))
                     | (WorkloadAdapter::PostgreSql, WorkloadMetrics::PostgreSql(_))
                     | (WorkloadAdapter::MySql, WorkloadMetrics::MySql(_))
+                    | (WorkloadAdapter::MongoDb, WorkloadMetrics::MongoDb(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -1077,6 +1136,173 @@ fn mysql_metrics_from_rows(
         slow_queries: metric("Slow_queries")?,
         bytes_received: metric("Bytes_received")?,
         bytes_sent: metric("Bytes_sent")?,
+    })
+}
+
+/// Collect fixed read-only server metrics from an explicit MongoDB connection.
+pub fn monitor_mongodb_with_connection(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<(String, MongoDbMetrics), WorkloadProbeError> {
+    connection
+        .validate_for(WorkloadAdapter::MongoDb)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("MongoDB connection configuration is invalid".into())
+        })?;
+    let endpoint = connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("MongoDB endpoint is invalid".into()))?;
+    let secret = resolve_connection_secret(connection).map_err(|_| {
+        WorkloadProbeError::Rejected("MongoDB authentication secret is unavailable".into())
+    })?;
+    let (host, port, use_tls) = match endpoint {
+        WorkloadEndpoint::Tcp { host, port } => (host, port, false),
+        WorkloadEndpoint::Tls { host, port } => (host, port, true),
+        WorkloadEndpoint::Unix(_) => {
+            return Err(WorkloadProbeError::Malformed(
+                "MongoDB endpoint must use TCP or TLS".into(),
+            ));
+        }
+    };
+    let username = connection.username.clone();
+    let auth_source = connection
+        .auth_source
+        .clone()
+        .unwrap_or_else(|| "admin".into());
+    let endpoint_text = connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("MongoDB probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                MONGODB_PROBE_TIMEOUT,
+                monitor_mongodb_async(
+                    &host,
+                    port,
+                    use_tls,
+                    username.as_deref(),
+                    secret.as_deref(),
+                    &auth_source,
+                ),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("MongoDB probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("MongoDB probe runtime failed".into()))??;
+    Ok((endpoint_text, metrics))
+}
+
+async fn monitor_mongodb_async(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: Option<&str>,
+    password: Option<&str>,
+    auth_source: &str,
+) -> std::result::Result<MongoDbMetrics, WorkloadProbeError> {
+    let credential = username.map(|username| {
+        Credential::builder()
+            .username(Some(username.to_owned()))
+            .password(password.map(str::to_owned))
+            .source(Some(auth_source.to_owned()))
+            .build()
+    });
+    let tls = if use_tls {
+        Some(Tls::Enabled(
+            TlsOptions::builder()
+                .allow_invalid_certificates(Some(false))
+                .allow_invalid_hostnames(Some(false))
+                .build(),
+        ))
+    } else {
+        Some(Tls::Disabled)
+    };
+    let options = ClientOptions::builder()
+        .hosts(vec![ServerAddress::Tcp {
+            host: host.to_owned(),
+            port: Some(port),
+        }])
+        .app_name(Some("aic-workload-monitor".into()))
+        .credential(credential)
+        .direct_connection(Some(true))
+        .connect_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .server_selection_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .min_pool_size(Some(0))
+        .max_pool_size(Some(1))
+        .max_connecting(Some(1))
+        .retry_reads(Some(false))
+        .retry_writes(Some(false))
+        .tls(tls)
+        .build();
+    let client = MongoDbClient::with_options(options).map_err(map_mongodb_connect_error)?;
+    let response = client
+        .database("admin")
+        .run_command(doc! {
+            "serverStatus": 1,
+            "repl": 0,
+            "metrics": 0,
+            "locks": 0,
+            "wiredTiger": 0,
+            "tcmalloc": 0,
+        })
+        .await
+        .map_err(|_| WorkloadProbeError::Rejected("MongoDB rejected metrics query".into()))?;
+    let metrics = mongodb_metrics_from_document(&response);
+    client.shutdown().immediate(true).await;
+    metrics
+}
+
+fn map_mongodb_connect_error(_: mongodb::error::Error) -> WorkloadProbeError {
+    WorkloadProbeError::Unreachable("MongoDB endpoint is unavailable".into())
+}
+
+fn mongodb_metrics_from_document(
+    response: &Document,
+) -> std::result::Result<MongoDbMetrics, WorkloadProbeError> {
+    let encoded = mongodb::bson::to_vec(response).map_err(|_| {
+        WorkloadProbeError::Malformed("MongoDB response could not be encoded".into())
+    })?;
+    if encoded.len() > MONGODB_RESPONSE_BYTES {
+        return Err(WorkloadProbeError::Malformed(
+            "MongoDB response exceeds the size limit".into(),
+        ));
+    }
+    let section = |name| {
+        response.get_document(name).map_err(|_| {
+            WorkloadProbeError::Malformed(format!("MongoDB response is missing {name}"))
+        })
+    };
+    let metric = |document: &Document, key: &str| {
+        let value = match document.get(key) {
+            Some(Bson::Int32(value)) if *value >= 0 => *value as u64,
+            Some(Bson::Int64(value)) if *value >= 0 => *value as u64,
+            _ => {
+                return Err(WorkloadProbeError::Malformed(format!(
+                    "MongoDB metric is missing, negative, or not an integer: {key}"
+                )))
+            }
+        };
+        Ok(value)
+    };
+    let connections = section("connections")?;
+    let opcounters = section("opcounters")?;
+    let network = section("network")?;
+    Ok(MongoDbMetrics {
+        connections_current: metric(connections, "current")?,
+        connections_available: metric(connections, "available")?,
+        connections_total_created: metric(connections, "totalCreated")?,
+        opcounters_query: metric(opcounters, "query")?,
+        opcounters_get_more: metric(opcounters, "getmore")?,
+        opcounters_command: metric(opcounters, "command")?,
+        network_bytes_in: metric(network, "bytesIn")?,
+        network_bytes_out: metric(network, "bytesOut")?,
+        network_num_requests: metric(network, "numRequests")?,
+        uptime_seconds: metric(response, "uptime")?,
     })
 }
 
@@ -1715,6 +1941,7 @@ path = "/usr/bin/redis-server"
             username: Some("monitor".into()),
             secret_ref: None,
             database: Some("app".into()),
+            auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::PostgreSql).unwrap();
 
@@ -1739,6 +1966,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tcp://127.0.0.1:6379".into(),
             username: None,
             secret_ref: None,
+            auth_source: None,
         }
         .validate_for(WorkloadAdapter::Redis)
         .is_err());
@@ -1816,6 +2044,7 @@ path = "/usr/bin/redis-server"
             username: Some("monitor".into()),
             secret_ref: None,
             database: Some("metrics".into()),
+            auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::MySql).unwrap();
         assert!(WorkloadConnectionConfig {
@@ -1912,6 +2141,130 @@ path = "/usr/bin/redis-server"
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 
+    fn mongodb_response() -> Document {
+        doc! {
+            "connections": { "current": 1_i32, "available": 2_i64, "totalCreated": 3_i64 },
+            "opcounters": { "query": 4_i32, "getmore": 5_i64, "command": 6_i64 },
+            "network": { "bytesIn": 7_i64, "bytesOut": 8_i64, "numRequests": 9_i64 },
+            "uptime": 10_i64,
+        }
+    }
+
+    #[test]
+    fn mongodb_connection_requires_safe_auth_pair_and_rejects_database() {
+        let anonymous = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:27017".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        anonymous.validate_for(WorkloadAdapter::MongoDb).unwrap();
+        let authenticated = WorkloadConnectionConfig {
+            endpoint: "tls://mongo.example:27017".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:MONGODB_PASSWORD".into()),
+            database: None,
+            auth_source: Some("admin".into()),
+        };
+        authenticated
+            .validate_for(WorkloadAdapter::MongoDb)
+            .unwrap();
+        for invalid in [
+            WorkloadConnectionConfig {
+                secret_ref: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                username: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("admin".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/mongodb/mongodb.sock".into(),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..anonymous
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::MongoDb).is_err());
+        }
+    }
+
+    #[test]
+    fn mongodb_metrics_require_nested_nonnegative_integers() {
+        let metrics = mongodb_metrics_from_document(&mongodb_response()).unwrap();
+        assert_eq!(metrics.connections_total_created, 3);
+        assert_eq!(metrics.uptime_seconds, 10);
+
+        for invalid in [
+            {
+                let mut response = mongodb_response();
+                response
+                    .get_document_mut("network")
+                    .unwrap()
+                    .remove("bytesIn");
+                response
+            },
+            {
+                let mut response = mongodb_response();
+                response
+                    .get_document_mut("opcounters")
+                    .unwrap()
+                    .insert("query", Bson::Double(1.0));
+                response
+            },
+            {
+                let mut response = mongodb_response();
+                response.insert("uptime", -1_i64);
+                response
+            },
+        ] {
+            assert!(matches!(
+                mongodb_metrics_from_document(&invalid),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn mongodb_metrics_reject_oversized_response() {
+        let mut response = mongodb_response();
+        response.insert("padding", "x".repeat(MONGODB_RESPONSE_BYTES));
+        assert!(matches!(
+            mongodb_metrics_from_document(&response),
+            Err(WorkloadProbeError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn mongodb_metric_variant_matches_only_mongodb_samples() {
+        let metrics = mongodb_metrics_from_document(&mongodb_response()).unwrap();
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "mongodb".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::MongoDb,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:27017".into(),
+                metrics: WorkloadMetrics::MongoDb(metrics),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("my_sql".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
     #[test]
     fn workload_connection_accepts_only_safe_endpoint_and_secret_reference_shapes() {
         let valid = WorkloadConnectionConfig {
@@ -1919,6 +2272,7 @@ path = "/usr/bin/redis-server"
             username: Some("monitor".into()),
             secret_ref: Some("env:REDIS_PASSWORD".into()),
             database: None,
+            auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::Redis).unwrap();
         assert!(matches!(
@@ -1936,6 +2290,7 @@ path = "/usr/bin/redis-server"
                 username: None,
                 secret_ref: None,
                 database: None,
+                auth_source: None,
             }
             .endpoint()
             .is_err());
@@ -1945,6 +2300,7 @@ path = "/usr/bin/redis-server"
             username: None,
             secret_ref: Some("plaintext".into()),
             database: None,
+            auth_source: None,
         }
         .validate_for(WorkloadAdapter::Redis)
         .is_err());
@@ -1954,6 +2310,7 @@ path = "/usr/bin/redis-server"
                 username: None,
                 secret_ref: None,
                 database: None,
+                auth_source: None,
             }
             .endpoint()
             .unwrap(),
@@ -1971,6 +2328,7 @@ path = "/usr/bin/redis-server"
             username: None,
             secret_ref: Some("env:MEMCACHED_PASSWORD".into()),
             database: None,
+            auth_source: None,
         };
         assert!(config.validate_for(WorkloadAdapter::Memcached).is_err());
     }
@@ -2002,6 +2360,7 @@ path = "/usr/bin/redis-server"
             username: None,
             secret_ref: None,
             database: None,
+            auth_source: None,
         };
         let metrics = monitor_redis_with_connector(&connection, |endpoint| {
             assert_eq!(

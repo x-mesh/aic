@@ -1,9 +1,10 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_memcached_with_connection, monitor_mysql_with_connection,
-    monitor_postgresql_with_connection, monitor_redis_with_connection, workload_history_path,
-    workloads_file_path, MemcachedMonitorReport, MySqlMonitorReport, PostgreSqlMonitorReport,
+    load_workload_history, monitor_memcached_with_connection, monitor_mongodb_with_connection,
+    monitor_mysql_with_connection, monitor_postgresql_with_connection,
+    monitor_redis_with_connection, workload_history_path, workloads_file_path,
+    MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport, PostgreSqlMonitorReport,
     ProposalCost, ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
     WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
 };
@@ -349,6 +350,19 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                     .map_err(|error| safe_monitor_error(WorkloadAdapter::MySql, error))?,
             })
         }
+        WorkloadAdapter::MongoDb => {
+            let connection = connection.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("MongoDB monitor requires an explicit connection")
+            })?;
+            WorkloadMonitorReport::MongoDb(MongoDbMonitorReport {
+                candidate_id: candidate.id.clone(),
+                adapter: WorkloadAdapter::MongoDb,
+                monitor_ready: true,
+                metrics: monitor_mongodb_with_connection(connection)
+                    .map(|(_, metrics)| metrics)
+                    .map_err(|error| safe_monitor_error(WorkloadAdapter::MongoDb, error))?,
+            })
+        }
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -360,6 +374,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::Memcached => "Memcached",
         WorkloadAdapter::PostgreSql => "PostgreSQL",
         WorkloadAdapter::MySql => "MySQL",
+        WorkloadAdapter::MongoDb => "MongoDB",
         _ => "Workload",
     };
     let detail = match error {
@@ -385,6 +400,7 @@ fn select_monitor_candidate<'a>(
             | WorkloadAdapter::Memcached
             | WorkloadAdapter::PostgreSql
             | WorkloadAdapter::MySql
+            | WorkloadAdapter::MongoDb
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -853,6 +869,7 @@ pub fn derive_status(
                     | WorkloadAdapter::Memcached
                     | WorkloadAdapter::PostgreSql
                     | WorkloadAdapter::MySql
+                    | WorkloadAdapter::MongoDb
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
@@ -959,7 +976,7 @@ fn validate_enable_connection(
 ) -> Result<()> {
     if matches!(
         adapter,
-        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql
+        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql | WorkloadAdapter::MongoDb
     ) && connection.is_none()
     {
         bail!("database workload monitoring requires an explicit connection");
@@ -1494,6 +1511,7 @@ mod tests {
     fn postgresql_enable_requires_an_explicit_connection() {
         assert!(validate_enable_connection(WorkloadAdapter::PostgreSql, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::MySql, None).is_err());
+        assert!(validate_enable_connection(WorkloadAdapter::MongoDb, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::Redis, None).is_ok());
     }
 
