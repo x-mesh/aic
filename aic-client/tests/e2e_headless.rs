@@ -162,10 +162,10 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        ClickHouseMetrics, MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics,
-        PrometheusMetrics, WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode,
-        WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome, WorkloadSelector, WorkloadStore,
-        WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        ClickHouseMetrics, EtcdMetrics, MemcachedMetrics, MongoDbMetrics, MySqlMetrics,
+        PostgreSqlMetrics, PrometheusMetrics, WorkloadAdapter, WorkloadDefinition,
+        WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
+        WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -274,6 +274,21 @@ fn workload_status_and_history_read_local_history() {
             auth_source: None,
         }),
     };
+    let etcd_definition = WorkloadDefinition {
+        id: "etcd-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/etcd".into(),
+        },
+        adapter: WorkloadAdapter::Etcd,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:12379".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -285,6 +300,7 @@ fn workload_status_and_history_read_local_history() {
                 mongodb_definition,
                 prometheus_definition,
                 clickhouse_definition,
+                etcd_definition,
             ],
         })
         .unwrap(),
@@ -426,17 +442,39 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let etcd_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "etcd-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::Etcd,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:12379".into(),
+            metrics: WorkloadMetrics::Etcd(EtcdMetrics {
+                server_has_leader: 1,
+                server_is_leader: 0,
+                leader_changes_seen_total: 2,
+                proposals_applied_total: 3,
+                proposals_committed_total: 4,
+                proposals_failed_total: 5,
+                proposals_pending: 6,
+                mvcc_db_total_size_bytes: 7,
+                mvcc_db_total_size_in_use_bytes: 8,
+                process_resident_memory_bytes: 9,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
             serde_json::to_string(&mysql_sample).unwrap(),
             serde_json::to_string(&mongodb_sample).unwrap(),
             serde_json::to_string(&prometheus_sample).unwrap(),
-            serde_json::to_string(&clickhouse_sample).unwrap()
+            serde_json::to_string(&clickhouse_sample).unwrap(),
+            serde_json::to_string(&etcd_sample).unwrap()
         ),
     )
     .unwrap();
@@ -533,6 +571,18 @@ fn workload_status_and_history_read_local_history() {
         10
     );
 
+    let etcd_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "etcd-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(etcd_history.status.success());
+    let etcd_history: serde_json::Value = serde_json::from_slice(&etcd_history.stdout).unwrap();
+    assert_eq!(etcd_history["samples"][0]["adapter"], "etcd");
+    assert_eq!(
+        etcd_history["samples"][0]["metrics"]["process_resident_memory_bytes"],
+        9
+    );
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -566,6 +616,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let mongodb = candidate["adapter"] == "mongo_db";
     let prometheus = candidate["adapter"] == "prometheus";
     let clickhouse = candidate["adapter"] == "click_house";
+    let etcd = candidate["adapter"] == "etcd";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -592,6 +643,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "tcp://127.0.0.1:19090"
         } else if clickhouse {
             "tcp://127.0.0.1:18123"
+        } else if etcd {
+            "tcp://127.0.0.1:12379"
         } else {
             "tcp://127.0.0.1:16379"
         },
@@ -635,6 +688,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "endpoint = \"tcp://127.0.0.1:19090\""
     } else if clickhouse {
         "endpoint = \"tcp://127.0.0.1:18123\""
+    } else if etcd {
+        "endpoint = \"tcp://127.0.0.1:12379\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));

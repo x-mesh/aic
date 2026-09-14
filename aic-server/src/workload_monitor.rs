@@ -73,6 +73,10 @@ pub fn load_clickhouse_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::ClickHouse)
 }
 
+pub fn load_etcd_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::Etcd)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -184,6 +188,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MongoDb => "MongoDB endpoint is unavailable",
         WorkloadAdapter::Prometheus => "Prometheus endpoint is unavailable",
         WorkloadAdapter::ClickHouse => "ClickHouse endpoint is unavailable",
+        WorkloadAdapter::Etcd => "etcd endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -197,6 +202,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MongoDb => "MongoDB rejected the serverStatus request",
         WorkloadAdapter::Prometheus => "Prometheus rejected the metrics request",
         WorkloadAdapter::ClickHouse => "ClickHouse rejected the metrics query",
+        WorkloadAdapter::Etcd => "etcd rejected the metrics request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -210,6 +216,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MongoDb => "MongoDB returned an invalid serverStatus response",
         WorkloadAdapter::Prometheus => "Prometheus returned an invalid metrics response",
         WorkloadAdapter::ClickHouse => "ClickHouse returned an invalid metrics response",
+        WorkloadAdapter::Etcd => "etcd returned an invalid metrics response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -309,6 +316,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::MongoDb,
                     WorkloadAdapter::Prometheus,
                     WorkloadAdapter::ClickHouse,
+                    WorkloadAdapter::Etcd,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -486,6 +494,17 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::Etcd => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_etcd_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::Etcd(metrics)))
+                    },
+                    Utc::now(),
+                ),
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -513,8 +532,9 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        ClickHouseMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics,
-        RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
+        ClickHouseMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics,
+        PrometheusMetrics, RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode,
+        WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -691,6 +711,33 @@ mod tests {
             memory_tracking_bytes: 8,
             uptime_seconds: 9,
             memory_resident_bytes: 10,
+        }
+    }
+
+    fn etcd_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "etcd".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/etcd".into(),
+            },
+            adapter: WorkloadAdapter::Etcd,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
+        }
+    }
+
+    fn etcd_metrics() -> EtcdMetrics {
+        EtcdMetrics {
+            server_has_leader: 1,
+            server_is_leader: 0,
+            leader_changes_seen_total: 2,
+            proposals_applied_total: 3,
+            proposals_committed_total: 4,
+            proposals_failed_total: 5,
+            proposals_pending: 6,
+            mvcc_db_total_size_bytes: 7,
+            mvcc_db_total_size_in_use_bytes: 8,
+            process_resident_memory_bytes: 9,
         }
     }
 
@@ -900,6 +947,25 @@ mod tests {
             load_clickhouse_definition(&path),
             DefinitionsState::Ambiguous(2)
         );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn etcd_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![etcd_definition(), etcd_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_etcd_definition(&path), DefinitionsState::Ambiguous(2));
         assert_eq!(
             load_redis_definition(&path),
             DefinitionsState::One(definition())
@@ -1371,6 +1437,56 @@ mod tests {
             panic!("expected failed ClickHouse sample");
         };
         assert_eq!(detail, "ClickHouse rejected the metrics query");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn etcd_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &etcd_definition(),
+            || {
+                Ok((
+                    "http://127.0.0.1:2379/metrics".into(),
+                    WorkloadMetrics::Etcd(etcd_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::Etcd,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::Etcd(_),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let failed = collect_once(
+            &cfg,
+            &etcd_definition(),
+            || Err(WorkloadProbeError::Rejected("token=secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed etcd sample");
+        };
+        assert_eq!(detail, "etcd rejected the metrics request");
         assert!(!detail.contains("secret"));
     }
 
