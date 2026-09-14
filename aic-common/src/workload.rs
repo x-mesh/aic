@@ -609,14 +609,10 @@ pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_com
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
-<<<<<<< HEAD
-pub const PROMETHEUS_RESPONSE_BYTES: usize = 64 * 1024;
+pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, toUInt64(value) AS value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, toUInt64(value) AS value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
-=======
-pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
->>>>>>> origin/feat/prometheus-workload-monitoring
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1561,7 +1557,6 @@ fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, Wor
     })
 }
 
-<<<<<<< HEAD
 /// Run one fixed read-only ClickHouse system query over HTTP.
 pub fn monitor_clickhouse_with_connection(
     connection: Option<&WorkloadConnectionConfig>,
@@ -1733,7 +1728,8 @@ fn parse_clickhouse_u64(value: &str, name: &str) -> std::result::Result<u64, Wor
     value.parse::<u64>().map_err(|_| {
         WorkloadProbeError::Malformed(format!("ClickHouse metric is not a u64: {name}"))
     })
-=======
+}
+
 fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
     let value = value.strip_prefix('+').unwrap_or(value);
     if value.is_empty() || value.starts_with('-') {
@@ -1794,7 +1790,6 @@ fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
             .ok_or(())?;
     }
     Ok(result)
->>>>>>> origin/feat/prometheus-workload-monitoring
 }
 
 fn postgresql_metrics_from_rows(
