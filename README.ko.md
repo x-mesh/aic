@@ -455,10 +455,16 @@ down 상태인 server row를 셉니다. `current_sessions`, `sessions_total`, `b
 `denied_requests_total`, `denied_responses_total`, `failed_connections_total`, `retry_warnings_total`,
 `servers_down`을 반환합니다. socket 작업 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은 256KiB입니다.
 TCP, HTTP stats page, 인증, custom command, 설정 변경, 권한 변경, reload는 지원하지 않습니다.
+
+monitor adapter는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, etcd,
+Elasticsearch, OpenSearch, RabbitMQ, Nginx, HAProxy입니다. JVM, Kafka, Consul은 discovery-only로
+유지합니다. JVM은 별도의 opt-in JMX 또는 검증된 local PerfData 계약이 필요합니다. Kafka는 bounded Admin
+API, egress 정책, 전용 security schema가 필요합니다. Consul은 server와 client agent에 공통으로 항상 노출되는
+필수 metric set이 없습니다. AIC는 이 세 discovery-only adapter의 history sample을 만들지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Elasticsearch와 OpenSearch 정의도 각각 하나씩 60초마다 probe합니다. 저장된 connection이 있으면
+`aicd`는 각 monitor adapter 정의를 하나씩 60초마다 probe합니다. 저장된 connection이 있으면
 그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
 `127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
 PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
@@ -467,6 +473,8 @@ Prometheus 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 
 ClickHouse 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 etcd 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 Elasticsearch와 OpenSearch 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
+RabbitMQ는 기본 management endpoint 또는 저장된 endpoint를 사용할 수 있습니다. Nginx와 HAProxy는 저장된
+connection이 필요합니다. JVM, Kafka, Consul 정의의 상태는 `not_collected`로 유지합니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 
