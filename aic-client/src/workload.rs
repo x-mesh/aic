@@ -503,20 +503,41 @@ fn monitor_redis_unix_socket(path: &Path) -> Result<RedisMetrics, String> {
 
 pub fn monitor_redis_candidate(candidate_id: &str) -> Result<RedisMonitorReport> {
     let report = discover_for_monitor()?;
-    let candidate = report
-        .candidates
-        .into_iter()
-        .find(|candidate| candidate.id == candidate_id)
-        .context("workload candidate was not found")?;
+    let candidate = select_redis_monitor_candidate(&report, candidate_id)?;
     if candidate.adapter != WorkloadAdapter::Redis {
         bail!("workload candidate is not Redis");
     }
     let metrics = monitor_redis().context("Redis monitor probe failed")?;
     Ok(RedisMonitorReport {
-        candidate_id: candidate.id,
+        candidate_id: candidate.id.clone(),
         monitor_ready: true,
         metrics,
     })
+}
+
+fn select_redis_monitor_candidate<'a>(
+    report: &'a DiscoveryReport,
+    candidate_id: &str,
+) -> Result<&'a WorkloadCandidate> {
+    let redis_candidates = report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.adapter == WorkloadAdapter::Redis)
+        .collect::<Vec<_>>();
+    if redis_candidates.len() != 1 {
+        bail!(
+            "Redis monitor requires exactly one unambiguous candidate, found {}",
+            redis_candidates.len()
+        );
+    }
+    let candidate = redis_candidates[0];
+    if candidate.id != candidate_id {
+        bail!("requested workload candidate does not match the discovered Redis candidate");
+    }
+    if !candidate.ambiguity.is_empty() {
+        bail!("Redis monitor candidate is ambiguous");
+    }
+    Ok(candidate)
 }
 
 fn probe_postgres_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
@@ -1480,6 +1501,63 @@ mod tests {
     fn redis_monitor_endpoint_reports_unavailable_redis() {
         let error = monitor_redis_tcp("127.0.0.1:0".parse().unwrap()).unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    fn redis_candidate(id: &str, ambiguity: &[&str]) -> WorkloadCandidate {
+        WorkloadCandidate {
+            id: id.into(),
+            fingerprint: format!("fingerprint:{id}"),
+            selector: Some(WorkloadSelector::Executable {
+                path: format!("/usr/bin/{id}"),
+            }),
+            adapter: WorkloadAdapter::Redis,
+            driver_mode: Some(WorkloadDriverMode::DetectOnly),
+            bindings: Vec::new(),
+            ambiguity: ambiguity.iter().map(|item| (*item).to_string()).collect(),
+        }
+    }
+
+    fn redis_report(candidates: Vec<WorkloadCandidate>) -> DiscoveryReport {
+        DiscoveryReport {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "test".into(),
+            candidates,
+        }
+    }
+
+    #[test]
+    fn redis_monitor_selects_the_single_matching_unambiguous_candidate() {
+        let report = redis_report(vec![redis_candidate("redis-a", &[])]);
+        let selected = select_redis_monitor_candidate(&report, "redis-a").unwrap();
+        assert_eq!(selected.id, "redis-a");
+    }
+
+    #[test]
+    fn redis_monitor_fails_closed_for_zero_multiple_mismatched_or_ambiguous_candidates() {
+        let cases = [
+            (redis_report(Vec::new()), "redis-a"),
+            (
+                redis_report(vec![
+                    redis_candidate("redis-a", &[]),
+                    redis_candidate("redis-b", &[]),
+                ]),
+                "redis-a",
+            ),
+            (
+                redis_report(vec![redis_candidate("redis-a", &[])]),
+                "redis-b",
+            ),
+            (
+                redis_report(vec![redis_candidate(
+                    "redis-a",
+                    &["executable_unavailable"],
+                )]),
+                "redis-a",
+            ),
+        ];
+        for (report, candidate_id) in cases {
+            assert!(select_redis_monitor_candidate(&report, candidate_id).is_err());
+        }
     }
 
     #[cfg(unix)]
