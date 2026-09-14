@@ -172,6 +172,7 @@ pub struct WorkloadProposal {
 
 /// Numeric metrics returned by one bounded Redis INFO probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedisMetrics {
     pub connected_clients: u64,
     pub used_memory: u64,
@@ -181,12 +182,50 @@ pub struct RedisMetrics {
     pub keyspace_misses: u64,
 }
 
-/// Result of a one-shot Redis monitor probe.
+/// Numeric metrics returned by one bounded Memcached `stats` probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemcachedMetrics {
+    pub curr_connections: u64,
+    pub bytes: u64,
+    pub cmd_get: u64,
+    pub cmd_set: u64,
+    pub get_hits: u64,
+    pub get_misses: u64,
+    pub evictions: u64,
+}
+
+/// Adapter-specific metrics in a common workload sample.
+///
+/// The untagged representation preserves the Redis metric JSON written by the first monitor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkloadMetrics {
+    Redis(RedisMetrics),
+    Memcached(MemcachedMetrics),
+}
+
+/// Backward-compatible result of a one-shot Redis monitor probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedisMonitorReport {
     pub candidate_id: String,
     pub monitor_ready: bool,
     pub metrics: RedisMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemcachedMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: MemcachedMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WorkloadMonitorReport {
+    Redis(RedisMonitorReport),
+    Memcached(MemcachedMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -198,31 +237,37 @@ pub const REDIS_SOCKET_PATHS: &[&str] = &[
     "/tmp/redis.sock",
 ];
 pub const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
+pub const MEMCACHED_STATS_REQUEST: &[u8] = b"stats\r\n";
+pub const MEMCACHED_LOOPBACK_ENDPOINT: &str = "127.0.0.1:11211";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
+pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
-pub const REDIS_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+pub const WORKLOAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+pub const REDIS_SAMPLE_INTERVAL: Duration = WORKLOAD_SAMPLE_INTERVAL;
 pub const MAX_WORKLOAD_HISTORY_SAMPLES: usize = 1440;
 pub const WORKLOAD_HISTORY_FILE: &str = "workload-history.jsonl";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RedisProbeError {
+pub enum WorkloadProbeError {
     Unreachable(String),
     Rejected(String),
     Malformed(String),
 }
 
-impl fmt::Display for RedisProbeError {
+impl fmt::Display for WorkloadProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unreachable(detail) => write!(f, "Redis unreachable: {detail}"),
-            Self::Rejected(detail) => write!(f, "Redis rejected request: {detail}"),
-            Self::Malformed(detail) => write!(f, "Redis malformed response: {detail}"),
+            Self::Unreachable(detail) => write!(f, "workload endpoint is unavailable: {detail}"),
+            Self::Rejected(detail) => write!(f, "workload rejected request: {detail}"),
+            Self::Malformed(detail) => write!(f, "workload returned an invalid response: {detail}"),
         }
     }
 }
 
-impl std::error::Error for RedisProbeError {}
+impl std::error::Error for WorkloadProbeError {}
+
+pub type RedisProbeError = WorkloadProbeError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadStore {
@@ -230,35 +275,85 @@ pub struct WorkloadStore {
     pub workloads: Vec<WorkloadDefinition>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RedisWorkloadSample {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkloadSample {
     pub schema_version: u32,
     pub workload_id: String,
     pub captured_at: DateTime<Utc>,
+    /// Missing in Stage 0 Redis samples. Those samples always describe Redis.
+    #[serde(default = "default_redis_adapter")]
+    pub adapter: WorkloadAdapter,
     #[serde(flatten)]
-    pub outcome: RedisSampleOutcome,
+    pub outcome: WorkloadSampleOutcome,
+}
+
+fn default_redis_adapter() -> WorkloadAdapter {
+    WorkloadAdapter::Redis
+}
+
+impl<'de> Deserialize<'de> for WorkloadSample {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireSample {
+            schema_version: u32,
+            workload_id: String,
+            captured_at: DateTime<Utc>,
+            #[serde(default = "default_redis_adapter")]
+            adapter: WorkloadAdapter,
+            #[serde(flatten)]
+            outcome: WorkloadSampleOutcome,
+        }
+
+        let wire = WireSample::deserialize(deserializer)?;
+        if let WorkloadSampleOutcome::Collected { metrics, .. } = &wire.outcome {
+            let matches = matches!(
+                (wire.adapter, metrics),
+                (WorkloadAdapter::Redis, WorkloadMetrics::Redis(_))
+                    | (WorkloadAdapter::Memcached, WorkloadMetrics::Memcached(_))
+            );
+            if !matches {
+                return Err(serde::de::Error::custom(
+                    "workload adapter does not match metric type",
+                ));
+            }
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            workload_id: wire.workload_id,
+            captured_at: wire.captured_at,
+            adapter: wire.adapter,
+            outcome: wire.outcome,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum RedisSampleOutcome {
+pub enum WorkloadSampleOutcome {
     Collected {
         endpoint: String,
-        metrics: RedisMetrics,
+        metrics: WorkloadMetrics,
     },
     Failed {
-        reason: RedisSampleFailure,
+        reason: WorkloadSampleFailure,
         detail: String,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RedisSampleFailure {
+pub enum WorkloadSampleFailure {
     Unreachable,
     Rejected,
     Malformed,
 }
+
+pub type RedisWorkloadSample = WorkloadSample;
+pub type RedisSampleOutcome = WorkloadSampleOutcome;
+pub type RedisSampleFailure = WorkloadSampleFailure;
 
 pub fn workloads_file_path() -> PathBuf {
     paths::config_file_path().with_file_name("workloads.toml")
@@ -268,7 +363,7 @@ pub fn workload_history_path() -> PathBuf {
     paths::state_dir().join(WORKLOAD_HISTORY_FILE)
 }
 
-pub fn load_workload_history(path: &Path) -> Result<Vec<RedisWorkloadSample>> {
+pub fn load_workload_history(path: &Path) -> Result<Vec<WorkloadSample>> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -278,7 +373,7 @@ pub fn load_workload_history(path: &Path) -> Result<Vec<RedisWorkloadSample>> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .filter_map(|line| serde_json::from_str(line).ok())
-        .collect::<Vec<RedisWorkloadSample>>();
+        .collect::<Vec<WorkloadSample>>();
     samples.sort_by_key(|sample| sample.captured_at);
     Ok(samples)
 }
@@ -302,6 +397,22 @@ pub fn monitor_redis() -> std::result::Result<(String, RedisMetrics), RedisProbe
             Err(preferred_redis_error(errors))
         }
     }
+}
+
+/// Collect one bounded Memcached `stats` response from the fixed loopback endpoint.
+pub fn monitor_memcached() -> std::result::Result<(String, MemcachedMetrics), WorkloadProbeError> {
+    let endpoint: SocketAddr = MEMCACHED_LOOPBACK_ENDPOINT
+        .parse()
+        .expect("valid Memcached endpoint");
+    monitor_memcached_tcp(endpoint)
+        .map(|metrics| (MEMCACHED_LOOPBACK_ENDPOINT.to_string(), metrics))
+}
+
+pub fn probe_memcached_server() -> std::result::Result<(), WorkloadProbeError> {
+    let endpoint: SocketAddr = MEMCACHED_LOOPBACK_ENDPOINT
+        .parse()
+        .expect("valid Memcached endpoint");
+    monitor_memcached_tcp(endpoint).map(|_| ())
 }
 
 fn preferred_redis_error(errors: Vec<RedisProbeError>) -> RedisProbeError {
@@ -504,10 +615,158 @@ fn probe_redis_server_stream(
     }
 }
 
+pub fn monitor_memcached_stream(
+    stream: &mut (impl Read + Write),
+) -> std::result::Result<MemcachedMetrics, WorkloadProbeError> {
+    stream
+        .write_all(MEMCACHED_STATS_REQUEST)
+        .map_err(unreachable)?;
+    stream.flush().map_err(unreachable)?;
+    let response = read_memcached_stats_response(stream, MEMCACHED_RESPONSE_BYTES)?;
+    parse_memcached_stats(&response)
+}
+
+pub fn read_memcached_stats_response(
+    stream: &mut impl Read,
+    response_cap: usize,
+) -> std::result::Result<String, WorkloadProbeError> {
+    let mut response = Vec::new();
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    while response.len() < response_cap {
+        match stream.read_exact(&mut byte) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(WorkloadProbeError::Malformed(
+                    "Memcached stats response omitted END".into(),
+                ));
+            }
+            Err(error) => return Err(unreachable(error)),
+        }
+        response.push(byte[0]);
+        line.push(byte[0]);
+        if !line.ends_with(b"\r\n") {
+            continue;
+        }
+        let text = std::str::from_utf8(&line[..line.len() - 2])
+            .map_err(|_| WorkloadProbeError::Malformed("Memcached stats is not UTF-8".into()))?;
+        if matches!(text, "ERROR" | "CLIENT_ERROR" | "SERVER_ERROR")
+            || text.starts_with("CLIENT_ERROR ")
+            || text.starts_with("SERVER_ERROR ")
+        {
+            return Err(WorkloadProbeError::Rejected(
+                "Memcached rejected stats".into(),
+            ));
+        }
+        if text == "END" {
+            response.truncate(response.len() - line.len());
+            return String::from_utf8(response)
+                .map_err(|_| WorkloadProbeError::Malformed("Memcached stats is not UTF-8".into()));
+        }
+        line.clear();
+    }
+    Err(WorkloadProbeError::Malformed(
+        "Memcached stats response exceeded the byte cap or omitted END".into(),
+    ))
+}
+
+pub fn parse_memcached_stats(
+    response: &str,
+) -> std::result::Result<MemcachedMetrics, WorkloadProbeError> {
+    let mut values = std::collections::BTreeMap::new();
+    for line in response.split("\r\n").filter(|line| !line.is_empty()) {
+        let mut fields = line.split_ascii_whitespace();
+        if fields.next() != Some("STAT") {
+            return Err(WorkloadProbeError::Malformed(
+                "Memcached stats contains a malformed line".into(),
+            ));
+        }
+        let key = fields.next().ok_or_else(|| {
+            WorkloadProbeError::Malformed("Memcached stats contains a malformed line".into())
+        })?;
+        let value = fields.next().ok_or_else(|| {
+            WorkloadProbeError::Malformed("Memcached stats contains a malformed line".into())
+        })?;
+        if fields.next().is_some() || values.insert(key, value).is_some() {
+            return Err(WorkloadProbeError::Malformed(
+                "Memcached stats contains a duplicate or malformed metric".into(),
+            ));
+        }
+    }
+    let metric = |key| {
+        values
+            .get(key)
+            .ok_or_else(|| {
+                WorkloadProbeError::Malformed(format!("Memcached stats is missing {key}"))
+            })
+            .and_then(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    WorkloadProbeError::Malformed(format!(
+                        "Memcached stats metric is not a u64: {key}"
+                    ))
+                })
+            })
+    };
+    Ok(MemcachedMetrics {
+        curr_connections: metric("curr_connections")?,
+        bytes: metric("bytes")?,
+        cmd_get: metric("cmd_get")?,
+        cmd_set: metric("cmd_set")?,
+        get_hits: metric("get_hits")?,
+        get_misses: metric("get_misses")?,
+        evictions: metric("evictions")?,
+    })
+}
+
+fn monitor_memcached_tcp(
+    endpoint: SocketAddr,
+) -> std::result::Result<MemcachedMetrics, WorkloadProbeError> {
+    let mut stream =
+        TcpStream::connect_timeout(&endpoint, DRIVER_CONNECT_TIMEOUT).map_err(unreachable)?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(unreachable)?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(unreachable)?;
+    monitor_memcached_stream(&mut stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Result as IoResult};
+
+    struct TestStream {
+        input: Cursor<Vec<u8>>,
+        output: Vec<u8>,
+    }
+
+    impl TestStream {
+        fn response(response: &str) -> Self {
+            Self {
+                input: Cursor::new(response.as_bytes().to_vec()),
+                output: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for TestStream {
+        fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
+            self.input.read(buffer)
+        }
+    }
+
+    impl Write for TestStream {
+        fn write(&mut self, buffer: &[u8]) -> IoResult<usize> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn stable_selector_does_not_include_runtime_binding() {
@@ -611,6 +870,11 @@ mod tests {
         assert_eq!(json["monitor_ready"], true);
         assert_eq!(json["metrics"]["used_memory"], 4096);
         assert!(json["metrics"]["used_memory"].is_u64());
+        assert!(json.get("adapter").is_none());
+        assert_eq!(
+            serde_json::from_value::<RedisMonitorReport>(json).unwrap(),
+            report
+        );
     }
 
     #[test]
@@ -687,6 +951,7 @@ mod tests {
             schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
             workload_id: "redis".into(),
             captured_at: Utc::now(),
+            adapter: WorkloadAdapter::Redis,
             outcome: RedisSampleOutcome::Failed {
                 reason: RedisSampleFailure::Rejected,
                 detail: "NOAUTH".into(),
@@ -712,22 +977,24 @@ mod tests {
                 schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
                 workload_id: "redis".into(),
                 captured_at,
+                adapter: WorkloadAdapter::Redis,
                 outcome: RedisSampleOutcome::Collected {
                     endpoint: REDIS_LOOPBACK_ENDPOINT.into(),
-                    metrics: RedisMetrics {
+                    metrics: WorkloadMetrics::Redis(RedisMetrics {
                         connected_clients: 1,
                         used_memory: 2,
                         total_commands_processed: 3,
                         instantaneous_ops_per_sec: 4,
                         keyspace_hits: 5,
                         keyspace_misses: 6,
-                    },
+                    }),
                 },
             },
             RedisWorkloadSample {
                 schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
                 workload_id: "redis".into(),
                 captured_at,
+                adapter: WorkloadAdapter::Redis,
                 outcome: RedisSampleOutcome::Failed {
                     reason: RedisSampleFailure::Unreachable,
                     detail: "Redis endpoint is unavailable".into(),
@@ -750,5 +1017,59 @@ mod tests {
             monitor_redis_tcp(endpoint),
             Err(RedisProbeError::Unreachable(_))
         ));
+    }
+
+    #[test]
+    fn old_redis_sample_json_loads_as_a_generic_sample() {
+        let old = r#"{
+            "schema_version":1,
+            "workload_id":"redis",
+            "captured_at":"2026-09-14T00:00:00Z",
+            "outcome":"collected",
+            "endpoint":"127.0.0.1:6379",
+            "metrics":{"connected_clients":1,"used_memory":2,"total_commands_processed":3,"instantaneous_ops_per_sec":4,"keyspace_hits":5,"keyspace_misses":6}
+        }"#;
+        let sample: WorkloadSample = serde_json::from_str(old).unwrap();
+        assert_eq!(sample.adapter, WorkloadAdapter::Redis);
+        assert!(matches!(
+            sample.outcome,
+            WorkloadSampleOutcome::Collected {
+                metrics: WorkloadMetrics::Redis(_),
+                ..
+            }
+        ));
+        let mismatched = r#"{
+            "schema_version":1,
+            "workload_id":"memcached",
+            "captured_at":"2026-09-14T00:00:00Z",
+            "adapter":"memcached",
+            "outcome":"collected",
+            "endpoint":"127.0.0.1:11211",
+            "metrics":{"connected_clients":1,"used_memory":2,"total_commands_processed":3,"instantaneous_ops_per_sec":4,"keyspace_hits":5,"keyspace_misses":6}
+        }"#;
+        assert!(serde_json::from_str::<WorkloadSample>(mismatched).is_err());
+    }
+
+    #[test]
+    fn memcached_stream_requires_complete_valid_stats() {
+        let response = concat!(
+            "STAT curr_connections 1\r\nSTAT bytes 2\r\nSTAT cmd_get 3\r\n",
+            "STAT cmd_set 4\r\nSTAT get_hits 5\r\nSTAT get_misses 6\r\n",
+            "STAT evictions 7\r\nEND\r\n"
+        );
+        let mut stream = TestStream::response(response);
+        let metrics = monitor_memcached_stream(&mut stream).unwrap();
+        assert_eq!(stream.output, MEMCACHED_STATS_REQUEST);
+        assert_eq!(metrics.curr_connections, 1);
+        assert_eq!(metrics.evictions, 7);
+
+        for invalid in [
+            "STAT curr_connections 1\r\n",
+            "STAT curr_connections 1\r\nSTAT curr_connections 2\r\nEND\r\n",
+            "STAT curr_connections 18446744073709551616\r\nEND\r\n",
+        ] {
+            let mut stream = TestStream::response(invalid);
+            assert!(monitor_memcached_stream(&mut stream).is_err());
+        }
     }
 }

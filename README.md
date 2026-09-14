@@ -387,7 +387,8 @@ service-level meaning.
 Each workload has a driver mode: `detect_only`, `inspect_ready`, or `monitor_ready`.
 
 Discovery creates `detect_only` drivers. Nginx checks known local configuration paths. Redis sends a
-bounded `INFO SERVER` request to a local socket or `127.0.0.1:6379`. PostgreSQL sends an
+bounded `INFO SERVER` request to a local socket or `127.0.0.1:6379`. Memcached sends a bounded
+`stats` request to `127.0.0.1:11211`. PostgreSQL sends an
 unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successful check sets
 `inspect_ready`. The checks do not read configuration content, credentials, or remote endpoints.
 
@@ -395,22 +396,26 @@ unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successf
 
 `inspect_ready` only confirms local read-only access. It does not collect service metrics.
 
-`aic workload monitor <id> --json` runs one Redis monitor probe from the shell. It has no
-`aic chat` slash-command form. It connects to a fixed local Redis socket or `127.0.0.1:6379` and
-sends one read-only `INFO` request. It returns six typed metrics: `connected_clients`,
-`used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`, `keyspace_hits`, and
-`keyspace_misses`. The probe sets `monitor_ready: true` only when the connection, the request, and
-the metric parse all succeed.
+`aic workload monitor <id> --json` runs one local monitor probe from the shell. It has no
+`aic chat` slash-command form. Redis uses fixed local sockets or `127.0.0.1:6379` and sends one
+read-only `INFO` request. Memcached uses `127.0.0.1:11211` and sends one `stats` request.
+Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
+`instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
+`curr_connections`, `bytes`, `cmd_get`, `cmd_set`, `get_hits`, `get_misses`, and `evictions`.
+Each connect, read, and write uses a 200 ms limit. Each response has a 64 KiB limit.
+Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
+all required metrics.
 
-`aicd` probes one configured Redis definition every 60 seconds.
-It uses the fixed local socket paths or `127.0.0.1:6379`.
+`aicd` probes one configured Redis definition and one configured Memcached definition every 60 seconds.
+It uses the fixed Redis socket paths or `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.
 The directory mode is 0700, and the file mode is 0600.
 Retention keeps 1440 samples.
 
-More than one Redis definition blocks collection.
+More than one definition of the same monitored adapter blocks only that adapter. Redis and Memcached
+samples share the history file. Existing Redis sample JSON remains readable.
 Use `aic workload status [--json]` to read the current state without `aicd`.
 Use `aic workload history <id> [--limit N] [--json]` to read stored samples without `aicd`.
 

@@ -633,7 +633,7 @@ enum WorkloadOp {
         #[arg(long)]
         json: bool,
     },
-    /// Run one bounded Redis INFO probe for a candidate.
+    /// Run one bounded local workload monitor probe for a candidate.
     Monitor {
         candidate_id: String,
         #[arg(long)]
@@ -1372,14 +1372,20 @@ fn handle_workload(op: WorkloadOp) {
             })
         }
         WorkloadOp::Monitor { candidate_id, json } => {
-            workload::monitor_redis_candidate(&candidate_id).map(|report| {
+            workload::monitor_candidate(&candidate_id).map(|report| {
                 if json {
-                    serde_json::to_string(&report).expect("Redis monitor report serializes")
+                    serde_json::to_string(&report).expect("workload monitor report serializes")
                 } else {
-                    format!(
-                        "candidate={} monitor_ready={} metrics={:?}",
-                        report.candidate_id, report.monitor_ready, report.metrics
-                    )
+                    match report {
+                        aic_common::workload::WorkloadMonitorReport::Redis(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
+                        aic_common::workload::WorkloadMonitorReport::Memcached(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
+                    }
                 }
             })
         }
@@ -1396,11 +1402,11 @@ fn handle_workload(op: WorkloadOp) {
                                 "captured_at={} outcome={}",
                                 sample.captured_at.to_rfc3339(),
                                 match &sample.outcome {
-                                    aic_common::workload::RedisSampleOutcome::Collected { .. } => "collected",
-                                    aic_common::workload::RedisSampleOutcome::Failed { reason, .. } => match reason {
-                                        aic_common::workload::RedisSampleFailure::Unreachable => "unreachable",
-                                        aic_common::workload::RedisSampleFailure::Rejected => "rejected",
-                                        aic_common::workload::RedisSampleFailure::Malformed => "malformed",
+                                    aic_common::workload::WorkloadSampleOutcome::Collected { .. } => "collected",
+                                    aic_common::workload::WorkloadSampleOutcome::Failed { reason, .. } => match reason {
+                                        aic_common::workload::WorkloadSampleFailure::Unreachable => "unreachable",
+                                        aic_common::workload::WorkloadSampleFailure::Rejected => "rejected",
+                                        aic_common::workload::WorkloadSampleFailure::Malformed => "malformed",
                                     },
                                 }
                             ),
@@ -1427,11 +1433,11 @@ fn handle_workload(op: WorkloadOp) {
                 samples
                     .into_iter()
                     .map(|sample| match sample.outcome {
-                        aic_common::workload::RedisSampleOutcome::Collected { endpoint, metrics } => format!(
-                            "{} captured_at={} endpoint={} connected_clients={} used_memory={} total_commands_processed={} instantaneous_ops_per_sec={} keyspace_hits={} keyspace_misses={}\n",
-                            sample.workload_id, sample.captured_at.to_rfc3339(), endpoint, metrics.connected_clients, metrics.used_memory, metrics.total_commands_processed, metrics.instantaneous_ops_per_sec, metrics.keyspace_hits, metrics.keyspace_misses
+                        aic_common::workload::WorkloadSampleOutcome::Collected { endpoint, metrics } => format!(
+                            "{} adapter={:?} captured_at={} endpoint={} metrics={:?}\n",
+                            sample.workload_id, sample.adapter, sample.captured_at.to_rfc3339(), endpoint, metrics
                         ),
-                        aic_common::workload::RedisSampleOutcome::Failed { reason, detail } => format!(
+                        aic_common::workload::WorkloadSampleOutcome::Failed { reason, detail } => format!(
                             "{} captured_at={} failure={:?} detail={}\n",
                             sample.workload_id, sample.captured_at.to_rfc3339(), reason, detail
                         ),
