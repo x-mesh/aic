@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.41.1] - 2026-09-14
+
 ### Fixed
 
 - HAProxy의 atomic close-on-exec success-path test를 해당 socket flag를 지원하는 Unix target에서만 실행한다.
