@@ -395,7 +395,7 @@ Redis는
 `cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. PostgreSQL은 `numbackends`, `xact_commit`,
 `xact_rollback`, `blks_read`, `blks_hit`, `tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`,
 `tup_deleted`, `conflicts`, `temp_files`, `temp_bytes`, `deadlocks`를 반환합니다. `pg_stat_database`에서 현재
-database의 scalar row 하나만 읽습니다. read-only transaction mode, statement timeout, lock timeout을 적용합니다.
+database의 scalar row 하나만 읽습니다. PostgreSQL connection에 read-only transaction mode, statement timeout, lock timeout을 적용합니다.
 MySQL은 `threads_connected`, `threads_running`, `connections`, `aborted_connects`, `questions`, `slow_queries`,
 `bytes_received`, `bytes_sent`를 반환합니다. 고정 `SHOW GLOBAL STATUS` query로 이 지표 8개만 요청합니다.
 MongoDB는 `connections_current`, `connections_available`, `connections_total_created`, `opcounters_query`,
@@ -410,15 +410,15 @@ driver가 먼저 더 큰 응답을 받을 수 있습니다.
 Prometheus adapter는 공식 Linux Prometheus server를 지원합니다. custom path나 query 없이 고정 `/metrics`
 경로를 사용하며 인증과 redirect는 지원하지 않습니다. 기본 endpoint는 `127.0.0.1:9090`이고 explicit TCP 또는
 TLS endpoint로 바꿀 수 있습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은
-3초이며 응답 제한은 64KiB입니다. Prometheus는 `config_last_reload_successful`, `tsdb_head_series`,
+3초이며 응답 제한은 1MiB입니다. Prometheus는 `config_last_reload_successful`, `tsdb_head_series`,
 `tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`, `process_resident_memory_bytes`,
 `process_virtual_memory_bytes`, `go_goroutines`를 반환합니다.
 ClickHouse adapter는 기본적으로 `127.0.0.1:8123`의 HTTP interface를 사용하며 explicit TCP 또는 TLS endpoint로
 바꿀 수 있습니다. native port 9000과 Unix endpoint는 지원하지 않습니다. custom path, query parameter, 사용자
 SQL 없이 고정 SQL 하나만 실행합니다. `queries`, `merges`, `part_mutations`, `replicated_fetches`,
 `replicated_sends`, `tcp_connections`, `http_connections`, `memory_tracking_bytes`, `uptime_seconds`,
-`memory_resident_bytes`를 반환합니다. 현재 probe query 자체가 `queries` 값에 포함됩니다. Basic 인증에는
-`--username`과 secret option 하나가 모두 필요합니다. 필요한 system table만 읽을 수 있는 사용자를 사용하십시오.
+`memory_resident_bytes`를 반환합니다. 현재 probe query 자체가 `queries` 값에 포함됩니다. Basic 인증에는 TLS,
+`--username`, secret option 하나가 모두 필요합니다. 필요한 system table만 읽을 수 있는 사용자를 사용하십시오.
 database와 `--auth-source`는 지원하지 않습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고
 전체 probe 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다.
 etcd adapter는 기본적으로 `127.0.0.1:2379`의 익명 `GET /metrics`를 사용하며 explicit TCP 또는 TLS
@@ -436,7 +436,7 @@ Elasticsearch와 OpenSearch adapter는 기본적으로 `127.0.0.1:9200`을 사�
 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. API key, SigV4, private CA, mTLS, custom
 path, query, 검색, node stats는 지원하지 않습니다.
 RabbitMQ adapter는 `rabbitmq_management` plugin이 필요하며 기본적으로 `127.0.0.1:15672`를 사용합니다.
-고정 `GET /api/overview`를 호출합니다. Basic 인증에는 username과 secret이 모두 필요합니다. `monitoring` tag가
+고정 `GET /api/overview`를 호출합니다. Basic 인증에는 TLS, username, secret이 모두 필요합니다. `monitoring` tag가
 있는 전용 사용자를 사용하며 administrator 권한은 필요하지 않습니다. `messages`, `messages_ready`,
 `messages_unacknowledged`, `queues`, `connections`, `channels`, `consumers`, `exchanges`,
 `message_stats_publish_total`, `message_stats_deliver_get_total`을 반환합니다. 선택 사항인 message counter가 없으면
@@ -444,7 +444,7 @@ RabbitMQ adapter는 `rabbitmq_management` plugin이 필요하며 기본적으로
 제한은 64KiB입니다. redirect는 따르지 않습니다. AMQP port 5672, vhost 선택, private CA, mTLS, custom API는
 지원하지 않습니다.
 Nginx adapter는 explicit TCP 또는 TLS endpoint가 필요하며 항상 `/stub_status`를 요청합니다. 사용 전에 Nginx
-`stub_status` module과 정확히 이 location을 설정하십시오. Basic 인증에는 username과 secret이 모두 필요합니다.
+`stub_status` module과 정확히 이 location을 설정하십시오. Basic 인증에는 TLS, username, secret이 모두 필요합니다.
 TLS는 native host root를 사용합니다. `active_connections`, `accepts_total`, `handled_total`, `requests_total`,
 `reading`, `writing`, `waiting`을 반환합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은
 16KiB입니다. redirect는 따르지 않습니다. AIC는 Nginx 설정을 변경하거나 reload하지 않습니다. custom status
