@@ -9,14 +9,11 @@
 //!
 //! Linux headless 환경 등 keychain 사용 불가 시 호출자는 환경 변수로 fallback 가능.
 
-const SERVICE: &str = "aic";
-const KEYCHAIN_PREFIX: &str = "keychain:";
-
 /// `keychain:<name>` 참조 문자열인지 확인하고, 그렇다면 실제 키를 keychain에서 로드한다.
 /// 일반 평문이면 그대로 반환.
 pub fn resolve(value: &str) -> Result<String, String> {
-    if let Some(name) = value.strip_prefix(KEYCHAIN_PREFIX) {
-        load(name)
+    if aic_common::secret::is_keychain_reference(value) {
+        aic_common::secret::resolve_secret_reference(value)
     } else {
         Ok(value.to_string())
     }
@@ -24,40 +21,28 @@ pub fn resolve(value: &str) -> Result<String, String> {
 
 /// keychain entry에 API key를 저장.
 pub fn store(account: &str, secret: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(SERVICE, account)
-        .map_err(|e| format!("keychain entry 생성 실패: {e}"))?;
-    entry
-        .set_password(secret)
-        .map_err(|e| format!("keychain 저장 실패: {e}"))
+    aic_common::secret::store_keychain(account, secret)
 }
 
 /// keychain entry에서 API key를 로드.
 pub fn load(account: &str) -> Result<String, String> {
-    let entry = keyring::Entry::new(SERVICE, account)
-        .map_err(|e| format!("keychain entry 생성 실패: {e}"))?;
-    entry
-        .get_password()
-        .map_err(|e| format!("keychain 로드 실패 (account={account}): {e}"))
+    aic_common::secret::load_keychain(account)
 }
 
 /// keychain entry 삭제.
 #[allow(dead_code)]
 pub fn delete(account: &str) -> Result<(), String> {
-    let entry = keyring::Entry::new(SERVICE, account)
-        .map_err(|e| format!("keychain entry 생성 실패: {e}"))?;
-    entry
-        .delete_credential()
-        .map_err(|e| format!("keychain 삭제 실패: {e}"))
+    aic_common::secret::delete_keychain(account)
 }
 
 /// 평문 API key를 keychain reference 형식(`keychain:<name>`)으로 변환.
 pub fn make_reference(name: &str) -> String {
-    format!("{KEYCHAIN_PREFIX}{name}")
+    aic_common::secret::make_keychain_reference(name)
 }
 
 /// 값이 keychain reference인지 검사.
 pub fn is_reference(value: &str) -> bool {
-    value.starts_with(KEYCHAIN_PREFIX)
+    aic_common::secret::is_keychain_reference(value)
 }
 
 #[cfg(test)]

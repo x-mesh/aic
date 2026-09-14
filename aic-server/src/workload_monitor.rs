@@ -65,6 +65,14 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
         Ok(store) => store,
         Err(error) => return DefinitionsState::Malformed(error.to_string()),
     };
+    if let Some(error) = store.workloads.iter().find_map(|definition| {
+        definition
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.validate_for(definition.adapter).err())
+    }) {
+        return DefinitionsState::Malformed(error.to_string());
+    }
     let mut definitions = store
         .workloads
         .into_iter()
@@ -302,8 +310,10 @@ fn start_collection_thread(
                     &cfg,
                     &definition,
                     || {
-                        aic_common::workload::monitor_redis()
-                            .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::Redis(metrics)))
+                        aic_common::workload::monitor_redis_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::Redis(metrics)))
                     },
                     Utc::now(),
                 ),
@@ -311,9 +321,10 @@ fn start_collection_thread(
                     &cfg,
                     &definition,
                     || {
-                        aic_common::workload::monitor_memcached().map(|(endpoint, metrics)| {
-                            (endpoint, WorkloadMetrics::Memcached(metrics))
-                        })
+                        aic_common::workload::monitor_memcached_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::Memcached(metrics)))
                     },
                     Utc::now(),
                 ),
@@ -353,6 +364,7 @@ mod tests {
             },
             adapter: WorkloadAdapter::Redis,
             driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
         }
     }
 
@@ -364,6 +376,7 @@ mod tests {
             },
             adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
         }
     }
 

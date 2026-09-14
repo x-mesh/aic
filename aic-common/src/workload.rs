@@ -3,14 +3,17 @@
 use crate::paths;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
@@ -106,6 +109,140 @@ pub struct WorkloadDefinition {
     /// Older workload definitions predate drivers and default to detect-only.
     #[serde(default)]
     pub driver_mode: WorkloadDriverMode,
+    /// Missing records keep the fixed local endpoint defaults.
+    #[serde(default)]
+    pub connection: Option<WorkloadConnectionConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkloadConnectionConfig {
+    pub endpoint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkloadEndpoint {
+    Unix(PathBuf),
+    Tcp { host: String, port: u16 },
+    Tls { host: String, port: u16 },
+}
+
+impl WorkloadConnectionConfig {
+    pub fn validate_for(&self, adapter: WorkloadAdapter) -> Result<()> {
+        self.endpoint()?;
+        if self.username.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("workload username must not be empty");
+        }
+        if let Some(secret_ref) = &self.secret_ref {
+            crate::secret::parse_secret_reference(secret_ref).map_err(anyhow::Error::msg)?;
+        }
+        if self.username.is_some() && self.secret_ref.is_none() {
+            anyhow::bail!("workload username requires secret_ref");
+        }
+        if adapter == WorkloadAdapter::Memcached
+            && (self.username.is_some() || self.secret_ref.is_some())
+        {
+            anyhow::bail!("Memcached workload connections do not support username or secret_ref");
+        }
+        Ok(())
+    }
+
+    pub fn endpoint(&self) -> Result<WorkloadEndpoint> {
+        if self.endpoint.is_empty()
+            || self.endpoint.contains('@')
+            || self.endpoint.contains('?')
+            || self.endpoint.contains('#')
+            || self.endpoint.chars().any(char::is_whitespace)
+        {
+            anyhow::bail!("workload endpoint is invalid");
+        }
+        let (scheme, target) = self.endpoint.split_once("://").ok_or_else(|| {
+            anyhow::anyhow!("workload endpoint must use unix://, tcp://, or tls://")
+        })?;
+        match scheme {
+            "unix" => {
+                let path = PathBuf::from(target);
+                if !path.is_absolute() || target.is_empty() {
+                    anyhow::bail!("unix workload endpoint must have an absolute path");
+                }
+                Ok(WorkloadEndpoint::Unix(path))
+            }
+            "tcp" | "tls" => {
+                let (host, port) = parse_host_port(target)?;
+                if scheme == "tcp" {
+                    Ok(WorkloadEndpoint::Tcp { host, port })
+                } else {
+                    ServerName::try_from(host.clone())
+                        .map_err(|_| anyhow::anyhow!("TLS workload endpoint host is invalid"))?;
+                    Ok(WorkloadEndpoint::Tls { host, port })
+                }
+            }
+            _ => anyhow::bail!("workload endpoint must use unix://, tcp://, or tls://"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkloadConnectionConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            endpoint: String,
+            #[serde(default)]
+            username: Option<String>,
+            #[serde(default)]
+            secret_ref: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let config = Self {
+            endpoint: wire.endpoint,
+            username: wire.username,
+            secret_ref: wire.secret_ref,
+        };
+        config.endpoint().map_err(serde::de::Error::custom)?;
+        if config.username.as_deref().is_some_and(str::is_empty) {
+            return Err(serde::de::Error::custom(
+                "workload username must not be empty",
+            ));
+        }
+        if let Some(secret_ref) = &config.secret_ref {
+            crate::secret::parse_secret_reference(secret_ref).map_err(serde::de::Error::custom)?;
+        }
+        Ok(config)
+    }
+}
+
+fn parse_host_port(value: &str) -> Result<(String, u16)> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .ok_or_else(|| anyhow::anyhow!("IPv6 workload endpoint must use [address]:port"))?;
+        if host.is_empty() || host.parse::<std::net::Ipv6Addr>().is_err() {
+            anyhow::bail!("TCP workload endpoint host is invalid");
+        }
+        (host, port)
+    } else {
+        let (host, port) = value
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("TCP workload endpoint must include host and port"))?;
+        if host.is_empty() || host.contains('/') || host.contains(':') {
+            anyhow::bail!("TCP workload endpoint host is invalid");
+        }
+        (host, port)
+    };
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("TCP workload endpoint port is invalid"))?;
+    if port == 0 {
+        anyhow::bail!("TCP workload endpoint port is invalid");
+    }
+    Ok((host.to_string(), port))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -399,6 +536,88 @@ pub fn monitor_redis() -> std::result::Result<(String, RedisMetrics), RedisProbe
     }
 }
 
+/// Collect Redis metrics from an optional explicit connection. A missing connection preserves the
+/// fixed local endpoint selection used by older workload records.
+pub fn monitor_redis_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, RedisMetrics), RedisProbeError> {
+    let Some(connection) = connection else {
+        return monitor_redis();
+    };
+    connection
+        .validate_for(WorkloadAdapter::Redis)
+        .map_err(|_| {
+            RedisProbeError::Malformed("Redis connection configuration is invalid".into())
+        })?;
+    let secret = resolve_connection_secret(connection)?;
+    match connection
+        .endpoint()
+        .map_err(|_| RedisProbeError::Malformed("Redis endpoint is invalid".into()))?
+    {
+        #[cfg(unix)]
+        WorkloadEndpoint::Unix(path) => {
+            let mut stream = UnixStream::connect(&path).map_err(unreachable)?;
+            set_timeouts(&stream)?;
+            monitor_redis_authenticated_stream(
+                &mut stream,
+                connection.username.as_deref(),
+                secret.as_deref(),
+            )
+            .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+        #[cfg(not(unix))]
+        WorkloadEndpoint::Unix(_) => Err(RedisProbeError::Unreachable(
+            "Unix sockets are unavailable".into(),
+        )),
+        WorkloadEndpoint::Tcp { host, port } => {
+            let mut stream = connect_tcp(&host, port)?;
+            monitor_redis_authenticated_stream(
+                &mut stream,
+                connection.username.as_deref(),
+                secret.as_deref(),
+            )
+            .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            let stream = connect_tcp(&host, port)?;
+            let mut stream = tls_stream(stream, &host)?;
+            monitor_redis_authenticated_stream(
+                &mut stream,
+                connection.username.as_deref(),
+                secret.as_deref(),
+            )
+            .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+    }
+}
+
+/// Run a Redis custom connection through an injected connector.
+///
+/// This keeps endpoint selection testable without opening a network connection.
+pub fn monitor_redis_with_connector<S>(
+    connection: &WorkloadConnectionConfig,
+    connector: impl FnOnce(&WorkloadEndpoint) -> std::result::Result<S, WorkloadProbeError>,
+) -> std::result::Result<RedisMetrics, RedisProbeError>
+where
+    S: Read + Write,
+{
+    connection
+        .validate_for(WorkloadAdapter::Redis)
+        .map_err(|_| {
+            RedisProbeError::Malformed("Redis connection configuration is invalid".into())
+        })?;
+    let endpoint = connection
+        .endpoint()
+        .map_err(|_| RedisProbeError::Malformed("Redis endpoint is invalid".into()))?;
+    let secret = resolve_connection_secret(connection)?;
+    let mut stream = connector(&endpoint)?;
+    monitor_redis_authenticated_stream(
+        &mut stream,
+        connection.username.as_deref(),
+        secret.as_deref(),
+    )
+}
+
 /// Collect one bounded Memcached `stats` response from the fixed loopback endpoint.
 pub fn monitor_memcached() -> std::result::Result<(String, MemcachedMetrics), WorkloadProbeError> {
     let endpoint: SocketAddr = MEMCACHED_LOOPBACK_ENDPOINT
@@ -406,6 +625,143 @@ pub fn monitor_memcached() -> std::result::Result<(String, MemcachedMetrics), Wo
         .expect("valid Memcached endpoint");
     monitor_memcached_tcp(endpoint)
         .map(|metrics| (MEMCACHED_LOOPBACK_ENDPOINT.to_string(), metrics))
+}
+
+/// Collect Memcached metrics from an optional explicit connection. Memcached connections reject
+/// authentication fields during validation.
+pub fn monitor_memcached_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, MemcachedMetrics), WorkloadProbeError> {
+    let Some(connection) = connection else {
+        return monitor_memcached();
+    };
+    connection
+        .validate_for(WorkloadAdapter::Memcached)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("Memcached connection configuration is invalid".into())
+        })?;
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("Memcached endpoint is invalid".into()))?
+    {
+        #[cfg(unix)]
+        WorkloadEndpoint::Unix(path) => {
+            let mut stream = UnixStream::connect(&path).map_err(unreachable)?;
+            set_timeouts(&stream)?;
+            monitor_memcached_stream(&mut stream)
+                .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+        #[cfg(not(unix))]
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Unreachable(
+            "Unix sockets are unavailable".into(),
+        )),
+        WorkloadEndpoint::Tcp { host, port } => {
+            let mut stream = connect_tcp(&host, port)?;
+            monitor_memcached_stream(&mut stream)
+                .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            let stream = connect_tcp(&host, port)?;
+            let mut stream = tls_stream(stream, &host)?;
+            monitor_memcached_stream(&mut stream)
+                .map(|metrics| (connection.endpoint.clone(), metrics))
+        }
+    }
+}
+
+fn resolve_connection_secret(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<Option<String>, WorkloadProbeError> {
+    connection
+        .secret_ref
+        .as_deref()
+        .map(crate::secret::resolve_secret_reference)
+        .transpose()
+        .map_err(|_| {
+            WorkloadProbeError::Rejected("Redis authentication secret is unavailable".into())
+        })
+}
+
+fn connect_tcp(host: &str, port: u16) -> std::result::Result<TcpStream, WorkloadProbeError> {
+    let addresses = (host, port).to_socket_addrs().map_err(unreachable)?;
+    let address = addresses.into_iter().next().ok_or_else(|| {
+        WorkloadProbeError::Unreachable("workload endpoint did not resolve".into())
+    })?;
+    let stream =
+        TcpStream::connect_timeout(&address, DRIVER_CONNECT_TIMEOUT).map_err(unreachable)?;
+    set_timeouts(&stream)?;
+    Ok(stream)
+}
+
+fn set_timeouts(stream: &impl TimeoutStream) -> std::result::Result<(), WorkloadProbeError> {
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(unreachable)?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(unreachable)
+}
+
+trait TimeoutStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl TimeoutStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+#[cfg(unix)]
+impl TimeoutStream for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_write_timeout(self, timeout)
+    }
+}
+
+fn tls_stream(
+    stream: TcpStream,
+    host: &str,
+) -> std::result::Result<StreamOwned<ClientConnection, TcpStream>, WorkloadProbeError> {
+    let config = tls_client_config()?;
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| {
+        WorkloadProbeError::Malformed("TLS workload endpoint host is invalid".into())
+    })?;
+    let connection = ClientConnection::new(Arc::new(config), server_name).map_err(|_| {
+        WorkloadProbeError::Malformed("TLS workload endpoint host is invalid".into())
+    })?;
+    Ok(StreamOwned::new(connection, stream))
+}
+
+pub fn tls_client_config() -> std::result::Result<ClientConfig, WorkloadProbeError> {
+    let mut roots = RootCertStore::empty();
+    let certificates = rustls_native_certs::load_native_certs();
+    if !certificates.errors.is_empty() {
+        tracing::debug!(
+            invalid_native_roots = certificates.errors.len(),
+            "some native TLS roots could not be loaded"
+        );
+    }
+    for certificate in certificates.certs {
+        if roots.add(certificate).is_err() {
+            tracing::debug!("native TLS root could not be parsed");
+        }
+    }
+    if roots.is_empty() {
+        return Err(WorkloadProbeError::Unreachable(
+            "native TLS roots are unavailable".into(),
+        ));
+    }
+    Ok(ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }
 
 pub fn probe_memcached_server() -> std::result::Result<(), WorkloadProbeError> {
@@ -448,6 +804,54 @@ pub fn monitor_redis_stream(
     parse_redis_info(&response)
 }
 
+pub fn monitor_redis_authenticated_stream(
+    stream: &mut (impl Read + Write),
+    username: Option<&str>,
+    password: Option<&str>,
+) -> std::result::Result<RedisMetrics, RedisProbeError> {
+    if let Some(password) = password {
+        write_redis_auth(stream, username, password)?;
+    }
+    monitor_redis_stream(stream)
+}
+
+fn write_redis_auth(
+    stream: &mut (impl Read + Write),
+    username: Option<&str>,
+    password: &str,
+) -> std::result::Result<(), RedisProbeError> {
+    let arguments = username.map_or_else(
+        || vec!["AUTH", password],
+        |username| vec!["AUTH", username, password],
+    );
+    let mut request = format!("*{}\r\n", arguments.len()).into_bytes();
+    for argument in arguments {
+        request.extend_from_slice(format!("${}\r\n", argument.len()).as_bytes());
+        request.extend_from_slice(argument.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    stream.write_all(&request).map_err(unreachable)?;
+    stream.flush().map_err(unreachable)?;
+    let mut prefix = [0_u8; 1];
+    stream.read_exact(&mut prefix).map_err(unreachable)?;
+    let mut consumed = 1;
+    match prefix[0] {
+        b'+' => {
+            let _ = read_resp_line(stream, REDIS_RESPONSE_BYTES, &mut consumed)?;
+            Ok(())
+        }
+        b'-' => {
+            let _ = read_resp_line(stream, REDIS_RESPONSE_BYTES, &mut consumed)?;
+            Err(RedisProbeError::Rejected(
+                "Redis authentication failed".into(),
+            ))
+        }
+        _ => Err(RedisProbeError::Malformed(
+            "Redis AUTH returned malformed RESP".into(),
+        )),
+    }
+}
+
 pub fn read_redis_info_response(
     stream: &mut impl Read,
     response_cap: usize,
@@ -456,11 +860,8 @@ pub fn read_redis_info_response(
     let mut prefix = [0_u8; 1];
     stream.read_exact(&mut prefix).map_err(unreachable)?;
     if prefix[0] == b'-' {
-        return Err(RedisProbeError::Rejected(read_resp_line(
-            stream,
-            response_cap,
-            &mut consumed,
-        )?));
+        let _ = read_resp_line(stream, response_cap, &mut consumed)?;
+        return Err(RedisProbeError::Rejected("Redis rejected request".into()));
     }
     if prefix[0] != b'$' {
         return Err(RedisProbeError::Malformed(
@@ -795,6 +1196,7 @@ mod tests {
             },
             adapter: WorkloadAdapter::Jvm,
             driver_mode: WorkloadDriverMode::DetectOnly,
+            connection: None,
         };
         let json = serde_json::to_string(&definition).unwrap();
         assert_eq!(
@@ -817,6 +1219,131 @@ mod tests {
         }"#;
         let definition: WorkloadDefinition = serde_json::from_str(json).unwrap();
         assert_eq!(definition.driver_mode, WorkloadDriverMode::DetectOnly);
+        assert_eq!(definition.connection, None);
+    }
+
+    #[test]
+    fn legacy_workloads_toml_parses_without_a_connection() {
+        let store: WorkloadStore = toml::from_str(
+            r#"[[workloads]]
+id = "redis"
+adapter = "redis"
+
+[workloads.selector.executable]
+path = "/usr/bin/redis-server"
+"#,
+        )
+        .unwrap();
+        assert_eq!(store.workloads[0].connection, None);
+    }
+
+    #[test]
+    fn workload_connection_accepts_only_safe_endpoint_and_secret_reference_shapes() {
+        let valid = WorkloadConnectionConfig {
+            endpoint: "tls://redis.example:6380".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:REDIS_PASSWORD".into()),
+        };
+        valid.validate_for(WorkloadAdapter::Redis).unwrap();
+        assert!(matches!(
+            valid.endpoint().unwrap(),
+            WorkloadEndpoint::Tls { .. }
+        ));
+        for endpoint in [
+            "tcp://host",
+            "tcp://user@host:6379",
+            "tcp://host:6379/?x",
+            "unix://relative",
+        ] {
+            assert!(WorkloadConnectionConfig {
+                endpoint: endpoint.into(),
+                username: None,
+                secret_ref: None
+            }
+            .endpoint()
+            .is_err());
+        }
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://host:6379".into(),
+            username: None,
+            secret_ref: Some("plaintext".into())
+        }
+        .validate_for(WorkloadAdapter::Redis)
+        .is_err());
+        assert_eq!(
+            WorkloadConnectionConfig {
+                endpoint: "tcp://[::1]:6379".into(),
+                username: None,
+                secret_ref: None,
+            }
+            .endpoint()
+            .unwrap(),
+            WorkloadEndpoint::Tcp {
+                host: "::1".into(),
+                port: 6379,
+            }
+        );
+    }
+
+    #[test]
+    fn memcached_connection_rejects_authentication() {
+        let config = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:11211".into(),
+            username: None,
+            secret_ref: Some("env:MEMCACHED_PASSWORD".into()),
+        };
+        assert!(config.validate_for(WorkloadAdapter::Memcached).is_err());
+    }
+
+    #[test]
+    fn redis_auth_framing_does_not_return_secret_in_error() {
+        let mut stream = TestStream::response("-ERR invalid password secret-value\r\n");
+        let error =
+            monitor_redis_authenticated_stream(&mut stream, Some("monitor"), Some("secret-value"))
+                .unwrap_err();
+        assert!(matches!(error, RedisProbeError::Rejected(_)));
+        assert!(!error.to_string().contains("secret-value"));
+        assert_eq!(
+            stream.output,
+            b"*3\r\n$4\r\nAUTH\r\n$7\r\nmonitor\r\n$12\r\nsecret-value\r\n"
+        );
+    }
+
+    #[test]
+    fn redis_custom_connection_passes_the_validated_endpoint_to_connector() {
+        let body = concat!(
+            "connected_clients:1\r\nused_memory:2\r\n",
+            "total_commands_processed:3\r\ninstantaneous_ops_per_sec:4\r\n",
+            "keyspace_hits:5\r\nkeyspace_misses:6\r\n"
+        );
+        let response = format!("${}\r\n{}\r\n", body.len(), body);
+        let connection = WorkloadConnectionConfig {
+            endpoint: "tcp://redis.internal:6379".into(),
+            username: None,
+            secret_ref: None,
+        };
+        let metrics = monitor_redis_with_connector(&connection, |endpoint| {
+            assert_eq!(
+                endpoint,
+                &WorkloadEndpoint::Tcp {
+                    host: "redis.internal".into(),
+                    port: 6379
+                }
+            );
+            Ok(TestStream::response(&response))
+        })
+        .unwrap();
+        assert_eq!(metrics.connected_clients, 1);
+    }
+
+    #[test]
+    fn tls_config_uses_native_roots_without_a_network_connection() {
+        let result = tls_client_config();
+        assert!(
+            result.is_ok(),
+            "native TLS roots must construct a client config"
+        );
+        assert!(ServerName::try_from("redis.example".to_string()).is_ok());
     }
 
     #[test]
@@ -881,7 +1408,7 @@ mod tests {
     fn redis_probe_rejects_noauth_and_malformed_responses() {
         assert!(matches!(
             read_redis_info_response(&mut Cursor::new(b"-NOAUTH Authentication required.\r\n"), 128),
-            Err(RedisProbeError::Rejected(detail)) if detail.contains("NOAUTH")
+            Err(RedisProbeError::Rejected(detail)) if detail == "Redis rejected request"
         ));
         assert!(matches!(
             read_redis_info_response(&mut Cursor::new(b"+OK\r\n"), 32),

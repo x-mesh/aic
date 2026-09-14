@@ -396,9 +396,14 @@ unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successf
 
 `inspect_ready` only confirms local read-only access. It does not collect service metrics.
 
-`aic workload monitor <id> --json` runs one local monitor probe from the shell. It has no
-`aic chat` slash-command form. Redis uses fixed local sockets or `127.0.0.1:6379` and sends one
-read-only `INFO` request. Memcached uses `127.0.0.1:11211` and sends one `stats` request.
+`aic workload monitor <id> --json` runs one monitor probe from the shell. It has no
+`aic chat` slash-command form. Definitions without a connection use fixed local endpoints.
+Use `aic workload enable <id> --fingerprint <value> --endpoint <scheme://target>` to save an explicit endpoint.
+Use only `unix:///absolute/path`, `tcp://host:port`, or `tls://host:port` endpoints.
+Use brackets for IPv6, for example `tcp://[::1]:6379`.
+An explicit endpoint authorizes outbound connections to that host and port.
+Redis accepts `--auth-env NAME` or `--auth-keychain ACCOUNT`, and an optional `--username`.
+Memcached rejects authentication options. TLS uses native host roots and validates the endpoint host.
 Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
 `instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
 `curr_connections`, `bytes`, `cmd_get`, `cmd_set`, `get_hits`, `get_misses`, and `evictions`.
@@ -407,7 +412,8 @@ Memcached responses must end with `END`. The probe sets `monitor_ready: true` on
 all required metrics.
 
 `aicd` probes one configured Redis definition and one configured Memcached definition every 60 seconds.
-It uses the fixed Redis socket paths or `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached.
+It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
+`127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

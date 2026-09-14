@@ -662,6 +662,15 @@ enum WorkloadOp {
         candidate_id: String,
         #[arg(long)]
         fingerprint: String,
+        /// Explicit unix://, tcp://, or tls:// workload endpoint.
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long, conflicts_with = "auth_keychain")]
+        auth_env: Option<String>,
+        #[arg(long, conflicts_with = "auth_env")]
+        auth_keychain: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1462,14 +1471,32 @@ fn handle_workload(op: WorkloadOp) {
         WorkloadOp::Enable {
             candidate_id,
             fingerprint,
+            endpoint,
+            username,
+            auth_env,
+            auth_keychain,
             json,
-        } => workload::enable(&candidate_id, &fingerprint).map(|definition| {
+        } => {
+            let connection = match endpoint {
+                Some(endpoint) => Ok(Some(aic_common::workload::WorkloadConnectionConfig {
+                    endpoint,
+                    username,
+                    secret_ref: auth_env.map(|name| format!("env:{name}"))
+                        .or_else(|| auth_keychain.map(|account| format!("keychain:{account}"))),
+                })),
+                None if username.is_some() || auth_env.is_some() || auth_keychain.is_some() => {
+                    Err(anyhow::anyhow!("--username, --auth-env, and --auth-keychain require --endpoint"))
+                }
+                None => Ok(None),
+            };
+            connection.and_then(|connection| workload::enable_with_connection(&candidate_id, &fingerprint, connection)).map(|definition| {
             if json {
                 serde_json::json!({ "configured": definition }).to_string()
             } else {
                 format!("configured {}", definition.id)
             }
-        }),
+            })
+        }
     };
     match result {
         Ok(output) => println!("{output}"),
