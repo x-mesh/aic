@@ -365,7 +365,8 @@ RabbitMQ를 실행한 Erlang VM 명령행도 분류합니다.
 각 workload에는 `detect_only`, `inspect_ready`, `monitor_ready` driver mode가 있습니다.
 
 발견 단계는 `detect_only` driver를 만듭니다. Nginx는 알려진 로컬 설정 파일의 읽기 접근을, Redis는
-로컬 socket 또는 `127.0.0.1:6379`의 bounded `INFO SERVER` 요청을, PostgreSQL은 로컬 socket 또는
+로컬 socket 또는 `127.0.0.1:6379`의 bounded `INFO SERVER` 요청을, Memcached는 `127.0.0.1:11211`의
+bounded `stats` 요청을, PostgreSQL은 로컬 socket 또는
 `127.0.0.1:5432` 연결을 확인합니다. 검사에 성공하면 해당 후보를 `inspect_ready`로 표시합니다.
 이 검사는 설정 내용, 자격 증명, 원격 endpoint를 읽거나 사용하지 않습니다.
 
@@ -373,17 +374,23 @@ RabbitMQ를 실행한 Erlang VM 명령행도 분류합니다.
 
 `inspect_ready`는 read-only 접근 조건만 확인하며, 서비스 지표는 수집하지 않습니다.
 
-`aic workload monitor <id> --json`은 셸에서 실행하는 Redis용 단발 monitor probe이며, `aic chat`
-slash 명령 형태는 없습니다. 고정된 로컬 Redis socket 또는 `127.0.0.1:6379`에 연결해 read-only
-`INFO` 요청을 한 번 보내고, `connected_clients`, `used_memory`, `total_commands_processed`,
-`instantaneous_ops_per_sec`, `keyspace_hits`, `keyspace_misses` 여섯 가지 지표를 반환합니다. 연결,
-요청, 지표 파싱이 모두 성공할 때만 `monitor_ready: true`를 반환합니다.
+`aic workload monitor <id> --json`은 셸에서 실행하는 단발 monitor probe이며, `aic chat` slash 명령
+형태는 없습니다. Redis는 고정된 로컬 socket 또는 `127.0.0.1:6379`에 연결해 read-only `INFO` 요청을
+한 번 보냅니다. Memcached는 `127.0.0.1:11211`에 연결해 `stats` 요청을 한 번 보냅니다. Redis는
+`connected_clients`, `used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`,
+`keyspace_hits`, `keyspace_misses`를 반환합니다. Memcached는 `curr_connections`, `bytes`, `cmd_get`,
+`cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. 연결, 읽기, 쓰기 제한은 각각 200ms이고
+응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
+`monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis 정의가 하나일 때 60초마다 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 probe합니다.
+`aicd`는 Redis 정의와 Memcached 정의가 각각 하나일 때 60초마다 probe합니다. Redis는 고정 로컬 socket
+경로 또는 `127.0.0.1:6379`를 사용하고 Memcached는 `127.0.0.1:11211`을 사용합니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 
-Redis 정의가 둘 이상이면 수집하지 않습니다. `aic workload status [--json]`와 `aic workload history <id> [--limit N] [--json]`는 `aicd` 없이 이 파일을 읽습니다.
+같은 adapter의 정의가 둘 이상이면 해당 adapter만 수집하지 않습니다. Redis와 Memcached sample은 같은
+history 파일에 저장하고 기존 Redis JSON sample도 읽습니다. `aic workload status [--json]`와
+`aic workload history <id> [--limit N] [--json]`는 `aicd` 없이 이 파일을 읽습니다.
 
 인증, 사용자 지정 endpoint, PostgreSQL 지표, 원격 전송은 지원하지 않습니다.
 

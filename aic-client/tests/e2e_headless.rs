@@ -162,8 +162,9 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        RedisMetrics, RedisSampleOutcome, RedisWorkloadSample, WorkloadAdapter, WorkloadDefinition,
-        WorkloadDriverMode, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        MemcachedMetrics, WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics,
+        WorkloadSample, WorkloadSampleOutcome, WorkloadSelector, WorkloadStore,
+        WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -179,7 +180,7 @@ fn workload_status_and_history_read_local_history() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("cfg/aic");
     std::fs::create_dir_all(&config_dir).unwrap();
-    let definition = WorkloadDefinition {
+    let redis_definition = WorkloadDefinition {
         id: "redis-test".into(),
         selector: WorkloadSelector::Executable {
             path: "/usr/bin/redis-server".into(),
@@ -187,35 +188,60 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Redis,
         driver_mode: WorkloadDriverMode::MonitorReady,
     };
+    let memcached_definition = WorkloadDefinition {
+        id: "memcached-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/memcached".into(),
+        },
+        adapter: WorkloadAdapter::Memcached,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
-            workloads: vec![definition],
+            workloads: vec![redis_definition, memcached_definition],
         })
         .unwrap(),
     )
     .unwrap();
     let state_dir = tmp.path().join("state/aic");
     std::fs::create_dir_all(&state_dir).unwrap();
-    let sample = RedisWorkloadSample {
+    let memcached_sample = WorkloadSample {
         schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
-        workload_id: "redis-test".into(),
+        workload_id: "memcached-test".into(),
         captured_at: Utc::now() - Duration::minutes(10),
-        outcome: RedisSampleOutcome::Collected {
-            endpoint: "127.0.0.1:6379".into(),
-            metrics: RedisMetrics {
-                connected_clients: 1,
-                used_memory: 2,
-                total_commands_processed: 3,
-                instantaneous_ops_per_sec: 4,
-                keyspace_hits: 5,
-                keyspace_misses: 6,
-            },
+        adapter: WorkloadAdapter::Memcached,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "127.0.0.1:11211".into(),
+            metrics: WorkloadMetrics::Memcached(MemcachedMetrics {
+                curr_connections: 1,
+                bytes: 2,
+                cmd_get: 3,
+                cmd_set: 4,
+                get_hits: 5,
+                get_misses: 6,
+                evictions: 7,
+            }),
         },
     };
+    let legacy_redis_sample = serde_json::json!({
+        "schema_version": WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        "workload_id": "redis-test",
+        "captured_at": (Utc::now() - Duration::minutes(10)).to_rfc3339(),
+        "outcome": "collected",
+        "endpoint": "127.0.0.1:6379",
+        "metrics": {
+            "connected_clients": 1, "used_memory": 2, "total_commands_processed": 3,
+            "instantaneous_ops_per_sec": 4, "keyspace_hits": 5, "keyspace_misses": 6
+        }
+    });
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
-        format!("{}\nnot-json\n", serde_json::to_string(&sample).unwrap()),
+        format!(
+            "{}\n{}\nnot-json\n",
+            legacy_redis_sample,
+            serde_json::to_string(&memcached_sample).unwrap()
+        ),
     )
     .unwrap();
 
@@ -229,7 +255,11 @@ fn workload_status_and_history_read_local_history() {
         String::from_utf8_lossy(&status.stderr)
     );
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["workloads"][0]["state"], "stale");
+    assert!(status["workloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|workload| workload["state"] == "stale"));
 
     let history = aic_cmd(tmp.path())
         .args(["workload", "history", "redis-test", "--json"])
@@ -238,6 +268,16 @@ fn workload_status_and_history_read_local_history() {
     assert!(history.status.success());
     let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     assert_eq!(history["samples"].as_array().unwrap().len(), 1);
+    assert_eq!(history["samples"][0]["adapter"], "redis");
+
+    let memcached_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "memcached-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(memcached_history.status.success());
+    let memcached_history: serde_json::Value =
+        serde_json::from_slice(&memcached_history.stdout).unwrap();
+    assert_eq!(memcached_history["samples"][0]["adapter"], "memcached");
 
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])

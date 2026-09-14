@@ -1,9 +1,10 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_redis, workload_history_path, workloads_file_path, ProposalCost,
-    ProposalReadiness, RedisMonitorReport, RedisWorkloadSample, WorkloadStore,
-    REDIS_SAMPLE_INTERVAL,
+    load_workload_history, monitor_memcached, monitor_redis, workload_history_path,
+    workloads_file_path, MemcachedMonitorReport, ProposalCost, ProposalReadiness,
+    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
+    WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -225,6 +226,7 @@ pub fn inspect_driver(candidate: &WorkloadCandidate) -> DriverInspection {
     let evidence = match candidate.adapter {
         WorkloadAdapter::Nginx => probe_nginx_config(),
         WorkloadAdapter::Redis => probe_redis(),
+        WorkloadAdapter::Memcached => probe_memcached(),
         WorkloadAdapter::PostgreSql => probe_postgres(),
         _ => None,
     };
@@ -261,6 +263,12 @@ fn probe_redis() -> Option<String> {
         .map(|_| "Redis INFO SERVER accepted at fixed local endpoint".to_string())
 }
 
+fn probe_memcached() -> Option<String> {
+    aic_common::workload::probe_memcached_server()
+        .ok()
+        .map(|_| "Memcached stats accepted at fixed local endpoint".to_string())
+}
+
 fn probe_postgres() -> Option<String> {
     #[cfg(unix)]
     for path in POSTGRES_SOCKET_PATHS {
@@ -291,43 +299,69 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
     probe_postgres_stream(&mut stream)
 }
 
-pub fn monitor_redis_candidate(candidate_id: &str) -> Result<RedisMonitorReport> {
+pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
     let report = discover_for_monitor()?;
-    let candidate = select_redis_monitor_candidate(&report, candidate_id)?;
-    if candidate.adapter != WorkloadAdapter::Redis {
-        bail!("workload candidate is not Redis");
-    }
-    let (_, metrics) = monitor_redis()
-        .map_err(anyhow::Error::msg)
-        .context("Redis monitor probe failed")?;
-    Ok(RedisMonitorReport {
-        candidate_id: candidate.id.clone(),
-        monitor_ready: true,
-        metrics,
-    })
+    let candidate = select_monitor_candidate(&report, candidate_id)?;
+    let report = match candidate.adapter {
+        WorkloadAdapter::Redis => WorkloadMonitorReport::Redis(RedisMonitorReport {
+            candidate_id: candidate.id.clone(),
+            monitor_ready: true,
+            metrics: monitor_redis()
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::Redis, error))?,
+        }),
+        WorkloadAdapter::Memcached => WorkloadMonitorReport::Memcached(MemcachedMonitorReport {
+            candidate_id: candidate.id.clone(),
+            adapter: WorkloadAdapter::Memcached,
+            monitor_ready: true,
+            metrics: monitor_memcached()
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::Memcached, error))?,
+        }),
+        _ => bail!("workload candidate does not support monitoring"),
+    };
+    Ok(report)
 }
 
-fn select_redis_monitor_candidate<'a>(
+fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> anyhow::Error {
+    let adapter_name = match adapter {
+        WorkloadAdapter::Redis => "Redis",
+        WorkloadAdapter::Memcached => "Memcached",
+        _ => "Workload",
+    };
+    let detail = match error {
+        WorkloadProbeError::Unreachable(_) => "endpoint is unavailable",
+        WorkloadProbeError::Rejected(_) => "rejected the monitor request",
+        WorkloadProbeError::Malformed(_) => "returned an invalid monitor response",
+    };
+    anyhow::anyhow!("{adapter_name} monitor probe failed: {detail}")
+}
+
+fn select_monitor_candidate<'a>(
     report: &'a DiscoveryReport,
     candidate_id: &str,
 ) -> Result<&'a WorkloadCandidate> {
-    let redis_candidates = report
+    let candidate = report
         .candidates
         .iter()
-        .filter(|candidate| candidate.adapter == WorkloadAdapter::Redis)
-        .collect::<Vec<_>>();
-    if redis_candidates.len() != 1 {
-        bail!(
-            "Redis monitor requires exactly one unambiguous candidate, found {}",
-            redis_candidates.len()
-        );
-    }
-    let candidate = redis_candidates[0];
-    if candidate.id != candidate_id {
-        bail!("requested workload candidate does not match the discovered Redis candidate");
+        .find(|candidate| candidate.id == candidate_id)
+        .ok_or_else(|| anyhow::anyhow!("requested workload candidate was not discovered"))?;
+    if !matches!(
+        candidate.adapter,
+        WorkloadAdapter::Redis | WorkloadAdapter::Memcached
+    ) {
+        bail!("workload candidate does not support monitoring");
     }
     if !candidate.ambiguity.is_empty() {
-        bail!("Redis monitor candidate is ambiguous");
+        bail!("workload monitor candidate is ambiguous");
+    }
+    let count = report
+        .candidates
+        .iter()
+        .filter(|other| other.adapter == candidate.adapter)
+        .count();
+    if count != 1 {
+        bail!("workload monitor requires exactly one unambiguous adapter candidate, found {count}");
     }
     Ok(candidate)
 }
@@ -729,7 +763,7 @@ pub fn list_configured() -> Result<Vec<WorkloadDefinition>> {
     Ok(store.workloads)
 }
 
-pub const STALE_AFTER: Duration = REDIS_SAMPLE_INTERVAL.saturating_mul(3);
+pub const STALE_AFTER: Duration = WORKLOAD_SAMPLE_INTERVAL.saturating_mul(3);
 pub const DEFAULT_HISTORY_LIMIT: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -760,23 +794,22 @@ pub struct WorkloadStatusEntry {
     pub adapter: WorkloadAdapter,
     pub driver_mode: WorkloadDriverMode,
     pub state: CollectionState,
-    pub last_sample: Option<RedisWorkloadSample>,
+    pub last_sample: Option<WorkloadSample>,
     pub age_secs: Option<u64>,
 }
 
 pub fn derive_status(
     definitions: &[WorkloadDefinition],
-    samples: &[RedisWorkloadSample],
+    samples: &[WorkloadSample],
     now: DateTime<Utc>,
 ) -> Vec<WorkloadStatusEntry> {
-    let redis_count = definitions
-        .iter()
-        .filter(|definition| definition.adapter == WorkloadAdapter::Redis)
-        .count();
     definitions
         .iter()
         .map(|definition| {
-            if definition.adapter != WorkloadAdapter::Redis {
+            if !matches!(
+                definition.adapter,
+                WorkloadAdapter::Redis | WorkloadAdapter::Memcached
+            ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
                     adapter: definition.adapter,
@@ -788,7 +821,9 @@ pub fn derive_status(
             }
             let last_sample = samples
                 .iter()
-                .filter(|sample| sample.workload_id == definition.id)
+                .filter(|sample| {
+                    sample.workload_id == definition.id && sample.adapter == definition.adapter
+                })
                 .max_by_key(|sample| sample.captured_at)
                 .cloned();
             let age_secs = last_sample.as_ref().map(|sample| {
@@ -796,7 +831,12 @@ pub fn derive_status(
                     .num_seconds()
                     .max(0) as u64
             });
-            let state = if redis_count > 1 {
+            let state = if definitions
+                .iter()
+                .filter(|other| other.adapter == definition.adapter)
+                .count()
+                > 1
+            {
                 CollectionState::AmbiguousDefinitions
             } else if let Some(age_secs) = age_secs {
                 if Duration::from_secs(age_secs) > STALE_AFTER {
@@ -825,7 +865,7 @@ pub fn status() -> Result<Vec<WorkloadStatusEntry>> {
     Ok(derive_status(&definitions, &samples, Utc::now()))
 }
 
-pub fn history(workload_id: &str, limit: usize) -> Result<Vec<RedisWorkloadSample>> {
+pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
     if !list_configured()?
         .iter()
         .any(|definition| definition.id == workload_id)
@@ -1333,14 +1373,14 @@ mod tests {
     }
 
     #[test]
-    fn redis_monitor_selects_the_single_matching_unambiguous_candidate() {
+    fn monitor_selects_the_single_matching_unambiguous_candidate() {
         let report = redis_report(vec![redis_candidate("redis-a", &[])]);
-        let selected = select_redis_monitor_candidate(&report, "redis-a").unwrap();
+        let selected = select_monitor_candidate(&report, "redis-a").unwrap();
         assert_eq!(selected.id, "redis-a");
     }
 
     #[test]
-    fn redis_monitor_fails_closed_for_zero_multiple_mismatched_or_ambiguous_candidates() {
+    fn monitor_fails_closed_for_zero_multiple_mismatched_or_ambiguous_candidates() {
         let cases = [
             (redis_report(Vec::new()), "redis-a"),
             (
@@ -1363,17 +1403,38 @@ mod tests {
             ),
         ];
         for (report, candidate_id) in cases {
-            assert!(select_redis_monitor_candidate(&report, candidate_id).is_err());
+            assert!(select_monitor_candidate(&report, candidate_id).is_err());
         }
     }
 
-    fn sample(workload_id: &str, captured_at: DateTime<Utc>) -> RedisWorkloadSample {
-        RedisWorkloadSample {
+    #[test]
+    fn monitor_errors_do_not_expose_probe_details() {
+        let error = safe_monitor_error(
+            WorkloadAdapter::Memcached,
+            WorkloadProbeError::Rejected("CLIENT_ERROR token=secret".into()),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Memcached monitor probe failed: rejected the monitor request"
+        );
+    }
+
+    fn sample(workload_id: &str, captured_at: DateTime<Utc>) -> WorkloadSample {
+        sample_for_adapter(workload_id, WorkloadAdapter::Redis, captured_at)
+    }
+
+    fn sample_for_adapter(
+        workload_id: &str,
+        adapter: WorkloadAdapter,
+        captured_at: DateTime<Utc>,
+    ) -> WorkloadSample {
+        WorkloadSample {
             schema_version: aic_common::workload::WORKLOAD_SAMPLE_SCHEMA_VERSION,
             workload_id: workload_id.into(),
             captured_at,
-            outcome: aic_common::workload::RedisSampleOutcome::Failed {
-                reason: aic_common::workload::RedisSampleFailure::Unreachable,
+            adapter,
+            outcome: aic_common::workload::WorkloadSampleOutcome::Failed {
+                reason: aic_common::workload::WorkloadSampleFailure::Unreachable,
                 detail: "unavailable".into(),
             },
         }
@@ -1386,6 +1447,17 @@ mod tests {
                 path: format!("/usr/bin/{id}"),
             },
             adapter: WorkloadAdapter::Redis,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+        }
+    }
+
+    fn memcached_definition(id: &str) -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: id.into(),
+            selector: WorkloadSelector::Executable {
+                path: format!("/usr/bin/{id}"),
+            },
+            adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
         }
     }
@@ -1428,6 +1500,22 @@ mod tests {
             .state,
             CollectionState::AmbiguousDefinitions
         );
+        let memcached = memcached_definition("memcached");
+        let states = derive_status(
+            &[
+                definition.clone(),
+                redis_definition("redis-two"),
+                memcached.clone(),
+            ],
+            &[sample_for_adapter(
+                "memcached",
+                WorkloadAdapter::Memcached,
+                now,
+            )],
+            now,
+        );
+        assert_eq!(states[0].state, CollectionState::AmbiguousDefinitions);
+        assert_eq!(states[2].state, CollectionState::Fresh);
     }
 
     #[cfg(unix)]
