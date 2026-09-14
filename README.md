@@ -393,8 +393,17 @@ unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successf
 
 `/workload inspect` shows the local evidence and pending driver checks.
 
-The current implementation does not collect service metrics. `inspect_ready` only confirms local
-read-only access. Redis `INFO` collection and PostgreSQL `pg_stat_*` queries need a
+`inspect_ready` only confirms local read-only access. It does not collect service metrics.
+
+`aic workload monitor <id> --json` runs one Redis monitor probe from the shell. It has no
+`aic chat` slash-command form. It connects to a fixed local Redis socket or `127.0.0.1:6379` and
+sends one read-only `INFO` request. It returns six typed metrics: `connected_clients`,
+`used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`, `keyspace_hits`, and
+`keyspace_misses`. The probe sets `monitor_ready: true` only when the connection, the request, and
+the metric parse all succeed.
+
+The command does not support authentication, a custom endpoint, periodic collection, or
+persistence. It does not write to `workloads.toml`. PostgreSQL `pg_stat_*` collection still needs a
 `monitor_ready` driver.
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
