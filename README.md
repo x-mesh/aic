@@ -483,6 +483,7 @@ Nginx returns `active_connections`, `accepts_total`, `handled_total`, `requests_
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 16 KiB limit.
 The client does not follow redirects. AIC does not change or reload Nginx configuration. Custom status paths are unsupported.
 The HAProxy adapter requires an explicit Unix stats socket with user-level read and write access.
+It runs on Unix targets that support atomic close-on-exec socket creation. It fails closed on macOS.
 It sends only `show stat` and stores `local-unix-socket` as the history endpoint label.
 It aggregates frontend counters and counts server rows with a down status.
 HAProxy returns `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,

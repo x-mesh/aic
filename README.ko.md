@@ -450,6 +450,7 @@ TLS는 native host root를 사용합니다. `active_connections`, `accepts_total
 16KiB입니다. redirect는 따르지 않습니다. AIC는 Nginx 설정을 변경하거나 reload하지 않습니다. custom status
 path는 지원하지 않습니다.
 HAProxy adapter는 사용자 수준의 읽기·쓰기 권한이 있는 explicit Unix stats socket이 필요합니다. `show stat`만
+atomic close-on-exec socket 생성을 지원하는 Unix에서 동작하며 macOS에서는 fail closed합니다.
 전송하고 history endpoint에는 socket path 대신 `local-unix-socket`을 저장합니다. frontend counter를 합산하고
 down 상태인 server row를 셉니다. `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
 `denied_requests_total`, `denied_responses_total`, `failed_connections_total`, `retry_warnings_total`,
