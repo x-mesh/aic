@@ -85,6 +85,10 @@ pub fn load_opensearch_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::OpenSearch)
 }
 
+pub fn load_rabbitmq_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::RabbitMq)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -199,6 +203,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Etcd => "etcd endpoint is unavailable",
         WorkloadAdapter::Elasticsearch => "Elasticsearch endpoint is unavailable",
         WorkloadAdapter::OpenSearch => "OpenSearch endpoint is unavailable",
+        WorkloadAdapter::RabbitMq => "RabbitMQ management endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -215,6 +220,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Etcd => "etcd rejected the metrics request",
         WorkloadAdapter::Elasticsearch => "Elasticsearch rejected the cluster stats request",
         WorkloadAdapter::OpenSearch => "OpenSearch rejected the cluster stats request",
+        WorkloadAdapter::RabbitMq => "RabbitMQ rejected the overview request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -231,6 +237,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Etcd => "etcd returned an invalid metrics response",
         WorkloadAdapter::Elasticsearch => "Elasticsearch returned invalid cluster stats",
         WorkloadAdapter::OpenSearch => "OpenSearch returned invalid cluster stats",
+        WorkloadAdapter::RabbitMq => "RabbitMQ returned an invalid overview response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -333,6 +340,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::Etcd,
                     WorkloadAdapter::Elasticsearch,
                     WorkloadAdapter::OpenSearch,
+                    WorkloadAdapter::RabbitMq,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -545,6 +553,17 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::RabbitMq => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_rabbitmq_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::RabbitMq(metrics)))
+                    },
+                    Utc::now(),
+                ),
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -573,7 +592,7 @@ mod tests {
     use super::*;
     use aic_common::workload::{
         ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics,
-        OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RedisMetrics,
+        OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics, RedisMetrics,
         WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
     };
 
@@ -821,6 +840,33 @@ mod tests {
             store_size_bytes: 6,
             fs_total_bytes: 8,
             fs_available_bytes: 7,
+        }
+    }
+
+    fn rabbitmq_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "rabbitmq".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/sbin/rabbitmq-server".into(),
+            },
+            adapter: WorkloadAdapter::RabbitMq,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
+        }
+    }
+
+    fn rabbitmq_metrics() -> RabbitMqMetrics {
+        RabbitMqMetrics {
+            messages: 1,
+            messages_ready: 1,
+            messages_unacknowledged: 0,
+            queues: 2,
+            connections: 3,
+            channels: 4,
+            consumers: 5,
+            exchanges: 6,
+            message_stats_publish_total: 7,
+            message_stats_deliver_get_total: 8,
         }
     }
 
@@ -1078,6 +1124,28 @@ mod tests {
         assert_eq!(
             load_opensearch_definition(&path),
             DefinitionsState::One(search_definition(WorkloadAdapter::OpenSearch))
+        );
+    }
+
+    #[test]
+    fn rabbitmq_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![rabbitmq_definition(), rabbitmq_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_rabbitmq_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
         );
     }
 
@@ -1647,6 +1715,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rabbitmq_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &rabbitmq_definition(),
+            || {
+                Ok((
+                    "http://127.0.0.1:15672/api/overview".into(),
+                    WorkloadMetrics::RabbitMq(rabbitmq_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::RabbitMq,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::RabbitMq(_),
+                    ..
+                },
+                ..
+            })
+        ));
+        let failed = collect_once(
+            &cfg,
+            &rabbitmq_definition(),
+            || Err(WorkloadProbeError::Rejected("realm secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected RabbitMQ failure");
+        };
+        assert_eq!(detail, "RabbitMQ rejected the overview request");
+        assert!(!detail.contains("secret"));
     }
 
     #[test]

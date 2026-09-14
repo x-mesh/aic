@@ -468,6 +468,14 @@ Optional Basic authentication requires both `--username` and one secret option.
 Use a least-privilege monitoring user. TLS uses native host roots.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
 The clients do not follow redirects. They do not support API keys, SigV4, private CAs, mTLS, custom paths, queries, searches, or node stats.
+The RabbitMQ adapter requires the `rabbitmq_management` plugin. It uses `127.0.0.1:15672` by default.
+It sends fixed `GET /api/overview` requests. Optional Basic authentication requires TLS and both credential fields.
+Use a dedicated user with the `monitoring` tag. Administrator access is not required.
+RabbitMQ returns `messages`, `messages_ready`, `messages_unacknowledged`, `queues`, `connections`,
+`channels`, `consumers`, `exchanges`, `message_stats_publish_total`, and `message_stats_deliver_get_total`.
+Missing optional message counters use zero. TLS uses native host roots.
+Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
+The client does not follow redirects. It does not support AMQP port 5672, vhost selection, private CAs, mTLS, or custom APIs.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
