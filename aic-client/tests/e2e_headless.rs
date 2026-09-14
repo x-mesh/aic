@@ -887,13 +887,13 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     } else if prometheus {
         "endpoint = \"tcp://127.0.0.1:19090\""
     } else if clickhouse {
-        "endpoint = \"tcp://127.0.0.1:18123\""
+        "endpoint = \"tls://127.0.0.1:18123\""
     } else if etcd {
         "endpoint = \"tcp://127.0.0.1:12379\""
     } else if elasticsearch {
-        "endpoint = \"tcp://127.0.0.1:19200\""
+        "endpoint = \"tls://127.0.0.1:19200\""
     } else if opensearch {
-        "endpoint = \"tcp://127.0.0.1:19201\""
+        "endpoint = \"tls://127.0.0.1:19201\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));
