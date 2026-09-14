@@ -162,8 +162,8 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, WorkloadAdapter,
-        WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
+        MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics,
+        WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
         WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
@@ -243,6 +243,21 @@ fn workload_status_and_history_read_local_history() {
             auth_source: Some("admin".into()),
         }),
     };
+    let prometheus_definition = WorkloadDefinition {
+        id: "prometheus-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/prometheus".into(),
+        },
+        adapter: WorkloadAdapter::Prometheus,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:9090".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -252,6 +267,7 @@ fn workload_status_and_history_read_local_history() {
                 postgresql_definition,
                 mysql_definition,
                 mongodb_definition,
+                prometheus_definition,
             ],
         })
         .unwrap(),
@@ -353,15 +369,35 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let prometheus_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "prometheus-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::Prometheus,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:9090".into(),
+            metrics: WorkloadMetrics::Prometheus(PrometheusMetrics {
+                config_last_reload_successful: 1,
+                tsdb_head_series: 2,
+                tsdb_head_chunks: 3,
+                tsdb_head_samples_appended_total: 4,
+                engine_queries: 5,
+                process_resident_memory_bytes: 6,
+                process_virtual_memory_bytes: 7,
+                go_goroutines: 8,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
             serde_json::to_string(&mysql_sample).unwrap(),
-            serde_json::to_string(&mongodb_sample).unwrap()
+            serde_json::to_string(&mongodb_sample).unwrap(),
+            serde_json::to_string(&prometheus_sample).unwrap()
         ),
     )
     .unwrap();
@@ -432,6 +468,19 @@ fn workload_status_and_history_read_local_history() {
         10
     );
 
+    let prometheus_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "prometheus-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(prometheus_history.status.success());
+    let prometheus_history: serde_json::Value =
+        serde_json::from_slice(&prometheus_history.stdout).unwrap();
+    assert_eq!(prometheus_history["samples"][0]["adapter"], "prometheus");
+    assert_eq!(
+        prometheus_history["samples"][0]["metrics"]["go_goroutines"],
+        8
+    );
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -463,6 +512,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let postgresql = candidate["adapter"] == "postgre_sql";
     let mysql = candidate["adapter"] == "my_sql";
     let mongodb = candidate["adapter"] == "mongo_db";
+    let prometheus = candidate["adapter"] == "prometheus";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -485,6 +535,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "tcp://127.0.0.1:3306"
         } else if mongodb {
             "tcp://127.0.0.1:27017"
+        } else if prometheus {
+            "tcp://127.0.0.1:19090"
         } else {
             "tcp://127.0.0.1:16379"
         },
@@ -517,6 +569,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "endpoint = \"tcp://127.0.0.1:3306\""
     } else if mongodb {
         "endpoint = \"tcp://127.0.0.1:27017\""
+    } else if prometheus {
+        "endpoint = \"tcp://127.0.0.1:19090\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));

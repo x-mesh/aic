@@ -65,6 +65,10 @@ pub fn load_mongodb_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::MongoDb)
 }
 
+pub fn load_prometheus_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::Prometheus)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -174,6 +178,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::PostgreSql => "PostgreSQL endpoint is unavailable",
         WorkloadAdapter::MySql => "MySQL endpoint is unavailable",
         WorkloadAdapter::MongoDb => "MongoDB endpoint is unavailable",
+        WorkloadAdapter::Prometheus => "Prometheus endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -185,6 +190,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::PostgreSql => "PostgreSQL rejected the statistics request",
         WorkloadAdapter::MySql => "MySQL rejected the statistics request",
         WorkloadAdapter::MongoDb => "MongoDB rejected the serverStatus request",
+        WorkloadAdapter::Prometheus => "Prometheus rejected the metrics request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -196,6 +202,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::PostgreSql => "PostgreSQL returned an invalid statistics response",
         WorkloadAdapter::MySql => "MySQL returned an invalid statistics response",
         WorkloadAdapter::MongoDb => "MongoDB returned an invalid serverStatus response",
+        WorkloadAdapter::Prometheus => "Prometheus returned an invalid metrics response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -293,6 +300,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::PostgreSql,
                     WorkloadAdapter::MySql,
                     WorkloadAdapter::MongoDb,
+                    WorkloadAdapter::Prometheus,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -448,6 +456,17 @@ fn start_collection_thread(
                         Utc::now(),
                     ),
                 },
+                WorkloadAdapter::Prometheus => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_prometheus_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::Prometheus(metrics)))
+                    },
+                    Utc::now(),
+                ),
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -475,8 +494,8 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, RedisMetrics, WorkloadConnectionConfig,
-        WorkloadDriverMode, WorkloadSelector,
+        MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics, RedisMetrics,
+        WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -601,6 +620,31 @@ mod tests {
             network_bytes_out: 8,
             network_num_requests: 9,
             uptime_seconds: 10,
+        }
+    }
+
+    fn prometheus_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "prometheus".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/prometheus".into(),
+            },
+            adapter: WorkloadAdapter::Prometheus,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
+        }
+    }
+
+    fn prometheus_metrics() -> PrometheusMetrics {
+        PrometheusMetrics {
+            config_last_reload_successful: 1,
+            tsdb_head_series: 2,
+            tsdb_head_chunks: 3,
+            tsdb_head_samples_appended_total: 4,
+            engine_queries: 5,
+            process_resident_memory_bytes: 6,
+            process_virtual_memory_bytes: 7,
+            go_goroutines: 8,
         }
     }
 
@@ -756,6 +800,32 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_mongodb_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn prometheus_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![
+                    prometheus_definition(),
+                    prometheus_definition(),
+                    definition(),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_prometheus_definition(&path),
             DefinitionsState::Ambiguous(2)
         );
         assert_eq!(
@@ -1129,6 +1199,56 @@ mod tests {
             panic!("expected failed MongoDB sample");
         };
         assert_eq!(detail, "MongoDB rejected the serverStatus request");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn prometheus_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &prometheus_definition(),
+            || {
+                Ok((
+                    "http://127.0.0.1:9090/metrics".into(),
+                    WorkloadMetrics::Prometheus(prometheus_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::Prometheus,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::Prometheus(_),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let failed = collect_once(
+            &cfg,
+            &prometheus_definition(),
+            || Err(WorkloadProbeError::Rejected("Authorization: secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed Prometheus sample");
+        };
+        assert_eq!(detail, "Prometheus rejected the metrics request");
         assert!(!detail.contains("secret"));
     }
 

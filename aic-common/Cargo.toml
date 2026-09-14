@@ -45,6 +45,7 @@ tokio-postgres = { version = "=0.7.15", default-features = false, features = ["r
 tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring"] }
 mysql_async = { version = "=0.37.1", default-features = false, features = ["default-rustls-ring"] }
 mongodb = { version = "=3.9.1", default-features = false, features = ["compat-3-0-0", "bson-2", "openssl-tls", "redact-errors"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 
 [dev-dependencies]
 proptest = "1"
