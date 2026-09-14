@@ -199,7 +199,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Nginx,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: Some(aic_common::workload::WorkloadConnectionConfig {
-            endpoint: "tcp://127.0.0.1:18080".into(),
+            endpoint: "tls://127.0.0.1:18080".into(),
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:NGINX_PASSWORD".into()),
             database: None,
@@ -283,7 +283,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::ClickHouse,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: Some(aic_common::workload::WorkloadConnectionConfig {
-            endpoint: "tcp://127.0.0.1:18123".into(),
+            endpoint: "tls://127.0.0.1:18123".into(),
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:CLICKHOUSE_PASSWORD".into()),
             database: None,
@@ -313,7 +313,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Elasticsearch,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: Some(aic_common::workload::WorkloadConnectionConfig {
-            endpoint: "tcp://127.0.0.1:19200".into(),
+            endpoint: "tls://127.0.0.1:19200".into(),
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:ELASTICSEARCH_PASSWORD".into()),
             database: None,
@@ -328,7 +328,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::OpenSearch,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: Some(aic_common::workload::WorkloadConnectionConfig {
-            endpoint: "tcp://127.0.0.1:19201".into(),
+            endpoint: "tls://127.0.0.1:19201".into(),
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:OPENSEARCH_PASSWORD".into()),
             database: None,
@@ -343,7 +343,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::RabbitMq,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: Some(aic_common::workload::WorkloadConnectionConfig {
-            endpoint: "tcp://127.0.0.1:15672".into(),
+            endpoint: "tls://127.0.0.1:15672".into(),
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:RABBITMQ_PASSWORD".into()),
             database: None,
@@ -827,13 +827,13 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         } else if prometheus {
             "tcp://127.0.0.1:19090"
         } else if clickhouse {
-            "tcp://127.0.0.1:18123"
+            "tls://127.0.0.1:18123"
         } else if etcd {
             "tcp://127.0.0.1:12379"
         } else if elasticsearch {
-            "tcp://127.0.0.1:19200"
+            "tls://127.0.0.1:19200"
         } else if opensearch {
-            "tcp://127.0.0.1:19201"
+            "tls://127.0.0.1:19201"
         } else {
             "tcp://127.0.0.1:16379"
         },

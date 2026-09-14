@@ -464,7 +464,7 @@ The Elasticsearch and OpenSearch adapters use `127.0.0.1:9200` by default.
 They run fixed cluster stats requests and return `nodes_total`, `indices_count`, `shards_total`,
 `shards_primaries`, `docs_count`, `docs_deleted`, `store_size_bytes`, `fs_total_bytes`, and
 `fs_available_bytes`. Each adapter tracks candidates and ambiguity independently.
-Optional Basic authentication requires both `--username` and one secret option.
+Optional Basic authentication requires TLS, `--username`, and one secret option.
 Use a least-privilege monitoring user. TLS uses native host roots.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
 The clients do not follow redirects. They do not support API keys, SigV4, private CAs, mTLS, custom paths, queries, searches, or node stats.
