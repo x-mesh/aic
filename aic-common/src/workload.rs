@@ -209,6 +209,21 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("Prometheus workload connections do not support authentication or database fields");
                 }
             }
+            WorkloadAdapter::ClickHouse => {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("ClickHouse workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some() != self.secret_ref.is_some() {
+                    anyhow::bail!("ClickHouse username and secret_ref must be provided together");
+                }
+                if self.database.is_some() || self.auth_source.is_some() {
+                    anyhow::bail!("ClickHouse workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -484,6 +499,22 @@ pub struct PrometheusMetrics {
     pub go_goroutines: u64,
 }
 
+/// Numeric metrics returned by one fixed ClickHouse system query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClickHouseMetrics {
+    pub queries: u64,
+    pub merges: u64,
+    pub part_mutations: u64,
+    pub replicated_fetches: u64,
+    pub replicated_sends: u64,
+    pub tcp_connections: u64,
+    pub http_connections: u64,
+    pub memory_tracking_bytes: u64,
+    pub uptime_seconds: u64,
+    pub memory_resident_bytes: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -496,6 +527,7 @@ pub enum WorkloadMetrics {
     MySql(MySqlMetrics),
     MongoDb(MongoDbMetrics),
     Prometheus(PrometheusMetrics),
+    ClickHouse(ClickHouseMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -547,6 +579,14 @@ pub struct PrometheusMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClickHouseMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: ClickHouseMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
@@ -555,6 +595,7 @@ pub enum WorkloadMonitorReport {
     MySql(MySqlMonitorReport),
     MongoDb(MongoDbMonitorReport),
     Prometheus(PrometheusMonitorReport),
+    ClickHouse(ClickHouseMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -573,11 +614,15 @@ pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
 pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
+pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
+pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
+pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MONGODB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PROMETHEUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const CLICKHOUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -655,6 +700,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::MySql, WorkloadMetrics::MySql(_))
                     | (WorkloadAdapter::MongoDb, WorkloadMetrics::MongoDb(_))
                     | (WorkloadAdapter::Prometheus, WorkloadMetrics::Prometheus(_))
+                    | (WorkloadAdapter::ClickHouse, WorkloadMetrics::ClickHouse(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -1512,6 +1558,180 @@ fn parse_prometheus_metrics(
 fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
     parse_exposition_u64(value).map_err(|_| {
         WorkloadProbeError::Malformed(format!("Prometheus metric is not a u64: {name}"))
+    })
+}
+
+/// Run one fixed read-only ClickHouse system query over HTTP.
+pub fn monitor_clickhouse_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, ClickHouseMetrics), WorkloadProbeError> {
+    let owned_connection = connection.cloned().unwrap_or(WorkloadConnectionConfig {
+        endpoint: format!("tcp://{CLICKHOUSE_LOOPBACK_ENDPOINT}"),
+        username: None,
+        secret_ref: None,
+        database: None,
+        auth_source: None,
+    });
+    owned_connection
+        .validate_for(WorkloadAdapter::ClickHouse)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("ClickHouse connection configuration is invalid".into())
+        })?;
+    let url = clickhouse_http_url(&owned_connection)?;
+    let secret = resolve_connection_secret(&owned_connection).map_err(|_| {
+        WorkloadProbeError::Rejected("ClickHouse authentication secret is unavailable".into())
+    })?;
+    let username = owned_connection.username.clone();
+    let endpoint = owned_connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("ClickHouse probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                CLICKHOUSE_PROBE_TIMEOUT,
+                monitor_clickhouse_async(&url, username.as_deref(), secret.as_deref()),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("ClickHouse probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("ClickHouse probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn clickhouse_http_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("ClickHouse endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => Ok(format!("http://{}:{port}/", url_host(&host))),
+        WorkloadEndpoint::Tls { host, port } => Ok(format!("https://{}:{port}/", url_host(&host))),
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "ClickHouse endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+async fn monitor_clickhouse_async(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> std::result::Result<ClickHouseMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(CLICKHOUSE_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| {
+            WorkloadProbeError::Unreachable("ClickHouse HTTP client is unavailable".into())
+        })?;
+    let mut request = client.post(url).body(CLICKHOUSE_METRICS_QUERY);
+    if let Some(username) = username {
+        request = request.basic_auth(username, password);
+    }
+    let mut response = request.send().await.map_err(|_| {
+        WorkloadProbeError::Unreachable("ClickHouse endpoint is unavailable".into())
+    })?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "ClickHouse rejected metrics query".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > CLICKHOUSE_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "ClickHouse response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        WorkloadProbeError::Unreachable("ClickHouse response could not be read".into())
+    })? {
+        if body.len().saturating_add(chunk.len()) > CLICKHOUSE_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "ClickHouse response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("ClickHouse response is not UTF-8".into()))?;
+    parse_clickhouse_metrics(body)
+}
+
+fn parse_clickhouse_metrics(
+    body: &str,
+) -> std::result::Result<ClickHouseMetrics, WorkloadProbeError> {
+    const REQUIRED: [&str; 10] = [
+        "Query",
+        "Merge",
+        "PartMutation",
+        "ReplicatedFetch",
+        "ReplicatedSend",
+        "TCPConnection",
+        "HTTPConnection",
+        "MemoryTracking",
+        "Uptime",
+        "MemoryResident",
+    ];
+    let mut values = BTreeMap::new();
+    for line in body.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let name = fields.next().unwrap_or_default();
+        let value = fields.next().ok_or_else(|| {
+            WorkloadProbeError::Malformed("ClickHouse metrics row is malformed".into())
+        })?;
+        if fields.next().is_some()
+            || !REQUIRED.contains(&name)
+            || values
+                .insert(name, parse_clickhouse_u64(value, name)?)
+                .is_some()
+        {
+            return Err(WorkloadProbeError::Malformed(
+                "ClickHouse metrics contain an unknown, duplicate, or malformed row".into(),
+            ));
+        }
+    }
+    if values.len() != REQUIRED.len() {
+        return Err(WorkloadProbeError::Malformed(
+            "ClickHouse metrics are incomplete".into(),
+        ));
+    }
+    let mut take = |name| {
+        values.remove(name).ok_or_else(|| {
+            WorkloadProbeError::Malformed(format!("ClickHouse response is missing {name}"))
+        })
+    };
+    Ok(ClickHouseMetrics {
+        queries: take("Query")?,
+        merges: take("Merge")?,
+        part_mutations: take("PartMutation")?,
+        replicated_fetches: take("ReplicatedFetch")?,
+        replicated_sends: take("ReplicatedSend")?,
+        tcp_connections: take("TCPConnection")?,
+        http_connections: take("HTTPConnection")?,
+        memory_tracking_bytes: take("MemoryTracking")?,
+        uptime_seconds: take("Uptime")?,
+        memory_resident_bytes: take("MemoryResident")?,
+    })
+}
+
+fn parse_clickhouse_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
+    value.parse::<u64>().map_err(|_| {
+        WorkloadProbeError::Malformed(format!("ClickHouse metric is not a u64: {name}"))
     })
 }
 
@@ -2441,6 +2661,12 @@ path = "/usr/bin/redis-server"
         authenticated
             .validate_for(WorkloadAdapter::MongoDb)
             .unwrap();
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://clickhouse.example:8123".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::ClickHouse)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -2659,6 +2885,121 @@ path = "/usr/bin/redis-server"
         );
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("redis".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    fn clickhouse_response() -> String {
+        [
+            "Query\t1",
+            "Merge\t2",
+            "PartMutation\t3",
+            "ReplicatedFetch\t4",
+            "ReplicatedSend\t5",
+            "TCPConnection\t6",
+            "HTTPConnection\t7",
+            "MemoryTracking\t8",
+            "Uptime\t9",
+            "MemoryResident\t10",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn clickhouse_endpoint_and_auth_contract_are_strict() {
+        let anonymous = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:8123".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        anonymous.validate_for(WorkloadAdapter::ClickHouse).unwrap();
+        assert_eq!(
+            clickhouse_http_url(&anonymous).unwrap(),
+            "http://127.0.0.1:8123/"
+        );
+        let authenticated = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:8443".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:CLICKHOUSE_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        };
+        authenticated
+            .validate_for(WorkloadAdapter::ClickHouse)
+            .unwrap();
+        assert_eq!(
+            clickhouse_http_url(&authenticated).unwrap(),
+            "https://[::1]:8443/"
+        );
+        for invalid in [
+            WorkloadConnectionConfig {
+                secret_ref: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                username: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("system".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/clickhouse.sock".into(),
+                ..authenticated
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::ClickHouse).is_err());
+        }
+    }
+
+    #[test]
+    fn clickhouse_parser_requires_exact_allowlisted_u64_rows() {
+        let metrics = parse_clickhouse_metrics(&clickhouse_response()).unwrap();
+        assert_eq!(metrics.queries, 1);
+        assert_eq!(metrics.memory_resident_bytes, 10);
+        for invalid in [
+            clickhouse_response().replace("Uptime\t9", ""),
+            format!("{}\nQuery\t11", clickhouse_response()),
+            clickhouse_response().replace("Query\t1", "Unknown\t1"),
+            clickhouse_response().replace("Query\t1", "Query\t1\textra"),
+            clickhouse_response().replace("Query\t1", "Query\t-1"),
+            clickhouse_response().replace("Query\t1", "Query\t1.5"),
+            clickhouse_response().replace("Query\t1", "Query\t18446744073709551616"),
+        ] {
+            assert!(matches!(
+                parse_clickhouse_metrics(&invalid),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn clickhouse_metric_variant_matches_only_clickhouse_samples() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "clickhouse".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::ClickHouse,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:8123".into(),
+                metrics: WorkloadMetrics::ClickHouse(
+                    parse_clickhouse_metrics(&clickhouse_response()).unwrap(),
+                ),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("prometheus".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 

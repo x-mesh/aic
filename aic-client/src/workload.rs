@@ -1,10 +1,11 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_memcached_with_connection, monitor_mongodb_with_connection,
-    monitor_mysql_with_connection, monitor_postgresql_with_connection,
-    monitor_prometheus_with_connection, monitor_redis_with_connection, workload_history_path,
-    workloads_file_path, MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport,
+    load_workload_history, monitor_clickhouse_with_connection, monitor_memcached_with_connection,
+    monitor_mongodb_with_connection, monitor_mysql_with_connection,
+    monitor_postgresql_with_connection, monitor_prometheus_with_connection,
+    monitor_redis_with_connection, workload_history_path, workloads_file_path,
+    ClickHouseMonitorReport, MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport,
     PostgreSqlMonitorReport, PrometheusMonitorReport, ProposalCost, ProposalReadiness,
     RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
     WORKLOAD_SAMPLE_INTERVAL,
@@ -372,6 +373,14 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Prometheus, error))?,
         }),
+        WorkloadAdapter::ClickHouse => WorkloadMonitorReport::ClickHouse(ClickHouseMonitorReport {
+            candidate_id: candidate.id.clone(),
+            adapter: WorkloadAdapter::ClickHouse,
+            monitor_ready: true,
+            metrics: monitor_clickhouse_with_connection(connection.as_ref())
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::ClickHouse, error))?,
+        }),
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -385,6 +394,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::MySql => "MySQL",
         WorkloadAdapter::MongoDb => "MongoDB",
         WorkloadAdapter::Prometheus => "Prometheus",
+        WorkloadAdapter::ClickHouse => "ClickHouse",
         _ => "Workload",
     };
     let detail = match error {
@@ -412,6 +422,7 @@ fn select_monitor_candidate<'a>(
             | WorkloadAdapter::MySql
             | WorkloadAdapter::MongoDb
             | WorkloadAdapter::Prometheus
+            | WorkloadAdapter::ClickHouse
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -882,6 +893,7 @@ pub fn derive_status(
                     | WorkloadAdapter::MySql
                     | WorkloadAdapter::MongoDb
                     | WorkloadAdapter::Prometheus
+                    | WorkloadAdapter::ClickHouse
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),

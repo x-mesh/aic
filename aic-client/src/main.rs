@@ -1416,6 +1416,10 @@ fn handle_workload(op: WorkloadOp) {
                             "candidate={} monitor_ready={} metrics={:?}",
                             report.candidate_id, report.monitor_ready, report.metrics
                         ),
+                        aic_common::workload::WorkloadMonitorReport::ClickHouse(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
                     }
                 }
             })
