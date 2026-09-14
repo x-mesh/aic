@@ -476,6 +476,12 @@ RabbitMQ returns `messages`, `messages_ready`, `messages_unacknowledged`, `queue
 Missing optional message counters use zero. TLS uses native host roots.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
 The client does not follow redirects. It does not support AMQP port 5672, vhost selection, private CAs, mTLS, or custom APIs.
+The Nginx adapter requires an explicit TCP or TLS endpoint. It always requests `/stub_status`.
+Enable the Nginx `stub_status` module and configure that exact location before use.
+Optional Basic authentication requires TLS and both credential fields. TLS uses native host roots.
+Nginx returns `active_connections`, `accepts_total`, `handled_total`, `requests_total`, `reading`, `writing`, and `waiting`.
+Connect operations use 200 ms, each probe has a three-second limit, and responses have a 16 KiB limit.
+The client does not follow redirects. AIC does not change or reload Nginx configuration. Custom status paths are unsupported.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses

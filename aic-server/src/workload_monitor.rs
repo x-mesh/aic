@@ -89,6 +89,10 @@ pub fn load_rabbitmq_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::RabbitMq)
 }
 
+pub fn load_nginx_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::Nginx)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -107,7 +111,10 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
     };
     if matches!(
         adapter,
-        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql | WorkloadAdapter::MongoDb
+        WorkloadAdapter::PostgreSql
+            | WorkloadAdapter::MySql
+            | WorkloadAdapter::MongoDb
+            | WorkloadAdapter::Nginx
     ) && store
         .workloads
         .iter()
@@ -117,6 +124,7 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
             WorkloadAdapter::PostgreSql => "PostgreSQL",
             WorkloadAdapter::MySql => "MySQL",
             WorkloadAdapter::MongoDb => "MongoDB",
+            WorkloadAdapter::Nginx => "Nginx",
             _ => unreachable!("only database monitor adapters require connections"),
         };
         return DefinitionsState::Malformed(format!(
@@ -204,6 +212,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Elasticsearch => "Elasticsearch endpoint is unavailable",
         WorkloadAdapter::OpenSearch => "OpenSearch endpoint is unavailable",
         WorkloadAdapter::RabbitMq => "RabbitMQ management endpoint is unavailable",
+        WorkloadAdapter::Nginx => "Nginx status endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -221,6 +230,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Elasticsearch => "Elasticsearch rejected the cluster stats request",
         WorkloadAdapter::OpenSearch => "OpenSearch rejected the cluster stats request",
         WorkloadAdapter::RabbitMq => "RabbitMQ rejected the overview request",
+        WorkloadAdapter::Nginx => "Nginx rejected the stub status request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -238,6 +248,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Elasticsearch => "Elasticsearch returned invalid cluster stats",
         WorkloadAdapter::OpenSearch => "OpenSearch returned invalid cluster stats",
         WorkloadAdapter::RabbitMq => "RabbitMQ returned an invalid overview response",
+        WorkloadAdapter::Nginx => "Nginx returned an invalid stub status response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -341,6 +352,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::Elasticsearch,
                     WorkloadAdapter::OpenSearch,
                     WorkloadAdapter::RabbitMq,
+                    WorkloadAdapter::Nginx,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -564,6 +576,28 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::Nginx => match definition.connection.as_ref() {
+                    Some(connection) => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            aic_common::workload::monitor_nginx_with_connection(connection).map(
+                                |(endpoint, metrics)| (endpoint, WorkloadMetrics::Nginx(metrics)),
+                            )
+                        },
+                        Utc::now(),
+                    ),
+                    None => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            Err(WorkloadProbeError::Malformed(
+                                "Nginx connection is missing".into(),
+                            ))
+                        },
+                        Utc::now(),
+                    ),
+                },
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -592,8 +626,8 @@ mod tests {
     use super::*;
     use aic_common::workload::{
         ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics,
-        OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics, RedisMetrics,
-        WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
+        NginxMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics,
+        RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -870,6 +904,36 @@ mod tests {
         }
     }
 
+    fn nginx_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "nginx".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/sbin/nginx".into(),
+            },
+            adapter: WorkloadAdapter::Nginx,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: Some(WorkloadConnectionConfig {
+                endpoint: "tcp://127.0.0.1:8080".into(),
+                username: None,
+                secret_ref: None,
+                database: None,
+                auth_source: None,
+            }),
+        }
+    }
+
+    fn nginx_metrics() -> NginxMetrics {
+        NginxMetrics {
+            active_connections: 3,
+            accepts_total: 10,
+            handled_total: 10,
+            requests_total: 20,
+            reading: 1,
+            writing: 1,
+            waiting: 1,
+        }
+    }
+
     #[test]
     fn missing_and_ambiguous_definitions_do_not_collect() {
         let temp = tempfile::tempdir().unwrap();
@@ -1143,6 +1207,45 @@ mod tests {
             load_rabbitmq_definition(&path),
             DefinitionsState::Ambiguous(2)
         );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn nginx_requires_connection_and_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        let mut missing = nginx_definition();
+        missing.connection = None;
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![missing, definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_nginx_definition(&path),
+            DefinitionsState::Malformed(
+                "Nginx workload definitions require an explicit connection".into()
+            )
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![nginx_definition(), nginx_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_nginx_definition(&path), DefinitionsState::Ambiguous(2));
         assert_eq!(
             load_redis_definition(&path),
             DefinitionsState::One(definition())
@@ -1763,6 +1866,55 @@ mod tests {
             panic!("expected RabbitMQ failure");
         };
         assert_eq!(detail, "RabbitMQ rejected the overview request");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn nginx_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &nginx_definition(),
+            || {
+                Ok((
+                    "http://127.0.0.1:8080/stub_status".into(),
+                    WorkloadMetrics::Nginx(nginx_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::Nginx,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::Nginx(_),
+                    ..
+                },
+                ..
+            })
+        ));
+        let failed = collect_once(
+            &cfg,
+            &nginx_definition(),
+            || Err(WorkloadProbeError::Rejected("realm secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected Nginx failure");
+        };
+        assert_eq!(detail, "Nginx rejected the stub status request");
         assert!(!detail.contains("secret"));
     }
 

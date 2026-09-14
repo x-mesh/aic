@@ -163,9 +163,10 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
         ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MemcachedMetrics, MongoDbMetrics,
-        MySqlMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics,
-        WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
-        WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        MySqlMetrics, NginxMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics,
+        RabbitMqMetrics, WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics,
+        WorkloadSample, WorkloadSampleOutcome, WorkloadSelector, WorkloadStore,
+        WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -189,6 +190,21 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Redis,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: None,
+    };
+    let nginx_definition = WorkloadDefinition {
+        id: "nginx-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/sbin/nginx".into(),
+        },
+        adapter: WorkloadAdapter::Nginx,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:18080".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:NGINX_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        }),
     };
     let memcached_definition = WorkloadDefinition {
         id: "memcached-test".into(),
@@ -339,6 +355,7 @@ fn workload_status_and_history_read_local_history() {
         toml::to_string_pretty(&WorkloadStore {
             workloads: vec![
                 redis_definition,
+                nginx_definition,
                 memcached_definition,
                 postgresql_definition,
                 mysql_definition,
@@ -385,6 +402,24 @@ fn workload_status_and_history_read_local_history() {
             "instantaneous_ops_per_sec": 4, "keyspace_hits": 5, "keyspace_misses": 6
         }
     });
+    let nginx_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "nginx-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::Nginx,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:18080".into(),
+            metrics: WorkloadMetrics::Nginx(NginxMetrics {
+                active_connections: 1,
+                accepts_total: 2,
+                handled_total: 3,
+                requests_total: 4,
+                reading: 5,
+                writing: 6,
+                waiting: 7,
+            }),
+        },
+    };
     let postgresql_sample = WorkloadSample {
         schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
         workload_id: "postgresql-test".into(),
@@ -575,8 +610,9 @@ fn workload_status_and_history_read_local_history() {
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
+            serde_json::to_string(&nginx_sample).unwrap(),
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
             serde_json::to_string(&mysql_sample).unwrap(),
@@ -615,6 +651,14 @@ fn workload_status_and_history_read_local_history() {
     let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     assert_eq!(history["samples"].as_array().unwrap().len(), 1);
     assert_eq!(history["samples"][0]["adapter"], "redis");
+    let output = aic_cmd(tmp.path())
+        .args(["workload", "history", "nginx-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["samples"][0]["adapter"], "nginx");
+    assert_eq!(value["samples"][0]["metrics"]["waiting"], 7);
 
     let memcached_history = aic_cmd(tmp.path())
         .args(["workload", "history", "memcached-test", "--json"])

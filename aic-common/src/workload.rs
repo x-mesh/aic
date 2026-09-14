@@ -266,6 +266,21 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("RabbitMQ authentication requires a TLS endpoint");
                 }
             }
+            WorkloadAdapter::Nginx => {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("Nginx workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some() != self.secret_ref.is_some() {
+                    anyhow::bail!("Nginx username and secret_ref must be provided together");
+                }
+                if self.database.is_some() || self.auth_source.is_some() {
+                    anyhow::bail!("Nginx workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("Nginx authentication requires a TLS endpoint");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -608,6 +623,18 @@ pub struct RabbitMqMetrics {
     pub message_stats_deliver_get_total: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NginxMetrics {
+    pub active_connections: u64,
+    pub accepts_total: u64,
+    pub handled_total: u64,
+    pub requests_total: u64,
+    pub reading: u64,
+    pub writing: u64,
+    pub waiting: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -625,6 +652,7 @@ pub enum WorkloadMetrics {
     Elasticsearch(ElasticsearchMetrics),
     OpenSearch(OpenSearchMetrics),
     RabbitMq(RabbitMqMetrics),
+    Nginx(NginxMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -705,6 +733,7 @@ macro_rules! search_report {
 search_report!(ElasticsearchMonitorReport, ElasticsearchMetrics);
 search_report!(OpenSearchMonitorReport, OpenSearchMetrics);
 search_report!(RabbitMqMonitorReport, RabbitMqMetrics);
+search_report!(NginxMonitorReport, NginxMetrics);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -720,6 +749,7 @@ pub enum WorkloadMonitorReport {
     Elasticsearch(ElasticsearchMonitorReport),
     OpenSearch(OpenSearchMonitorReport),
     RabbitMq(RabbitMqMonitorReport),
+    Nginx(NginxMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -747,6 +777,7 @@ pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
 pub const SEARCH_RESPONSE_BYTES: usize = 64 * 1024;
 pub const RABBITMQ_LOOPBACK_ENDPOINT: &str = "127.0.0.1:15672";
 pub const RABBITMQ_RESPONSE_BYTES: usize = 64 * 1024;
+pub const NGINX_RESPONSE_BYTES: usize = 16 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -756,6 +787,7 @@ pub const CLICKHOUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const ETCD_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SEARCH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const RABBITMQ_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const NGINX_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -856,6 +888,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     )
                     | (WorkloadAdapter::OpenSearch, WorkloadMetrics::OpenSearch(_))
                     | (WorkloadAdapter::RabbitMq, WorkloadMetrics::RabbitMq(_))
+                    | (WorkloadAdapter::Nginx, WorkloadMetrics::Nginx(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -2424,6 +2457,179 @@ fn parse_rabbitmq_metrics(
         exchanges: metric(&["object_totals", "exchanges"])?,
         message_stats_publish_total: optional_message_metric("publish")?,
         message_stats_deliver_get_total: optional_message_metric("deliver_get")?,
+    })
+}
+
+pub fn monitor_nginx_with_connection(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<(String, NginxMetrics), WorkloadProbeError> {
+    connection
+        .validate_for(WorkloadAdapter::Nginx)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("Nginx connection configuration is invalid".into())
+        })?;
+    let url = nginx_stub_status_url(connection)?;
+    let secret = resolve_connection_secret(connection).map_err(|_| {
+        WorkloadProbeError::Rejected("Nginx authentication secret is unavailable".into())
+    })?;
+    let username = connection.username.clone();
+    let endpoint = connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("Nginx probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                NGINX_PROBE_TIMEOUT,
+                monitor_nginx_async(&url, username.as_deref(), secret.as_deref()),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("Nginx probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("Nginx probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn nginx_stub_status_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("Nginx endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => {
+            Ok(format!("http://{}:{port}/stub_status", url_host(&host)))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            Ok(format!("https://{}:{port}/stub_status", url_host(&host)))
+        }
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "Nginx endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+async fn monitor_nginx_async(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> std::result::Result<NginxMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(NGINX_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| WorkloadProbeError::Unreachable("Nginx HTTP client is unavailable".into()))?;
+    let mut request = client.get(url);
+    if let Some(username) = username {
+        request = request.basic_auth(username, password);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("Nginx endpoint is unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "Nginx rejected status request".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > NGINX_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("Nginx response could not be read".into()))?
+    {
+        if body.len().saturating_add(chunk.len()) > NGINX_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "Nginx response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("Nginx response is not UTF-8".into()))?;
+    parse_nginx_stub_status(body)
+}
+
+fn parse_nginx_stub_status(body: &str) -> std::result::Result<NginxMetrics, WorkloadProbeError> {
+    let lines = body.lines().collect::<Vec<_>>();
+    if lines.len() != 4 {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx stub status must contain four lines".into(),
+        ));
+    }
+    let active_connections = lines[0]
+        .strip_prefix("Active connections: ")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or_else(|| {
+            WorkloadProbeError::Malformed("Nginx active connections is invalid".into())
+        })?;
+    if lines[1].trim() != "server accepts handled requests" {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx stub status header is invalid".into(),
+        ));
+    }
+    let totals = lines[2]
+        .split_ascii_whitespace()
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| WorkloadProbeError::Malformed("Nginx totals are invalid".into()))?;
+    if totals.len() != 3 {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx totals field count is invalid".into(),
+        ));
+    }
+    let fields = lines[3].split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 6
+        || fields[0] != "Reading:"
+        || fields[2] != "Writing:"
+        || fields[4] != "Waiting:"
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx connection states are invalid".into(),
+        ));
+    }
+    let reading = fields[1].parse::<u64>();
+    let writing = fields[3].parse::<u64>();
+    let waiting = fields[5].parse::<u64>();
+    let (reading, writing, waiting) = match (reading, writing, waiting) {
+        (Ok(r), Ok(w), Ok(i)) => (r, w, i),
+        _ => {
+            return Err(WorkloadProbeError::Malformed(
+                "Nginx connection state value is invalid".into(),
+            ))
+        }
+    };
+    let state_total = reading
+        .checked_add(writing)
+        .and_then(|value| value.checked_add(waiting));
+    if totals[1] > totals[0] || state_total != Some(active_connections) {
+        return Err(WorkloadProbeError::Malformed(
+            "Nginx stub status invariants failed".into(),
+        ));
+    }
+    Ok(NginxMetrics {
+        active_connections,
+        accepts_total: totals[0],
+        handled_total: totals[1],
+        requests_total: totals[2],
+        reading,
+        writing,
+        waiting,
     })
 }
 
@@ -4086,6 +4292,102 @@ path = "/usr/bin/redis-server"
                 metrics: WorkloadMetrics::RabbitMq(
                     parse_rabbitmq_metrics(&rabbitmq_response()).unwrap(),
                 ),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("redis".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    #[test]
+    fn nginx_endpoint_and_auth_contract_are_strict() {
+        let anonymous = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:8080".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        anonymous.validate_for(WorkloadAdapter::Nginx).unwrap();
+        assert_eq!(
+            nginx_stub_status_url(&anonymous).unwrap(),
+            "http://127.0.0.1:8080/stub_status"
+        );
+        let authenticated = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:8443".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:NGINX_PASSWORD".into()),
+            ..anonymous.clone()
+        };
+        authenticated.validate_for(WorkloadAdapter::Nginx).unwrap();
+        assert_eq!(
+            nginx_stub_status_url(&authenticated).unwrap(),
+            "https://[::1]:8443/stub_status"
+        );
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://nginx.example:8080".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::Nginx)
+        .is_err());
+        for invalid in [
+            WorkloadConnectionConfig {
+                secret_ref: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                username: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("status".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/nginx.sock".into(),
+                ..authenticated
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::Nginx).is_err());
+        }
+    }
+
+    #[test]
+    fn nginx_parser_requires_official_four_line_format_and_invariants() {
+        let valid = "Active connections: 291\nserver accepts handled requests\n 16630948 16630948 31070465\nReading: 6 Writing: 179 Waiting: 106\n";
+        let metrics = parse_nginx_stub_status(valid).unwrap();
+        assert_eq!(metrics.active_connections, 291);
+        assert_eq!(metrics.requests_total, 31_070_465);
+        for invalid in [
+            "Active connections: 1\nserver accepts handled requests\n1 1 1\nReading: 0 Writing: 0 Waiting: 0\nextra\n",
+            "Active connections: 1\nserver accepts handled requests\n1 2 3\nReading: 0 Writing: 0 Waiting: 0\n",
+            "Active connections: 1\nserver accepts handled requests\n1 1 3\nReading: 1 Writing: 1 Waiting: 0\n",
+            "Active connections: 2\nserver accepts handled requests\n1 1 3\nReading: 1 Writing: 0 Waiting: 0\n",
+            "Active connections: 1\nserver accepts handled requests\n1 1 3\nReading: 18446744073709551615 Writing: 1 Waiting: 0\n",
+            "Active connections: x\nserver accepts handled requests\n1 1 3\nReading: 0 Writing: 0 Waiting: 0\n",
+        ] { assert!(matches!(parse_nginx_stub_status(invalid), Err(WorkloadProbeError::Malformed(_)))); }
+    }
+
+    #[test]
+    fn nginx_metric_variant_matches_only_nginx_samples() {
+        let metrics = parse_nginx_stub_status("Active connections: 3\nserver accepts handled requests\n4 4 5\nReading: 1 Writing: 1 Waiting: 1\n").unwrap();
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "nginx".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::Nginx,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:8080".into(),
+                metrics: WorkloadMetrics::Nginx(metrics),
             },
         };
         let json = serde_json::to_string(&sample).unwrap();

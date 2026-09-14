@@ -443,6 +443,12 @@ RabbitMQ adapter는 `rabbitmq_management` plugin이 필요하며 기본적으로
 0을 사용합니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답
 제한은 64KiB입니다. redirect는 따르지 않습니다. AMQP port 5672, vhost 선택, private CA, mTLS, custom API는
 지원하지 않습니다.
+Nginx adapter는 explicit TCP 또는 TLS endpoint가 필요하며 항상 `/stub_status`를 요청합니다. 사용 전에 Nginx
+`stub_status` module과 정확히 이 location을 설정하십시오. Basic 인증에는 TLS, username, secret이 모두 필요합니다.
+TLS는 native host root를 사용합니다. `active_connections`, `accepts_total`, `handled_total`, `requests_total`,
+`reading`, `writing`, `waiting`을 반환합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은
+16KiB입니다. redirect는 따르지 않습니다. AIC는 Nginx 설정을 변경하거나 reload하지 않습니다. custom status
+path는 지원하지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
