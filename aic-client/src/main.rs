@@ -639,6 +639,19 @@ enum WorkloadOp {
         #[arg(long)]
         json: bool,
     },
+    /// Display workload collection state from local history.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Display stored workload samples from local history.
+    History {
+        workload_id: String,
+        #[arg(long, default_value_t = aic_client::workload::DEFAULT_HISTORY_LIMIT)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// 명시적으로 저장된 workload 정의를 표시한다.
     List {
         #[arg(long)]
@@ -1370,6 +1383,62 @@ fn handle_workload(op: WorkloadOp) {
                 }
             })
         }
+        WorkloadOp::Status { json } => workload::status().map(|workloads| {
+            if json {
+                serde_json::json!({ "workloads": workloads }).to_string()
+            } else {
+                workloads
+                    .into_iter()
+                    .map(|entry| {
+                        let sample = entry.last_sample.as_ref().map_or_else(
+                            || "captured_at=- outcome=-".to_string(),
+                            |sample| format!(
+                                "captured_at={} outcome={}",
+                                sample.captured_at.to_rfc3339(),
+                                match &sample.outcome {
+                                    aic_common::workload::RedisSampleOutcome::Collected { .. } => "collected",
+                                    aic_common::workload::RedisSampleOutcome::Failed { reason, .. } => match reason {
+                                        aic_common::workload::RedisSampleFailure::Unreachable => "unreachable",
+                                        aic_common::workload::RedisSampleFailure::Rejected => "rejected",
+                                        aic_common::workload::RedisSampleFailure::Malformed => "malformed",
+                                    },
+                                }
+                            ),
+                        );
+                        format!(
+                            "{} state={} age_secs={} {}\n",
+                            entry.workload_id,
+                            entry.state.as_str(),
+                            entry.age_secs.map_or_else(|| "-".to_string(), |age| age.to_string()),
+                            sample
+                        )
+                    })
+                    .collect()
+            }
+        }),
+        WorkloadOp::History {
+            workload_id,
+            limit,
+            json,
+        } => workload::history(&workload_id, limit).map(|samples| {
+            if json {
+                serde_json::json!({ "workload_id": workload_id, "samples": samples }).to_string()
+            } else {
+                samples
+                    .into_iter()
+                    .map(|sample| match sample.outcome {
+                        aic_common::workload::RedisSampleOutcome::Collected { endpoint, metrics } => format!(
+                            "{} captured_at={} endpoint={} connected_clients={} used_memory={} total_commands_processed={} instantaneous_ops_per_sec={} keyspace_hits={} keyspace_misses={}\n",
+                            sample.workload_id, sample.captured_at.to_rfc3339(), endpoint, metrics.connected_clients, metrics.used_memory, metrics.total_commands_processed, metrics.instantaneous_ops_per_sec, metrics.keyspace_hits, metrics.keyspace_misses
+                        ),
+                        aic_common::workload::RedisSampleOutcome::Failed { reason, detail } => format!(
+                            "{} captured_at={} failure={:?} detail={}\n",
+                            sample.workload_id, sample.captured_at.to_rfc3339(), reason, detail
+                        ),
+                    })
+                    .collect()
+            }
+        }),
         WorkloadOp::List { json } => workload::list_configured().map(|definitions| {
             if json {
                 serde_json::json!({ "configured": definitions }).to_string()

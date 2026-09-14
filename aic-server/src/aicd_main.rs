@@ -565,6 +565,20 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => None,
     };
+
+    let workload_cfg = aic_server::workload_monitor::default_config();
+    tracing::info!(
+        workloads_path = %workload_cfg.workloads_path.display(),
+        history_path = %workload_cfg.history_path.display(),
+        interval_secs = workload_cfg.interval.as_secs(),
+        "aicd workload collector started"
+    );
+    let workload_shutdown = shutdown.subscribe();
+    let workload_handle = tokio::spawn(async move {
+        if let Err(e) = aic_server::workload_monitor::serve(workload_cfg, workload_shutdown).await {
+            tracing::warn!(error = %e, "workload collector stopped with error");
+        }
+    });
     // agent exporter의 생존(`agent_live`)은 **위에서 spawn 전에 켰다**(구독이 성립한 시점이 곧
     // "이벤트가 버려지지 않는다"가 참이 되는 시점이다). 끄는 건 task 안의 `AgentLiveGuard`가
     // 종료(정상·에러·panic) 시 맡는다 — 켜기와 끄기의 주체를 나눠야 유실 창도, 단방향 래치도 없다.
@@ -617,6 +631,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(h) = file_handle {
         let _ = h.await;
     }
+    let _ = workload_handle.await;
 
     reconcile_handle.abort();
     // 소켓 파일 정리 — AttachServer 는 Drop 구현이 없으므로 명시 remove.

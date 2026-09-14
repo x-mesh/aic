@@ -379,8 +379,13 @@ slash 명령 형태는 없습니다. 고정된 로컬 Redis socket 또는 `127.0
 `instantaneous_ops_per_sec`, `keyspace_hits`, `keyspace_misses` 여섯 가지 지표를 반환합니다. 연결,
 요청, 지표 파싱이 모두 성공할 때만 `monitor_ready: true`를 반환합니다.
 
-이 명령은 인증, 사용자 지정 endpoint, 주기 수집, persistence를 지원하지 않으며 `workloads.toml`에
-쓰지 않습니다. PostgreSQL `pg_stat_*` 수집은 아직 `monitor_ready` driver가 없습니다.
+`aicd`는 Redis 정의가 하나일 때 60초마다 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 probe합니다.
+
+sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
+
+Redis 정의가 둘 이상이면 수집하지 않습니다. `aic workload status [--json]`와 `aic workload history <id> [--limit N] [--json]`는 `aicd` 없이 이 파일을 읽습니다.
+
+인증, 사용자 지정 endpoint, PostgreSQL 지표, 원격 전송은 지원하지 않습니다.
 
 probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다: local
 sysinfo 섹션(`fd`=열린 파일 디스크립터 현재/최대 포함) + `process` + git read-only + `docker`

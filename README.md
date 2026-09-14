@@ -402,9 +402,19 @@ sends one read-only `INFO` request. It returns six typed metrics: `connected_cli
 `keyspace_misses`. The probe sets `monitor_ready: true` only when the connection, the request, and
 the metric parse all succeed.
 
-The command does not support authentication, a custom endpoint, periodic collection, or
-persistence. It does not write to `workloads.toml`. PostgreSQL `pg_stat_*` collection still needs a
-`monitor_ready` driver.
+`aicd` probes one configured Redis definition every 60 seconds.
+It uses the fixed local socket paths or `127.0.0.1:6379`.
+
+Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
+The default directory is `~/.local/state/aic`.
+The directory mode is 0700, and the file mode is 0600.
+Retention keeps 1440 samples.
+
+More than one Redis definition blocks collection.
+Use `aic workload status [--json]` to read the current state without `aicd`.
+Use `aic workload history <id> [--limit N] [--json]` to read stored samples without `aicd`.
+
+Authentication, custom endpoints, PostgreSQL metrics, and remote transport remain unsupported.
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
 local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +
