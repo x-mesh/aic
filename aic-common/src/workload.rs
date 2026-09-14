@@ -572,7 +572,7 @@ pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_com
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
-pub const PROMETHEUS_RESPONSE_BYTES: usize = 64 * 1024;
+pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1413,6 +1413,7 @@ async fn monitor_prometheus_async(
     url: &str,
 ) -> std::result::Result<PrometheusMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(PROMETHEUS_PROBE_TIMEOUT)
@@ -1509,9 +1510,64 @@ fn parse_prometheus_metrics(
 }
 
 fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
-    value.parse::<u64>().map_err(|_| {
+    parse_exposition_u64(value).map_err(|_| {
         WorkloadProbeError::Malformed(format!("Prometheus metric is not a u64: {name}"))
     })
+}
+
+fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.is_empty() || value.starts_with('-') {
+        return Err(());
+    }
+    let (mantissa, exponent) = match value.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = value[index + 1..].parse::<i32>().map_err(|_| ())?;
+            (&value[..index], exponent)
+        }
+        None => (value, 0),
+    };
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut fractional_digits = 0_i32;
+    let mut seen_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                if seen_decimal {
+                    fractional_digits = fractional_digits.checked_add(1).ok_or(())?;
+                }
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            _ => return Err(()),
+        }
+    }
+    if digits.is_empty() {
+        return Err(());
+    }
+    let scale = exponent.checked_sub(fractional_digits).ok_or(())?;
+    if scale < 0 {
+        let remove = usize::try_from(scale.checked_neg().ok_or(())?).map_err(|_| ())?;
+        if remove > digits.len()
+            || !digits[digits.len() - remove..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err(());
+        }
+        digits.truncate(digits.len() - remove);
+    }
+    let mut result = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<u64>().map_err(|_| ())?
+    };
+    if scale > 0 {
+        for _ in 0..scale {
+            result = result.checked_mul(10).ok_or(())?;
+        }
+    }
+    Ok(result)
 }
 
 fn postgresql_metrics_from_rows(
@@ -2546,6 +2602,7 @@ path = "/usr/bin/redis-server"
             "prometheus_engine_queries -1",
             "prometheus_engine_queries 1.5",
             "prometheus_engine_queries 18446744073709551616",
+            "prometheus_engine_queries 1.5e0",
         ] {
             let response =
                 prometheus_response().replace("prometheus_engine_queries 5", replacement);
@@ -2558,6 +2615,18 @@ path = "/usr/bin/redis-server"
         assert!(parse_prometheus_metrics(&missing).is_err());
         let duplicate = format!("{}\ngo_goroutines 9", prometheus_response());
         assert!(parse_prometheus_metrics(&duplicate).is_err());
+        let scientific = prometheus_response()
+            .replace(
+                "prometheus_tsdb_head_samples_appended_total 4",
+                "prometheus_tsdb_head_samples_appended_total 1.234e+06",
+            )
+            .replace(
+                "prometheus_engine_queries 5",
+                "prometheus_engine_queries 5.0e0",
+            );
+        let metrics = parse_prometheus_metrics(&scientific).unwrap();
+        assert_eq!(metrics.tsdb_head_samples_appended_total, 1_234_000);
+        assert_eq!(metrics.engine_queries, 5);
     }
 
     #[test]
