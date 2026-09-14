@@ -210,7 +210,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::ClickHouse => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("ClickHouse workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -218,6 +219,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("ClickHouse workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::Etcd => {
@@ -696,10 +700,10 @@ pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_com
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
-pub const PROMETHEUS_RESPONSE_BYTES: usize = 64 * 1024;
+pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
-pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, toUInt64(value) AS value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, toUInt64(value) AS value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
+pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
 pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
@@ -1183,6 +1187,7 @@ pub fn monitor_mysql_with_connection(
     };
 
     let username = username.to_owned();
+    let database = connection.database.clone();
     let endpoint_text = connection.endpoint.clone();
     let metrics = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1194,7 +1199,14 @@ pub fn monitor_mysql_with_connection(
         runtime.block_on(async {
             tokio::time::timeout(
                 MYSQL_PROBE_TIMEOUT,
-                monitor_mysql_async(&host, port, use_tls, &username, secret.as_deref()),
+                monitor_mysql_async(
+                    &host,
+                    port,
+                    use_tls,
+                    &username,
+                    secret.as_deref(),
+                    database.as_deref(),
+                ),
             )
             .await
             .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
@@ -1211,17 +1223,9 @@ async fn monitor_mysql_async(
     use_tls: bool,
     username: &str,
     password: Option<&str>,
+    database: Option<&str>,
 ) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
-    let mut options = MySqlOptsBuilder::default()
-        .ip_or_hostname(host)
-        .tcp_port(port)
-        .user(Some(username))
-        .pass(password)
-        .prefer_socket(false)
-        .stmt_cache_size(0);
-    if use_tls {
-        options = options.ssl_opts(Some(mysql_ssl_options()?));
-    }
+    let options = mysql_connection_options(host, port, use_tls, username, password, database)?;
     let mut connection = MySqlConnection::new(options)
         .await
         .map_err(map_mysql_connect_error)?;
@@ -1232,6 +1236,28 @@ async fn monitor_mysql_async(
     let metrics = mysql_metrics_from_rows(&rows);
     let _ = connection.disconnect().await;
     metrics
+}
+
+fn mysql_connection_options(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> std::result::Result<MySqlOptsBuilder, WorkloadProbeError> {
+    let mut options = MySqlOptsBuilder::default()
+        .ip_or_hostname(host)
+        .tcp_port(port)
+        .user(Some(username))
+        .pass(password)
+        .db_name(database)
+        .prefer_socket(false)
+        .stmt_cache_size(0);
+    if use_tls {
+        options = options.ssl_opts(Some(mysql_ssl_options()?));
+    }
+    Ok(options)
 }
 
 fn mysql_ssl_options() -> std::result::Result<SslOpts, WorkloadProbeError> {
@@ -1547,6 +1573,7 @@ async fn monitor_prometheus_async(
     url: &str,
 ) -> std::result::Result<PrometheusMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(PROMETHEUS_PROBE_TIMEOUT)
@@ -1643,7 +1670,7 @@ fn parse_prometheus_metrics(
 }
 
 fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
-    value.parse::<u64>().map_err(|_| {
+    parse_exposition_u64(value).map_err(|_| {
         WorkloadProbeError::Malformed(format!("Prometheus metric is not a u64: {name}"))
     })
 }
@@ -1712,6 +1739,7 @@ async fn monitor_clickhouse_async(
     password: Option<&str>,
 ) -> std::result::Result<ClickHouseMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(CLICKHOUSE_PROBE_TIMEOUT)
@@ -1878,6 +1906,7 @@ fn etcd_metrics_url(
 
 async fn monitor_etcd_async(url: &str) -> std::result::Result<EtcdMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(ETCD_PROBE_TIMEOUT)
@@ -1955,7 +1984,7 @@ fn parse_etcd_metrics(body: &str) -> std::result::Result<EtcdMetrics, WorkloadPr
                 "etcd required metric is duplicate or malformed: {name}"
             )));
         }
-        let value = fields[1].parse::<u64>().map_err(|_| {
+        let value = parse_exposition_u64(fields[1]).map_err(|_| {
             WorkloadProbeError::Malformed(format!("etcd metric is not a u64: {name}"))
         })?;
         if matches!(name, "etcd_server_has_leader" | "etcd_server_is_leader") && value > 1 {
@@ -2192,6 +2221,68 @@ fn parse_search_metrics(
         ));
     }
     Ok(metrics)
+}
+
+fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.is_empty() || value.starts_with('-') {
+        return Err(());
+    }
+    let (mantissa, exponent) = match value.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = value[index + 1..].parse::<i32>().map_err(|_| ())?;
+            (&value[..index], exponent)
+        }
+        None => (value, 0),
+    };
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut fractional_digits = 0_i32;
+    let mut seen_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                if seen_decimal {
+                    fractional_digits = fractional_digits.checked_add(1).ok_or(())?;
+                }
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            _ => return Err(()),
+        }
+    }
+    if digits.is_empty() {
+        return Err(());
+    }
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Ok(0);
+    }
+    let scale = exponent.checked_sub(fractional_digits).ok_or(())?;
+    if scale < 0 {
+        let remove = usize::try_from(scale.checked_neg().ok_or(())?).map_err(|_| ())?;
+        if remove > digits.len()
+            || !digits[digits.len() - remove..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err(());
+        }
+        digits.truncate(digits.len() - remove);
+    }
+    let mut result = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<u64>().map_err(|_| ())?
+    };
+    if scale > 0 {
+        let scale = u32::try_from(scale).map_err(|_| ())?;
+        if scale > 19 || digits.trim_start_matches('0').len() + scale as usize > 20 {
+            return Err(());
+        }
+        result = result
+            .checked_mul(10_u64.checked_pow(scale).ok_or(())?)
+            .ok_or(())?;
+    }
+    Ok(result)
 }
 
 fn postgresql_metrics_from_rows(
@@ -2931,7 +3022,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tls://mysql.example:3306".into(),
             username: Some("monitor".into()),
             secret_ref: None,
-            database: Some("ignored_by_global_status".into()),
+            database: Some("metrics".into()),
             auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::MySql).unwrap();
@@ -2947,6 +3038,11 @@ path = "/usr/bin/redis-server"
         }
         .validate_for(WorkloadAdapter::MySql)
         .is_err());
+        let options = mysql_async::Opts::from(
+            mysql_connection_options("127.0.0.1", 3306, false, "monitor", None, Some("metrics"))
+                .unwrap(),
+        );
+        assert_eq!(options.db_name(), Some("metrics"));
     }
 
     #[test]
@@ -3053,6 +3149,12 @@ path = "/usr/bin/redis-server"
         authenticated
             .validate_for(WorkloadAdapter::MongoDb)
             .unwrap();
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://clickhouse.example:8123".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::ClickHouse)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -3221,6 +3323,9 @@ path = "/usr/bin/redis-server"
             "prometheus_engine_queries -1",
             "prometheus_engine_queries 1.5",
             "prometheus_engine_queries 18446744073709551616",
+            "prometheus_engine_queries 1.5e0",
+            "prometheus_engine_queries 1e2147483647",
+            "prometheus_engine_queries 1e-2147483648",
         ] {
             let response =
                 prometheus_response().replace("prometheus_engine_queries 5", replacement);
@@ -3233,6 +3338,18 @@ path = "/usr/bin/redis-server"
         assert!(parse_prometheus_metrics(&missing).is_err());
         let duplicate = format!("{}\ngo_goroutines 9", prometheus_response());
         assert!(parse_prometheus_metrics(&duplicate).is_err());
+        let scientific = prometheus_response()
+            .replace(
+                "prometheus_tsdb_head_samples_appended_total 4",
+                "prometheus_tsdb_head_samples_appended_total 1.234e+06",
+            )
+            .replace(
+                "prometheus_engine_queries 5",
+                "prometheus_engine_queries 5.0e0",
+            );
+        let metrics = parse_prometheus_metrics(&scientific).unwrap();
+        assert_eq!(metrics.tsdb_head_samples_appended_total, 1_234_000);
+        assert_eq!(metrics.engine_queries, 5);
     }
 
     #[test]
@@ -3462,12 +3579,26 @@ path = "/usr/bin/redis-server"
                 "process_resident_memory_bytes 9",
                 "process_resident_memory_bytes 18446744073709551616",
             ),
+            etcd_response().replace(
+                "etcd_server_proposals_pending 6",
+                "etcd_server_proposals_pending 1e2147483647",
+            ),
         ] {
             assert!(matches!(
                 parse_etcd_metrics(&invalid),
                 Err(WorkloadProbeError::Malformed(_))
             ));
         }
+        let scientific = etcd_response().replace(
+            "etcd_server_proposals_applied_total 3",
+            "etcd_server_proposals_applied_total 1.234e+06",
+        );
+        assert_eq!(
+            parse_etcd_metrics(&scientific)
+                .unwrap()
+                .proposals_applied_total,
+            1_234_000
+        );
     }
 
     #[test]
