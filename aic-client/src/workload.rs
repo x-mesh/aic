@@ -6,12 +6,12 @@ use aic_common::workload::{
     monitor_memcached_with_connection, monitor_mongodb_with_connection,
     monitor_mysql_with_connection, monitor_opensearch_with_connection,
     monitor_postgresql_with_connection, monitor_prometheus_with_connection,
-    monitor_redis_with_connection, workload_history_path, workloads_file_path,
-    ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport, MemcachedMonitorReport,
-    MongoDbMonitorReport, MySqlMonitorReport, OpenSearchMonitorReport, PostgreSqlMonitorReport,
-    PrometheusMonitorReport, ProposalCost, ProposalReadiness, RedisMonitorReport,
-    WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
-    WORKLOAD_SAMPLE_INTERVAL,
+    monitor_rabbitmq_with_connection, monitor_redis_with_connection, workload_history_path,
+    workloads_file_path, ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport,
+    MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport, OpenSearchMonitorReport,
+    PostgreSqlMonitorReport, PrometheusMonitorReport, ProposalCost, ProposalReadiness,
+    RabbitMqMonitorReport, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
+    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -410,6 +410,14 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::OpenSearch, error))?,
         }),
+        WorkloadAdapter::RabbitMq => WorkloadMonitorReport::RabbitMq(RabbitMqMonitorReport {
+            candidate_id: candidate.id.clone(),
+            adapter: WorkloadAdapter::RabbitMq,
+            monitor_ready: true,
+            metrics: monitor_rabbitmq_with_connection(connection.as_ref())
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::RabbitMq, error))?,
+        }),
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -427,6 +435,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::Etcd => "etcd",
         WorkloadAdapter::Elasticsearch => "Elasticsearch",
         WorkloadAdapter::OpenSearch => "OpenSearch",
+        WorkloadAdapter::RabbitMq => "RabbitMQ",
         _ => "Workload",
     };
     let detail = match error {
@@ -458,6 +467,7 @@ fn select_monitor_candidate<'a>(
             | WorkloadAdapter::Etcd
             | WorkloadAdapter::Elasticsearch
             | WorkloadAdapter::OpenSearch
+            | WorkloadAdapter::RabbitMq
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -932,6 +942,7 @@ pub fn derive_status(
                     | WorkloadAdapter::Etcd
                     | WorkloadAdapter::Elasticsearch
                     | WorkloadAdapter::OpenSearch
+                    | WorkloadAdapter::RabbitMq
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
@@ -1328,6 +1339,34 @@ mod tests {
             .candidates
             .iter()
             .any(|candidate| candidate.adapter == WorkloadAdapter::OpenSearch));
+    }
+
+    #[test]
+    fn rabbitmq_processes_with_one_systemd_unit_collapse() {
+        let mut server = row(
+            1,
+            1,
+            "rabbitmq-server",
+            Some("/usr/sbin/rabbitmq-server"),
+            &[],
+        );
+        server.systemd_unit = Some("rabbitmq-server.service".into());
+        let mut beam = row(
+            2,
+            1,
+            "beam.smp",
+            Some("/usr/lib/erlang/beam.smp"),
+            &["rabbitmq"],
+        );
+        beam.systemd_unit = Some("rabbitmq-server.service".into());
+        let report = discover_rows(vec![server, beam]);
+        let candidates = report
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.adapter == WorkloadAdapter::RabbitMq)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].bindings.len(), 2);
     }
 
     #[test]

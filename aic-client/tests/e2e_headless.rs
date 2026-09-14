@@ -163,8 +163,8 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
         ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MemcachedMetrics, MongoDbMetrics,
-        MySqlMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, WorkloadAdapter,
-        WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
+        MySqlMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RabbitMqMetrics,
+        WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
         WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
@@ -319,6 +319,21 @@ fn workload_status_and_history_read_local_history() {
             auth_source: None,
         }),
     };
+    let rabbitmq_definition = WorkloadDefinition {
+        id: "rabbitmq-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/sbin/rabbitmq-server".into(),
+        },
+        adapter: WorkloadAdapter::RabbitMq,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:15672".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:RABBITMQ_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -333,6 +348,7 @@ fn workload_status_and_history_read_local_history() {
                 etcd_definition,
                 elasticsearch_definition,
                 opensearch_definition,
+                rabbitmq_definition,
             ],
         })
         .unwrap(),
@@ -535,10 +551,31 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let rabbitmq_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "rabbitmq-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::RabbitMq,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:15672".into(),
+            metrics: WorkloadMetrics::RabbitMq(RabbitMqMetrics {
+                messages: 1,
+                messages_ready: 2,
+                messages_unacknowledged: 3,
+                queues: 4,
+                connections: 5,
+                channels: 6,
+                consumers: 7,
+                exchanges: 8,
+                message_stats_publish_total: 9,
+                message_stats_deliver_get_total: 10,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
@@ -548,7 +585,8 @@ fn workload_status_and_history_read_local_history() {
             serde_json::to_string(&clickhouse_sample).unwrap(),
             serde_json::to_string(&etcd_sample).unwrap(),
             serde_json::to_string(&elasticsearch_sample).unwrap(),
-            serde_json::to_string(&opensearch_sample).unwrap()
+            serde_json::to_string(&opensearch_sample).unwrap(),
+            serde_json::to_string(&rabbitmq_sample).unwrap()
         ),
     )
     .unwrap();
@@ -672,6 +710,17 @@ fn workload_status_and_history_read_local_history() {
             expected
         );
     }
+    let output = aic_cmd(tmp.path())
+        .args(["workload", "history", "rabbitmq-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["samples"][0]["adapter"], "rabbit_mq");
+    assert_eq!(
+        value["samples"][0]["metrics"]["message_stats_deliver_get_total"],
+        10
+    );
 
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])

@@ -435,6 +435,14 @@ Elasticsearch와 OpenSearch adapter는 기본적으로 `127.0.0.1:9200`을 사�
 가진 monitoring 사용자를 사용하십시오. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe
 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. API key, SigV4, private CA, mTLS, custom
 path, query, 검색, node stats는 지원하지 않습니다.
+RabbitMQ adapter는 `rabbitmq_management` plugin이 필요하며 기본적으로 `127.0.0.1:15672`를 사용합니다.
+고정 `GET /api/overview`를 호출합니다. Basic 인증에는 username과 secret이 모두 필요합니다. `monitoring` tag가
+있는 전용 사용자를 사용하며 administrator 권한은 필요하지 않습니다. `messages`, `messages_ready`,
+`messages_unacknowledged`, `queues`, `connections`, `channels`, `consumers`, `exchanges`,
+`message_stats_publish_total`, `message_stats_deliver_get_total`을 반환합니다. 선택 사항인 message counter가 없으면
+0을 사용합니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답
+제한은 64KiB입니다. redirect는 따르지 않습니다. AMQP port 5672, vhost 선택, private CA, mTLS, custom API는
+지원하지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 

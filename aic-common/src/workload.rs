@@ -243,6 +243,17 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("search workload connections do not support database fields");
                 }
             }
+            WorkloadAdapter::RabbitMq => {
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("RabbitMQ workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some() != self.secret_ref.is_some() {
+                    anyhow::bail!("RabbitMQ username and secret_ref must be provided together");
+                }
+                if self.database.is_some() || self.auth_source.is_some() {
+                    anyhow::bail!("RabbitMQ workload connections do not support database fields");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -570,6 +581,21 @@ macro_rules! search_metrics {
 search_metrics!(ElasticsearchMetrics);
 search_metrics!(OpenSearchMetrics);
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RabbitMqMetrics {
+    pub messages: u64,
+    pub messages_ready: u64,
+    pub messages_unacknowledged: u64,
+    pub queues: u64,
+    pub connections: u64,
+    pub channels: u64,
+    pub consumers: u64,
+    pub exchanges: u64,
+    pub message_stats_publish_total: u64,
+    pub message_stats_deliver_get_total: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -586,6 +612,7 @@ pub enum WorkloadMetrics {
     Etcd(EtcdMetrics),
     Elasticsearch(ElasticsearchMetrics),
     OpenSearch(OpenSearchMetrics),
+    RabbitMq(RabbitMqMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -665,6 +692,7 @@ macro_rules! search_report {
 }
 search_report!(ElasticsearchMonitorReport, ElasticsearchMetrics);
 search_report!(OpenSearchMonitorReport, OpenSearchMetrics);
+search_report!(RabbitMqMonitorReport, RabbitMqMetrics);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -679,6 +707,7 @@ pub enum WorkloadMonitorReport {
     Etcd(EtcdMonitorReport),
     Elasticsearch(ElasticsearchMonitorReport),
     OpenSearch(OpenSearchMonitorReport),
+    RabbitMq(RabbitMqMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -704,6 +733,8 @@ pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
 pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
 pub const SEARCH_RESPONSE_BYTES: usize = 64 * 1024;
+pub const RABBITMQ_LOOPBACK_ENDPOINT: &str = "127.0.0.1:15672";
+pub const RABBITMQ_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -712,6 +743,7 @@ pub const PROMETHEUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CLICKHOUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const ETCD_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const SEARCH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const RABBITMQ_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -811,6 +843,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                         WorkloadMetrics::Elasticsearch(_)
                     )
                     | (WorkloadAdapter::OpenSearch, WorkloadMetrics::OpenSearch(_))
+                    | (WorkloadAdapter::RabbitMq, WorkloadMetrics::RabbitMq(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -2192,6 +2225,167 @@ fn parse_search_metrics(
         ));
     }
     Ok(metrics)
+}
+
+pub fn monitor_rabbitmq_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, RabbitMqMetrics), WorkloadProbeError> {
+    let owned_connection = connection.cloned().unwrap_or(WorkloadConnectionConfig {
+        endpoint: format!("tcp://{RABBITMQ_LOOPBACK_ENDPOINT}"),
+        username: None,
+        secret_ref: None,
+        database: None,
+        auth_source: None,
+    });
+    owned_connection
+        .validate_for(WorkloadAdapter::RabbitMq)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("RabbitMQ connection configuration is invalid".into())
+        })?;
+    let url = rabbitmq_overview_url(&owned_connection)?;
+    let secret = resolve_connection_secret(&owned_connection).map_err(|_| {
+        WorkloadProbeError::Rejected("RabbitMQ authentication secret is unavailable".into())
+    })?;
+    let username = owned_connection.username.clone();
+    let endpoint = owned_connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("RabbitMQ probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                RABBITMQ_PROBE_TIMEOUT,
+                monitor_rabbitmq_async(&url, username.as_deref(), secret.as_deref()),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("RabbitMQ probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("RabbitMQ probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn rabbitmq_overview_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("RabbitMQ endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => {
+            Ok(format!("http://{}:{port}/api/overview", url_host(&host)))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            Ok(format!("https://{}:{port}/api/overview", url_host(&host)))
+        }
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "RabbitMQ endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+async fn monitor_rabbitmq_async(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> std::result::Result<RabbitMqMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(RABBITMQ_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| {
+            WorkloadProbeError::Unreachable("RabbitMQ HTTP client is unavailable".into())
+        })?;
+    let mut request = client.get(url);
+    if let Some(username) = username {
+        request = request.basic_auth(username, password);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("RabbitMQ endpoint is unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "RabbitMQ rejected overview request".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > RABBITMQ_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "RabbitMQ response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        WorkloadProbeError::Unreachable("RabbitMQ response could not be read".into())
+    })? {
+        if body.len().saturating_add(chunk.len()) > RABBITMQ_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "RabbitMQ response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("RabbitMQ response is not UTF-8".into()))?;
+    let value = serde_json::from_str(body)
+        .map_err(|_| WorkloadProbeError::Malformed("RabbitMQ response is not valid JSON".into()))?;
+    parse_rabbitmq_metrics(&value)
+}
+
+fn parse_rabbitmq_metrics(
+    value: &serde_json::Value,
+) -> std::result::Result<RabbitMqMetrics, WorkloadProbeError> {
+    let metric = |path: &[&str]| {
+        let mut current = value;
+        for segment in path {
+            current = current.get(*segment).ok_or_else(|| {
+                WorkloadProbeError::Malformed(format!(
+                    "RabbitMQ response is missing {}",
+                    path.join(".")
+                ))
+            })?;
+        }
+        current.as_u64().ok_or_else(|| {
+            WorkloadProbeError::Malformed(format!(
+                "RabbitMQ metric is not a u64: {}",
+                path.join(".")
+            ))
+        })
+    };
+    let optional_message_metric = |key| match value.get("message_stats") {
+        None => Ok(0),
+        Some(serde_json::Value::Object(stats)) => match stats.get(key) {
+            None => Ok(0),
+            Some(metric) => metric.as_u64().ok_or_else(|| {
+                WorkloadProbeError::Malformed(format!(
+                    "RabbitMQ message_stats metric is not a u64: {key}"
+                ))
+            }),
+        },
+        Some(_) => Err(WorkloadProbeError::Malformed(
+            "RabbitMQ message_stats is not an object".into(),
+        )),
+    };
+    Ok(RabbitMqMetrics {
+        messages: metric(&["queue_totals", "messages"])?,
+        messages_ready: metric(&["queue_totals", "messages_ready"])?,
+        messages_unacknowledged: metric(&["queue_totals", "messages_unacknowledged"])?,
+        queues: metric(&["object_totals", "queues"])?,
+        connections: metric(&["object_totals", "connections"])?,
+        channels: metric(&["object_totals", "channels"])?,
+        consumers: metric(&["object_totals", "consumers"])?,
+        exchanges: metric(&["object_totals", "exchanges"])?,
+        message_stats_publish_total: optional_message_metric("publish")?,
+        message_stats_deliver_get_total: optional_message_metric("deliver_get")?,
+    })
 }
 
 fn postgresql_metrics_from_rows(
@@ -3627,6 +3821,126 @@ path = "/usr/bin/redis-server"
             mismatched["adapter"] = serde_json::Value::String("redis".into());
             assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
         }
+    }
+
+    fn rabbitmq_response() -> serde_json::Value {
+        serde_json::json!({
+            "queue_totals": { "messages": 1, "messages_ready": 2, "messages_unacknowledged": 3 },
+            "object_totals": { "queues": 4, "connections": 5, "channels": 6, "consumers": 7, "exchanges": 8 },
+            "message_stats": { "publish": 9, "deliver_get": 10 },
+            "rabbitmq_version": "secret-metadata"
+        })
+    }
+
+    #[test]
+    fn rabbitmq_endpoint_and_auth_contract_are_strict() {
+        let anonymous = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:15672".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        anonymous.validate_for(WorkloadAdapter::RabbitMq).unwrap();
+        assert_eq!(
+            rabbitmq_overview_url(&anonymous).unwrap(),
+            "http://127.0.0.1:15672/api/overview"
+        );
+        let authenticated = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:15672".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:RABBITMQ_PASSWORD".into()),
+            ..anonymous.clone()
+        };
+        authenticated
+            .validate_for(WorkloadAdapter::RabbitMq)
+            .unwrap();
+        assert_eq!(
+            rabbitmq_overview_url(&authenticated).unwrap(),
+            "https://[::1]:15672/api/overview"
+        );
+        for invalid in [
+            WorkloadConnectionConfig {
+                secret_ref: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                username: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("vhost".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/rabbitmq.sock".into(),
+                ..authenticated
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::RabbitMq).is_err());
+        }
+    }
+
+    #[test]
+    fn rabbitmq_parser_requires_core_u64_and_defaults_only_missing_message_stats() {
+        let metrics = parse_rabbitmq_metrics(&rabbitmq_response()).unwrap();
+        assert_eq!(metrics.queues, 4);
+        assert_eq!(metrics.message_stats_deliver_get_total, 10);
+        let mut missing = rabbitmq_response();
+        missing.as_object_mut().unwrap().remove("message_stats");
+        let metrics = parse_rabbitmq_metrics(&missing).unwrap();
+        assert_eq!(metrics.message_stats_publish_total, 0);
+        let mut missing_key = rabbitmq_response();
+        missing_key["message_stats"]
+            .as_object_mut()
+            .unwrap()
+            .remove("publish");
+        assert_eq!(
+            parse_rabbitmq_metrics(&missing_key)
+                .unwrap()
+                .message_stats_publish_total,
+            0
+        );
+        let mut wrong = rabbitmq_response();
+        wrong["message_stats"]["publish"] = serde_json::json!("9");
+        assert!(parse_rabbitmq_metrics(&wrong).is_err());
+        let mut missing_core = rabbitmq_response();
+        missing_core["queue_totals"]
+            .as_object_mut()
+            .unwrap()
+            .remove("messages");
+        assert!(parse_rabbitmq_metrics(&missing_core).is_err());
+        let mut negative = rabbitmq_response();
+        negative["object_totals"]["queues"] = serde_json::json!(-1);
+        assert!(parse_rabbitmq_metrics(&negative).is_err());
+    }
+
+    #[test]
+    fn rabbitmq_metric_variant_matches_only_rabbitmq_samples() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "rabbitmq".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::RabbitMq,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:15672".into(),
+                metrics: WorkloadMetrics::RabbitMq(
+                    parse_rabbitmq_metrics(&rabbitmq_response()).unwrap(),
+                ),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("redis".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 
     #[test]
