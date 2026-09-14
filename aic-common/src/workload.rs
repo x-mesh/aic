@@ -2730,6 +2730,10 @@ fn connect_unix_with_timeout(
         return Err(unreachable(std::io::Error::last_os_error()));
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(unreachable(std::io::Error::last_os_error()));
+    }
     let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
     #[cfg(any(
         target_os = "macos",
@@ -4776,6 +4780,30 @@ path = "/usr/bin/redis-server"
             ),
             Err(WorkloadProbeError::Unreachable(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_connect_timeout_sets_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let temp = std::env::temp_dir().join(format!(
+            "aic-haproxy-connect-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&temp).unwrap();
+        let path = temp.join("stats.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream = connect_unix_with_timeout(&path, Duration::from_millis(100)).unwrap();
+        let accepted = listener.accept().unwrap().0;
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        drop(accepted);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(temp).unwrap();
     }
 
     #[test]
