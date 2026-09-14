@@ -987,6 +987,7 @@ pub fn monitor_mysql_with_connection(
     };
 
     let username = username.to_owned();
+    let database = connection.database.clone();
     let endpoint_text = connection.endpoint.clone();
     let metrics = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -998,7 +999,14 @@ pub fn monitor_mysql_with_connection(
         runtime.block_on(async {
             tokio::time::timeout(
                 MYSQL_PROBE_TIMEOUT,
-                monitor_mysql_async(&host, port, use_tls, &username, secret.as_deref()),
+                monitor_mysql_async(
+                    &host,
+                    port,
+                    use_tls,
+                    &username,
+                    secret.as_deref(),
+                    database.as_deref(),
+                ),
             )
             .await
             .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
@@ -1015,17 +1023,9 @@ async fn monitor_mysql_async(
     use_tls: bool,
     username: &str,
     password: Option<&str>,
+    database: Option<&str>,
 ) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
-    let mut options = MySqlOptsBuilder::default()
-        .ip_or_hostname(host)
-        .tcp_port(port)
-        .user(Some(username))
-        .pass(password)
-        .prefer_socket(false)
-        .stmt_cache_size(0);
-    if use_tls {
-        options = options.ssl_opts(Some(mysql_ssl_options()?));
-    }
+    let options = mysql_connection_options(host, port, use_tls, username, password, database)?;
     let mut connection = MySqlConnection::new(options)
         .await
         .map_err(map_mysql_connect_error)?;
@@ -1036,6 +1036,28 @@ async fn monitor_mysql_async(
     let metrics = mysql_metrics_from_rows(&rows);
     let _ = connection.disconnect().await;
     metrics
+}
+
+fn mysql_connection_options(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> std::result::Result<MySqlOptsBuilder, WorkloadProbeError> {
+    let mut options = MySqlOptsBuilder::default()
+        .ip_or_hostname(host)
+        .tcp_port(port)
+        .user(Some(username))
+        .pass(password)
+        .db_name(database)
+        .prefer_socket(false)
+        .stmt_cache_size(0);
+    if use_tls {
+        options = options.ssl_opts(Some(mysql_ssl_options()?));
+    }
+    Ok(options)
 }
 
 fn mysql_ssl_options() -> std::result::Result<SslOpts, WorkloadProbeError> {
@@ -2021,7 +2043,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tls://mysql.example:3306".into(),
             username: Some("monitor".into()),
             secret_ref: None,
-            database: Some("ignored_by_global_status".into()),
+            database: Some("metrics".into()),
             auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::MySql).unwrap();
@@ -2037,6 +2059,11 @@ path = "/usr/bin/redis-server"
         }
         .validate_for(WorkloadAdapter::MySql)
         .is_err());
+        let options = mysql_async::Opts::from(
+            mysql_connection_options("127.0.0.1", 3306, false, "monitor", None, Some("metrics"))
+                .unwrap(),
+        );
+        assert_eq!(options.db_name(), Some("metrics"));
     }
 
     #[test]
