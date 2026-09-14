@@ -439,7 +439,7 @@ The Prometheus adapter supports the official Linux Prometheus server.
 It uses the fixed `/metrics` path without a custom query. It does not support authentication or redirects.
 It uses `127.0.0.1:9090` by default. An explicit TCP or TLS endpoint can override this address.
 TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
-Responses have a 64 KiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
+Responses have a 1 MiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
 `tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`,
 `process_resident_memory_bytes`, `process_virtual_memory_bytes`, and `go_goroutines`.
 The ClickHouse adapter uses the HTTP interface on `127.0.0.1:8123` by default.
@@ -448,7 +448,7 @@ The adapter sends one fixed SQL query without a custom path, query parameter, or
 It returns `queries`, `merges`, `part_mutations`, `replicated_fetches`, `replicated_sends`,
 `tcp_connections`, `http_connections`, `memory_tracking_bytes`, `uptime_seconds`, and
 `memory_resident_bytes`. The current query includes itself in the `queries` value.
-Optional Basic authentication requires both `--username` and one secret option.
+Optional Basic authentication requires TLS, `--username`, and one secret option.
 Use a read-only user with access to the required system tables. Database and `--auth-source` are unsupported.
 TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
 Responses have a 64 KiB limit. The client does not follow redirects.
