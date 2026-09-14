@@ -149,6 +149,105 @@ fn workload_discovery_and_inspect_do_not_create_configuration() {
 }
 
 #[test]
+fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let monitor = aic_cmd(tmp.path())
+        .args(["workload", "monitor", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!monitor.status.success());
+    assert!(String::from_utf8_lossy(&monitor.stderr).contains("candidate"));
+}
+
+#[test]
+fn workload_status_and_history_read_local_history() {
+    use aic_common::workload::{
+        RedisMetrics, RedisSampleOutcome, RedisWorkloadSample, WorkloadAdapter, WorkloadDefinition,
+        WorkloadDriverMode, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+    };
+    use chrono::{Duration, Utc};
+
+    let empty = tempfile::tempdir().unwrap();
+    let empty_status = aic_cmd(empty.path())
+        .args(["workload", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(empty_status.status.success());
+    let empty_status: serde_json::Value = serde_json::from_slice(&empty_status.stdout).unwrap();
+    assert_eq!(empty_status["workloads"], serde_json::json!([]));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("cfg/aic");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let definition = WorkloadDefinition {
+        id: "redis-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/redis-server".into(),
+        },
+        adapter: WorkloadAdapter::Redis,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+    };
+    std::fs::write(
+        config_dir.join("workloads.toml"),
+        toml::to_string_pretty(&WorkloadStore {
+            workloads: vec![definition],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let state_dir = tmp.path().join("state/aic");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let sample = RedisWorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "redis-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        outcome: RedisSampleOutcome::Collected {
+            endpoint: "127.0.0.1:6379".into(),
+            metrics: RedisMetrics {
+                connected_clients: 1,
+                used_memory: 2,
+                total_commands_processed: 3,
+                instantaneous_ops_per_sec: 4,
+                keyspace_hits: 5,
+                keyspace_misses: 6,
+            },
+        },
+    };
+    std::fs::write(
+        state_dir.join("workload-history.jsonl"),
+        format!("{}\nnot-json\n", serde_json::to_string(&sample).unwrap()),
+    )
+    .unwrap();
+
+    let status = aic_cmd(tmp.path())
+        .args(["workload", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["workloads"][0]["state"], "stale");
+
+    let history = aic_cmd(tmp.path())
+        .args(["workload", "history", "redis-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history["samples"].as_array().unwrap().len(), 1);
+
+    let missing = aic_cmd(tmp.path())
+        .args(["workload", "history", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not configured"));
+}
+
+#[test]
 fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
     let discover = aic_cmd(tmp.path())

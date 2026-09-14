@@ -1,13 +1,17 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
-use crate::config::ConfigManager;
-use aic_common::workload::{ProposalCost, ProposalReadiness};
+use aic_common::workload::{
+    load_workload_history, monitor_redis, workload_history_path, workloads_file_path, ProposalCost,
+    ProposalReadiness, RedisMonitorReport, RedisWorkloadSample, WorkloadStore,
+    REDIS_SAMPLE_INTERVAL,
+};
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
     WorkloadCandidate, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
     WORKLOAD_SCHEMA_VERSION,
 };
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +22,6 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::path::Path;
-use std::path::PathBuf;
 use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -31,16 +34,8 @@ const MAX_CGROUP_BYTES: u64 = 8 * 1024;
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-const DRIVER_RESPONSE_BYTES: usize = 1024;
-const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
 const POSTGRES_LOOPBACK_ENDPOINT: &str = "127.0.0.1:5432";
 const NGINX_CONFIG_PATHS: &[&str] = &["/etc/nginx/nginx.conf", "/usr/local/etc/nginx/nginx.conf"];
-#[cfg(unix)]
-const REDIS_SOCKET_PATHS: &[&str] = &[
-    "/run/redis/redis-server.sock",
-    "/var/run/redis/redis-server.sock",
-    "/tmp/redis.sock",
-];
 #[cfg(unix)]
 const POSTGRES_SOCKET_PATHS: &[&str] = &[
     "/run/postgresql/.s.PGSQL.5432",
@@ -86,6 +81,14 @@ pub struct DriverInspection {
 }
 
 pub fn discover() -> Result<DiscoveryReport> {
+    discover_with_driver_checks(true)
+}
+
+fn discover_for_monitor() -> Result<DiscoveryReport> {
+    discover_with_driver_checks(false)
+}
+
+fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
     let mut system = System::new();
     let refresh = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::OnlyIfNotSet)
@@ -134,9 +137,11 @@ pub fn discover() -> Result<DiscoveryReport> {
     });
     rows.truncate(MAX_PROCESSES);
     let mut report = discover_rows(rows);
-    for candidate in &mut report.candidates {
-        if candidate.driver_mode.is_some() {
-            candidate.driver_mode = Some(inspect_driver(candidate).mode);
+    if check_drivers {
+        for candidate in &mut report.candidates {
+            if candidate.driver_mode.is_some() {
+                candidate.driver_mode = Some(inspect_driver(candidate).mode);
+            }
         }
     }
     Ok(report)
@@ -251,19 +256,9 @@ fn probe_nginx_config() -> Option<String> {
 }
 
 fn probe_redis() -> Option<String> {
-    #[cfg(unix)]
-    for path in REDIS_SOCKET_PATHS {
-        if probe_redis_unix_socket(Path::new(path)).is_ok() {
-            return Some(format!("Redis INFO SERVER accepted at local socket {path}"));
-        }
-    }
-
-    let endpoint = REDIS_LOOPBACK_ENDPOINT
-        .parse()
-        .expect("valid Redis endpoint");
-    probe_redis_tcp(endpoint)
+    aic_common::workload::probe_redis_server()
         .ok()
-        .map(|_| format!("Redis INFO SERVER accepted at {REDIS_LOOPBACK_ENDPOINT}"))
+        .map(|_| "Redis INFO SERVER accepted at fixed local endpoint".to_string())
 }
 
 fn probe_postgres() -> Option<String> {
@@ -296,45 +291,45 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
     probe_postgres_stream(&mut stream)
 }
 
-fn probe_redis_tcp(endpoint: SocketAddr) -> Result<(), String> {
-    let mut stream = TcpStream::connect_timeout(&endpoint, DRIVER_CONNECT_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    probe_redis_stream(&mut stream)
-}
-
-#[cfg(unix)]
-fn probe_redis_unix_socket(path: &Path) -> Result<(), String> {
-    let mut stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    probe_redis_stream(&mut stream)
-}
-
-fn probe_redis_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
-    stream
-        .write_all(b"INFO SERVER\r\n")
-        .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
-    let mut response = [0_u8; DRIVER_RESPONSE_BYTES];
-    let read = stream
-        .read(&mut response)
-        .map_err(|error| error.to_string())?;
-    let response = std::str::from_utf8(&response[..read]).map_err(|error| error.to_string())?;
-    if response.contains("# Server") {
-        Ok(())
-    } else {
-        Err("Redis INFO SERVER was not accepted".to_string())
+pub fn monitor_redis_candidate(candidate_id: &str) -> Result<RedisMonitorReport> {
+    let report = discover_for_monitor()?;
+    let candidate = select_redis_monitor_candidate(&report, candidate_id)?;
+    if candidate.adapter != WorkloadAdapter::Redis {
+        bail!("workload candidate is not Redis");
     }
+    let (_, metrics) = monitor_redis()
+        .map_err(anyhow::Error::msg)
+        .context("Redis monitor probe failed")?;
+    Ok(RedisMonitorReport {
+        candidate_id: candidate.id.clone(),
+        monitor_ready: true,
+        metrics,
+    })
+}
+
+fn select_redis_monitor_candidate<'a>(
+    report: &'a DiscoveryReport,
+    candidate_id: &str,
+) -> Result<&'a WorkloadCandidate> {
+    let redis_candidates = report
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.adapter == WorkloadAdapter::Redis)
+        .collect::<Vec<_>>();
+    if redis_candidates.len() != 1 {
+        bail!(
+            "Redis monitor requires exactly one unambiguous candidate, found {}",
+            redis_candidates.len()
+        );
+    }
+    let candidate = redis_candidates[0];
+    if candidate.id != candidate_id {
+        bail!("requested workload candidate does not match the discovered Redis candidate");
+    }
+    if !candidate.ambiguity.is_empty() {
+        bail!("Redis monitor candidate is ambiguous");
+    }
+    Ok(candidate)
 }
 
 fn probe_postgres_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
@@ -734,6 +729,118 @@ pub fn list_configured() -> Result<Vec<WorkloadDefinition>> {
     Ok(store.workloads)
 }
 
+pub const STALE_AFTER: Duration = REDIS_SAMPLE_INTERVAL.saturating_mul(3);
+pub const DEFAULT_HISTORY_LIMIT: usize = 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollectionState {
+    Fresh,
+    Stale,
+    NoSamples,
+    AmbiguousDefinitions,
+    NotCollected,
+}
+
+impl CollectionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::NoSamples => "no_samples",
+            Self::AmbiguousDefinitions => "ambiguous_definitions",
+            Self::NotCollected => "not_collected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorkloadStatusEntry {
+    pub workload_id: String,
+    pub adapter: WorkloadAdapter,
+    pub driver_mode: WorkloadDriverMode,
+    pub state: CollectionState,
+    pub last_sample: Option<RedisWorkloadSample>,
+    pub age_secs: Option<u64>,
+}
+
+pub fn derive_status(
+    definitions: &[WorkloadDefinition],
+    samples: &[RedisWorkloadSample],
+    now: DateTime<Utc>,
+) -> Vec<WorkloadStatusEntry> {
+    let redis_count = definitions
+        .iter()
+        .filter(|definition| definition.adapter == WorkloadAdapter::Redis)
+        .count();
+    definitions
+        .iter()
+        .map(|definition| {
+            if definition.adapter != WorkloadAdapter::Redis {
+                return WorkloadStatusEntry {
+                    workload_id: definition.id.clone(),
+                    adapter: definition.adapter,
+                    driver_mode: definition.driver_mode,
+                    state: CollectionState::NotCollected,
+                    last_sample: None,
+                    age_secs: None,
+                };
+            }
+            let last_sample = samples
+                .iter()
+                .filter(|sample| sample.workload_id == definition.id)
+                .max_by_key(|sample| sample.captured_at)
+                .cloned();
+            let age_secs = last_sample.as_ref().map(|sample| {
+                now.signed_duration_since(sample.captured_at)
+                    .num_seconds()
+                    .max(0) as u64
+            });
+            let state = if redis_count > 1 {
+                CollectionState::AmbiguousDefinitions
+            } else if let Some(age_secs) = age_secs {
+                if Duration::from_secs(age_secs) > STALE_AFTER {
+                    CollectionState::Stale
+                } else {
+                    CollectionState::Fresh
+                }
+            } else {
+                CollectionState::NoSamples
+            };
+            WorkloadStatusEntry {
+                workload_id: definition.id.clone(),
+                adapter: definition.adapter,
+                driver_mode: definition.driver_mode,
+                state,
+                last_sample,
+                age_secs,
+            }
+        })
+        .collect()
+}
+
+pub fn status() -> Result<Vec<WorkloadStatusEntry>> {
+    let definitions = list_configured()?;
+    let samples = load_workload_history(&workload_history_path())?;
+    Ok(derive_status(&definitions, &samples, Utc::now()))
+}
+
+pub fn history(workload_id: &str, limit: usize) -> Result<Vec<RedisWorkloadSample>> {
+    if !list_configured()?
+        .iter()
+        .any(|definition| definition.id == workload_id)
+    {
+        bail!("workload is not configured");
+    }
+    let mut samples = load_workload_history(&workload_history_path())?
+        .into_iter()
+        .filter(|sample| sample.workload_id == workload_id)
+        .collect::<Vec<_>>();
+    samples.sort_by_key(|sample| sample.captured_at);
+    let skip = samples.len().saturating_sub(limit);
+    Ok(samples.into_iter().skip(skip).collect())
+}
+
 pub fn enable(candidate_id: &str, expected_fingerprint: &str) -> Result<WorkloadDefinition> {
     let (_, candidate) = inspect(candidate_id)?;
     if candidate.fingerprint != expected_fingerprint {
@@ -827,14 +934,8 @@ fn parse_llm_explanations(raw: &str) -> Result<Vec<Explanation>> {
     bail!("invalid workload explanation JSON")
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct WorkloadStore {
-    #[serde(default)]
-    workloads: Vec<WorkloadDefinition>,
-}
-
-fn workloads_path() -> PathBuf {
-    ConfigManager::config_path().with_file_name("workloads.toml")
+fn workloads_path() -> std::path::PathBuf {
+    workloads_file_path()
 }
 
 fn save_definition(definition: &WorkloadDefinition) -> Result<()> {
@@ -1209,21 +1310,124 @@ mod tests {
             .all(|proposal| proposal.kind != ProposalKind::DriverInspect));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn redis_probe_accepts_only_the_info_server_response() {
-        use std::os::unix::net::UnixStream;
-        use std::thread;
+    fn redis_candidate(id: &str, ambiguity: &[&str]) -> WorkloadCandidate {
+        WorkloadCandidate {
+            id: id.into(),
+            fingerprint: format!("fingerprint:{id}"),
+            selector: Some(WorkloadSelector::Executable {
+                path: format!("/usr/bin/{id}"),
+            }),
+            adapter: WorkloadAdapter::Redis,
+            driver_mode: Some(WorkloadDriverMode::DetectOnly),
+            bindings: Vec::new(),
+            ambiguity: ambiguity.iter().map(|item| (*item).to_string()).collect(),
+        }
+    }
 
-        let (mut peer, mut client) = UnixStream::pair().unwrap();
-        let server = thread::spawn(move || {
-            let mut request = [0_u8; 13];
-            peer.read_exact(&mut request).unwrap();
-            assert_eq!(&request, b"INFO SERVER\r\n");
-            peer.write_all(b"$10\r\n# Server\r\n").unwrap();
-        });
-        assert!(probe_redis_stream(&mut client).is_ok());
-        server.join().unwrap();
+    fn redis_report(candidates: Vec<WorkloadCandidate>) -> DiscoveryReport {
+        DiscoveryReport {
+            schema_version: WORKLOAD_SCHEMA_VERSION,
+            evidence_coverage: "test".into(),
+            candidates,
+        }
+    }
+
+    #[test]
+    fn redis_monitor_selects_the_single_matching_unambiguous_candidate() {
+        let report = redis_report(vec![redis_candidate("redis-a", &[])]);
+        let selected = select_redis_monitor_candidate(&report, "redis-a").unwrap();
+        assert_eq!(selected.id, "redis-a");
+    }
+
+    #[test]
+    fn redis_monitor_fails_closed_for_zero_multiple_mismatched_or_ambiguous_candidates() {
+        let cases = [
+            (redis_report(Vec::new()), "redis-a"),
+            (
+                redis_report(vec![
+                    redis_candidate("redis-a", &[]),
+                    redis_candidate("redis-b", &[]),
+                ]),
+                "redis-a",
+            ),
+            (
+                redis_report(vec![redis_candidate("redis-a", &[])]),
+                "redis-b",
+            ),
+            (
+                redis_report(vec![redis_candidate(
+                    "redis-a",
+                    &["executable_unavailable"],
+                )]),
+                "redis-a",
+            ),
+        ];
+        for (report, candidate_id) in cases {
+            assert!(select_redis_monitor_candidate(&report, candidate_id).is_err());
+        }
+    }
+
+    fn sample(workload_id: &str, captured_at: DateTime<Utc>) -> RedisWorkloadSample {
+        RedisWorkloadSample {
+            schema_version: aic_common::workload::WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: workload_id.into(),
+            captured_at,
+            outcome: aic_common::workload::RedisSampleOutcome::Failed {
+                reason: aic_common::workload::RedisSampleFailure::Unreachable,
+                detail: "unavailable".into(),
+            },
+        }
+    }
+
+    fn redis_definition(id: &str) -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: id.into(),
+            selector: WorkloadSelector::Executable {
+                path: format!("/usr/bin/{id}"),
+            },
+            adapter: WorkloadAdapter::Redis,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+        }
+    }
+
+    #[test]
+    fn derive_status_covers_fresh_stale_missing_and_ambiguous() {
+        let now = Utc::now();
+        let definition = redis_definition("redis");
+        assert_eq!(
+            derive_status(
+                std::slice::from_ref(&definition),
+                &[sample("redis", now)],
+                now
+            )[0]
+            .state,
+            CollectionState::Fresh
+        );
+        assert_eq!(
+            derive_status(
+                std::slice::from_ref(&definition),
+                &[sample(
+                    "redis",
+                    now - chrono::Duration::seconds(STALE_AFTER.as_secs() as i64 + 1)
+                )],
+                now
+            )[0]
+            .state,
+            CollectionState::Stale
+        );
+        assert_eq!(
+            derive_status(std::slice::from_ref(&definition), &[], now)[0].state,
+            CollectionState::NoSamples
+        );
+        assert_eq!(
+            derive_status(
+                &[definition.clone(), redis_definition("redis-two")],
+                &[],
+                now
+            )[0]
+            .state,
+            CollectionState::AmbiguousDefinitions
+        );
     }
 
     #[cfg(unix)]

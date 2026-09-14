@@ -24,3 +24,5 @@ mod test_support;
 pub mod uds_server;
 // SRE R2: webhook alert ingestion → aic diagnose 자동 spawn.
 pub mod webhook_server;
+// Periodic bounded local Redis workload collection.
+pub mod workload_monitor;
