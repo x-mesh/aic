@@ -41,8 +41,8 @@ pub use session::{
 };
 pub use shell_hooks::generate_shell_hooks;
 pub use workload::{
-    ClickHouseMetrics, ClickHouseMonitorReport, DiscoveryReport, MongoDbMetrics,
-    MongoDbMonitorReport, MySqlMetrics, MySqlMonitorReport, PostgreSqlMetrics,
+    ClickHouseMetrics, ClickHouseMonitorReport, DiscoveryReport, EtcdMetrics, EtcdMonitorReport,
+    MongoDbMetrics, MongoDbMonitorReport, MySqlMetrics, MySqlMonitorReport, PostgreSqlMetrics,
     PostgreSqlMonitorReport, PrometheusMetrics, PrometheusMonitorReport, ProposalEffects,
     ProposalKind, RuntimeBinding, WorkloadAdapter, WorkloadCandidate, WorkloadConnectionConfig,
     WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,

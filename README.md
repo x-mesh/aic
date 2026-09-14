@@ -452,17 +452,26 @@ Optional Basic authentication requires TLS, `--username`, and one secret option.
 Use a read-only user with access to the required system tables. Database and `--auth-source` are unsupported.
 TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
 Responses have a 64 KiB limit. The client does not follow redirects.
+The etcd adapter uses anonymous `GET /metrics` on `127.0.0.1:2379` by default.
+An explicit TCP or TLS endpoint can override this address. TLS uses native host roots.
+Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
+The client does not follow redirects. The minimum supported modern etcd must expose the in-use database size metric.
+etcd returns `server_has_leader`, `server_is_leader`, `leader_changes_seen_total`,
+`proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
+`mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, and `process_resident_memory_bytes`.
+The adapter does not support gRPC status, authentication, private CAs, mTLS, custom paths, queries, or Unix endpoints.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, and ClickHouse definition every 60 seconds.
+`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, and etcd definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
 MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
 Prometheus definitions can use the default endpoint or a saved endpoint.
 ClickHouse definitions can use the default endpoint or a saved endpoint.
+etcd definitions can use the default endpoint or a saved endpoint.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

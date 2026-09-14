@@ -421,16 +421,24 @@ SQL 없이 고정 SQL 하나만 실행합니다. `queries`, `merges`, `part_muta
 `--username`, secret option 하나가 모두 필요합니다. 필요한 system table만 읽을 수 있는 사용자를 사용하십시오.
 database와 `--auth-source`는 지원하지 않습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고
 전체 probe 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다.
+etcd adapter는 기본적으로 `127.0.0.1:2379`의 익명 `GET /metrics`를 사용하며 explicit TCP 또는 TLS
+endpoint로 바꿀 수 있습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은
+3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. 지원하는 최신 etcd는 사용 중인 database 크기
+지표를 노출해야 합니다. etcd는 `server_has_leader`, `server_is_leader`, `leader_changes_seen_total`,
+`proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
+`mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, `process_resident_memory_bytes`를 반환합니다.
+gRPC status, 인증, private CA, mTLS, custom path, query, Unix endpoint는 지원하지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
+`aicd`는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, etcd 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
 그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
 `127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
 PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
 상태로 처리합니다.
 Prometheus 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 ClickHouse 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
+etcd 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 

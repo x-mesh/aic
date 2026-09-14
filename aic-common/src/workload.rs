@@ -224,6 +224,18 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
                 }
             }
+            WorkloadAdapter::Etcd => {
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("etcd workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some()
+                    || self.secret_ref.is_some()
+                    || self.database.is_some()
+                    || self.auth_source.is_some()
+                {
+                    anyhow::bail!("etcd workload connections do not support configuration fields");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -515,6 +527,22 @@ pub struct ClickHouseMetrics {
     pub memory_resident_bytes: u64,
 }
 
+/// Numeric metrics returned by one bounded etcd `/metrics` scrape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EtcdMetrics {
+    pub server_has_leader: u64,
+    pub server_is_leader: u64,
+    pub leader_changes_seen_total: u64,
+    pub proposals_applied_total: u64,
+    pub proposals_committed_total: u64,
+    pub proposals_failed_total: u64,
+    pub proposals_pending: u64,
+    pub mvcc_db_total_size_bytes: u64,
+    pub mvcc_db_total_size_in_use_bytes: u64,
+    pub process_resident_memory_bytes: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -528,6 +556,7 @@ pub enum WorkloadMetrics {
     MongoDb(MongoDbMetrics),
     Prometheus(PrometheusMetrics),
     ClickHouse(ClickHouseMetrics),
+    Etcd(EtcdMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -587,6 +616,14 @@ pub struct ClickHouseMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtcdMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: EtcdMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
@@ -596,6 +633,7 @@ pub enum WorkloadMonitorReport {
     MongoDb(MongoDbMonitorReport),
     Prometheus(PrometheusMonitorReport),
     ClickHouse(ClickHouseMonitorReport),
+    Etcd(EtcdMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -617,12 +655,15 @@ pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
+pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
+pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MONGODB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PROMETHEUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CLICKHOUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const ETCD_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -701,6 +742,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::MongoDb, WorkloadMetrics::MongoDb(_))
                     | (WorkloadAdapter::Prometheus, WorkloadMetrics::Prometheus(_))
                     | (WorkloadAdapter::ClickHouse, WorkloadMetrics::ClickHouse(_))
+                    | (WorkloadAdapter::Etcd, WorkloadMetrics::Etcd(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -1732,6 +1774,170 @@ fn parse_clickhouse_metrics(
 fn parse_clickhouse_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
     value.parse::<u64>().map_err(|_| {
         WorkloadProbeError::Malformed(format!("ClickHouse metric is not a u64: {name}"))
+    })
+}
+
+/// Scrape one bounded etcd `/metrics` endpoint.
+pub fn monitor_etcd_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, EtcdMetrics), WorkloadProbeError> {
+    let owned_connection = connection.cloned().unwrap_or(WorkloadConnectionConfig {
+        endpoint: format!("tcp://{ETCD_LOOPBACK_ENDPOINT}"),
+        username: None,
+        secret_ref: None,
+        database: None,
+        auth_source: None,
+    });
+    owned_connection
+        .validate_for(WorkloadAdapter::Etcd)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("etcd connection configuration is invalid".into())
+        })?;
+    let url = etcd_metrics_url(&owned_connection)?;
+    let endpoint = owned_connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("etcd probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(ETCD_PROBE_TIMEOUT, monitor_etcd_async(&url))
+                .await
+                .map_err(|_| WorkloadProbeError::Unreachable("etcd probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("etcd probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn etcd_metrics_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("etcd endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => {
+            Ok(format!("http://{}:{port}/metrics", url_host(&host)))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            Ok(format!("https://{}:{port}/metrics", url_host(&host)))
+        }
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "etcd endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+async fn monitor_etcd_async(url: &str) -> std::result::Result<EtcdMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(ETCD_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| WorkloadProbeError::Unreachable("etcd HTTP client is unavailable".into()))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("etcd endpoint is unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "etcd rejected metrics request".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > ETCD_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "etcd response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("etcd response could not be read".into()))?
+    {
+        if body.len().saturating_add(chunk.len()) > ETCD_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "etcd response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("etcd response is not UTF-8".into()))?;
+    parse_etcd_metrics(body)
+}
+
+fn parse_etcd_metrics(body: &str) -> std::result::Result<EtcdMetrics, WorkloadProbeError> {
+    const REQUIRED: [&str; 10] = [
+        "etcd_server_has_leader",
+        "etcd_server_is_leader",
+        "etcd_server_leader_changes_seen_total",
+        "etcd_server_proposals_applied_total",
+        "etcd_server_proposals_committed_total",
+        "etcd_server_proposals_failed_total",
+        "etcd_server_proposals_pending",
+        "etcd_mvcc_db_total_size_in_bytes",
+        "etcd_mvcc_db_total_size_in_use_in_bytes",
+        "process_resident_memory_bytes",
+    ];
+    let mut values = BTreeMap::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name_end = line
+            .find(|character: char| character == '{' || character.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let name = &line[..name_end];
+        if !REQUIRED.contains(&name) {
+            continue;
+        }
+        if line[name_end..].starts_with('{') {
+            return Err(WorkloadProbeError::Malformed(format!(
+                "etcd required metric contains labels: {name}"
+            )));
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || values.contains_key(name) {
+            return Err(WorkloadProbeError::Malformed(format!(
+                "etcd required metric is duplicate or malformed: {name}"
+            )));
+        }
+        let value = parse_exposition_u64(fields[1]).map_err(|_| {
+            WorkloadProbeError::Malformed(format!("etcd metric is not a u64: {name}"))
+        })?;
+        if matches!(name, "etcd_server_has_leader" | "etcd_server_is_leader") && value > 1 {
+            return Err(WorkloadProbeError::Malformed(format!(
+                "etcd leader gauge is not 0 or 1: {name}"
+            )));
+        }
+        values.insert(name, value);
+    }
+    let mut take = |name| {
+        values.remove(name).ok_or_else(|| {
+            WorkloadProbeError::Malformed(format!("etcd response is missing {name}"))
+        })
+    };
+    Ok(EtcdMetrics {
+        server_has_leader: take("etcd_server_has_leader")?,
+        server_is_leader: take("etcd_server_is_leader")?,
+        leader_changes_seen_total: take("etcd_server_leader_changes_seen_total")?,
+        proposals_applied_total: take("etcd_server_proposals_applied_total")?,
+        proposals_committed_total: take("etcd_server_proposals_committed_total")?,
+        proposals_failed_total: take("etcd_server_proposals_failed_total")?,
+        proposals_pending: take("etcd_server_proposals_pending")?,
+        mvcc_db_total_size_bytes: take("etcd_mvcc_db_total_size_in_bytes")?,
+        mvcc_db_total_size_in_use_bytes: take("etcd_mvcc_db_total_size_in_use_in_bytes")?,
+        process_resident_memory_bytes: take("process_resident_memory_bytes")?,
     })
 }
 
@@ -3000,6 +3206,138 @@ path = "/usr/bin/redis-server"
         );
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("prometheus".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    fn etcd_response() -> String {
+        [
+            "# HELP ignored comment",
+            "unknown_metric 99",
+            "etcd_server_has_leader 1",
+            "etcd_server_is_leader 0",
+            "etcd_server_leader_changes_seen_total 2",
+            "etcd_server_proposals_applied_total 3",
+            "etcd_server_proposals_committed_total 4",
+            "etcd_server_proposals_failed_total 5",
+            "etcd_server_proposals_pending 6",
+            "etcd_mvcc_db_total_size_in_bytes 7",
+            "etcd_mvcc_db_total_size_in_use_in_bytes 8",
+            "process_resident_memory_bytes 9",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn etcd_endpoint_maps_to_metrics_and_rejects_configuration_fields() {
+        let tcp = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:2379".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        tcp.validate_for(WorkloadAdapter::Etcd).unwrap();
+        assert_eq!(
+            etcd_metrics_url(&tcp).unwrap(),
+            "http://127.0.0.1:2379/metrics"
+        );
+        let tls = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:2379".into(),
+            ..tcp.clone()
+        };
+        assert_eq!(
+            etcd_metrics_url(&tls).unwrap(),
+            "https://[::1]:2379/metrics"
+        );
+        for invalid in [
+            WorkloadConnectionConfig {
+                username: Some("monitor".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                secret_ref: Some("env:ETCD_PASSWORD".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("metrics".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/etcd.sock".into(),
+                ..tcp
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::Etcd).is_err());
+        }
+    }
+
+    #[test]
+    fn etcd_parser_requires_exact_label_free_u64_metrics_and_boolean_gauges() {
+        let metrics = parse_etcd_metrics(&etcd_response()).unwrap();
+        assert_eq!(metrics.server_has_leader, 1);
+        assert_eq!(metrics.process_resident_memory_bytes, 9);
+        for invalid in [
+            etcd_response().replace("etcd_server_has_leader 1", ""),
+            format!("{}\netcd_server_has_leader 1", etcd_response()),
+            etcd_response().replace(
+                "etcd_server_has_leader 1",
+                "etcd_server_has_leader{instance=\"local\"} 1",
+            ),
+            etcd_response().replace("etcd_server_has_leader 1", "etcd_server_has_leader 2"),
+            etcd_response().replace("etcd_server_is_leader 0", "etcd_server_is_leader -1"),
+            etcd_response().replace(
+                "etcd_server_proposals_pending 6",
+                "etcd_server_proposals_pending 1.5",
+            ),
+            etcd_response().replace(
+                "process_resident_memory_bytes 9",
+                "process_resident_memory_bytes 18446744073709551616",
+            ),
+            etcd_response().replace(
+                "etcd_server_proposals_pending 6",
+                "etcd_server_proposals_pending 1e2147483647",
+            ),
+        ] {
+            assert!(matches!(
+                parse_etcd_metrics(&invalid),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+        let scientific = etcd_response().replace(
+            "etcd_server_proposals_applied_total 3",
+            "etcd_server_proposals_applied_total 1.234e+06",
+        );
+        assert_eq!(
+            parse_etcd_metrics(&scientific)
+                .unwrap()
+                .proposals_applied_total,
+            1_234_000
+        );
+    }
+
+    #[test]
+    fn etcd_metric_variant_matches_only_etcd_samples() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "etcd".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::Etcd,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:2379".into(),
+                metrics: WorkloadMetrics::Etcd(parse_etcd_metrics(&etcd_response()).unwrap()),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("click_house".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 
