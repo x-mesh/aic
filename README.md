@@ -421,7 +421,7 @@ MySQL returns `threads_connected`, `threads_running`, `connections`, `aborted_co
 `questions`, `slow_queries`, `bytes_received`, and `bytes_sent`.
 PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
 MySQL runs one fixed `SHOW GLOBAL STATUS` query for the eight listed metrics.
-The connection sets read-only transaction mode and bounded statement and lock timeouts.
+The PostgreSQL connection sets read-only transaction mode and bounded statement and lock timeouts.
 The monitor opens one connection for each probe. It does not use a connection pool.
 The PostgreSQL library does not expose a response byte limit. Its fixed query returns one scalar row.
 The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
