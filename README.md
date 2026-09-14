@@ -427,7 +427,7 @@ MongoDB returns `connections_current`, `connections_available`, `connections_tot
 `network_bytes_out`, `network_num_requests`, and `uptime_seconds`.
 PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
 MySQL runs one fixed `SHOW GLOBAL STATUS` query for the eight listed metrics.
-The connection sets read-only transaction mode and bounded statement and lock timeouts.
+The PostgreSQL connection sets read-only transaction mode and bounded statement and lock timeouts.
 The monitor opens one connection for each probe. It does not use a connection pool.
 The PostgreSQL library does not expose a response byte limit. Its fixed query returns one scalar row.
 The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
@@ -439,7 +439,7 @@ The Prometheus adapter supports the official Linux Prometheus server.
 It uses the fixed `/metrics` path without a custom query. It does not support authentication or redirects.
 It uses `127.0.0.1:9090` by default. An explicit TCP or TLS endpoint can override this address.
 TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
-Responses have a 64 KiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
+Responses have a 1 MiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
 `tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`,
 `process_resident_memory_bytes`, `process_virtual_memory_bytes`, and `go_goroutines`.
 The ClickHouse adapter uses the HTTP interface on `127.0.0.1:8123` by default.
@@ -448,7 +448,7 @@ The adapter sends one fixed SQL query without a custom path, query parameter, or
 It returns `queries`, `merges`, `part_mutations`, `replicated_fetches`, `replicated_sends`,
 `tcp_connections`, `http_connections`, `memory_tracking_bytes`, `uptime_seconds`, and
 `memory_resident_bytes`. The current query includes itself in the `queries` value.
-Optional Basic authentication requires both `--username` and one secret option.
+Optional Basic authentication requires TLS, `--username`, and one secret option.
 Use a read-only user with access to the required system tables. Database and `--auth-source` are unsupported.
 TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
 Responses have a 64 KiB limit. The client does not follow redirects.
@@ -469,7 +469,7 @@ Use a least-privilege monitoring user. TLS uses native host roots.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
 The clients do not follow redirects. They do not support API keys, SigV4, private CAs, mTLS, custom paths, queries, searches, or node stats.
 The RabbitMQ adapter requires the `rabbitmq_management` plugin. It uses `127.0.0.1:15672` by default.
-It sends fixed `GET /api/overview` requests. Optional Basic authentication requires both credential fields.
+It sends fixed `GET /api/overview` requests. Optional Basic authentication requires TLS and both credential fields.
 Use a dedicated user with the `monitoring` tag. Administrator access is not required.
 RabbitMQ returns `messages`, `messages_ready`, `messages_unacknowledged`, `queues`, `connections`,
 `channels`, `consumers`, `exchanges`, `message_stats_publish_total`, and `message_stats_deliver_get_total`.
@@ -478,11 +478,12 @@ Connect operations use 200 ms, each probe has a three-second limit, and response
 The client does not follow redirects. It does not support AMQP port 5672, vhost selection, private CAs, mTLS, or custom APIs.
 The Nginx adapter requires an explicit TCP or TLS endpoint. It always requests `/stub_status`.
 Enable the Nginx `stub_status` module and configure that exact location before use.
-Optional Basic authentication requires both credential fields. TLS uses native host roots.
+Optional Basic authentication requires TLS and both credential fields. TLS uses native host roots.
 Nginx returns `active_connections`, `accepts_total`, `handled_total`, `requests_total`, `reading`, `writing`, and `waiting`.
 Connect operations use 200 ms, each probe has a three-second limit, and responses have a 16 KiB limit.
 The client does not follow redirects. AIC does not change or reload Nginx configuration. Custom status paths are unsupported.
 The HAProxy adapter requires an explicit Unix stats socket with user-level read and write access.
+It runs on Unix targets that support atomic close-on-exec socket creation. It fails closed on macOS.
 It sends only `show stat` and stores `local-unix-socket` as the history endpoint label.
 It aggregates frontend counters and counts server rows with a down status.
 HAProxy returns `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
