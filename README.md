@@ -433,7 +433,8 @@ The PostgreSQL library does not expose a response byte limit. Its fixed query re
 The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
 MySQL TLS uses native host roots only and verifies the endpoint host.
 MongoDB runs one fixed `serverStatus` command with a three-second total timeout.
-The MongoDB client limits its internal pool to one connection. MongoDB TLS uses OpenSSL system roots.
+The MongoDB client limits its internal pool to one connection. MongoDB TLS uses OpenSSL filesystem CA paths.
+Set `SSL_CERT_FILE` or `SSL_CERT_DIR` when the default filesystem paths do not contain the required CA.
 The MongoDB probe applies its 64 KiB limit after BSON decode. The driver can receive a larger response first.
 The Prometheus adapter supports the official Linux Prometheus server.
 It uses the fixed `/metrics` path without a custom query. It does not support authentication or redirects.

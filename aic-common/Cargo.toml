@@ -1,6 +1,6 @@
 [package]
 name = "aic-common"
-version = "0.41.2"
+version = "0.41.3"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -48,9 +48,9 @@ mongodb = { version = "=3.9.1", default-features = false, features = ["compat-3-
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
 csv = { version = "=1.4.0", default-features = false }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# MongoDB uses OpenSSL TLS. Linux release binaries are cross-built on macOS, so they need
-# a target OpenSSL instead of the host installation. Keep macOS on the system library.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# MongoDB uses OpenSSL TLS. Release binaries use one static OpenSSL implementation on Linux
+# and macOS so cross-builds do not depend on a host Homebrew library.
 openssl = { version = "=0.10.81", default-features = false, features = ["vendored"] }
 
 [dev-dependencies]

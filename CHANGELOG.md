@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.41.3] - 2026-09-14
+
+### Fixed
+
+- Linux와 macOS release target에 vendored OpenSSL을 사용해 MongoDB TLS binary의 cross-linking을 복구한다.
+- MongoDB TLS가 filesystem CA path와 `SSL_CERT_FILE` 또는 `SSL_CERT_DIR`을 사용함을 명시한다.
+
 ## [0.41.2] - 2026-09-14
 
 ### Fixed

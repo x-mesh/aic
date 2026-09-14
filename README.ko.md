@@ -405,7 +405,8 @@ MySQL TLS는 native root만 사용하고 endpoint host를 검증합니다. probe
 않습니다. PostgreSQL과 MySQL library는 응답 byte 제한을 제공하지 않습니다. PostgreSQL의 고정 query는
 반환 범위를 row 하나로 제한합니다. Redis와 Memcached의 연결, 읽기, 쓰기 제한은 각각 200ms이고
 MongoDB는 고정 `serverStatus` command와 3초 전체 timeout을 사용합니다. 내부 pool은 connection 하나로
-제한합니다. MongoDB TLS는 OpenSSL system root를 사용합니다. 64KiB 제한은 BSON decode 뒤에 적용하므로
+제한합니다. MongoDB TLS는 OpenSSL filesystem CA path를 사용합니다. 기본 path에 필요한 CA가 없으면
+`SSL_CERT_FILE` 또는 `SSL_CERT_DIR`을 설정하십시오. 64KiB 제한은 BSON decode 뒤에 적용하므로
 driver가 먼저 더 큰 응답을 받을 수 있습니다.
 Prometheus adapter는 공식 Linux Prometheus server를 지원합니다. custom path나 query 없이 고정 `/metrics`
 경로를 사용하며 인증과 redirect는 지원하지 않습니다. 기본 endpoint는 `127.0.0.1:9090`이고 explicit TCP 또는

@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "aic-client"
-version = "0.41.2"
+version = "0.41.3"
 dependencies = [
  "aic-common",
  "aic-server",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "aic-common"
-version = "0.41.2"
+version = "0.41.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "aic-server"
-version = "0.41.2"
+version = "0.41.3"
 dependencies = [
  "aic-common",
  "anyhow",
