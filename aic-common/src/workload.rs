@@ -210,7 +210,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::ClickHouse => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("ClickHouse workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -218,6 +219,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("ClickHouse workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
@@ -612,7 +616,7 @@ pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
 pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
-pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, toUInt64(value) AS value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, toUInt64(value) AS value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
+pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1621,6 +1625,7 @@ async fn monitor_clickhouse_async(
     password: Option<&str>,
 ) -> std::result::Result<ClickHouseMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(CLICKHOUSE_PROBE_TIMEOUT)
@@ -2656,6 +2661,12 @@ path = "/usr/bin/redis-server"
         authenticated
             .validate_for(WorkloadAdapter::MongoDb)
             .unwrap();
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://clickhouse.example:8123".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::ClickHouse)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
