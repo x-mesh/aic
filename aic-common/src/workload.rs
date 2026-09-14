@@ -18,6 +18,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -2685,7 +2687,7 @@ pub fn monitor_haproxy_with_connection(
             unreachable!()
         };
         let metrics = std::thread::spawn(move || {
-            let mut stream = UnixStream::connect(path).map_err(unreachable)?;
+            let mut stream = connect_unix_with_timeout(&path, DRIVER_CONNECT_TIMEOUT)?;
             stream
                 .set_read_timeout(Some(HAPROXY_PROBE_TIMEOUT))
                 .map_err(unreachable)?;
@@ -2705,6 +2707,89 @@ pub fn monitor_haproxy_with_connection(
             "Unix sockets are unavailable".into(),
         ))
     }
+}
+
+#[cfg(unix)]
+fn connect_unix_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> std::result::Result<UnixStream, WorkloadProbeError> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() {
+        return Err(WorkloadProbeError::Malformed(
+            "Unix socket path is invalid".into(),
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK, 0) };
+    if fd < 0 {
+        return Err(unreachable(std::io::Error::last_os_error()));
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len = address_len as u8;
+    }
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN
+        ) {
+            return Err(unreachable(error));
+        }
+        let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready <= 0 {
+            return Err(WorkloadProbeError::Unreachable(
+                "Unix socket connection timed out".into(),
+            ));
+        }
+        let mut socket_error = 0_i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || socket_error != 0
+        {
+            return Err(unreachable(if socket_error != 0 {
+                std::io::Error::from_raw_os_error(socket_error)
+            } else {
+                std::io::Error::last_os_error()
+            }));
+        }
+    }
+    stream.set_nonblocking(false).map_err(unreachable)?;
+    Ok(stream)
 }
 
 fn monitor_haproxy_stream(
@@ -4674,6 +4759,23 @@ path = "/usr/bin/redis-server"
         let mut stream = TestStream::response(haproxy_csv());
         assert_eq!(monitor_haproxy_stream(&mut stream).unwrap().servers_down, 2);
         assert_eq!(stream.output, HAPROXY_STATS_COMMAND);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_connect_timeout_rejects_invalid_and_missing_paths() {
+        let too_long = PathBuf::from(format!("/tmp/{}", "x".repeat(200)));
+        assert!(matches!(
+            connect_unix_with_timeout(&too_long, Duration::from_millis(10)),
+            Err(WorkloadProbeError::Malformed(_))
+        ));
+        assert!(matches!(
+            connect_unix_with_timeout(
+                Path::new("/tmp/aic-definitely-missing-haproxy.sock"),
+                Duration::from_millis(10)
+            ),
+            Err(WorkloadProbeError::Unreachable(_))
+        ));
     }
 
     #[test]
