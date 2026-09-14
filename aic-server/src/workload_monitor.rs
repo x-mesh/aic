@@ -69,6 +69,10 @@ pub fn load_prometheus_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::Prometheus)
 }
 
+pub fn load_clickhouse_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::ClickHouse)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -179,6 +183,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MySql => "MySQL endpoint is unavailable",
         WorkloadAdapter::MongoDb => "MongoDB endpoint is unavailable",
         WorkloadAdapter::Prometheus => "Prometheus endpoint is unavailable",
+        WorkloadAdapter::ClickHouse => "ClickHouse endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -191,6 +196,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MySql => "MySQL rejected the statistics request",
         WorkloadAdapter::MongoDb => "MongoDB rejected the serverStatus request",
         WorkloadAdapter::Prometheus => "Prometheus rejected the metrics request",
+        WorkloadAdapter::ClickHouse => "ClickHouse rejected the metrics query",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -203,6 +209,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::MySql => "MySQL returned an invalid statistics response",
         WorkloadAdapter::MongoDb => "MongoDB returned an invalid serverStatus response",
         WorkloadAdapter::Prometheus => "Prometheus returned an invalid metrics response",
+        WorkloadAdapter::ClickHouse => "ClickHouse returned an invalid metrics response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -301,6 +308,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::MySql,
                     WorkloadAdapter::MongoDb,
                     WorkloadAdapter::Prometheus,
+                    WorkloadAdapter::ClickHouse,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -467,6 +475,17 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::ClickHouse => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_clickhouse_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::ClickHouse(metrics)))
+                    },
+                    Utc::now(),
+                ),
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -494,8 +513,8 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics, RedisMetrics,
-        WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
+        ClickHouseMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics,
+        RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -645,6 +664,33 @@ mod tests {
             process_resident_memory_bytes: 6,
             process_virtual_memory_bytes: 7,
             go_goroutines: 8,
+        }
+    }
+
+    fn clickhouse_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "clickhouse".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/clickhouse-server".into(),
+            },
+            adapter: WorkloadAdapter::ClickHouse,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
+        }
+    }
+
+    fn clickhouse_metrics() -> ClickHouseMetrics {
+        ClickHouseMetrics {
+            queries: 1,
+            merges: 2,
+            part_mutations: 3,
+            replicated_fetches: 4,
+            replicated_sends: 5,
+            tcp_connections: 6,
+            http_connections: 7,
+            memory_tracking_bytes: 8,
+            uptime_seconds: 9,
+            memory_resident_bytes: 10,
         }
     }
 
@@ -826,6 +872,32 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_prometheus_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn clickhouse_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![
+                    clickhouse_definition(),
+                    clickhouse_definition(),
+                    definition(),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_clickhouse_definition(&path),
             DefinitionsState::Ambiguous(2)
         );
         assert_eq!(
@@ -1249,6 +1321,56 @@ mod tests {
             panic!("expected failed Prometheus sample");
         };
         assert_eq!(detail, "Prometheus rejected the metrics request");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn clickhouse_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &clickhouse_definition(),
+            || {
+                Ok((
+                    "http://127.0.0.1:8123/".into(),
+                    WorkloadMetrics::ClickHouse(clickhouse_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::ClickHouse,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::ClickHouse(_),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let failed = collect_once(
+            &cfg,
+            &clickhouse_definition(),
+            || Err(WorkloadProbeError::Rejected("password=secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed ClickHouse sample");
+        };
+        assert_eq!(detail, "ClickHouse rejected the metrics query");
         assert!(!detail.contains("secret"));
     }
 

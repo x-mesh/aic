@@ -162,9 +162,10 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, PrometheusMetrics,
-        WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
-        WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        ClickHouseMetrics, MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics,
+        PrometheusMetrics, WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode,
+        WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome, WorkloadSelector, WorkloadStore,
+        WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -258,6 +259,21 @@ fn workload_status_and_history_read_local_history() {
             auth_source: None,
         }),
     };
+    let clickhouse_definition = WorkloadDefinition {
+        id: "clickhouse-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/clickhouse-server".into(),
+        },
+        adapter: WorkloadAdapter::ClickHouse,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:18123".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:CLICKHOUSE_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -268,6 +284,7 @@ fn workload_status_and_history_read_local_history() {
                 mysql_definition,
                 mongodb_definition,
                 prometheus_definition,
+                clickhouse_definition,
             ],
         })
         .unwrap(),
@@ -388,16 +405,38 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let clickhouse_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "clickhouse-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::ClickHouse,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:18123".into(),
+            metrics: WorkloadMetrics::ClickHouse(ClickHouseMetrics {
+                queries: 1,
+                merges: 2,
+                part_mutations: 3,
+                replicated_fetches: 4,
+                replicated_sends: 5,
+                tcp_connections: 6,
+                http_connections: 7,
+                memory_tracking_bytes: 8,
+                uptime_seconds: 9,
+                memory_resident_bytes: 10,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
             serde_json::to_string(&mysql_sample).unwrap(),
             serde_json::to_string(&mongodb_sample).unwrap(),
-            serde_json::to_string(&prometheus_sample).unwrap()
+            serde_json::to_string(&prometheus_sample).unwrap(),
+            serde_json::to_string(&clickhouse_sample).unwrap()
         ),
     )
     .unwrap();
@@ -481,6 +520,19 @@ fn workload_status_and_history_read_local_history() {
         8
     );
 
+    let clickhouse_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "clickhouse-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(clickhouse_history.status.success());
+    let clickhouse_history: serde_json::Value =
+        serde_json::from_slice(&clickhouse_history.stdout).unwrap();
+    assert_eq!(clickhouse_history["samples"][0]["adapter"], "click_house");
+    assert_eq!(
+        clickhouse_history["samples"][0]["metrics"]["memory_resident_bytes"],
+        10
+    );
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -513,6 +565,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let mysql = candidate["adapter"] == "my_sql";
     let mongodb = candidate["adapter"] == "mongo_db";
     let prometheus = candidate["adapter"] == "prometheus";
+    let clickhouse = candidate["adapter"] == "click_house";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -537,6 +590,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "tcp://127.0.0.1:27017"
         } else if prometheus {
             "tcp://127.0.0.1:19090"
+        } else if clickhouse {
+            "tcp://127.0.0.1:18123"
         } else {
             "tcp://127.0.0.1:16379"
         },
@@ -553,6 +608,13 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "MONGODB_PASSWORD",
             "--auth-source",
             "admin",
+        ]);
+    } else if clickhouse {
+        enabled.args([
+            "--username",
+            "aic_monitor",
+            "--auth-env",
+            "CLICKHOUSE_PASSWORD",
         ]);
     }
     let enabled = enabled.arg("--json").output().unwrap();
@@ -571,6 +633,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "endpoint = \"tcp://127.0.0.1:27017\""
     } else if prometheus {
         "endpoint = \"tcp://127.0.0.1:19090\""
+    } else if clickhouse {
+        "endpoint = \"tcp://127.0.0.1:18123\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));
@@ -584,6 +648,9 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         assert!(saved.contains("username = \"aic_monitor\""));
         assert!(saved.contains("secret_ref = \"env:MONGODB_PASSWORD\""));
         assert!(saved.contains("auth_source = \"admin\""));
+    } else if clickhouse {
+        assert!(saved.contains("username = \"aic_monitor\""));
+        assert!(saved.contains("secret_ref = \"env:CLICKHOUSE_PASSWORD\""));
     }
 
     let listed = aic_cmd(tmp.path())
