@@ -236,6 +236,21 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("etcd workload connections do not support configuration fields");
                 }
             }
+            WorkloadAdapter::Elasticsearch | WorkloadAdapter::OpenSearch => {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("search workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some() != self.secret_ref.is_some() {
+                    anyhow::bail!("search username and secret_ref must be provided together");
+                }
+                if self.database.is_some() || self.auth_source.is_some() {
+                    anyhow::bail!("search workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("search authentication requires a TLS endpoint");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -543,6 +558,26 @@ pub struct EtcdMetrics {
     pub process_resident_memory_bytes: u64,
 }
 
+macro_rules! search_metrics {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub nodes_total: u64,
+            pub indices_count: u64,
+            pub shards_total: u64,
+            pub shards_primaries: u64,
+            pub docs_count: u64,
+            pub docs_deleted: u64,
+            pub store_size_bytes: u64,
+            pub fs_total_bytes: u64,
+            pub fs_available_bytes: u64,
+        }
+    };
+}
+search_metrics!(ElasticsearchMetrics);
+search_metrics!(OpenSearchMetrics);
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -557,6 +592,8 @@ pub enum WorkloadMetrics {
     Prometheus(PrometheusMetrics),
     ClickHouse(ClickHouseMetrics),
     Etcd(EtcdMetrics),
+    Elasticsearch(ElasticsearchMetrics),
+    OpenSearch(OpenSearchMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -623,6 +660,20 @@ pub struct EtcdMonitorReport {
     pub metrics: EtcdMetrics,
 }
 
+macro_rules! search_report {
+    ($name:ident, $metrics:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct $name {
+            pub candidate_id: String,
+            pub adapter: WorkloadAdapter,
+            pub monitor_ready: bool,
+            pub metrics: $metrics,
+        }
+    };
+}
+search_report!(ElasticsearchMonitorReport, ElasticsearchMetrics);
+search_report!(OpenSearchMonitorReport, OpenSearchMetrics);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
@@ -634,6 +685,8 @@ pub enum WorkloadMonitorReport {
     Prometheus(PrometheusMonitorReport),
     ClickHouse(ClickHouseMonitorReport),
     Etcd(EtcdMonitorReport),
+    Elasticsearch(ElasticsearchMonitorReport),
+    OpenSearch(OpenSearchMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -657,6 +710,8 @@ pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
 pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
+pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
+pub const SEARCH_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -664,6 +719,7 @@ pub const MONGODB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PROMETHEUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const CLICKHOUSE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const ETCD_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const SEARCH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -731,10 +787,25 @@ impl<'de> Deserialize<'de> for WorkloadSample {
             outcome: WorkloadSampleOutcome,
         }
 
-        let wire = WireSample::deserialize(deserializer)?;
-        if let WorkloadSampleOutcome::Collected { metrics, .. } = &wire.outcome {
+        let mut wire = WireSample::deserialize(deserializer)?;
+        if let WorkloadSampleOutcome::Collected { metrics, .. } = &mut wire.outcome {
+            if wire.adapter == WorkloadAdapter::OpenSearch {
+                if let WorkloadMetrics::Elasticsearch(value) = metrics {
+                    *metrics = WorkloadMetrics::OpenSearch(OpenSearchMetrics {
+                        nodes_total: value.nodes_total,
+                        indices_count: value.indices_count,
+                        shards_total: value.shards_total,
+                        shards_primaries: value.shards_primaries,
+                        docs_count: value.docs_count,
+                        docs_deleted: value.docs_deleted,
+                        store_size_bytes: value.store_size_bytes,
+                        fs_total_bytes: value.fs_total_bytes,
+                        fs_available_bytes: value.fs_available_bytes,
+                    });
+                }
+            }
             let matches = matches!(
-                (wire.adapter, metrics),
+                (wire.adapter, &*metrics),
                 (WorkloadAdapter::Redis, WorkloadMetrics::Redis(_))
                     | (WorkloadAdapter::Memcached, WorkloadMetrics::Memcached(_))
                     | (WorkloadAdapter::PostgreSql, WorkloadMetrics::PostgreSql(_))
@@ -743,6 +814,11 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::Prometheus, WorkloadMetrics::Prometheus(_))
                     | (WorkloadAdapter::ClickHouse, WorkloadMetrics::ClickHouse(_))
                     | (WorkloadAdapter::Etcd, WorkloadMetrics::Etcd(_))
+                    | (
+                        WorkloadAdapter::Elasticsearch,
+                        WorkloadMetrics::Elasticsearch(_)
+                    )
+                    | (WorkloadAdapter::OpenSearch, WorkloadMetrics::OpenSearch(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -1941,6 +2017,217 @@ fn parse_etcd_metrics(body: &str) -> std::result::Result<EtcdMetrics, WorkloadPr
     })
 }
 
+pub fn monitor_elasticsearch_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, ElasticsearchMetrics), WorkloadProbeError> {
+    let (endpoint, metrics) =
+        monitor_search_with_connection(WorkloadAdapter::Elasticsearch, connection)?;
+    Ok((endpoint, ElasticsearchMetrics::from(metrics)))
+}
+
+pub fn monitor_opensearch_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, OpenSearchMetrics), WorkloadProbeError> {
+    let (endpoint, metrics) =
+        monitor_search_with_connection(WorkloadAdapter::OpenSearch, connection)?;
+    Ok((endpoint, OpenSearchMetrics::from(metrics)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchMetrics {
+    nodes_total: u64,
+    indices_count: u64,
+    shards_total: u64,
+    shards_primaries: u64,
+    docs_count: u64,
+    docs_deleted: u64,
+    store_size_bytes: u64,
+    fs_total_bytes: u64,
+    fs_available_bytes: u64,
+}
+
+macro_rules! search_metrics_conversion {
+    ($name:ident) => {
+        impl From<SearchMetrics> for $name {
+            fn from(metrics: SearchMetrics) -> Self {
+                Self {
+                    nodes_total: metrics.nodes_total,
+                    indices_count: metrics.indices_count,
+                    shards_total: metrics.shards_total,
+                    shards_primaries: metrics.shards_primaries,
+                    docs_count: metrics.docs_count,
+                    docs_deleted: metrics.docs_deleted,
+                    store_size_bytes: metrics.store_size_bytes,
+                    fs_total_bytes: metrics.fs_total_bytes,
+                    fs_available_bytes: metrics.fs_available_bytes,
+                }
+            }
+        }
+    };
+}
+search_metrics_conversion!(ElasticsearchMetrics);
+search_metrics_conversion!(OpenSearchMetrics);
+
+fn monitor_search_with_connection(
+    adapter: WorkloadAdapter,
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, SearchMetrics), WorkloadProbeError> {
+    let owned_connection = connection.cloned().unwrap_or(WorkloadConnectionConfig {
+        endpoint: format!("tcp://{SEARCH_LOOPBACK_ENDPOINT}"),
+        username: None,
+        secret_ref: None,
+        database: None,
+        auth_source: None,
+    });
+    owned_connection.validate_for(adapter).map_err(|_| {
+        WorkloadProbeError::Malformed("search connection configuration is invalid".into())
+    })?;
+    let url = search_cluster_stats_url(&owned_connection)?;
+    let secret = resolve_connection_secret(&owned_connection).map_err(|_| {
+        WorkloadProbeError::Rejected("search authentication secret is unavailable".into())
+    })?;
+    let username = owned_connection.username.clone();
+    let endpoint = owned_connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("search probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                SEARCH_PROBE_TIMEOUT,
+                monitor_search_async(&url, username.as_deref(), secret.as_deref()),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("search probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("search probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn search_cluster_stats_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("search endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => Ok(format!(
+            "http://{}:{port}/_cluster/stats?timeout=2s",
+            url_host(&host)
+        )),
+        WorkloadEndpoint::Tls { host, port } => Ok(format!(
+            "https://{}:{port}/_cluster/stats?timeout=2s",
+            url_host(&host)
+        )),
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "search endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+async fn monitor_search_async(
+    url: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> std::result::Result<SearchMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(SEARCH_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| WorkloadProbeError::Unreachable("search HTTP client is unavailable".into()))?;
+    let mut request = client.get(url);
+    if let Some(username) = username {
+        request = request.basic_auth(username, password);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("search endpoint is unavailable".into()))?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "search rejected stats request".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > SEARCH_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "search response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("search response could not be read".into()))?
+    {
+        if body.len().saturating_add(chunk.len()) > SEARCH_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "search response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("search response is not UTF-8".into()))?;
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| WorkloadProbeError::Malformed("search response is not valid JSON".into()))?;
+    parse_search_metrics(&value)
+}
+
+fn parse_search_metrics(
+    value: &serde_json::Value,
+) -> std::result::Result<SearchMetrics, WorkloadProbeError> {
+    let metric = |path: &[&str]| {
+        let mut current = value;
+        for segment in path {
+            current = current.get(*segment).ok_or_else(|| {
+                WorkloadProbeError::Malformed(format!(
+                    "search response is missing {}",
+                    path.join(".")
+                ))
+            })?;
+        }
+        current.as_u64().ok_or_else(|| {
+            WorkloadProbeError::Malformed(format!("search metric is not a u64: {}", path.join(".")))
+        })
+    };
+    let nodes_total = metric(&["nodes", "count", "total"])?;
+    let node_total = metric(&["_nodes", "total"])?;
+    let successful = metric(&["_nodes", "successful"])?;
+    let failed = metric(&["_nodes", "failed"])?;
+    let metrics = SearchMetrics {
+        nodes_total,
+        indices_count: metric(&["indices", "count"])?,
+        shards_total: metric(&["indices", "shards", "total"])?,
+        shards_primaries: metric(&["indices", "shards", "primaries"])?,
+        docs_count: metric(&["indices", "docs", "count"])?,
+        docs_deleted: metric(&["indices", "docs", "deleted"])?,
+        store_size_bytes: metric(&["indices", "store", "size_in_bytes"])?,
+        fs_total_bytes: metric(&["nodes", "fs", "total_in_bytes"])?,
+        fs_available_bytes: metric(&["nodes", "fs", "available_in_bytes"])?,
+    };
+    if failed != 0
+        || successful.checked_add(failed) != Some(node_total)
+        || nodes_total != successful
+        || metrics.shards_primaries > metrics.shards_total
+        || metrics.fs_available_bytes > metrics.fs_total_bytes
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "search response invariants failed".into(),
+        ));
+    }
+    Ok(metrics)
+}
+
 fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
     let value = value.strip_prefix('+').unwrap_or(value);
     if value.is_empty() || value.starts_with('-') {
@@ -2867,6 +3154,14 @@ path = "/usr/bin/redis-server"
         authenticated
             .validate_for(WorkloadAdapter::MongoDb)
             .unwrap();
+        for adapter in [WorkloadAdapter::Elasticsearch, WorkloadAdapter::OpenSearch] {
+            assert!(WorkloadConnectionConfig {
+                endpoint: "tcp://search.example:9200".into(),
+                ..authenticated.clone()
+            }
+            .validate_for(adapter)
+            .is_err());
+        }
         assert!(WorkloadConnectionConfig {
             endpoint: "tcp://clickhouse.example:8123".into(),
             ..authenticated.clone()
@@ -3339,6 +3634,143 @@ path = "/usr/bin/redis-server"
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("click_house".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    fn search_response() -> serde_json::Value {
+        serde_json::json!({
+            "_nodes": { "total": 3, "successful": 3, "failed": 0 },
+            "indices": {
+                "count": 4,
+                "shards": { "total": 5, "primaries": 2 },
+                "docs": { "count": 6, "deleted": 7 },
+                "store": { "size_in_bytes": 8 }
+            },
+            "nodes": {
+                "count": { "total": 3 },
+                "fs": { "total_in_bytes": 10, "available_in_bytes": 9 }
+            },
+            "unknown": true
+        })
+    }
+
+    #[test]
+    fn search_endpoint_and_auth_contract_are_strict() {
+        let anonymous = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:9200".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        for adapter in [WorkloadAdapter::Elasticsearch, WorkloadAdapter::OpenSearch] {
+            anonymous.validate_for(adapter).unwrap();
+        }
+        assert_eq!(
+            search_cluster_stats_url(&anonymous).unwrap(),
+            "http://127.0.0.1:9200/_cluster/stats?timeout=2s"
+        );
+        let authenticated = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:9200".into(),
+            username: Some("monitor".into()),
+            secret_ref: Some("env:SEARCH_PASSWORD".into()),
+            ..anonymous.clone()
+        };
+        authenticated
+            .validate_for(WorkloadAdapter::Elasticsearch)
+            .unwrap();
+        assert_eq!(
+            search_cluster_stats_url(&authenticated).unwrap(),
+            "https://[::1]:9200/_cluster/stats?timeout=2s"
+        );
+        for invalid in [
+            WorkloadConnectionConfig {
+                secret_ref: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                username: None,
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("index".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..authenticated.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/search.sock".into(),
+                ..authenticated
+            },
+        ] {
+            assert!(invalid
+                .validate_for(WorkloadAdapter::Elasticsearch)
+                .is_err());
+            assert!(invalid.validate_for(WorkloadAdapter::OpenSearch).is_err());
+        }
+    }
+
+    #[test]
+    fn search_parser_requires_exact_u64_paths_and_invariants() {
+        let metrics = parse_search_metrics(&search_response()).unwrap();
+        assert_eq!(metrics.nodes_total, 3);
+        assert_eq!(metrics.fs_available_bytes, 9);
+        let mut invalid = search_response();
+        invalid["indices"]["shards"]["primaries"] = serde_json::json!(6);
+        assert!(parse_search_metrics(&invalid).is_err());
+        let mut invalid = search_response();
+        invalid["nodes"]["fs"]["available_in_bytes"] = serde_json::json!(11);
+        assert!(parse_search_metrics(&invalid).is_err());
+        let mut invalid = search_response();
+        invalid["_nodes"]["failed"] = serde_json::json!(1);
+        assert!(parse_search_metrics(&invalid).is_err());
+        let mut invalid = search_response();
+        invalid["indices"]["docs"]["count"] = serde_json::json!(-1);
+        assert!(parse_search_metrics(&invalid).is_err());
+        let mut invalid = search_response();
+        invalid["indices"]["docs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("count");
+        assert!(parse_search_metrics(&invalid).is_err());
+    }
+
+    #[test]
+    fn search_metric_variants_are_adapter_specific() {
+        let metrics = parse_search_metrics(&search_response()).unwrap();
+        let samples = [
+            WorkloadSample {
+                schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+                workload_id: "elasticsearch".into(),
+                captured_at: Utc::now(),
+                adapter: WorkloadAdapter::Elasticsearch,
+                outcome: WorkloadSampleOutcome::Collected {
+                    endpoint: "tcp://127.0.0.1:9200".into(),
+                    metrics: WorkloadMetrics::Elasticsearch(metrics.clone().into()),
+                },
+            },
+            WorkloadSample {
+                schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+                workload_id: "opensearch".into(),
+                captured_at: Utc::now(),
+                adapter: WorkloadAdapter::OpenSearch,
+                outcome: WorkloadSampleOutcome::Collected {
+                    endpoint: "tcp://127.0.0.1:9200".into(),
+                    metrics: WorkloadMetrics::OpenSearch(metrics.into()),
+                },
+            },
+        ];
+        for sample in samples {
+            let json = serde_json::to_string(&sample).unwrap();
+            assert_eq!(
+                serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+                sample
+            );
+            let mut mismatched = serde_json::to_value(&sample).unwrap();
+            mismatched["adapter"] = serde_json::Value::String("redis".into());
+            assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+        }
     }
 
     #[test]

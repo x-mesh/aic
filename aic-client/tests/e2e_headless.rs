@@ -162,10 +162,10 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        ClickHouseMetrics, EtcdMetrics, MemcachedMetrics, MongoDbMetrics, MySqlMetrics,
-        PostgreSqlMetrics, PrometheusMetrics, WorkloadAdapter, WorkloadDefinition,
-        WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
-        WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MemcachedMetrics, MongoDbMetrics,
+        MySqlMetrics, OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, WorkloadAdapter,
+        WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
+        WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -289,6 +289,36 @@ fn workload_status_and_history_read_local_history() {
             auth_source: None,
         }),
     };
+    let elasticsearch_definition = WorkloadDefinition {
+        id: "elasticsearch-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/java".into(),
+        },
+        adapter: WorkloadAdapter::Elasticsearch,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:19200".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:ELASTICSEARCH_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        }),
+    };
+    let opensearch_definition = WorkloadDefinition {
+        id: "opensearch-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/java".into(),
+        },
+        adapter: WorkloadAdapter::OpenSearch,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:19201".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:OPENSEARCH_PASSWORD".into()),
+            database: None,
+            auth_source: None,
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -301,6 +331,8 @@ fn workload_status_and_history_read_local_history() {
                 prometheus_definition,
                 clickhouse_definition,
                 etcd_definition,
+                elasticsearch_definition,
+                opensearch_definition,
             ],
         })
         .unwrap(),
@@ -463,10 +495,50 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let elasticsearch_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "elasticsearch-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::Elasticsearch,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:19200".into(),
+            metrics: WorkloadMetrics::Elasticsearch(ElasticsearchMetrics {
+                nodes_total: 1,
+                indices_count: 2,
+                shards_total: 3,
+                shards_primaries: 4,
+                docs_count: 5,
+                docs_deleted: 6,
+                store_size_bytes: 7,
+                fs_total_bytes: 8,
+                fs_available_bytes: 9,
+            }),
+        },
+    };
+    let opensearch_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "opensearch-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::OpenSearch,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:19201".into(),
+            metrics: WorkloadMetrics::OpenSearch(OpenSearchMetrics {
+                nodes_total: 11,
+                indices_count: 12,
+                shards_total: 13,
+                shards_primaries: 14,
+                docs_count: 15,
+                docs_deleted: 16,
+                store_size_bytes: 17,
+                fs_total_bytes: 18,
+                fs_available_bytes: 19,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
@@ -474,7 +546,9 @@ fn workload_status_and_history_read_local_history() {
             serde_json::to_string(&mongodb_sample).unwrap(),
             serde_json::to_string(&prometheus_sample).unwrap(),
             serde_json::to_string(&clickhouse_sample).unwrap(),
-            serde_json::to_string(&etcd_sample).unwrap()
+            serde_json::to_string(&etcd_sample).unwrap(),
+            serde_json::to_string(&elasticsearch_sample).unwrap(),
+            serde_json::to_string(&opensearch_sample).unwrap()
         ),
     )
     .unwrap();
@@ -582,6 +656,22 @@ fn workload_status_and_history_read_local_history() {
         etcd_history["samples"][0]["metrics"]["process_resident_memory_bytes"],
         9
     );
+    for (id, adapter, expected) in [
+        ("elasticsearch-test", "elasticsearch", 9),
+        ("opensearch-test", "open_search", 19),
+    ] {
+        let output = aic_cmd(tmp.path())
+            .args(["workload", "history", id, "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["samples"][0]["adapter"], adapter);
+        assert_eq!(
+            value["samples"][0]["metrics"]["fs_available_bytes"],
+            expected
+        );
+    }
 
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
@@ -617,6 +707,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let prometheus = candidate["adapter"] == "prometheus";
     let clickhouse = candidate["adapter"] == "click_house";
     let etcd = candidate["adapter"] == "etcd";
+    let elasticsearch = candidate["adapter"] == "elasticsearch";
+    let opensearch = candidate["adapter"] == "open_search";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -645,6 +737,10 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "tcp://127.0.0.1:18123"
         } else if etcd {
             "tcp://127.0.0.1:12379"
+        } else if elasticsearch {
+            "tcp://127.0.0.1:19200"
+        } else if opensearch {
+            "tcp://127.0.0.1:19201"
         } else {
             "tcp://127.0.0.1:16379"
         },
@@ -669,6 +765,17 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "--auth-env",
             "CLICKHOUSE_PASSWORD",
         ]);
+    } else if elasticsearch || opensearch {
+        enabled.args([
+            "--username",
+            "aic_monitor",
+            "--auth-env",
+            if elasticsearch {
+                "ELASTICSEARCH_PASSWORD"
+            } else {
+                "OPENSEARCH_PASSWORD"
+            },
+        ]);
     }
     let enabled = enabled.arg("--json").output().unwrap();
     assert!(
@@ -690,6 +797,10 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "endpoint = \"tcp://127.0.0.1:18123\""
     } else if etcd {
         "endpoint = \"tcp://127.0.0.1:12379\""
+    } else if elasticsearch {
+        "endpoint = \"tcp://127.0.0.1:19200\""
+    } else if opensearch {
+        "endpoint = \"tcp://127.0.0.1:19201\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));
@@ -706,6 +817,13 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     } else if clickhouse {
         assert!(saved.contains("username = \"aic_monitor\""));
         assert!(saved.contains("secret_ref = \"env:CLICKHOUSE_PASSWORD\""));
+    } else if elasticsearch || opensearch {
+        assert!(saved.contains("username = \"aic_monitor\""));
+        assert!(saved.contains(if elasticsearch {
+            "secret_ref = \"env:ELASTICSEARCH_PASSWORD\""
+        } else {
+            "secret_ref = \"env:OPENSEARCH_PASSWORD\""
+        }));
     }
 
     let listed = aic_cmd(tmp.path())

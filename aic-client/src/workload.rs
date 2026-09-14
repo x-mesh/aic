@@ -1,14 +1,17 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_clickhouse_with_connection, monitor_etcd_with_connection,
+    load_workload_history, monitor_clickhouse_with_connection,
+    monitor_elasticsearch_with_connection, monitor_etcd_with_connection,
     monitor_memcached_with_connection, monitor_mongodb_with_connection,
-    monitor_mysql_with_connection, monitor_postgresql_with_connection,
-    monitor_prometheus_with_connection, monitor_redis_with_connection, workload_history_path,
-    workloads_file_path, ClickHouseMonitorReport, EtcdMonitorReport, MemcachedMonitorReport,
-    MongoDbMonitorReport, MySqlMonitorReport, PostgreSqlMonitorReport, PrometheusMonitorReport,
-    ProposalCost, ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
-    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
+    monitor_mysql_with_connection, monitor_opensearch_with_connection,
+    monitor_postgresql_with_connection, monitor_prometheus_with_connection,
+    monitor_redis_with_connection, workload_history_path, workloads_file_path,
+    ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport, MemcachedMonitorReport,
+    MongoDbMonitorReport, MySqlMonitorReport, OpenSearchMonitorReport, PostgreSqlMonitorReport,
+    PrometheusMonitorReport, ProposalCost, ProposalReadiness, RedisMonitorReport,
+    WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
+    WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -389,6 +392,24 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Etcd, error))?,
         }),
+        WorkloadAdapter::Elasticsearch => {
+            WorkloadMonitorReport::Elasticsearch(ElasticsearchMonitorReport {
+                candidate_id: candidate.id.clone(),
+                adapter: WorkloadAdapter::Elasticsearch,
+                monitor_ready: true,
+                metrics: monitor_elasticsearch_with_connection(connection.as_ref())
+                    .map(|(_, metrics)| metrics)
+                    .map_err(|error| safe_monitor_error(WorkloadAdapter::Elasticsearch, error))?,
+            })
+        }
+        WorkloadAdapter::OpenSearch => WorkloadMonitorReport::OpenSearch(OpenSearchMonitorReport {
+            candidate_id: candidate.id.clone(),
+            adapter: WorkloadAdapter::OpenSearch,
+            monitor_ready: true,
+            metrics: monitor_opensearch_with_connection(connection.as_ref())
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::OpenSearch, error))?,
+        }),
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -404,6 +425,8 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::Prometheus => "Prometheus",
         WorkloadAdapter::ClickHouse => "ClickHouse",
         WorkloadAdapter::Etcd => "etcd",
+        WorkloadAdapter::Elasticsearch => "Elasticsearch",
+        WorkloadAdapter::OpenSearch => "OpenSearch",
         _ => "Workload",
     };
     let detail = match error {
@@ -433,6 +456,8 @@ fn select_monitor_candidate<'a>(
             | WorkloadAdapter::Prometheus
             | WorkloadAdapter::ClickHouse
             | WorkloadAdapter::Etcd
+            | WorkloadAdapter::Elasticsearch
+            | WorkloadAdapter::OpenSearch
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -905,6 +930,8 @@ pub fn derive_status(
                     | WorkloadAdapter::Prometheus
                     | WorkloadAdapter::ClickHouse
                     | WorkloadAdapter::Etcd
+                    | WorkloadAdapter::Elasticsearch
+                    | WorkloadAdapter::OpenSearch
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),

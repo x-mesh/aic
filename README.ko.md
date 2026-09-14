@@ -428,10 +428,17 @@ endpoint로 바꿀 수 있습니다. TLS는 native host root를 사용합니다.
 `proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
 `mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, `process_resident_memory_bytes`를 반환합니다.
 gRPC status, 인증, private CA, mTLS, custom path, query, Unix endpoint는 지원하지 않습니다.
+Elasticsearch와 OpenSearch adapter는 기본적으로 `127.0.0.1:9200`을 사용합니다. 고정 cluster stats 요청으로
+`nodes_total`, `indices_count`, `shards_total`, `shards_primaries`, `docs_count`, `docs_deleted`,
+`store_size_bytes`, `fs_total_bytes`, `fs_available_bytes`를 반환합니다. 두 adapter는 candidate와 ambiguity를
+서로 독립적으로 처리합니다. Basic 인증에는 `--username`과 secret option 하나가 모두 필요합니다. 최소 권한을
+가진 monitoring 사용자를 사용하십시오. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe
+제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. API key, SigV4, private CA, mTLS, custom
+path, query, 검색, node stats는 지원하지 않습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, etcd 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
+`aicd`는 Elasticsearch와 OpenSearch 정의도 각각 하나씩 60초마다 probe합니다. 저장된 connection이 있으면
 그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
 `127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
 PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
@@ -439,6 +446,7 @@ PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 ad
 Prometheus 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 ClickHouse 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 etcd 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
+Elasticsearch와 OpenSearch 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 
