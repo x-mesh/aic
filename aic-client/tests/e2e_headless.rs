@@ -952,6 +952,87 @@ fn workload_enable_rejects_conflicting_auth_flags() {
 }
 
 #[test]
+fn haproxy_history_hides_the_socket_path_and_reads_persisted_config() {
+    use aic_common::workload::{
+        HaProxyMetrics, WorkloadAdapter, WorkloadConnectionConfig, WorkloadDefinition,
+        WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
+        WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("cfg/aic");
+    let state_dir = tmp.path().join("state/aic");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let socket_path = "/run/haproxy/aic-private.sock";
+    let definition = WorkloadDefinition {
+        id: "haproxy-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/sbin/haproxy".into(),
+        },
+        adapter: WorkloadAdapter::HaProxy,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(WorkloadConnectionConfig {
+            endpoint: format!("unix://{socket_path}"),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        }),
+    };
+    std::fs::write(
+        config_dir.join("workloads.toml"),
+        toml::to_string_pretty(&WorkloadStore {
+            workloads: vec![definition],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "haproxy-test".into(),
+        captured_at: chrono::Utc::now(),
+        adapter: WorkloadAdapter::HaProxy,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "local-unix-socket".into(),
+            metrics: WorkloadMetrics::HaProxy(HaProxyMetrics {
+                current_sessions: 1,
+                sessions_total: 2,
+                bytes_in_total: 3,
+                bytes_out_total: 4,
+                denied_requests_total: 5,
+                denied_responses_total: 6,
+                failed_connections_total: 7,
+                retry_warnings_total: 8,
+                servers_down: 9,
+            }),
+        },
+    };
+    std::fs::write(
+        state_dir.join("workload-history.jsonl"),
+        format!("{}\n", serde_json::to_string(&sample).unwrap()),
+    )
+    .unwrap();
+
+    let listed = aic_cmd(tmp.path())
+        .args(["workload", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains(socket_path));
+    let history = aic_cmd(tmp.path())
+        .args(["workload", "history", "haproxy-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(history.status.success());
+    let history_text = String::from_utf8_lossy(&history.stdout);
+    assert!(history_text.contains("local-unix-socket"));
+    assert!(!history_text.contains(socket_path));
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history["samples"][0]["metrics"]["servers_down"], 9);
+}
+
+#[test]
 fn workload_enable_requires_endpoint_for_database() {
     let tmp = tempfile::tempdir().unwrap();
     let output = aic_cmd(tmp.path())

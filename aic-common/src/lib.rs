@@ -42,13 +42,13 @@ pub use session::{
 pub use shell_hooks::generate_shell_hooks;
 pub use workload::{
     ClickHouseMetrics, ClickHouseMonitorReport, DiscoveryReport, ElasticsearchMetrics,
-    ElasticsearchMonitorReport, EtcdMetrics, EtcdMonitorReport, MongoDbMetrics,
-    MongoDbMonitorReport, MySqlMetrics, MySqlMonitorReport, NginxMetrics, NginxMonitorReport,
-    OpenSearchMetrics, OpenSearchMonitorReport, PostgreSqlMetrics, PostgreSqlMonitorReport,
-    PrometheusMetrics, PrometheusMonitorReport, ProposalEffects, ProposalKind, RabbitMqMetrics,
-    RabbitMqMonitorReport, RuntimeBinding, WorkloadAdapter, WorkloadCandidate,
-    WorkloadConnectionConfig, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal,
-    WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
+    ElasticsearchMonitorReport, EtcdMetrics, EtcdMonitorReport, HaProxyMetrics,
+    HaProxyMonitorReport, MongoDbMetrics, MongoDbMonitorReport, MySqlMetrics, MySqlMonitorReport,
+    NginxMetrics, NginxMonitorReport, OpenSearchMetrics, OpenSearchMonitorReport,
+    PostgreSqlMetrics, PostgreSqlMonitorReport, PrometheusMetrics, PrometheusMonitorReport,
+    ProposalEffects, ProposalKind, RabbitMqMetrics, RabbitMqMonitorReport, RuntimeBinding,
+    WorkloadAdapter, WorkloadCandidate, WorkloadConnectionConfig, WorkloadDefinition,
+    WorkloadDriverMode, WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
 };
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
