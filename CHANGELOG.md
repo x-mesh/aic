@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-09-14
+
+### Added
+
+- **13개 service workload의 bounded monitoring을 추가한다.** Redis, Memcached, PostgreSQL,
+  MySQL, MongoDB, Prometheus, ClickHouse, etcd, Elasticsearch, OpenSearch, RabbitMQ, Nginx,
+  HAProxy의 read-only service metric을 단발 또는 `aicd` 60초 주기로 수집한다.
+- **adapter-neutral local history와 status 조회를 추가한다.** 최대 1,440개 sample을
+  `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장하며 기존 Redis history JSON을 계속 읽는다.
+- **명시적 endpoint, TLS, secret reference를 지원한다.** native root와 hostname을 검증하고,
+  `env:NAME`과 `keychain:ACCOUNT` secret은 probe 시점에만 해석한다.
+
+### Security
+
+- HTTP workload probe는 system proxy와 redirect를 사용하지 않는다. Basic authentication은
+  TLS endpoint에서만 허용하며 raw response, server error, secret을 log/history에 저장하지 않는다.
+- 모든 probe에 connection·request timeout을 적용한다. HTTP와 socket probe는 response cap을 사용한다.
+  PostgreSQL과 MySQL은 고정 bounded-row query를 사용하며 MongoDB cap은 BSON decode 뒤에 적용한다.
+  HAProxy socket은 bounded nonblocking connect와 atomic close-on-exec를 사용하며 실제 path를 숨긴다.
+
+### Changed
+
+- JVM, Kafka, Consul을 안전한 service-level 계약이 준비될 때까지 discovery-only로 명시한다.
+- runtime path trust test가 host umask와 무관하게 공개 parent directory를 모델링한다.
+
 ## [0.40.0] - 2026-09-10
 
 ### Added
