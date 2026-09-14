@@ -18,6 +18,8 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -210,7 +212,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::ClickHouse => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("ClickHouse workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -218,6 +221,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("ClickHouse workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::Etcd => {
@@ -233,7 +239,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::Elasticsearch | WorkloadAdapter::OpenSearch => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("search workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -242,9 +249,13 @@ impl WorkloadConnectionConfig {
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("search workload connections do not support database fields");
                 }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("search authentication requires a TLS endpoint");
+                }
             }
             WorkloadAdapter::RabbitMq => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("RabbitMQ workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -253,9 +264,13 @@ impl WorkloadConnectionConfig {
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("RabbitMQ workload connections do not support database fields");
                 }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("RabbitMQ authentication requires a TLS endpoint");
+                }
             }
             WorkloadAdapter::Nginx => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("Nginx workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -263,6 +278,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("Nginx workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("Nginx authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::HaProxy => {
@@ -782,10 +800,10 @@ pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_com
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
 pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
-pub const PROMETHEUS_RESPONSE_BYTES: usize = 64 * 1024;
+pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
-pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, toUInt64(value) AS value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, toUInt64(value) AS value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
+pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
 pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
@@ -1280,6 +1298,7 @@ pub fn monitor_mysql_with_connection(
     };
 
     let username = username.to_owned();
+    let database = connection.database.clone();
     let endpoint_text = connection.endpoint.clone();
     let metrics = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1291,7 +1310,14 @@ pub fn monitor_mysql_with_connection(
         runtime.block_on(async {
             tokio::time::timeout(
                 MYSQL_PROBE_TIMEOUT,
-                monitor_mysql_async(&host, port, use_tls, &username, secret.as_deref()),
+                monitor_mysql_async(
+                    &host,
+                    port,
+                    use_tls,
+                    &username,
+                    secret.as_deref(),
+                    database.as_deref(),
+                ),
             )
             .await
             .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
@@ -1308,17 +1334,9 @@ async fn monitor_mysql_async(
     use_tls: bool,
     username: &str,
     password: Option<&str>,
+    database: Option<&str>,
 ) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
-    let mut options = MySqlOptsBuilder::default()
-        .ip_or_hostname(host)
-        .tcp_port(port)
-        .user(Some(username))
-        .pass(password)
-        .prefer_socket(false)
-        .stmt_cache_size(0);
-    if use_tls {
-        options = options.ssl_opts(Some(mysql_ssl_options()?));
-    }
+    let options = mysql_connection_options(host, port, use_tls, username, password, database)?;
     let mut connection = MySqlConnection::new(options)
         .await
         .map_err(map_mysql_connect_error)?;
@@ -1329,6 +1347,28 @@ async fn monitor_mysql_async(
     let metrics = mysql_metrics_from_rows(&rows);
     let _ = connection.disconnect().await;
     metrics
+}
+
+fn mysql_connection_options(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> std::result::Result<MySqlOptsBuilder, WorkloadProbeError> {
+    let mut options = MySqlOptsBuilder::default()
+        .ip_or_hostname(host)
+        .tcp_port(port)
+        .user(Some(username))
+        .pass(password)
+        .db_name(database)
+        .prefer_socket(false)
+        .stmt_cache_size(0);
+    if use_tls {
+        options = options.ssl_opts(Some(mysql_ssl_options()?));
+    }
+    Ok(options)
 }
 
 fn mysql_ssl_options() -> std::result::Result<SslOpts, WorkloadProbeError> {
@@ -1644,6 +1684,7 @@ async fn monitor_prometheus_async(
     url: &str,
 ) -> std::result::Result<PrometheusMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(PROMETHEUS_PROBE_TIMEOUT)
@@ -1740,7 +1781,7 @@ fn parse_prometheus_metrics(
 }
 
 fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
-    value.parse::<u64>().map_err(|_| {
+    parse_exposition_u64(value).map_err(|_| {
         WorkloadProbeError::Malformed(format!("Prometheus metric is not a u64: {name}"))
     })
 }
@@ -1809,6 +1850,7 @@ async fn monitor_clickhouse_async(
     password: Option<&str>,
 ) -> std::result::Result<ClickHouseMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(CLICKHOUSE_PROBE_TIMEOUT)
@@ -1975,6 +2017,7 @@ fn etcd_metrics_url(
 
 async fn monitor_etcd_async(url: &str) -> std::result::Result<EtcdMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(ETCD_PROBE_TIMEOUT)
@@ -2052,7 +2095,7 @@ fn parse_etcd_metrics(body: &str) -> std::result::Result<EtcdMetrics, WorkloadPr
                 "etcd required metric is duplicate or malformed: {name}"
             )));
         }
-        let value = fields[1].parse::<u64>().map_err(|_| {
+        let value = parse_exposition_u64(fields[1]).map_err(|_| {
             WorkloadProbeError::Malformed(format!("etcd metric is not a u64: {name}"))
         })?;
         if matches!(name, "etcd_server_has_leader" | "etcd_server_is_leader") && value > 1 {
@@ -2200,6 +2243,7 @@ async fn monitor_search_async(
     password: Option<&str>,
 ) -> std::result::Result<SearchMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(SEARCH_PROBE_TIMEOUT)
@@ -2358,6 +2402,7 @@ async fn monitor_rabbitmq_async(
     password: Option<&str>,
 ) -> std::result::Result<RabbitMqMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(RABBITMQ_PROBE_TIMEOUT)
@@ -2512,6 +2557,7 @@ async fn monitor_nginx_async(
     password: Option<&str>,
 ) -> std::result::Result<NginxMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(NGINX_PROBE_TIMEOUT)
@@ -2641,7 +2687,7 @@ pub fn monitor_haproxy_with_connection(
             unreachable!()
         };
         let metrics = std::thread::spawn(move || {
-            let mut stream = UnixStream::connect(path).map_err(unreachable)?;
+            let mut stream = connect_unix_with_timeout(&path, DRIVER_CONNECT_TIMEOUT)?;
             stream
                 .set_read_timeout(Some(HAPROXY_PROBE_TIMEOUT))
                 .map_err(unreachable)?;
@@ -2661,6 +2707,129 @@ pub fn monitor_haproxy_with_connection(
             "Unix sockets are unavailable".into(),
         ))
     }
+}
+
+#[cfg(unix)]
+fn connect_unix_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> std::result::Result<UnixStream, WorkloadProbeError> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= address.sun_path.len() {
+        return Err(WorkloadProbeError::Malformed(
+            "Unix socket path is invalid".into(),
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (target, source) in address.sun_path.iter_mut().zip(bytes) {
+        *target = *source as libc::c_char;
+    }
+    let fd = create_cloexec_unix_socket()?;
+    if fd < 0 {
+        return Err(unreachable(std::io::Error::last_os_error()));
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len = address_len as u8;
+    }
+    let result = unsafe {
+        libc::connect(
+            fd,
+            (&address as *const libc::sockaddr_un).cast(),
+            address_len as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EINPROGRESS || code == libc::EAGAIN
+        ) {
+            return Err(unreachable(error));
+        }
+        let milliseconds = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+        if ready <= 0 {
+            return Err(WorkloadProbeError::Unreachable(
+                "Unix socket connection timed out".into(),
+            ));
+        }
+        let mut socket_error = 0_i32;
+        let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut i32).cast(),
+                &mut length,
+            )
+        } != 0
+            || socket_error != 0
+        {
+            return Err(unreachable(if socket_error != 0 {
+                std::io::Error::from_raw_os_error(socket_error)
+            } else {
+                std::io::Error::last_os_error()
+            }));
+        }
+    }
+    stream.set_nonblocking(false).map_err(unreachable)?;
+    Ok(stream)
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn create_cloexec_unix_socket() -> std::result::Result<i32, WorkloadProbeError> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        Err(unreachable(std::io::Error::last_os_error()))
+    } else {
+        Ok(fd)
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+fn create_cloexec_unix_socket() -> std::result::Result<i32, WorkloadProbeError> {
+    Err(WorkloadProbeError::Unreachable(
+        "atomic close-on-exec Unix sockets are unavailable on this platform".into(),
+    ))
 }
 
 fn monitor_haproxy_stream(
@@ -2793,6 +2962,68 @@ fn parse_haproxy_stats(text: &str) -> std::result::Result<HaProxyMetrics, Worklo
         ));
     }
     Ok(metrics)
+}
+
+fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
+    let value = value.strip_prefix('+').unwrap_or(value);
+    if value.is_empty() || value.starts_with('-') {
+        return Err(());
+    }
+    let (mantissa, exponent) = match value.find(['e', 'E']) {
+        Some(index) => {
+            let exponent = value[index + 1..].parse::<i32>().map_err(|_| ())?;
+            (&value[..index], exponent)
+        }
+        None => (value, 0),
+    };
+    let mut digits = String::with_capacity(mantissa.len());
+    let mut fractional_digits = 0_i32;
+    let mut seen_decimal = false;
+    for character in mantissa.chars() {
+        match character {
+            '0'..='9' => {
+                digits.push(character);
+                if seen_decimal {
+                    fractional_digits = fractional_digits.checked_add(1).ok_or(())?;
+                }
+            }
+            '.' if !seen_decimal => seen_decimal = true,
+            _ => return Err(()),
+        }
+    }
+    if digits.is_empty() {
+        return Err(());
+    }
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Ok(0);
+    }
+    let scale = exponent.checked_sub(fractional_digits).ok_or(())?;
+    if scale < 0 {
+        let remove = usize::try_from(scale.checked_neg().ok_or(())?).map_err(|_| ())?;
+        if remove > digits.len()
+            || !digits[digits.len() - remove..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err(());
+        }
+        digits.truncate(digits.len() - remove);
+    }
+    let mut result = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<u64>().map_err(|_| ())?
+    };
+    if scale > 0 {
+        let scale = u32::try_from(scale).map_err(|_| ())?;
+        if scale > 19 || digits.trim_start_matches('0').len() + scale as usize > 20 {
+            return Err(());
+        }
+        result = result
+            .checked_mul(10_u64.checked_pow(scale).ok_or(())?)
+            .ok_or(())?;
+    }
+    Ok(result)
 }
 
 fn postgresql_metrics_from_rows(
@@ -3532,7 +3763,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tls://mysql.example:3306".into(),
             username: Some("monitor".into()),
             secret_ref: None,
-            database: Some("ignored_by_global_status".into()),
+            database: Some("metrics".into()),
             auth_source: None,
         };
         valid.validate_for(WorkloadAdapter::MySql).unwrap();
@@ -3548,6 +3779,11 @@ path = "/usr/bin/redis-server"
         }
         .validate_for(WorkloadAdapter::MySql)
         .is_err());
+        let options = mysql_async::Opts::from(
+            mysql_connection_options("127.0.0.1", 3306, false, "monitor", None, Some("metrics"))
+                .unwrap(),
+        );
+        assert_eq!(options.db_name(), Some("metrics"));
     }
 
     #[test]
@@ -3654,6 +3890,20 @@ path = "/usr/bin/redis-server"
         authenticated
             .validate_for(WorkloadAdapter::MongoDb)
             .unwrap();
+        for adapter in [WorkloadAdapter::Elasticsearch, WorkloadAdapter::OpenSearch] {
+            assert!(WorkloadConnectionConfig {
+                endpoint: "tcp://search.example:9200".into(),
+                ..authenticated.clone()
+            }
+            .validate_for(adapter)
+            .is_err());
+        }
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://clickhouse.example:8123".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::ClickHouse)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -3822,6 +4072,9 @@ path = "/usr/bin/redis-server"
             "prometheus_engine_queries -1",
             "prometheus_engine_queries 1.5",
             "prometheus_engine_queries 18446744073709551616",
+            "prometheus_engine_queries 1.5e0",
+            "prometheus_engine_queries 1e2147483647",
+            "prometheus_engine_queries 1e-2147483648",
         ] {
             let response =
                 prometheus_response().replace("prometheus_engine_queries 5", replacement);
@@ -3834,6 +4087,18 @@ path = "/usr/bin/redis-server"
         assert!(parse_prometheus_metrics(&missing).is_err());
         let duplicate = format!("{}\ngo_goroutines 9", prometheus_response());
         assert!(parse_prometheus_metrics(&duplicate).is_err());
+        let scientific = prometheus_response()
+            .replace(
+                "prometheus_tsdb_head_samples_appended_total 4",
+                "prometheus_tsdb_head_samples_appended_total 1.234e+06",
+            )
+            .replace(
+                "prometheus_engine_queries 5",
+                "prometheus_engine_queries 5.0e0",
+            );
+        let metrics = parse_prometheus_metrics(&scientific).unwrap();
+        assert_eq!(metrics.tsdb_head_samples_appended_total, 1_234_000);
+        assert_eq!(metrics.engine_queries, 5);
     }
 
     #[test]
@@ -4063,12 +4328,26 @@ path = "/usr/bin/redis-server"
                 "process_resident_memory_bytes 9",
                 "process_resident_memory_bytes 18446744073709551616",
             ),
+            etcd_response().replace(
+                "etcd_server_proposals_pending 6",
+                "etcd_server_proposals_pending 1e2147483647",
+            ),
         ] {
             assert!(matches!(
                 parse_etcd_metrics(&invalid),
                 Err(WorkloadProbeError::Malformed(_))
             ));
         }
+        let scientific = etcd_response().replace(
+            "etcd_server_proposals_applied_total 3",
+            "etcd_server_proposals_applied_total 1.234e+06",
+        );
+        assert_eq!(
+            parse_etcd_metrics(&scientific)
+                .unwrap()
+                .proposals_applied_total,
+            1_234_000
+        );
     }
 
     #[test]
@@ -4266,6 +4545,12 @@ path = "/usr/bin/redis-server"
             rabbitmq_overview_url(&authenticated).unwrap(),
             "https://[::1]:15672/api/overview"
         );
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://rabbitmq.example:15672".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::RabbitMq)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -4375,6 +4660,12 @@ path = "/usr/bin/redis-server"
             nginx_stub_status_url(&authenticated).unwrap(),
             "https://[::1]:8443/stub_status"
         );
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://nginx.example:8080".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::Nginx)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -4508,6 +4799,47 @@ path = "/usr/bin/redis-server"
         let mut stream = TestStream::response(haproxy_csv());
         assert_eq!(monitor_haproxy_stream(&mut stream).unwrap().servers_down, 2);
         assert_eq!(stream.output, HAPROXY_STATS_COMMAND);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_connect_timeout_rejects_invalid_and_missing_paths() {
+        let too_long = PathBuf::from(format!("/tmp/{}", "x".repeat(200)));
+        assert!(matches!(
+            connect_unix_with_timeout(&too_long, Duration::from_millis(10)),
+            Err(WorkloadProbeError::Malformed(_))
+        ));
+        assert!(matches!(
+            connect_unix_with_timeout(
+                Path::new("/tmp/aic-definitely-missing-haproxy.sock"),
+                Duration::from_millis(10)
+            ),
+            Err(WorkloadProbeError::Unreachable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_connect_timeout_sets_close_on_exec() {
+        use std::os::fd::AsRawFd;
+
+        let temp = std::env::temp_dir().join(format!(
+            "aic-haproxy-connect-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir(&temp).unwrap();
+        let path = temp.join("stats.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let stream = connect_unix_with_timeout(&path, Duration::from_millis(100)).unwrap();
+        let accepted = listener.accept().unwrap().0;
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        drop(accepted);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(temp).unwrap();
     }
 
     #[test]
