@@ -460,18 +460,27 @@ etcd returns `server_has_leader`, `server_is_leader`, `leader_changes_seen_total
 `proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
 `mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, and `process_resident_memory_bytes`.
 The adapter does not support gRPC status, authentication, private CAs, mTLS, custom paths, queries, or Unix endpoints.
+The Elasticsearch and OpenSearch adapters use `127.0.0.1:9200` by default.
+They run fixed cluster stats requests and return `nodes_total`, `indices_count`, `shards_total`,
+`shards_primaries`, `docs_count`, `docs_deleted`, `store_size_bytes`, `fs_total_bytes`, and
+`fs_available_bytes`. Each adapter tracks candidates and ambiguity independently.
+Optional Basic authentication requires both `--username` and one secret option.
+Use a least-privilege monitoring user. TLS uses native host roots.
+Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
+The clients do not follow redirects. They do not support API keys, SigV4, private CAs, mTLS, custom paths, queries, searches, or node stats.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, and etcd definition every 60 seconds.
+`aicd` also probes one Elasticsearch and one OpenSearch definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
 MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
 Prometheus definitions can use the default endpoint or a saved endpoint.
 ClickHouse definitions can use the default endpoint or a saved endpoint.
 etcd definitions can use the default endpoint or a saved endpoint.
+Elasticsearch and OpenSearch definitions can use default or saved endpoints.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

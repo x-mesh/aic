@@ -77,6 +77,14 @@ pub fn load_etcd_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::Etcd)
 }
 
+pub fn load_elasticsearch_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::Elasticsearch)
+}
+
+pub fn load_opensearch_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::OpenSearch)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -189,6 +197,8 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Prometheus => "Prometheus endpoint is unavailable",
         WorkloadAdapter::ClickHouse => "ClickHouse endpoint is unavailable",
         WorkloadAdapter::Etcd => "etcd endpoint is unavailable",
+        WorkloadAdapter::Elasticsearch => "Elasticsearch endpoint is unavailable",
+        WorkloadAdapter::OpenSearch => "OpenSearch endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -203,6 +213,8 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Prometheus => "Prometheus rejected the metrics request",
         WorkloadAdapter::ClickHouse => "ClickHouse rejected the metrics query",
         WorkloadAdapter::Etcd => "etcd rejected the metrics request",
+        WorkloadAdapter::Elasticsearch => "Elasticsearch rejected the cluster stats request",
+        WorkloadAdapter::OpenSearch => "OpenSearch rejected the cluster stats request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -217,6 +229,8 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Prometheus => "Prometheus returned an invalid metrics response",
         WorkloadAdapter::ClickHouse => "ClickHouse returned an invalid metrics response",
         WorkloadAdapter::Etcd => "etcd returned an invalid metrics response",
+        WorkloadAdapter::Elasticsearch => "Elasticsearch returned invalid cluster stats",
+        WorkloadAdapter::OpenSearch => "OpenSearch returned invalid cluster stats",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -317,6 +331,8 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::Prometheus,
                     WorkloadAdapter::ClickHouse,
                     WorkloadAdapter::Etcd,
+                    WorkloadAdapter::Elasticsearch,
+                    WorkloadAdapter::OpenSearch,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -505,6 +521,30 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::Elasticsearch => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_elasticsearch_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| {
+                            (endpoint, WorkloadMetrics::Elasticsearch(metrics))
+                        })
+                    },
+                    Utc::now(),
+                ),
+                WorkloadAdapter::OpenSearch => collect_once(
+                    &cfg,
+                    &definition,
+                    || {
+                        aic_common::workload::monitor_opensearch_with_connection(
+                            definition.connection.as_ref(),
+                        )
+                        .map(|(endpoint, metrics)| (endpoint, WorkloadMetrics::OpenSearch(metrics)))
+                    },
+                    Utc::now(),
+                ),
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -532,9 +572,9 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        ClickHouseMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics,
-        PrometheusMetrics, RedisMetrics, WorkloadConnectionConfig, WorkloadDriverMode,
-        WorkloadSelector,
+        ClickHouseMetrics, ElasticsearchMetrics, EtcdMetrics, MongoDbMetrics, MySqlMetrics,
+        OpenSearchMetrics, PostgreSqlMetrics, PrometheusMetrics, RedisMetrics,
+        WorkloadConnectionConfig, WorkloadDriverMode, WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -738,6 +778,49 @@ mod tests {
             mvcc_db_total_size_bytes: 7,
             mvcc_db_total_size_in_use_bytes: 8,
             process_resident_memory_bytes: 9,
+        }
+    }
+
+    fn search_definition(adapter: WorkloadAdapter) -> WorkloadDefinition {
+        let (id, path) = match adapter {
+            WorkloadAdapter::Elasticsearch => ("elasticsearch", "/usr/bin/elasticsearch"),
+            WorkloadAdapter::OpenSearch => ("opensearch", "/usr/bin/opensearch"),
+            _ => panic!("search definition requires a search adapter"),
+        };
+        WorkloadDefinition {
+            id: id.into(),
+            selector: WorkloadSelector::Executable { path: path.into() },
+            adapter,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
+        }
+    }
+
+    fn elasticsearch_metrics() -> ElasticsearchMetrics {
+        ElasticsearchMetrics {
+            nodes_total: 1,
+            indices_count: 2,
+            shards_total: 3,
+            shards_primaries: 2,
+            docs_count: 4,
+            docs_deleted: 5,
+            store_size_bytes: 6,
+            fs_total_bytes: 8,
+            fs_available_bytes: 7,
+        }
+    }
+
+    fn opensearch_metrics() -> OpenSearchMetrics {
+        OpenSearchMetrics {
+            nodes_total: 1,
+            indices_count: 2,
+            shards_total: 3,
+            shards_primaries: 2,
+            docs_count: 4,
+            docs_deleted: 5,
+            store_size_bytes: 6,
+            fs_total_bytes: 8,
+            fs_available_bytes: 7,
         }
     }
 
@@ -969,6 +1052,32 @@ mod tests {
         assert_eq!(
             load_redis_definition(&path),
             DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn search_adapter_ambiguity_is_independent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![
+                    search_definition(WorkloadAdapter::Elasticsearch),
+                    search_definition(WorkloadAdapter::Elasticsearch),
+                    search_definition(WorkloadAdapter::OpenSearch),
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_elasticsearch_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
+        assert_eq!(
+            load_opensearch_definition(&path),
+            DefinitionsState::One(search_definition(WorkloadAdapter::OpenSearch))
         );
     }
 
@@ -1488,6 +1597,56 @@ mod tests {
         };
         assert_eq!(detail, "etcd rejected the metrics request");
         assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn search_adapters_collect_independent_metric_variants() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        collect_once(
+            &cfg,
+            &search_definition(WorkloadAdapter::Elasticsearch),
+            || {
+                Ok((
+                    "http://127.0.0.1:9200/_cluster/stats?timeout=2s".into(),
+                    WorkloadMetrics::Elasticsearch(elasticsearch_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        collect_once(
+            &cfg,
+            &search_definition(WorkloadAdapter::OpenSearch),
+            || {
+                Ok((
+                    "http://127.0.0.1:9200/_cluster/stats?timeout=2s".into(),
+                    WorkloadMetrics::OpenSearch(opensearch_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        let samples = aic_common::workload::load_workload_history(&cfg.history_path).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(matches!(
+            samples[0].outcome,
+            WorkloadSampleOutcome::Collected {
+                metrics: WorkloadMetrics::Elasticsearch(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            samples[1].outcome,
+            WorkloadSampleOutcome::Collected {
+                metrics: WorkloadMetrics::OpenSearch(_),
+                ..
+            }
+        ));
     }
 
     #[test]
