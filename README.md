@@ -407,6 +407,9 @@ Memcached rejects authentication options. TLS uses native host roots and validat
 PostgreSQL requires an explicit TCP or TLS endpoint, `--username`, and `--database`.
 PostgreSQL accepts `--auth-env NAME` or `--auth-keychain ACCOUNT` for password authentication.
 The secret is optional because PostgreSQL can use trust authentication.
+MySQL requires an explicit TCP or TLS endpoint and `--username`.
+MySQL accepts an optional `--database`.
+Use `--auth-env NAME` or `--auth-keychain ACCOUNT` for MySQL password authentication.
 The probe resolves the secret only when it connects.
 Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
 `instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
@@ -414,18 +417,24 @@ Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
 PostgreSQL returns `numbackends`, `xact_commit`, `xact_rollback`, `blks_read`, `blks_hit`,
 `tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`, `tup_deleted`, `conflicts`,
 `temp_files`, `temp_bytes`, and `deadlocks`.
+MySQL returns `threads_connected`, `threads_running`, `connections`, `aborted_connects`,
+`questions`, `slow_queries`, `bytes_received`, and `bytes_sent`.
 PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
-The connection sets read-only transaction mode and bounded statement and lock timeouts.
+MySQL runs one fixed `SHOW GLOBAL STATUS` query for the eight listed metrics.
+The PostgreSQL connection sets read-only transaction mode and bounded statement and lock timeouts.
 The monitor opens one connection for each probe. It does not use a connection pool.
-The PostgreSQL library does not expose a response byte limit. The fixed query returns one scalar row.
+The PostgreSQL library does not expose a response byte limit. Its fixed query returns one scalar row.
+The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
+MySQL TLS uses native host roots only and verifies the endpoint host.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis, Memcached, and PostgreSQL definition every 60 seconds.
+`aicd` probes one configured Redis, Memcached, PostgreSQL, and MySQL definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
+MySQL and PostgreSQL require saved connections. Multiple definitions make only that adapter ambiguous.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

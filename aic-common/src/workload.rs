@@ -3,9 +3,12 @@
 use crate::paths;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use mysql_async::prelude::Queryable;
+use mysql_async::{Conn as MySqlConnection, OptsBuilder as MySqlOptsBuilder, SslOpts};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -147,8 +150,10 @@ impl WorkloadConnectionConfig {
         if let Some(secret_ref) = &self.secret_ref {
             crate::secret::parse_secret_reference(secret_ref).map_err(anyhow::Error::msg)?;
         }
-        if adapter != WorkloadAdapter::PostgreSql
-            && self.username.is_some()
+        if !matches!(
+            adapter,
+            WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql
+        ) && self.username.is_some()
             && self.secret_ref.is_none()
         {
             anyhow::bail!("workload username requires secret_ref");
@@ -160,6 +165,14 @@ impl WorkloadConnectionConfig {
                 }
                 if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("PostgreSQL workload connections require a TCP or TLS endpoint");
+                }
+            }
+            WorkloadAdapter::MySql => {
+                if self.username.is_none() {
+                    anyhow::bail!("MySQL workload connections require username");
+                }
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("MySQL workload connections require a TCP or TLS endpoint");
                 }
             }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
@@ -385,6 +398,20 @@ pub struct PostgreSqlMetrics {
     pub deadlocks: u64,
 }
 
+/// Numeric metrics returned by one bounded MySQL `SHOW GLOBAL STATUS` probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MySqlMetrics {
+    pub threads_connected: u64,
+    pub threads_running: u64,
+    pub connections: u64,
+    pub aborted_connects: u64,
+    pub questions: u64,
+    pub slow_queries: u64,
+    pub bytes_received: u64,
+    pub bytes_sent: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -394,6 +421,7 @@ pub enum WorkloadMetrics {
     Redis(RedisMetrics),
     Memcached(MemcachedMetrics),
     PostgreSql(PostgreSqlMetrics),
+    MySql(MySqlMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -421,11 +449,20 @@ pub struct PostgreSqlMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MySqlMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: MySqlMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
     Memcached(MemcachedMonitorReport),
     PostgreSql(PostgreSqlMonitorReport),
+    MySql(MySqlMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -440,8 +477,10 @@ pub const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
 pub const MEMCACHED_STATS_REQUEST: &[u8] = b"stats\r\n";
 pub const MEMCACHED_LOOPBACK_ENDPOINT: &str = "127.0.0.1:11211";
 pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_commit::bigint, xact_rollback::bigint, blks_read::bigint, blks_hit::bigint, tup_returned::bigint, tup_fetched::bigint, tup_inserted::bigint, tup_updated::bigint, tup_deleted::bigint, conflicts::bigint, temp_files::bigint, temp_bytes::bigint, deadlocks::bigint FROM pg_stat_database WHERE datname = current_database()";
+pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -516,6 +555,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                 (WorkloadAdapter::Redis, WorkloadMetrics::Redis(_))
                     | (WorkloadAdapter::Memcached, WorkloadMetrics::Memcached(_))
                     | (WorkloadAdapter::PostgreSql, WorkloadMetrics::PostgreSql(_))
+                    | (WorkloadAdapter::MySql, WorkloadMetrics::MySql(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -856,6 +896,188 @@ fn map_postgresql_connect_error(error: tokio_postgres::Error) -> WorkloadProbeEr
     } else {
         WorkloadProbeError::Unreachable("PostgreSQL endpoint is unavailable".into())
     }
+}
+
+/// Collect one bounded, fixed `SHOW GLOBAL STATUS` result from an explicit MySQL connection.
+pub fn monitor_mysql_with_connection(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<(String, MySqlMetrics), WorkloadProbeError> {
+    connection
+        .validate_for(WorkloadAdapter::MySql)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("MySQL connection configuration is invalid".into())
+        })?;
+    let endpoint = connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("MySQL endpoint is invalid".into()))?;
+    let secret = resolve_connection_secret(connection).map_err(|_| {
+        WorkloadProbeError::Rejected("MySQL authentication secret is unavailable".into())
+    })?;
+    let username = connection
+        .username
+        .as_deref()
+        .ok_or_else(|| WorkloadProbeError::Malformed("MySQL username is missing".into()))?;
+    let (host, port, use_tls) = match endpoint {
+        WorkloadEndpoint::Tcp { host, port } => (host, port, false),
+        WorkloadEndpoint::Tls { host, port } => (host, port, true),
+        WorkloadEndpoint::Unix(_) => {
+            return Err(WorkloadProbeError::Malformed(
+                "MySQL endpoint must use TCP or TLS".into(),
+            ));
+        }
+    };
+
+    let username = username.to_owned();
+    let database = connection.database.clone();
+    let endpoint_text = connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("MySQL probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                MYSQL_PROBE_TIMEOUT,
+                monitor_mysql_async(
+                    &host,
+                    port,
+                    use_tls,
+                    &username,
+                    secret.as_deref(),
+                    database.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe runtime failed".into()))??;
+    Ok((endpoint_text, metrics))
+}
+
+async fn monitor_mysql_async(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
+    let options = mysql_connection_options(host, port, use_tls, username, password, database)?;
+    let mut connection = MySqlConnection::new(options)
+        .await
+        .map_err(map_mysql_connect_error)?;
+    let rows: Vec<(String, String)> = connection
+        .query(MYSQL_METRICS_QUERY)
+        .await
+        .map_err(|_| WorkloadProbeError::Rejected("MySQL rejected metrics query".into()))?;
+    let metrics = mysql_metrics_from_rows(&rows);
+    let _ = connection.disconnect().await;
+    metrics
+}
+
+fn mysql_connection_options(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    password: Option<&str>,
+    database: Option<&str>,
+) -> std::result::Result<MySqlOptsBuilder, WorkloadProbeError> {
+    let mut options = MySqlOptsBuilder::default()
+        .ip_or_hostname(host)
+        .tcp_port(port)
+        .user(Some(username))
+        .pass(password)
+        .db_name(database)
+        .prefer_socket(false)
+        .stmt_cache_size(0);
+    if use_tls {
+        options = options.ssl_opts(Some(mysql_ssl_options()?));
+    }
+    Ok(options)
+}
+
+fn mysql_ssl_options() -> std::result::Result<SslOpts, WorkloadProbeError> {
+    let certificates = rustls_native_certs::load_native_certs();
+    if !certificates.errors.is_empty() {
+        tracing::debug!(
+            invalid_native_roots = certificates.errors.len(),
+            "some native TLS roots could not be loaded for MySQL"
+        );
+    }
+    if certificates.certs.is_empty() {
+        return Err(WorkloadProbeError::Unreachable(
+            "native TLS roots are unavailable".into(),
+        ));
+    }
+    Ok(SslOpts::default()
+        .with_root_certs(
+            certificates
+                .certs
+                .into_iter()
+                .map(|certificate| certificate.as_ref().to_vec().into())
+                .collect(),
+        )
+        .with_disable_built_in_roots(true))
+}
+
+fn map_mysql_connect_error(error: mysql_async::Error) -> WorkloadProbeError {
+    if matches!(error, mysql_async::Error::Server(_)) {
+        WorkloadProbeError::Rejected("MySQL rejected connection".into())
+    } else {
+        WorkloadProbeError::Unreachable("MySQL endpoint is unavailable".into())
+    }
+}
+
+fn mysql_metrics_from_rows(
+    rows: &[(String, String)],
+) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
+    const KEYS: [&str; 8] = [
+        "Threads_connected",
+        "Threads_running",
+        "Connections",
+        "Aborted_connects",
+        "Questions",
+        "Slow_queries",
+        "Bytes_received",
+        "Bytes_sent",
+    ];
+    if rows.len() != KEYS.len() {
+        return Err(WorkloadProbeError::Malformed(
+            "MySQL metrics have an invalid row count".into(),
+        ));
+    }
+    let mut values = BTreeMap::new();
+    for (key, value) in rows {
+        if !KEYS.contains(&key.as_str()) || values.insert(key.as_str(), value.as_str()).is_some() {
+            return Err(WorkloadProbeError::Malformed(
+                "MySQL metrics contain an unknown or duplicate metric".into(),
+            ));
+        }
+    }
+    let metric = |key| {
+        values
+            .get(key)
+            .ok_or_else(|| {
+                WorkloadProbeError::Malformed(format!("MySQL metrics are missing {key}"))
+            })?
+            .parse::<u64>()
+            .map_err(|_| WorkloadProbeError::Malformed(format!("MySQL metric is not a u64: {key}")))
+    };
+    Ok(MySqlMetrics {
+        threads_connected: metric("Threads_connected")?,
+        threads_running: metric("Threads_running")?,
+        connections: metric("Connections")?,
+        aborted_connects: metric("Aborted_connects")?,
+        questions: metric("Questions")?,
+        slow_queries: metric("Slow_queries")?,
+        bytes_received: metric("Bytes_received")?,
+        bytes_sent: metric("Bytes_sent")?,
+    })
 }
 
 fn postgresql_metrics_from_rows(
@@ -1584,6 +1806,109 @@ path = "/usr/bin/redis-server"
         );
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("redis".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    #[test]
+    fn mysql_connection_requires_tcp_or_tls_and_username() {
+        let valid = WorkloadConnectionConfig {
+            endpoint: "tls://mysql.example:3306".into(),
+            username: Some("monitor".into()),
+            secret_ref: None,
+            database: Some("metrics".into()),
+        };
+        valid.validate_for(WorkloadAdapter::MySql).unwrap();
+        assert!(WorkloadConnectionConfig {
+            username: None,
+            ..valid.clone()
+        }
+        .validate_for(WorkloadAdapter::MySql)
+        .is_err());
+        assert!(WorkloadConnectionConfig {
+            endpoint: "unix:///run/mysqld/mysqld.sock".into(),
+            ..valid
+        }
+        .validate_for(WorkloadAdapter::MySql)
+        .is_err());
+        let options = mysql_async::Opts::from(
+            mysql_connection_options("127.0.0.1", 3306, false, "monitor", None, Some("metrics"))
+                .unwrap(),
+        );
+        assert_eq!(options.db_name(), Some("metrics"));
+    }
+
+    #[test]
+    fn mysql_metrics_require_exact_allowlisted_u64_rows() {
+        let rows = [
+            ("Threads_connected", "1"),
+            ("Threads_running", "2"),
+            ("Connections", "3"),
+            ("Aborted_connects", "4"),
+            ("Questions", "5"),
+            ("Slow_queries", "6"),
+            ("Bytes_received", "7"),
+            ("Bytes_sent", "8"),
+        ];
+        let owned = rows
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(mysql_metrics_from_rows(&owned).unwrap().bytes_sent, 8);
+
+        let invalid = [
+            owned[..7].to_vec(),
+            {
+                let mut rows = owned.clone();
+                rows[7] = ("Unknown".into(), "8".into());
+                rows
+            },
+            {
+                let mut rows = owned.clone();
+                rows[7] = rows[0].clone();
+                rows
+            },
+            {
+                let mut rows = owned.clone();
+                rows[3].1 = "-1".into();
+                rows
+            },
+        ];
+        for rows in invalid {
+            assert!(matches!(
+                mysql_metrics_from_rows(&rows),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn mysql_metric_variant_matches_only_mysql_samples() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "mysql".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::MySql,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:3306".into(),
+                metrics: WorkloadMetrics::MySql(MySqlMetrics {
+                    threads_connected: 1,
+                    threads_running: 2,
+                    connections: 3,
+                    aborted_connects: 4,
+                    questions: 5,
+                    slow_queries: 6,
+                    bytes_received: 7,
+                    bytes_sent: 8,
+                }),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("postgres_sql".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 
