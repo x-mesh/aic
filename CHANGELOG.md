@@ -4,39 +4,9 @@
 
 ## [Unreleased]
 
-## [0.41.0] - 2026-09-14
-
-### Added
-
-- **workload:** add HAProxy monitoring
-- **workload:** add Nginx monitoring
-- **workload:** add RabbitMQ monitoring
-- **workload:** add search cluster monitoring
-- **workload:** add etcd monitoring
-- **workload:** add ClickHouse monitoring
-- **workload:** add Prometheus monitoring
-- **workload:** add MongoDB monitoring
-- **workload:** add MySQL monitoring
-- **workload:** add PostgreSQL monitoring
-- **workload:** add endpoint TLS and authentication
-- **workload:** add Memcached monitoring
-- **workload:** add Redis periodic monitoring
-- add Redis workload monitoring probe
-
 ### Fixed
 
-- **workload:** create HAProxy sockets atomically
-- **workload:** prevent HAProxy socket fd inheritance
-- **workload:** bound HAProxy socket connection
-- **workload:** secure Nginx status transport
-- **workload:** secure RabbitMQ metrics transport
-- **workload:** secure search cluster authentication
-- **workload:** parse etcd exposition numbers
-- **workload:** secure ClickHouse metrics transport
-- resolve workload monitor merge
-- **workload:** bound exposition exponent parsing
-- **workload:** accept integer exposition numbers
-- **workload:** apply MySQL database selection
+- HAProxy의 atomic close-on-exec success-path test를 해당 socket flag를 지원하는 Unix target에서만 실행한다.
 
 ## [0.41.0] - 2026-09-14
 

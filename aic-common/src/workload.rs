@@ -4818,7 +4818,14 @@ path = "/usr/bin/redis-server"
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     #[test]
     fn unix_connect_timeout_sets_close_on_exec() {
         use std::os::fd::AsRawFd;
