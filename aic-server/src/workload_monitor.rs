@@ -53,6 +53,10 @@ pub fn load_memcached_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::Memcached)
 }
 
+pub fn load_postgresql_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::PostgreSql)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -63,13 +67,31 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
     };
     let store = match toml::from_str::<WorkloadStore>(&content) {
         Ok(store) => store,
-        Err(error) => return DefinitionsState::Malformed(error.to_string()),
+        Err(_) => {
+            return DefinitionsState::Malformed(
+                "workload definitions contain invalid TOML".to_string(),
+            )
+        }
     };
+    if adapter == WorkloadAdapter::PostgreSql
+        && store
+            .workloads
+            .iter()
+            .any(|definition| definition.adapter == adapter && definition.connection.is_none())
+    {
+        return DefinitionsState::Malformed(
+            "PostgreSQL workload definitions require an explicit connection".to_string(),
+        );
+    }
     if let Some(error) = store.workloads.iter().find_map(|definition| {
-        definition
-            .connection
-            .as_ref()
-            .and_then(|connection| connection.validate_for(definition.adapter).err())
+        (definition.adapter == adapter)
+            .then_some(definition)
+            .and_then(|definition| {
+                definition
+                    .connection
+                    .as_ref()
+                    .and_then(|connection| connection.validate_for(definition.adapter).err())
+            })
     }) {
         return DefinitionsState::Malformed(error.to_string());
     }
@@ -133,6 +155,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
     match adapter {
         WorkloadAdapter::Redis => "Redis endpoint is unavailable",
         WorkloadAdapter::Memcached => "Memcached endpoint is unavailable",
+        WorkloadAdapter::PostgreSql => "PostgreSQL endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -141,6 +164,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
     match adapter {
         WorkloadAdapter::Redis => "Redis rejected the INFO request",
         WorkloadAdapter::Memcached => "Memcached rejected the stats request",
+        WorkloadAdapter::PostgreSql => "PostgreSQL rejected the statistics request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -149,6 +173,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
     match adapter {
         WorkloadAdapter::Redis => "Redis returned an invalid INFO response",
         WorkloadAdapter::Memcached => "Memcached returned an invalid stats response",
+        WorkloadAdapter::PostgreSql => "PostgreSQL returned an invalid statistics response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -240,7 +265,11 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
         }
         tokio::select! {
             _ = interval.tick() => {
-                for adapter in [WorkloadAdapter::Redis, WorkloadAdapter::Memcached] {
+                for adapter in [
+                    WorkloadAdapter::Redis,
+                    WorkloadAdapter::Memcached,
+                    WorkloadAdapter::PostgreSql,
+                ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
                     let changed = previous
@@ -328,6 +357,29 @@ fn start_collection_thread(
                     },
                     Utc::now(),
                 ),
+                WorkloadAdapter::PostgreSql => match definition.connection.as_ref() {
+                    Some(connection) => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            aic_common::workload::monitor_postgresql_with_connection(connection)
+                                .map(|(endpoint, metrics)| {
+                                    (endpoint, WorkloadMetrics::PostgreSql(metrics))
+                                })
+                        },
+                        Utc::now(),
+                    ),
+                    None => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            Err(WorkloadProbeError::Malformed(
+                                "PostgreSQL connection is missing".to_string(),
+                            ))
+                        },
+                        Utc::now(),
+                    ),
+                },
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -354,7 +406,28 @@ async fn wait_for_collection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aic_common::workload::{RedisMetrics, WorkloadDriverMode, WorkloadSelector};
+    use aic_common::workload::{
+        PostgreSqlMetrics, RedisMetrics, WorkloadDriverMode, WorkloadSelector,
+    };
+
+    fn postgresql_metrics() -> PostgreSqlMetrics {
+        PostgreSqlMetrics {
+            numbackends: 1,
+            xact_commit: 2,
+            xact_rollback: 3,
+            blks_read: 4,
+            blks_hit: 5,
+            tup_returned: 6,
+            tup_fetched: 7,
+            tup_inserted: 8,
+            tup_updated: 9,
+            tup_deleted: 10,
+            conflicts: 11,
+            temp_files: 12,
+            temp_bytes: 13,
+            deadlocks: 14,
+        }
+    }
 
     fn definition() -> WorkloadDefinition {
         WorkloadDefinition {
@@ -377,6 +450,23 @@ mod tests {
             adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+        }
+    }
+
+    fn postgresql_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "postgresql".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/postgres".into(),
+            },
+            adapter: WorkloadAdapter::PostgreSql,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: Some(aic_common::workload::WorkloadConnectionConfig {
+                endpoint: "tcp://127.0.0.1:5432".into(),
+                username: Some("aic_monitor".into()),
+                secret_ref: None,
+                database: Some("postgres".into()),
+            }),
         }
     }
 
@@ -404,6 +494,56 @@ mod tests {
         assert_eq!(
             load_memcached_definition(&path),
             DefinitionsState::One(memcached_definition())
+        );
+
+        let store = WorkloadStore {
+            workloads: vec![
+                definition(),
+                postgresql_definition(),
+                postgresql_definition(),
+                memcached_definition(),
+            ],
+        };
+        fs::write(&path, toml::to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            load_postgresql_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+        assert_eq!(
+            load_memcached_definition(&path),
+            DefinitionsState::One(memcached_definition())
+        );
+    }
+
+    #[test]
+    fn malformed_toml_and_missing_postgresql_connection_are_sanitized() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        fs::write(&path, "secret_ref = \"actual-password\"\nworkloads = [").unwrap();
+        assert_eq!(
+            load_postgresql_definition(&path),
+            DefinitionsState::Malformed("workload definitions contain invalid TOML".to_string())
+        );
+
+        let mut definition = postgresql_definition();
+        definition.connection = None;
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![definition],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_postgresql_definition(&path),
+            DefinitionsState::Malformed(
+                "PostgreSQL workload definitions require an explicit connection".to_string()
+            )
         );
     }
 
@@ -614,6 +754,112 @@ mod tests {
         };
         assert_eq!(reason, WorkloadSampleFailure::Malformed);
         assert_eq!(detail, "Memcached returned an invalid stats response");
+    }
+
+    #[test]
+    fn postgresql_collection_uses_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let outcome = collect_once(
+            &cfg,
+            &postgresql_definition(),
+            || Err(WorkloadProbeError::Rejected("password=secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(sample) = outcome else {
+            panic!("expected appended sample");
+        };
+        assert_eq!(sample.adapter, WorkloadAdapter::PostgreSql);
+        let WorkloadSampleOutcome::Failed { reason, detail } = sample.outcome else {
+            panic!("expected failed sample");
+        };
+        assert_eq!(reason, WorkloadSampleFailure::Rejected);
+        assert_eq!(detail, "PostgreSQL rejected the statistics request");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn postgresql_definition_collects_one_sample() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let outcome = collect_once(
+            &cfg,
+            &postgresql_definition(),
+            || {
+                Ok((
+                    "127.0.0.1:5432".into(),
+                    WorkloadMetrics::PostgreSql(postgresql_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(sample) = outcome else {
+            panic!("expected appended sample");
+        };
+        assert!(matches!(
+            sample.outcome,
+            WorkloadSampleOutcome::Collected {
+                metrics: WorkloadMetrics::PostgreSql(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn postgresql_failure_does_not_prevent_redis_collection() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        collect_once(
+            &cfg,
+            &postgresql_definition(),
+            || Err(WorkloadProbeError::Unreachable("database down".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        collect_once(
+            &cfg,
+            &definition(),
+            || {
+                Ok((
+                    "127.0.0.1:6379".into(),
+                    WorkloadMetrics::Redis(RedisMetrics {
+                        connected_clients: 1,
+                        used_memory: 2,
+                        total_commands_processed: 3,
+                        instantaneous_ops_per_sec: 4,
+                        keyspace_hits: 5,
+                        keyspace_misses: 6,
+                    }),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+
+        let samples = aic_common::workload::load_workload_history(&cfg.history_path).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(samples.iter().any(|sample| {
+            sample.adapter == WorkloadAdapter::PostgreSql
+                && matches!(sample.outcome, WorkloadSampleOutcome::Failed { .. })
+        }));
+        assert!(samples.iter().any(|sample| {
+            sample.adapter == WorkloadAdapter::Redis
+                && matches!(sample.outcome, WorkloadSampleOutcome::Collected { .. })
+        }));
     }
 
     #[test]

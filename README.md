@@ -404,14 +404,26 @@ Use brackets for IPv6, for example `tcp://[::1]:6379`.
 An explicit endpoint authorizes outbound connections to that host and port.
 Redis accepts `--auth-env NAME` or `--auth-keychain ACCOUNT`, and an optional `--username`.
 Memcached rejects authentication options. TLS uses native host roots and validates the endpoint host.
+PostgreSQL requires an explicit TCP or TLS endpoint, `--username`, and `--database`.
+PostgreSQL accepts `--auth-env NAME` or `--auth-keychain ACCOUNT` for password authentication.
+The secret is optional because PostgreSQL can use trust authentication.
+The probe resolves the secret only when it connects.
 Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
 `instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
 `curr_connections`, `bytes`, `cmd_get`, `cmd_set`, `get_hits`, `get_misses`, and `evictions`.
-Each connect, read, and write uses a 200 ms limit. Each response has a 64 KiB limit.
+PostgreSQL returns `numbackends`, `xact_commit`, `xact_rollback`, `blks_read`, `blks_hit`,
+`tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`, `tup_deleted`, `conflicts`,
+`temp_files`, `temp_bytes`, and `deadlocks`.
+PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
+The connection sets read-only transaction mode and bounded statement and lock timeouts.
+The monitor opens one connection for each probe. It does not use a connection pool.
+The PostgreSQL library does not expose a response byte limit. The fixed query returns one scalar row.
+Each Redis and Memcached connect, read, and write uses a 200 ms limit.
+Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis definition and one configured Memcached definition every 60 seconds.
+`aicd` probes one configured Redis, Memcached, and PostgreSQL definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
 
@@ -420,12 +432,12 @@ The default directory is `~/.local/state/aic`.
 The directory mode is 0700, and the file mode is 0600.
 Retention keeps 1440 samples.
 
-More than one definition of the same monitored adapter blocks only that adapter. Redis and Memcached
+More than one definition of the same monitored adapter blocks only that adapter. All monitored adapters
 samples share the history file. Existing Redis sample JSON remains readable.
 Use `aic workload status [--json]` to read the current state without `aicd`.
 Use `aic workload history <id> [--limit N] [--json]` to read stored samples without `aicd`.
 
-Authentication, custom endpoints, PostgreSQL metrics, and remote transport remain unsupported.
+Remote history transport remains unsupported.
 
 Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
 local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +

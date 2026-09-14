@@ -37,10 +37,12 @@ bytes = "1"
 # 사용하므로 feature 를 `io-util` 로 최소화한다. aic-server 는 "full" 로 가져가지만
 # aic-common 은 lean 하게 유지한다.
 # `sync` 는 BoundedByteChannel 이 사용하는 `tokio::sync::mpsc::unbounded_channel` 때문에 필요하다.
-tokio = { version = "1", features = ["io-util", "sync"] }
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
 rustls = { version = "=0.23.39", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.4"
+tokio-postgres = { version = "=0.7.15", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 proptest = "1"

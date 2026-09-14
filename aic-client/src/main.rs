@@ -667,6 +667,9 @@ enum WorkloadOp {
         endpoint: Option<String>,
         #[arg(long)]
         username: Option<String>,
+        /// PostgreSQL database name.
+        #[arg(long)]
+        database: Option<String>,
         #[arg(long, conflicts_with = "auth_keychain")]
         auth_env: Option<String>,
         #[arg(long, conflicts_with = "auth_env")]
@@ -1394,6 +1397,10 @@ fn handle_workload(op: WorkloadOp) {
                             "candidate={} monitor_ready={} metrics={:?}",
                             report.candidate_id, report.monitor_ready, report.metrics
                         ),
+                        aic_common::workload::WorkloadMonitorReport::PostgreSql(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
                     }
                 }
             })
@@ -1473,6 +1480,7 @@ fn handle_workload(op: WorkloadOp) {
             fingerprint,
             endpoint,
             username,
+            database,
             auth_env,
             auth_keychain,
             json,
@@ -1483,9 +1491,17 @@ fn handle_workload(op: WorkloadOp) {
                     username,
                     secret_ref: auth_env.map(|name| format!("env:{name}"))
                         .or_else(|| auth_keychain.map(|account| format!("keychain:{account}"))),
+                    database,
                 })),
-                None if username.is_some() || auth_env.is_some() || auth_keychain.is_some() => {
-                    Err(anyhow::anyhow!("--username, --auth-env, and --auth-keychain require --endpoint"))
+                None
+                    if username.is_some()
+                        || database.is_some()
+                        || auth_env.is_some()
+                        || auth_keychain.is_some() =>
+                {
+                    Err(anyhow::anyhow!(
+                        "--username, --database, --auth-env, and --auth-keychain require --endpoint"
+                    ))
                 }
                 None => Ok(None),
             };

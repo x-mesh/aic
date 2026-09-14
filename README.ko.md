@@ -381,24 +381,32 @@ bounded `stats` 요청을, PostgreSQL은 로컬 socket 또는
 IPv6는 `tcp://[::1]:6379`처럼 대괄호를 사용합니다. 명시적 endpoint는 해당 host와 port로 나가는 연결을
 허용합니다. Redis는 `--auth-env NAME` 또는
 `--auth-keychain ACCOUNT`와 선택 사항인 `--username`을 지원합니다. Memcached는 인증 옵션을 거부합니다.
-TLS는 OS의 native root를 사용하고 endpoint host를 검증합니다. Redis는
+PostgreSQL은 명시적 TCP 또는 TLS endpoint, `--username`, `--database`가 필요합니다. password 인증은
+`--auth-env NAME` 또는 `--auth-keychain ACCOUNT`를 사용합니다. trust 인증을 위해 secret은 선택 사항입니다.
+secret reference는 연결할 때만 해석합니다. PostgreSQL TLS도 native root를 사용하고 endpoint host를 검증합니다.
+Redis는
 `connected_clients`, `used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`,
 `keyspace_hits`, `keyspace_misses`를 반환합니다. Memcached는 `curr_connections`, `bytes`, `cmd_get`,
-`cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. 연결, 읽기, 쓰기 제한은 각각 200ms이고
+`cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. PostgreSQL은 `numbackends`, `xact_commit`,
+`xact_rollback`, `blks_read`, `blks_hit`, `tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`,
+`tup_deleted`, `conflicts`, `temp_files`, `temp_bytes`, `deadlocks`를 반환합니다. `pg_stat_database`에서 현재
+database의 scalar row 하나만 읽습니다. read-only transaction mode, statement timeout, lock timeout을 적용합니다.
+probe마다 연결 하나를 열고 pool은 사용하지 않습니다. PostgreSQL library는 응답 byte 제한을 제공하지 않습니다.
+고정 query가 반환 범위를 row 하나로 제한합니다. Redis와 Memcached의 연결, 읽기, 쓰기 제한은 각각 200ms이고
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis 정의와 Memcached 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
+`aicd`는 Redis, Memcached, PostgreSQL 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
 그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
 `127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 
-같은 adapter의 정의가 둘 이상이면 해당 adapter만 수집하지 않습니다. Redis와 Memcached sample은 같은
+같은 adapter의 정의가 둘 이상이면 해당 adapter만 수집하지 않습니다. 모든 monitor adapter sample은 같은
 history 파일에 저장하고 기존 Redis JSON sample도 읽습니다. `aic workload status [--json]`와
 `aic workload history <id> [--limit N] [--json]`는 `aicd` 없이 이 파일을 읽습니다.
 
-인증, 사용자 지정 endpoint, PostgreSQL 지표, 원격 전송은 지원하지 않습니다.
+workload history의 원격 전송은 지원하지 않습니다.
 
 probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다: local
 sysinfo 섹션(`fd`=열린 파일 디스크립터 현재/최대 포함) + `process` + git read-only + `docker`
