@@ -655,8 +655,8 @@ pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
 pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
- pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
- pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
+pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
+pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1834,6 +1834,7 @@ fn etcd_metrics_url(
 
 async fn monitor_etcd_async(url: &str) -> std::result::Result<EtcdMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(ETCD_PROBE_TIMEOUT)
@@ -3296,12 +3297,26 @@ path = "/usr/bin/redis-server"
                 "process_resident_memory_bytes 9",
                 "process_resident_memory_bytes 18446744073709551616",
             ),
+            etcd_response().replace(
+                "etcd_server_proposals_pending 6",
+                "etcd_server_proposals_pending 1e2147483647",
+            ),
         ] {
             assert!(matches!(
                 parse_etcd_metrics(&invalid),
                 Err(WorkloadProbeError::Malformed(_))
             ));
         }
+        let scientific = etcd_response().replace(
+            "etcd_server_proposals_applied_total 3",
+            "etcd_server_proposals_applied_total 1.234e+06",
+        );
+        assert_eq!(
+            parse_etcd_metrics(&scientific)
+                .unwrap()
+                .proposals_applied_total,
+            1_234_000
+        );
     }
 
     #[test]
