@@ -162,9 +162,9 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        MemcachedMetrics, MySqlMetrics, PostgreSqlMetrics, WorkloadAdapter, WorkloadDefinition,
-        WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
-        WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        MemcachedMetrics, MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, WorkloadAdapter,
+        WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics, WorkloadSample,
+        WorkloadSampleOutcome, WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -210,6 +210,7 @@ fn workload_status_and_history_read_local_history() {
             username: Some("aic_monitor".into()),
             secret_ref: None,
             database: Some("postgres".into()),
+            auth_source: None,
         }),
     };
     let mysql_definition = WorkloadDefinition {
@@ -224,6 +225,22 @@ fn workload_status_and_history_read_local_history() {
             username: Some("aic_monitor".into()),
             secret_ref: Some("env:MYSQL_PASSWORD".into()),
             database: Some("metrics".into()),
+            auth_source: None,
+        }),
+    };
+    let mongodb_definition = WorkloadDefinition {
+        id: "mongodb-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/mongod".into(),
+        },
+        adapter: WorkloadAdapter::MongoDb,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:27017".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:MONGODB_PASSWORD".into()),
+            database: None,
+            auth_source: Some("admin".into()),
         }),
     };
     std::fs::write(
@@ -234,6 +251,7 @@ fn workload_status_and_history_read_local_history() {
                 memcached_definition,
                 postgresql_definition,
                 mysql_definition,
+                mongodb_definition,
             ],
         })
         .unwrap(),
@@ -314,14 +332,36 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let mongodb_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "mongodb-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::MongoDb,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:27017".into(),
+            metrics: WorkloadMetrics::MongoDb(MongoDbMetrics {
+                connections_current: 1,
+                connections_available: 2,
+                connections_total_created: 3,
+                opcounters_query: 4,
+                opcounters_get_more: 5,
+                opcounters_command: 6,
+                network_bytes_in: 7,
+                network_bytes_out: 8,
+                network_num_requests: 9,
+                uptime_seconds: 10,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
             serde_json::to_string(&postgresql_sample).unwrap(),
-            serde_json::to_string(&mysql_sample).unwrap()
+            serde_json::to_string(&mysql_sample).unwrap(),
+            serde_json::to_string(&mongodb_sample).unwrap()
         ),
     )
     .unwrap();
@@ -379,6 +419,19 @@ fn workload_status_and_history_read_local_history() {
     assert_eq!(mysql_history["samples"][0]["adapter"], "my_sql");
     assert_eq!(mysql_history["samples"][0]["metrics"]["bytes_sent"], 8);
 
+    let mongodb_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "mongodb-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(mongodb_history.status.success());
+    let mongodb_history: serde_json::Value =
+        serde_json::from_slice(&mongodb_history.stdout).unwrap();
+    assert_eq!(mongodb_history["samples"][0]["adapter"], "mongo_db");
+    assert_eq!(
+        mongodb_history["samples"][0]["metrics"]["uptime_seconds"],
+        10
+    );
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -409,6 +462,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let fingerprint = candidate["fingerprint"].as_str().unwrap();
     let postgresql = candidate["adapter"] == "postgre_sql";
     let mysql = candidate["adapter"] == "my_sql";
+    let mongodb = candidate["adapter"] == "mongo_db";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -429,6 +483,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             "tcp://127.0.0.1:5432"
         } else if mysql {
             "tcp://127.0.0.1:3306"
+        } else if mongodb {
+            "tcp://127.0.0.1:27017"
         } else {
             "tcp://127.0.0.1:16379"
         },
@@ -437,6 +493,15 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         enabled.args(["--username", "aic_monitor", "--database", "postgres"]);
     } else if mysql {
         enabled.args(["--username", "aic_monitor", "--database", "metrics"]);
+    } else if mongodb {
+        enabled.args([
+            "--username",
+            "aic_monitor",
+            "--auth-env",
+            "MONGODB_PASSWORD",
+            "--auth-source",
+            "admin",
+        ]);
     }
     let enabled = enabled.arg("--json").output().unwrap();
     assert!(
@@ -450,6 +515,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "endpoint = \"tcp://127.0.0.1:5432\""
     } else if mysql {
         "endpoint = \"tcp://127.0.0.1:3306\""
+    } else if mongodb {
+        "endpoint = \"tcp://127.0.0.1:27017\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));
@@ -459,6 +526,10 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     } else if mysql {
         assert!(saved.contains("username = \"aic_monitor\""));
         assert!(saved.contains("database = \"metrics\""));
+    } else if mongodb {
+        assert!(saved.contains("username = \"aic_monitor\""));
+        assert!(saved.contains("secret_ref = \"env:MONGODB_PASSWORD\""));
+        assert!(saved.contains("auth_source = \"admin\""));
     }
 
     let listed = aic_cmd(tmp.path())

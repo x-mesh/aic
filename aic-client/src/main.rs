@@ -670,6 +670,9 @@ enum WorkloadOp {
         /// PostgreSQL or MySQL database name.
         #[arg(long)]
         database: Option<String>,
+        /// MongoDB authentication database. Defaults to admin.
+        #[arg(long)]
+        auth_source: Option<String>,
         #[arg(long, conflicts_with = "auth_keychain")]
         auth_env: Option<String>,
         #[arg(long, conflicts_with = "auth_env")]
@@ -1405,6 +1408,10 @@ fn handle_workload(op: WorkloadOp) {
                             "candidate={} monitor_ready={} metrics={:?}",
                             report.candidate_id, report.monitor_ready, report.metrics
                         ),
+                        aic_common::workload::WorkloadMonitorReport::MongoDb(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
                     }
                 }
             })
@@ -1485,6 +1492,7 @@ fn handle_workload(op: WorkloadOp) {
             endpoint,
             username,
             database,
+            auth_source,
             auth_env,
             auth_keychain,
             json,
@@ -1496,15 +1504,17 @@ fn handle_workload(op: WorkloadOp) {
                     secret_ref: auth_env.map(|name| format!("env:{name}"))
                         .or_else(|| auth_keychain.map(|account| format!("keychain:{account}"))),
                     database,
+                    auth_source,
                 })),
                 None
                     if username.is_some()
                         || database.is_some()
+                        || auth_source.is_some()
                         || auth_env.is_some()
                         || auth_keychain.is_some() =>
                 {
                     Err(anyhow::anyhow!(
-                        "--username, --database, --auth-env, and --auth-keychain require --endpoint"
+                        "--username, --database, --auth-source, --auth-env, and --auth-keychain require --endpoint"
                     ))
                 }
                 None => Ok(None),

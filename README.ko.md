@@ -385,6 +385,9 @@ PostgreSQL은 명시적 TCP 또는 TLS endpoint, `--username`, `--database`가 �
 `--auth-env NAME` 또는 `--auth-keychain ACCOUNT`를 사용합니다. trust 인증을 위해 secret은 선택 사항입니다.
 MySQL은 명시적 TCP 또는 TLS endpoint와 `--username`이 필요하며 `--database`는 선택 사항입니다. password
 인증은 `--auth-env NAME` 또는 `--auth-keychain ACCOUNT`를 사용합니다.
+MongoDB는 명시적 TCP 또는 TLS endpoint가 필요합니다. URI, SRV, Unix endpoint는 지원하지 않습니다.
+MongoDB 인증에는 `--username`과 secret option 하나를 함께 사용합니다. `--auth-source NAME`을 생략하면
+인증 database로 `admin`을 사용합니다.
 secret reference는 연결할 때만 해석합니다. PostgreSQL TLS도 native root를 사용하고 endpoint host를 검증합니다.
 Redis는
 `connected_clients`, `used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`,
@@ -395,16 +398,22 @@ Redis는
 database의 scalar row 하나만 읽습니다. read-only transaction mode, statement timeout, lock timeout을 적용합니다.
 MySQL은 `threads_connected`, `threads_running`, `connections`, `aborted_connects`, `questions`, `slow_queries`,
 `bytes_received`, `bytes_sent`를 반환합니다. 고정 `SHOW GLOBAL STATUS` query로 이 지표 8개만 요청합니다.
+MongoDB는 `connections_current`, `connections_available`, `connections_total_created`, `opcounters_query`,
+`opcounters_get_more`, `opcounters_command`, `network_bytes_in`, `network_bytes_out`, `network_num_requests`,
+`uptime_seconds`를 반환합니다.
 MySQL TLS는 native root만 사용하고 endpoint host를 검증합니다. probe마다 연결 하나를 열고 pool은 사용하지
 않습니다. PostgreSQL과 MySQL library는 응답 byte 제한을 제공하지 않습니다. PostgreSQL의 고정 query는
 반환 범위를 row 하나로 제한합니다. Redis와 Memcached의 연결, 읽기, 쓰기 제한은 각각 200ms이고
+MongoDB는 고정 `serverStatus` command와 3초 전체 timeout을 사용합니다. 내부 pool은 connection 하나로
+제한합니다. MongoDB TLS는 OpenSSL system root를 사용합니다. 64KiB 제한은 BSON decode 뒤에 적용하므로
+driver가 먼저 더 큰 응답을 받을 수 있습니다.
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis, Memcached, PostgreSQL, MySQL 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
+`aicd`는 Redis, Memcached, PostgreSQL, MySQL, MongoDB 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
 그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
 `127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
-PostgreSQL과 MySQL은 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
+PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
 상태로 처리합니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.

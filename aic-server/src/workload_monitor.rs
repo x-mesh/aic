@@ -61,6 +61,10 @@ pub fn load_mysql_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::MySql)
 }
 
+pub fn load_mongodb_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::MongoDb)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -79,16 +83,17 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
     };
     if matches!(
         adapter,
-        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql
+        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql | WorkloadAdapter::MongoDb
     ) && store
         .workloads
         .iter()
         .any(|definition| definition.adapter == adapter && definition.connection.is_none())
     {
-        let name = if adapter == WorkloadAdapter::PostgreSql {
-            "PostgreSQL"
-        } else {
-            "MySQL"
+        let name = match adapter {
+            WorkloadAdapter::PostgreSql => "PostgreSQL",
+            WorkloadAdapter::MySql => "MySQL",
+            WorkloadAdapter::MongoDb => "MongoDB",
+            _ => unreachable!("only database monitor adapters require connections"),
         };
         return DefinitionsState::Malformed(format!(
             "{name} workload definitions require an explicit connection"
@@ -168,6 +173,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Memcached => "Memcached endpoint is unavailable",
         WorkloadAdapter::PostgreSql => "PostgreSQL endpoint is unavailable",
         WorkloadAdapter::MySql => "MySQL endpoint is unavailable",
+        WorkloadAdapter::MongoDb => "MongoDB endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -178,6 +184,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Memcached => "Memcached rejected the stats request",
         WorkloadAdapter::PostgreSql => "PostgreSQL rejected the statistics request",
         WorkloadAdapter::MySql => "MySQL rejected the statistics request",
+        WorkloadAdapter::MongoDb => "MongoDB rejected the serverStatus request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -188,6 +195,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Memcached => "Memcached returned an invalid stats response",
         WorkloadAdapter::PostgreSql => "PostgreSQL returned an invalid statistics response",
         WorkloadAdapter::MySql => "MySQL returned an invalid statistics response",
+        WorkloadAdapter::MongoDb => "MongoDB returned an invalid serverStatus response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -284,6 +292,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::Memcached,
                     WorkloadAdapter::PostgreSql,
                     WorkloadAdapter::MySql,
+                    WorkloadAdapter::MongoDb,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -417,6 +426,28 @@ fn start_collection_thread(
                         Utc::now(),
                     ),
                 },
+                WorkloadAdapter::MongoDb => match definition.connection.as_ref() {
+                    Some(connection) => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            aic_common::workload::monitor_mongodb_with_connection(connection).map(
+                                |(endpoint, metrics)| (endpoint, WorkloadMetrics::MongoDb(metrics)),
+                            )
+                        },
+                        Utc::now(),
+                    ),
+                    None => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            Err(WorkloadProbeError::Malformed(
+                                "MongoDB connection is missing".to_string(),
+                            ))
+                        },
+                        Utc::now(),
+                    ),
+                },
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -444,7 +475,7 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        MySqlMetrics, PostgreSqlMetrics, RedisMetrics, WorkloadConnectionConfig,
+        MongoDbMetrics, MySqlMetrics, PostgreSqlMetrics, RedisMetrics, WorkloadConnectionConfig,
         WorkloadDriverMode, WorkloadSelector,
     };
 
@@ -504,6 +535,7 @@ mod tests {
                 username: Some("aic_monitor".into()),
                 secret_ref: None,
                 database: Some("postgres".into()),
+                auth_source: None,
             }),
         }
     }
@@ -521,6 +553,7 @@ mod tests {
                 username: Some("aic_monitor".into()),
                 secret_ref: None,
                 database: None,
+                auth_source: None,
             }),
         }
     }
@@ -535,6 +568,39 @@ mod tests {
             slow_queries: 6,
             bytes_received: 7,
             bytes_sent: 8,
+        }
+    }
+
+    fn mongodb_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "mongodb".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/mongod".into(),
+            },
+            adapter: WorkloadAdapter::MongoDb,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: Some(WorkloadConnectionConfig {
+                endpoint: "tcp://127.0.0.1:27017".into(),
+                username: None,
+                secret_ref: None,
+                database: None,
+                auth_source: None,
+            }),
+        }
+    }
+
+    fn mongodb_metrics() -> MongoDbMetrics {
+        MongoDbMetrics {
+            connections_current: 1,
+            connections_available: 2,
+            connections_total_created: 3,
+            opcounters_query: 4,
+            opcounters_get_more: 5,
+            opcounters_command: 6,
+            network_bytes_in: 7,
+            network_bytes_out: 8,
+            network_num_requests: 9,
+            uptime_seconds: 10,
         }
     }
 
@@ -649,6 +715,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(load_mysql_definition(&path), DefinitionsState::Ambiguous(2));
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+    }
+
+    #[test]
+    fn mongodb_requires_connection_and_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        let mut missing = mongodb_definition();
+        missing.connection = None;
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![missing, definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_mongodb_definition(&path),
+            DefinitionsState::Malformed(
+                "MongoDB workload definitions require an explicit connection".to_string()
+            )
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![mongodb_definition(), mongodb_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_mongodb_definition(&path),
+            DefinitionsState::Ambiguous(2)
+        );
         assert_eq!(
             load_redis_definition(&path),
             DefinitionsState::One(definition())
@@ -970,6 +1079,56 @@ mod tests {
             panic!("expected failed MySQL sample");
         };
         assert_eq!(detail, "MySQL rejected the statistics request");
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn mongodb_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &mongodb_definition(),
+            || {
+                Ok((
+                    "tcp://127.0.0.1:27017".into(),
+                    WorkloadMetrics::MongoDb(mongodb_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::MongoDb,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::MongoDb(_),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let failed = collect_once(
+            &cfg,
+            &mongodb_definition(),
+            || Err(WorkloadProbeError::Rejected("password=secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed MongoDB sample");
+        };
+        assert_eq!(detail, "MongoDB rejected the serverStatus request");
         assert!(!detail.contains("secret"));
     }
 
