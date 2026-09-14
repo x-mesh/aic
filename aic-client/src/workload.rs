@@ -4,11 +4,12 @@ use aic_common::workload::{
     load_workload_history, monitor_clickhouse_with_connection,
     monitor_elasticsearch_with_connection, monitor_etcd_with_connection,
     monitor_memcached_with_connection, monitor_mongodb_with_connection,
-    monitor_mysql_with_connection, monitor_opensearch_with_connection,
-    monitor_postgresql_with_connection, monitor_prometheus_with_connection,
-    monitor_rabbitmq_with_connection, monitor_redis_with_connection, workload_history_path,
-    workloads_file_path, ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport,
-    MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport, OpenSearchMonitorReport,
+    monitor_mysql_with_connection, monitor_nginx_with_connection,
+    monitor_opensearch_with_connection, monitor_postgresql_with_connection,
+    monitor_prometheus_with_connection, monitor_rabbitmq_with_connection,
+    monitor_redis_with_connection, workload_history_path, workloads_file_path,
+    ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport, MemcachedMonitorReport,
+    MongoDbMonitorReport, MySqlMonitorReport, NginxMonitorReport, OpenSearchMonitorReport,
     PostgreSqlMonitorReport, PrometheusMonitorReport, ProposalCost, ProposalReadiness,
     RabbitMqMonitorReport, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
     WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
@@ -314,6 +315,19 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
         .find(|definition| definition.id == candidate.id)
         .and_then(|definition| definition.connection);
     let report = match candidate.adapter {
+        WorkloadAdapter::Nginx => {
+            let connection = connection
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Nginx monitor requires an explicit connection"))?;
+            WorkloadMonitorReport::Nginx(NginxMonitorReport {
+                candidate_id: candidate.id.clone(),
+                adapter: WorkloadAdapter::Nginx,
+                monitor_ready: true,
+                metrics: monitor_nginx_with_connection(connection)
+                    .map(|(_, metrics)| metrics)
+                    .map_err(|error| safe_monitor_error(WorkloadAdapter::Nginx, error))?,
+            })
+        }
         WorkloadAdapter::Redis => WorkloadMonitorReport::Redis(RedisMonitorReport {
             candidate_id: candidate.id.clone(),
             monitor_ready: true,
@@ -425,6 +439,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
 
 fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> anyhow::Error {
     let adapter_name = match adapter {
+        WorkloadAdapter::Nginx => "Nginx",
         WorkloadAdapter::Redis => "Redis",
         WorkloadAdapter::Memcached => "Memcached",
         WorkloadAdapter::PostgreSql => "PostgreSQL",
@@ -458,6 +473,7 @@ fn select_monitor_candidate<'a>(
     if !matches!(
         candidate.adapter,
         WorkloadAdapter::Redis
+            | WorkloadAdapter::Nginx
             | WorkloadAdapter::Memcached
             | WorkloadAdapter::PostgreSql
             | WorkloadAdapter::MySql
@@ -933,6 +949,7 @@ pub fn derive_status(
             if !matches!(
                 definition.adapter,
                 WorkloadAdapter::Redis
+                    | WorkloadAdapter::Nginx
                     | WorkloadAdapter::Memcached
                     | WorkloadAdapter::PostgreSql
                     | WorkloadAdapter::MySql
@@ -1049,7 +1066,10 @@ fn validate_enable_connection(
 ) -> Result<()> {
     if matches!(
         adapter,
-        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql | WorkloadAdapter::MongoDb
+        WorkloadAdapter::PostgreSql
+            | WorkloadAdapter::MySql
+            | WorkloadAdapter::MongoDb
+            | WorkloadAdapter::Nginx
     ) && connection.is_none()
     {
         bail!("database workload monitoring requires an explicit connection");

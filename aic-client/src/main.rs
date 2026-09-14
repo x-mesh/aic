@@ -1392,6 +1392,9 @@ fn handle_workload(op: WorkloadOp) {
                     serde_json::to_string(&report).expect("workload monitor report serializes")
                 } else {
                     match report {
+                        aic_common::workload::WorkloadMonitorReport::Nginx(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}", report.candidate_id, report.monitor_ready, report.metrics
+                        ),
                         aic_common::workload::WorkloadMonitorReport::Redis(report) => format!(
                             "candidate={} monitor_ready={} metrics={:?}",
                             report.candidate_id, report.monitor_ready, report.metrics
