@@ -491,19 +491,28 @@ HAProxy returns `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_o
 `retry_warnings_total`, and `servers_down`.
 Socket operations use 200 ms, each probe has a three-second limit, and responses have a 256 KiB limit.
 The adapter does not support TCP, HTTP stats pages, authentication, custom commands, configuration changes, permission changes, or reloads.
+
+The monitor adapters are Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse,
+etcd, Elasticsearch, OpenSearch, RabbitMQ, Nginx, and HAProxy. JVM, Kafka, and Consul remain
+discovery-only. JVM monitoring needs a separate opt-in JMX or verified local PerfData contract.
+Kafka monitoring needs a bounded Admin API, an egress policy, and a dedicated security schema.
+Consul does not expose one stable required metric set across server and client agents. AIC does not
+create history samples for these three discovery-only adapters.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` also probes one Elasticsearch and one OpenSearch definition every 60 seconds.
-It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
-`127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
+`aicd` probes one definition for each monitor adapter every 60 seconds.
+It uses the saved connection when present. Otherwise, Redis uses fixed socket paths or `127.0.0.1:6379`.
+Memcached uses `127.0.0.1:11211`. It resolves secret references only at probe time.
 MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
 Prometheus definitions can use the default endpoint or a saved endpoint.
 ClickHouse definitions can use the default endpoint or a saved endpoint.
 etcd definitions can use the default endpoint or a saved endpoint.
 Elasticsearch and OpenSearch definitions can use default or saved endpoints.
+RabbitMQ can use its default management endpoint or a saved endpoint. Nginx and HAProxy require
+saved connections. JVM, Kafka, and Consul definitions stay in the `not_collected` state.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.

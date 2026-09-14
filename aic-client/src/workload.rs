@@ -484,22 +484,7 @@ fn select_monitor_candidate<'a>(
         .iter()
         .find(|candidate| candidate.id == candidate_id)
         .ok_or_else(|| anyhow::anyhow!("requested workload candidate was not discovered"))?;
-    if !matches!(
-        candidate.adapter,
-        WorkloadAdapter::Redis
-            | WorkloadAdapter::HaProxy
-            | WorkloadAdapter::Nginx
-            | WorkloadAdapter::Memcached
-            | WorkloadAdapter::PostgreSql
-            | WorkloadAdapter::MySql
-            | WorkloadAdapter::MongoDb
-            | WorkloadAdapter::Prometheus
-            | WorkloadAdapter::ClickHouse
-            | WorkloadAdapter::Etcd
-            | WorkloadAdapter::Elasticsearch
-            | WorkloadAdapter::OpenSearch
-            | WorkloadAdapter::RabbitMq
-    ) {
+    if !is_monitor_adapter(candidate.adapter) {
         bail!("workload candidate does not support monitoring");
     }
     if !candidate.ambiguity.is_empty() {
@@ -514,6 +499,25 @@ fn select_monitor_candidate<'a>(
         bail!("workload monitor requires exactly one unambiguous adapter candidate, found {count}");
     }
     Ok(candidate)
+}
+
+fn is_monitor_adapter(adapter: WorkloadAdapter) -> bool {
+    matches!(
+        adapter,
+        WorkloadAdapter::Redis
+            | WorkloadAdapter::HaProxy
+            | WorkloadAdapter::Nginx
+            | WorkloadAdapter::Memcached
+            | WorkloadAdapter::PostgreSql
+            | WorkloadAdapter::MySql
+            | WorkloadAdapter::MongoDb
+            | WorkloadAdapter::Prometheus
+            | WorkloadAdapter::ClickHouse
+            | WorkloadAdapter::Etcd
+            | WorkloadAdapter::Elasticsearch
+            | WorkloadAdapter::OpenSearch
+            | WorkloadAdapter::RabbitMq
+    )
 }
 
 fn probe_postgres_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
@@ -961,22 +965,7 @@ pub fn derive_status(
     definitions
         .iter()
         .map(|definition| {
-            if !matches!(
-                definition.adapter,
-                WorkloadAdapter::Redis
-                    | WorkloadAdapter::Nginx
-                    | WorkloadAdapter::Memcached
-                    | WorkloadAdapter::PostgreSql
-                    | WorkloadAdapter::MySql
-                    | WorkloadAdapter::MongoDb
-                    | WorkloadAdapter::Prometheus
-                    | WorkloadAdapter::ClickHouse
-                    | WorkloadAdapter::Etcd
-                    | WorkloadAdapter::Elasticsearch
-                    | WorkloadAdapter::OpenSearch
-                    | WorkloadAdapter::RabbitMq
-                    | WorkloadAdapter::HaProxy
-            ) {
+            if !is_monitor_adapter(definition.adapter) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
                     adapter: definition.adapter,
@@ -1630,6 +1619,30 @@ mod tests {
         ];
         for (report, candidate_id) in cases {
             assert!(select_monitor_candidate(&report, candidate_id).is_err());
+        }
+    }
+
+    #[test]
+    fn jvm_kafka_and_consul_are_discovery_only() {
+        for adapter in [
+            WorkloadAdapter::Jvm,
+            WorkloadAdapter::Kafka,
+            WorkloadAdapter::Consul,
+        ] {
+            assert!(!is_monitor_adapter(adapter));
+            let definition = WorkloadDefinition {
+                id: format!("{adapter:?}"),
+                selector: WorkloadSelector::Executable {
+                    path: "/usr/bin/service".into(),
+                },
+                adapter,
+                driver_mode: WorkloadDriverMode::DetectOnly,
+                connection: None,
+            };
+            assert_eq!(
+                derive_status(&[definition], &[], Utc::now())[0].state,
+                CollectionState::NotCollected
+            );
         }
     }
 
