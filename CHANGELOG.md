@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.41.2] - 2026-09-14
+
+### Fixed
+
+- Linux cross-release build에 target별 vendored OpenSSL을 사용해 MongoDB TLS binary linking을 복구한다.
+
 ## [0.41.1] - 2026-09-14
 
 ### Fixed
