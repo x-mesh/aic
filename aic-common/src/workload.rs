@@ -15,6 +15,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_postgres::config::SslMode;
+use tokio_postgres::{Config as PostgreSqlConfig, NoTls, Row};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
 
@@ -121,6 +124,8 @@ pub struct WorkloadConnectionConfig {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,11 +141,31 @@ impl WorkloadConnectionConfig {
         if self.username.as_deref().is_some_and(str::is_empty) {
             anyhow::bail!("workload username must not be empty");
         }
+        if self.database.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("workload database must not be empty");
+        }
         if let Some(secret_ref) = &self.secret_ref {
             crate::secret::parse_secret_reference(secret_ref).map_err(anyhow::Error::msg)?;
         }
-        if self.username.is_some() && self.secret_ref.is_none() {
+        if adapter != WorkloadAdapter::PostgreSql
+            && self.username.is_some()
+            && self.secret_ref.is_none()
+        {
             anyhow::bail!("workload username requires secret_ref");
+        }
+        match adapter {
+            WorkloadAdapter::PostgreSql => {
+                if self.username.is_none() || self.database.is_none() {
+                    anyhow::bail!("PostgreSQL workload connections require username and database");
+                }
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("PostgreSQL workload connections require a TCP or TLS endpoint");
+                }
+            }
+            WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
+                anyhow::bail!("Redis and Memcached workload connections do not support database");
+            }
+            _ => {}
         }
         if adapter == WorkloadAdapter::Memcached
             && (self.username.is_some() || self.secret_ref.is_some())
@@ -198,17 +223,25 @@ impl<'de> Deserialize<'de> for WorkloadConnectionConfig {
             username: Option<String>,
             #[serde(default)]
             secret_ref: Option<String>,
+            #[serde(default)]
+            database: Option<String>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let config = Self {
             endpoint: wire.endpoint,
             username: wire.username,
             secret_ref: wire.secret_ref,
+            database: wire.database,
         };
         config.endpoint().map_err(serde::de::Error::custom)?;
         if config.username.as_deref().is_some_and(str::is_empty) {
             return Err(serde::de::Error::custom(
                 "workload username must not be empty",
+            ));
+        }
+        if config.database.as_deref().is_some_and(str::is_empty) {
+            return Err(serde::de::Error::custom(
+                "workload database must not be empty",
             ));
         }
         if let Some(secret_ref) = &config.secret_ref {
@@ -332,6 +365,26 @@ pub struct MemcachedMetrics {
     pub evictions: u64,
 }
 
+/// Numeric metrics returned by one bounded PostgreSQL `pg_stat_database` probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgreSqlMetrics {
+    pub numbackends: u64,
+    pub xact_commit: u64,
+    pub xact_rollback: u64,
+    pub blks_read: u64,
+    pub blks_hit: u64,
+    pub tup_returned: u64,
+    pub tup_fetched: u64,
+    pub tup_inserted: u64,
+    pub tup_updated: u64,
+    pub tup_deleted: u64,
+    pub conflicts: u64,
+    pub temp_files: u64,
+    pub temp_bytes: u64,
+    pub deadlocks: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -340,6 +393,7 @@ pub struct MemcachedMetrics {
 pub enum WorkloadMetrics {
     Redis(RedisMetrics),
     Memcached(MemcachedMetrics),
+    PostgreSql(PostgreSqlMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -359,10 +413,19 @@ pub struct MemcachedMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgreSqlMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: PostgreSqlMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
     Memcached(MemcachedMonitorReport),
+    PostgreSql(PostgreSqlMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -376,7 +439,9 @@ pub const REDIS_SOCKET_PATHS: &[&str] = &[
 pub const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
 pub const MEMCACHED_STATS_REQUEST: &[u8] = b"stats\r\n";
 pub const MEMCACHED_LOOPBACK_ENDPOINT: &str = "127.0.0.1:11211";
+pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_commit::bigint, xact_rollback::bigint, blks_read::bigint, blks_hit::bigint, tup_returned::bigint, tup_fetched::bigint, tup_inserted::bigint, tup_updated::bigint, tup_deleted::bigint, conflicts::bigint, temp_files::bigint, temp_bytes::bigint, deadlocks::bigint FROM pg_stat_database WHERE datname = current_database()";
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -450,6 +515,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                 (wire.adapter, metrics),
                 (WorkloadAdapter::Redis, WorkloadMetrics::Redis(_))
                     | (WorkloadAdapter::Memcached, WorkloadMetrics::Memcached(_))
+                    | (WorkloadAdapter::PostgreSql, WorkloadMetrics::PostgreSql(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -667,6 +733,182 @@ pub fn monitor_memcached_with_connection(
                 .map(|metrics| (connection.endpoint.clone(), metrics))
         }
     }
+}
+
+/// Collect one bounded `pg_stat_database` row from an explicit PostgreSQL connection.
+pub fn monitor_postgresql_with_connection(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<(String, PostgreSqlMetrics), WorkloadProbeError> {
+    connection
+        .validate_for(WorkloadAdapter::PostgreSql)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("PostgreSQL connection configuration is invalid".into())
+        })?;
+    let endpoint = connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("PostgreSQL endpoint is invalid".into()))?;
+    let secret = resolve_connection_secret(connection).map_err(|_| {
+        WorkloadProbeError::Rejected("PostgreSQL authentication secret is unavailable".into())
+    })?;
+    let username = connection
+        .username
+        .as_deref()
+        .ok_or_else(|| WorkloadProbeError::Malformed("PostgreSQL username is missing".into()))?;
+    let database = connection
+        .database
+        .as_deref()
+        .ok_or_else(|| WorkloadProbeError::Malformed("PostgreSQL database is missing".into()))?;
+    let (host, port, use_tls) = match endpoint {
+        WorkloadEndpoint::Tcp { host, port } => (host, port, false),
+        WorkloadEndpoint::Tls { host, port } => (host, port, true),
+        WorkloadEndpoint::Unix(_) => {
+            return Err(WorkloadProbeError::Malformed(
+                "PostgreSQL endpoint must use TCP or TLS".into(),
+            ));
+        }
+    };
+
+    let username = username.to_owned();
+    let database = database.to_owned();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("PostgreSQL probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(
+                POSTGRESQL_PROBE_TIMEOUT,
+                monitor_postgresql_async(
+                    &host,
+                    port,
+                    use_tls,
+                    &username,
+                    &database,
+                    secret.as_deref(),
+                ),
+            )
+            .await
+            .map_err(|_| WorkloadProbeError::Unreachable("PostgreSQL probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("PostgreSQL probe runtime failed".into()))??;
+    Ok((connection.endpoint.clone(), metrics))
+}
+
+async fn monitor_postgresql_async(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    username: &str,
+    database: &str,
+    password: Option<&str>,
+) -> std::result::Result<PostgreSqlMetrics, WorkloadProbeError> {
+    let mut config = PostgreSqlConfig::new();
+    config
+        .host(host)
+        .port(port)
+        .user(username)
+        .dbname(database)
+        .application_name("aic-workload-monitor")
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .options(
+            "-c default_transaction_read_only=on -c statement_timeout=1000 -c lock_timeout=200",
+        );
+    if let Some(password) = password {
+        config.password(password);
+    }
+
+    let client = if use_tls {
+        config.ssl_mode(SslMode::Require);
+        let connector = MakeRustlsConnect::new(tls_client_config()?);
+        let (client, connection) = config
+            .connect(connector)
+            .await
+            .map_err(map_postgresql_connect_error)?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    } else {
+        config.ssl_mode(SslMode::Disable);
+        let (client, connection) = config
+            .connect(NoTls)
+            .await
+            .map_err(map_postgresql_connect_error)?;
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+    };
+    let rows = client
+        .query(POSTGRESQL_METRICS_QUERY, &[])
+        .await
+        .map_err(|_| WorkloadProbeError::Rejected("PostgreSQL rejected metrics query".into()))?;
+    postgresql_metrics_from_rows(&rows)
+}
+
+fn map_postgresql_connect_error(error: tokio_postgres::Error) -> WorkloadProbeError {
+    if error.as_db_error().is_some() {
+        WorkloadProbeError::Rejected("PostgreSQL rejected connection".into())
+    } else {
+        WorkloadProbeError::Unreachable("PostgreSQL endpoint is unavailable".into())
+    }
+}
+
+fn postgresql_metrics_from_rows(
+    rows: &[Row],
+) -> std::result::Result<PostgreSqlMetrics, WorkloadProbeError> {
+    if rows.len() != 1 {
+        return Err(WorkloadProbeError::Malformed(
+            "PostgreSQL metrics query must return exactly one row".into(),
+        ));
+    }
+    let row = &rows[0];
+    let values = (0..14)
+        .map(|index| row.try_get::<_, Option<i64>>(index))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("PostgreSQL metrics have invalid types".into())
+        })?;
+    postgresql_metrics_from_values(&values)
+}
+
+fn postgresql_metrics_from_values(
+    values: &[Option<i64>],
+) -> std::result::Result<PostgreSqlMetrics, WorkloadProbeError> {
+    if values.len() != 14 {
+        return Err(WorkloadProbeError::Malformed(
+            "PostgreSQL metrics have an invalid field count".into(),
+        ));
+    }
+    let mut values = values.iter().map(|value| {
+        value
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| {
+                WorkloadProbeError::Malformed(
+                    "PostgreSQL metrics contain a null or negative value".into(),
+                )
+            })
+    });
+    Ok(PostgreSqlMetrics {
+        numbackends: values.next().expect("validated metric count")?,
+        xact_commit: values.next().expect("validated metric count")?,
+        xact_rollback: values.next().expect("validated metric count")?,
+        blks_read: values.next().expect("validated metric count")?,
+        blks_hit: values.next().expect("validated metric count")?,
+        tup_returned: values.next().expect("validated metric count")?,
+        tup_fetched: values.next().expect("validated metric count")?,
+        tup_inserted: values.next().expect("validated metric count")?,
+        tup_updated: values.next().expect("validated metric count")?,
+        tup_deleted: values.next().expect("validated metric count")?,
+        conflicts: values.next().expect("validated metric count")?,
+        temp_files: values.next().expect("validated metric count")?,
+        temp_bytes: values.next().expect("validated metric count")?,
+        deadlocks: values.next().expect("validated metric count")?,
+    })
 }
 
 fn resolve_connection_secret(
@@ -1238,11 +1480,120 @@ path = "/usr/bin/redis-server"
     }
 
     #[test]
+    fn legacy_connection_defaults_database_to_none() {
+        let connection: WorkloadConnectionConfig =
+            toml::from_str(r#"endpoint = "tcp://127.0.0.1:6379""#).unwrap();
+        assert_eq!(connection.database, None);
+    }
+
+    #[test]
+    fn postgresql_connection_requires_endpoint_username_and_database() {
+        let valid = WorkloadConnectionConfig {
+            endpoint: "tls://postgres.example:5432".into(),
+            username: Some("monitor".into()),
+            secret_ref: None,
+            database: Some("app".into()),
+        };
+        valid.validate_for(WorkloadAdapter::PostgreSql).unwrap();
+
+        for invalid in [
+            WorkloadConnectionConfig {
+                username: None,
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                database: None,
+                ..valid.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/postgresql/.s.PGSQL.5432".into(),
+                ..valid.clone()
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::PostgreSql).is_err());
+        }
+        assert!(WorkloadConnectionConfig {
+            database: Some("app".into()),
+            endpoint: "tcp://127.0.0.1:6379".into(),
+            username: None,
+            secret_ref: None,
+        }
+        .validate_for(WorkloadAdapter::Redis)
+        .is_err());
+    }
+
+    #[test]
+    fn postgresql_metrics_reject_null_negative_and_wrong_field_count() {
+        let values = (1_i64..=14).map(Some).collect::<Vec<_>>();
+        let metrics = postgresql_metrics_from_values(&values).unwrap();
+        assert_eq!(metrics.numbackends, 1);
+        assert_eq!(metrics.deadlocks, 14);
+
+        for invalid in [
+            vec![Some(1); 13],
+            {
+                let mut values = vec![Some(1); 14];
+                values[4] = None;
+                values
+            },
+            {
+                let mut values = vec![Some(1); 14];
+                values[9] = Some(-1);
+                values
+            },
+        ] {
+            assert!(matches!(
+                postgresql_metrics_from_values(&invalid),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn postgresql_metric_variant_matches_only_postgresql_samples() {
+        let metrics = PostgreSqlMetrics {
+            numbackends: 1,
+            xact_commit: 2,
+            xact_rollback: 3,
+            blks_read: 4,
+            blks_hit: 5,
+            tup_returned: 6,
+            tup_fetched: 7,
+            tup_inserted: 8,
+            tup_updated: 9,
+            tup_deleted: 10,
+            conflicts: 11,
+            temp_files: 12,
+            temp_bytes: 13,
+            deadlocks: 14,
+        };
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "postgres".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::PostgreSql,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:5432".into(),
+                metrics: WorkloadMetrics::PostgreSql(metrics),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("redis".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    #[test]
     fn workload_connection_accepts_only_safe_endpoint_and_secret_reference_shapes() {
         let valid = WorkloadConnectionConfig {
             endpoint: "tls://redis.example:6380".into(),
             username: Some("monitor".into()),
             secret_ref: Some("env:REDIS_PASSWORD".into()),
+            database: None,
         };
         valid.validate_for(WorkloadAdapter::Redis).unwrap();
         assert!(matches!(
@@ -1258,7 +1609,8 @@ path = "/usr/bin/redis-server"
             assert!(WorkloadConnectionConfig {
                 endpoint: endpoint.into(),
                 username: None,
-                secret_ref: None
+                secret_ref: None,
+                database: None,
             }
             .endpoint()
             .is_err());
@@ -1266,7 +1618,8 @@ path = "/usr/bin/redis-server"
         assert!(WorkloadConnectionConfig {
             endpoint: "tcp://host:6379".into(),
             username: None,
-            secret_ref: Some("plaintext".into())
+            secret_ref: Some("plaintext".into()),
+            database: None,
         }
         .validate_for(WorkloadAdapter::Redis)
         .is_err());
@@ -1275,6 +1628,7 @@ path = "/usr/bin/redis-server"
                 endpoint: "tcp://[::1]:6379".into(),
                 username: None,
                 secret_ref: None,
+                database: None,
             }
             .endpoint()
             .unwrap(),
@@ -1291,6 +1645,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tcp://127.0.0.1:11211".into(),
             username: None,
             secret_ref: Some("env:MEMCACHED_PASSWORD".into()),
+            database: None,
         };
         assert!(config.validate_for(WorkloadAdapter::Memcached).is_err());
     }
@@ -1321,6 +1676,7 @@ path = "/usr/bin/redis-server"
             endpoint: "tcp://redis.internal:6379".into(),
             username: None,
             secret_ref: None,
+            database: None,
         };
         let metrics = monitor_redis_with_connector(&connection, |endpoint| {
             assert_eq!(

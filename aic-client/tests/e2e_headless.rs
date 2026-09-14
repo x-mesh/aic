@@ -162,9 +162,9 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        MemcachedMetrics, WorkloadAdapter, WorkloadDefinition, WorkloadDriverMode, WorkloadMetrics,
-        WorkloadSample, WorkloadSampleOutcome, WorkloadSelector, WorkloadStore,
-        WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        MemcachedMetrics, PostgreSqlMetrics, WorkloadAdapter, WorkloadDefinition,
+        WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
+        WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
     use chrono::{Duration, Utc};
 
@@ -198,10 +198,28 @@ fn workload_status_and_history_read_local_history() {
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: None,
     };
+    let postgresql_definition = WorkloadDefinition {
+        id: "postgresql-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/bin/postgres".into(),
+        },
+        adapter: WorkloadAdapter::PostgreSql,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:5432".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: None,
+            database: Some("postgres".into()),
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
-            workloads: vec![redis_definition, memcached_definition],
+            workloads: vec![
+                redis_definition,
+                memcached_definition,
+                postgresql_definition,
+            ],
         })
         .unwrap(),
     )
@@ -237,12 +255,38 @@ fn workload_status_and_history_read_local_history() {
             "instantaneous_ops_per_sec": 4, "keyspace_hits": 5, "keyspace_misses": 6
         }
     });
+    let postgresql_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "postgresql-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::PostgreSql,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:5432".into(),
+            metrics: WorkloadMetrics::PostgreSql(PostgreSqlMetrics {
+                numbackends: 1,
+                xact_commit: 2,
+                xact_rollback: 3,
+                blks_read: 4,
+                blks_hit: 5,
+                tup_returned: 6,
+                tup_fetched: 7,
+                tup_inserted: 8,
+                tup_updated: 9,
+                tup_deleted: 10,
+                conflicts: 11,
+                temp_files: 12,
+                temp_bytes: 13,
+                deadlocks: 14,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
-            serde_json::to_string(&memcached_sample).unwrap()
+            serde_json::to_string(&memcached_sample).unwrap(),
+            serde_json::to_string(&postgresql_sample).unwrap()
         ),
     )
     .unwrap();
@@ -281,6 +325,16 @@ fn workload_status_and_history_read_local_history() {
         serde_json::from_slice(&memcached_history.stdout).unwrap();
     assert_eq!(memcached_history["samples"][0]["adapter"], "memcached");
 
+    let postgresql_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "postgresql-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(postgresql_history.status.success());
+    let postgresql_history: serde_json::Value =
+        serde_json::from_slice(&postgresql_history.stdout).unwrap();
+    assert_eq!(postgresql_history["samples"][0]["adapter"], "postgre_sql");
+    assert_eq!(postgresql_history["samples"][0]["metrics"]["deadlocks"], 14);
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -309,6 +363,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         .expect("현재 aic 프로세스에서 활성화 가능한 workload 후보가 있어야 함");
     let id = candidate["id"].as_str().unwrap();
     let fingerprint = candidate["fingerprint"].as_str().unwrap();
+    let postgresql = candidate["adapter"] == "postgre_sql";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -317,19 +372,24 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     assert!(!stale.status.success());
     assert!(!tmp.path().join("cfg/aic/workloads.toml").exists());
 
-    let enabled = aic_cmd(tmp.path())
-        .args([
-            "workload",
-            "enable",
-            id,
-            "--fingerprint",
-            fingerprint,
-            "--endpoint",
-            "tcp://127.0.0.1:16379",
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let mut enabled = aic_cmd(tmp.path());
+    enabled.args([
+        "workload",
+        "enable",
+        id,
+        "--fingerprint",
+        fingerprint,
+        "--endpoint",
+        if postgresql {
+            "tcp://127.0.0.1:5432"
+        } else {
+            "tcp://127.0.0.1:16379"
+        },
+    ]);
+    if postgresql {
+        enabled.args(["--username", "aic_monitor", "--database", "postgres"]);
+    }
+    let enabled = enabled.arg("--json").output().unwrap();
     assert!(
         enabled.status.success(),
         "stderr={}",
@@ -337,7 +397,15 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     );
     let saved = std::fs::read_to_string(tmp.path().join("cfg/aic/workloads.toml")).unwrap();
     assert!(saved.contains(id));
-    assert!(saved.contains("endpoint = \"tcp://127.0.0.1:16379\""));
+    assert!(saved.contains(if postgresql {
+        "endpoint = \"tcp://127.0.0.1:5432\""
+    } else {
+        "endpoint = \"tcp://127.0.0.1:16379\""
+    }));
+    if postgresql {
+        assert!(saved.contains("username = \"aic_monitor\""));
+        assert!(saved.contains("database = \"postgres\""));
+    }
 
     let listed = aic_cmd(tmp.path())
         .args(["workload", "list", "--json"])
@@ -369,6 +437,25 @@ fn workload_enable_rejects_conflicting_auth_flags() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used"));
+}
+
+#[test]
+fn workload_enable_requires_endpoint_for_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = aic_cmd(tmp.path())
+        .args([
+            "workload",
+            "enable",
+            "candidate",
+            "--fingerprint",
+            "fingerprint",
+            "--database",
+            "postgres",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--database"));
 }
 
 /// 보안 속성: 비대화(TTY 없음)에서 NeedsConfirm 명령은 자동 실행되지 않는다.

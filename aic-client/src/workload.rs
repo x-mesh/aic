@@ -1,10 +1,11 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_memcached_with_connection, monitor_redis_with_connection,
-    workload_history_path, workloads_file_path, MemcachedMonitorReport, ProposalCost,
-    ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
-    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
+    load_workload_history, monitor_memcached_with_connection, monitor_postgresql_with_connection,
+    monitor_redis_with_connection, workload_history_path, workloads_file_path,
+    MemcachedMonitorReport, PostgreSqlMonitorReport, ProposalCost, ProposalReadiness,
+    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
+    WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -322,6 +323,19 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Memcached, error))?,
         }),
+        WorkloadAdapter::PostgreSql => {
+            let connection = connection.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("PostgreSQL monitor requires an explicit connection")
+            })?;
+            WorkloadMonitorReport::PostgreSql(PostgreSqlMonitorReport {
+                candidate_id: candidate.id.clone(),
+                adapter: WorkloadAdapter::PostgreSql,
+                monitor_ready: true,
+                metrics: monitor_postgresql_with_connection(connection)
+                    .map(|(_, metrics)| metrics)
+                    .map_err(|error| safe_monitor_error(WorkloadAdapter::PostgreSql, error))?,
+            })
+        }
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -331,6 +345,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
     let adapter_name = match adapter {
         WorkloadAdapter::Redis => "Redis",
         WorkloadAdapter::Memcached => "Memcached",
+        WorkloadAdapter::PostgreSql => "PostgreSQL",
         _ => "Workload",
     };
     let detail = match error {
@@ -352,7 +367,7 @@ fn select_monitor_candidate<'a>(
         .ok_or_else(|| anyhow::anyhow!("requested workload candidate was not discovered"))?;
     if !matches!(
         candidate.adapter,
-        WorkloadAdapter::Redis | WorkloadAdapter::Memcached
+        WorkloadAdapter::Redis | WorkloadAdapter::Memcached | WorkloadAdapter::PostgreSql
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -817,7 +832,7 @@ pub fn derive_status(
         .map(|definition| {
             if !matches!(
                 definition.adapter,
-                WorkloadAdapter::Redis | WorkloadAdapter::Memcached
+                WorkloadAdapter::Redis | WorkloadAdapter::Memcached | WorkloadAdapter::PostgreSql
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
@@ -906,9 +921,7 @@ pub fn enable_with_connection(
     if !candidate.ambiguity.is_empty() || candidate.selector.is_none() {
         bail!("ambiguous workload candidates cannot be enabled");
     }
-    if let Some(connection) = &connection {
-        connection.validate_for(candidate.adapter)?;
-    }
+    validate_enable_connection(candidate.adapter, connection.as_ref())?;
     let definition = WorkloadDefinition {
         id: candidate.id,
         selector: candidate.selector.unwrap(),
@@ -918,6 +931,19 @@ pub fn enable_with_connection(
     };
     save_definition(&definition)?;
     Ok(definition)
+}
+
+fn validate_enable_connection(
+    adapter: WorkloadAdapter,
+    connection: Option<&WorkloadConnectionConfig>,
+) -> Result<()> {
+    if adapter == WorkloadAdapter::PostgreSql && connection.is_none() {
+        bail!("PostgreSQL workload monitoring requires an explicit connection");
+    }
+    if let Some(connection) = connection {
+        connection.validate_for(adapter)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1438,6 +1464,12 @@ mod tests {
             error.to_string(),
             "Memcached monitor probe failed: rejected the monitor request"
         );
+    }
+
+    #[test]
+    fn postgresql_enable_requires_an_explicit_connection() {
+        assert!(validate_enable_connection(WorkloadAdapter::PostgreSql, None).is_err());
+        assert!(validate_enable_connection(WorkloadAdapter::Redis, None).is_ok());
     }
 
     fn sample(workload_id: &str, captured_at: DateTime<Utc>) -> WorkloadSample {
