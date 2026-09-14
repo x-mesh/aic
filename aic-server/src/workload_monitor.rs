@@ -57,6 +57,10 @@ pub fn load_postgresql_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::PostgreSql)
 }
 
+pub fn load_mysql_definition(path: &Path) -> DefinitionsState {
+    load_adapter_definition(path, WorkloadAdapter::MySql)
+}
+
 pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> DefinitionsState {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
@@ -73,15 +77,22 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
             )
         }
     };
-    if adapter == WorkloadAdapter::PostgreSql
-        && store
-            .workloads
-            .iter()
-            .any(|definition| definition.adapter == adapter && definition.connection.is_none())
+    if matches!(
+        adapter,
+        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql
+    ) && store
+        .workloads
+        .iter()
+        .any(|definition| definition.adapter == adapter && definition.connection.is_none())
     {
-        return DefinitionsState::Malformed(
-            "PostgreSQL workload definitions require an explicit connection".to_string(),
-        );
+        let name = if adapter == WorkloadAdapter::PostgreSql {
+            "PostgreSQL"
+        } else {
+            "MySQL"
+        };
+        return DefinitionsState::Malformed(format!(
+            "{name} workload definitions require an explicit connection"
+        ));
     }
     if let Some(error) = store.workloads.iter().find_map(|definition| {
         (definition.adapter == adapter)
@@ -156,6 +167,7 @@ fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Redis => "Redis endpoint is unavailable",
         WorkloadAdapter::Memcached => "Memcached endpoint is unavailable",
         WorkloadAdapter::PostgreSql => "PostgreSQL endpoint is unavailable",
+        WorkloadAdapter::MySql => "MySQL endpoint is unavailable",
         _ => "Workload endpoint is unavailable",
     }
 }
@@ -165,6 +177,7 @@ fn rejected_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Redis => "Redis rejected the INFO request",
         WorkloadAdapter::Memcached => "Memcached rejected the stats request",
         WorkloadAdapter::PostgreSql => "PostgreSQL rejected the statistics request",
+        WorkloadAdapter::MySql => "MySQL rejected the statistics request",
         _ => "Workload rejected the monitor request",
     }
 }
@@ -174,6 +187,7 @@ fn malformed_detail(adapter: WorkloadAdapter) -> &'static str {
         WorkloadAdapter::Redis => "Redis returned an invalid INFO response",
         WorkloadAdapter::Memcached => "Memcached returned an invalid stats response",
         WorkloadAdapter::PostgreSql => "PostgreSQL returned an invalid statistics response",
+        WorkloadAdapter::MySql => "MySQL returned an invalid statistics response",
         _ => "Workload returned an invalid monitor response",
     }
 }
@@ -269,6 +283,7 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                     WorkloadAdapter::Redis,
                     WorkloadAdapter::Memcached,
                     WorkloadAdapter::PostgreSql,
+                    WorkloadAdapter::MySql,
                 ] {
                     let state = load_adapter_definition(&cfg.workloads_path, adapter);
                     let tag = state_tag(&state);
@@ -380,6 +395,28 @@ fn start_collection_thread(
                         Utc::now(),
                     ),
                 },
+                WorkloadAdapter::MySql => match definition.connection.as_ref() {
+                    Some(connection) => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            aic_common::workload::monitor_mysql_with_connection(connection).map(
+                                |(endpoint, metrics)| (endpoint, WorkloadMetrics::MySql(metrics)),
+                            )
+                        },
+                        Utc::now(),
+                    ),
+                    None => collect_once(
+                        &cfg,
+                        &definition,
+                        || {
+                            Err(WorkloadProbeError::Malformed(
+                                "MySQL connection is missing".to_string(),
+                            ))
+                        },
+                        Utc::now(),
+                    ),
+                },
                 _ => unreachable!("only supported monitor adapters start collection threads"),
             };
             let _ = sender.send(result);
@@ -407,7 +444,8 @@ async fn wait_for_collection(
 mod tests {
     use super::*;
     use aic_common::workload::{
-        PostgreSqlMetrics, RedisMetrics, WorkloadDriverMode, WorkloadSelector,
+        MySqlMetrics, PostgreSqlMetrics, RedisMetrics, WorkloadConnectionConfig,
+        WorkloadDriverMode, WorkloadSelector,
     };
 
     fn postgresql_metrics() -> PostgreSqlMetrics {
@@ -467,6 +505,36 @@ mod tests {
                 secret_ref: None,
                 database: Some("postgres".into()),
             }),
+        }
+    }
+
+    fn mysql_definition() -> WorkloadDefinition {
+        WorkloadDefinition {
+            id: "mysql".into(),
+            selector: WorkloadSelector::Executable {
+                path: "/usr/bin/mysqld".into(),
+            },
+            adapter: WorkloadAdapter::MySql,
+            driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: Some(WorkloadConnectionConfig {
+                endpoint: "tcp://127.0.0.1:3306".into(),
+                username: Some("aic_monitor".into()),
+                secret_ref: None,
+                database: None,
+            }),
+        }
+    }
+
+    fn mysql_metrics() -> MySqlMetrics {
+        MySqlMetrics {
+            threads_connected: 1,
+            threads_running: 2,
+            connections: 3,
+            aborted_connects: 4,
+            questions: 5,
+            slow_queries: 6,
+            bytes_received: 7,
+            bytes_sent: 8,
         }
     }
 
@@ -544,6 +612,46 @@ mod tests {
             DefinitionsState::Malformed(
                 "PostgreSQL workload definitions require an explicit connection".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn mysql_requires_connection_and_ambiguity_is_adapter_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("workloads.toml");
+        let mut missing = mysql_definition();
+        missing.connection = None;
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![missing, definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_mysql_definition(&path),
+            DefinitionsState::Malformed(
+                "MySQL workload definitions require an explicit connection".to_string()
+            )
+        );
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
+        );
+
+        fs::write(
+            &path,
+            toml::to_string(&WorkloadStore {
+                workloads: vec![mysql_definition(), mysql_definition(), definition()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load_mysql_definition(&path), DefinitionsState::Ambiguous(2));
+        assert_eq!(
+            load_redis_definition(&path),
+            DefinitionsState::One(definition())
         );
     }
 
@@ -813,6 +921,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn mysql_collection_uses_metrics_and_fixed_failure_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        };
+        let collected = collect_once(
+            &cfg,
+            &mysql_definition(),
+            || {
+                Ok((
+                    "tcp://127.0.0.1:3306".into(),
+                    WorkloadMetrics::MySql(mysql_metrics()),
+                ))
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        assert!(matches!(
+            collected,
+            TickOutcome::Appended(WorkloadSample {
+                adapter: WorkloadAdapter::MySql,
+                outcome: WorkloadSampleOutcome::Collected {
+                    metrics: WorkloadMetrics::MySql(_),
+                    ..
+                },
+                ..
+            })
+        ));
+
+        let failed = collect_once(
+            &cfg,
+            &mysql_definition(),
+            || Err(WorkloadProbeError::Rejected("password=secret".into())),
+            Utc::now(),
+        )
+        .unwrap();
+        let TickOutcome::Appended(WorkloadSample {
+            outcome: WorkloadSampleOutcome::Failed { detail, .. },
+            ..
+        }) = failed
+        else {
+            panic!("expected failed MySQL sample");
+        };
+        assert_eq!(detail, "MySQL rejected the statistics request");
+        assert!(!detail.contains("secret"));
     }
 
     #[test]

@@ -162,7 +162,7 @@ fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
 #[test]
 fn workload_status_and_history_read_local_history() {
     use aic_common::workload::{
-        MemcachedMetrics, PostgreSqlMetrics, WorkloadAdapter, WorkloadDefinition,
+        MemcachedMetrics, MySqlMetrics, PostgreSqlMetrics, WorkloadAdapter, WorkloadDefinition,
         WorkloadDriverMode, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
         WorkloadSelector, WorkloadStore, WORKLOAD_SAMPLE_SCHEMA_VERSION,
     };
@@ -212,6 +212,20 @@ fn workload_status_and_history_read_local_history() {
             database: Some("postgres".into()),
         }),
     };
+    let mysql_definition = WorkloadDefinition {
+        id: "mysql-test".into(),
+        selector: WorkloadSelector::Executable {
+            path: "/usr/sbin/mysqld".into(),
+        },
+        adapter: WorkloadAdapter::MySql,
+        driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: Some(aic_common::workload::WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:3306".into(),
+            username: Some("aic_monitor".into()),
+            secret_ref: Some("env:MYSQL_PASSWORD".into()),
+            database: Some("metrics".into()),
+        }),
+    };
     std::fs::write(
         config_dir.join("workloads.toml"),
         toml::to_string_pretty(&WorkloadStore {
@@ -219,6 +233,7 @@ fn workload_status_and_history_read_local_history() {
                 redis_definition,
                 memcached_definition,
                 postgresql_definition,
+                mysql_definition,
             ],
         })
         .unwrap(),
@@ -280,13 +295,33 @@ fn workload_status_and_history_read_local_history() {
             }),
         },
     };
+    let mysql_sample = WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: "mysql-test".into(),
+        captured_at: Utc::now() - Duration::minutes(10),
+        adapter: WorkloadAdapter::MySql,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://127.0.0.1:3306".into(),
+            metrics: WorkloadMetrics::MySql(MySqlMetrics {
+                threads_connected: 1,
+                threads_running: 2,
+                connections: 3,
+                aborted_connects: 4,
+                questions: 5,
+                slow_queries: 6,
+                bytes_received: 7,
+                bytes_sent: 8,
+            }),
+        },
+    };
     std::fs::write(
         state_dir.join("workload-history.jsonl"),
         format!(
-            "{}\n{}\n{}\nnot-json\n",
+            "{}\n{}\n{}\n{}\nnot-json\n",
             legacy_redis_sample,
             serde_json::to_string(&memcached_sample).unwrap(),
-            serde_json::to_string(&postgresql_sample).unwrap()
+            serde_json::to_string(&postgresql_sample).unwrap(),
+            serde_json::to_string(&mysql_sample).unwrap()
         ),
     )
     .unwrap();
@@ -335,6 +370,15 @@ fn workload_status_and_history_read_local_history() {
     assert_eq!(postgresql_history["samples"][0]["adapter"], "postgre_sql");
     assert_eq!(postgresql_history["samples"][0]["metrics"]["deadlocks"], 14);
 
+    let mysql_history = aic_cmd(tmp.path())
+        .args(["workload", "history", "mysql-test", "--json"])
+        .output()
+        .unwrap();
+    assert!(mysql_history.status.success());
+    let mysql_history: serde_json::Value = serde_json::from_slice(&mysql_history.stdout).unwrap();
+    assert_eq!(mysql_history["samples"][0]["adapter"], "my_sql");
+    assert_eq!(mysql_history["samples"][0]["metrics"]["bytes_sent"], 8);
+
     let missing = aic_cmd(tmp.path())
         .args(["workload", "history", "missing", "--json"])
         .output()
@@ -364,6 +408,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let id = candidate["id"].as_str().unwrap();
     let fingerprint = candidate["fingerprint"].as_str().unwrap();
     let postgresql = candidate["adapter"] == "postgre_sql";
+    let mysql = candidate["adapter"] == "my_sql";
 
     let stale = aic_cmd(tmp.path())
         .args(["workload", "enable", id, "--fingerprint", "stale"])
@@ -382,12 +427,16 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
         "--endpoint",
         if postgresql {
             "tcp://127.0.0.1:5432"
+        } else if mysql {
+            "tcp://127.0.0.1:3306"
         } else {
             "tcp://127.0.0.1:16379"
         },
     ]);
     if postgresql {
         enabled.args(["--username", "aic_monitor", "--database", "postgres"]);
+    } else if mysql {
+        enabled.args(["--username", "aic_monitor", "--database", "metrics"]);
     }
     let enabled = enabled.arg("--json").output().unwrap();
     assert!(
@@ -399,12 +448,17 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     assert!(saved.contains(id));
     assert!(saved.contains(if postgresql {
         "endpoint = \"tcp://127.0.0.1:5432\""
+    } else if mysql {
+        "endpoint = \"tcp://127.0.0.1:3306\""
     } else {
         "endpoint = \"tcp://127.0.0.1:16379\""
     }));
     if postgresql {
         assert!(saved.contains("username = \"aic_monitor\""));
         assert!(saved.contains("database = \"postgres\""));
+    } else if mysql {
+        assert!(saved.contains("username = \"aic_monitor\""));
+        assert!(saved.contains("database = \"metrics\""));
     }
 
     let listed = aic_cmd(tmp.path())

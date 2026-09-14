@@ -667,7 +667,7 @@ enum WorkloadOp {
         endpoint: Option<String>,
         #[arg(long)]
         username: Option<String>,
-        /// PostgreSQL database name.
+        /// PostgreSQL or MySQL database name.
         #[arg(long)]
         database: Option<String>,
         #[arg(long, conflicts_with = "auth_keychain")]
@@ -1398,6 +1398,10 @@ fn handle_workload(op: WorkloadOp) {
                             report.candidate_id, report.monitor_ready, report.metrics
                         ),
                         aic_common::workload::WorkloadMonitorReport::PostgreSql(report) => format!(
+                            "candidate={} monitor_ready={} metrics={:?}",
+                            report.candidate_id, report.monitor_ready, report.metrics
+                        ),
+                        aic_common::workload::WorkloadMonitorReport::MySql(report) => format!(
                             "candidate={} monitor_ready={} metrics={:?}",
                             report.candidate_id, report.monitor_ready, report.metrics
                         ),

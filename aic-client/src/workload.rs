@@ -1,11 +1,11 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_memcached_with_connection, monitor_postgresql_with_connection,
-    monitor_redis_with_connection, workload_history_path, workloads_file_path,
-    MemcachedMonitorReport, PostgreSqlMonitorReport, ProposalCost, ProposalReadiness,
-    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
-    WORKLOAD_SAMPLE_INTERVAL,
+    load_workload_history, monitor_memcached_with_connection, monitor_mysql_with_connection,
+    monitor_postgresql_with_connection, monitor_redis_with_connection, workload_history_path,
+    workloads_file_path, MemcachedMonitorReport, MySqlMonitorReport, PostgreSqlMonitorReport,
+    ProposalCost, ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
+    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -336,6 +336,19 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                     .map_err(|error| safe_monitor_error(WorkloadAdapter::PostgreSql, error))?,
             })
         }
+        WorkloadAdapter::MySql => {
+            let connection = connection
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("MySQL monitor requires an explicit connection"))?;
+            WorkloadMonitorReport::MySql(MySqlMonitorReport {
+                candidate_id: candidate.id.clone(),
+                adapter: WorkloadAdapter::MySql,
+                monitor_ready: true,
+                metrics: monitor_mysql_with_connection(connection)
+                    .map(|(_, metrics)| metrics)
+                    .map_err(|error| safe_monitor_error(WorkloadAdapter::MySql, error))?,
+            })
+        }
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -346,6 +359,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::Redis => "Redis",
         WorkloadAdapter::Memcached => "Memcached",
         WorkloadAdapter::PostgreSql => "PostgreSQL",
+        WorkloadAdapter::MySql => "MySQL",
         _ => "Workload",
     };
     let detail = match error {
@@ -367,7 +381,10 @@ fn select_monitor_candidate<'a>(
         .ok_or_else(|| anyhow::anyhow!("requested workload candidate was not discovered"))?;
     if !matches!(
         candidate.adapter,
-        WorkloadAdapter::Redis | WorkloadAdapter::Memcached | WorkloadAdapter::PostgreSql
+        WorkloadAdapter::Redis
+            | WorkloadAdapter::Memcached
+            | WorkloadAdapter::PostgreSql
+            | WorkloadAdapter::MySql
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -832,7 +849,10 @@ pub fn derive_status(
         .map(|definition| {
             if !matches!(
                 definition.adapter,
-                WorkloadAdapter::Redis | WorkloadAdapter::Memcached | WorkloadAdapter::PostgreSql
+                WorkloadAdapter::Redis
+                    | WorkloadAdapter::Memcached
+                    | WorkloadAdapter::PostgreSql
+                    | WorkloadAdapter::MySql
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),
@@ -937,8 +957,12 @@ fn validate_enable_connection(
     adapter: WorkloadAdapter,
     connection: Option<&WorkloadConnectionConfig>,
 ) -> Result<()> {
-    if adapter == WorkloadAdapter::PostgreSql && connection.is_none() {
-        bail!("PostgreSQL workload monitoring requires an explicit connection");
+    if matches!(
+        adapter,
+        WorkloadAdapter::PostgreSql | WorkloadAdapter::MySql
+    ) && connection.is_none()
+    {
+        bail!("database workload monitoring requires an explicit connection");
     }
     if let Some(connection) = connection {
         connection.validate_for(adapter)?;
@@ -1469,6 +1493,7 @@ mod tests {
     #[test]
     fn postgresql_enable_requires_an_explicit_connection() {
         assert!(validate_enable_connection(WorkloadAdapter::PostgreSql, None).is_err());
+        assert!(validate_enable_connection(WorkloadAdapter::MySql, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::Redis, None).is_ok());
     }
 
