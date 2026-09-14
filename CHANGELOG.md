@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 영문과 한글 README의 언어를 분리하고 누락된 운영 기능 설명을 동기화한다.
+- workload 발견, 명시적 활성화, 주기 수집, 상태와 이력 조회 절차를 별도 운영 문서로 정리한다.
+- 현재 구현에 맞게 SRE 범위와 SSH 멀티호스트 RFC 상태를 갱신한다.
+
+## [0.41.3] - 2026-09-14
+
+### Fixed
+
+- Linux와 macOS release target에 vendored OpenSSL을 사용해 MongoDB TLS binary의 cross-linking을 복구한다.
+- MongoDB TLS가 filesystem CA path와 `SSL_CERT_FILE` 또는 `SSL_CERT_DIR`을 사용함을 명시한다.
+
+## [0.41.2] - 2026-09-14
+
+### Fixed
+
+- Linux cross-release build에 target별 vendored OpenSSL을 사용해 MongoDB TLS binary linking을 복구한다.
+
+## [0.41.1] - 2026-09-14
+
+### Fixed
+
+- HAProxy의 atomic close-on-exec success-path test를 해당 socket flag를 지원하는 Unix target에서만 실행한다.
+
 ## [0.41.0] - 2026-09-14
 
 ### Added
