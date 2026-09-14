@@ -149,6 +149,17 @@ fn workload_discovery_and_inspect_do_not_create_configuration() {
 }
 
 #[test]
+fn workload_monitor_is_a_headless_public_command_and_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let monitor = aic_cmd(tmp.path())
+        .args(["workload", "monitor", "missing", "--json"])
+        .output()
+        .unwrap();
+    assert!(!monitor.status.success());
+    assert!(String::from_utf8_lossy(&monitor.stderr).contains("candidate"));
+}
+
+#[test]
 fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
     let discover = aic_cmd(tmp.path())

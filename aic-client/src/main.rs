@@ -633,6 +633,12 @@ enum WorkloadOp {
         #[arg(long)]
         json: bool,
     },
+    /// Run one bounded Redis INFO probe for a candidate.
+    Monitor {
+        candidate_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// 명시적으로 저장된 workload 정의를 표시한다.
     List {
         #[arg(long)]
@@ -1348,6 +1354,18 @@ fn handle_workload(op: WorkloadOp) {
                         driver.pending_checks,
                         candidate.ambiguity,
                         proposals
+                    )
+                }
+            })
+        }
+        WorkloadOp::Monitor { candidate_id, json } => {
+            workload::monitor_redis_candidate(&candidate_id).map(|report| {
+                if json {
+                    serde_json::to_string(&report).expect("Redis monitor report serializes")
+                } else {
+                    format!(
+                        "candidate={} monitor_ready={} metrics={:?}",
+                        report.candidate_id, report.monitor_ready, report.metrics
                     )
                 }
             })

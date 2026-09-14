@@ -159,6 +159,25 @@ pub struct WorkloadProposal {
     pub related_candidate_ids: Vec<String>,
 }
 
+/// Numeric metrics returned by one bounded Redis INFO probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisMetrics {
+    pub connected_clients: u64,
+    pub used_memory: u64,
+    pub total_commands_processed: u64,
+    pub instantaneous_ops_per_sec: u64,
+    pub keyspace_hits: u64,
+    pub keyspace_misses: u64,
+}
+
+/// Result of a one-shot Redis monitor probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisMonitorReport {
+    pub candidate_id: String,
+    pub monitor_ready: bool,
+    pub metrics: RedisMetrics,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +264,25 @@ mod tests {
                 proposal
             );
         }
+    }
+
+    #[test]
+    fn redis_monitor_report_serializes_numeric_metrics() {
+        let report = RedisMonitorReport {
+            candidate_id: "exe:/usr/bin/redis-server".into(),
+            monitor_ready: true,
+            metrics: RedisMetrics {
+                connected_clients: 2,
+                used_memory: 4096,
+                total_commands_processed: 10,
+                instantaneous_ops_per_sec: 3,
+                keyspace_hits: 8,
+                keyspace_misses: 1,
+            },
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["monitor_ready"], true);
+        assert_eq!(json["metrics"]["used_memory"], 4096);
+        assert!(json["metrics"]["used_memory"].is_u64());
     }
 }

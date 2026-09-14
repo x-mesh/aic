@@ -1,7 +1,7 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use crate::config::ConfigManager;
-use aic_common::workload::{ProposalCost, ProposalReadiness};
+use aic_common::workload::{ProposalCost, ProposalReadiness, RedisMetrics, RedisMonitorReport};
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
     WorkloadCandidate, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
@@ -32,6 +32,9 @@ const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const DRIVER_RESPONSE_BYTES: usize = 1024;
+const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
+const REDIS_SERVER_INFO_REQUEST: &[u8] = b"*2\r\n$4\r\nINFO\r\n$6\r\nSERVER\r\n";
+const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
 const REDIS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:6379";
 const POSTGRES_LOOPBACK_ENDPOINT: &str = "127.0.0.1:5432";
 const NGINX_CONFIG_PATHS: &[&str] = &["/etc/nginx/nginx.conf", "/usr/local/etc/nginx/nginx.conf"];
@@ -86,6 +89,14 @@ pub struct DriverInspection {
 }
 
 pub fn discover() -> Result<DiscoveryReport> {
+    discover_with_driver_checks(true)
+}
+
+fn discover_for_monitor() -> Result<DiscoveryReport> {
+    discover_with_driver_checks(false)
+}
+
+fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
     let mut system = System::new();
     let refresh = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::OnlyIfNotSet)
@@ -134,9 +145,11 @@ pub fn discover() -> Result<DiscoveryReport> {
     });
     rows.truncate(MAX_PROCESSES);
     let mut report = discover_rows(rows);
-    for candidate in &mut report.candidates {
-        if candidate.driver_mode.is_some() {
-            candidate.driver_mode = Some(inspect_driver(candidate).mode);
+    if check_drivers {
+        for candidate in &mut report.candidates {
+            if candidate.driver_mode.is_some() {
+                candidate.driver_mode = Some(inspect_driver(candidate).mode);
+            }
         }
     }
     Ok(report)
@@ -322,19 +335,188 @@ fn probe_redis_unix_socket(path: &Path) -> Result<(), String> {
 
 fn probe_redis_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
     stream
-        .write_all(b"INFO SERVER\r\n")
+        .write_all(REDIS_SERVER_INFO_REQUEST)
         .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())?;
-    let mut response = [0_u8; DRIVER_RESPONSE_BYTES];
-    let read = stream
-        .read(&mut response)
-        .map_err(|error| error.to_string())?;
-    let response = std::str::from_utf8(&response[..read]).map_err(|error| error.to_string())?;
+    let response = read_redis_info_response(stream, DRIVER_RESPONSE_BYTES)?;
     if response.contains("# Server") {
         Ok(())
     } else {
         Err("Redis INFO SERVER was not accepted".to_string())
     }
+}
+
+fn monitor_redis_stream(stream: &mut (impl Read + Write)) -> Result<RedisMetrics, String> {
+    stream
+        .write_all(REDIS_INFO_REQUEST)
+        .map_err(|error| error.to_string())?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let response = read_redis_info_response(stream, REDIS_RESPONSE_BYTES)?;
+    parse_redis_info(&response)
+}
+
+fn read_redis_info_response(stream: &mut impl Read, response_cap: usize) -> Result<String, String> {
+    let mut consumed = 0;
+    let mut prefix = [0_u8; 1];
+    stream
+        .read_exact(&mut prefix)
+        .map_err(|error| error.to_string())?;
+    consumed += prefix.len();
+    if prefix[0] == b'-' {
+        let error = read_resp_line(stream, response_cap, &mut consumed)?;
+        return Err(format!("Redis INFO returned an error: {error}"));
+    }
+    if prefix[0] != b'$' {
+        return Err("Redis INFO returned malformed RESP".to_string());
+    }
+
+    let length = read_resp_line(stream, response_cap, &mut consumed)?
+        .parse::<usize>()
+        .map_err(|_| "Redis INFO returned an invalid bulk length".to_string())?;
+    if length > response_cap.saturating_sub(consumed).saturating_sub(2) {
+        return Err("Redis INFO response exceeded the byte cap".to_string());
+    }
+    let mut body = vec![0_u8; length];
+    stream
+        .read_exact(&mut body)
+        .map_err(|error| error.to_string())?;
+    let mut terminator = [0_u8; 2];
+    stream
+        .read_exact(&mut terminator)
+        .map_err(|error| error.to_string())?;
+    if terminator != *b"\r\n" {
+        return Err("Redis INFO returned a malformed bulk terminator".to_string());
+    }
+    String::from_utf8(body).map_err(|error| error.to_string())
+}
+
+fn read_resp_line(
+    stream: &mut impl Read,
+    response_cap: usize,
+    consumed: &mut usize,
+) -> Result<String, String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    while *consumed < response_cap {
+        stream
+            .read_exact(&mut byte)
+            .map_err(|error| error.to_string())?;
+        *consumed += byte.len();
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return String::from_utf8(line).map_err(|error| error.to_string());
+        }
+    }
+    Err("Redis INFO response exceeded the byte cap".to_string())
+}
+
+fn parse_redis_info(info: &str) -> Result<RedisMetrics, String> {
+    let mut connected_clients = None;
+    let mut used_memory = None;
+    let mut total_commands_processed = None;
+    let mut instantaneous_ops_per_sec = None;
+    let mut keyspace_hits = None;
+    let mut keyspace_misses = None;
+
+    for line in info.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| "Redis INFO contains a malformed line".to_string())?;
+        if key.is_empty() || value.is_empty() {
+            return Err("Redis INFO contains a malformed metric".to_string());
+        }
+        let metric = match key {
+            "connected_clients" => &mut connected_clients,
+            "used_memory" => &mut used_memory,
+            "total_commands_processed" => &mut total_commands_processed,
+            "instantaneous_ops_per_sec" => &mut instantaneous_ops_per_sec,
+            "keyspace_hits" => &mut keyspace_hits,
+            "keyspace_misses" => &mut keyspace_misses,
+            _ => continue,
+        };
+        if metric.is_some() {
+            return Err(format!("Redis INFO contains a duplicate metric: {key}"));
+        }
+        *metric = Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("Redis INFO metric is not numeric: {key}"))?,
+        );
+    }
+
+    Ok(RedisMetrics {
+        connected_clients: connected_clients
+            .ok_or_else(|| "Redis INFO is missing connected_clients".to_string())?,
+        used_memory: used_memory.ok_or_else(|| "Redis INFO is missing used_memory".to_string())?,
+        total_commands_processed: total_commands_processed
+            .ok_or_else(|| "Redis INFO is missing total_commands_processed".to_string())?,
+        instantaneous_ops_per_sec: instantaneous_ops_per_sec
+            .ok_or_else(|| "Redis INFO is missing instantaneous_ops_per_sec".to_string())?,
+        keyspace_hits: keyspace_hits
+            .ok_or_else(|| "Redis INFO is missing keyspace_hits".to_string())?,
+        keyspace_misses: keyspace_misses
+            .ok_or_else(|| "Redis INFO is missing keyspace_misses".to_string())?,
+    })
+}
+
+fn monitor_redis() -> Result<RedisMetrics> {
+    #[cfg(unix)]
+    for path in REDIS_SOCKET_PATHS {
+        if let Ok(metrics) = monitor_redis_unix_socket(Path::new(path)) {
+            return Ok(metrics);
+        }
+    }
+
+    let endpoint = REDIS_LOOPBACK_ENDPOINT
+        .parse()
+        .expect("valid Redis endpoint");
+    monitor_redis_tcp(endpoint).map_err(|error| anyhow::anyhow!(error))
+}
+
+fn monitor_redis_tcp(endpoint: SocketAddr) -> Result<RedisMetrics, String> {
+    let mut stream = TcpStream::connect_timeout(&endpoint, DRIVER_CONNECT_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    monitor_redis_stream(&mut stream)
+}
+
+#[cfg(unix)]
+fn monitor_redis_unix_socket(path: &Path) -> Result<RedisMetrics, String> {
+    let mut stream = UnixStream::connect(path).map_err(|error| error.to_string())?;
+    stream
+        .set_read_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(DRIVER_CONNECT_TIMEOUT))
+        .map_err(|error| error.to_string())?;
+    monitor_redis_stream(&mut stream)
+}
+
+pub fn monitor_redis_candidate(candidate_id: &str) -> Result<RedisMonitorReport> {
+    let report = discover_for_monitor()?;
+    let candidate = report
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.id == candidate_id)
+        .context("workload candidate was not found")?;
+    if candidate.adapter != WorkloadAdapter::Redis {
+        bail!("workload candidate is not Redis");
+    }
+    let metrics = monitor_redis().context("Redis monitor probe failed")?;
+    Ok(RedisMonitorReport {
+        candidate_id: candidate.id,
+        monitor_ready: true,
+        metrics,
+    })
 }
 
 fn probe_postgres_stream(stream: &mut (impl Read + Write)) -> Result<(), String> {
@@ -1217,13 +1399,87 @@ mod tests {
 
         let (mut peer, mut client) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
-            let mut request = [0_u8; 13];
+            let mut request = [0_u8; 26];
             peer.read_exact(&mut request).unwrap();
-            assert_eq!(&request, b"INFO SERVER\r\n");
-            peer.write_all(b"$10\r\n# Server\r\n").unwrap();
+            assert_eq!(&request, REDIS_SERVER_INFO_REQUEST);
+            peer.write_all(b"$8\r\n# Server\r\n").unwrap();
         });
         assert!(probe_redis_stream(&mut client).is_ok());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn redis_info_parser_returns_typed_numeric_metrics() {
+        let metrics = parse_redis_info(
+            "# Server\nconnected_clients:3\nused_memory:4096\ntotal_commands_processed:17\ninstantaneous_ops_per_sec:2\nkeyspace_hits:11\nkeyspace_misses:4\n",
+        )
+        .unwrap();
+        assert_eq!(metrics.connected_clients, 3);
+        assert_eq!(metrics.used_memory, 4096);
+        assert_eq!(metrics.keyspace_misses, 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redis_monitor_stream_collects_one_full_info_response() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let (mut peer, mut client) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut request = [0_u8; 14];
+            peer.read_exact(&mut request).unwrap();
+            assert_eq!(&request, REDIS_INFO_REQUEST);
+            peer.write_all(
+                b"$137\r\n# Server\nconnected_clients:3\nused_memory:4096\ntotal_commands_processed:17\ninstantaneous_ops_per_sec:2\nkeyspace_hits:11\nkeyspace_misses:4\n\r\n",
+            )
+            .unwrap();
+        });
+        let metrics = monitor_redis_stream(&mut client).unwrap();
+        assert_eq!(metrics.total_commands_processed, 17);
+        assert_eq!(metrics.instantaneous_ops_per_sec, 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redis_info_parser_rejects_malformed_and_missing_metrics() {
+        let malformed = parse_redis_info("connected_clients:1\nbroken\n").unwrap_err();
+        assert!(malformed.contains("malformed line"));
+        let missing = parse_redis_info("connected_clients:1\n").unwrap_err();
+        assert!(missing.contains("missing used_memory"));
+        let non_numeric = parse_redis_info("connected_clients:nope\n").unwrap_err();
+        assert!(non_numeric.contains("not numeric"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redis_info_response_rejects_malformed_resp_and_byte_cap() {
+        use std::io::Cursor;
+
+        let malformed = read_redis_info_response(&mut Cursor::new(b"+OK\r\n"), 32).unwrap_err();
+        assert!(malformed.contains("malformed RESP"));
+        let oversized =
+            read_redis_info_response(&mut Cursor::new(b"$5\r\nhello\r\n"), 4).unwrap_err();
+        assert!(oversized.contains("byte cap"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redis_info_response_times_out_without_a_reply() {
+        use std::os::unix::net::UnixStream;
+
+        let (_peer, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let error = monitor_redis_stream(&mut client).unwrap_err();
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn redis_monitor_endpoint_reports_unavailable_redis() {
+        let error = monitor_redis_tcp("127.0.0.1:0".parse().unwrap()).unwrap_err();
+        assert!(!error.is_empty());
     }
 
     #[cfg(unix)]
