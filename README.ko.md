@@ -375,16 +375,22 @@ bounded `stats` 요청을, PostgreSQL은 로컬 socket 또는
 `inspect_ready`는 read-only 접근 조건만 확인하며, 서비스 지표는 수집하지 않습니다.
 
 `aic workload monitor <id> --json`은 셸에서 실행하는 단발 monitor probe이며, `aic chat` slash 명령
-형태는 없습니다. Redis는 고정된 로컬 socket 또는 `127.0.0.1:6379`에 연결해 read-only `INFO` 요청을
-한 번 보냅니다. Memcached는 `127.0.0.1:11211`에 연결해 `stats` 요청을 한 번 보냅니다. Redis는
+형태는 없습니다. connection이 없는 정의는 기존 고정 로컬 endpoint를 사용합니다. `aic workload enable <id>
+--fingerprint <value> --endpoint <scheme://target>`으로 명시적 endpoint를 저장할 수 있습니다. 허용하는
+형식은 `unix:///absolute/path`, `tcp://host:port`, `tls://host:port`뿐입니다.
+IPv6는 `tcp://[::1]:6379`처럼 대괄호를 사용합니다. 명시적 endpoint는 해당 host와 port로 나가는 연결을
+허용합니다. Redis는 `--auth-env NAME` 또는
+`--auth-keychain ACCOUNT`와 선택 사항인 `--username`을 지원합니다. Memcached는 인증 옵션을 거부합니다.
+TLS는 OS의 native root를 사용하고 endpoint host를 검증합니다. Redis는
 `connected_clients`, `used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`,
 `keyspace_hits`, `keyspace_misses`를 반환합니다. Memcached는 `curr_connections`, `bytes`, `cmd_get`,
 `cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. 연결, 읽기, 쓰기 제한은 각각 200ms이고
 응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
 `monitor_ready: true`를 반환합니다.
 
-`aicd`는 Redis 정의와 Memcached 정의가 각각 하나일 때 60초마다 probe합니다. Redis는 고정 로컬 socket
-경로 또는 `127.0.0.1:6379`를 사용하고 Memcached는 `127.0.0.1:11211`을 사용합니다.
+`aicd`는 Redis 정의와 Memcached 정의가 각각 하나일 때 60초마다 probe합니다. 저장된 connection이 있으면
+그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
+`127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
 
 sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
 

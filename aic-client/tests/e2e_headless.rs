@@ -187,6 +187,7 @@ fn workload_status_and_history_read_local_history() {
         },
         adapter: WorkloadAdapter::Redis,
         driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: None,
     };
     let memcached_definition = WorkloadDefinition {
         id: "memcached-test".into(),
@@ -195,6 +196,7 @@ fn workload_status_and_history_read_local_history() {
         },
         adapter: WorkloadAdapter::Memcached,
         driver_mode: WorkloadDriverMode::MonitorReady,
+        connection: None,
     };
     std::fs::write(
         config_dir.join("workloads.toml"),
@@ -322,6 +324,8 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
             id,
             "--fingerprint",
             fingerprint,
+            "--endpoint",
+            "tcp://127.0.0.1:16379",
             "--json",
         ])
         .output()
@@ -333,6 +337,7 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     );
     let saved = std::fs::read_to_string(tmp.path().join("cfg/aic/workloads.toml")).unwrap();
     assert!(saved.contains(id));
+    assert!(saved.contains("endpoint = \"tcp://127.0.0.1:16379\""));
 
     let listed = aic_cmd(tmp.path())
         .args(["workload", "list", "--json"])
@@ -341,6 +346,29 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     assert!(listed.status.success());
     let configured: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(configured["configured"][0]["id"], id);
+}
+
+#[test]
+fn workload_enable_rejects_conflicting_auth_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = aic_cmd(tmp.path())
+        .args([
+            "workload",
+            "enable",
+            "candidate",
+            "--fingerprint",
+            "fingerprint",
+            "--endpoint",
+            "tcp://127.0.0.1:6379",
+            "--auth-env",
+            "REDIS_PASSWORD",
+            "--auth-keychain",
+            "redis-monitor",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used"));
 }
 
 /// 보안 속성: 비대화(TTY 없음)에서 NeedsConfirm 명령은 자동 실행되지 않는다.

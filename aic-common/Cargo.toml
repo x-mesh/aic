@@ -38,6 +38,9 @@ bytes = "1"
 # aic-common 은 lean 하게 유지한다.
 # `sync` 는 BoundedByteChannel 이 사용하는 `tokio::sync::mpsc::unbounded_channel` 때문에 필요하다.
 tokio = { version = "1", features = ["io-util", "sync"] }
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native", "linux-native", "windows-native"] }
+rustls = { version = "=0.23.39", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.4"
 
 [dev-dependencies]
 proptest = "1"

@@ -1,15 +1,15 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_memcached, monitor_redis, workload_history_path,
-    workloads_file_path, MemcachedMonitorReport, ProposalCost, ProposalReadiness,
-    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
-    WORKLOAD_SAMPLE_INTERVAL,
+    load_workload_history, monitor_memcached_with_connection, monitor_redis_with_connection,
+    workload_history_path, workloads_file_path, MemcachedMonitorReport, ProposalCost,
+    ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
+    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
-    WorkloadCandidate, WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
-    WORKLOAD_SCHEMA_VERSION,
+    WorkloadCandidate, WorkloadConnectionConfig, WorkloadDefinition, WorkloadDriverMode,
+    WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -302,11 +302,15 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
 pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
     let report = discover_for_monitor()?;
     let candidate = select_monitor_candidate(&report, candidate_id)?;
+    let connection = list_configured()?
+        .into_iter()
+        .find(|definition| definition.id == candidate.id)
+        .and_then(|definition| definition.connection);
     let report = match candidate.adapter {
         WorkloadAdapter::Redis => WorkloadMonitorReport::Redis(RedisMonitorReport {
             candidate_id: candidate.id.clone(),
             monitor_ready: true,
-            metrics: monitor_redis()
+            metrics: monitor_redis_with_connection(connection.as_ref())
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Redis, error))?,
         }),
@@ -314,7 +318,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::Memcached,
             monitor_ready: true,
-            metrics: monitor_memcached()
+            metrics: monitor_memcached_with_connection(connection.as_ref())
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Memcached, error))?,
         }),
@@ -760,6 +764,11 @@ pub fn list_configured() -> Result<Vec<WorkloadDefinition>> {
     }
     let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let store: WorkloadStore = toml::from_str(&content).context("parse workloads.toml")?;
+    for definition in &store.workloads {
+        if let Some(connection) = &definition.connection {
+            connection.validate_for(definition.adapter)?;
+        }
+    }
     Ok(store.workloads)
 }
 
@@ -882,6 +891,14 @@ pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
 }
 
 pub fn enable(candidate_id: &str, expected_fingerprint: &str) -> Result<WorkloadDefinition> {
+    enable_with_connection(candidate_id, expected_fingerprint, None)
+}
+
+pub fn enable_with_connection(
+    candidate_id: &str,
+    expected_fingerprint: &str,
+    connection: Option<WorkloadConnectionConfig>,
+) -> Result<WorkloadDefinition> {
     let (_, candidate) = inspect(candidate_id)?;
     if candidate.fingerprint != expected_fingerprint {
         bail!("workload candidate changed; discover again before enabling");
@@ -889,11 +906,15 @@ pub fn enable(candidate_id: &str, expected_fingerprint: &str) -> Result<Workload
     if !candidate.ambiguity.is_empty() || candidate.selector.is_none() {
         bail!("ambiguous workload candidates cannot be enabled");
     }
+    if let Some(connection) = &connection {
+        connection.validate_for(candidate.adapter)?;
+    }
     let definition = WorkloadDefinition {
         id: candidate.id,
         selector: candidate.selector.unwrap(),
         adapter: candidate.adapter,
         driver_mode: candidate.driver_mode.unwrap_or_default(),
+        connection,
     };
     save_definition(&definition)?;
     Ok(definition)
@@ -1448,6 +1469,7 @@ mod tests {
             },
             adapter: WorkloadAdapter::Redis,
             driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
         }
     }
 
@@ -1459,6 +1481,7 @@ mod tests {
             },
             adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
+            connection: None,
         }
     }
 
