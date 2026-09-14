@@ -1103,6 +1103,9 @@ mod tests {
     fn trusted_candidates_drops_hijacked_dirs() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = unique_temp_dir("trusted-filter");
+        // Model an open parent such as /tmp. A closed 0700 parent intentionally makes
+        // group-writable children unreachable to other users and therefore trusted.
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
         let good = tmp.join("good");
         let hijacked = tmp.join("hijacked");
         fs::create_dir(&good).unwrap();

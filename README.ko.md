@@ -431,7 +431,7 @@ gRPC status, 인증, private CA, mTLS, custom path, query, Unix endpoint는 지�
 Elasticsearch와 OpenSearch adapter는 기본적으로 `127.0.0.1:9200`을 사용합니다. 고정 cluster stats 요청으로
 `nodes_total`, `indices_count`, `shards_total`, `shards_primaries`, `docs_count`, `docs_deleted`,
 `store_size_bytes`, `fs_total_bytes`, `fs_available_bytes`를 반환합니다. 두 adapter는 candidate와 ambiguity를
-서로 독립적으로 처리합니다. Basic 인증에는 `--username`과 secret option 하나가 모두 필요합니다. 최소 권한을
+서로 독립적으로 처리합니다. Basic 인증에는 TLS, `--username`, secret option 하나가 모두 필요합니다. 최소 권한을
 가진 monitoring 사용자를 사용하십시오. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe
 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. API key, SigV4, private CA, mTLS, custom
 path, query, 검색, node stats는 지원하지 않습니다.
