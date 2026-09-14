@@ -267,7 +267,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::Nginx => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("Nginx workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -275,6 +276,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("Nginx workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("Nginx authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
@@ -2516,6 +2520,7 @@ async fn monitor_nginx_async(
     password: Option<&str>,
 ) -> std::result::Result<NginxMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(NGINX_PROBE_TIMEOUT)
@@ -4324,6 +4329,12 @@ path = "/usr/bin/redis-server"
             nginx_stub_status_url(&authenticated).unwrap(),
             "https://[::1]:8443/stub_status"
         );
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://nginx.example:8080".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::Nginx)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
