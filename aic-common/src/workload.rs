@@ -252,7 +252,8 @@ impl WorkloadConnectionConfig {
                 }
             }
             WorkloadAdapter::RabbitMq => {
-                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                let endpoint = self.endpoint()?;
+                if matches!(endpoint, WorkloadEndpoint::Unix(_)) {
                     anyhow::bail!("RabbitMQ workload connections require a TCP or TLS endpoint");
                 }
                 if self.username.is_some() != self.secret_ref.is_some() {
@@ -260,6 +261,9 @@ impl WorkloadConnectionConfig {
                 }
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("RabbitMQ workload connections do not support database fields");
+                }
+                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
+                    anyhow::bail!("RabbitMQ authentication requires a TLS endpoint");
                 }
             }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
@@ -2328,6 +2332,7 @@ async fn monitor_rabbitmq_async(
     password: Option<&str>,
 ) -> std::result::Result<RabbitMqMetrics, WorkloadProbeError> {
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(DRIVER_CONNECT_TIMEOUT)
         .timeout(RABBITMQ_PROBE_TIMEOUT)
@@ -4003,6 +4008,12 @@ path = "/usr/bin/redis-server"
             rabbitmq_overview_url(&authenticated).unwrap(),
             "https://[::1]:15672/api/overview"
         );
+        assert!(WorkloadConnectionConfig {
+            endpoint: "tcp://rabbitmq.example:15672".into(),
+            ..authenticated.clone()
+        }
+        .validate_for(WorkloadAdapter::RabbitMq)
+        .is_err());
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
