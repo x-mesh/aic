@@ -1545,6 +1545,9 @@ fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
     if digits.is_empty() {
         return Err(());
     }
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Ok(0);
+    }
     let scale = exponent.checked_sub(fractional_digits).ok_or(())?;
     if scale < 0 {
         let remove = usize::try_from(scale.checked_neg().ok_or(())?).map_err(|_| ())?;
@@ -1563,9 +1566,13 @@ fn parse_exposition_u64(value: &str) -> std::result::Result<u64, ()> {
         digits.parse::<u64>().map_err(|_| ())?
     };
     if scale > 0 {
-        for _ in 0..scale {
-            result = result.checked_mul(10).ok_or(())?;
+        let scale = u32::try_from(scale).map_err(|_| ())?;
+        if scale > 19 || digits.trim_start_matches('0').len() + scale as usize > 20 {
+            return Err(());
         }
+        result = result
+            .checked_mul(10_u64.checked_pow(scale).ok_or(())?)
+            .ok_or(())?;
     }
     Ok(result)
 }
@@ -2603,6 +2610,8 @@ path = "/usr/bin/redis-server"
             "prometheus_engine_queries 1.5",
             "prometheus_engine_queries 18446744073709551616",
             "prometheus_engine_queries 1.5e0",
+            "prometheus_engine_queries 1e2147483647",
+            "prometheus_engine_queries 1e-2147483648",
         ] {
             let response =
                 prometheus_response().replace("prometheus_engine_queries 5", replacement);
