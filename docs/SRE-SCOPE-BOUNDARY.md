@@ -1,62 +1,71 @@
-# aic SRE 범위 경계 & 후속 로드맵 (R7)
+# AIC의 SRE 범위와 후속 로드맵
 
-> aic를 SRE 도구로 확장하면서 **무엇을 aic가 하고, 무엇을 하지 않는지**를 명확히 한다.
-> 특히 별도 `sre-agent`(상시 감시·기억) 프로젝트와 기능이 겹치지 않게 경계를 고정한다.
+> AIC의 대화형 진단, 제한된 주기 수집, 별도 상시 감시 시스템의 경계를 정의한다.
 
-## 핵심 경계: aic(pull) vs sre-agent(push)
+## 핵심 경계
 
-| 축 | **aic** | **sre-agent** (별도 프로젝트) |
-|----|---------|------------------------------|
-| 트리거 | **pull** — 사람이 호출(`aic chat`/`diagnose`) 또는 alert webhook 1회성 | **push** — 상시 백그라운드 감시 루프 |
-| 상태 | 대체로 stateless(세션·번들·audit 로그) | stateful — 시계열 anomaly score, fingerprint DB, incident 기억 |
-| 역할 | **대화형 진단** — 증상→Safe probe→가설/증거/다음확인 | **상시 감시·기억** — drift/anomaly 탐지, 유사 incident 매칭, runbook 추천 |
-| LLM | 진단/분석 시 호출 | 탐지는 비-LLM(통계), 요약·매칭에만 LLM |
-| 데이터 | 로컬 호스트 + 등록 관측 백엔드 read | 지속 수집된 메트릭/이벤트/config 스냅샷 |
+| 구분 | AIC | 별도 상시 감시 시스템 |
+|------|-----|----------------------|
+| 시작 조건 | 운영자 명령, webhook, 저장한 workload 정의 | 계속 실행되는 감시 정책 |
+| 수집 | `aicd`가 저장한 workload를 60초마다 제한된 읽기 전용 probe로 수집 | 여러 신호를 장기간 연속 수집 |
+| 상태 | 로컬 세션, bundle, audit, 제한된 workload 이력 | 장기 시계열, 이상 점수, fingerprint와 incident 기억 |
+| 역할 | 현재 증상 진단, 안전한 증거 수집, workload 상태와 최근 이력 조회 | drift와 이상 탐지, incident 연관 분석과 선제 alert |
+| LLM | 진단과 분석을 요청할 때 호출 | 탐지는 비-LLM 방식으로 수행하고 필요한 요약에만 호출 |
+| 데이터 범위 | 로컬 호스트, SSH 대상, 등록한 관측 백엔드, 명시적으로 활성화한 workload | 지속 수집한 지표, event와 configuration snapshot |
 
-원칙: **aic는 "지금 이 증상을 진단"하고, sre-agent는 "계속 지켜보고 기억"한다.** 같은 기능을
-두 곳에 만들지 않는다.
+AIC는 더 이상 요청에 따른 단발 진단만 제공하지 않는다. `aicd`는 활성화한 service workload에
+60초마다 제한된 probe를 실행하고, 결과를 로컬 JSONL 이력에 저장한다. 이 기능은 연결 상태와
+서비스 지표의 최근 변화를 확인하기 위한 제한된 수집 기능이다.
 
-## 이번에 구현한 것 (R1~R6)
+다만 AIC는 프로세스를 계속 재발견하지 않는다. `discover` 결과도 자동으로 활성화하지 않는다.
+운영자가 workload 정의를 저장해야 수집을 시작한다. 이력은 모든 어댑터를 합쳐 1,440개 표본만
+보존하며, 원격 이력 전송도 지원하지 않는다.
 
-- R1 관측 백엔드 read 통합(Prometheus/Loki/Elasticsearch) — `obs_tools.rs`
-- R2 webhook alert ingestion → 자동 초동 진단(`aic diagnose` spawn) — `webhook_server.rs`
-- R3 k8s 네이티브 probe(`/triage k8s`, `/diagnose` k8s 카테고리)
-- R4 Anthropic 네이티브 tool-calling
-- R5 audit tail/search 조회
-- R6 headless/air-gapped 검증(CI headless job)
+따라서 다음 기능은 별도 상시 감시 시스템의 영역이다.
 
-이 전부는 **pull/1회성** 성격이라 sre-agent와 겹치지 않는다.
+- 여러 신호를 결합한 연속 이상 탐지와 drift 탐지
+- 장기 baseline과 이상 점수 관리
+- 여러 호스트와 service를 연결한 incident 연관 분석
+- 과거 incident fingerprint 검색과 자동 유사 장애 매칭
+- 정책 기반 선제 alert와 자동 복구
 
-## 후속 로드맵 (이번 범위 밖)
+## 현재 구현 범위
 
-차별화 기능. 일부는 **sre-agent 영역**이므로 거기로 보내거나, aic에 넣더라도 경계를 지킨다.
+- Prometheus, Loki와 Elasticsearch의 관측 데이터 조회
+- webhook alert를 받아 실행하는 일회성 초동 진단
+- Kubernetes read-only probe
+- audit tail과 검색
+- headless와 air-gapped 검증
+- SSH 인벤토리를 사용한 제한된 다중 호스트 diagnose와 batch audit
+- `aicd`의 60초 workload probe와 제한된 로컬 이력
+- workload의 최신 상태와 최근 지표 이력 조회
 
-1. **incident memory / 유사 장애 검색** → **sre-agent 영역**.
-   - aic의 `/bundle`은 증거 저장까지만. fingerprint 기반 "지난번 비슷한 장애" 매칭은
-     상시 기억이 필요하므로 sre-agent(`match_incidents`/`fingerprint_anomaly`)가 담당.
-   - aic는 필요 시 sre-agent를 **조회**(MCP/CLI)만 하고 자체 incident DB는 두지 않는다.
+Workload monitor 어댑터는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus,
+ClickHouse, etcd, Elasticsearch, OpenSearch, RabbitMQ, Nginx와 HAProxy를 지원한다. JVM, Kafka와
+Consul은 discovery-only 상태이며 서비스 지표 이력을 만들지 않는다.
+구체적인 활성화 절차와 수집 계약은 [워크로드 모니터링](./WORKLOAD-MONITORING.md)을 따른다.
 
-2. **상시 감시 / drift·anomaly 탐지** → **sre-agent 영역**. aic는 webhook으로 "알림을 받는"
-   쪽이지 "감시하는" 쪽이 아니다.
+## 후속 로드맵
 
-3. **`/runbook` 실행** → **aic 영역(후속)**. YAML runbook을 단계별 confirm gate +
-   기존 risk_guard/HMAC audit로 실행. `/triage`가 체크리스트까지 하므로 자연 확장.
-
-4. **팀 공유** → **aic 영역(후속)**. `/bundle` 결과를 Slack/webhook으로 전송(외부 전송이라
-   confirm gate 필수). org-level config 배포 + read-only 강제 lockdown.
-
-5. **write/mutation 도구** → 신중히. 현재 read-only 원칙. runbook 실행과 함께 설계.
+1. Incident memory와 유사 장애 검색은 별도 상시 감시 시스템이 담당한다. AIC는 필요할 때 그
+   시스템을 조회할 수 있지만 자체 장기 incident database는 두지 않는다.
+2. 연속 이상 탐지와 drift 탐지는 별도 상시 감시 시스템이 담당한다. AIC는 webhook으로 alert를
+   받거나 최근 workload 이력을 진단 증거로 사용할 수 있다.
+3. `/runbook` 실행은 AIC의 후속 범위다. 각 단계를 확인하고 기존 risk guard와 HMAC audit를
+   적용해야 한다.
+4. 팀 공유는 AIC의 후속 범위다. 외부 전송에는 명시적 확인과 redaction을 적용해야 한다.
+5. Mutation 도구는 read-only 원칙과 분리해 설계해야 한다. Runbook 실행 계약과 함께 검토한다.
 
 ## 결정 근거
 
-- 중복 구현은 유지보수 비용 2배 + 동작 불일치 위험. 경계를 코드/문서로 고정.
-- aic의 강점(대화형 진단 + bounded Safe probe + audit)과 sre-agent의 강점(상시 통계 감시 +
-  기억)은 **상보적**이다. 연동(aic가 sre-agent를 조회)이 통합보다 낫다.
+AIC의 강점은 대화형 진단, 제한된 probe와 audit이다. 60초 workload 수집은 진단에 필요한 최근
+서비스 상태를 제공하지만, 장기 관측 시스템을 대체하지 않는다. 별도 시스템은 상시 통계 감시와
+incident 기억을 담당한다. 두 시스템을 이 경계에서 연동하면 중복 수집과 서로 다른 판정을 줄일 수 있다.
 
-## 다중 클라이언트 점검 후속 계약
+## 다중 호스트 점검 계약
 
-원격 점검은 기존 SSH 인벤토리와 fan-out 실행기를 재사용하되, 로컬 doctor/diagnose와 다른
-임시 출력 형식을 추가하지 않는다. 후속 구현은 각 호스트가 동일한 버전드 결과 계약을 반환하고,
-집계 계층은 healthy를 추정하지 않은 채 호스트별 pass/warn/fail/unknown과 미완료 대상을
-그대로 보존해야 한다. 원격 명령은 bounded read-only probe만 허용하며, 인증 실패, timeout,
-host key 불일치는 진단 결과와 구분되는 연결 상태로 보고한다.
+원격 점검은 SSH 인벤토리와 fan-out 실행기를 사용한다. 각 호스트는 버전이 명시된 같은 결과 계약을
+반환한다. 집계 계층은 성공을 추정하지 않고 호스트별 상태와 미완료 대상을 보존한다.
+
+원격 명령은 제한된 읽기 전용 probe만 허용한다. 인증 실패, timeout과 host key 불일치는 진단
+결과가 아닌 연결 상태로 보고한다. Batch 결과는 audit chain에 기록한다.

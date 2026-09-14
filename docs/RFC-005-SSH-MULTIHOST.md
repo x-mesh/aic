@@ -1,13 +1,13 @@
-# RFC-005: `aic chat` — SSH 멀티호스트 진단
+# RFC-005: SSH 다중 호스트 진단
 
-> `aic chat`의 단일 호스트 진단을 N개 원격 호스트로 확장한다. `~/.aic/hosts.toml`
+> 역사적 제안 요약: `aic chat`의 단일 호스트 진단을 N개 원격 호스트로 확장한다. `~/.aic/hosts.toml`
 > 통합 인벤토리(`~/.ssh/config` 자동 import) 기반으로 `/diagnose @web-tier` 같은
 > 그룹 패턴을 받아, 외부 `ssh` 프로세스로 probe·read-only run_command를 병렬
 > 실행하고 결과를 호스트별 카드(severity-sort + collapsed ok)로 보여준다.
 > mutation·write는 멀티호스트에서 하드 차단해 안전 경계를 단일 호스트와 분리한다.
 
-- 상태: **Draft v2 — council CONSENSUS WITH RESERVATIONS + red-team Critical 12 fixed (2026-05-25)**, MVP 미구현
-- 작성일: 2026-05-25 (v1) · 갱신일: 2026-05-25 (v2 — red-team 반영)
+- 상태: **구현됨**. 아래 설계 기록은 2026-05-25의 역사적 제안과 검토 결과를 보존한다.
+- 작성일: 2026-05-25 (v1) · 설계 갱신일: 2026-05-25 (v2) · 구현 상태 갱신일: 2026-09-14
 - 대상 바이너리: `aic` (crate `aic-client`, lib `aic_client`)
 - 범위: `aic chat` 안에서의 멀티호스트 진단 흐름. mutation을 묶는 `aic run --hosts`
   서브커맨드는 본 RFC의 비목표(별도 후속 RFC).
@@ -25,11 +25,33 @@
   - `aic-client/src/agent/audit.rs` — HMAC chain (batch_id + daily segment)
   - `aic-client/src/agent/chat_tui.rs` — 카드 stack 렌더, 상태 태그
 
+## 현재 구현 상태
+
+다중 호스트 SSH 진단과 감사 기능은 구현됐다. 현재 공개 CLI는 다음과 같다.
+
+- `aic hosts show [name] [--json]`은 `~/.aic/hosts.toml`과 `~/.ssh/config`를 합친 인벤토리를 표시한다.
+- `aic hosts ping <host|@group|user@host[:port]>`은 허용된 읽기 전용 명령을 한 호스트 또는 그룹에서 실행한다.
+- `aic hosts trust <host>`는 fingerprint 확인 뒤 host key를 `known_hosts`에 추가한다.
+- `aic diagnose --host <host|@group|user@host[:port]> [symptom] [--json]`은 원격에서
+  `aic diagnose --no-analyze --json`을 실행하고 버전이 명시된 결과를 집계한다.
+- `aic audit batch-verify`는 일자별 다중 호스트 audit chain을 검증한다. `aic audit search
+  --multihost`는 해당 기록을 검색한다.
+
+실행기는 외부 `ssh` 프로세스, `BatchMode=yes`, 실행 수를 제한한 fan-out, 호스트별 시간 제한과
+전체 시간 제한을 사용한다. 결과는 여덟 가지 호스트 상태로 분류한다. 표준 출력은 64 KiB만
+저장하고 최대 8 MiB까지 읽어서 버린다. 그룹의 일부 호스트가 실패해도 완료한 결과와 미완료
+대상은 보존한다.
+
+현재 구현은 CLI 기반이다. 이 문서가 제안한 chat 내부 `/diagnose @group`, `--retry-failed`, 자동
+원격 shell probe, 차이 보기와 다중 호스트 변경 작업은 구현 범위에 포함되지 않는다. 아래 1장부터
+9장까지는 최초 제안과 결정 기록이다. 현재 동작과 다르면 이 절과 실제 CLI 계약을 기준으로
+판단한다.
+
 ---
 
-## 1. 목표 / 비목표
+## 1. 역사적 목표와 비목표
 
-### 1.1 Goals (MVP)
+### 1.1 목표
 - `/diagnose @group` · `/diagnose --host user@host`로 N개 원격 호스트에서 probe를 병렬 실행하고,
   호스트별 카드를 chat 로그에 표시(severity-sort + collapsed ok).
 - CLI의 관리 대상 진입점은 `aic diagnose --host <name|@group|user@host[:port]> [증상]`이다.
@@ -39,7 +61,7 @@
 - 부분 실패에 대해 `continue-and-report` + 8종 상태 태그(§4.4)로 원인을 즉시 식별 가능하게 한다.
 - 멀티호스트 명령은 `batch_id` 단위 audit + daily segment(§4.6)로 추적·검증 가능하게 한다.
 
-### 1.2 Non-Goals
+### 1.2 비목표
 - mutation · `write_file` · `edit_file`의 멀티호스트 흐름 → **하드 차단**. 별도 후속 RFC.
 - 원격 `aic` 자동 배포·설치. `--host` 진단은 aic가 이미 설치된 관리 대상만 지원하며,
   미설치 호스트는 원격 명령 실패로 명시한다.
@@ -48,14 +70,14 @@
 - Ansible inventory / Kubernetes context 직접 통합 — 후속 옵션.
 - diff 모드(majority-diff·reference 호스트 선택 UX) — MVP는 카드 stack(+ severity-sort + collapsed)만, 1.1로 분리.
 
-### 1.3 Out of Scope의 의도
+### 1.3 제외 범위의 의도
 mutation을 멀티호스트로 가져가면 부분 실패 시 클러스터 상태가 비일관해진다(롤백 부재). aic는 SRE
 **진단** 도구지 오케스트레이터가 아니므로 변경은 단일 호스트 흐름(또는 별도 명시적 서브커맨드)에
 머무는 것이 책임 경계에 맞다.
 
 ---
 
-## 2. Context
+## 2. 배경
 
 ### 2.1 왜 지금 필요한가
 0.10.0까지 aic는 **단일 호스트(로컬)** 만 대상이다. probe catalog · run_command · sandbox · audit · TUI
@@ -76,14 +98,14 @@ council 결론에 더해 red-team의 12 Critical 결함에 대한 fix까지 반�
 
 ---
 
-## 3. Design Decision
+## 3. 설계 결정
 
 본 RFC는 두 단계의 외부 검증을 통과했다.
 
-### 3.1 1차 — council CONSENSUS WITH RESERVATIONS
+### 3.1 1차 council 검토
 `.xm/op/council-2026-05-25-ssh-multihost.json`. 4 dimension(실행·인증·범위·안전)에서 R1·R2 cross-examine 후 도출.
 
-### 3.2 2차 — red-team Critical 12 검증
+### 3.2 2차 적대적 검증
 `.xm/op/red-team-2026-05-25-rfc-005-ssh-multihost.json`. dimension별 4 attacker가 54 결함(Critical 12 / High 18 / Medium 24) 도출 → defender가 Critical 12 응답.
 
 결과: **🟢 Fixed/Counter 8 · 🟡 Partial 4 · 🔴 Open 0.**
@@ -107,7 +129,7 @@ PARTIAL 4개의 잔존(RESIDUAL)은 §7 Risks에 명시.
 
 ---
 
-## 4. Detailed Design
+## 4. 상세 설계
 
 ### 4.1 호스트 정의 + 인증
 
@@ -231,7 +253,7 @@ pub(crate) struct RemoteResult {
 }
 ```
 
-#### MVP: 외부 `ssh` 프로세스 (단일 구현)
+#### 최초 구현: 외부 `ssh` 프로세스
 
 ```rust
 let mut cmd = tokio::process::Command::new("ssh");
@@ -269,7 +291,7 @@ fn shell_escape(s: &str) -> String {
 #### `RemoteExecutor` trait 유지 이유
 MVP는 단일 구현. 미래 전환 트리거(러스시/`ssh2`)는 §5.2.
 
-#### Collect-then-render
+#### 수집 후 렌더링
 호스트별 stdout/stderr를 §4.5의 상한 안에서 완전 버퍼링한 뒤 카드로 렌더한다(streaming 금지 — interleave 방지). 단일 호스트가 cmd timeout(30s)에 걸려도 다른 호스트는 즉시 카드 렌더(ControlMaster 세션 별개).
 
 ### 4.3 진단 범위
@@ -386,7 +408,7 @@ pub enum HostStatus {
 
 stderr 패턴 분류는 locale·ssh 버전에 따라 미일치 가능 → 미일치 시 `RemoteErr` fallback + stderr 원문 노출(§7 Risk).
 
-#### 카드 stack (U1 — severity-sort + collapsed ok)
+#### 카드 묶음 (U1 — 심각도 정렬과 정상 결과 접기)
 
 기본 정렬: `[host_key_mismatch] > [auth_fail] > [proxy_fail] > [timeout] > [unreachable] > [remote_err] > [ok_warn] > [ok]`.
 
@@ -482,7 +504,7 @@ for host in hosts {
 
 `OwnedSemaphorePermit`은 task panic/timeout/abort 시에도 자동 반환되므로 누수 없다. `JoinSet::abort_all()` 후 `join_next()`를 끝까지 소진해 permit을 회수한다.
 
-#### Timeout (3-layer)
+#### 세 단계 시간 제한
 
 | 레이어 | 값(기본) | 의미 | 결과 태그 |
 |--------|----------|------|-----------|
@@ -501,7 +523,7 @@ const REMOTE_MAX_DRAIN_BYTES: usize  = 8 * 1024 * 1024; // 드레인 후 버림
 
 단일 호스트 `run_command`와 동일 정책. cap 8 동시 최악 RSS ≈ 8 × (64 KiB + 8 MiB) × 2(stdout+stderr) ≈ **128 MiB**. 초과 시 카드 헤더에 `[truncated]` 태그.
 
-#### Continue-and-report
+#### 실패 후 계속 실행하고 보고
 일부 호스트 실패해도 나머지 진행. 진단 헤더 통계에 포함.
 
 #### Ctrl+C 취소 (★ R3 — PID 재사용 race 해소)
@@ -530,9 +552,9 @@ select! {
 #### 원격 orphan 정리 (잔존)
 SIGTERM이 로컬 ssh를 종료시켜도 원격 셸 child(예: `find /`)는 SIGHUP 무시 시 계속 실행될 수 있다. MVP는 audit에 `remote_orphan_possible` 경고 첨부. ssh `RequestTTY=force` + process group kill은 후속(§5.2).
 
-### 4.6 Audit
+### 4.6 감사
 
-#### Daily segment + cross-segment chain (★ O2)
+#### 일별 segment와 segment 간 chain (★ O2)
 
 ```
 ~/.aic/audit/
@@ -560,7 +582,7 @@ day segment 경계 레코드(연결고리):
 
 cross-segment verify로 일별 분리에도 연속성 검증 가능.
 
-#### Batch 엔트리
+#### Batch 항목
 
 ```jsonl
 {"ts":"…","type":"batch_start","batch_id":"01J…","kind":"diagnose","group":"@web-tier","hosts":["web-01",…],"hmac":"…"}
@@ -577,7 +599,7 @@ cross-segment verify로 일별 분리에도 연속성 검증 가능.
 - `tofu_reject` — 사용자 거부 (★ red-team A1·A2 High — 보안 이벤트로 반드시 기록)
 - `host_key_mismatch` — known_hosts 불일치 → 즉시 차단 + audit critical
 
-#### Secret 필터 시점 (★ R2 — pre-render 강제)
+#### Secret 필터 시점 (★ R2 — 렌더링 전 강제)
 
 ```
 ssh exec
@@ -605,9 +627,9 @@ $ aic audit verify --date 2026-05-24
 
 ---
 
-## 5. MVP vs 1.1
+## 5. 제안 당시 구현 단계
 
-### 5.1 MVP (이 RFC에서 구현)
+### 5.1 최초 구현 목표
 
 | 항목 | 범위 |
 |------|------|
@@ -621,7 +643,7 @@ $ aic audit verify --date 2026-05-24
 | 취소 | Ctrl+C → SIGTERM + 200ms grace + `try_wait` + 명시 `wait().await` reap |
 | Audit | batch_id + host_result(prev_hash) + **daily segment** + TOFU 이벤트 + pre-render secret 필터 + `aic audit verify` |
 
-### 5.2 1.1 (후속)
+### 5.2 후속 목표
 - **diff 모드 토글** (`Tab`) — majority-diff 또는 `r` 키 reference 선택. 동률·임계 결정 후.
 - **표 모드** — 100+ 호스트 환경 추가 UX (compact mode와 별도).
 - **mutation 멀티호스트** — `aic run --hosts <group> -- <command>` 서브커맨드.
@@ -633,7 +655,7 @@ $ aic audit verify --date 2026-05-24
 
 ---
 
-## 6. Open Questions
+## 6. 남은 질문
 
 1. `host_shell_probe` 캐시 정책 — `$SHELL` 결과를 hosts.toml에 자동 기록할지 매 batch마다 재탐지할지.
 2. `ssh-keyscan -T 5`의 MITM 안내 톤 — confirm UI에 "외부 채널로 검증"을 얼마나 강조할지(피로 vs 보안).
@@ -642,7 +664,7 @@ $ aic audit verify --date 2026-05-24
 
 ---
 
-## 7. Risks
+## 7. 위험
 
 | 위험 | 영향 | 완화 |
 |------|------|------|
@@ -664,7 +686,7 @@ $ aic audit verify --date 2026-05-24
 
 ---
 
-## 8. References
+## 8. 참고 자료
 
 - council artifact: `.xm/op/council-2026-05-25-ssh-multihost.json` — 1차 합의
 - **red-team artifact: `.xm/op/red-team-2026-05-25-rfc-005-ssh-multihost.json` — 2차 검증(Critical 12 fix)**
@@ -674,9 +696,9 @@ $ aic audit verify --date 2026-05-24
 
 ---
 
-## 9. Stance Evolution & Red-Team Verification
+## 9. 결정 변화와 적대적 검증
 
-### 9.1 Council R1 → Final Stance Evolution
+### 9.1 1차 검토에서 최종 결정까지의 변화
 
 | Agent (차원) | R1 입장 | Final | Changed |
 |---|---|---|:---:|
@@ -685,7 +707,7 @@ $ aic audit verify --date 2026-05-24
 | A3 (결과/범위) | 카드+Tab diff + 임의 run_command 화이트리스트 | **catalog 확장 우선** + tokenizer 화이트리스트 + majority-diff는 1.1 | ✅ |
 | A4 (안전) | cap 8 + mutation 별도 서브커맨드 + audit batch | + read-only run_command **조건부 수용** + **경로 접두사 제한** | ✅ |
 
-### 9.2 Red-Team Critical 12 — Verdict 요약
+### 9.2 적대적 검토의 주요 판정
 
 🟢 **Fixed/Counter (8)**: S2, S3, R2, R3, U2, U3, O2, O3
 🟡 **Partial (4)**: S1, R1, U1, O1

@@ -1,12 +1,12 @@
 # aic
 
-> Rust 터미널 LLM 어시스턴트: 셸 에러 분석 + bounded·sandbox read-only 진단을 실행하는 SRE chat 에이전트. OpenAI 호환·Groq·Anthropic·CLI 백엔드 지원.
+> Rust 터미널 LLM 어시스턴트: 셸 오류를 분석하고 범위가 제한된 읽기 전용 SRE 진단을 실행합니다. OpenAI 호환, Groq, Anthropic, CLI 백엔드를 지원합니다.
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
-**Languages:** [English](./README.md) · 한국어
+**언어:** [English](./README.md) · 한국어
 
-## Overview
+## 개요
 
 명령어가 실패하면 `aic`가 그 출력을 LLM에 넘겨 원인 설명과 수정 명령어를 받아옵니다.
 
@@ -26,9 +26,9 @@ graph LR
     Client -->|에러 분석| LLM[LLM Provider]
 ```
 
-## Features
+## 기능
 
-### Core
+### 핵심 기능
 - ✅ PTY 셸 래퍼 — 기존 워크플로우 변경 없이 출력 캡처
 - ✅ 명령어 경계 감지 — OSC 133 마커 + Timing Heuristic 폴백
 - ✅ 에러 자동 분석 — exit code ≠ 0이면 LLM으로 원인 분석 및 수정 제안
@@ -50,26 +50,26 @@ graph LR
 - ✅ workload discovery — `/discover`가 지원 서비스 프로세스를 식별하고 모니터링 제안을 정렬한다. TTY에서는 정의를 고른 뒤 한 번 확인하고 저장한다.
 - ✅ 세션 스냅샷 레코더 (opt-in) — `~/.aic/snapshots/`에 백그라운드 시스템 스냅샷 기록, `AIC_SNAPSHOT_RECORD`로 게이트: alert 트리거 전체 캡처(L1), 주기 타이머(L2, `aic snapshot install`), Crit auto-RCA(L3, `AIC_AUTO_RCA`). 아래 [세션 스냅샷 레코더](#세션-스냅샷-레코더) 참고
 
-### 보안 baseline
+### 보안 기준
 - ✅ Secret/PII redaction — secret 5종(AWS/GitHub/OpenAI/Anthropic/JWT) + PII 4종(email/한국 전화/주민번호/IPv4) 자동 마스킹, `AIC_REDACT=off` opt-out
 - ✅ 호스트 read-only 진단 + secret 경로 denylist — `run_command` 읽기 전용 명령은 호스트 전역(로그, `/tmp`, `/proc`)을 읽을 수 있으나, **secret 경로는 읽기조차 차단**한다: `~/.ssh`/`~/.aws`/`~/.gnupg`/`~/.kube`/`~/.docker`, `/etc/shadow`, `/etc/ssl/private`, `/proc/*/environ`, `*.pem`/`*.key`/`.env`/`id_rsa`/`credentials`(symlink 대상은 `canonicalize`로 해소). egress(curl/ssh/nc)·mutation(rm/mv/`docker prune`)은 게이트(확인/차단) 유지, mutation은 cwd 샌드박스에 격리
 - ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, `aic audit verify` 무결성 검증. HMAC 키는 **기본 file backend**, OS keychain은 opt-in(`AIC_AUDIT_KEYCHAIN=1`), `AIC_NO_KEYCHAIN=1`은 강제 off
   - **업그레이드 노트**: 이전 버전에서 audit 키가 OS keychain에만 있던 경우, 새 file 기본에서 verify WARN/키 없음(또는 chain 보호를 위한 append skip)이 날 수 있다. (1) keychain chain을 계속 검증/사용하려면 `AIC_AUDIT_KEYCHAIN=1`로 실행, **또는** (2) 새 file 기반 chain을 시작하려면 `~/.local/state/aic/audit.log`를 백업/rotate 후 재실행. `aic doctor`가 두 선택지를 안내한다.
 - ✅ OS keychain — macOS Keychain / Linux Secret Service / Windows Credential Manager로 API key 저장, `aic migrate-keys`로 평문 일괄 이동
 
-### LLM UX
+### LLM 사용성
 - ✅ Streaming — OpenAI-compat 자동 streaming (TTY 환경), `AIC_NO_STREAM=1` opt-out
 - ✅ 결과 캐시 — 같은 (cmd, exit, output) 24h TTL, 즉시 응답
 - ✅ Dry-run 미리보기 — `aic --dry-run "..."`로 토큰·비용·timeout 사전 확인
 - ✅ Retry circuit breaker — 60s window 5회 실패 시 30s fail-fast
 - ✅ i18n 자동 감지 — `lang = "auto"` 시 `$LC_ALL`/`$LANG` 추론
 
-### Onboarding
+### 시작 안내
 - ✅ `aic init zsh|bash` — 셸 hook 자동 설치 (마커 기반 멱등)
 - ✅ `aic init --hook-mode` — Phase 3 metadata-only hook 추가 설치
 - ✅ `aic config` 인터랙티브 wizard
 
-### Supervisor / Capture Modes
+### 감독 데몬과 캡처 방식
 - ✅ `aicd` supervisor daemon — 사용자당 1개. 세션 registry, control UDS,
   graceful shutdown
 - ✅ `aic daemon { status | start | stop }` — supervisor 제어
@@ -79,7 +79,7 @@ graph LR
 - ✅ `aic run -- <cmd>` — explicit FullOutput capture wrapper
 - ✅ `CommandRecord.capture_mode/quality` + 분석 시 capture quality hint
 
-### Roadmap
+### 개발 예정
 - 🚧 `aic-proxy` — LLM API 프록시 서버 (개발 예정)
 - 🚧 PTY ownership을 `aicd`로 이동 (PRD-AICD-SUPERVISOR Phase 2 본 구현)
 
@@ -91,9 +91,9 @@ graph LR
 4. 사용자가 `aic`를 실행하면 UDS를 통해 직전 명령어 데이터를 조회
 5. exit code에 따라 에러 분석(LLM) 또는 Interactive REPL로 자동 분기
 
-## Quick Start
+## 빠른 시작
 
-### Prerequisites
+### 사전 요구 사항
 
 - Rust 1.89+ (2021 edition)
 - macOS 또는 Linux
@@ -115,7 +115,7 @@ archive를 받고, `checksums.txt`로 SHA-256을 검증한 다음 `aic` +
 옵션:
 
 ```bash
-AIC_VERSION=v0.4.0 sh install.sh         # 특정 tag 고정
+AIC_VERSION=<tag> sh install.sh          # 특정 tag 고정
 AIC_INSTALL_DIR=$HOME/.local/bin sh ...  # 사용자 디렉토리에 설치
 ```
 
@@ -162,7 +162,7 @@ make check                   # 빠른 workspace 타입 체크
 ```bash
 aic update             # 설치 출처를 감지해 그 자리에서 갱신
 aic update --check     # 신버전이 있으면 exit 1, 최신이면 0
-aic update --to v0.4.0 # 특정 tag 고정 (manual install에서만 적용)
+aic update --to <tag>  # 특정 tag 고정 (manual install에서만 적용)
 aic update --force     # 같은 버전이어도 강제 재설치
 ```
 
@@ -208,6 +208,10 @@ aic init zsh           # ~/.zshrc에 'source ~/.aic/hooks.zsh' 멱등 추가
 aic migrate-keys       # 평문 API key를 OS keychain으로 이동 (선택)
 aic doctor             # 9축 진단 — PASS/WARN/FAIL 한눈에 확인
 aic doctor --probe-tools  # opt-in 라이브 probe: provider가 실제로 tool-calling을 지원하는지 진단
+
+# 원격 호스트 하나 또는 그룹에서 같은 읽기 전용 진단 실행
+aic diagnose --host web-01 "disk full"
+aic diagnose --host @web-tier "high cpu" --json
 
 # 2. (선택) supervisor 시작 — 멀티 세션 lifecycle 중앙 관리
 aic daemon start       # aicd 백그라운드 spawn
@@ -268,7 +272,7 @@ aic rca status         # persistent RCA incident (start / status / timeline / re
 aic snapshot status    # 세션 스냅샷 레코더 (capture / list / status / install / uninstall)
 ```
 
-### RCA workspace
+### RCA 작업 공간
 
 `aic rca`는 RCA를 incident id 기준으로 영속 저장한다. 증거는 `~/.aic/incidents/<id>/evidence.jsonl`,
 보고서는 같은 디렉터리의 `report.md`에 저장된다. 기본 저장 파일은 0600, incident 디렉터리는 0700
@@ -323,7 +327,7 @@ chat 안에서 `/record [on|off|now]`로 세션 기록을 토글하고(`now`=게
 캡처 vs 세션의 `/compare` append)는 process-internal mutex + cross-process flock으로 직렬화돼 잃은 쓰기가
 없다.
 
-### Chat slash 명령
+### 채팅 슬래시 명령
 
 `aic chat` 안에서 `/`로 시작하는 줄은 로컬에서 가로채 처리한다 — **LLM에 전송되지 않고** 대화 history에도
 들어가지 않으며, 출력은 화면(stderr)에만 표시된다. TTY에서는 `/`를 입력하면 후보 패널이 열린다(↑↓ 이동,
@@ -332,6 +336,10 @@ Tab 순환, Enter 선택, Esc 닫기).
 | 명령 | 설명 |
 |------|------|
 | `/help` | 사용 가능한 slash 명령 목록 |
+| `/health` | LLM 호출 없이 `HEALTHY`, `DEGRADED`, `CRITICAL` 또는 `UNKNOWN` 범위를 표시하고 활성 RCA에 증거를 연결 |
+| `/discover [--raw]` | 지원 workload 후보와 모니터링 제안을 표시. TTY에서는 정의를 선택하고 저장을 확인. `--raw`는 전체 프로세스 목록 표시 |
+| `/workload inspect <id>` | 후보의 selector, binding, ambiguity와 제안을 표시 |
+| `/workload enable <id> <fingerprint>` | fingerprint와 selector를 다시 확인한 뒤 정의 저장을 확인 |
 | `/last [N]` | 직전 tool 카드, 또는 최근 N개 tool 호출 요약 |
 | `/raw [seq\|corr]` | 마지막(또는 지정) tool 호출의 redacted 전체 출력 |
 | `/local [section] [--raw]` | 로컬 sysinfo 스냅샷 → LLM 요약 (`--raw`=증거만). alias: `/sys`, `/snapshot` |
@@ -347,157 +355,55 @@ Tab 순환, Enter 선택, Esc 닫기).
 | `/rca start\|use\|add\|timeline\|report` | persistent RCA workspace에 chat 증거 저장. 예: `/rca start api-latency`, `/rca add last 3`, `/rca add note ...`, `/rca report --write` |
 | `/triage [--run] [topic]` | 토픽 체크리스트 + Probe Catalog 후보 probe; `--run`이면 실행(LLM 미호출). topics: `mac-slow web disk memory cpu network build-fail docker generic` (`disk` 토픽은 docker 디스크 사용량·큰 `/tmp` 파일도 점검) |
 | `/watch [target] [--count N] [--every Ns]` | probe를 몇 번 다시 실행해 tick마다 변화량을 요약(LLM 미호출). bounded: 기본 3회(최대 20), 간격 1s. `target`은 Probe Catalog id — LOCAL 섹션, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — 예: `/watch tmp_recent`는 `/tmp`에서 늘어나는 파일을 추적. 생략하면 compact 세트 |
+| `/watch arm` \| `/watch off` | 선제 alert lane을 켜거나 끔. 악화와 복구 상태를 대화에 표시 |
 
-### Workload discovery
+### 워크로드 모니터링
 
-`/discover`는 지원 서비스 workload만 표시하며, 설정을 바꾸지 않습니다. 대화형 세션에서는 하나 이상의
-정의를 고른 뒤 `workloads.toml`에 저장할 때 한 번 확인합니다.
+발견 기능은 모니터링을 시작하지 않습니다. 현재 프로세스 목록에서 후보만 만듭니다.
 
-지원 adapter는 Nginx, JVM, Redis 또는 Valkey, PostgreSQL, MySQL 또는 MariaDB, MongoDB, Kafka,
-RabbitMQ, Elasticsearch, OpenSearch, HAProxy, Prometheus, ClickHouse, etcd, Consul, Memcached입니다.
-프로세스 이름 또는 실행 파일 이름으로 분류하며, Java 서비스는 main class를 함께 확인합니다. RabbitMQ는
-RabbitMQ를 실행한 Erlang VM 명령행도 분류합니다.
+다음 순서로 설정합니다.
 
-`/discover --raw`는 전체 프로세스 인벤토리를 표시합니다. Generic 프로세스는 기본 발견, LLM 분석,
-모니터링 제안, 대화형 선택에서 제외합니다. CPU·메모리·재시작 상태는 볼 수 있지만 서비스 수준의
-의미를 판단할 수 없기 때문입니다.
+1. `aic workload discover --json`으로 후보를 찾습니다.
+2. `aic workload inspect <id> --json`으로 후보 하나를 점검합니다.
+3. `aic workload enable <id> --fingerprint <value> ...`로 정의를 저장합니다.
+4. `aic workload list --json`으로 저장된 정의를 확인합니다.
+5. `aic workload monitor <id> --json`으로 단발 프로브를 시험합니다.
+6. `aic daemon start`로 60초 주기 수집을 시작합니다.
+7. `aic workload status --json`과 `aic workload history <id> --limit 20 --json`으로 결과를 확인합니다.
 
-각 workload에는 `detect_only`, `inspect_ready`, `monitor_ready` driver mode가 있습니다.
+데몬은 저장된 정의만 읽습니다. 새 프로세스를 자동으로 다시 발견하지 않습니다.
 
-발견 단계는 `detect_only` driver를 만듭니다. Nginx는 알려진 로컬 설정 파일의 읽기 접근을, Redis는
-로컬 socket 또는 `127.0.0.1:6379`의 bounded `INFO SERVER` 요청을, Memcached는 `127.0.0.1:11211`의
-bounded `stats` 요청을, PostgreSQL은 로컬 socket 또는
-`127.0.0.1:5432` 연결을 확인합니다. 검사에 성공하면 해당 후보를 `inspect_ready`로 표시합니다.
-이 검사는 설정 내용, 자격 증명, 원격 endpoint를 읽거나 사용하지 않습니다.
+실행 중인 데몬은 다음 수집 주기에 새 정의를 읽습니다. 반영에 최대 60초가 걸릴 수 있습니다.
 
-`/workload inspect`는 확인 근거와 아직 필요한 조건을 표시합니다.
+PostgreSQL, MySQL 또는 MariaDB, MongoDB, Nginx, HAProxy는 연결 옵션을 명시해야 합니다.
 
-`inspect_ready`는 read-only 접근 조건만 확인하며, 서비스 지표는 수집하지 않습니다.
+엔드포인트에는 `unix:///absolute/path`, `tcp://host:port`, `tls://host:port`만 사용합니다. 어댑터에 따라 더 엄격한 제한이 적용됩니다.
 
-`aic workload monitor <id> --json`은 셸에서 실행하는 단발 monitor probe이며, `aic chat` slash 명령
-형태는 없습니다. connection이 없는 정의는 기존 고정 로컬 endpoint를 사용합니다. `aic workload enable <id>
---fingerprint <value> --endpoint <scheme://target>`으로 명시적 endpoint를 저장할 수 있습니다. 허용하는
-형식은 `unix:///absolute/path`, `tcp://host:port`, `tls://host:port`뿐입니다.
-IPv6는 `tcp://[::1]:6379`처럼 대괄호를 사용합니다. 명시적 endpoint는 해당 host와 port로 나가는 연결을
-허용합니다. Redis는 `--auth-env NAME` 또는
-`--auth-keychain ACCOUNT`와 선택 사항인 `--username`을 지원합니다. Memcached는 인증 옵션을 거부합니다.
-PostgreSQL은 명시적 TCP 또는 TLS endpoint, `--username`, `--database`가 필요합니다. password 인증은
-`--auth-env NAME` 또는 `--auth-keychain ACCOUNT`를 사용합니다. trust 인증을 위해 secret은 선택 사항입니다.
-MySQL은 명시적 TCP 또는 TLS endpoint와 `--username`이 필요하며 `--database`는 선택 사항입니다. password
-인증은 `--auth-env NAME` 또는 `--auth-keychain ACCOUNT`를 사용합니다.
-MongoDB는 명시적 TCP 또는 TLS endpoint가 필요합니다. URI, SRV, Unix endpoint는 지원하지 않습니다.
-MongoDB 인증에는 `--username`과 secret option 하나를 함께 사용합니다. `--auth-source NAME`을 생략하면
-인증 database로 `admin`을 사용합니다.
-secret reference는 연결할 때만 해석합니다. PostgreSQL TLS도 native root를 사용하고 endpoint host를 검증합니다.
-Redis는
-`connected_clients`, `used_memory`, `total_commands_processed`, `instantaneous_ops_per_sec`,
-`keyspace_hits`, `keyspace_misses`를 반환합니다. Memcached는 `curr_connections`, `bytes`, `cmd_get`,
-`cmd_set`, `get_hits`, `get_misses`, `evictions`를 반환합니다. PostgreSQL은 `numbackends`, `xact_commit`,
-`xact_rollback`, `blks_read`, `blks_hit`, `tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`,
-`tup_deleted`, `conflicts`, `temp_files`, `temp_bytes`, `deadlocks`를 반환합니다. `pg_stat_database`에서 현재
-database의 scalar row 하나만 읽습니다. PostgreSQL connection에 read-only transaction mode, statement timeout, lock timeout을 적용합니다.
-MySQL은 `threads_connected`, `threads_running`, `connections`, `aborted_connects`, `questions`, `slow_queries`,
-`bytes_received`, `bytes_sent`를 반환합니다. 고정 `SHOW GLOBAL STATUS` query로 이 지표 8개만 요청합니다.
-MongoDB는 `connections_current`, `connections_available`, `connections_total_created`, `opcounters_query`,
-`opcounters_get_more`, `opcounters_command`, `network_bytes_in`, `network_bytes_out`, `network_num_requests`,
-`uptime_seconds`를 반환합니다.
-MySQL TLS는 native root만 사용하고 endpoint host를 검증합니다. probe마다 연결 하나를 열고 pool은 사용하지
-않습니다. PostgreSQL과 MySQL library는 응답 byte 제한을 제공하지 않습니다. PostgreSQL의 고정 query는
-반환 범위를 row 하나로 제한합니다. Redis와 Memcached의 연결, 읽기, 쓰기 제한은 각각 200ms이고
-MongoDB는 고정 `serverStatus` command와 3초 전체 timeout을 사용합니다. 내부 pool은 connection 하나로
-제한합니다. MongoDB TLS는 OpenSSL filesystem CA path를 사용합니다. 기본 path에 필요한 CA가 없으면
-`SSL_CERT_FILE` 또는 `SSL_CERT_DIR`을 설정하십시오. 64KiB 제한은 BSON decode 뒤에 적용하므로
-driver가 먼저 더 큰 응답을 받을 수 있습니다.
-Prometheus adapter는 공식 Linux Prometheus server를 지원합니다. custom path나 query 없이 고정 `/metrics`
-경로를 사용하며 인증과 redirect는 지원하지 않습니다. 기본 endpoint는 `127.0.0.1:9090`이고 explicit TCP 또는
-TLS endpoint로 바꿀 수 있습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은
-3초이며 응답 제한은 1MiB입니다. Prometheus는 `config_last_reload_successful`, `tsdb_head_series`,
-`tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`, `process_resident_memory_bytes`,
-`process_virtual_memory_bytes`, `go_goroutines`를 반환합니다.
-ClickHouse adapter는 기본적으로 `127.0.0.1:8123`의 HTTP interface를 사용하며 explicit TCP 또는 TLS endpoint로
-바꿀 수 있습니다. native port 9000과 Unix endpoint는 지원하지 않습니다. custom path, query parameter, 사용자
-SQL 없이 고정 SQL 하나만 실행합니다. `queries`, `merges`, `part_mutations`, `replicated_fetches`,
-`replicated_sends`, `tcp_connections`, `http_connections`, `memory_tracking_bytes`, `uptime_seconds`,
-`memory_resident_bytes`를 반환합니다. 현재 probe query 자체가 `queries` 값에 포함됩니다. Basic 인증에는 TLS,
-`--username`, secret option 하나가 모두 필요합니다. 필요한 system table만 읽을 수 있는 사용자를 사용하십시오.
-database와 `--auth-source`는 지원하지 않습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고
-전체 probe 제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다.
-etcd adapter는 기본적으로 `127.0.0.1:2379`의 익명 `GET /metrics`를 사용하며 explicit TCP 또는 TLS
-endpoint로 바꿀 수 있습니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은
-3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. 지원하는 최신 etcd는 사용 중인 database 크기
-지표를 노출해야 합니다. etcd는 `server_has_leader`, `server_is_leader`, `leader_changes_seen_total`,
-`proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
-`mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, `process_resident_memory_bytes`를 반환합니다.
-gRPC status, 인증, private CA, mTLS, custom path, query, Unix endpoint는 지원하지 않습니다.
-Elasticsearch와 OpenSearch adapter는 기본적으로 `127.0.0.1:9200`을 사용합니다. 고정 cluster stats 요청으로
-`nodes_total`, `indices_count`, `shards_total`, `shards_primaries`, `docs_count`, `docs_deleted`,
-`store_size_bytes`, `fs_total_bytes`, `fs_available_bytes`를 반환합니다. 두 adapter는 candidate와 ambiguity를
-서로 독립적으로 처리합니다. Basic 인증에는 TLS, `--username`, secret option 하나가 모두 필요합니다. 최소 권한을
-가진 monitoring 사용자를 사용하십시오. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe
-제한은 3초이며 응답 제한은 64KiB입니다. redirect는 따르지 않습니다. API key, SigV4, private CA, mTLS, custom
-path, query, 검색, node stats는 지원하지 않습니다.
-RabbitMQ adapter는 `rabbitmq_management` plugin이 필요하며 기본적으로 `127.0.0.1:15672`를 사용합니다.
-고정 `GET /api/overview`를 호출합니다. Basic 인증에는 TLS, username, secret이 모두 필요합니다. `monitoring` tag가
-있는 전용 사용자를 사용하며 administrator 권한은 필요하지 않습니다. `messages`, `messages_ready`,
-`messages_unacknowledged`, `queues`, `connections`, `channels`, `consumers`, `exchanges`,
-`message_stats_publish_total`, `message_stats_deliver_get_total`을 반환합니다. 선택 사항인 message counter가 없으면
-0을 사용합니다. TLS는 native host root를 사용합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답
-제한은 64KiB입니다. redirect는 따르지 않습니다. AMQP port 5672, vhost 선택, private CA, mTLS, custom API는
-지원하지 않습니다.
-Nginx adapter는 explicit TCP 또는 TLS endpoint가 필요하며 항상 `/stub_status`를 요청합니다. 사용 전에 Nginx
-`stub_status` module과 정확히 이 location을 설정하십시오. Basic 인증에는 TLS, username, secret이 모두 필요합니다.
-TLS는 native host root를 사용합니다. `active_connections`, `accepts_total`, `handled_total`, `requests_total`,
-`reading`, `writing`, `waiting`을 반환합니다. 연결 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은
-16KiB입니다. redirect는 따르지 않습니다. AIC는 Nginx 설정을 변경하거나 reload하지 않습니다. custom status
-path는 지원하지 않습니다.
-HAProxy adapter는 사용자 수준의 읽기·쓰기 권한이 있는 explicit Unix stats socket이 필요합니다. `show stat`만
-atomic close-on-exec socket 생성을 지원하는 Unix에서 동작하며 macOS에서는 fail closed합니다.
-전송하고 history endpoint에는 socket path 대신 `local-unix-socket`을 저장합니다. frontend counter를 합산하고
-down 상태인 server row를 셉니다. `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
-`denied_requests_total`, `denied_responses_total`, `failed_connections_total`, `retry_warnings_total`,
-`servers_down`을 반환합니다. socket 작업 제한은 200ms이고 전체 probe 제한은 3초이며 응답 제한은 256KiB입니다.
-TCP, HTTP stats page, 인증, custom command, 설정 변경, 권한 변경, reload는 지원하지 않습니다.
+수집 상태는 다음 의미를 가집니다.
 
-monitor adapter는 Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse, etcd,
-Elasticsearch, OpenSearch, RabbitMQ, Nginx, HAProxy입니다. JVM, Kafka, Consul은 discovery-only로
-유지합니다. JVM은 별도의 opt-in JMX 또는 검증된 local PerfData 계약이 필요합니다. Kafka는 bounded Admin
-API, egress 정책, 전용 security schema가 필요합니다. Consul은 server와 client agent에 공통으로 항상 노출되는
-필수 metric set이 없습니다. AIC는 이 세 discovery-only adapter의 history sample을 만들지 않습니다.
-응답 제한은 64KiB입니다. Memcached 응답은 `END`로 끝나야 합니다. 필수 지표를 모두 파싱할 때만
-`monitor_ready: true`를 반환합니다.
+- `fresh`: 최근 180초 안에 생성된 샘플이 있습니다.
+- `stale`: 최신 샘플이 180초보다 오래됐습니다.
+- `no_samples`: 정의는 있지만 샘플이 없습니다.
+- `ambiguous_definitions`: 같은 어댑터의 정의가 여러 개여서 수집하지 않습니다.
+- `not_collected`: 발견만 지원하는 어댑터입니다.
 
-`aicd`는 각 monitor adapter 정의를 하나씩 60초마다 probe합니다. 저장된 connection이 있으면
-그 설정을 사용하고, 없으면 Redis는 고정 로컬 socket 경로 또는 `127.0.0.1:6379`를 사용하며 Memcached는
-`127.0.0.1:11211`을 사용합니다. secret reference는 probe 시점에만 해석합니다.
-PostgreSQL, MySQL, MongoDB는 저장된 connection이 필요합니다. 같은 adapter의 정의가 여러 개면 해당 adapter만 모호한
-상태로 처리합니다.
-Prometheus 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
-ClickHouse 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
-etcd 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
-Elasticsearch와 OpenSearch 정의는 기본 endpoint 또는 저장된 endpoint를 사용할 수 있습니다.
-RabbitMQ는 기본 management endpoint 또는 저장된 endpoint를 사용할 수 있습니다. Nginx와 HAProxy는 저장된
-connection이 필요합니다. JVM, Kafka, Consul 정의의 상태는 `not_collected`로 유지합니다.
+Redis 또는 Valkey, Memcached, PostgreSQL, MySQL 또는 MariaDB, MongoDB, Prometheus, ClickHouse, etcd, Elasticsearch, OpenSearch, RabbitMQ, Nginx, HAProxy를 모니터링할 수 있습니다. JVM, Kafka, Consul은 발견만 지원합니다.
 
-sample은 `$XDG_STATE_HOME/aic/workload-history.jsonl`에 저장합니다. 기본 디렉터리는 `~/.local/state/aic`입니다. 디렉터리 권한은 0700이고 파일 권한은 0600입니다. 1440개 sample을 유지합니다.
+어댑터별 지표, 인증, TLS 규칙, 제한, 저장 경로와 예제는 [워크로드 모니터링](docs/WORKLOAD-MONITORING.md)을 참고하세요.
 
-같은 adapter의 정의가 둘 이상이면 해당 adapter만 수집하지 않습니다. 모든 monitor adapter sample은 같은
-history 파일에 저장하고 기존 Redis JSON sample도 읽습니다. `aic workload status [--json]`와
-`aic workload history <id> [--limit N] [--json]`는 `aicd` 없이 이 파일을 읽습니다.
+### 원격 호스트와 그룹
 
-workload history의 원격 전송은 지원하지 않습니다.
+`~/.aic/hosts.toml`에 호스트와 그룹을 정의합니다. `~/.ssh/config`의 항목도 가져올 수 있습니다.
 
-probe는 고정·bounded·read-only Safe 명령의 단일 **Probe Catalog**(`agent::probes`)에서 온다: local
-sysinfo 섹션(`fd`=열린 파일 디스크립터 현재/최대 포함) + `process` + git read-only + `docker`
-(`docker_df`/`docker_ps`/`docker_images`) + `filesystem`(`tmp_big`/`tmp_recent`). `/local`·`/compare`·
-`/diagnose`·`/incident`·`/bundle`·`/triage`가 모두 이를 참조한다. `docker`/`filesystem` probe는 기본
-`/local` 세트엔 없고(docker/절대경로 read 필요) `/triage`·`/diagnose`·`/watch`에서 선택된다.
+```bash
+aic hosts show
+aic hosts trust web-01
+aic hosts ping web-01 --cmd "uptime"
+aic hosts ping @web-tier --cmd "df -h"
+aic diagnose --host @web-tier "high cpu" --json
+```
 
-분석 명령은 **redacted** 증거 스냅샷을 tool 없는 stateless 단발 호출로 provider에 보낸다. `--raw`(및
-`AIC_LOCAL_NO_ANALYZE=1`)는 모델 호출을 건너뛰고 증거만 보여주며, provider 오류/timeout 시 raw 증거로
-fallback한다. 분석 출력은 TTY에서 CLI 친화 markdown subset(amber 강조)으로 렌더되고, 파이프에서는 plain,
-진행 중에는 spinner를 표시한다.
-
-보류(roadmap): `/runbook`, `/fix-preview`, `/config`, background watch daemon, persistent `/audit` 조회.
+원격 실행은 SSH batch mode와 읽기 전용 명령을 사용합니다. 그룹 실행에는 동시 실행 수와 timeout 제한이 적용됩니다.
 
 ### 안전 모델 (run_command)
 
@@ -516,7 +422,7 @@ timeout이 걸리며, **secret/PII redaction**이 LLM·화면·audit log에 닿�
 포함)는 차단되고, mutation/위험 명령은 cwd 샌드박스에 격리된다. 셸 실행 자체를 끄려면 `--no-run` /
 `--read-only` / `AIC_AGENT_NO_RUN=1`(읽기 도구 `read_file`/`list_dir`/`grep`/`glob`는 유지).
 
-### 옵션: Hook capture mode (PTY wrapper 없이 metadata만)
+### 선택 사항: 셸 훅 캡처 방식
 
 PTY 래핑 부담 없이 명령어 metadata만 수집하고 싶을 때:
 
@@ -533,7 +439,7 @@ cargo build
 aic run -- cargo build              # stdout/stderr 보존, exit code 그대로
 ```
 
-### 환경 변수
+### 에이전트 환경 제어
 
 | 변수 | 효과 |
 |---|---|
@@ -548,7 +454,7 @@ aic run -- cargo build              # stdout/stderr 보존, exit code 그대로
 | `AIC_VERBOSE=1` | command별 상세 `run_command` 카드(preamble + `→ done` 요약) 표시. 기본은 조용(섹션 헤더 + 보안 경고만). `AIC_DEBUG=1`도 활성화 |
 | `AIC_SESSION_ID` | 활성 세션 ID. `aic-session`이 자동 export, hook도 참조 |
 
-## Project Structure
+## 프로젝트 구조
 
 ```
 aic/
@@ -559,6 +465,7 @@ aic/
 │       │                            # AppConfig, capture_quality_hint()
 │       ├── ipc.rs                   # IpcRequest/Response — session/control/hook
 │       ├── error.rs                 # AicError
+│       ├── workload.rs              # 워크로드 정의와 sample
 │       └── paths.rs                 # session_socket_path, aicd_socket_path,
 │                                    # aicd_lock_path
 ├── aic-server/                      # 두 binary: aic-session + aicd
@@ -570,14 +477,19 @@ aic/
 │       ├── session_registry.rs      # in-memory HashMap registry
 │       ├── hook_events.rs           # per-session bounded ring (Phase 3)
 │       ├── aicd_client.rs           # aic-session → aicd best-effort RPC
+│       ├── workload_monitor.rs       # 주기적 서비스 지표 probe
 │       ├── pty_manager.rs / output_processor.rs / boundary_detector.rs /
 │       │   ring_buffer.rs / uds_server.rs / lock.rs / metrics.rs / telemetry.rs
 ├── aic-client/                      # CLI 클라이언트 (바이너리: aic)
 │   └── src/
-│       ├── main.rs                  # clap CLI: 11+ subcommand
+│       ├── main.rs                  # clap CLI 진입점과 하위 명령
 │       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
 │       ├── uds_client.rs            # session UDS + aicd control client
 │       ├── doctor.rs                # 9축 진단 (aicd supervisor 포함)
+│       ├── workload.rs              # 워크로드 CLI 동작
+│       ├── agent/
+│       │   ├── hosts.rs              # 원격 호스트와 그룹 인벤토리
+│       │   └── mcp.rs                # MCP Streamable HTTP client
 │       ├── config.rs / auto_brancher.rs / error_analyzer.rs /
 │       │   llm_dispatcher.rs / repl.rs / cache.rs / redaction.rs /
 │       │   audit.rs / keychain.rs / streaming.rs / spinner.rs / top.rs
@@ -645,12 +557,61 @@ provider_type = "CliBackend"
 cli_path = "claude"
 ```
 
-## Environment Variables
+### 관측 백엔드
+
+등록한 Prometheus, Loki, Elasticsearch 또는 OpenSearch backend를 채팅에서 조회할 수 있습니다.
+
+```toml
+[observability.backends.prom]
+backend_type = "Prometheus"
+url = "http://prometheus:9090"
+
+[observability.backends.logs]
+backend_type = "Loki"
+url = "http://loki:3100"
+```
+
+`/metrics`와 `/logs`는 LLM을 호출하지 않고 마스킹한 원본 결과를 표시합니다.
+
+### MCP 서버
+
+`aic chat`은 Streamable HTTP를 사용하는 MCP 서버의 tool을 호출할 수 있습니다.
+
+```toml
+[mcp.servers.mem-mesh]
+url = "http://127.0.0.1:8787/mcp"
+auto_approve = ["search", "context", "get_links", "stats"]
+```
+
+`auto_approve`에 등록한 읽기 전용 tool은 자동 실행됩니다. 다른 tool은 실행 전에 확인합니다.
+
+### 웹훅 경보 수신
+
+`aicd`는 Alertmanager, Grafana, PagerDuty와 generic webhook을 받을 수 있습니다. 이 기능은 기본으로 꺼져 있습니다.
+
+```toml
+[aicd.webhook]
+enabled = true
+listen_addr = "127.0.0.1:9099"
+secret = "shared-secret"
+auto_diagnose = true
+```
+
+최근 처리 이력은 `aic webhook list` 또는 `aic webhook list --json`으로 확인합니다.
+
+### 헤드리스와 폐쇄망 서버
+
+비대화 명령은 TTY나 GUI 없이 동작합니다. 확인이 필요한 변경 명령은 비대화 환경에서 거부됩니다.
+
+Linux Secret Service가 없으면 `AIC_NO_KEYCHAIN=1`을 설정합니다. 폐쇄망에서는 내부 OpenAI 호환 endpoint를 등록합니다.
+
+## 환경 변수
 
 | 변수 | 설명 | 기본값 |
 |------|------|--------|
 | `XDG_CONFIG_HOME` | 설정 파일 디렉토리 | `~/.config` |
 | `XDG_RUNTIME_DIR` | 소켓 경로 (Linux) | `/tmp/aic-{uid}` |
+| `AIC_RUNTIME_DIR` | 소켓, lock, registry가 사용할 절대 runtime directory. 설정하면 다른 후보를 탐색하지 않음 | unset |
 | `AIC_SESSION_ID` | 활성 세션 식별자 — `aic-session`이 셸에 export. 클라이언트(`aic`/`status`/`doctor`/`top`)가 이 값으로 sock을 찾는다. | (자동 생성) |
 | `AIC_NO_RUN` | 설정 시 LLM 제안 명령 인라인 실행 prompt 비활성화 | unset |
 | `AIC_AUTO_RUN` | `1`이면 인라인 실행 prompt 없이 자동 실행 (destructive 명령 제외) | unset |
@@ -666,6 +627,7 @@ cli_path = "claude"
 
 | 플랫폼 | 경로 패턴 |
 |--------|-----------|
+| 모든 플랫폼 (`AIC_RUNTIME_DIR` 설정) | `$AIC_RUNTIME_DIR/session-{id}.sock` |
 | macOS | `/tmp/aic-{uid}/session-{id}.sock` |
 | Linux (XDG 설정) | `$XDG_RUNTIME_DIR/aic/session-{id}.sock` |
 | Linux (XDG 미설정) | `/tmp/aic-{uid}/session-{id}.sock` |
@@ -772,6 +734,6 @@ make help         # 전체 명령어 목록
 | ANSI 제거 | `strip-ansi-escapes` |
 | 테스트 | `proptest` (Property-Based Testing) |
 
-## License
+## 라이선스
 
 MIT. [LICENSE](./LICENSE)를 참고하세요.

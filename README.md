@@ -1,6 +1,7 @@
 # aic
 
-> A Rust terminal LLM assistant: shell-error analysis + an SRE chat agent that runs bounded, sandboxed read-only diagnostics. Works with OpenAI-compatible, Groq, Anthropic, and CLI backends.
+> A Rust terminal assistant for shell-error analysis and bounded SRE diagnostics.
+> It supports OpenAI-compatible, Groq, Anthropic, and CLI backends.
 
 [![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
@@ -8,11 +9,14 @@
 
 ## Overview
 
-When a command fails, `aic` hands its output to an LLM and gets back an explanation of what went wrong plus a suggested fix.
+When a command fails, `aic` sends its output to an LLM. The LLM explains the failure and suggests a fix.
 
-It works through a PTY-based daemon (`aic-session`) that wraps your shell, relaying I/O while keeping a ring buffer of recent output. The CLI client (`aic`) reads the previous command's exit code and either explains the error or drops you into an interactive REPL.
+`aic-session` wraps your shell with a PTY and keeps recent output in a ring buffer.
+The `aic` client reads the previous exit code. It then explains the error or starts an interactive REPL.
 
-A per-user supervisor daemon (`aicd`) manages session lifecycle, registry, and cleanup. For workflows where PTY wrapping is too expensive, a metadata-only **hook capture mode** skips output capture entirely (PRDs: [docs/PRD-AICD-SUPERVISOR.md](./docs/PRD-AICD-SUPERVISOR.md), [docs/PRD-HOOK-CAPTURE-MODE.md](./docs/PRD-HOOK-CAPTURE-MODE.md)).
+The per-user `aicd` daemon manages session lifecycle, registry, and cleanup.
+Metadata-only hook capture skips output capture when PTY wrapping is unsuitable.
+Read the [supervisor PRD](docs/PRD-AICD-SUPERVISOR.md) and [hook capture PRD](docs/PRD-HOOK-CAPTURE-MODE.md).
 
 ```mermaid
 graph LR
@@ -33,10 +37,15 @@ graph LR
 - ✅ Command boundary detection — OSC 133 markers + timing-heuristic fallback
 - ✅ Automatic error analysis — when exit code ≠ 0, the LLM explains the cause and suggests fixes
 - ✅ Interactive REPL — when exit code = 0, freeform chat with the LLM
-- ✅ `aic chat` agent mode — explicit chat entry point. With an OpenAI-compatible provider it runs a tool-calling agent over your project; gracefully degrades to plain chat when the provider doesn't support tools
-- ✅ SRE shell execution (default-on) — the interactive agent can run **bounded** shell commands via `run_command`. Read-only diagnostics run automatically and may inspect the **whole host** (e.g. `tail /var/log/...`, `du -ah /tmp | sort -rh | head`, `find /tmp -mmin -10`); state-changing commands need confirmation and dangerous ones are blocked. Secret paths (`~/.ssh`, `~/.aws`, `/etc/shadow`, `*.pem`, `.env`, …) are blocked even for reads. Turn it off with `--no-run` / `--read-only` / `AIC_AGENT_NO_RUN=1` for a read-only session (`read_file`/`list_dir`/`grep`/`glob` only)
+- ✅ `aic chat` agent mode — runs project tools with supported OpenAI-compatible providers
+- ✅ Graceful fallback — uses plain chat when the provider does not support tools
+- ✅ SRE shell execution — runs bounded read-only diagnostics through `run_command`
+- ✅ Confirmation gates — requests approval for state changes and blocks dangerous commands
+- ✅ Secret-path protection — blocks sensitive paths, including `~/.ssh`, `/etc/shadow`, and `.env`
+- ✅ Read-only option — disable `run_command` with `--no-run`, `--read-only`, or `AIC_AGENT_NO_RUN=1`
 - ✅ Multiple LLM providers — OpenAI-compatible, Groq, Anthropic, CLI Backend (kiro-cli, claude-cli)
-- ✅ MCP tool servers — `aic chat` can call tools from configured **MCP servers** (e.g. mem-mesh memory) over Streamable HTTP; discovered tools join the agent under `<server>__<tool>` names, read-only ones (in `auto_approve`) run automatically and mutating ones require confirmation. Config: `[mcp.servers.<name>]` (see Configuration)
+- ✅ MCP tool servers — expose configured Streamable HTTP tools as `<server>__<tool>`
+- ✅ MCP safety gates — auto-approve listed read-only tools and confirm other tools
 - ✅ TUI compatibility — alternate-screen-buffer detection keeps vim, htop, etc. working correctly
 - ✅ Cross-platform — macOS (Apple Silicon, x86_64), Linux (x86_64, aarch64)
 
@@ -46,8 +55,8 @@ graph LR
 - ✅ Structured trace logs — JSONL daily-rotate (7-day retention), `AIC_LOG=info|debug`
 - ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
-- ✅ Proactive chat status bar — the `aic chat` status line samples host metrics in an off-thread task (so a hung mount or an idle prompt never freezes the UI) and surfaces problems live: severity-colored segments, a per-metric sparkline + trend arrow, a gated disk-exhaustion ETA (`disk 4.2G free · ~8m→crit`), and edge-triggered alerts that name the top offending process (`⚠ mem 97% — top: node 12.1G`) with hysteresis/cooldown. Toggle the alert lane with `/watch arm|off`
-- ✅ Deterministic machine health verdict — `/health` answers whether the current machine is healthy, degraded, or critical without an LLM call. It reports explicit per-axis coverage, preserves unavailable checks as `UNKNOWN`, emits stable evidence references, and automatically attaches the structured verdict plus redacted probe evidence when a chat RCA is active
+- ✅ Proactive chat status bar — samples host metrics off-thread and shows severity, trends, and bounded alerts
+- ✅ Deterministic health verdict — `/health` reports healthy, degraded, critical, or `UNKNOWN` without an LLM call
 - ✅ Workload discovery — `/discover` identifies supported service processes, ranks monitoring proposals, and lets a TTY user select explicit workload definitions before one confirmation.
 - ✅ `aic diagnose` — symptom-driven Safe probes → typed **Findings** (severity / confidence / probe_id). A deterministic threshold scan flags disk / inode / fd / swap exhaustion, kernel OOM-kills, and failed systemd units **without an LLM**; `aic diagnose --json` emits a machine-readable envelope
 - ✅ `aic rca` — persistent RCA workspace: incidents under `~/.aic/incidents/<id>/` (`evidence.jsonl` + `report.md`), with `start` / `status` / `timeline` / `report`; `--diagnose` attaches first evidence from the headless `/diagnose` engine
@@ -55,9 +64,11 @@ graph LR
 
 ### Security baseline
 - ✅ Secret/PII redaction — automatic masking for 5 secret types (AWS / GitHub / OpenAI / Anthropic / JWT) and 4 PII types (email / KR phone / KR resident number / IPv4); opt-out via `AIC_REDACT=off`
-- ✅ Read-only host diagnostics with a secret-path denylist — `run_command` read-only commands may read host-wide (logs, `/tmp`, `/proc`), but **secret paths are denied even for reads**: `~/.ssh`/`~/.aws`/`~/.gnupg`/`~/.kube`/`~/.docker`, `/etc/shadow`, `/etc/ssl/private`, `/proc/*/environ`, and `*.pem`/`*.key`/`.env`/`id_rsa`/`credentials` (symlink targets resolved via `canonicalize`). Egress (curl/ssh/nc) and mutation (rm/mv/`docker prune`) stay gated (confirm/block), and mutations remain confined to the cwd sandbox
+- ✅ Read-only host diagnostics — inspect logs, `/tmp`, and `/proc` while secret paths remain blocked
+- ✅ Egress and mutation gates — confirm or block network access and state changes
 - ✅ Audit log HMAC chain — `~/.local/state/aic/audit.log` JSONL append-only, integrity verification via `aic audit verify`. The HMAC key uses a **file backend by default**; the OS keychain is opt-in (`AIC_AUDIT_KEYCHAIN=1`), and `AIC_NO_KEYCHAIN=1` forces it off
-  - **Upgrade note**: if you used an earlier version where the audit key lived only in the OS keychain, the new file-backend default may report a verify WARN/missing-key (or skip new appends to protect the chain). Either keep verifying/using the keychain-backed chain by running with `AIC_AUDIT_KEYCHAIN=1`, **or** start a fresh file-backed chain by backing up/rotating `~/.local/state/aic/audit.log` and re-running. `aic doctor` prints both options.
+  - **Upgrade note**: Set `AIC_AUDIT_KEYCHAIN=1` to continue a keychain-backed chain.
+  - Back up or rotate `audit.log` before you start a new file-backed chain. `aic doctor` shows both options.
 - ✅ OS keychain — store API keys in macOS Keychain / Linux Secret Service / Windows Credential Manager; bulk migrate plaintext via `aic migrate-keys`
 
 ### LLM UX
@@ -118,7 +129,7 @@ matching release archive, verifies its SHA-256 against the published
 Override targets:
 
 ```bash
-AIC_VERSION=v0.4.0 sh install.sh        # pin a specific tag
+AIC_VERSION=<tag> sh install.sh         # pin a specific tag
 AIC_INSTALL_DIR=$HOME/.local/bin sh ... # install to a user dir
 ```
 
@@ -165,7 +176,7 @@ make check                   # fast workspace type-check
 ```bash
 aic update             # detect install source and upgrade in place
 aic update --check     # exit 1 if a newer release is available, 0 otherwise
-aic update --to v0.4.0 # pin a specific tag (manual installs only)
+aic update --to <tag>  # pin a specific tag (manual installs only)
 aic update --force     # reinstall even if already on the latest version
 ```
 
@@ -212,7 +223,7 @@ aic migrate-keys       # move plaintext API keys into the OS keychain (optional)
 aic doctor             # 9-axis diagnosis — see PASS/WARN/FAIL at a glance
 aic doctor --probe-tools  # opt-in live probe: does the provider actually support tool-calling?
 
-# 원격 host/group에서 같은 read-only 진단을 병렬 실행(원격 LLM 호출 없음)
+# Run the same read-only diagnosis across one host or a host group.
 aic diagnose --host web-01 "disk full"
 aic diagnose --host @web-tier "high cpu" --json
 
@@ -366,180 +377,53 @@ opens a candidate panel (↑↓ to move, Tab to cycle, Enter to pick, Esc to clo
 | `/watch [target] [--count N] [--every Ns]` | Re-run probes a few times and summarize what changed per tick (no LLM). Bounded: default 3 runs (max 20), interval 1s. `target` is any Probe Catalog id — LOCAL sections, `docker_df`/`docker_ps`, `tmp_big`/`tmp_recent` — e.g. `/watch tmp_recent` tracks files growing under `/tmp`; omit it for a compact set |
 | `/watch arm` \| `/watch off` | Toggle the proactive alert lane (default on). When armed, a worsening resource transition (Normal→Warn/Crit) drops a one-line ambient note into the chat (Crit also rings a bell) and recovery prints a `✓` line. `off`/`mute` silences it. Distinct from the bounded-probe `/watch <target>` above |
 
-### Workload discovery
+### Workload monitoring
 
-`/discover` shows supported service workloads. It does not change configuration.
+Discovery does not start monitoring. It only creates candidates from the current process inventory.
 
-In an interactive session, select definitions. Then confirm the write to `workloads.toml`.
+Use this lifecycle:
 
-The supported adapters are Nginx, JVM, Redis or Valkey, PostgreSQL, MySQL or MariaDB, MongoDB,
-Kafka, RabbitMQ, Elasticsearch, OpenSearch, HAProxy, Prometheus, ClickHouse, etcd, Consul, and
-Memcached. Discovery checks the process name and executable name.
+1. Run `aic workload discover --json` to find candidates.
+2. Run `aic workload inspect <id> --json` to check one candidate.
+3. Run `aic workload enable <id> --fingerprint <value> ...` to save a definition.
+4. Run `aic workload list --json` to verify saved definitions.
+5. Run `aic workload monitor <id> --json` to test one probe.
+6. Run `aic daemon start` to collect samples every 60 seconds.
+7. Run `aic workload status --json` and `aic workload history <id> --limit 20 --json`.
 
-Java services use the main class. RabbitMQ also checks an Erlang VM command line.
+The daemon reads saved definitions. It does not discover new processes automatically.
 
-`/discover --raw` shows the complete process inventory.
+A running daemon loads a new definition on the next collection cycle. This delay can take 60 seconds.
 
-Generic processes stay out of default discovery, LLM analysis, monitoring proposals, and interactive
-selection. A generic process can expose CPU, memory, and restart state. It does not provide
-service-level meaning.
+PostgreSQL, MySQL or MariaDB, MongoDB, Nginx, and HAProxy require explicit connection options.
 
-Each workload has a driver mode: `detect_only`, `inspect_ready`, or `monitor_ready`.
+Use only `unix:///absolute/path`, `tcp://host:port`, or `tls://host:port` endpoints. The adapter can impose stricter rules.
 
-Discovery creates `detect_only` drivers. Nginx checks known local configuration paths. Redis sends a
-bounded `INFO SERVER` request to a local socket or `127.0.0.1:6379`. Memcached sends a bounded
-`stats` request to `127.0.0.1:11211`. PostgreSQL sends an
-unauthenticated startup packet to a local socket or `127.0.0.1:5432`. A successful check sets
-`inspect_ready`. The checks do not read configuration content, credentials, or remote endpoints.
+The following status values describe collection state:
 
-`/workload inspect` shows the local evidence and pending driver checks.
+- `fresh`: A sample exists from the last 180 seconds.
+- `stale`: The newest sample is older than 180 seconds.
+- `no_samples`: A definition exists, but no sample exists.
+- `ambiguous_definitions`: Multiple definitions prevent collection for that adapter.
+- `not_collected`: The adapter supports discovery only.
 
-`inspect_ready` only confirms local read-only access. It does not collect service metrics.
+Thirteen adapters support monitoring. JVM, Kafka, and Consul support discovery only.
 
-`aic workload monitor <id> --json` runs one monitor probe from the shell. It has no
-`aic chat` slash-command form. Definitions without a connection use fixed local endpoints.
-Use `aic workload enable <id> --fingerprint <value> --endpoint <scheme://target>` to save an explicit endpoint.
-Use only `unix:///absolute/path`, `tcp://host:port`, or `tls://host:port` endpoints.
-Use brackets for IPv6, for example `tcp://[::1]:6379`.
-An explicit endpoint authorizes outbound connections to that host and port.
-Redis accepts `--auth-env NAME` or `--auth-keychain ACCOUNT`, and an optional `--username`.
-Memcached rejects authentication options. TLS uses native host roots and validates the endpoint host.
-PostgreSQL requires an explicit TCP or TLS endpoint, `--username`, and `--database`.
-PostgreSQL accepts `--auth-env NAME` or `--auth-keychain ACCOUNT` for password authentication.
-The secret is optional because PostgreSQL can use trust authentication.
-MySQL requires an explicit TCP or TLS endpoint and `--username`.
-MySQL accepts an optional `--database`.
-Use `--auth-env NAME` or `--auth-keychain ACCOUNT` for MySQL password authentication.
-MongoDB requires an explicit TCP or TLS endpoint. URI, SRV, and Unix endpoints are unsupported.
-For MongoDB authentication, set `--username` with one secret option.
-Use `--auth-source NAME` to override the default `admin` authentication database.
-The probe resolves the secret only when it connects.
-Redis returns `connected_clients`, `used_memory`, `total_commands_processed`,
-`instantaneous_ops_per_sec`, `keyspace_hits`, and `keyspace_misses`. Memcached returns
-`curr_connections`, `bytes`, `cmd_get`, `cmd_set`, `get_hits`, `get_misses`, and `evictions`.
-PostgreSQL returns `numbackends`, `xact_commit`, `xact_rollback`, `blks_read`, `blks_hit`,
-`tup_returned`, `tup_fetched`, `tup_inserted`, `tup_updated`, `tup_deleted`, `conflicts`,
-`temp_files`, `temp_bytes`, and `deadlocks`.
-MySQL returns `threads_connected`, `threads_running`, `connections`, `aborted_connects`,
-`questions`, `slow_queries`, `bytes_received`, and `bytes_sent`.
-MongoDB returns `connections_current`, `connections_available`, `connections_total_created`,
-`opcounters_query`, `opcounters_get_more`, `opcounters_command`, `network_bytes_in`,
-`network_bytes_out`, `network_num_requests`, and `uptime_seconds`.
-PostgreSQL runs one fixed query against `pg_stat_database`. It selects only the current database.
-MySQL runs one fixed `SHOW GLOBAL STATUS` query for the eight listed metrics.
-The PostgreSQL connection sets read-only transaction mode and bounded statement and lock timeouts.
-The monitor opens one connection for each probe. It does not use a connection pool.
-The PostgreSQL library does not expose a response byte limit. Its fixed query returns one scalar row.
-The MySQL library does not expose a response byte limit. The fixed query requests eight rows.
-MySQL TLS uses native host roots only and verifies the endpoint host.
-MongoDB runs one fixed `serverStatus` command with a three-second total timeout.
-The MongoDB client limits its internal pool to one connection. MongoDB TLS uses OpenSSL filesystem CA paths.
-Set `SSL_CERT_FILE` or `SSL_CERT_DIR` when the default filesystem paths do not contain the required CA.
-The MongoDB probe applies its 64 KiB limit after BSON decode. The driver can receive a larger response first.
-The Prometheus adapter supports the official Linux Prometheus server.
-It uses the fixed `/metrics` path without a custom query. It does not support authentication or redirects.
-It uses `127.0.0.1:9090` by default. An explicit TCP or TLS endpoint can override this address.
-TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
-Responses have a 1 MiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
-`tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`,
-`process_resident_memory_bytes`, `process_virtual_memory_bytes`, and `go_goroutines`.
-The ClickHouse adapter uses the HTTP interface on `127.0.0.1:8123` by default.
-An explicit TCP or TLS endpoint can override this address. Native port 9000 and Unix endpoints are unsupported.
-The adapter sends one fixed SQL query without a custom path, query parameter, or user SQL.
-It returns `queries`, `merges`, `part_mutations`, `replicated_fetches`, `replicated_sends`,
-`tcp_connections`, `http_connections`, `memory_tracking_bytes`, `uptime_seconds`, and
-`memory_resident_bytes`. The current query includes itself in the `queries` value.
-Optional Basic authentication requires TLS, `--username`, and one secret option.
-Use a read-only user with access to the required system tables. Database and `--auth-source` are unsupported.
-TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
-Responses have a 64 KiB limit. The client does not follow redirects.
-The etcd adapter uses anonymous `GET /metrics` on `127.0.0.1:2379` by default.
-An explicit TCP or TLS endpoint can override this address. TLS uses native host roots.
-Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
-The client does not follow redirects. The minimum supported modern etcd must expose the in-use database size metric.
-etcd returns `server_has_leader`, `server_is_leader`, `leader_changes_seen_total`,
-`proposals_applied_total`, `proposals_committed_total`, `proposals_failed_total`, `proposals_pending`,
-`mvcc_db_total_size_bytes`, `mvcc_db_total_size_in_use_bytes`, and `process_resident_memory_bytes`.
-The adapter does not support gRPC status, authentication, private CAs, mTLS, custom paths, queries, or Unix endpoints.
-The Elasticsearch and OpenSearch adapters use `127.0.0.1:9200` by default.
-They run fixed cluster stats requests and return `nodes_total`, `indices_count`, `shards_total`,
-`shards_primaries`, `docs_count`, `docs_deleted`, `store_size_bytes`, `fs_total_bytes`, and
-`fs_available_bytes`. Each adapter tracks candidates and ambiguity independently.
-Optional Basic authentication requires TLS, `--username`, and one secret option.
-Use a least-privilege monitoring user. TLS uses native host roots.
-Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
-The clients do not follow redirects. They do not support API keys, SigV4, private CAs, mTLS, custom paths, queries, searches, or node stats.
-The RabbitMQ adapter requires the `rabbitmq_management` plugin. It uses `127.0.0.1:15672` by default.
-It sends fixed `GET /api/overview` requests. Optional Basic authentication requires TLS and both credential fields.
-Use a dedicated user with the `monitoring` tag. Administrator access is not required.
-RabbitMQ returns `messages`, `messages_ready`, `messages_unacknowledged`, `queues`, `connections`,
-`channels`, `consumers`, `exchanges`, `message_stats_publish_total`, and `message_stats_deliver_get_total`.
-Missing optional message counters use zero. TLS uses native host roots.
-Connect operations use 200 ms, each probe has a three-second limit, and responses have a 64 KiB limit.
-The client does not follow redirects. It does not support AMQP port 5672, vhost selection, private CAs, mTLS, or custom APIs.
-The Nginx adapter requires an explicit TCP or TLS endpoint. It always requests `/stub_status`.
-Enable the Nginx `stub_status` module and configure that exact location before use.
-Optional Basic authentication requires TLS and both credential fields. TLS uses native host roots.
-Nginx returns `active_connections`, `accepts_total`, `handled_total`, `requests_total`, `reading`, `writing`, and `waiting`.
-Connect operations use 200 ms, each probe has a three-second limit, and responses have a 16 KiB limit.
-The client does not follow redirects. AIC does not change or reload Nginx configuration. Custom status paths are unsupported.
-The HAProxy adapter requires an explicit Unix stats socket with user-level read and write access.
-It runs on Unix targets that support atomic close-on-exec socket creation. It fails closed on macOS.
-It sends only `show stat` and stores `local-unix-socket` as the history endpoint label.
-It aggregates frontend counters and counts server rows with a down status.
-HAProxy returns `current_sessions`, `sessions_total`, `bytes_in_total`, `bytes_out_total`,
-`denied_requests_total`, `denied_responses_total`, `failed_connections_total`,
-`retry_warnings_total`, and `servers_down`.
-Socket operations use 200 ms, each probe has a three-second limit, and responses have a 256 KiB limit.
-The adapter does not support TCP, HTTP stats pages, authentication, custom commands, configuration changes, permission changes, or reloads.
+Read [Workload monitoring](docs/WORKLOAD-MONITORING.md) for adapter metrics, authentication, TLS rules, limits, paths, and examples.
 
-The monitor adapters are Redis, Memcached, PostgreSQL, MySQL, MongoDB, Prometheus, ClickHouse,
-etcd, Elasticsearch, OpenSearch, RabbitMQ, Nginx, and HAProxy. JVM, Kafka, and Consul remain
-discovery-only. JVM monitoring needs a separate opt-in JMX or verified local PerfData contract.
-Kafka monitoring needs a bounded Admin API, an egress policy, and a dedicated security schema.
-Consul does not expose one stable required metric set across server and client agents. AIC does not
-create history samples for these three discovery-only adapters.
-Each Redis and Memcached connect, read, and write uses a 200 ms limit.
-Each Redis and Memcached response has a 64 KiB limit.
-Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
-all required metrics.
+### Remote hosts and groups
 
-`aicd` probes one definition for each monitor adapter every 60 seconds.
-It uses the saved connection when present. Otherwise, Redis uses fixed socket paths or `127.0.0.1:6379`.
-Memcached uses `127.0.0.1:11211`. It resolves secret references only at probe time.
-MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
-Prometheus definitions can use the default endpoint or a saved endpoint.
-ClickHouse definitions can use the default endpoint or a saved endpoint.
-etcd definitions can use the default endpoint or a saved endpoint.
-Elasticsearch and OpenSearch definitions can use default or saved endpoints.
-RabbitMQ can use its default management endpoint or a saved endpoint. Nginx and HAProxy require
-saved connections. JVM, Kafka, and Consul definitions stay in the `not_collected` state.
+Define hosts and groups in `~/.aic/hosts.toml`. AIC can also import entries from `~/.ssh/config`.
 
-Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
-The default directory is `~/.local/state/aic`.
-The directory mode is 0700, and the file mode is 0600.
-Retention keeps 1440 samples.
+```bash
+aic hosts show
+aic hosts trust web-01
+aic hosts ping web-01 --cmd "uptime"
+aic hosts ping @web-tier --cmd "df -h"
+aic diagnose --host @web-tier "high cpu" --json
+```
 
-More than one definition of the same monitored adapter blocks only that adapter. All monitored adapters
-samples share the history file. Existing Redis sample JSON remains readable.
-Use `aic workload status [--json]` to read the current state without `aicd`.
-Use `aic workload history <id> [--limit N] [--json]` to read stored samples without `aicd`.
-
-Remote history transport remains unsupported.
-
-Probes come from a single **Probe Catalog** (`agent::probes`) of fixed, bounded, read-only Safe commands:
-local sysinfo sections (incl. `fd` = open file descriptors, current/max) + `process` + git read-only +
-`docker` (`docker_df`/`docker_ps`/`docker_images`) + `filesystem` (`tmp_big`/`tmp_recent`). `/local`,
-`/compare`, `/diagnose`, `/incident`, `/bundle`, and `/triage` all draw from it. The `docker`/`filesystem`
-probes are not in the default `/local` set (they need docker / absolute-path reads) but are selected by
-`/triage`, `/diagnose`, and `/watch`.
-
-Analysis commands send a **redacted** evidence snapshot to the provider in a single, tool-less,
-stateless call. `--raw` (and `AIC_LOCAL_NO_ANALYZE=1`) skip the model and show evidence only; on any
-provider error/timeout they fall back to the raw evidence. Analysis output is rendered as a CLI-friendly
-markdown subset (amber accents) on a TTY, plain when piped, with a progress spinner.
-
-Deferred (roadmap): `/runbook`, `/fix-preview`, `/config`, a background watch daemon, persistent `/audit` browsing.
+Remote execution uses SSH batch mode and read-only commands. Group execution applies concurrency and timeout limits.
 
 ### Safety model (run_command)
 
@@ -552,10 +436,13 @@ Deferred (roadmap): `/runbook`, `/fix-preview`, `/config`, a background watch da
 | **Dangerous** | Blocked | `rm -rf`, `mkfs`, `dd`, `ssh`/`scp`/`nc` (remote/arbitrary network) |
 | **Unknown** | Blocked (conservative) | unparseable / subshell `$(…)` |
 
-Additional guarantees: commands run via `sh -c` confined to the cwd sandbox with a minimal env allowlist
-(no API keys passed), bounded output + process-group timeout, and **secret/PII redaction** applied before
-anything reaches the LLM, the screen, or the audit log. Disable shell execution entirely with `--no-run` /
-`--read-only` / `AIC_AGENT_NO_RUN=1` (read-only tools `read_file`/`list_dir`/`grep`/`glob` remain).
+Safe read-only commands can inspect host-wide paths. Secret paths remain blocked, including symlink targets.
+
+Mutation commands stay inside the current working directory. All commands use a minimal environment allowlist.
+
+Output limits, process-group timeouts, and secret redaction apply before data reaches the LLM, screen, or audit log.
+
+Disable shell execution with `--no-run`, `--read-only`, or `AIC_AGENT_NO_RUN=1`. Read-only file tools remain available.
 
 ### Optional: Hook capture mode (metadata only, no PTY wrapper)
 
@@ -574,7 +461,7 @@ cargo build
 aic run -- cargo build              # preserves stdout/stderr and exit code
 ```
 
-### Environment variables
+### Agent environment controls
 
 | Variable | Effect |
 |---|---|
@@ -600,6 +487,7 @@ aic/
 │       │                            # AppConfig, capture_quality_hint()
 │       ├── ipc.rs                   # IpcRequest/Response — session/control/hook
 │       ├── error.rs                 # AicError
+│       ├── workload.rs              # workload definitions and samples
 │       └── paths.rs                 # session_socket_path, aicd_socket_path,
 │                                    # aicd_lock_path
 ├── aic-server/                      # two binaries: aic-session + aicd
@@ -611,14 +499,19 @@ aic/
 │       ├── session_registry.rs      # in-memory HashMap registry
 │       ├── hook_events.rs           # per-session bounded ring (Phase 3)
 │       ├── aicd_client.rs           # aic-session → aicd best-effort RPC
+│       ├── workload_monitor.rs       # periodic service-level probes
 │       ├── pty_manager.rs / output_processor.rs / boundary_detector.rs /
 │       │   ring_buffer.rs / uds_server.rs / lock.rs / metrics.rs / telemetry.rs
 ├── aic-client/                      # CLI client (binary: aic)
 │   └── src/
-│       ├── main.rs                  # clap CLI: 11+ subcommands
+│       ├── main.rs                  # clap CLI entry point and subcommands
 │       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
 │       ├── uds_client.rs            # session UDS + aicd control client
 │       ├── doctor.rs                # 9-axis diagnosis (incl. aicd supervisor)
+│       ├── workload.rs              # workload CLI behavior
+│       ├── agent/
+│       │   ├── hosts.rs              # remote host and group inventory
+│       │   └── mcp.rs                # MCP Streamable HTTP client
 │       ├── config.rs / auto_brancher.rs / error_analyzer.rs /
 │       │   llm_dispatcher.rs / repl.rs / cache.rs / redaction.rs /
 │       │   audit.rs / keychain.rs / streaming.rs / spinner.rs / top.rs
@@ -668,8 +561,7 @@ model = "llama-3.3-70b-versatile"
 # Model IDs: see https://docs.anthropic.com/en/docs/about-claude/models
 # Recommended: claude-opus-4-7 (most capable), claude-sonnet-4-6 (balanced, default),
 #              claude-haiku-4-5-20251001 (cheap/fast).
-# Older models (claude-sonnet-4-20250514, claude-3-5-haiku-20241022, etc.) may
-# return 404 once retired — update to the IDs above.
+# Retired models can return 404. Update them to the IDs above.
 [llm.providers.anthropic]
 provider_type = "Anthropic"
 endpoint = "https://api.anthropic.com/v1/messages"
@@ -686,111 +578,89 @@ provider_type = "CliBackend"
 cli_path = "claude"
 
 # ── Observability backends (SRE) ──
-# 등록된 백엔드만 질의 가능(endpoint allowlist) — LLM은 backend 이름만 고르고 URL은
-# 직접 줄 수 없다. reqwest redirect 비활성 + link-local(169.254) 차단으로 SSRF를 막는다.
-# aic chat의 tool-calling(prometheus_query/loki_query/es_search) + slash(/metrics, /logs)에서 사용.
+# The agent can query only registered backends. The LLM selects a backend name, not a URL.
+# Redirect and link-local blocking reduce SSRF risk.
 [observability.backends.prom]
-backend_type = "Prometheus"          # VictoriaMetrics도 PromQL 호환이라 "Prometheus"로 등록
+backend_type = "Prometheus"
 url = "http://prometheus:9090"
-# auth = "keychain:obs_prom"         # 선택: Bearer 토큰(평문 또는 keychain:<account> 참조)
+# auth = "keychain:obs_prom"
 
 [observability.backends.logs]
 backend_type = "Loki"
 url = "http://loki:3100"
 
 [observability.backends.es]
-backend_type = "Elasticsearch"       # OpenSearch 포함
+backend_type = "Elasticsearch"
 url = "http://elasticsearch:9200"
 ```
 
-관측 백엔드를 등록하면 `aic chat`에서 다음을 쓸 수 있다:
+Use registered backends from `aic chat`:
 
 ```sh
-# slash 명령(LLM 미호출, redacted raw 출력) — backend가 타입별 1개면 -b 생략 가능
 /metrics up
 /metrics -b prom rate(http_requests_total[5m])
 /logs {app="api"} |= "error"
-
-# 또는 자연어로 물으면 에이전트가 prometheus_query/loki_query/es_search 도구를 호출한다.
 ```
 
-### MCP servers (mem-mesh 등 외부 도구)
+Natural-language requests can call `prometheus_query`, `loki_query`, or `es_search`.
 
-`aic chat`이 [Model Context Protocol](https://modelcontextprotocol.io) 서버(예: mem-mesh 메모리)의
-tool을 직접 호출하게 한다. 현재 transport는 **Streamable HTTP**다. 등록하면 서버의 tool이
-`<server>__<tool>` 이름으로 에이전트 tool 목록에 합류한다.
+### MCP servers
+
+`aic chat` can call tools from [Model Context Protocol](https://modelcontextprotocol.io) servers.
+The current transport is Streamable HTTP. Each tool uses a `<server>__<tool>` name.
 
 ```toml
-# ── MCP servers ──
-# 각 서버의 tool이 chat tool-calling에 노출된다. 세션 시작 시 핸드셰이크(initialize/tools/list)로
-# tool을 발견하며, 서버가 다운/지연이면 해당 서버만 건너뛰고 진행한다(graceful degrade).
 [mcp.servers.mem-mesh]
-url = "http://127.0.0.1:8787/mcp"     # Streamable HTTP endpoint. obs와 동일한 SSRF 방어 적용
-# enabled = true                       # 기본 true. false면 연결·노출 안 함
-# auth = "keychain:mem-mesh"           # 선택: Authorization: Bearer(평문 또는 keychain:<account>)
-auto_approve = ["search", "context", "get_links", "stats"]   # read-only tool은 확인 없이 자동 실행
+url = "http://127.0.0.1:8787/mcp"
+# enabled = true
+# auth = "keychain:mem-mesh"
+auto_approve = ["search", "context", "get_links", "stats"]
 ```
 
-- **`auto_approve`** 에 적은 (read-only) tool은 자동 실행되고, 그 외(예: `add`/`delete`/`update`)
-  변경 tool은 실행 전 **y/N 확인**을 받는다(`run_command`와 동일 게이트).
-- tool 결과는 LLM에 넘기기 전 redaction + 길이 cap이 적용되고, 응답 크기도 bound된다.
-- 등록하면 에이전트가 대화 중 알아서 `mem-mesh__search`로 과거 맥락을 찾거나
-  `mem-mesh__add`로 결정을 저장할 수 있다(변경은 확인 후).
+Tools in `auto_approve` run without confirmation. Other tools require confirmation before execution.
 
-### aicd webhook alert ingestion (SRE R2)
+Tool results receive redaction and size limits before they reach the LLM.
 
-aicd가 Alertmanager/Grafana/PagerDuty/generic webhook을 수신해, firing alert마다
-`aic diagnose --bundle`(읽기 전용 진단 + 증거 번들)을 자동 spawn한다. 온콜이 터미널을
-열기 전에 증거가 준비된다. **기본 비활성 + 127.0.0.1 바인드**다.
+### Webhook alert ingestion
+
+`aicd` receives Alertmanager, Grafana, PagerDuty, and generic webhooks.
+It can run `aic diagnose --bundle` for each active alert. The listener is disabled by default.
 
 ```toml
 [aicd.webhook]
-enabled = true                    # opt-in (기본 false)
-listen_addr = "127.0.0.1:9099"    # 기본 localhost. 외부 노출은 리버스 프록시 경유 권장
-secret = "shared-secret"          # 인증용. env AIC_WEBHOOK_SECRET가 우선
-rate_limit_per_min = 10           # alert storm 비용 폭주 차단(token-bucket)
-dedup_ttl_secs = 300              # 동일 fingerprint 재진단 차단(루프 방지)
-auto_diagnose = true              # alert 수신 시 aic diagnose 자동 spawn
+enabled = true
+listen_addr = "127.0.0.1:9099"
+secret = "shared-secret"
+rate_limit_per_min = 10
+dedup_ttl_secs = 300
+auto_diagnose = true
 ```
 
-인증(secret 설정 시 둘 중 하나 필요):
-- `Authorization: Bearer <secret>` (Alertmanager/Grafana 헤더)
-- `X-AIC-Signature: <hex HMAC-SHA256(secret, body)>` (PagerDuty류/generic)
+If you set a secret, send one authentication header:
 
-엔드포인트: `POST /webhook/alertmanager` · `/webhook/grafana` · `/webhook/pagerduty` · `/webhook`(generic) · `GET /health`.
+- `Authorization: Bearer <secret>`
+- `X-AIC-Signature: <hex HMAC-SHA256(secret, body)>`
 
 ```sh
-# Alertmanager receiver 예시
-#   webhook_configs:
-#     - url: http://127.0.0.1:9099/webhook/alertmanager
-#       http_config: { authorization: { credentials: "shared-secret" } }
-
-aic webhook list            # 수신·진단·dedup·rate-limit 이력 조회
-aic webhook list --json     # 스크립팅용
+aic webhook list
+aic webhook list --json
 ```
 
-> 기능별 실전 온콜 워크플로는 [docs/SRE-USE-CASES.md](docs/SRE-USE-CASES.md), 설계 경계는
-> [docs/SRE-SCOPE-BOUNDARY.md](docs/SRE-SCOPE-BOUNDARY.md) 참조.
+Read [SRE use cases](docs/SRE-USE-CASES.md) and [SRE scope boundaries](docs/SRE-SCOPE-BOUNDARY.md).
 
-### Headless / air-gapped 서버 (SRE)
+### Headless and air-gapped servers
 
-aic는 TTY·GUI·인터넷이 없는 서버에서 1급으로 동작한다. CI의 `headless` job이 이 경로를
-매 PR마다 검증한다(비대화 diagnose/audit/webhook + NeedsConfirm 비대화 거부).
+Headless commands work without a TTY or GUI. CI checks non-interactive diagnosis, audit, and webhook paths.
 
-- **TTY 없음**: cron/systemd/webhook spawn에서 `aic diagnose`·`aic audit`·`aic webhook list`가
-  hang 없이 동작한다. NeedsConfirm(상태 변경) 명령은 비대화 환경에서 **자동 거부**된다.
-- **키체인 없음**: 헤드리스 Linux엔 Secret Service가 없을 수 있다. `AIC_NO_KEYCHAIN=1`로
-  keychain을 건너뛰고 API key를 config 평문/환경변수로 쓴다.
-- **air-gapped(인터넷 차단)**: 외부 LLM 대신 사내 OpenAI-compat 엔드포인트(vLLM/LiteLLM 등)를
-  `[llm.providers.*]`에 등록한다. 관측 백엔드·webhook도 전부 사내망 주소로 동작하므로
-  외부 송신 0으로 운영 가능하다.
+- Non-interactive commands reject actions that require confirmation.
+- Set `AIC_NO_KEYCHAIN=1` when Linux Secret Service is unavailable.
+- Register an internal OpenAI-compatible endpoint for air-gapped use.
 
 ```toml
-# air-gapped: 사내 LLM + 사내 관측 백엔드만 사용
 [llm.providers.internal]
 provider_type = "OpenAiCompatible"
 endpoint = "http://llm.internal:8000/v1/chat/completions"
-api_key = "keychain:internal"   # 또는 평문(headless면 env)
+api_key = "keychain:internal"
 model = "qwen2.5-coder"
 ```
 
