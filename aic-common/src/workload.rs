@@ -197,6 +197,18 @@ impl WorkloadConnectionConfig {
                     anyhow::bail!("MongoDB auth_source requires credentials");
                 }
             }
+            WorkloadAdapter::Prometheus => {
+                if matches!(self.endpoint()?, WorkloadEndpoint::Unix(_)) {
+                    anyhow::bail!("Prometheus workload connections require a TCP or TLS endpoint");
+                }
+                if self.username.is_some()
+                    || self.secret_ref.is_some()
+                    || self.database.is_some()
+                    || self.auth_source.is_some()
+                {
+                    anyhow::bail!("Prometheus workload connections do not support authentication or database fields");
+                }
+            }
             WorkloadAdapter::Redis | WorkloadAdapter::Memcached if self.database.is_some() => {
                 anyhow::bail!("Redis and Memcached workload connections do not support database");
             }
@@ -458,6 +470,20 @@ pub struct MongoDbMetrics {
     pub uptime_seconds: u64,
 }
 
+/// Numeric metrics returned by one bounded Prometheus `/metrics` scrape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrometheusMetrics {
+    pub config_last_reload_successful: u64,
+    pub tsdb_head_series: u64,
+    pub tsdb_head_chunks: u64,
+    pub tsdb_head_samples_appended_total: u64,
+    pub engine_queries: u64,
+    pub process_resident_memory_bytes: u64,
+    pub process_virtual_memory_bytes: u64,
+    pub go_goroutines: u64,
+}
+
 /// Adapter-specific metrics in a common workload sample.
 ///
 /// The untagged representation preserves the Redis metric JSON written by the first monitor.
@@ -469,6 +495,7 @@ pub enum WorkloadMetrics {
     PostgreSql(PostgreSqlMetrics),
     MySql(MySqlMetrics),
     MongoDb(MongoDbMetrics),
+    Prometheus(PrometheusMetrics),
 }
 
 /// Backward-compatible result of a one-shot Redis monitor probe.
@@ -512,6 +539,14 @@ pub struct MongoDbMonitorReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrometheusMonitorReport {
+    pub candidate_id: String,
+    pub adapter: WorkloadAdapter,
+    pub monitor_ready: bool,
+    pub metrics: PrometheusMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkloadMonitorReport {
     Redis(RedisMonitorReport),
@@ -519,6 +554,7 @@ pub enum WorkloadMonitorReport {
     PostgreSql(PostgreSqlMonitorReport),
     MySql(MySqlMonitorReport),
     MongoDb(MongoDbMonitorReport),
+    Prometheus(PrometheusMonitorReport),
 }
 
 pub const REDIS_INFO_REQUEST: &[u8] = b"*1\r\n$4\r\nINFO\r\n";
@@ -535,10 +571,13 @@ pub const MEMCACHED_LOOPBACK_ENDPOINT: &str = "127.0.0.1:11211";
 pub const POSTGRESQL_METRICS_QUERY: &str = "SELECT numbackends::bigint, xact_commit::bigint, xact_rollback::bigint, blks_read::bigint, blks_hit::bigint, tup_returned::bigint, tup_fetched::bigint, tup_inserted::bigint, tup_updated::bigint, tup_deleted::bigint, conflicts::bigint, temp_files::bigint, temp_bytes::bigint, deadlocks::bigint FROM pg_stat_database WHERE datname = current_database()";
 pub const MYSQL_METRICS_QUERY: &str = "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Connections','Aborted_connects','Questions','Slow_queries','Bytes_received','Bytes_sent')";
 pub const MONGODB_RESPONSE_BYTES: usize = 64 * 1024;
+pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
+pub const PROMETHEUS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const POSTGRESQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MYSQL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MONGODB_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const PROMETHEUS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const REDIS_RESPONSE_BYTES: usize = 64 * 1024;
 pub const MEMCACHED_RESPONSE_BYTES: usize = 64 * 1024;
 pub const WORKLOAD_SAMPLE_SCHEMA_VERSION: u32 = 1;
@@ -615,6 +654,7 @@ impl<'de> Deserialize<'de> for WorkloadSample {
                     | (WorkloadAdapter::PostgreSql, WorkloadMetrics::PostgreSql(_))
                     | (WorkloadAdapter::MySql, WorkloadMetrics::MySql(_))
                     | (WorkloadAdapter::MongoDb, WorkloadMetrics::MongoDb(_))
+                    | (WorkloadAdapter::Prometheus, WorkloadMetrics::Prometheus(_))
             );
             if !matches {
                 return Err(serde::de::Error::custom(
@@ -1281,6 +1321,174 @@ fn mongodb_metrics_from_document(
         network_bytes_out: metric(network, "bytesOut")?,
         network_num_requests: metric(network, "numRequests")?,
         uptime_seconds: metric(response, "uptime")?,
+    })
+}
+
+/// Scrape one bounded Prometheus `/metrics` endpoint.
+pub fn monitor_prometheus_with_connection(
+    connection: Option<&WorkloadConnectionConfig>,
+) -> std::result::Result<(String, PrometheusMetrics), WorkloadProbeError> {
+    let owned_connection = connection.cloned().unwrap_or(WorkloadConnectionConfig {
+        endpoint: format!("tcp://{PROMETHEUS_LOOPBACK_ENDPOINT}"),
+        username: None,
+        secret_ref: None,
+        database: None,
+        auth_source: None,
+    });
+    owned_connection
+        .validate_for(WorkloadAdapter::Prometheus)
+        .map_err(|_| {
+            WorkloadProbeError::Malformed("Prometheus connection configuration is invalid".into())
+        })?;
+    let url = prometheus_metrics_url(&owned_connection)?;
+    let endpoint = owned_connection.endpoint.clone();
+    let metrics = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| {
+                WorkloadProbeError::Unreachable("Prometheus probe runtime is unavailable".into())
+            })?;
+        runtime.block_on(async {
+            tokio::time::timeout(PROMETHEUS_PROBE_TIMEOUT, monitor_prometheus_async(&url))
+                .await
+                .map_err(|_| WorkloadProbeError::Unreachable("Prometheus probe timed out".into()))?
+        })
+    })
+    .join()
+    .map_err(|_| WorkloadProbeError::Unreachable("Prometheus probe runtime failed".into()))??;
+    Ok((endpoint, metrics))
+}
+
+fn prometheus_metrics_url(
+    connection: &WorkloadConnectionConfig,
+) -> std::result::Result<String, WorkloadProbeError> {
+    match connection
+        .endpoint()
+        .map_err(|_| WorkloadProbeError::Malformed("Prometheus endpoint is invalid".into()))?
+    {
+        WorkloadEndpoint::Tcp { host, port } => {
+            Ok(format!("http://{}:{port}/metrics", url_host(&host)))
+        }
+        WorkloadEndpoint::Tls { host, port } => {
+            Ok(format!("https://{}:{port}/metrics", url_host(&host)))
+        }
+        WorkloadEndpoint::Unix(_) => Err(WorkloadProbeError::Malformed(
+            "Prometheus endpoint must use TCP or TLS".into(),
+        )),
+    }
+}
+
+fn url_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    }
+}
+
+async fn monitor_prometheus_async(
+    url: &str,
+) -> std::result::Result<PrometheusMetrics, WorkloadProbeError> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DRIVER_CONNECT_TIMEOUT)
+        .timeout(PROMETHEUS_PROBE_TIMEOUT)
+        .build()
+        .map_err(|_| {
+            WorkloadProbeError::Unreachable("Prometheus HTTP client is unavailable".into())
+        })?;
+    let mut response = client.get(url).send().await.map_err(|_| {
+        WorkloadProbeError::Unreachable("Prometheus endpoint is unavailable".into())
+    })?;
+    if !response.status().is_success() {
+        return Err(WorkloadProbeError::Rejected(
+            "Prometheus rejected metrics request".into(),
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > PROMETHEUS_RESPONSE_BYTES as u64)
+    {
+        return Err(WorkloadProbeError::Malformed(
+            "Prometheus response exceeds the size limit".into(),
+        ));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        WorkloadProbeError::Unreachable("Prometheus response could not be read".into())
+    })? {
+        if body.len().saturating_add(chunk.len()) > PROMETHEUS_RESPONSE_BYTES {
+            return Err(WorkloadProbeError::Malformed(
+                "Prometheus response exceeds the size limit".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| WorkloadProbeError::Malformed("Prometheus response is not UTF-8".into()))?;
+    parse_prometheus_metrics(body)
+}
+
+fn parse_prometheus_metrics(
+    body: &str,
+) -> std::result::Result<PrometheusMetrics, WorkloadProbeError> {
+    const REQUIRED: [&str; 8] = [
+        "prometheus_config_last_reload_successful",
+        "prometheus_tsdb_head_series",
+        "prometheus_tsdb_head_chunks",
+        "prometheus_tsdb_head_samples_appended_total",
+        "prometheus_engine_queries",
+        "process_resident_memory_bytes",
+        "process_virtual_memory_bytes",
+        "go_goroutines",
+    ];
+    let mut values = BTreeMap::new();
+    for line in body.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let name_end = line
+            .find(|character: char| character == '{' || character.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let name = &line[..name_end];
+        if !REQUIRED.contains(&name) {
+            continue;
+        }
+        if line[name_end..].starts_with('{') {
+            return Err(WorkloadProbeError::Malformed(format!(
+                "Prometheus required metric contains labels: {name}"
+            )));
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 || values.contains_key(name) {
+            return Err(WorkloadProbeError::Malformed(format!(
+                "Prometheus required metric is duplicate or malformed: {name}"
+            )));
+        }
+        let value = parse_prometheus_u64(fields[1], name)?;
+        values.insert(name, value);
+    }
+    let mut take = |name| {
+        values.remove(name).ok_or_else(|| {
+            WorkloadProbeError::Malformed(format!("Prometheus response is missing {name}"))
+        })
+    };
+    Ok(PrometheusMetrics {
+        config_last_reload_successful: take("prometheus_config_last_reload_successful")?,
+        tsdb_head_series: take("prometheus_tsdb_head_series")?,
+        tsdb_head_chunks: take("prometheus_tsdb_head_chunks")?,
+        tsdb_head_samples_appended_total: take("prometheus_tsdb_head_samples_appended_total")?,
+        engine_queries: take("prometheus_engine_queries")?,
+        process_resident_memory_bytes: take("process_resident_memory_bytes")?,
+        process_virtual_memory_bytes: take("process_virtual_memory_bytes")?,
+        go_goroutines: take("go_goroutines")?,
+    })
+}
+
+fn parse_prometheus_u64(value: &str, name: &str) -> std::result::Result<u64, WorkloadProbeError> {
+    value.parse::<u64>().map_err(|_| {
+        WorkloadProbeError::Malformed(format!("Prometheus metric is not a u64: {name}"))
     })
 }
 
@@ -2235,6 +2443,117 @@ path = "/usr/bin/redis-server"
         );
         let mut mismatched = serde_json::to_value(&sample).unwrap();
         mismatched["adapter"] = serde_json::Value::String("my_sql".into());
+        assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
+    }
+
+    fn prometheus_response() -> String {
+        [
+            "# HELP ignored comment",
+            "unknown_metric 99",
+            "prometheus_config_last_reload_successful 1",
+            "prometheus_tsdb_head_series 2",
+            "prometheus_tsdb_head_chunks 3",
+            "prometheus_tsdb_head_samples_appended_total 4",
+            "prometheus_engine_queries 5",
+            "process_resident_memory_bytes 6",
+            "process_virtual_memory_bytes 7",
+            "go_goroutines 8",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn prometheus_endpoint_maps_to_fixed_metrics_url_and_rejects_configuration_fields() {
+        let tcp = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:9090".into(),
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        tcp.validate_for(WorkloadAdapter::Prometheus).unwrap();
+        assert_eq!(
+            prometheus_metrics_url(&tcp).unwrap(),
+            "http://127.0.0.1:9090/metrics"
+        );
+        let tls = WorkloadConnectionConfig {
+            endpoint: "tls://[::1]:9090".into(),
+            ..tcp.clone()
+        };
+        assert_eq!(
+            prometheus_metrics_url(&tls).unwrap(),
+            "https://[::1]:9090/metrics"
+        );
+        for invalid in [
+            WorkloadConnectionConfig {
+                username: Some("monitor".into()),
+                secret_ref: Some("env:PROM_PASSWORD".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                database: Some("metrics".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                auth_source: Some("admin".into()),
+                ..tcp.clone()
+            },
+            WorkloadConnectionConfig {
+                endpoint: "unix:///run/prometheus.sock".into(),
+                ..tcp
+            },
+        ] {
+            assert!(invalid.validate_for(WorkloadAdapter::Prometheus).is_err());
+        }
+    }
+
+    #[test]
+    fn prometheus_parser_requires_exact_label_free_u64_metrics() {
+        let metrics = parse_prometheus_metrics(&prometheus_response()).unwrap();
+        assert_eq!(metrics.tsdb_head_samples_appended_total, 4);
+        assert_eq!(metrics.go_goroutines, 8);
+        for replacement in [
+            "prometheus_engine_queries{slice=\"inner_eval\"} 5",
+            "prometheus_engine_queries NaN",
+            "prometheus_engine_queries +Inf",
+            "prometheus_engine_queries -1",
+            "prometheus_engine_queries 1.5",
+            "prometheus_engine_queries 18446744073709551616",
+        ] {
+            let response =
+                prometheus_response().replace("prometheus_engine_queries 5", replacement);
+            assert!(matches!(
+                parse_prometheus_metrics(&response),
+                Err(WorkloadProbeError::Malformed(_))
+            ));
+        }
+        let missing = prometheus_response().replace("go_goroutines 8", "");
+        assert!(parse_prometheus_metrics(&missing).is_err());
+        let duplicate = format!("{}\ngo_goroutines 9", prometheus_response());
+        assert!(parse_prometheus_metrics(&duplicate).is_err());
+    }
+
+    #[test]
+    fn prometheus_metric_variant_matches_only_prometheus_samples() {
+        let sample = WorkloadSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "prometheus".into(),
+            captured_at: Utc::now(),
+            adapter: WorkloadAdapter::Prometheus,
+            outcome: WorkloadSampleOutcome::Collected {
+                endpoint: "tcp://127.0.0.1:9090".into(),
+                metrics: WorkloadMetrics::Prometheus(
+                    parse_prometheus_metrics(&prometheus_response()).unwrap(),
+                ),
+            },
+        };
+        let json = serde_json::to_string(&sample).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WorkloadSample>(&json).unwrap(),
+            sample
+        );
+        let mut mismatched = serde_json::to_value(&sample).unwrap();
+        mismatched["adapter"] = serde_json::Value::String("redis".into());
         assert!(serde_json::from_value::<WorkloadSample>(mismatched).is_err());
     }
 

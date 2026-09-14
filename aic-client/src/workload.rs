@@ -3,10 +3,11 @@
 use aic_common::workload::{
     load_workload_history, monitor_memcached_with_connection, monitor_mongodb_with_connection,
     monitor_mysql_with_connection, monitor_postgresql_with_connection,
-    monitor_redis_with_connection, workload_history_path, workloads_file_path,
-    MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport, PostgreSqlMonitorReport,
-    ProposalCost, ProposalReadiness, RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError,
-    WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
+    monitor_prometheus_with_connection, monitor_redis_with_connection, workload_history_path,
+    workloads_file_path, MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport,
+    PostgreSqlMonitorReport, PrometheusMonitorReport, ProposalCost, ProposalReadiness,
+    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
+    WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -363,6 +364,14 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                     .map_err(|error| safe_monitor_error(WorkloadAdapter::MongoDb, error))?,
             })
         }
+        WorkloadAdapter::Prometheus => WorkloadMonitorReport::Prometheus(PrometheusMonitorReport {
+            candidate_id: candidate.id.clone(),
+            adapter: WorkloadAdapter::Prometheus,
+            monitor_ready: true,
+            metrics: monitor_prometheus_with_connection(connection.as_ref())
+                .map(|(_, metrics)| metrics)
+                .map_err(|error| safe_monitor_error(WorkloadAdapter::Prometheus, error))?,
+        }),
         _ => bail!("workload candidate does not support monitoring"),
     };
     Ok(report)
@@ -375,6 +384,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
         WorkloadAdapter::PostgreSql => "PostgreSQL",
         WorkloadAdapter::MySql => "MySQL",
         WorkloadAdapter::MongoDb => "MongoDB",
+        WorkloadAdapter::Prometheus => "Prometheus",
         _ => "Workload",
     };
     let detail = match error {
@@ -401,6 +411,7 @@ fn select_monitor_candidate<'a>(
             | WorkloadAdapter::PostgreSql
             | WorkloadAdapter::MySql
             | WorkloadAdapter::MongoDb
+            | WorkloadAdapter::Prometheus
     ) {
         bail!("workload candidate does not support monitoring");
     }
@@ -870,6 +881,7 @@ pub fn derive_status(
                     | WorkloadAdapter::PostgreSql
                     | WorkloadAdapter::MySql
                     | WorkloadAdapter::MongoDb
+                    | WorkloadAdapter::Prometheus
             ) {
                 return WorkloadStatusEntry {
                     workload_id: definition.id.clone(),

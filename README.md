@@ -435,15 +435,23 @@ MySQL TLS uses native host roots only and verifies the endpoint host.
 MongoDB runs one fixed `serverStatus` command with a three-second total timeout.
 The MongoDB client limits its internal pool to one connection. MongoDB TLS uses OpenSSL system roots.
 The MongoDB probe applies its 64 KiB limit after BSON decode. The driver can receive a larger response first.
+The Prometheus adapter supports the official Linux Prometheus server.
+It uses the fixed `/metrics` path without a custom query. It does not support authentication or redirects.
+It uses `127.0.0.1:9090` by default. An explicit TCP or TLS endpoint can override this address.
+TLS uses native host roots. Connect operations use 200 ms, and each probe has a three-second limit.
+Responses have a 64 KiB limit. Prometheus returns `config_last_reload_successful`, `tsdb_head_series`,
+`tsdb_head_chunks`, `tsdb_head_samples_appended_total`, `engine_queries`,
+`process_resident_memory_bytes`, `process_virtual_memory_bytes`, and `go_goroutines`.
 Each Redis and Memcached connect, read, and write uses a 200 ms limit.
 Each Redis and Memcached response has a 64 KiB limit.
 Memcached responses must end with `END`. The probe sets `monitor_ready: true` only after it parses
 all required metrics.
 
-`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, and MongoDB definition every 60 seconds.
+`aicd` probes one configured Redis, Memcached, PostgreSQL, MySQL, MongoDB, and Prometheus definition every 60 seconds.
 It uses the saved connection when present. Otherwise it uses the fixed Redis socket paths or
 `127.0.0.1:6379`, and `127.0.0.1:11211` for Memcached. It resolves secret references only at probe time.
 MySQL, PostgreSQL, and MongoDB require saved connections. Multiple definitions make only that adapter ambiguous.
+Prometheus definitions can use the default endpoint or a saved endpoint.
 
 Samples use `$XDG_STATE_HOME/aic/workload-history.jsonl`.
 The default directory is `~/.local/state/aic`.
