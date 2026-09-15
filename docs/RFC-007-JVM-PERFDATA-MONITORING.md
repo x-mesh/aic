@@ -309,21 +309,34 @@ The fixture spike must prove a stable semantic mapping before PR 1 receives appr
 
 Each mapping records JDK vendor, major version, counter aliases, raw type, units, variability, scale, and typed output field.
 
-The proposed required outputs are:
+The fixture spike removed `uptime_millis`. JDK 25 does not expose `sun.os.hrt.ticks`.
+
+Do not derive uptime from `sun.rt.applicationTime`. That counter excludes JVM activity outside application execution.
+
+The required outputs are:
 
 | Output | Type and unit | Semantic rule |
 | --- | --- | --- |
-| `uptime_millis` | Nonnegative `u64` milliseconds | Convert elapsed ticks with the fixture-proven PerfData frequency. Use checked integer arithmetic. |
+| `threads_started_total` | Nonnegative `u64` count | Use cumulative `java.threads.started`. |
 | `threads_live` | Nonnegative `u64` count | Current live Java threads. Do not include an alias with different thread semantics. |
 | `threads_peak` | Nonnegative `u64` count | Highest live Java thread count since JVM start. Require `threads_peak >= threads_live`. |
-| `classes_loaded` | Nonnegative `u64` count | Classes currently loaded. Do not use cumulative loaded-class counters. |
-| `classes_unloaded_total` | Nonnegative `u64` count | Cumulative unloaded classes since JVM start. |
+| `threads_daemon` | Nonnegative `u64` count | Current live daemon threads. Require `threads_daemon <= threads_live`. |
+| `classes_loaded` | Nonnegative `u64` count | Sum loaded and shared-loaded totals, then subtract both unloaded totals. |
+| `classes_unloaded_total` | Nonnegative `u64` count | Sum unloaded and shared-unloaded totals. |
 
 Raw PerfData integer widths can be signed. Reject negative values and checked-conversion overflow.
 
 The implementation must define an explicit versioned counter-name alias map for every supported fixture.
 
-Do not approve a required output until Temurin and OpenJDK 17, 21, and 25 fixtures prove the same meaning and unit.
+V1 supports Eclipse Temurin OpenJDK builds only. Other vendors require separate fixture and live evidence.
+
+Do not approve a required output until Temurin 17, 21, and 25 sanitized captures prove the same meaning and unit.
+
+The raw required allowlist contains four thread counters and four class counters. All are scalar signed 64-bit values.
+
+The thread counters are `java.threads.started`, `live`, `livePeak`, and `daemon`.
+
+The class counters are `java.cls.loadedClasses`, `sharedLoadedClasses`, `unloadedClasses`, and `sharedUnloadedClasses`.
 
 If the spike cannot prove one required output, remove it or stop implementation. Do not infer aliases from name similarity.
 
@@ -481,6 +494,8 @@ Add property tests for cursor monotonicity, bounded allocation, and deterministi
 
 Add a fuzz target for the complete bounded parser. Seed it with all supported fixtures.
 
+The dependency-free parser PR uses property tests and a checked-in corpus. A separate PR1b adds `cargo-fuzz` after dependency approval.
+
 Run production parser tests through the worker protocol. Verify input, output, and trailing-byte caps.
 
 ### 11.3 Security tests
@@ -567,9 +582,15 @@ The same-UID kill criterion applies only to undetected path, inode, owner, names
 
 ### PR 1: Parser and fixtures
 
-Add the bounded PerfData parser and versioned worker protocol. Add fixtures, property tests, and the fuzz target.
+Add the bounded PerfData parser and versioned worker protocol. Add sanitized capture fixtures and property tests.
 
 Do not connect the parser to discovery, CLI, daemon, filesystem access, or history.
+
+### PR 1b: Fuzz harness
+
+Add the `cargo-fuzz` harness and seed corpus after exact dependency approval.
+
+Do not start PR 2 until the fuzz harness completes its bounded CI smoke run.
 
 ### PR 2: Trusted local reader
 
