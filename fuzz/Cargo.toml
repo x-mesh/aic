@@ -1,0 +1,20 @@
+[package]
+name = "aic-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+aic-common = { path = "../aic-common", default-features = false, features = ["phase-3_4"] }
+
+[[bin]]
+name = "jvm_perfdata"
+path = "fuzz_targets/jvm_perfdata.rs"
+test = false
+doc = false
+bench = false

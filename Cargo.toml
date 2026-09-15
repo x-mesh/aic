@@ -1,5 +1,6 @@
 [workspace]
 members = ["aic-common", "aic-server", "aic-client"]
+exclude = ["fuzz"]
 resolver = "2"
 
 # Phase features (phase-3_1 ~ phase-3_5) 는 각 member crate (aic-common / aic-server /
