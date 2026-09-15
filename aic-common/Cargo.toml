@@ -24,6 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 libc = "0.2"
+sha2 = "=0.10.9"
 rand = "0.8"
 # secret·PII redaction(redaction.rs) 패턴 매칭. aic-client에서 옮겨오며 함께 이동 —
 # aic-server(OTLP exporter)도 동일 redaction을 공유한다.

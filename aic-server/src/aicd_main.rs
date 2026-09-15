@@ -48,12 +48,45 @@ struct Cli {
     /// 로그를 stderr로 출력 (default는 tracing의 기본 layer 사용).
     #[arg(long)]
     foreground: bool,
+
+    #[arg(long, hide = true)]
+    jvm_perfdata_worker: bool,
+
+    #[arg(long, hide = true, default_value = "normal")]
+    jvm_perfdata_worker_test: String,
+
+    #[arg(long, hide = true)]
+    jvm_perfdata_fd_setup_test: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.jvm_perfdata_fd_setup_test {
+        #[cfg(target_os = "linux")]
+        std::process::exit(aic_server::jvm_perfdata_worker::fd_setup_test_main());
+        #[cfg(not(target_os = "linux"))]
+        std::process::exit(70);
+    }
+    if cli.jvm_perfdata_worker {
+        let test_mode = std::env::args()
+            .find_map(|argument| {
+                argument
+                    .strip_prefix("--jvm-perfdata-worker-test=")
+                    .map(str::to_owned)
+            })
+            .unwrap_or(cli.jvm_perfdata_worker_test);
+        let hook = aic_server::jvm_perfdata_worker::WorkerTestHook::from_cli(&test_mode)
+            .ok_or_else(|| anyhow::anyhow!("invalid JVM PerfData worker test mode"))?;
+        std::process::exit(aic_server::jvm_perfdata_worker::worker_main(hook));
+    }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(daemon_main(cli))
+}
+
+async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     // sysinfo의 `/proc/<pid>/stat` fd 캐시를 끈다 — **첫 프로세스 refresh보다 먼저** 불러야 한다
     // (sysinfo 문서의 명시 조건).
     //

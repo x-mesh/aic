@@ -13,6 +13,14 @@ const METRICS_RESPONSE_BODY_LEN: usize = 50;
 const FAILURE_RESPONSE_BODY_LEN: usize = 3;
 const MAX_WORKER_FRAME_BODY: usize = 64 * 1024;
 
+#[cfg(target_os = "linux")]
+pub use crate::jvm_perfdata_linux::capture_linux;
+
+#[cfg(not(target_os = "linux"))]
+pub fn capture_linux(_request: &WorkerRequest) -> WorkerResponse {
+    WorkerResponse::Failure(WorkerFailure::Rejected)
+}
+
 const THREAD_STARTED: &str = "java.threads.started";
 const THREAD_LIVE: &str = "java.threads.live";
 const THREAD_PEAK: &str = "java.threads.livePeak";
@@ -53,6 +61,44 @@ pub struct JvmPerfDataMetrics {
 enum ByteOrder {
     Big,
     Little,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PerfDataPrologue {
+    pub(crate) byte_order: u8,
+    pub(crate) accessible: u8,
+    pub(crate) used: usize,
+    pub(crate) overflow: i32,
+    pub(crate) modification_timestamp: i64,
+    pub(crate) entry_offset: usize,
+    pub(crate) entry_count: usize,
+}
+
+pub(crate) fn decode_prologue(input: &[u8]) -> Result<PerfDataPrologue, ParseError> {
+    let prologue = input.get(..PROLOGUE_LEN).ok_or(ParseError::Malformed)?;
+    if prologue[..4] != MAGIC {
+        return Err(ParseError::InvalidMagic);
+    }
+    let order = match prologue[4] {
+        0 => ByteOrder::Big,
+        1 => ByteOrder::Little,
+        _ => return Err(ParseError::UnsupportedFormat),
+    };
+    if prologue[5] != 2 || prologue[6] != 0 {
+        return Err(ParseError::UnsupportedFormat);
+    }
+    if prologue[7] != 1 {
+        return Err(ParseError::Inaccessible);
+    }
+    Ok(PerfDataPrologue {
+        byte_order: prologue[4],
+        accessible: prologue[7],
+        used: nonnegative_usize(order.i32(&prologue[8..12])?)?,
+        overflow: order.i32(&prologue[12..16])?,
+        modification_timestamp: order.i64(&prologue[16..24])?,
+        entry_offset: nonnegative_usize(order.i32(&prologue[24..28])?)?,
+        entry_count: nonnegative_usize(order.i32(&prologue[28..32])?)?,
+    })
 }
 
 impl ByteOrder {
@@ -136,29 +182,18 @@ pub fn parse(input: &[u8]) -> Result<JvmPerfDataMetrics, ParseError> {
     if input.len() > MAX_PERFDATA_BYTES {
         return Err(ParseError::InputTooLarge);
     }
-    let prologue = input.get(..PROLOGUE_LEN).ok_or(ParseError::Malformed)?;
-    if prologue[..4] != MAGIC {
-        return Err(ParseError::InvalidMagic);
-    }
-    let order = match prologue[4] {
+    let decoded = decode_prologue(input)?;
+    let order = match decoded.byte_order {
         0 => ByteOrder::Big,
         1 => ByteOrder::Little,
-        _ => return Err(ParseError::UnsupportedFormat),
+        _ => unreachable!("decode_prologue validates byte order"),
     };
-    if prologue[5] != 2 || prologue[6] != 0 {
-        return Err(ParseError::UnsupportedFormat);
-    }
-    if prologue[7] != 1 {
-        return Err(ParseError::Inaccessible);
-    }
-    let used = nonnegative_usize(order.i32(&prologue[8..12])?)?;
-    if order.i32(&prologue[12..16])? != 0 {
+    let used = decoded.used;
+    if decoded.overflow != 0 {
         return Err(ParseError::Overflow);
     }
-    // Validate the timestamp field even though the capture layer compares it.
-    let _modification_timestamp = order.i64(&prologue[16..24])?;
-    let entry_offset = nonnegative_usize(order.i32(&prologue[24..28])?)?;
-    let entry_count = nonnegative_usize(order.i32(&prologue[28..32])?)?;
+    let entry_offset = decoded.entry_offset;
+    let entry_count = decoded.entry_count;
     if used < PROLOGUE_LEN || used > input.len() || entry_count > MAX_ENTRIES {
         return Err(if entry_count > MAX_ENTRIES {
             ParseError::LimitExceeded

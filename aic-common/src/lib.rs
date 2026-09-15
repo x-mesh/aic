@@ -8,6 +8,8 @@ pub mod error;
 pub mod ipc;
 #[doc(hidden)]
 pub mod jvm_perfdata;
+#[cfg(target_os = "linux")]
+mod jvm_perfdata_linux;
 pub mod paths;
 /// UDS 상대편 uid 검증 — 경로·권한 검사가 못 막는 구간을 커널 판정으로 닫는다.
 pub mod peercred;
