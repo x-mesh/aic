@@ -1,4 +1,5 @@
 //! Isolated Linux worker lifecycle for trusted HotSpot PerfData capture.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 #[cfg(target_os = "linux")]
 use aic_common::jvm_perfdata::{decode_request, encode_response};
@@ -300,7 +301,7 @@ impl JvmWorkerSupervisor {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = request;
-            return Err(WorkerError::Unsupported);
+            Err(WorkerError::Unsupported)
         }
 
         #[cfg(target_os = "linux")]
@@ -542,7 +543,7 @@ pub fn worker_main(test_hook: WorkerTestHook) -> i32 {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = test_hook;
-        return 70;
+        70
     }
     #[cfg(target_os = "linux")]
     {
