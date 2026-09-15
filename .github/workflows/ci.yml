@@ -34,7 +34,10 @@ jobs:
             linux-fuzz-nightly-2026-09-01-cargo-fuzz-0.13.2-
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+        run: |
+          if [ "$(cargo fuzz --version 2>/dev/null || true)" != "cargo-fuzz 0.13.2" ]; then
+            cargo install cargo-fuzz --version 0.13.2 --locked --force
+          fi
 
       - name: Verify fuzz lockfile and corpus
         run: |

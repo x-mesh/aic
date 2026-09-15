@@ -62,15 +62,27 @@ The daemon must not create JVM definitions. It must not enable new JVM candidate
 
 The AIC process must not run as root. The AIC process and JVM process must have the same effective UID.
 
-The monitor must compare the effective UID with `/proc/<pid>/status`. It must reject any mismatch.
+Read `/proc/<pid>/status` with a 64 KiB cap and one extra byte for EOF proof. Reject truncation, NUL, or incomplete data.
+
+Parse one `Uid:` line with four unsigned decimal fields. Use the second field as the effective UID.
+
+Reject duplicate lines or extra fields.
+
+The monitor must compare the effective UID with `geteuid()`. It must reject any mismatch.
 
 The monitor must reject an effective UID of zero. It must not use root access to bypass this rule.
 
 The monitor must compare the user, PID, and mount namespace identities for AIC and the JVM.
 
-Read each identity from `/proc/self/ns/{user,pid,mnt}` and `/proc/<pid>/ns/{user,pid,mnt}`.
+Open `/proc/self` and `/proc/<pid>` as directory descriptors. Keep both descriptors for the complete capture.
 
-Compare the opened namespace objects by device and inode. Reject missing, inaccessible, or different namespace objects.
+Open `ns/user`, `ns/pid`, and `ns/mnt` relative to each proc descriptor with `O_RDONLY | O_CLOEXEC`.
+
+These opens follow procfs namespace magic links to the namespace objects. Do not apply `O_NOFOLLOW` to namespace entries.
+
+Compare each self and target namespace object by device and inode. Reject missing, inaccessible, or different objects.
+
+After capture, open all six namespace objects again. Compare each new object with its original descriptor and matching peer.
 
 Container and cross-namespace collection require a separate privileged design. V1 must not fall back to host paths.
 
@@ -84,13 +96,21 @@ Enablement requires exactly one current, unambiguous runtime binding for the sav
 
 Each probe verifies only the saved PID and saved identity. A later process with the same selector does not change that binding.
 
-Read field 22 from `/proc/<pid>/stat`. Parse the field after the final command-name parenthesis with the same parser used at enablement.
+Read at most 4 KiB from `/proc/<pid>/stat` and prove EOF with one extra byte. Reject NUL, truncation, and incomplete data.
+
+Find the last `) ` delimiter. Tokenize from field 3. Parse zero-based tail token 19 as field 22.
+
+Accept only unsigned ASCII decimal raw ticks that fit `u64`. Use the same parser during enablement and capture.
 
 Compare the current start time with the saved start time. Reject a mismatch as `identity_changed`.
 
-Read `/proc/<pid>/exe` through its procfs link with a 4 KiB bound. Compare it with the saved executable identity.
+Open `/proc/<pid>` once as a directory descriptor. Resolve `exe` with `readlinkat` into a 4,097-byte buffer.
 
-Read at most 64 KiB from `/proc/<pid>/cmdline`. Split NUL-delimited arguments and apply the current bounded main-token rules.
+Reject empty output or a 4,097-byte result. Treat executable bytes as an opaque byte string, not UTF-8.
+
+Read `/proc/<pid>/cmdline` repeatedly until EOF or 64 KiB. Reject a read that fills the 64 KiB cap before EOF.
+
+Split the complete NUL-delimited arguments and apply the current bounded main-token rules.
 
 Require a NUL-terminated complete stream below the cap. Reject a cap hit, missing terminator, or partial argument as `limit_exceeded`.
 
@@ -103,6 +123,8 @@ Canonicalize the selector digest with this byte format:
 Reject a component that exceeds `u16::MAX` before hashing.
 
 Hash the canonical bytes with SHA-256. Compare the result with the saved selector digest. Reject a mismatch.
+
+This selector digest is the only executable identity field. It authenticates both executable bytes and the bounded main token.
 
 Never emit, log, or persist the bytes read from `cmdline` or the resolved executable path.
 
@@ -120,11 +142,21 @@ The initial Linux candidate root is `/tmp`. A later PR can add a root only after
 
 Read `/proc/<pid>/status` and obtain the effective UID. Enumerate the opened `/tmp` descriptor to EOF within fixed caps.
 
-Read direct entries with repeated bounded `getdents64` calls and a fixed 16 KiB buffer. Continue until directory EOF.
+Read direct entries with repeated bounded `getdents64` calls and a fixed 16 KiB buffer. Retry `EINTR` within the probe deadline.
+
+Parse each record as bytes with a 19-byte Linux `linux_dirent64` header. Do not cast unaligned records to a struct.
+
+Validate remaining bytes, `reclen >= 20`, `reclen <= remaining`, progress, and a NUL inside the record name area.
+
+Do not use `d_type` as trust evidence. Continue until `getdents64` returns zero.
 
 Inspect at most 4,096 total entries and at most 256 entries with the exact `hsperfdata_` prefix.
 
-Fail with `limit_exceeded` if either cap is reached before EOF. Uniqueness is valid only after EOF.
+After processing exactly 4,096 total entries, continue the current buffer only to prove that it has no additional record.
+
+Then make one additional `getdents64` call that must return EOF. Reject any record beyond the total cap.
+
+Reject a 257th prefix entry immediately. Uniqueness is valid only after proven EOF.
 
 Use each bounded prefix entry name as a locator. Do not derive or trust a username.
 
@@ -134,38 +166,47 @@ Reject zero or multiple trusted directories. This bounded scan does not use NSS,
 
 Treat the entry name only as a locator. Never use its text as authorization evidence.
 
-Do not use glob expansion, recursive scans, account lookup, or a first-match winner. Validate every bounded direct candidate before uniqueness selection.
+Do not use glob expansion, recursive scans, account lookup, or a first-match winner.
+
+Validate every bounded direct candidate before uniqueness selection.
 
 Do not scan other users, arbitrary directories, or recursive paths. Do not accept a user-supplied PerfData path.
 
 ### 5.2 Directory checks
 
-Open `/tmp` with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Verify that it is a directory owned by UID zero.
+Open `/tmp` with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Verify that it is a directory owned by UID zero.
 
 Require mode `01777`. Reject another owner, missing sticky bit, or group and other permissions that differ from `01777`.
 
 Open the root by file descriptor. Record its device and inode for the complete capture.
 
-Open each bounded candidate entry relative to the trusted root. Use `openat` with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`.
+Open each candidate with Linux `openat2` and `O_RDONLY | O_DIRECTORY | O_CLOEXEC`.
+
+Use `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`. Reject unavailable `openat2` or unsupported resolve flags.
+
+This policy forbids candidate mountpoints and requires the candidate directory to remain on the `/tmp` filesystem.
 
 After open, use `fstat` on the directory descriptor. Apply these checks:
 
 - The object must be a directory.
 - The owner UID must equal the JVM UID.
 - Group-write and other-write bits must be clear.
-- The link count must be valid for a live directory.
+- The link count must not be zero.
 - The object must not be a symbolic link.
+- The device must equal the trusted root device.
 Reject the directory if any check fails. Do not fall back to a less trusted path.
 
-Before capture, call `fstat` again on the root and selected directory descriptors. Compare their original device and inode values.
+Before capture, call `fstat` again on the root and selected directory descriptors. Repeat every original type, UID, mode, link, device, and inode check.
 
-After capture, repeat those descriptor checks. Then reopen the same entry locator relative to the root descriptor.
+After capture, repeat the complete descriptor policy checks. Then reopen the same entry locator relative to the root descriptor.
 
 Compare the reopened directory device and inode with the selected directory descriptor. Never read data from the reopened descriptor.
 
 ### 5.3 File checks
 
-Open the decimal PID file relative to the verified directory. Use `openat` with `O_RDONLY | O_NOFOLLOW | O_CLOEXEC`.
+Open the decimal PID file with `openat2` relative to the verified directory.
+
+Use `O_RDONLY | O_NONBLOCK | O_CLOEXEC` and `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`.
 
 After open, use `fstat` on the file descriptor. Apply these checks:
 
@@ -179,13 +220,25 @@ After open, use `fstat` on the file descriptor. Apply these checks:
 
 Do not use path metadata as the final authority. The post-open `fstat` result is authoritative.
 
-Read only from the verified descriptor. Do not reopen the path after validation.
+Read only from the verified descriptor. Never reopen a locator to read PerfData.
+
+The later locator reopen is an identity check only. It must not replace the captured descriptor.
 
 Read with bounded `pread` calls. Do not use `mmap`, pathname reads, or a shared offset.
 
-Read the prologue, then read at most the validated `used` bytes into one 1 MiB buffer.
+Read exactly 32 bytes as prologue `P1` with bounded `pread`. Reject short reads and EOF.
 
-Read the live prologue again after parsing. Reject structural changes in accessibility, version, byte order, `used`, capacity, or modification timestamp.
+Validate `P1` and require `used <= initial fstat size <= 1 MiB`. The opened file size is the external capacity bound.
+
+Read exactly `used` bytes as snapshot `S` with bounded `pread`. Reject short reads and EOF.
+
+Parse `S`, then read exactly 32 bytes as prologue `P2` from the same descriptor.
+
+Compare required structural fields for `P1`, the copied prologue in `S`, and `P2`.
+
+Compare magic, accessibility, version, byte order, `used`, overflow, modification timestamp, entry offset, and entry count.
+
+Call `fstat` after `P2`. Reject a changed device, inode, file type, owner, link count, mode policy, or file size.
 
 This check provides structural consistency. It does not claim an atomic snapshot of counters that change during collection.
 
@@ -199,7 +252,7 @@ The complete production capture must run in a separate worker process. The paren
 
 The worker receives only an opaque request with PID, expected raw start ticks, selector digest, opaque workload ID, and protocol version.
 
-The worker must clear inherited environment values and close unrelated file descriptors before capture.
+The worker must clear inherited environment values. It must close unrelated file descriptors before capture.
 
 The worker must perform namespace, identity, path, descriptor, `pread`, consistency, and parser checks.
 
@@ -207,23 +260,97 @@ The worker must not accept a path, username, raw selector, environment value, or
 
 The parent must cap worker input at 1 MiB and typed output at 64 KiB. It must reject trailing output.
 
-The parent starts the 200 ms probe deadline before worker creation. Worker setup and execution use this deadline.
+The parent prepares the executable path, fixed arguments, fixed empty environment, pipes, and all C strings before the deadline.
 
-Before it reads the request, the worker must create a new process group and send one fixed `READY` frame.
+The parent creates every pipe with `O_CLOEXEC`. It does not change descriptors `0`, `1`, `2`, or `3` before `fork`.
 
-The parent must verify the worker PID and process group with `getpgid`. It sends the request only after this handshake.
+Use `F_DUPFD_CLOEXEC` before `fork` to place each child-side source descriptor at a unique number of at least 64.
 
-On probe timeout, the parent must send `SIGKILL` to the verified worker process group and discard all output.
+Reject duplicate source descriptors or a source descriptor below 64. Prepare all mappings before the deadline.
 
-The 200 ms deadline does not include process reaping. Reaping uses a separate singleton reaper and a one-second observation grace.
+The parent starts the 200 ms deadline immediately before Linux `fork`.
 
-The JVM worker slot remains `draining` until `waitpid` confirms the child exit. No new JVM worker can start while it drains.
+The child calls only async-signal-safe syscalls before `execve`.
 
-Other workload adapters continue while the JVM worker drains. Daemon shutdown transfers the PID to the same reaper.
+Allowed calls are `setpgid`, `dup2`, `dup3`, `close_range`, `write`, `execve`, and `_exit`.
 
-If the child remains after the grace, emit one fixed warning. Keep JVM collection disabled until the reaper confirms exit.
+The child must not allocate, lock, log, unwind, or call Rust library code before `execve`.
+
+The child calls `setpgid(0, 0)`. It maps the prepared stdin, stdout, and stderr sources with `dup2`.
+
+The child maps the exec-error source to descriptor `3` with `dup3` and `O_CLOEXEC`.
+
+The child calls raw `close_range(4, UINT_MAX, 0)`, then calls `execve`.
+
+If `close_range` fails, write its fixed errno to descriptor `3` and call `_exit`.
+
+Reject kernels without `close_range`. Do not fall back to descriptor enumeration or `/proc/self/fd`.
+
+The fixed `execve` environment is empty. An exec-error pipe reports a fixed numeric errno and then calls `_exit`.
+
+Successful `execve` closes the exec-error descriptor through `FD_CLOEXEC`. The parent requires EOF on that pipe before READY acceptance.
+
+The parent receives the PID directly from `fork`. It does not wait for an exec handshake inside worker creation.
+
+Generate a random 128-bit `ChildToken` before the deadline. A successful `fork` activates the prepared token.
+
+The singleton lifecycle actor receives the token and PID immediately. It alone calls `getpgid`, `kill`, and `waitpid`.
+
+The actor serializes `VerifyGroup`, `KillLeader`, `KillGroup`, and `PollExit` commands for each token.
+
+The supervisor never sends a signal or calls `waitpid`. It sends token-scoped commands to the actor.
+
+The actor never signals a PID after it has reaped that token. It never reuses a token.
+
+The supervisor state is `Idle`, `Running`, or `Draining`. Every non-idle state contains the token and PID.
+
+Each state stores `candidate_frame`, `stdout_eof`, and `wait_status` as independent optional values.
+
+The actor returns `LifecycleEvent { token, pid, group_state, wait_status }` through a typed channel.
+
+The supervisor accepts an event only when its token and PID match the current state. It ignores stale events.
+
+After successful `execve`, the worker verifies `getpgrp() == getpid()` and sends one fixed `READY` frame.
+
+The supervisor sends `VerifyGroup` after READY. The actor verifies `getpgid(pid) == pid`.
+
+The actor then emits a verified-group `LifecycleEvent`. The supervisor sends the request only after that event.
+
+The worker must not call `fork`, `clone`, or spawn a process.
+
+The descendant prohibition applies before READY and for the complete worker lifetime.
+
+Before group verification, timeout, invalid READY, exec failure, or group failure triggers actor command `KillLeader`.
+
+The actor implements `KillLeader` with `kill(pid, SIGKILL)`. It never signals `-pid` before verified group state.
+
+After group verification, timeout triggers actor command `KillGroup`. Discard all candidate output before the command.
+
+The actor implements `KillGroup` with `kill(-pid, SIGKILL)`. Treat `ESRCH` as an exit-poll condition.
+
+The 200 ms deadline does not include process reaping. The lifecycle actor uses a one-second observation grace.
+
+The JVM worker slot remains `Draining` until a matching lifecycle event contains final wait status.
+
+No new JVM worker can start while the slot drains.
+
+Other workload adapters continue while the JVM worker drains. Daemon shutdown sends a token-scoped kill command to the actor.
+
+If the child remains after the grace, emit one fixed warning.
+
+Keep JVM collection disabled until the lifecycle actor confirms final wait status.
 
 The worker must use a fixed internal protocol version. It must return typed numeric metrics or one fixed failure category.
+
+Read stdout into one bounded candidate frame while the child runs. Record the frame and EOF independently.
+
+Record matching wait status independently of stdout order. Preserve a completion that arrives before EOF.
+
+Accept output only when frame, EOF, and wait status exist for the same token and PID.
+
+Require normal exit status zero. A timeout discards the frame and moves the state to `Draining`.
+
+Require exactly one frame and no trailing data. Reject signal exits, nonzero exits, missing EOF, or mismatched completion.
 
 The daemon must enforce one active JVM worker. It must not start an unbounded worker thread or process per interval.
 
@@ -244,7 +371,9 @@ The parser must use checked arithmetic for every offset, length, count, and alig
 
 The probe deadline includes handshake, identity checks, filesystem checks, `pread`, parsing, conversion, and output validation.
 
-If the deadline expires, kill the verified process group. The singleton reaper owns cleanup and prevents another JVM worker.
+If the deadline expires before group verification, kill only the leader. Otherwise, kill the verified group.
+
+The lifecycle actor is the only `waitpid` owner. It prevents another JVM worker until it confirms child exit.
 
 ## 7. PerfData Validation
 
@@ -506,7 +635,9 @@ Add tests that replace a path between metadata checks and open. Verify that desc
 
 Add parent replacement, mount replacement, FIFO, device, socket, sparse file, and zero-length file tests.
 
-Add directory scans with EOF before each cap and scans that hit each cap before EOF. Only the EOF cases can prove uniqueness.
+Add directory scans that reach EOF before each cap. Add scans that hit each cap before EOF.
+
+Only the EOF cases can prove uniqueness.
 
 Add tests for PID reuse and start-time changes before and after file open.
 
@@ -514,9 +645,19 @@ Add tests for zero or multiple bindings, executable changes, selector changes, r
 
 Verify that errors, logs, status output, and history contain no raw path, argument, or string value.
 
-Add a worker hang fixture. Verify timeout, process-group kill, reap, and daemon continuation.
+Add a worker hang fixture. Verify timeout, process-group kill, actor-owned reap, and daemon continuation.
 
-Verify the `READY` handshake, process-group identity, one-second reap grace, `draining` slot, and singleton reaper ownership.
+Verify that parent descriptors `0` through `3` do not change. Reject duplicate or below-64 child source descriptors.
+
+Verify child descriptors `0` through `3` after mapping. Verify that descriptor `3` keeps `FD_CLOEXEC`.
+
+Verify fail-closed behavior for `close_range` and `execve` errors through descriptor `3`.
+
+Test stdout EOF before wait status and wait status before stdout EOF. Both orders must produce the same result.
+
+Test timeout against concurrent exit. Test stale token and PID events. The actor must ignore stale commands and events.
+
+Verify that the actor never signals a token after reap. Verify one-second grace, `Draining`, and final slot release.
 
 Verify that the worker cannot access the PerfData descriptor or inherited JVM-related environment values.
 
@@ -552,8 +693,9 @@ Stop implementation if any criterion applies:
 - The implementation requires Attach API, JMX, network access, signals, or privilege changes.
 - The parser cannot enforce the 1 MiB, 4,096-entry, 256-byte, 4 KiB, and 200 ms limits.
 - Production parsing requires `mmap`, in-daemon parsing, an inherited PerfData descriptor, or an unbounded worker protocol.
-- The parent cannot issue process-group kill at probe deadline or transfer the child to the singleton reaper.
-- The parent cannot verify the worker process group before it sends untrusted capture input.
+- The lifecycle actor cannot retain child ownership from successful `fork` through matching final wait status.
+- The actor cannot issue the required leader or group kill at probe deadline.
+- The actor cannot verify the worker process group before the supervisor sends untrusted capture input.
 - A killed worker can leave the JVM slot reusable before `waitpid` confirms exit.
 - Required structural prologue changes can occur during capture without detection.
 - The implementation treats ordinary numeric counter changes as a structural failure or an atomicity guarantee.
