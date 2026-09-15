@@ -42,10 +42,13 @@ jobs:
             --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null
           python3 fuzz/scripts/check_corpus.py
 
+      - name: Build parser fuzz target
+        run: cargo +nightly-2026-09-01 fuzz build jvm_perfdata
+
       - name: Run bounded parser fuzz smoke
         run: |
           mkdir -p fuzz/artifacts/jvm_perfdata
-          timeout 300s cargo +nightly-2026-09-01 fuzz run \
+          timeout 120s cargo +nightly-2026-09-01 fuzz run \
             jvm_perfdata fuzz/corpus/jvm_perfdata -- \
             -runs=1000 \
             -max_len=1048576 \
