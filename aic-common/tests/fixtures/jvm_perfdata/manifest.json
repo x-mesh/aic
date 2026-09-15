@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "generator_sha256": "f44ada4bfe528b742e8ecb8becc82e5f427d5808ed2ff42e32f81a605a374883",
+  "fixtures": [
+    {
+      "filename": "temurin-17.0.20-g1.bin",
+      "sha256": "66c4933ca9efac897a8f88da5cde7312e3a47aa4d27683d9e28b4117e66a0bef",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "17.0.20",
+      "gc": "G1",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:36d9a76dc231587873b103c68a789b85d91b41d314dda69730d6bc43a777f2a9",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 400,
+        "classes_unloaded_total": 0
+      }
+    },
+    {
+      "filename": "temurin-17.0.20-zgc.bin",
+      "sha256": "53dd6a5fcf7b55ca8503f23c3cf1d31d2a8d8b0603cab7e26aabb8dc39e8bcb4",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "17.0.20",
+      "gc": "ZGC",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:36d9a76dc231587873b103c68a789b85d91b41d314dda69730d6bc43a777f2a9",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 414,
+        "classes_unloaded_total": 0
+      }
+    },
+    {
+      "filename": "temurin-21.0.12-g1.bin",
+      "sha256": "b19f6398d305319f827cd4de6b23a4c235e6420bbd3d722b9b2390cdb8672fc8",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "21.0.12",
+      "gc": "G1",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:1f79c73404fb0cccf9a3459eda22892f368d994b1028d6fb1ae871c1f49749a6",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 442,
+        "classes_unloaded_total": 0
+      }
+    },
+    {
+      "filename": "temurin-21.0.12-zgc.bin",
+      "sha256": "424a37532a00c9f490246beda70c09da4c0717e8855a307065ce062d7249ba13",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "21.0.12",
+      "gc": "ZGC",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:1f79c73404fb0cccf9a3459eda22892f368d994b1028d6fb1ae871c1f49749a6",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 477,
+        "classes_unloaded_total": 0
+      }
+    },
+    {
+      "filename": "temurin-25.0.4-g1.bin",
+      "sha256": "8a352c7c3d56a547d2f9b26d152da6ba9b1177203ad1a1587013f68e52f1773d",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "25.0.4",
+      "gc": "G1",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:dcf835e52330939b6c9f90ecab8aafcbcaa8fbf48423db44de884cf978c10144",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 412,
+        "classes_unloaded_total": 0
+      }
+    },
+    {
+      "filename": "temurin-25.0.4-zgc.bin",
+      "sha256": "fdb23cac0df82d3321aa5614321ef798057b30dffa642d86ad47c6d7b2cbbb11",
+      "kind": "sanitized_capture",
+      "vendor": "Eclipse Temurin",
+      "build": "25.0.4",
+      "gc": "ZGC",
+      "byte_order": "little-endian",
+      "format": "2.0",
+      "source_image_digest": "sha256:dcf835e52330939b6c9f90ecab8aafcbcaa8fbf48423db44de884cf978c10144",
+      "expected": {
+        "threads_started_total": 6,
+        "threads_live": 6,
+        "threads_peak": 6,
+        "threads_daemon": 5,
+        "classes_loaded": 427,
+        "classes_unloaded_total": 0
+      }
+    }
+  ]
+}
