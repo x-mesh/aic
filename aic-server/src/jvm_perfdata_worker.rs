@@ -1,12 +1,17 @@
 //! Isolated Linux worker lifecycle for trusted HotSpot PerfData capture.
 
-use aic_common::jvm_perfdata::{
-    decode_request, decode_response, encode_request, encode_response, WorkerRequest, WorkerResponse,
-};
+#[cfg(target_os = "linux")]
+use aic_common::jvm_perfdata::{decode_request, encode_response};
+use aic_common::jvm_perfdata::{decode_response, encode_request, WorkerRequest, WorkerResponse};
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
@@ -15,6 +20,7 @@ use std::time::{Duration, Instant};
 
 const READY: &[u8] = b"AIC-JVM-PERFDATA/1 READY\n";
 const PROBE_DEADLINE: Duration = Duration::from_millis(200);
+const EXIT_STATUS_GRACE: Duration = Duration::from_millis(100);
 const REAP_WARNING_AFTER: Duration = Duration::from_secs(1);
 const MAX_RESPONSE_FRAME: usize = 64 * 1024 + 4;
 const MAX_REQUEST_FRAME: usize = 1024 * 1024 + 4;
@@ -369,6 +375,7 @@ impl JvmWorkerSupervisor {
         deadline: Instant,
     ) -> Result<WorkerResponse, WorkerError> {
         let mut request_sent = false;
+        let mut exit_status_deadline = None;
         loop {
             self.read_child_pipes()?;
             self.receive_events();
@@ -405,16 +412,30 @@ impl JvmWorkerSupervisor {
                 SupervisorState::Running(child) => child,
                 _ => return Err(WorkerError::Protocol),
             };
-            if let Some(result) = joined_response(
+            let now = Instant::now();
+            if now >= deadline {
+                if !child.stdout_eof {
+                    return Err(WorkerError::Timeout);
+                }
+                if let Some(status) = child.wait_status {
+                    return Err(if wifexited_zero(status) {
+                        WorkerError::Timeout
+                    } else {
+                        WorkerError::Crash
+                    });
+                }
+                let status_deadline =
+                    *exit_status_deadline.get_or_insert_with(|| now + EXIT_STATUS_GRACE);
+                if now >= status_deadline {
+                    return Err(WorkerError::Timeout);
+                }
+            } else if let Some(result) = joined_response(
                 &child.output,
                 child.stdout_eof,
                 child.wait_status,
                 request_sent,
             ) {
                 return result;
-            }
-            if Instant::now() >= deadline {
-                return Err(WorkerError::Timeout);
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -1010,6 +1031,7 @@ unsafe fn child_errno_exit(fd: libc::c_int) -> ! {
     libc::_exit(127);
 }
 
+#[cfg(target_os = "linux")]
 fn pipe_cloexec() -> Result<(libc::c_int, libc::c_int), WorkerError> {
     let mut fds = [-1; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -1018,6 +1040,7 @@ fn pipe_cloexec() -> Result<(libc::c_int, libc::c_int), WorkerError> {
     Ok((fds[0], fds[1]))
 }
 
+#[cfg(target_os = "linux")]
 fn duplicate_high(fd: libc::c_int) -> Result<libc::c_int, WorkerError> {
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, CHILD_FD_BASE) };
     if duplicated < CHILD_FD_BASE {
@@ -1027,6 +1050,7 @@ fn duplicate_high(fd: libc::c_int) -> Result<libc::c_int, WorkerError> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn set_nonblocking(fd: libc::c_int) -> Result<(), WorkerError> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
@@ -1095,7 +1119,7 @@ fn close_fd(fd: &mut libc::c_int) {
     }
 }
 fn last_errno() -> libc::c_int {
-    unsafe { *libc::__errno_location() }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 fn wifexited_zero(status: libc::c_int) -> bool {
     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
