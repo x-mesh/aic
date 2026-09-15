@@ -79,7 +79,9 @@ fn sha256(input: &[u8]) -> String {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
     let mut state = INITIAL;
-    for chunk in padded.chunks_exact(64) {
+    let (chunks, remainder) = padded.as_chunks::<64>();
+    assert!(remainder.is_empty());
+    for chunk in chunks {
         let mut words = [0_u32; 64];
         for (index, word) in words[..16].iter_mut().enumerate() {
             *word = u32::from_be_bytes(chunk[index * 4..index * 4 + 4].try_into().unwrap());
