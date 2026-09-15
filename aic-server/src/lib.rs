@@ -7,6 +7,7 @@ pub mod boundary_detector;
 pub mod boundary_ownership_gate;
 pub mod command_record_store;
 pub mod control_server;
+pub mod jvm_perfdata_worker;
 pub mod lock;
 pub mod metrics;
 // SRE t6: opt-in OTLP host-metrics exporter → 중앙 collector push.
