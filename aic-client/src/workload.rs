@@ -44,8 +44,6 @@ const CONTAINER_ID_MIN_HEX: usize = 12;
 const CONTAINER_ID_MAX_HEX: usize = 64;
 const CONTAINER_ID_PREFIX: &str = "container";
 const CONTAINERIZED_WORKLOAD_AMBIGUITY: &str = "containerized_workload";
-#[cfg(any(target_os = "linux", test))]
-const ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY: &str = "isolation_evidence_unavailable";
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -189,12 +187,6 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
                 own_namespaces,
                 process_namespaces,
             );
-            #[cfg(target_os = "linux")]
-            if isolation_evidence_ambiguity(container.as_ref(), own_namespaces, process_namespaces)
-                .is_some()
-            {
-                ambiguity.push(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY.to_string());
-            }
             ProcessRow {
                 pid,
                 start_time: process.start_time(),
@@ -882,26 +874,6 @@ fn container_evidence(
                 }
             })
         })
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn isolation_evidence_ambiguity(
-    container: Option<&ContainerEvidence>,
-    own: NamespaceIds,
-    process: NamespaceIds,
-) -> Option<&'static str> {
-    if container.is_some() {
-        return None;
-    }
-    let same_pid_namespace = own
-        .pid
-        .zip(process.pid)
-        .is_some_and(|(own, process)| own == process);
-    let same_root = own
-        .root
-        .zip(process.root)
-        .is_some_and(|(own, process)| own == process);
-    (!same_pid_namespace || !same_root).then_some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
 }
 
 fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
@@ -1798,15 +1770,23 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_isolation_evidence_stays_fail_closed() {
-        let own = NamespaceIds::default();
-        let process = NamespaceIds::default();
-        let container = container_evidence(None, own, process);
-        assert!(container.is_none());
-        assert_eq!(
-            isolation_evidence_ambiguity(container.as_ref(), own, process),
-            Some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
-        );
+    fn unreadable_namespaces_leave_the_cgroup_verdict_intact() {
+        // 비루트는 다른 사용자 프로세스의 /proc/<pid>/ns/*와 /proc/<pid>/root를 읽지 못한다.
+        let own = NamespaceIds {
+            pid: Some(1),
+            mnt: Some(2),
+            root: Some(FileIdentity {
+                device: 1,
+                inode: 1,
+            }),
+        };
+        let unreadable = NamespaceIds::default();
+        assert!(container_evidence(None, own, unreadable).is_none());
+        let id = "0123456789abcdef0123456789abcdef";
+        let marker = container_marker_from_cgroup(&format!("0::/system.slice/docker-{id}.scope"));
+        let evidence = container_evidence(marker, own, unreadable).unwrap();
+        assert_eq!(evidence.runtime, ContainerRuntime::Docker);
+        assert_eq!(evidence.key, id);
     }
 
     #[test]
