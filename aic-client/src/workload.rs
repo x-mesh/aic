@@ -44,6 +44,7 @@ const CONTAINER_ID_MIN_HEX: usize = 12;
 const CONTAINER_ID_MAX_HEX: usize = 64;
 const CONTAINER_ID_PREFIX: &str = "container";
 const CONTAINERIZED_WORKLOAD_AMBIGUITY: &str = "containerized_workload";
+#[cfg(any(target_os = "linux", test))]
 const ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY: &str = "isolation_evidence_unavailable";
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
@@ -154,16 +155,13 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet);
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
-    #[cfg(target_os = "linux")]
-    let own_namespaces = read_namespace_ids(std::process::id());
-    #[cfg(not(target_os = "linux"))]
-    let own_namespaces = NamespaceIds::default();
-    let scanner_executable = std::env::current_exe().ok();
+    let scanner_pid = std::process::id();
+    let own_namespaces = read_namespace_ids(scanner_pid);
 
     let mut rows = system
         .processes()
         .iter()
-        .filter(|(_, process)| process.exe() != scanner_executable.as_deref())
+        .filter(|(pid, _)| pid.as_u32() != scanner_pid)
         .map(|(pid, process)| {
             let pid = pid.as_u32();
             let exe = process.exe().map(|p| p.to_string_lossy().to_string());
@@ -185,30 +183,18 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
             }
             let cgroup = read_cgroup_text(pid, &mut ambiguity);
             let systemd_unit = cgroup.as_deref().and_then(systemd_unit_from_cgroup);
+            let process_namespaces = read_namespace_ids(pid);
+            let container = container_evidence(
+                cgroup.as_deref().and_then(container_marker_from_cgroup),
+                own_namespaces,
+                process_namespaces,
+            );
             #[cfg(target_os = "linux")]
-            let container = {
-                let process_namespaces = read_namespace_ids(pid);
-                let container = container_evidence(
-                    cgroup.as_deref().and_then(container_marker_from_cgroup),
-                    own_namespaces,
-                    process_namespaces,
-                );
-                if isolation_evidence_ambiguity(
-                    container.as_ref(),
-                    own_namespaces,
-                    process_namespaces,
-                )
+            if isolation_evidence_ambiguity(container.as_ref(), own_namespaces, process_namespaces)
                 .is_some()
-                {
-                    ambiguity.push(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY.to_string());
-                }
-                container
-            };
-            #[cfg(not(target_os = "linux"))]
-            let container = {
-                let _ = own_namespaces;
-                None
-            };
+            {
+                ambiguity.push(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY.to_string());
+            }
             ProcessRow {
                 pid,
                 start_time: process.start_time(),
@@ -841,6 +827,11 @@ fn read_namespace_ids(pid: u32) -> NamespaceIds {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_namespace_ids(_pid: u32) -> NamespaceIds {
+    NamespaceIds::default()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn namespace_inode(link: &str) -> Option<u64> {
     let (_, inode) = link.split_once(":[")?;
@@ -893,6 +884,7 @@ fn container_evidence(
         })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn isolation_evidence_ambiguity(
     container: Option<&ContainerEvidence>,
     own: NamespaceIds,
@@ -912,7 +904,6 @@ fn isolation_evidence_ambiguity(
     (!same_pid_namespace || !same_root).then_some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
     for line in text.lines() {
         let components = line.split('/').map(str::trim).collect::<Vec<_>>();
@@ -973,7 +964,6 @@ fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn is_container_hex_id(id: &str) -> bool {
     (CONTAINER_ID_MIN_HEX..=CONTAINER_ID_MAX_HEX).contains(&id.len())
         && id.bytes().all(|byte| byte.is_ascii_hexdigit())

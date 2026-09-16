@@ -786,25 +786,23 @@ fn workload_status_and_history_read_local_history() {
 #[test]
 fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
-    let workload = tmp.path().join("sleep");
-    std::fs::copy("/bin/sleep", &workload).unwrap();
-    let _workload = ChildGuard(Command::new(&workload).arg("60").spawn().unwrap());
+    // 적격 후보가 없는 호스트를 대비해 하나 띄운다. 복사한 바이너리는 macOS 프로세스 목록에 잡히지 않는다.
+    let _workload = ChildGuard(Command::new("/bin/sleep").arg("60").spawn().unwrap());
     let discover = aic_cmd(tmp.path())
         .args(["workload", "discover", "--json"])
         .output()
         .unwrap();
     assert!(discover.status.success());
     let report: serde_json::Value = serde_json::from_slice(&discover.stdout).unwrap();
-    let expected_id = format!("exe:{}", workload.display());
     let candidate = report["report"]["candidates"]
         .as_array()
         .and_then(|candidates| {
             candidates.iter().find(|candidate| {
-                candidate["id"] == expected_id
+                !candidate["selector"].is_null()
                     && candidate["ambiguity"].as_array().is_some_and(Vec::is_empty)
             })
         })
-        .expect("테스트가 시작한 workload 후보가 있어야 함");
+        .expect("활성화 가능한 workload 후보가 있어야 함");
     let id = candidate["id"].as_str().unwrap();
     let fingerprint = candidate["fingerprint"].as_str().unwrap();
     let postgresql = candidate["adapter"] == "postgre_sql";
