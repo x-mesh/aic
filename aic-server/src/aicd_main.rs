@@ -235,6 +235,11 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
             spool.clone(),
         ))
     });
+    // `collector_dropped`(200 응답인데 수신측이 버린 레코드 수)를 exporter 상태에도 싣는다 —
+    // push 실패가 아니라 실패 카운터가 오르지 않으므로, 연결하지 않으면 이 유실만 상태에서 빠진다.
+    if let Some(health) = &exporter_health {
+        health.attach_drop_counters(log_drop_counters.clone());
+    }
 
     // OTLP exporter config를 여기서 미리 계산한다(원래는 아래 spawn 시점) — ControlContext가
     // exporter task로 `/flush` 요청을 보내는 채널을 들어야 하는데, 그 채널은 exporter가 실제로 뜰

@@ -200,6 +200,50 @@ pub(crate) struct SysMetrics {
     pub sampled_at: Option<Instant>,
 }
 
+/// 유실의 **주된 사유** — status bar 한 토막에 들어갈 만큼 짧게 접은 것.
+///
+/// 가장 많이 버린 사유 하나만 고른다: 폭이 좁아 전부는 못 싣고, 사람이 먼저 손대야 할 곳은
+/// 대개 가장 큰 사유이기 때문이다. 자세한 내역은 `/doctor`가 보여 준다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum DropHint {
+    /// 사유를 모른다(이 필드를 모르는 구버전 aicd). 지어내지 않고 수만 보여 준다.
+    #[default]
+    Unknown,
+    /// spool 쿼터 초과 — 상한을 늘리거나 수집량을 줄여야 한다.
+    Quota,
+    /// 나이 cap 초과 — collector가 그만큼 오래 못 받았다는 뜻이다.
+    Age,
+    /// collector가 4xx로 영구 거부 — 인증·스키마 문제다.
+    Rejected,
+}
+
+impl DropHint {
+    /// 사유별 카운터에서 가장 큰 쪽을 고른다. 셋 다 0이면(합계만 아는 구버전) `Unknown`.
+    fn from_status(s: &aic_common::ExporterStatus) -> Self {
+        let candidates = [
+            (s.spool_dropped_quota, DropHint::Quota),
+            (s.spool_dropped_age, DropHint::Age),
+            (s.spool_dropped_rejected, DropHint::Rejected),
+        ];
+        candidates
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .max_by_key(|(n, _)| *n)
+            .map(|(_, hint)| hint)
+            .unwrap_or(DropHint::Unknown)
+    }
+
+    /// status bar에 붙일 한 토막. `None`이면 사유를 모른다는 뜻이라 아무것도 붙이지 않는다.
+    fn label(self) -> Option<&'static str> {
+        match self {
+            DropHint::Unknown => None,
+            DropHint::Quota => Some("쿼터초과"),
+            DropHint::Age => Some("기한초과"),
+            DropHint::Rejected => Some("서버거부"),
+        }
+    }
+}
+
 /// status bar가 보여줄 exporter 상태. IPC 응답을 사람이 볼 4가지 상태로 접은 것이다.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum ExporterState {
@@ -214,8 +258,11 @@ pub(crate) enum ExporterState {
     Ok,
     /// 전송에 실패해 spool에 밀려 있다(밀린 배치 수). collector에 못 닿고 있다는 뜻.
     Backlogged(u64),
-    /// spool 상한을 넘겨 **실제로 버렸다**(버린 배치 수). 데이터가 유실됐다.
-    Dropping(u64),
+    /// **실제로 버렸다**(버린 배치 수 + 가장 많이 버린 사유). 데이터가 유실됐다.
+    ///
+    /// 사유를 함께 드는 이유: 수만 보여 주던 예전에는 "19유실"에서 무엇을 고쳐야 하는지 알 수
+    /// 없어, 사람이 aicd 로그를 직접 여는 것 말고는 방법이 없었다.
+    Dropping(u64, DropHint),
     /// 부모 게이트(`enabled`)는 켜졌는데 **agent exporter가 떠 있지 않다**(`agent_enabled == Some(false)`).
     /// host metric은 나가는데 chat 이벤트(`tool.run_command`·`risk.denied`·`/record now` 등)는 구독자가
     /// 없어 **조용히 버려진다**. `enabled`만 보던 예전엔 이 상태에서도 `otlp ●`(정상)로 표시해, 사람이
@@ -245,7 +292,7 @@ impl ExporterState {
         // 유실이 실제로 일어났다면 그게 가장 나쁜 소식이다 — 밀림보다 먼저 알린다. spool은 주(host
         // metric) 파이프라인이라 그 하드 유실을 최우선으로 표시한다.
         if s.spool_dropped > 0 {
-            return ExporterState::Dropping(s.spool_dropped);
+            return ExporterState::Dropping(s.spool_dropped, DropHint::from_status(&s));
         }
         // agent exporter가 꺼져 chat 이벤트가 버려지는 중. spool 하드 유실보다는 뒤, 단순 밀림(지연이지
         // 유실 아님)보다는 앞에 둔다 — 이건 **진행 중인 유실**이다. `Some(false)`만 — `None`(구버전
@@ -266,7 +313,14 @@ impl ExporterState {
             ExporterState::Ok => Some(("otlp ●".to_string(), Severity::Normal)),
             ExporterState::DaemonDown => Some(("otlp aicd off".to_string(), Severity::Crit)),
             ExporterState::Backlogged(n) => Some((format!("otlp ⚠ {n}밀림"), Severity::Warn)),
-            ExporterState::Dropping(n) => Some((format!("otlp ✕ {n}유실"), Severity::Crit)),
+            ExporterState::Dropping(n, hint) => Some((
+                match hint.label() {
+                    // 사유를 모르면(구버전 aicd) 지어내지 않고 수만 보여 준다.
+                    None => format!("otlp ✕ {n}유실"),
+                    Some(label) => format!("otlp ✕ {n}유실 {label}"),
+                },
+                Severity::Crit,
+            )),
             // host metric은 나가지만 agent 이벤트는 버려지는 중 — 유실이라 표면화하되, 사용자가
             // 의도적으로 껐을 수도 있어 Crit이 아니라 Warn(스스로 판단하게).
             ExporterState::AgentOff => Some(("otlp ⚠ agent off".to_string(), Severity::Warn)),
@@ -1793,9 +1847,14 @@ mod tests {
         assert!(seg.0.contains("12"));
 
         // 유실 — 이미 버려진 데이터가 있다. 밀림보다 심각.
-        let seg = tail(ExporterState::Dropping(3));
+        let seg = tail(ExporterState::Dropping(3, DropHint::Unknown));
         assert_eq!(seg.1, Severity::Crit);
         assert!(seg.0.contains('3'));
+
+        // 사유를 알면 함께 보여 준다 — 수만 보고는 무엇을 고쳐야 할지 알 수 없다.
+        let seg = tail(ExporterState::Dropping(19, DropHint::Rejected));
+        assert!(seg.0.contains("19"), "라벨: {}", seg.0);
+        assert!(seg.0.contains("서버거부"), "라벨: {}", seg.0);
 
         // agent off — chat 이벤트가 버려지는 중. 표면화(Warn)하되, 의도적 비활성일 수 있어 Crit 아님.
         let seg = tail(ExporterState::AgentOff);
@@ -1833,7 +1892,20 @@ mod tests {
         };
         assert_eq!(
             ExporterState::from_status(Some(both)),
-            ExporterState::Dropping(2)
+            ExporterState::Dropping(2, DropHint::Unknown),
+            "사유별 내역이 없는 구버전 응답은 사유를 지어내지 않는다"
+        );
+
+        // 사유별 내역이 오면 **가장 많이 버린 쪽**을 고른다 — 먼저 손대야 할 곳이다.
+        let mixed = ExporterStatus {
+            spool_dropped: 19,
+            spool_dropped_quota: 4,
+            spool_dropped_rejected: 15,
+            ..base.clone()
+        };
+        assert_eq!(
+            ExporterState::from_status(Some(mixed)),
+            ExporterState::Dropping(19, DropHint::Rejected)
         );
 
         let backlogged = ExporterStatus {
@@ -1877,7 +1949,7 @@ mod tests {
         };
         assert_eq!(
             ExporterState::from_status(Some(dropping_and_agent_off)),
-            ExporterState::Dropping(3)
+            ExporterState::Dropping(3, DropHint::Unknown)
         );
 
         // **구버전 호환(핵심)**: agent_enabled == None(필드를 모르는 구버전 aicd)은 "모름"이라

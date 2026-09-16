@@ -460,7 +460,7 @@ async fn serve_kernel_with(
                             tracing::warn!(error = %e2, "OTLP kernel spool append 실패 — 이 샘플 유실");
                         }
                         backoff.on_failure();
-                        cfg.health.record_fail();
+                        cfg.health.record_fail(&url, &e);
                     }
                 }
             }
@@ -560,7 +560,7 @@ async fn push_oom_events(
                 }
             };
             backoff.on_failure();
-            cfg.health.record_fail();
+            cfg.health.record_fail(logs_url, &e);
             spooled
         }
     }

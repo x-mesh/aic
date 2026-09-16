@@ -57,6 +57,45 @@ pub enum SignalKind {
 /// `SignalKind` variant 수. `totals`/`dropped` 배열 크기 및 stress 테스트의 재계산에 쓴다.
 const SIGNAL_KIND_COUNT: usize = 3;
 
+/// 배치를 **버린 사유**. 조치가 서로 달라 카운터를 나눈다 — 쿼터 초과는 spool 상한이나 수집량의
+/// 문제고, 나이 cap은 collector가 오래 죽어 있었다는 뜻이며, 영구 거부는 인증·스키마 문제다.
+/// 합계만 보여 주던 예전에는 "19건 유실"에서 무엇을 고쳐야 할지 읽어낼 수 없었다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// kind별 용량 쿼터를 넘겨 밀어냈다.
+    Quota = 0,
+    /// `spool_max_age_secs`보다 오래된 배치를 드레인 전에 버렸다.
+    Age = 1,
+    /// collector가 4xx로 영구 거부했다 — 재전송해도 같은 응답이라 큐에서 뺐다.
+    Rejected = 2,
+}
+
+/// `DropReason` variant 수.
+const DROP_REASON_COUNT: usize = 3;
+
+/// 같은 사유의 유실 warn을 다시 남기기까지의 최소 간격(초).
+///
+/// 유실은 **반드시** 기본 로그에 남아야 한다 — 예전에는 쿼터 초과 드롭이 `AIC_DEBUG` 뒤에,
+/// 나이 cap 드롭이 `debug!`에 가려 7일치 로그에 한 줄도 남지 않았고, 그래서 유실 카운터만 오른
+/// 상태에서 원인을 추적할 방법이 없었다. 다만 app log 볼륨에서는 배치마다 찍으면 로그를 덮으므로,
+/// 사유별로 이 간격에 한 번만 남기고 누적 수를 함께 싣는다.
+const DROP_WARN_INTERVAL_SECS: u64 = 60;
+
+impl DropReason {
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// 로그·상태 표시에 쓰는 짧은 이름.
+    pub fn label(self) -> &'static str {
+        match self {
+            DropReason::Quota => "quota",
+            DropReason::Age => "age",
+            DropReason::Rejected => "rejected",
+        }
+    }
+}
+
 impl SignalKind {
     /// wire(파일 **내용** 첫 바이트) tag. 파일명 `code`와는 별개 축이다 — 값 자체는 순전히
     /// 내부용이라 바뀌어도 파일명 포맷엔 영향이 없다.
@@ -114,6 +153,9 @@ pub struct DrainReport {
     /// 도중에 **일시** 실패가 있었는지(있었다면 그 지점에서 즉시 멈춘다 — FIFO 순서 보존 + 어차피
     /// collector가 다운이면 뒤 배치도 실패할 것이므로). 영구 거부는 여기 해당하지 않는다.
     pub failed: bool,
+    /// 드레인 중 마지막으로 만난 실패와 그 배치의 signal. 호출부가 건강 상태에 사유를 실어
+    /// "밀려 있다"만이 아니라 **왜 못 나가는지**를 보여 줄 수 있게 한다.
+    pub last_error: Option<(SignalKind, super::PushError)>,
 }
 
 #[derive(Debug)]
@@ -125,7 +167,12 @@ pub struct Spool {
     /// `Mutex`를 두지 않고 하나로 유지한다 — 쪼개면 `enforce_cap`이 다른 kind 파일을 건드릴 때
     /// 경합이 생긴다.
     totals: Mutex<[u64; SIGNAL_KIND_COUNT]>,
-    dropped: [AtomicU64; SIGNAL_KIND_COUNT],
+    /// `[사유][kind]` 별 버린 배치 수. 사유를 나눠 두지 않으면 유실 수는 보여도 조치를 고를 수 없다.
+    /// **spool에 들어갔다 버려진 것만이 아니다** — 4xx로 즉시 버린 배치도 여기 센다
+    /// ([`Spool::record_rejected_batch`]).
+    dropped: [[AtomicU64; SIGNAL_KIND_COUNT]; DROP_REASON_COUNT],
+    /// 사유별 마지막 유실 warn 시각(unix seconds). [`DROP_WARN_INTERVAL_SECS`] 참고.
+    last_drop_warn_unix: [AtomicU64; DROP_REASON_COUNT],
 }
 
 impl Spool {
@@ -188,7 +235,8 @@ impl Spool {
             quotas,
             next_seq: AtomicU64::new(max_seq.wrapping_add(1)),
             totals: Mutex::new(totals),
-            dropped: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            dropped: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            last_drop_warn_unix: std::array::from_fn(|_| AtomicU64::new(0)),
         };
         {
             let mut totals = spool.totals.lock().unwrap();
@@ -256,6 +304,8 @@ impl Spool {
                     drained: 0,
                     rejected: 0,
                     failed: true,
+                    // 로컬 디렉토리 문제지 collector 문제가 아니다 — push 사유로 보고하지 않는다.
+                    last_error: None,
                 };
             }
         };
@@ -263,6 +313,7 @@ impl Spool {
 
         let mut drained = 0usize;
         let mut rejected = 0usize;
+        let mut last_error = None;
         for path in files.into_iter().take(limit) {
             let (kind, body) = match read_batch(&path) {
                 Ok(pair) => pair,
@@ -290,15 +341,17 @@ impl Spool {
                         error = %e,
                         "collector가 배치를 영구 거부 — 건너뛰고 삭제(재전송해도 같은 응답)"
                     );
-                    self.dropped[kind.index()].fetch_add(1, Ordering::Relaxed);
+                    self.record_drop(kind, DropReason::Rejected);
                     self.remove_and_untrack(&path, Some(kind));
                     rejected += 1;
+                    last_error = Some((kind, e));
                 }
-                Err(_) => {
+                Err(e) => {
                     return DrainReport {
                         drained,
                         rejected,
                         failed: true,
+                        last_error: Some((kind, e)),
                     }
                 }
             }
@@ -307,12 +360,52 @@ impl Spool {
             drained,
             rejected,
             failed: false,
+            last_error,
         }
     }
 
-    /// 지금까지 상한 초과로 drop된 누적 배치 수(테스트/디버그 관측용).
+    /// 지금까지 drop된 누적 배치 수(사유 무관 합계). "데이터가 유실됐는가" 하나만 묻는 호출부용.
     pub fn dropped_count(&self, kind: SignalKind) -> u64 {
-        self.dropped[kind.index()].load(Ordering::Relaxed)
+        (0..DROP_REASON_COUNT)
+            .map(|r| self.dropped[r][kind.index()].load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// 사유별 누적 drop 수(kind 무관 합계). 무엇을 고쳐야 하는지는 이 내역에서만 읽을 수 있다.
+    pub fn dropped_by_reason(&self, reason: DropReason) -> u64 {
+        self.dropped[reason.index()]
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// 배치 1건 유실을 사유별 카운터에 기록한다.
+    fn record_drop(&self, kind: SignalKind, reason: DropReason) {
+        self.dropped[reason.index()][kind.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// **spool을 거치지 않고** 버려진 배치 1건을 영구 거부로 센다.
+    ///
+    /// app logs의 4xx 경로가 그렇다: 재전송해도 같은 응답이라 spool에 넣지 않고 즉시 버린다
+    /// (넣으면 FIFO 머리에 박혀 다른 신호의 드레인까지 멈춘다). 그래도 **유실은 유실이다** —
+    /// 이 카운터에 세지 않으면 collector가 매번 413으로 거부하는 동안 app log가 100% 사라지는데도
+    /// 유실 수가 0이라, 진단은 "정상"이라고 말한다.
+    pub fn record_rejected_batch(&self, kind: SignalKind) {
+        self.record_drop(kind, DropReason::Rejected);
+    }
+
+    /// 이 사유의 유실 warn을 지금 남겨도 되는지(초당 수십 건 드롭에서 로그를 덮지 않도록).
+    /// 남겨도 되면 마지막 warn 시각을 갱신하고 `true`를 돌려준다.
+    fn should_warn_drop(&self, reason: DropReason) -> bool {
+        let now = unix_now_secs();
+        let slot = &self.last_drop_warn_unix[reason.index()];
+        let last = slot.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < DROP_WARN_INTERVAL_SECS {
+            return false;
+        }
+        // 경합에서 진 쪽은 이번 warn을 건너뛴다 — 같은 창에 두 줄이 남지 않게.
+        slot.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// mtime이 `max_age`보다 오래된 배치를 **네트워크 없이 삭제**한다. 낡은 telemetry가 FIFO 머리를
@@ -338,10 +431,20 @@ impl Spool {
             }
             let kind = parse_batch_filename(&path).and_then(|(_, k)| k);
             if let Some(k) = kind {
-                self.dropped[k.index()].fetch_add(1, Ordering::Relaxed);
+                self.record_drop(k, DropReason::Age);
             }
             self.remove_and_untrack(&path, kind);
             pruned += 1;
+        }
+        // 나이 cap 드롭은 **유실**이다 — 예전에는 호출부의 `debug!`에만 남아 기본 로그에서
+        // 사라졌고, 그래서 유실 카운터만 오른 채 원인을 추적할 수 없었다. 여기서 남긴다.
+        if pruned > 0 && self.should_warn_drop(DropReason::Age) {
+            tracing::warn!(
+                pruned,
+                max_age_secs = max_age.as_secs(),
+                dropped_total = self.dropped_by_reason(DropReason::Age),
+                "otlp spool 나이 cap 초과 — 배치 유실(collector가 그만큼 오래 못 받았다)"
+            );
         }
         pruned
     }
@@ -403,6 +506,7 @@ impl Spool {
             // seq 내림차순 — 가장 최근(newest) 것부터 지운다.
             files.reverse();
         }
+        let mut dropped_now = 0u64;
         for path in files {
             if totals[idx] <= quota {
                 break;
@@ -410,16 +514,21 @@ impl Spool {
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if std::fs::remove_file(&path).is_ok() {
                 totals[idx] = totals[idx].saturating_sub(len);
-                self.dropped[idx].fetch_add(1, Ordering::Relaxed);
-                if aic_debug_enabled() {
-                    tracing::debug!(
-                        path = %path.display(),
-                        kind = ?kind,
-                        dropped_total = self.dropped[idx].load(Ordering::Relaxed),
-                        "otlp spool 상한 초과 — 배치 drop"
-                    );
-                }
+                self.record_drop(kind, DropReason::Quota);
+                dropped_now += 1;
             }
+        }
+        // 예전에는 이 로그가 `AIC_DEBUG` 뒤에 있어, 기본 설정에서는 쿼터 초과 유실이 **로그에 한
+        // 줄도 남지 않았다** — 카운터만 오르고 원인은 알 수 없었다. 유실은 기본 로그에 남긴다.
+        // 다만 append마다(초당 수십 회) 불리는 경로라 [`DROP_WARN_INTERVAL_SECS`]로 묶는다.
+        if dropped_now > 0 && self.should_warn_drop(DropReason::Quota) {
+            tracing::warn!(
+                kind = ?kind,
+                dropped_now,
+                quota_bytes = quota,
+                dropped_total = self.dropped_by_reason(DropReason::Quota),
+                "otlp spool 쿼터 초과 — 배치 유실(쿼터를 늘리거나 수집량을 줄이세요)"
+            );
         }
     }
 
@@ -446,17 +555,12 @@ impl Spool {
     }
 }
 
-/// `AIC_DEBUG=1|true`(대소문자·공백 무시) 여부. 그 외(0/false/off/unset/empty)는 OFF —
-/// aic-client(`agent::debug::truthy`)와 동일 판정 규칙. aic-server는 aic-client에 의존하지 않으므로
-/// 여기서 최소 형태로 재구현한다(같은 env var가 크레이트마다 다른 의미가 되지 않도록).
-fn aic_debug_enabled() -> bool {
-    matches!(
-        std::env::var("AIC_DEBUG")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true")
-    )
+/// 현재 unix 초. 유실 warn의 rate limit 창 계산에만 쓴다.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 배치 파일명을 파싱해 `(seq, kind)`를 뽑는다.
@@ -663,6 +767,37 @@ mod tests {
             let (_, body) = read_batch(path).unwrap();
             assert_eq!(body, format!("body-{i}").as_bytes());
         }
+    }
+
+    #[test]
+    fn drop_reasons_are_counted_separately() {
+        // 합계만으로는 조치를 고를 수 없다: 쿼터 초과는 상한/수집량을, 나이 cap은 장기 미도달을,
+        // 영구 거부는 인증·스키마를 가리킨다. 사유가 뭉개지면 "19건 유실"에서 다시 아무것도 읽어낼
+        // 수 없는 상태로 돌아간다.
+        let per_batch = 15u64;
+        let (_dir, spool) = tmp_spool(per_batch * 2);
+
+        for i in 0..4u8 {
+            spool.append(SignalKind::Metrics, &[i; 10]).unwrap();
+        }
+        assert_eq!(
+            spool.dropped_by_reason(DropReason::Quota),
+            2,
+            "쿼터 초과분만 Quota로 잡혀야 한다"
+        );
+        assert_eq!(spool.dropped_by_reason(DropReason::Age), 0);
+        assert_eq!(spool.dropped_by_reason(DropReason::Rejected), 0);
+
+        // 나이 cap은 별도 사유다 — 같은 카운터에 섞이면 "collector가 오래 죽어 있었다"는 사실이
+        // 쿼터 문제로 오독된다.
+        let pruned = spool.prune_older_than(Duration::from_secs(0));
+        assert!(pruned > 0);
+        assert_eq!(spool.dropped_by_reason(DropReason::Age), pruned);
+        assert_eq!(
+            spool.dropped_count(SignalKind::Metrics),
+            2 + pruned,
+            "합계는 사유들의 합이어야 한다(기존 호출부 계약)"
+        );
     }
 
     #[test]

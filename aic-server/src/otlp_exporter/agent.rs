@@ -136,7 +136,7 @@ pub async fn serve_agent(
                                     tracing::warn!(error = %e2, kind = %ev.kind, "OTLP agent spool append 실패 — 이 이벤트 유실");
                                 }
                                 backoff.on_failure();
-                                cfg.health.record_fail();
+                                cfg.health.record_fail(&url, &e);
                             }
                         }
                     }

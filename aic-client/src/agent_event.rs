@@ -589,9 +589,19 @@ pub fn exporter_status() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query(&IpcRequest::GetExporterStatus))
 }
 
-/// [`exporter_status`]의 async 판.
+/// [`exporter_status`]의 async 판 — **emit 경로(`/record now` 보강)용**이라 짧은 [`IO_TIMEOUT`]을
+/// 쓴다. 진단(`aic doctor`·chat `/doctor`)은 [`exporter_status_for_diagnosis`]를 써야 한다.
 pub async fn exporter_status_async() -> Option<aic_common::ExporterStatus> {
     to_exporter_status(query_async(&IpcRequest::GetExporterStatus, IO_TIMEOUT).await)
+}
+
+/// 진단 전용 조회 — 여유로운 [`STATUS_QUERY_TIMEOUT`]을 쓴다.
+///
+/// emit용 300ms를 그대로 쓰면, **사람이 doctor를 돌리는 바로 그 상황**(부하로 aicd가 느린 상황)에서
+/// 응답이 늦었다는 이유로 `None`이 되고, 진단은 그걸 "aicd 미실행이거나 구버전"이라고 단정해
+/// 멀쩡한 데몬에 재설치를 안내한다. status bar가 [`ExporterProbe`]로 피한 것과 같은 함정이다.
+pub async fn exporter_status_for_diagnosis() -> Option<aic_common::ExporterStatus> {
+    to_exporter_status(query_async(&IpcRequest::GetExporterStatus, STATUS_QUERY_TIMEOUT).await)
 }
 
 /// `/flush` 클라이언트 상한. 서버 드레인이 큰 백로그를 로컬로 밀면 시간이 걸리므로(aicd control

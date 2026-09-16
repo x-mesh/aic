@@ -136,7 +136,7 @@ pub async fn serve_connections(
                                     tracing::warn!(error = %e2, "OTLP connections spool append 실패 — 이 스냅샷 유실");
                                 }
                                 backoff.on_failure();
-                                cfg.health.record_fail();
+                                cfg.health.record_fail(&url, &e);
                             }
                         }
                     }

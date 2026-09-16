@@ -10,9 +10,10 @@
 //! 아니기 때문이다. 개별 signal의 실패는 로그에 남는다.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use super::{SignalKind, Spool};
+use super::logs::DropCounters;
+use super::{DropReason, PushError, SignalKind, Spool};
 
 /// exporter 전송 카운터 + spool 참조. 모든 필드는 lock-free다(push 경로에 락을 넣지 않는다).
 #[derive(Debug)]
@@ -48,6 +49,26 @@ pub struct ExporterHealth {
     spool: Arc<Spool>,
     /// collector base URL(표시용).
     endpoint: String,
+    /// **마지막 push 실패 한 건**. 예전에는 실패 수만 셌기 때문에, 유실을 발견해도 collector가
+    /// 죽은 건지 토큰이 거부된 건지 알 수 없어 aicd 로그를 직접 여는 수밖에 없었다 — 그 한 줄을
+    /// 상태에 실어 chat status bar와 `aic doctor`가 사유까지 보여 줄 수 있게 한다.
+    ///
+    /// `Mutex`인 이유: 값이 문자열 둘이라 원자 타입으로 담을 수 없다. push **실패** 경로에서만
+    /// 잠그므로(성공 경로는 건드리지 않는다) 정상 동작 중에는 경합이 없다.
+    last_failure: Mutex<Option<StoredFailure>>,
+    /// 로그 수집기의 드롭 카운터 — `collector_dropped`(200 응답인데 수신측이 버린 레코드 수)를
+    /// 읽는다. exporter보다 나중에 만들어지므로 [`Self::attach_drop_counters`]로 1회 주입한다.
+    drop_counters: OnceLock<Arc<DropCounters>>,
+}
+
+/// [`ExporterHealth::last_failure`]에 보관하는 실패 1건. IPC 타입과 달리 시각을 절대값으로 들고
+/// 있다가 스냅샷 시점에 경과 초로 환산한다(보관 시점의 "몇 초 전"은 읽는 순간 이미 틀린 값이다).
+#[derive(Debug, Clone)]
+struct StoredFailure {
+    unix_secs: u64,
+    url: String,
+    permanent: bool,
+    message: String,
 }
 
 impl ExporterHealth {
@@ -60,7 +81,18 @@ impl ExporterHealth {
             agent_configured: AtomicBool::new(false),
             spool,
             endpoint,
+            last_failure: Mutex::new(None),
+            drop_counters: OnceLock::new(),
         }
+    }
+
+    /// 로그 수집기의 드롭 카운터를 연결한다(aicd_main이 기동 시 1회).
+    ///
+    /// collector가 200으로 받고도 `partial_success`로 레코드를 버리면 push는 성공이라 실패
+    /// 카운터가 오르지 않는다 — 그 유실은 이 카운터에만 남는다. 연결하지 않으면 0으로 보고한다
+    /// (모르는 값을 지어내지 않는다).
+    pub fn attach_drop_counters(&self, counters: Arc<DropCounters>) {
+        let _ = self.drop_counters.set(counters);
     }
 
     /// agent exporter task의 생존 여부를 기록한다.
@@ -88,8 +120,44 @@ impl ExporterHealth {
         self.last_ok_unix.store(unix_now_secs(), Ordering::Relaxed);
     }
 
-    /// push 1건 실패(spool에 적재됨).
-    pub fn record_fail(&self) {
+    /// push 1건 실패(spool에 적재됨). **사유를 함께 남긴다** — 실패 수만으로는 무엇을 고쳐야
+    /// 하는지 알 수 없고, 그때마다 aicd 로그를 여는 것이 유일한 방법이었다.
+    ///
+    /// `url`은 실패한 요청 주소(`.../v1/metrics` 또는 `.../v1/logs`)라 어느 신호가 막혔는지도
+    /// 함께 드러난다.
+    pub fn record_fail(&self, url: &str, err: &PushError) {
+        self.push_fail_total.fetch_add(1, Ordering::Relaxed);
+        let stored = StoredFailure {
+            unix_secs: unix_now_secs(),
+            url: url.to_string(),
+            permanent: err.is_permanent(),
+            message: err.reason().to_string(),
+        };
+        // 잠금이 poison돼도 건강 보고 때문에 exporter를 죽이지는 않는다 — 사유 한 건을 못 남길 뿐이다.
+        if let Ok(mut slot) = self.last_failure.lock() {
+            *slot = Some(stored);
+        }
+    }
+
+    /// collector가 배치를 **영구 거부**해 버렸다 — push 자체는 도달했으므로 실패 카운터는 올리지
+    /// 않고, 마지막 사유만 갱신한다. 이 경로가 없으면 app log 배치가 통째로 사라진 이유가 상태
+    /// 어디에도 남지 않는다(카운터는 `spool_dropped_rejected`/`aic.log.dropped`가 든다).
+    pub fn record_rejection(&self, url: &str, err: &PushError) {
+        let stored = StoredFailure {
+            unix_secs: unix_now_secs(),
+            url: url.to_string(),
+            permanent: err.is_permanent(),
+            message: err.reason().to_string(),
+        };
+        if let Ok(mut slot) = self.last_failure.lock() {
+            *slot = Some(stored);
+        }
+    }
+
+    /// push 1건 실패인데 **사유를 모르는** 경우(로컬 spool 디렉토리 오류 등 collector와 무관한
+    /// 실패). 카운터만 올리고 마지막 사유는 건드리지 않는다 — 없는 원인을 지어내면 그 다음 진단이
+    /// 통째로 엉뚱한 곳을 향한다.
+    pub fn record_fail_without_cause(&self) {
         self.push_fail_total.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -114,6 +182,24 @@ impl ExporterHealth {
                 .into_iter()
                 .map(|k| self.spool.dropped_count(k))
                 .sum(),
+            // 합계와 달리 **사유**는 조치를 고르는 근거다: 쿼터는 상한/수집량, 나이 cap은 장기
+            // 미도달, 영구 거부는 인증·스키마 문제다.
+            spool_dropped_quota: self.spool.dropped_by_reason(DropReason::Quota),
+            spool_dropped_age: self.spool.dropped_by_reason(DropReason::Age),
+            spool_dropped_rejected: self.spool.dropped_by_reason(DropReason::Rejected),
+            collector_dropped: self
+                .drop_counters
+                .get()
+                .map(|c| c.by_collector_dropped.load(Ordering::Relaxed))
+                .unwrap_or(0),
+            last_failure: self.last_failure.lock().ok().and_then(|slot| {
+                slot.as_ref().map(|f| aic_common::ExporterFailure {
+                    secs_ago: unix_now_secs().saturating_sub(f.unix_secs),
+                    url: f.url.clone(),
+                    permanent: f.permanent,
+                    message: f.message.clone(),
+                })
+            }),
         }
     }
 }
@@ -279,12 +365,86 @@ mod tests {
         let h = health();
         h.record_ok();
         h.record_ok();
-        h.record_fail();
+        h.record_fail(
+            "http://localhost:4318/v1/metrics",
+            &PushError::Transient("collector 연결 거부".to_string()),
+        );
         let s = h.snapshot();
         assert_eq!(s.push_ok_total, 2);
         assert_eq!(s.push_fail_total, 1);
         // 성공한 적이 있으므로 이제 Some이고, 방금이라 0초 근처다.
         assert!(s.last_ok_secs_ago.is_some_and(|secs| secs <= 1));
+    }
+
+    #[test]
+    fn failure_carries_cause_so_the_operator_knows_what_to_fix() {
+        // 이 테스트가 지키는 것: "19건 유실"만 보이고 원인은 aicd 로그를 열어야만 알 수 있던 상태로
+        // 되돌아가지 않는 것. 사유·URL·영구 여부가 상태에 함께 실려야 조치를 고를 수 있다.
+        let h = health();
+        assert_eq!(h.snapshot().last_failure, None, "실패 전에는 사유가 없다");
+
+        h.record_fail(
+            "http://collector:4318/v1/logs",
+            &PushError::Permanent("collector가 401 Unauthorized 응답".to_string()),
+        );
+
+        let f = h.snapshot().last_failure.expect("사유가 실려야 한다");
+        assert_eq!(
+            f.url, "http://collector:4318/v1/logs",
+            "어느 신호가 막혔는지"
+        );
+        assert!(
+            f.permanent,
+            "4xx는 기다려도 낫지 않는다 — 설정을 고쳐야 한다"
+        );
+        assert!(f.message.contains("401"), "원인: {}", f.message);
+        assert!(
+            !f.message.contains("영구 실패"),
+            "분류는 permanent 필드가 들고, message는 원인만 담는다: {}",
+            f.message
+        );
+        assert_eq!(h.snapshot().push_fail_total, 1);
+    }
+
+    #[test]
+    fn rejection_records_cause_without_counting_a_push_failure() {
+        // 영구 거부는 **도달한** 요청이라 push 실패가 아니다(backoff도 걸지 않는다). 그래도 배치는
+        // 사라졌으므로 사유는 남아야 한다 — 이게 없으면 app log가 통째로 증발한 이유를 어디서도
+        // 볼 수 없다.
+        let h = health();
+        h.record_rejection(
+            "http://collector:4318/v1/logs",
+            &PushError::Permanent("collector가 413 Payload Too Large 응답".to_string()),
+        );
+        let s = h.snapshot();
+        assert_eq!(s.push_fail_total, 0, "도달했으므로 실패 카운터는 그대로");
+        assert!(s.last_failure.is_some_and(|f| f.message.contains("413")));
+    }
+
+    #[test]
+    fn unknown_cause_failure_does_not_invent_one() {
+        // 로컬 spool 오류처럼 collector와 무관한 실패에 그럴듯한 사유를 지어내면, 다음 진단이
+        // 통째로 엉뚱한 곳(수신 서버)을 향한다.
+        let h = health();
+        h.record_fail_without_cause();
+        let s = h.snapshot();
+        assert_eq!(s.push_fail_total, 1);
+        assert_eq!(s.last_failure, None, "모르는 원인을 지어내지 않는다");
+    }
+
+    #[test]
+    fn collector_dropped_is_zero_until_counters_are_attached() {
+        // 배선되지 않았으면 0으로 보고한다 — "0건 폐기"와 "모름"을 구분할 방법이 없으므로,
+        // 적어도 지어내지는 않는다(배선은 aicd_main이 기동 시 1회 한다).
+        let h = health();
+        assert_eq!(h.snapshot().collector_dropped, 0);
+
+        let counters = Arc::new(DropCounters::new());
+        counters
+            .by_collector_dropped
+            .fetch_add(7, Ordering::Relaxed);
+        h.attach_drop_counters(counters);
+        assert_eq!(h.snapshot().collector_dropped, 7);
     }
 
     #[test]

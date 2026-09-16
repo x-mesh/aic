@@ -2318,15 +2318,21 @@ impl AgentSession {
             }),
             None => None,
         };
-        let report = tool_record::build_doctor_report(
-            self.provider.as_deref(),
-            self.model.as_deref(),
-            self.dispatcher.supports_tool_calling(),
-            self.allow_run_command,
-            crate::audit::audit_key_backend(),
-            &flags,
-            rca_state.as_deref(),
+        // exporter 전송 건강 — aicd에 물어 `aic doctor` CLI와 **같은 판정 함수**로 접는다.
+        // 유실은 여기서 드러나지 않으면 status bar 숫자 한 토막이 유일한 단서가 된다.
+        let exporter = crate::doctor::exporter_check_from_status(
+            crate::agent_event::exporter_status_for_diagnosis().await,
         );
+        let report = tool_record::build_doctor_report(tool_record::DoctorFacts {
+            provider: self.provider.as_deref(),
+            model: self.model.as_deref(),
+            tool_calling: self.dispatcher.supports_tool_calling(),
+            run_command_on: self.allow_run_command,
+            audit_key_backend: crate::audit::audit_key_backend(),
+            env_flags: &flags,
+            rca_agent: rca_state.as_deref(),
+            exporter: Some(&exporter),
+        });
         let body = if ui::is_tty() {
             super::markdown::render_markdown(&report, ui::render_width(), ui::color_enabled())
         } else {

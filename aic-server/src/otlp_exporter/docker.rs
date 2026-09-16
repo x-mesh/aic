@@ -729,7 +729,7 @@ async fn serve_docker_with(
                                     tracing::warn!(error = %e2, "OTLP docker spool append 실패 — 이 샘플 유실");
                                 }
                                 backoff.on_failure();
-                                cfg.health.record_fail();
+                                cfg.health.record_fail(&url, &e);
                             }
                         }
                     }

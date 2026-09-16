@@ -43,7 +43,7 @@ graph LR
 - ✅ 단일 인스턴스 보장 — `fcntl(F_SETLK)` PID lock + stale 자동 정리
 - ✅ Graceful shutdown — SIGTERM/SIGINT 핸들링, drain 후 cleanup
 - ✅ 구조화 trace 로그 — JSONL daily rotate (7일 보존), `AIC_LOG=info|debug`
-- ✅ `aic doctor` — 9축 환경 진단 (config/provider/소켓/데몬/supervisor/셸hook/LLM endpoint/keychain/audit)
+- ✅ `aic doctor` — 10축 환경 진단 (config/provider/소켓/데몬/supervisor/OTLP exporter/셸hook/LLM endpoint/keychain/audit). exporter 축은 마지막 전송 실패 사유와 사유별 유실 건수, 조치를 함께 보여준다
 - ✅ `aic status` — 데몬 PID/ping/마지막 명령어 1회 출력
 - ✅ `aic diagnose` — 증상 기반 Safe probe → typed **Finding**(severity/confidence/probe_id). 결정적 임계 스캔이 disk/inode/fd/swap 고갈·커널 OOM-kill·실패 systemd 유닛을 **LLM 없이** 표시하고, `aic diagnose --json`은 machine-readable 봉투로 출력
 - ✅ `aic rca` — persistent RCA workspace: `~/.aic/incidents/<id>/`(`evidence.jsonl` + `report.md`)에 incident 영속 저장, `start`/`status`/`timeline`/`report`. `--diagnose`는 headless `/diagnose` 엔진의 초동 증거를 첨부
@@ -206,7 +206,7 @@ EOF
 aic config             # provider/api_key/model 인터랙티브 설정
 aic init zsh           # ~/.zshrc에 'source ~/.aic/hooks.zsh' 멱등 추가
 aic migrate-keys       # 평문 API key를 OS keychain으로 이동 (선택)
-aic doctor             # 9축 진단 — PASS/WARN/FAIL 한눈에 확인
+aic doctor             # 10축 진단 — PASS/WARN/FAIL 한눈에 확인
 aic doctor --probe-tools  # opt-in 라이브 probe: provider가 실제로 tool-calling을 지원하는지 진단
 
 # 원격 호스트 하나 또는 그룹에서 같은 읽기 전용 진단 실행
@@ -485,7 +485,7 @@ aic/
 │       ├── main.rs                  # clap CLI 진입점과 하위 명령
 │       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
 │       ├── uds_client.rs            # session UDS + aicd control client
-│       ├── doctor.rs                # 9축 진단 (aicd supervisor 포함)
+│       ├── doctor.rs                # 10축 진단 (aicd supervisor·OTLP exporter 포함)
 │       ├── workload.rs              # 워크로드 CLI 동작
 │       ├── agent/
 │       │   ├── hosts.rs              # 원격 호스트와 그룹 인벤토리

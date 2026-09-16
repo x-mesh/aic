@@ -89,7 +89,7 @@ ac-rust/
         ├── hook_install.rs      # zsh/bash hook script generator + RC marker
         ├── uds_client.rs        # session + aicd control client.
         │                        # list_sessions/stop_session/shutdown/send_raw 추가
-        ├── doctor.rs            # 9축 진단 (aicd supervisor 포함)
+        ├── doctor.rs            # 10축 진단 (aicd supervisor·OTLP exporter 포함)
         ├── config.rs            # ConfigManager (TOML 로드/저장)
         ├── llm_dispatcher.rs    # LLM Provider 라우터: send/send_streaming
         │                        # + send_messages/supports_tool_calling (RFC-002)
@@ -368,7 +368,7 @@ grep 가능하게 출력. 색상은 위 정책을 따른다. banner는 AIC_DEBUG
 
 ```
 aic config [show|get <path>]                   # 설정 (wizard / CI 출력)
-aic doctor [--json] [--probe-tools]            # 9축 진단 + opt-in tool-calling live probe
+aic doctor [--json] [--probe-tools]            # 10축 진단 + opt-in tool-calling live probe
 aic status [--watch] [--interval N] / aic top  # 데몬 상태 + metrics
 aic sessions                                   # aicd registry-first 세션 목록
 aic audit verify                               # HMAC chain (exit 0/2/3)

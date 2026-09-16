@@ -258,6 +258,11 @@ impl LogsFlusher {
                 // backoff는 올리지 않는다 — collector는 살아 있다. 우리 요청이 틀렸을 뿐이고,
                 // backoff를 걸면 멀쩡한 다음 배치까지 지연시킨다.
                 self.cfg.health.record_ok();
+                // 다만 **유실은 유실로 센다**. push는 성공(도달)이라 실패 카운터가 오르지 않고
+                // spool에도 넣지 않으므로, 이 두 줄이 없으면 collector가 매번 거부해 app log가
+                // 100% 사라지는 동안에도 진단은 "정상"이라고 말한다(유실 수 0, 마지막 성공 방금).
+                self.cfg.spool.record_rejected_batch(SignalKind::AppLogs);
+                self.cfg.health.record_rejection(&self.url, &e);
             }
             Err(e) => {
                 tracing::warn!(error = %e, batch_lines, "OTLP app logs push 실패 — spool에 적재");
@@ -265,7 +270,7 @@ impl LogsFlusher {
                     tracing::warn!(error = %e2, batch_lines, "OTLP app logs spool append 실패 — 이 배치 유실");
                 }
                 self.backoff.on_failure();
-                self.cfg.health.record_fail();
+                self.cfg.health.record_fail(&self.url, &e);
             }
         }
     }
@@ -714,6 +719,64 @@ mod tests {
             "backoff 윈도 안에선 네트워크 시도가 없어야 함"
         );
         assert_eq!(spool.batch_count(), 2);
+
+        sd_tx.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+    }
+
+    /// collector가 배치를 **영구 거부**(4xx)하면 spool에 넣지 않고 버린다 — 그 유실을 세지 않으면
+    /// app log가 100% 사라지는 동안에도 상태는 전부 건강해 보인다: push는 도달했으니 실패 카운터도
+    /// 오르지 않고, 밀린 배치도 없고, 마지막 성공 시각도 방금이다. 그 상태에서 `aic doctor`는
+    /// "정상"이라고 답한다 — 이 관측성 작업이 없애려던 바로 그 상황이다.
+    #[tokio::test]
+    async fn permanently_rejected_batches_are_counted_as_loss() {
+        use axum::http::StatusCode;
+
+        async fn always_reject() -> StatusCode {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/v1/logs", axum::routing::post(always_reject));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (_dir, spool) = test_spool();
+        let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
+        let cfg = LogsExporterConfig {
+            endpoint: format!("http://{addr}"),
+            token: None,
+            service_version: "0.0.0-test".to_string(),
+            batch_max_lines: 1,
+            batch_max_bytes: 4 * 1024 * 1024,
+            batch_max_ms: 60_000,
+            spool: spool.clone(),
+            health: health.clone(),
+            logs_cfg: aic_common::AicdLogsConfig::default(),
+            drop_counters: Arc::new(DropCounters::new()),
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let (sd_tx, sd_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_logs(cfg, rx, sd_rx));
+
+        tx.send(log_line("lost")).await.unwrap();
+        wait_until(|| health.snapshot().spool_dropped > 0).await;
+
+        let snap = health.snapshot();
+        assert_eq!(
+            snap.spool_batches, 0,
+            "영구 거부 배치는 spool에 넣지 않는다"
+        );
+        assert_eq!(
+            snap.spool_dropped_rejected, 1,
+            "버린 배치는 서버거부 유실로 잡혀야 한다"
+        );
+        assert!(
+            snap.last_failure.is_some_and(|f| f.permanent),
+            "사유(영구 거부)도 함께 남아야 한다"
+        );
 
         sd_tx.send(true).unwrap();
         handle.await.unwrap().unwrap();

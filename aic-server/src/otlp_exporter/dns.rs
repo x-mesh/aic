@@ -114,7 +114,7 @@ impl DnsSink<'_> {
                 if let Err(e2) = self.spool.append(SignalKind::Logs, &body) {
                     tracing::warn!(error = %e2, "OTLP dns spool append 실패 — 이 관측 유실");
                 }
-                self.health.record_fail();
+                self.health.record_fail(self.url, &e);
             }
         }
     }

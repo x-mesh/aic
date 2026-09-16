@@ -333,6 +333,41 @@ pub struct ExporterStatus {
     /// spool 용량 상한을 넘겨 **버린** 배치 수. 0이 아니면 데이터가 실제로 유실됐다.
     #[serde(default)]
     pub spool_dropped: u64,
+    /// [`Self::spool_dropped`]의 **사유별 내역**. 합계만으로는 무엇을 고쳐야 할지 알 수 없다 —
+    /// 쿼터 초과는 spool 상한이나 수집량의 문제고, 나이 cap은 collector가 오래 죽어 있었다는
+    /// 뜻이며, 영구 거부는 인증·스키마 문제라 조치가 서로 다르다.
+    #[serde(default)]
+    pub spool_dropped_quota: u64,
+    #[serde(default)]
+    pub spool_dropped_age: u64,
+    #[serde(default)]
+    pub spool_dropped_rejected: u64,
+    /// collector가 **200으로 받고** partial_success로 버린 레코드 수. push는 성공이라 위 유실
+    /// 카운터에 잡히지 않는다 — 수신측에 미등록 scope나 미지원 타입이 있을 때 여기만 오른다.
+    #[serde(default)]
+    pub collector_dropped: u64,
+    /// 마지막 push 실패 한 건. 유실 **수**만으로는 원인을 알 수 없어, 사유를 그대로 싣는다.
+    /// `None`이면 실패한 적이 없거나 이 필드를 모르는 구버전 aicd다.
+    #[serde(default)]
+    pub last_failure: Option<ExporterFailure>,
+}
+
+/// exporter push가 마지막으로 실패한 사건.
+///
+/// 왜 상태에 싣는가: 실패 원인은 aicd 로그에만 남고, chat status bar와 `aic doctor`는 숫자만
+/// 본다. 그래서 "19건 유실"을 보고도 collector가 죽은 건지, 토큰이 거부된 건지, 수신측 스키마가
+/// 안 맞는 건지 알 수 없었다 — 그 한 줄을 여기로 올린다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExporterFailure {
+    /// 실패 후 경과 초. [`ExporterStatus::last_ok_secs_ago`]와 같은 축이라 나란히 읽을 수 있다.
+    pub secs_ago: u64,
+    /// 실패한 요청 URL(`.../v1/metrics` 또는 `.../v1/logs`) — 어느 신호가 막혔는지 구분한다.
+    pub url: String,
+    /// 영구 실패(4xx — 재전송해도 같은 응답)인가. false면 일시 실패(5xx·429·타임아웃·연결 실패).
+    /// 조치가 다르다: 영구는 인증·스키마를 고쳐야 하고, 일시는 collector 복구를 기다리면 된다.
+    pub permanent: bool,
+    /// 원인 문자열 — HTTP status 또는 연결 오류 chain(`err_chain`이 source까지 이어붙인 값).
+    pub message: String,
 }
 
 /// 실행 중인 데몬 바이너리의 빌드 identity (`GetVersion` 응답).
@@ -469,6 +504,48 @@ mod tests {
         assert_eq!(back.agent_enabled, Some(false));
         assert_eq!(back.agent_configured, Some(true));
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn exporter_status_from_old_daemon_has_no_failure_detail() {
+        // 구버전 aicd는 실패 사유를 모른다 — 필드가 없는 응답에서 `None`이 나와야 하고, 사유별
+        // 유실 내역도 0이어야 한다. 여기서 역직렬화가 깨지면 신버전 클라이언트가 구버전 aicd에
+        // 붙는 순간 exporter 상태를 통째로 못 읽어, 있던 표시까지 사라진다.
+        let old_wire = r#"{"enabled":true,"endpoint":"http://x:4318","push_ok_total":3,
+            "push_fail_total":2,"last_ok_secs_ago":1,"spool_batches":0,"spool_dropped":19}"#;
+        let s: ExporterStatus = serde_json::from_str(old_wire).unwrap();
+        assert_eq!(s.spool_dropped, 19, "합계는 구버전도 준다");
+        assert_eq!(s.last_failure, None, "구버전은 사유를 모른다");
+        assert_eq!(s.spool_dropped_quota, 0);
+        assert_eq!(s.spool_dropped_age, 0);
+        assert_eq!(s.spool_dropped_rejected, 0);
+        assert_eq!(s.collector_dropped, 0);
+    }
+
+    #[test]
+    fn exporter_status_roundtrips_failure_detail() {
+        // 유실 수만 왕복하고 사유가 떨어지면 이 필드를 추가한 의미가 없다 — "19건 유실"에서
+        // 무엇을 고쳐야 하는지 읽어내는 게 목적이다.
+        let s = ExporterStatus {
+            enabled: true,
+            spool_dropped: 19,
+            spool_dropped_quota: 12,
+            spool_dropped_rejected: 7,
+            collector_dropped: 40,
+            last_failure: Some(ExporterFailure {
+                secs_ago: 8,
+                url: "http://x:4318/v1/logs".to_string(),
+                permanent: true,
+                message: "collector가 401 Unauthorized 응답".to_string(),
+            }),
+            ..Default::default()
+        };
+        let back: ExporterStatus =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        let f = back.last_failure.unwrap();
+        assert!(f.permanent, "4xx는 영구 — 기다려도 낫지 않는다");
+        assert!(f.message.contains("401"));
     }
 
     #[test]

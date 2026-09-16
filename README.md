@@ -53,7 +53,7 @@ graph LR
 - ✅ Single-instance guarantee — `fcntl(F_SETLK)` PID lock with automatic stale cleanup
 - ✅ Graceful shutdown — SIGTERM/SIGINT handling, drain then cleanup
 - ✅ Structured trace logs — JSONL daily-rotate (7-day retention), `AIC_LOG=info|debug`
-- ✅ `aic doctor` — 9-axis environment diagnosis (config / provider / socket / daemon / supervisor / shell hook / LLM endpoint / keychain / audit)
+- ✅ `aic doctor` — 10-axis environment diagnosis (config / provider / socket / daemon / supervisor / OTLP exporter / shell hook / LLM endpoint / keychain / audit). The exporter check reports the last push failure, the per-reason loss counts, and the action to take.
 - ✅ `aic status` — daemon PID / ping / last command, one-shot output
 - ✅ Proactive chat status bar — samples host metrics off-thread and shows severity, trends, and bounded alerts
 - ✅ Deterministic health verdict — `/health` reports healthy, degraded, critical, or `UNKNOWN` without an LLM call
@@ -220,7 +220,7 @@ EOF
 aic config             # interactive provider/api_key/model setup
 aic init zsh           # idempotently appends 'source ~/.aic/hooks.zsh' to ~/.zshrc
 aic migrate-keys       # move plaintext API keys into the OS keychain (optional)
-aic doctor             # 9-axis diagnosis — see PASS/WARN/FAIL at a glance
+aic doctor             # 10-axis diagnosis — see PASS/WARN/FAIL at a glance
 aic doctor --probe-tools  # opt-in live probe: does the provider actually support tool-calling?
 
 # Run the same read-only diagnosis across one host or a host group.
@@ -507,7 +507,7 @@ aic/
 │       ├── main.rs                  # clap CLI entry point and subcommands
 │       ├── hook_install.rs          # zsh/bash hook script generator (Phase 3)
 │       ├── uds_client.rs            # session UDS + aicd control client
-│       ├── doctor.rs                # 9-axis diagnosis (incl. aicd supervisor)
+│       ├── doctor.rs                # 10-axis diagnosis (incl. aicd supervisor, OTLP exporter)
 │       ├── workload.rs              # workload CLI behavior
 │       ├── agent/
 │       │   ├── hosts.rs              # remote host and group inventory

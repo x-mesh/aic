@@ -219,6 +219,7 @@ fn check_id(name: &str) -> &'static str {
         "UDS 소켓 경로" => "session_socket",
         "aic-session 데몬" => "session_daemon",
         "aicd supervisor" => "aicd_supervisor",
+        "otlp exporter" => "otlp_exporter",
         "런타임 디렉토리" => "runtime_directory",
         "rca-agent" => "rca_agent",
         "셸 hooks" => "shell_hooks",
@@ -292,6 +293,7 @@ pub async fn run_all_checks_for_provider(
     results.push(check_socket_path(socket));
     results.push(check_daemon_alive(socket).await);
     results.push(check_aicd_supervisor().await);
+    results.push(check_otlp_exporter().await);
     results.push(check_runtime_dir_contract());
     results.push(check_shell_hooks());
     results.push(check_audit_log());
@@ -795,6 +797,140 @@ async fn check_aicd_supervisor() -> CheckResult {
     }
 }
 
+/// OTLP exporter 전송 건강 진단.
+///
+/// 왜 필요한가: exporter는 aicd 안에서 조용히 돈다. 유실이 나도 chat status bar의 숫자 한 토막과
+/// aicd 로그에만 남아, 사람이 "왜 서버에 안 보이지"를 물었을 때 `aic doctor`가 답하지 못했다.
+/// 여기서 마지막 성공 시각·밀린 배치·사유별 유실·마지막 실패 원인을 한 번에 보여 준다.
+async fn check_otlp_exporter() -> CheckResult {
+    exporter_check_from_status(crate::agent_event::exporter_status_for_diagnosis().await)
+}
+
+/// [`check_otlp_exporter`]의 판정부(순수 함수) — IPC 응답을 PASS/WARN/FAIL로 접는다.
+pub(crate) fn exporter_check_from_status(
+    status: Option<aic_common::ExporterStatus>,
+) -> CheckResult {
+    const NAME: &str = "otlp exporter";
+    let Some(s) = status else {
+        // aicd 미실행이거나 이 요청을 모르는 구버전이다 — 둘 다 "확인 못 함"이지 "정상"이 아니다.
+        return CheckResult::warn(
+            NAME,
+            "상태를 확인하지 못함 (aicd 미실행이거나 구버전)",
+            "`aic daemon install` 후 `aic daemon restart`로 aicd를 최신 버전으로 띄우세요",
+        );
+    };
+    if !s.enabled {
+        return CheckResult::pass(NAME, "비활성 (config `[aicd.exporter] enabled = false`)");
+    }
+
+    let endpoint = if s.endpoint.is_empty() {
+        "(endpoint 미설정)".to_string()
+    } else {
+        s.endpoint.clone()
+    };
+    let last_ok = match s.last_ok_secs_ago {
+        Some(secs) => format!("마지막 성공 {secs}초 전"),
+        None => "성공한 적 없음".to_string(),
+    };
+    let base = format!(
+        "{endpoint} · {last_ok} · 성공 {} / 실패 {}",
+        s.push_ok_total, s.push_fail_total
+    );
+    let cause = s
+        .last_failure
+        .as_ref()
+        .map(|f| {
+            format!(
+                " · 마지막 실패({}초 전, {}): {} [{}]",
+                f.secs_ago,
+                if f.permanent { "영구" } else { "일시" },
+                f.message,
+                f.url
+            )
+        })
+        .unwrap_or_default();
+
+    // 확정 유실이 가장 나쁜 소식이다 — 사유별 내역과 함께 올린다.
+    if s.spool_dropped > 0 {
+        // 사유별 내역을 모르는 구버전 aicd는 셋 다 0이다. 그대로 찍으면 "19건 유실 (쿼터초과 0 ·
+        // 기한초과 0 · 서버거부 0)"처럼 스스로 모순된 문장이 된다 — 모르면 말하지 않는다.
+        let breakdown =
+            if s.spool_dropped_quota + s.spool_dropped_age + s.spool_dropped_rejected > 0 {
+                format!(
+                    " (쿼터초과 {} · 기한초과 {} · 서버거부 {})",
+                    s.spool_dropped_quota, s.spool_dropped_age, s.spool_dropped_rejected
+                )
+            } else {
+                String::new()
+            };
+        let detail = format!("배치 {}건 유실{breakdown} · {base}{cause}", s.spool_dropped);
+        // **유실 카운터는 aicd 수명 동안 누적된다.** 지금 정상 전송 중인데도(밀린 배치 없음 +
+        // 최근 성공) 몇 주 전 장애 1건 때문에 FAIL을 내면, `aic doctor`의 종료 코드가 영구히 1로
+        // 굳어 CI·스크립트에서 의미를 잃는다. 과거 유실은 알리되 등급은 현재 상태를 따른다.
+        let recovered = s.spool_batches == 0 && s.last_ok_secs_ago.is_some();
+        return if recovered {
+            CheckResult::warn(
+                NAME,
+                format!("{detail} — 현재는 정상 전송 중(유실은 누적 기록)"),
+                exporter_fix_hint(&s),
+            )
+        } else {
+            CheckResult::fail(NAME, detail, exporter_fix_hint(&s))
+        };
+    }
+    // 200으로 받고도 수신측이 버린 레코드 — push는 성공이라 위 카운터에 잡히지 않는다.
+    if s.collector_dropped > 0 {
+        return CheckResult::warn(
+            NAME,
+            format!(
+                "수신측이 레코드 {}건을 폐기(partial_success) · {base}{cause}",
+                s.collector_dropped
+            ),
+            "수신 서버(rca)에 해당 scope decoder/스키마가 등록됐는지 확인하세요",
+        );
+    }
+    if s.spool_batches > 0 {
+        return CheckResult::warn(
+            NAME,
+            format!("배치 {}건이 spool에 밀림 · {base}{cause}", s.spool_batches),
+            "collector 도달 여부를 확인하고, 복구됐으면 chat에서 `/flush`로 즉시 드레인하세요",
+        );
+    }
+    // 설정은 켰는데 agent exporter가 뜨지 못한 상태 — chat 이벤트만 조용히 버려진다.
+    if s.agent_configured == Some(true) && s.agent_enabled == Some(false) {
+        return CheckResult::warn(
+            NAME,
+            format!("agent exporter가 떠 있지 않음 (chat 이벤트 유실) · {base}{cause}"),
+            "aicd 로그(`~/.local/state/aic/server.<날짜>.log`)에서 기동 실패 원인을 확인하세요",
+        );
+    }
+    if s.push_ok_total == 0 && s.push_fail_total > 0 {
+        return CheckResult::fail(
+            NAME,
+            format!("한 번도 전송에 성공하지 못함 · {base}{cause}"),
+            exporter_fix_hint(&s),
+        );
+    }
+    CheckResult::pass(NAME, base)
+}
+
+/// 마지막 실패의 성격에 맞는 조치를 고른다 — 영구 실패에 "collector 복구를 기다리라"고 하면
+/// 사용자가 시키는 대로 해도 영영 낫지 않는다(그 반대도 마찬가지).
+fn exporter_fix_hint(s: &aic_common::ExporterStatus) -> String {
+    match s.last_failure.as_ref() {
+        Some(f) if f.permanent => {
+            "수신 서버가 요청을 거부했습니다 — `[aicd.exporter] token`과 endpoint 경로를 확인하세요 (`aic enroll`로 다시 등록할 수 있습니다)"
+                .to_string()
+        }
+        Some(_) => {
+            "collector에 도달하지 못했습니다 — endpoint 도달성(DNS·방화벽·VPN)을 확인하세요"
+                .to_string()
+        }
+        None => "aicd 로그(`~/.local/state/aic/server.<날짜>.log`)에서 유실 사유를 확인하세요"
+            .to_string(),
+    }
+}
+
 /// rca-agent(커널 eBPF collector) 도달성 체크 — aicd supervisor와 같은 **optional 등급**이다.
 ///
 /// rca-agent는 aic가 생명주기를 소유하지 않는 별도 system 데몬이라, 없거나 죽어 있어도
@@ -1056,6 +1192,134 @@ mod tests {
         assert_eq!(
             CheckResult::pass("provider 'custom'", "ok").id,
             "provider_config"
+        );
+    }
+
+    #[test]
+    fn exporter_check_names_the_cause_not_just_the_count() {
+        // 이 테스트가 지키는 것: "19건 유실"만 보고 무엇을 고쳐야 할지 몰라 aicd 로그를 직접 열던
+        // 상태로 되돌아가지 않는 것. 사유별 내역과 마지막 실패 원인이 detail에 있어야 한다.
+        let status = aic_common::ExporterStatus {
+            enabled: true,
+            endpoint: "http://collector:8080".to_string(),
+            push_ok_total: 0,
+            push_fail_total: 21,
+            spool_dropped: 19,
+            spool_dropped_rejected: 19,
+            last_failure: Some(aic_common::ExporterFailure {
+                secs_ago: 12,
+                url: "http://collector:8080/v1/logs".to_string(),
+                permanent: true,
+                message: "collector가 401 Unauthorized 응답".to_string(),
+            }),
+            ..Default::default()
+        };
+        let check = exporter_check_from_status(Some(status));
+        assert_eq!(check.status, Status::Fail, "확정 유실은 FAIL이다");
+        assert!(check.detail.contains("19건 유실"), "{}", check.detail);
+        assert!(check.detail.contains("서버거부 19"), "{}", check.detail);
+        assert!(check.detail.contains("401"), "{}", check.detail);
+        // 영구 실패에 "복구를 기다리라"고 안내하면 사용자가 시키는 대로 해도 낫지 않는다.
+        let hint = check.fix_hint.unwrap();
+        assert!(hint.contains("token"), "{hint}");
+    }
+
+    #[test]
+    fn exporter_check_downgrades_stale_loss_but_keeps_ongoing_loss_fatal() {
+        // 유실 카운터는 aicd 수명 동안 누적된다 — 지금 정상인데도 과거 1건 때문에 FAIL을 내면
+        // `aic doctor`의 종료 코드가 영구히 1로 굳는다(CI·스크립트가 의미를 잃는다).
+        let recovered = aic_common::ExporterStatus {
+            enabled: true,
+            endpoint: "http://collector:8080".to_string(),
+            push_ok_total: 900,
+            last_ok_secs_ago: Some(12),
+            spool_batches: 0,
+            spool_dropped: 1,
+            spool_dropped_age: 1,
+            ..Default::default()
+        };
+        let check = exporter_check_from_status(Some(recovered.clone()));
+        assert_eq!(check.status, Status::Warn, "복구됐으면 WARN이다");
+        assert!(check.detail.contains("현재는 정상"), "{}", check.detail);
+
+        // 반대로 아직 밀려 있으면 진행 중인 유실이다 — 등급을 낮추면 안 된다.
+        let ongoing = aic_common::ExporterStatus {
+            spool_batches: 40,
+            ..recovered
+        };
+        assert_eq!(
+            exporter_check_from_status(Some(ongoing)).status,
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn exporter_check_omits_breakdown_it_does_not_know() {
+        // 구버전 aicd는 사유별 내역을 안 준다. 0을 그대로 찍으면 "19건 유실 (쿼터초과 0 · 기한초과
+        // 0 · 서버거부 0)"처럼 스스로 모순된 문장이 된다.
+        let old_daemon = aic_common::ExporterStatus {
+            enabled: true,
+            endpoint: "http://collector:8080".to_string(),
+            spool_batches: 3,
+            spool_dropped: 19,
+            ..Default::default()
+        };
+        let check = exporter_check_from_status(Some(old_daemon));
+        assert!(check.detail.contains("19건 유실"), "{}", check.detail);
+        assert!(!check.detail.contains("쿼터초과"), "{}", check.detail);
+    }
+
+    #[test]
+    fn exporter_fix_hint_has_no_stray_padding() {
+        // 사용자에게 그대로 출력되는 문구다 — 줄바꿈 연속을 정리하다 남은 공백이 문장 가운데를
+        // 벌려 놓으면 눈에 띈다.
+        let permanent = aic_common::ExporterStatus {
+            last_failure: Some(aic_common::ExporterFailure {
+                secs_ago: 1,
+                url: "http://collector:8080/v1/logs".to_string(),
+                permanent: true,
+                message: "collector가 401 Unauthorized 응답".to_string(),
+            }),
+            ..Default::default()
+        };
+        let hint = exporter_fix_hint(&permanent);
+        assert!(!hint.contains("  "), "연속 공백이 남아 있다: {hint}");
+    }
+
+    #[test]
+    fn exporter_check_distinguishes_off_from_unknown() {
+        // "안 켰다"와 "확인 못 했다"는 사용자가 할 일이 다르다 — 전자는 아무것도 안 해도 되고,
+        // 후자는 aicd를 띄워야 한다. 하나로 뭉개면 진짜 문제가 정상으로 보인다.
+        let off = exporter_check_from_status(Some(aic_common::ExporterStatus::default()));
+        assert_eq!(off.status, Status::Pass);
+        assert!(off.detail.contains("비활성"), "{}", off.detail);
+
+        let unknown = exporter_check_from_status(None);
+        assert_eq!(unknown.status, Status::Warn);
+        assert!(
+            unknown.detail.contains("확인하지 못함"),
+            "{}",
+            unknown.detail
+        );
+    }
+
+    #[test]
+    fn exporter_check_passes_when_delivering() {
+        let healthy = aic_common::ExporterStatus {
+            enabled: true,
+            agent_enabled: Some(true),
+            agent_configured: Some(true),
+            endpoint: "http://collector:8080".to_string(),
+            push_ok_total: 102,
+            last_ok_secs_ago: Some(23),
+            ..Default::default()
+        };
+        let check = exporter_check_from_status(Some(healthy));
+        assert_eq!(check.status, Status::Pass);
+        assert!(
+            check.detail.contains("마지막 성공 23초 전"),
+            "{}",
+            check.detail
         );
     }
 

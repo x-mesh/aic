@@ -1173,17 +1173,32 @@ pub(crate) fn recent_records_evidence(ring: &VecDeque<ToolRecord>, n: usize) -> 
 
 /// `/doctor` 리포트(순수) — AIC 자체 상태. **secret 값은 출력하지 않는다**: provider/model은 식별자만,
 /// env flag는 값이 아니라 set/unset만, config/env 전체 dump 없음.
-pub(crate) fn build_doctor_report(
-    provider: Option<&str>,
-    model: Option<&str>,
-    tool_calling: bool,
-    run_command_on: bool,
-    audit_key_backend: &str,
-    env_flags: &[(&str, bool)],
-    // 커널 evidence 연동 상태 한 줄(None이면 연동 자체가 비활성 — 줄을 넣지 않는다).
-    // 상태 문자열은 호출부가 실제 조회로 만든다(이 함수는 순수 문자열 조립).
-    rca_agent: Option<&str>,
-) -> String {
+/// `/doctor`가 보여 줄 사실들. 조회는 호출부가 하고, 이 모듈은 문자열 조립만 한다.
+pub(crate) struct DoctorFacts<'a> {
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub tool_calling: bool,
+    pub run_command_on: bool,
+    pub audit_key_backend: &'a str,
+    pub env_flags: &'a [(&'a str, bool)],
+    /// 커널 evidence 연동 상태 한 줄(None이면 연동 자체가 비활성 — 줄을 넣지 않는다).
+    pub rca_agent: Option<&'a str>,
+    /// OTLP exporter 전송 건강(None이면 조회 자체를 하지 않았다는 뜻). `aic doctor` CLI와 **같은
+    /// 판정 함수**의 결과를 받는다 — 두 진단이 같은 상황에 다른 말을 하면 안 된다.
+    pub exporter: Option<&'a crate::doctor::CheckResult>,
+}
+
+pub(crate) fn build_doctor_report(facts: DoctorFacts<'_>) -> String {
+    let DoctorFacts {
+        provider,
+        model,
+        tool_calling,
+        run_command_on,
+        audit_key_backend,
+        env_flags,
+        rca_agent,
+        exporter,
+    } = facts;
     let mut lines = vec!["## aic chat 상태".to_string()];
     lines.push(format!("- provider: {}", provider.unwrap_or("(미설정)")));
     lines.push(format!("- model: {}", model.unwrap_or("(미설정)")));
@@ -1209,6 +1224,18 @@ pub(crate) fn build_doctor_report(
     if let Some(state) = rca_agent {
         lines.push(format!("- rca-agent(커널 evidence): {state}"));
     }
+    // exporter는 aicd 안에서 조용히 돈다 — 유실이 나도 status bar 숫자 한 토막이 전부였고,
+    // `/doctor`는 그 사실을 아예 몰랐다. 여기서 사유까지 보여 준다.
+    if let Some(check) = exporter {
+        lines.push(format!(
+            "- otlp exporter: [{}] {}",
+            doctor_status_label(check.status),
+            check.detail
+        ));
+        if let Some(hint) = &check.fix_hint {
+            lines.push(format!("  - 조치: {hint}"));
+        }
+    }
     lines.push("## env flags (set/unset only)".to_string());
     for (name, present) in env_flags {
         lines.push(format!(
@@ -1217,6 +1244,17 @@ pub(crate) fn build_doctor_report(
         ));
     }
     lines.join("\n")
+}
+
+/// 진단 상태를 chat 리포트용 한글 라벨로. CLI는 PASS/WARN/FAIL을 쓰지만 chat 출력은 한국어라
+/// 여기서만 바꾼다(판정 자체는 `doctor` 모듈이 단독으로 한다).
+fn doctor_status_label(status: crate::doctor::Status) -> &'static str {
+    match status {
+        crate::doctor::Status::Pass => "정상",
+        crate::doctor::Status::Warn => "주의",
+        crate::doctor::Status::Fail => "실패",
+        crate::doctor::Status::Unknown => "모름",
+    }
 }
 
 /// `/timeline` — 세션 tool 기록을 시간순 compact 라인으로(redacted summary). 최근 `n`개(None=전체).
@@ -2220,15 +2258,16 @@ mod tests {
             ("AIC_AGENT_NO_RUN", false),
             ("SECRET_TOKEN", true), // 값이 아니라 set/unset만 노출되는지 확인용
         ];
-        let r = build_doctor_report(
-            Some("ai-mesh"),
-            Some("kiro/auto"),
-            true,
-            true,
-            "file (default)",
-            &flags,
-            Some("도달 가능, 활성 신호 4개 (http://127.0.0.1:9090)"),
-        );
+        let r = build_doctor_report(DoctorFacts {
+            provider: Some("ai-mesh"),
+            model: Some("kiro/auto"),
+            tool_calling: true,
+            run_command_on: true,
+            audit_key_backend: "file (default)",
+            env_flags: &flags,
+            rca_agent: Some("도달 가능, 활성 신호 4개 (http://127.0.0.1:9090)"),
+            exporter: None,
+        });
         assert!(r.contains("provider: ai-mesh"));
         assert!(r.contains("model: kiro/auto"));
         assert!(r.contains("tool-calling: 지원"));
@@ -2242,10 +2281,66 @@ mod tests {
         assert!(r.contains("SECRET_TOKEN: set"));
         assert!(!r.contains("SECRET_TOKEN: 1") && !r.contains("SECRET_TOKEN=true"));
         // 미설정 표시.
-        let r2 = build_doctor_report(None, None, false, false, "file (default)", &[], None);
+        let r2 = build_doctor_report(DoctorFacts {
+            provider: None,
+            model: None,
+            tool_calling: false,
+            run_command_on: false,
+            audit_key_backend: "file (default)",
+            env_flags: &[],
+            rca_agent: None,
+            exporter: None,
+        });
         assert!(r2.contains("provider: (미설정)") && r2.contains("run_command: off"));
         // 연동이 꺼져 있으면 줄 자체가 없다 — 안 쓰는 기능으로 진단을 어지럽히지 않는다.
         assert!(!r2.contains("rca-agent"));
+    }
+
+    #[test]
+    fn doctor_report_shows_exporter_loss_with_cause() {
+        // `/doctor`가 exporter를 아예 보지 않던 시절로 되돌아가지 않게 한다 — 그때는 유실이 나도
+        // 이 리포트 어디에도 단서가 없어, 사람이 aicd 로그를 여는 것 말고는 방법이 없었다.
+        let check = crate::doctor::exporter_check_from_status(Some(aic_common::ExporterStatus {
+            enabled: true,
+            endpoint: "http://collector:8080".to_string(),
+            push_fail_total: 21,
+            spool_dropped: 19,
+            spool_dropped_rejected: 19,
+            last_failure: Some(aic_common::ExporterFailure {
+                secs_ago: 12,
+                url: "http://collector:8080/v1/logs".to_string(),
+                permanent: true,
+                message: "collector가 401 Unauthorized 응답".to_string(),
+            }),
+            ..Default::default()
+        }));
+        let r = build_doctor_report(DoctorFacts {
+            provider: Some("ai-mesh"),
+            model: Some("kiro/auto"),
+            tool_calling: true,
+            run_command_on: true,
+            audit_key_backend: "file (default)",
+            env_flags: &[],
+            rca_agent: None,
+            exporter: Some(&check),
+        });
+        assert!(r.contains("otlp exporter: [실패]"), "{r}");
+        assert!(r.contains("19건 유실"), "{r}");
+        assert!(r.contains("401"), "{r}");
+        assert!(r.contains("조치:"), "{r}");
+
+        // 조회를 못 했으면 줄 자체가 없다 — 모르는 상태를 정상으로 보이게 하지 않는다.
+        let none = build_doctor_report(DoctorFacts {
+            provider: None,
+            model: None,
+            tool_calling: false,
+            run_command_on: false,
+            audit_key_backend: "file",
+            env_flags: &[],
+            rca_agent: None,
+            exporter: None,
+        });
+        assert!(!none.contains("otlp exporter"));
     }
 
     #[test]

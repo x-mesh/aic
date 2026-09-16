@@ -363,7 +363,7 @@ pub async fn serve_changes(
                             tracing::warn!(error = %e2, "OTLP changes spool append 실패 — 이 배치 유실");
                         }
                         backoff.on_failure();
-                        cfg.health.record_fail();
+                        cfg.health.record_fail(&url, &e);
                     }
                 }
             }

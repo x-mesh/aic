@@ -64,7 +64,7 @@ pub use events::{serve_events, EventsConfig};
 pub use health::ExporterHealth;
 pub use kernel::{ensure_loopback, serve_kernel, KernelConfig};
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
-pub use spool::{SignalKind, Spool};
+pub use spool::{DropReason, SignalKind, Spool};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -372,15 +372,18 @@ pub async fn serve(
                 }
 
                 let mut tick_failed = false;
+                // 이 tick에서 마지막으로 만난 push 실패 사유. tick 끝에서 health에 싣는다 —
+                // 카운터는 tick당 1건이지만(기존 계수 유지), 사유가 없으면 "밀린다"만 보이고
+                // 무엇을 고쳐야 하는지는 여전히 로그를 열어야만 알 수 있다.
+                let mut tick_failure: Option<(String, PushError)> = None;
 
                 // (0) 나이 cap — 드레인 전에 너무 오래된 배치를 네트워크 없이 드롭한다. 낡은 telemetry가
                 // FIFO 머리를 막아 최근 이벤트가 그 뒤에 갇히는 걸 막는다(수천 배치 백로그에서 20/tick
                 // 드레인으론 최근 것이 몇 시간 늦게 나간다). `None`이면 이 단계는 없다(기존 동작).
                 if let Some(max_age) = cfg.spool_max_age {
-                    let pruned = cfg.spool.prune_older_than(max_age);
-                    if pruned > 0 {
-                        tracing::debug!(pruned, "OTLP spool 나이 cap 초과 배치 드롭");
-                    }
+                    // 유실 warn은 `prune_older_than`이 직접 남긴다(rate-limited) — 예전에는 여기
+                    // `debug!`가 유일한 흔적이라 기본 로그에서 통째로 사라졌다.
+                    cfg.spool.prune_older_than(max_age);
                 }
 
                 // (1) 드레인 — 밀린 배치를 FIFO로 먼저 흘려보낸다(새 데이터보다 오래된 데이터 우선).
@@ -403,6 +406,19 @@ pub async fn serve(
                 if drain_report.failed {
                     tick_failed = true;
                 }
+                if let Some((kind, err)) = drain_report.last_error {
+                    let failed_url = match kind {
+                        SignalKind::Metrics => url.clone(),
+                        SignalKind::Logs | SignalKind::AppLogs => logs_endpoint.clone(),
+                    };
+                    if err.is_permanent() {
+                        // 영구 거부는 `failed`가 아니다(드레인은 계속 진행됐다) — tick이 그 뒤로
+                        // 전부 성공하면 아래 집계가 `record_ok`로 끝나고 사유는 버려진다. 그러면
+                        // 유실 수만 오르고 "왜 거부됐는지"는 다시 로그에만 남는다.
+                        cfg.health.record_rejection(&failed_url, &err);
+                    }
+                    tick_failure = Some((failed_url, err));
+                }
 
                 // (2) 신규 샘플 송신.
                 if let Err(e) = push(&client, &url, cfg.token.as_deref(), body.clone()).await {
@@ -411,6 +427,7 @@ pub async fn serve(
                         tracing::warn!(error = %e2, "OTLP metrics spool append 실패 — 이 샘플 유실");
                     }
                     tick_failed = true;
+                    tick_failure = Some((url.clone(), e));
                 }
 
                 // (3) 프로세스 top-N logs 송신(있을 때만). metrics와 독립적으로 성패를 따지되,
@@ -445,6 +462,7 @@ pub async fn serve(
                                 tracing::warn!(error = %e2, "OTLP process spool append 실패 — 이 샘플 유실");
                             }
                             tick_failed = true;
+                            tick_failure = Some((logs_endpoint.clone(), e));
                         }
                     }
                 }
@@ -479,13 +497,18 @@ pub async fn serve(
                                 tracing::warn!(error = %e2, "OTLP process inventory spool append 실패 — 이 변화분 유실");
                             }
                             tick_failed = true;
+                            tick_failure = Some((logs_endpoint.clone(), e));
                         }
                     }
                 }
 
                 if tick_failed {
                     backoff.on_failure();
-                    cfg.health.record_fail();
+                    match &tick_failure {
+                        Some((failed_url, err)) => cfg.health.record_fail(failed_url, err),
+                        // collector가 아니라 로컬 spool 쪽 실패다 — 사유를 지어내지 않는다.
+                        None => cfg.health.record_fail_without_cause(),
+                    }
                 } else {
                     backoff.on_success();
                     cfg.health.record_ok();
@@ -517,7 +540,16 @@ pub async fn serve(
                 .await;
                 if report.failed {
                     backoff.on_failure();
-                    cfg.health.record_fail();
+                    match &report.last_error {
+                        Some((kind, err)) => {
+                            let failed_url = match kind {
+                                SignalKind::Metrics => &url,
+                                SignalKind::Logs | SignalKind::AppLogs => &logs_endpoint,
+                            };
+                            cfg.health.record_fail(failed_url, err);
+                        }
+                        None => cfg.health.record_fail_without_cause(),
+                    }
                 } else {
                     backoff.on_success();
                     cfg.health.record_ok();
@@ -567,8 +599,16 @@ impl std::fmt::Display for PushError {
 }
 
 impl PushError {
-    fn is_permanent(&self) -> bool {
+    pub(crate) fn is_permanent(&self) -> bool {
         matches!(self, PushError::Permanent(_))
+    }
+
+    /// 분류 접미("영구 실패 — 재시도 안 함") 없는 **원인 문자열**. 영구/일시 구분은 별도 필드로
+    /// 나가므로(`ExporterFailure::permanent`), 상태에는 원인만 싣는다.
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            PushError::Permanent(m) | PushError::Transient(m) => m,
+        }
     }
 }
 
@@ -678,9 +718,11 @@ fn logs_url(endpoint: &str) -> String {
 /// 성공 시 **collector가 partial_success로 버린 레코드 수**를 돌려준다(보통 0). 200이어도 collector가
 /// 미지 scope·미지원 등으로 일부를 조용히 폐기할 수 있는데(예: rca가 `aic.process` decoder 부재 시
 /// 전량 드롭), 이 값이 그 사각지대를 드러내는 유일한 신호다. **재시도하지 않는다** — 재전송해도 같은
-/// 결과다(4xx `by_rejected`와 다른 범주). 사유 문자열은 debug 로그로만 남기고(스팸 방지 — 상시
-/// 조건이라 warn/카운터는 호출부가 상태를 들고 처리한다), 수만 반환한다. body를 못 읽어도 push는
-/// 성공(200)이므로 0으로 본다.
+/// 결과다(4xx `by_rejected`와 다른 범주). 폐기는 **유실**이므로 기본 로그에 남긴다 — 예전에는
+/// `debug!`라 기본 설정에서 아무 흔적이 없었고, 전이 로그를 든 호출부(process/inventory) 외의
+/// 신호는 조용히 사라졌다. 상시 조건일 수 있어 [`PARTIAL_REJECT_WARN_INTERVAL_SECS`]로 묶는다.
+/// 수는 그대로 반환한다(카운터·전이 판정은 호출부 몫). body를 못 읽어도 push는 성공(200)이므로
+/// 0으로 본다.
 async fn push_logs(
     client: &reqwest::Client,
     url: &str,
@@ -706,10 +748,44 @@ async fn push_logs(
         return Ok(0); // body 읽기 실패 — push 자체는 성공(200)이라 재시도하지 않는다.
     };
     let (rejected, reason) = logs_proto::decode_logs_partial_reject(&resp_body);
-    if rejected > 0 {
-        tracing::debug!(rejected, reason = %reason, url = %url, "collector partial_success 폐기");
+    if rejected > 0 && should_warn_partial_reject() {
+        tracing::warn!(
+            rejected,
+            reason = %reason,
+            url = %url,
+            "collector가 log 레코드를 partial_success로 폐기 — 200이지만 수신측에 남지 않는다 \
+             (수신측 scope/스키마 등록을 확인하세요)"
+        );
     }
     Ok(rejected)
+}
+
+/// partial_success 폐기 warn을 다시 남기기까지의 최소 간격(초). 폐기는 수신측 설정이 바뀔 때까지
+/// 매 배치 반복되는 상시 조건이라, 묶지 않으면 app log 볼륨에서 로그를 덮는다. spool 유실 warn과
+/// 같은 60초 축을 쓴다 — 더 길게 잡으면 주기가 짧은 신호(app logs, 2초)가 창을 선점해 주기가 긴
+/// 신호(host metrics tick, 60초)의 폐기가 로그에서 통째로 빠진다.
+const PARTIAL_REJECT_WARN_INTERVAL_SECS: u64 = 60;
+
+/// 전역 rate limit 창 — 이 helper는 free function(`push`/`push_logs`)이라 인스턴스 상태가 없다.
+/// 창을 공유해도 알리려는 사실은 "수신측이 우리 레코드를 버리고 있다" 하나뿐이고, 메시지에 url과
+/// 사유가 실려 어느 신호인지 구분된다. 호출부(process/inventory)의 전이 warn은 **상태 변화**를,
+/// 이 warn은 **상시 조건**을 알리는 다른 축이라 둘 다 남긴다.
+static LAST_PARTIAL_REJECT_WARN_UNIX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn should_warn_partial_reject() -> bool {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_PARTIAL_REJECT_WARN_UNIX.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < PARTIAL_REJECT_WARN_INTERVAL_SECS {
+        return false;
+    }
+    LAST_PARTIAL_REJECT_WARN_UNIX
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 /// 현재 시각을 unix epoch 나노초로. 시스템 시계가 epoch 이전이면 0(비정상 환경 방어).
