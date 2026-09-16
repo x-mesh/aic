@@ -20,6 +20,7 @@ pub mod proc;
 // (OTLP exporter, SRE t6) 양쪽이 공유하므로 lean한 aic-common으로 옮겨 단일 원천으로 둔다.
 pub mod redaction;
 pub mod secret;
+pub mod semver;
 pub mod session;
 pub mod shell_hooks;
 pub mod workload;
@@ -624,6 +625,17 @@ pub struct AicdExporterConfig {
     /// 미설정 시 Authorization 헤더 없이 전송(localhost collector 등).
     #[serde(default)]
     pub token: Option<String>,
+    /// 중앙(rca-web)이 선언한 목표 버전으로 aicd가 스스로 업데이트할지. 기본 false.
+    ///
+    /// 다른 하위 플래그와 달리 부모가 켜져도 따라 켜지지 않는다 — 텔레메트리를
+    /// 보내는 것과 디스크의 binary를 갈아끼우는 것은 같은 동의가 아니다.
+    /// 중앙은 버전만 말하고, 받을지 말지는 이 플래그가 정한다.
+    #[serde(default)]
+    pub self_update_enabled: bool,
+    /// 목표 버전 확인 주기(초). 기본 1시간. 호스트마다 최대 이 값의 절반만큼
+    /// 무작위로 흩어 놓으므로, 한 함대가 같은 순간에 같은 버전으로 움직이지 않는다.
+    #[serde(default = "default_self_update_interval")]
+    pub self_update_interval_secs: u64,
     /// 수집·push 주기(초). host metrics 전용. 기본 60초. 다른 config가 units 없는 `interval`을
     /// 쓰지 않도록 repo 관례(`dedup_ttl_secs`/`connect_timeout_secs`)를 따라 `_secs` suffix로
     /// 단위를 명시한다.
@@ -771,6 +783,8 @@ impl Default for AicdExporterConfig {
             enabled: false,
             endpoint: String::new(),
             token: None,
+            self_update_enabled: false,
+            self_update_interval_secs: default_self_update_interval(),
             interval_secs: default_exporter_interval(),
             events_enabled: true,
             connections_enabled: true,
@@ -796,6 +810,10 @@ impl Default for AicdExporterConfig {
             enrollment_id: None,
         }
     }
+}
+
+fn default_self_update_interval() -> u64 {
+    60 * 60
 }
 
 fn default_exporter_interval() -> u64 {

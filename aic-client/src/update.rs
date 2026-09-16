@@ -149,44 +149,10 @@ fn goreleaser_arch() -> Option<&'static str> {
 
 /// `a < b` → -1, 같으면 0, 크면 1. `v` prefix와 `-rc1` 류 suffix는 무시한다.
 /// 비-숫자 segment(예: dev)는 "항상 더 낮은 버전"으로 간주해 항상 update 가능 표시.
+/// 버전 비교. 구현은 `aic_common::semver`에 있다 — aicd의 셀프업데이트가 같은
+/// 판정을 써야 하고, 두 벌이 되면 CLI와 데몬이 다른 답을 낼 수 있다.
 pub fn compare_semver(a: &str, b: &str) -> i32 {
-    let (ax, a_dirty) = parse_version(a);
-    let (bx, b_dirty) = parse_version(b);
-    for (av, bv) in ax.iter().zip(bx.iter()) {
-        if av < bv {
-            return -1;
-        }
-        if av > bv {
-            return 1;
-        }
-    }
-    match (a_dirty, b_dirty) {
-        (true, false) => -1,
-        (false, true) => 1,
-        _ => 0,
-    }
-}
-
-fn parse_version(v: &str) -> ([u32; 3], bool) {
-    let v = v.trim();
-    let v = v.strip_prefix('v').unwrap_or(v);
-    let v = match v.find(['-', '+']) {
-        Some(i) => &v[..i],
-        None => v,
-    };
-    let mut out = [0u32; 3];
-    let mut dirty = false;
-    let parts: Vec<&str> = v.split('.').collect();
-    for (i, slot) in out.iter_mut().enumerate() {
-        match parts.get(i) {
-            None => dirty = true,
-            Some(s) => match s.parse::<u32>() {
-                Ok(n) => *slot = n,
-                Err(_) => dirty = true,
-            },
-        }
-    }
-    (out, dirty)
+    aic_common::semver::compare(a, b)
 }
 
 pub fn format_plan(current: &str, next: &str) -> String {
