@@ -602,7 +602,15 @@ pub fn worker_main(test_hook: WorkerTestHook) -> i32 {
         };
         match test_hook {
             WorkerTestHook::DescendantAttempt => {
-                let result = unsafe { libc::syscall(libc::SYS_fork) };
+                // 이 지점에서 필터는 이미 적용돼 있다(worker_main 진입 직후
+                // `install_descendant_filter`) — 그래서 이 호출은 EPERM으로 막히고 자손은 생기지
+                // 않는다. aarch64에는 fork syscall이 없으므로 그 아키텍처의 자손 생성 경로인
+                // clone으로 같은 것을 확인한다.
+                #[cfg(target_arch = "aarch64")]
+                let attempt = libc::SYS_clone;
+                #[cfg(not(target_arch = "aarch64"))]
+                let attempt = libc::SYS_fork;
+                let result = unsafe { libc::syscall(attempt) };
                 if result != -1 || last_errno() != libc::EPERM {
                     return 81;
                 }
@@ -1147,6 +1155,20 @@ fn joined_response(
 
 #[cfg(target_os = "linux")]
 fn install_descendant_filter() -> Result<(), ()> {
+    // `fork`/`vfork`는 레거시 syscall이라 **aarch64 ABI에는 아예 없다**(자손 생성은 clone/clone3
+    // 하나뿐이다). libc에 상수조차 없으므로 무조건 참조하면 aarch64 cross-build가 컴파일 단계에서
+    // 깨진다 — 실제로 v0.41.4 릴리스가 이 지점에서 실패했다. 목록에서 빼도 차단 범위는 그대로다:
+    // 존재하지 않는 syscall은 호출할 방법이 없다.
+    #[cfg(target_arch = "aarch64")]
+    const DESCENDANT_SYSCALLS: &[libc::c_long] = &[libc::SYS_clone, libc::SYS_clone3];
+    #[cfg(not(target_arch = "aarch64"))]
+    const DESCENDANT_SYSCALLS: &[libc::c_long] = &[
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_fork,
+        libc::SYS_vfork,
+    ];
+
     const LOAD_WORD: u16 = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
     const LOAD_ARCH: libc::sock_filter = libc::sock_filter {
         code: LOAD_WORD,
@@ -1207,17 +1229,12 @@ fn install_descendant_filter() -> Result<(), ()> {
         });
         filters.push(KILL);
     }
-    for syscall in [
-        libc::SYS_clone,
-        libc::SYS_clone3,
-        libc::SYS_fork,
-        libc::SYS_vfork,
-    ] {
+    for syscall in DESCENDANT_SYSCALLS {
         filters.push(libc::sock_filter {
             code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
             jt: 0,
             jf: 1,
-            k: syscall as u32,
+            k: *syscall as u32,
         });
         filters.push(DENY);
     }
