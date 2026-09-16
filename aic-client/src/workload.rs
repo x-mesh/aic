@@ -40,6 +40,12 @@ const MAX_COMMAND_TOKENS: usize = 16;
 const MAX_TOKEN_BYTES: usize = 256;
 #[cfg(target_os = "linux")]
 const MAX_CGROUP_BYTES: u64 = 8 * 1024;
+const CONTAINER_ID_MIN_HEX: usize = 12;
+const CONTAINER_ID_MAX_HEX: usize = 64;
+const CONTAINER_ID_PREFIX: &str = "container";
+const CONTAINERIZED_WORKLOAD_AMBIGUITY: &str = "containerized_workload";
+#[cfg(any(target_os = "linux", test))]
+const ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY: &str = "isolation_evidence_unavailable";
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -60,15 +66,61 @@ struct ProcessRow {
     exe: Option<String>,
     cmd: Vec<String>,
     systemd_unit: Option<String>,
+    container: Option<ContainerEvidence>,
     ambiguity: Vec<String>,
 }
 
 type CandidateGroup = (
+    String,
     Option<WorkloadSelector>,
     WorkloadAdapter,
     Vec<RuntimeBinding>,
     Vec<String>,
 );
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NamespaceIds {
+    pid: Option<u64>,
+    mnt: Option<u64>,
+    root: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerRuntime {
+    Docker,
+    Containerd,
+    Podman,
+    Lxc,
+    PidNamespace,
+    RootFs,
+    Isolated,
+}
+
+impl ContainerRuntime {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Containerd => "containerd",
+            Self::Podman => "podman",
+            Self::Lxc => "lxc",
+            Self::PidNamespace => "pidns",
+            Self::RootFs => "rootfs",
+            Self::Isolated => "isolated",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ContainerEvidence {
+    runtime: ContainerRuntime,
+    key: String,
+}
 
 struct ProposalSpec {
     id: String,
@@ -103,10 +155,13 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet);
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+    let scanner_pid = std::process::id();
+    let own_namespaces = read_namespace_ids(scanner_pid);
 
     let mut rows = system
         .processes()
         .iter()
+        .filter(|(pid, _)| pid.as_u32() != scanner_pid)
         .map(|(pid, process)| {
             let pid = pid.as_u32();
             let exe = process.exe().map(|p| p.to_string_lossy().to_string());
@@ -126,7 +181,20 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
             if cmd.is_empty() {
                 cmd.push(process.name().to_string_lossy().to_string());
             }
-            let systemd_unit = read_systemd_unit(pid, &mut ambiguity);
+            let cgroup = read_cgroup_text(pid, &mut ambiguity);
+            let systemd_unit = cgroup.as_deref().and_then(systemd_unit_from_cgroup);
+            let process_namespaces = read_namespace_ids(pid);
+            let container = container_evidence(
+                cgroup.as_deref().and_then(container_marker_from_cgroup),
+                own_namespaces,
+                process_namespaces,
+            );
+            #[cfg(target_os = "linux")]
+            if isolation_evidence_ambiguity(container.as_ref(), own_namespaces, process_namespaces)
+                .is_some()
+            {
+                ambiguity.push(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY.to_string());
+            }
             ProcessRow {
                 pid,
                 start_time: process.start_time(),
@@ -134,6 +202,7 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
                 exe,
                 cmd,
                 systemd_unit,
+                container,
                 ambiguity,
             }
         })
@@ -148,7 +217,7 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
     let mut report = discover_rows(rows);
     if check_drivers {
         for candidate in &mut report.candidates {
-            if candidate.driver_mode.is_some() {
+            if candidate.driver_mode.is_some() && candidate.ambiguity.is_empty() {
                 candidate.driver_mode = Some(inspect_driver(candidate).mode);
             }
         }
@@ -161,32 +230,46 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
     for row in rows {
         let (selector, adapter, mut ambiguity) = classify(&row);
         ambiguity.extend(row.ambiguity);
-        ambiguity.sort();
-        ambiguity.dedup();
-        let key = selector
+        let group_base = selector
             .as_ref()
             .map(WorkloadSelector::stable_id)
             .unwrap_or_else(|| format!("generic:{}:{}", row.name, row.pid));
+        let id_base = selector
+            .as_ref()
+            .map(WorkloadSelector::stable_id)
+            .unwrap_or_else(|| format!("generic:{}", row.pid));
+        let (key, id) = if let Some(container) = &row.container {
+            ambiguity.push(CONTAINERIZED_WORKLOAD_AMBIGUITY.to_string());
+            let prefix = format!(
+                "{CONTAINER_ID_PREFIX}:{}:{}:",
+                container.runtime.label(),
+                container.key
+            );
+            (
+                format!("{prefix}{group_base}"),
+                format!("{prefix}{id_base}"),
+            )
+        } else {
+            (group_base, id_base)
+        };
+        ambiguity.sort();
+        ambiguity.dedup();
         let entry = groups
             .entry(key)
-            .or_insert_with(|| (selector.clone(), adapter, Vec::new(), ambiguity.clone()));
-        entry.2.push(RuntimeBinding {
+            .or_insert_with(|| (id, selector.clone(), adapter, Vec::new(), ambiguity.clone()));
+        entry.3.push(RuntimeBinding {
             pid: row.pid,
             start_time: row.start_time,
         });
-        entry.3.extend(ambiguity);
-        entry.3.sort();
-        entry.3.dedup();
+        entry.4.extend(ambiguity);
+        entry.4.sort();
+        entry.4.dedup();
     }
 
     let mut candidates = groups
         .into_values()
-        .map(|(selector, adapter, mut bindings, ambiguity)| {
+        .map(|(id, selector, adapter, mut bindings, ambiguity)| {
             bindings.sort_by_key(|binding| (binding.pid, binding.start_time));
-            let id = selector
-                .as_ref()
-                .map(WorkloadSelector::stable_id)
-                .unwrap_or_else(|| format!("generic:{}", bindings[0].pid));
             let fingerprint = fingerprint(&id, &bindings);
             WorkloadCandidate {
                 id,
@@ -214,7 +297,7 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
     DiscoveryReport {
         schema_version: WORKLOAD_SCHEMA_VERSION,
         evidence_coverage:
-            "process_name, executable, bounded_command, pid, start_time, linux_cgroup".to_string(),
+            "process_name, executable, bounded_command, pid, start_time, linux_cgroup, linux_container_cgroup, linux_pid_namespace, linux_mount_namespace".to_string(),
         candidates,
     }
 }
@@ -687,7 +770,7 @@ fn classify(row: &ProcessRow) -> (Option<WorkloadSelector>, WorkloadAdapter, Vec
     )
 }
 
-fn read_systemd_unit(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
+fn read_cgroup_text(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let path = format!("/proc/{pid}/cgroup");
@@ -707,7 +790,7 @@ fn read_systemd_unit(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
             ambiguity.push("cgroup_unavailable".to_string());
             return None;
         }
-        systemd_unit_from_cgroup(&text)
+        Some(text)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -716,12 +799,174 @@ fn read_systemd_unit(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let unit = line.rsplit('/').next()?.trim();
         unit.ends_with(".service").then(|| unit.to_string())
     })
+}
+
+#[cfg(target_os = "linux")]
+fn read_namespace_ids(pid: u32) -> NamespaceIds {
+    use std::os::unix::fs::MetadataExt;
+
+    // EACCES is expected for some root-owned processes, so failed reads remain absent evidence.
+    NamespaceIds {
+        pid: fs::read_link(format!("/proc/{pid}/ns/pid"))
+            .ok()
+            .and_then(|link| namespace_inode(&link.to_string_lossy())),
+        mnt: fs::read_link(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .and_then(|link| namespace_inode(&link.to_string_lossy())),
+        root: fs::metadata(format!("/proc/{pid}/root"))
+            .ok()
+            .map(|metadata| FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_namespace_ids(_pid: u32) -> NamespaceIds {
+    NamespaceIds::default()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn namespace_inode(link: &str) -> Option<u64> {
+    let (_, inode) = link.split_once(":[")?;
+    inode.strip_suffix(']')?.parse().ok()
+}
+
+fn container_evidence(
+    marker: Option<ContainerEvidence>,
+    own: NamespaceIds,
+    process: NamespaceIds,
+) -> Option<ContainerEvidence> {
+    marker
+        .or_else(|| {
+            (own.pid
+                .zip(process.pid)
+                .filter(|(own, process)| own != process))
+            .map(|(_, pid)| {
+                let key = match (own.mnt, process.mnt) {
+                    (Some(own), Some(mnt)) if own != mnt => format!("{pid}-{mnt}"),
+                    _ => pid.to_string(),
+                };
+                ContainerEvidence {
+                    runtime: ContainerRuntime::PidNamespace,
+                    key,
+                }
+            })
+        })
+        .or_else(|| {
+            own.root
+                .zip(process.root)
+                .filter(|(own, process)| own != process)
+                .map(|(_, root)| ContainerEvidence {
+                    runtime: ContainerRuntime::RootFs,
+                    key: format!("{}-{}", root.device, root.inode),
+                })
+        })
+        .or_else(|| {
+            let different_mount = own
+                .mnt
+                .zip(process.mnt)
+                .is_some_and(|(own, process)| own != process);
+            let rootfs_unknown = own.root.is_none() || process.root.is_none();
+            (different_mount && rootfs_unknown).then(|| {
+                let mnt = process.mnt.expect("different mount namespaces are present");
+                ContainerEvidence {
+                    runtime: ContainerRuntime::Isolated,
+                    key: mnt.to_string(),
+                }
+            })
+        })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn isolation_evidence_ambiguity(
+    container: Option<&ContainerEvidence>,
+    own: NamespaceIds,
+    process: NamespaceIds,
+) -> Option<&'static str> {
+    if container.is_some() {
+        return None;
+    }
+    let same_pid_namespace = own
+        .pid
+        .zip(process.pid)
+        .is_some_and(|(own, process)| own == process);
+    let same_root = own
+        .root
+        .zip(process.root)
+        .is_some_and(|(own, process)| own == process);
+    (!same_pid_namespace || !same_root).then_some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
+}
+
+fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
+    for line in text.lines() {
+        let components = line.split('/').map(str::trim).collect::<Vec<_>>();
+        for component in &components {
+            let component = *component;
+            for (prefix, suffix, runtime) in [
+                ("docker-", ".scope", ContainerRuntime::Docker),
+                ("cri-containerd-", ".scope", ContainerRuntime::Containerd),
+                ("libpod-", ".scope", ContainerRuntime::Podman),
+            ] {
+                if let Some(id) = component
+                    .strip_prefix(prefix)
+                    .and_then(|value| value.strip_suffix(suffix))
+                    .filter(|id| is_container_hex_id(id))
+                {
+                    return Some(ContainerEvidence {
+                        runtime,
+                        key: id.to_ascii_lowercase(),
+                    });
+                }
+            }
+        }
+        for pair in components.windows(2) {
+            if pair[0] == "docker" && is_container_hex_id(pair[1]) {
+                return Some(ContainerEvidence {
+                    runtime: ContainerRuntime::Docker,
+                    key: pair[1].to_ascii_lowercase(),
+                });
+            }
+        }
+        if components
+            .iter()
+            .any(|component| component.contains("kubepods"))
+        {
+            if let Some(id) = components
+                .iter()
+                .copied()
+                .find(|component| is_container_hex_id(component))
+            {
+                return Some(ContainerEvidence {
+                    runtime: ContainerRuntime::Containerd,
+                    key: id.to_ascii_lowercase(),
+                });
+            }
+        }
+        if let Some(name) = components
+            .windows(2)
+            .find(|pair| pair[0] == "lxc")
+            .map(|pair| pair[1])
+            .filter(|name| !name.is_empty())
+        {
+            return Some(ContainerEvidence {
+                runtime: ContainerRuntime::Lxc,
+                key: truncate(name, MAX_TOKEN_BYTES),
+            });
+        }
+    }
+    None
+}
+
+fn is_container_hex_id(id: &str) -> bool {
+    (CONTAINER_ID_MIN_HEX..=CONTAINER_ID_MAX_HEX).contains(&id.len())
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 pub fn inspect(candidate_id: &str) -> Result<(DiscoveryReport, WorkloadCandidate)> {
@@ -1255,8 +1500,26 @@ mod tests {
             exe: exe.map(str::to_string),
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             systemd_unit: None,
+            container: None,
             ambiguity: Vec::new(),
         }
+    }
+
+    fn container_row(
+        pid: u32,
+        start_time: u64,
+        name: &str,
+        exe: Option<&str>,
+        cmd: &[&str],
+        runtime: ContainerRuntime,
+        key: &str,
+    ) -> ProcessRow {
+        let mut row = row(pid, start_time, name, exe, cmd);
+        row.container = Some(ContainerEvidence {
+            runtime,
+            key: key.to_string(),
+        });
+        row
     }
 
     #[test]
@@ -1434,6 +1697,263 @@ mod tests {
             systemd_unit_from_cgroup("0::/user.slice/user-1000.slice\n"),
             None
         );
+    }
+
+    #[test]
+    fn container_marker_from_cgroup_recognizes_supported_runtimes() {
+        let id = "0123456789abcdef0123456789abcdef";
+        for (text, runtime) in [
+            (
+                format!("0::/system.slice/docker-{id}.scope"),
+                ContainerRuntime::Docker,
+            ),
+            (format!("0::/docker/{id}"), ContainerRuntime::Docker),
+            (
+                format!("0::/kubepods.slice/cri-containerd-{id}.scope"),
+                ContainerRuntime::Containerd,
+            ),
+            (
+                format!("0::/machine.slice/libpod-{id}.scope"),
+                ContainerRuntime::Podman,
+            ),
+            (
+                format!("0::/kubepods.slice/{id}"),
+                ContainerRuntime::Containerd,
+            ),
+        ] {
+            let evidence = container_marker_from_cgroup(&text).unwrap();
+            assert_eq!(evidence.runtime, runtime);
+            assert_eq!(evidence.key, id);
+        }
+        let lxc = container_marker_from_cgroup("0::/lxc/web1").unwrap();
+        assert_eq!(lxc.runtime, ContainerRuntime::Lxc);
+        assert_eq!(lxc.key, "web1");
+    }
+
+    #[test]
+    fn container_marker_ignores_runtime_daemon_units() {
+        for text in [
+            "0::/system.slice/docker.service",
+            "0::/system.slice/containerd.service",
+            "0::/system.slice/podman.service",
+            "0::/system.slice/nginx.service",
+            "0::/system.slice/docker-012345.scope",
+        ] {
+            assert!(container_marker_from_cgroup(text).is_none());
+        }
+    }
+
+    #[test]
+    fn container_evidence_prefers_cgroup_then_pid_namespace() {
+        let marker = ContainerEvidence {
+            runtime: ContainerRuntime::Docker,
+            key: "marker".to_string(),
+        };
+        let own = NamespaceIds {
+            pid: Some(1),
+            mnt: Some(2),
+            root: Some(FileIdentity {
+                device: 1,
+                inode: 1,
+            }),
+        };
+        let process = NamespaceIds {
+            pid: Some(3),
+            mnt: Some(4),
+            root: Some(FileIdentity {
+                device: 2,
+                inode: 2,
+            }),
+        };
+        let evidence = container_evidence(Some(marker), own, process).unwrap();
+        assert_eq!(evidence.runtime.label(), "docker");
+        assert_eq!(evidence.key, "marker");
+        let evidence = container_evidence(None, own, process).unwrap();
+        assert_eq!(evidence.runtime.label(), "pidns");
+        assert_eq!(evidence.key, "3-4");
+    }
+
+    #[test]
+    fn mount_namespace_difference_alone_keeps_host_classification() {
+        assert!(container_evidence(
+            None,
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(2),
+                root: Some(FileIdentity {
+                    device: 1,
+                    inode: 1,
+                }),
+            },
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(3),
+                root: Some(FileIdentity {
+                    device: 1,
+                    inode: 1,
+                }),
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unreadable_isolation_evidence_stays_fail_closed() {
+        let own = NamespaceIds::default();
+        let process = NamespaceIds::default();
+        let container = container_evidence(None, own, process);
+        assert!(container.is_none());
+        assert_eq!(
+            isolation_evidence_ambiguity(container.as_ref(), own, process),
+            Some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
+        );
+    }
+
+    #[test]
+    fn rootfs_difference_detects_host_pid_namespace_containers() {
+        let evidence = container_evidence(
+            None,
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(2),
+                root: Some(FileIdentity {
+                    device: 10,
+                    inode: 20,
+                }),
+            },
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(3),
+                root: Some(FileIdentity {
+                    device: 11,
+                    inode: 21,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.runtime, ContainerRuntime::RootFs);
+        assert_eq!(evidence.key, "11-21");
+    }
+
+    #[test]
+    fn unreadable_rootfs_with_mount_isolation_stays_fail_closed() {
+        let evidence = container_evidence(
+            None,
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(2),
+                root: Some(FileIdentity {
+                    device: 10,
+                    inode: 20,
+                }),
+            },
+            NamespaceIds {
+                pid: Some(1),
+                mnt: Some(3),
+                root: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(evidence.runtime, ContainerRuntime::Isolated);
+        assert_eq!(evidence.key, "3");
+    }
+
+    #[test]
+    fn namespace_inode_parses_proc_namespace_links() {
+        assert_eq!(namespace_inode("pid:[4026531836]"), Some(4_026_531_836));
+        assert_eq!(namespace_inode("mnt:[4026531840]"), Some(4_026_531_840));
+        assert_eq!(namespace_inode("invalid"), None);
+    }
+
+    #[test]
+    fn containerized_postgres_is_separated_from_host_with_same_executable() {
+        let executable = "/usr/lib/postgresql/16/bin/postgres";
+        let report = discover_rows(vec![
+            row(1, 1, "postgres", Some(executable), &[]),
+            container_row(
+                2,
+                1,
+                "postgres",
+                Some(executable),
+                &[],
+                ContainerRuntime::Docker,
+                "0123456789abcdef0123456789abcdef",
+            ),
+        ]);
+        let host_id = format!("exe:{executable}");
+        assert_eq!(
+            report
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.adapter == WorkloadAdapter::PostgreSql)
+                .count(),
+            2
+        );
+        assert!(report
+            .candidates
+            .iter()
+            .any(|candidate| candidate.id == host_id));
+        let container = report
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .id
+                    .starts_with("container:docker:0123456789abcdef0123456789abcdef:")
+            })
+            .unwrap();
+        assert!(container
+            .ambiguity
+            .iter()
+            .any(|ambiguity| ambiguity == CONTAINERIZED_WORKLOAD_AMBIGUITY));
+        assert_eq!(container.driver_mode, Some(WorkloadDriverMode::DetectOnly));
+        let enabled = proposals(&report)
+            .into_iter()
+            .filter(|proposal| proposal.kind == ProposalKind::Enable)
+            .map(|proposal| proposal.candidate_id)
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, vec![host_id]);
+    }
+
+    #[test]
+    fn containers_and_host_keep_separate_stable_candidates() {
+        let executable = "/usr/lib/postgresql/16/bin/postgres";
+        let first_id = "0123456789abaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let second_id = "0123456789abbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let host = discover_rows(vec![row(1, 1, "postgres", Some(executable), &[])]);
+        let report = discover_rows(vec![
+            row(1, 1, "postgres", Some(executable), &[]),
+            container_row(
+                2,
+                1,
+                "postgres",
+                Some(executable),
+                &[],
+                ContainerRuntime::Docker,
+                first_id,
+            ),
+            container_row(
+                3,
+                1,
+                "postgres",
+                Some(executable),
+                &[],
+                ContainerRuntime::Docker,
+                second_id,
+            ),
+        ]);
+        assert_eq!(report.candidates.len(), 3);
+        assert_eq!(report.candidates[0].id, host.candidates[0].id);
+        assert_eq!(
+            report.candidates[0].fingerprint,
+            host.candidates[0].fingerprint
+        );
+        assert!(report.candidates[1]
+            .id
+            .starts_with(&format!("container:docker:{first_id}:")));
+        assert!(report.candidates[2]
+            .id
+            .starts_with(&format!("container:docker:{second_id}:")));
     }
 
     #[test]
