@@ -162,11 +162,7 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .filter(|(pid, _)| pid.as_u32() != scanner_pid)
         .map(|(pid, process)| {
             let pid = pid.as_u32();
-            let exe = process.exe().map(|p| p.to_string_lossy().to_string());
             let mut ambiguity = Vec::new();
-            if exe.is_none() {
-                ambiguity.push("executable_unavailable".to_string());
-            }
             let mut cmd = process
                 .cmd()
                 .iter()
@@ -178,6 +174,13 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
             }
             if cmd.is_empty() {
                 cmd.push(process.name().to_string_lossy().to_string());
+            }
+            let exe = process
+                .exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| executable_from_argv0(&cmd));
+            if exe.is_none() {
+                ambiguity.push("executable_unavailable".to_string());
             }
             let cgroup = read_cgroup_text(pid, &mut ambiguity);
             let systemd_unit = cgroup.as_deref().and_then(systemd_unit_from_cgroup);
@@ -289,7 +292,7 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
     DiscoveryReport {
         schema_version: WORKLOAD_SCHEMA_VERSION,
         evidence_coverage:
-            "process_name, executable, bounded_command, pid, start_time, linux_cgroup, linux_container_cgroup, linux_pid_namespace, linux_mount_namespace".to_string(),
+            "process_name, executable, cmdline_argv0, bounded_command, pid, start_time, linux_cgroup, linux_container_cgroup, linux_pid_namespace, linux_mount_namespace".to_string(),
         candidates,
     }
 }
@@ -789,6 +792,14 @@ fn read_cgroup_text(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
         let _ = (pid, ambiguity);
         None
     }
+}
+
+/// 비루트는 다른 사용자 프로세스의 `/proc/<pid>/exe`를 읽지 못한다. argv[0]은 프로세스가
+/// 바꿀 수 있으므로, 절대 경로이면서 실재하는 파일일 때만 대체 증거로 받는다.
+fn executable_from_argv0(cmd: &[String]) -> Option<String> {
+    let argv0 = cmd.first()?;
+    let path = std::path::Path::new(argv0);
+    (path.is_absolute() && path.is_file()).then(|| argv0.clone())
 }
 
 fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
@@ -1767,6 +1778,30 @@ mod tests {
             },
         )
         .is_none());
+    }
+
+    #[test]
+    fn argv0_replaces_an_unreadable_executable_only_when_it_resolves() {
+        let existing = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            executable_from_argv0(std::slice::from_ref(&existing)),
+            Some(existing.clone())
+        );
+        assert_eq!(executable_from_argv0(&[]), None);
+        assert_eq!(executable_from_argv0(&["redis-server".to_string()]), None);
+        assert_eq!(
+            executable_from_argv0(&["/nonexistent/redis-server".to_string()]),
+            None
+        );
+        let directory = std::path::Path::new(&existing)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(executable_from_argv0(&[directory]), None);
     }
 
     #[test]
