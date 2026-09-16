@@ -115,8 +115,25 @@ impl TokenBucket {
 
 /// webhook 서버를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
 /// bind 실패 시 에러를 반환(호출부는 aicd 전체를 abort하지 않고 경고만 — webhook은 opt-in 부가 기능).
-pub async fn serve(cfg: WebhookConfig, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(cfg: WebhookConfig, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
+    serve_with_listener(listener, cfg, shutdown).await
+}
+
+/// **이미 bind된** listener로 서버를 실행한다. [`serve`]는 주소로 bind한 뒤 이걸 부른다.
+///
+/// 왜 나눠 두는가: 포트 0으로 띄우는 쪽(테스트)이 "OS가 준 포트를 알아내려고 잡았다가 놓고,
+/// 서버가 그 주소로 다시 bind"하는 구조를 쓰면 그 사이가 경쟁 창이 된다. 같은 순간 포트 0으로
+/// bind하는 다른 프로세스가 그 포트를 가져가면 서버의 bind가 실패하고, 요청은 `Connection
+/// refused`로 떨어진다. listener를 넘기면 창 자체가 없고, 반환 시점에 이미 listen 중이라
+/// "기동 대기"도 필요 없다.
+///
+/// `cfg.listen_addr`은 이 경로에서 쓰이지 않는다 — 바인딩은 인자로 받은 listener가 끝냈다.
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener,
+    cfg: WebhookConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let bound = listener.local_addr().ok();
     tracing::info!(addr = ?bound, auto_diagnose = cfg.auto_diagnose, "webhook 리스너 바인드");
     if cfg.secret.is_none() {
