@@ -264,6 +264,13 @@ pub struct JvmWorkerSupervisor {
     event_sender: mpsc::Sender<ActorEvent>,
     state: SupervisorState,
     test_hook: WorkerTestHook,
+    /// 프로브 하나에 허용하는 총 시간. 기본은 [`PROBE_DEADLINE`]이고, 이 기한 안에 fork/exec와
+    /// READY 왕복, 요청 전송, 응답 또는 워커 종료 관측까지 전부 끝나야 한다.
+    ///
+    /// 필드로 둔 이유는 테스트 때문이다(`with_probe_deadline`). 워커가 **죽는 것**을 관측해야
+    /// 통과하는 테스트는 부하 걸린 CI 러너에서 200ms 안에 fork/exec까지 끝나지 못해 `Timeout`으로
+    /// 뒤집힌다 — 그 테스트들이 검증하는 것은 필터와 프로토콜 동작이지 프로브의 제한 시간이 아니다.
+    probe_deadline: Duration,
 }
 
 impl JvmWorkerSupervisor {
@@ -285,7 +292,20 @@ impl JvmWorkerSupervisor {
             event_sender,
             state: SupervisorState::Idle,
             test_hook,
+            probe_deadline: PROBE_DEADLINE,
         }
+    }
+
+    /// 프로브 기한을 바꾼다(테스트 전용).
+    ///
+    /// 프로덕션은 [`PROBE_DEADLINE`]을 쓴다 — JVM 프로브가 느리면 포기하는 것이 맞다. 반면
+    /// 워커의 정상 종료나 seccomp 강제 종료를 **관측해야** 통과하는 테스트는 그 기한에 묶이면
+    /// 러너가 느린 날 `Timeout`으로 뒤집힌다. 검증 대상이 제한 시간이 아닌 테스트는 이걸로
+    /// 기한을 넉넉히 잡는다.
+    #[doc(hidden)]
+    pub fn with_probe_deadline(mut self, deadline: Duration) -> Self {
+        self.probe_deadline = deadline;
+        self
     }
 
     pub fn capture(&mut self, request: WorkerRequest) -> Result<WorkerResponse, WorkerError> {
@@ -316,13 +336,13 @@ impl JvmWorkerSupervisor {
                     reply: reply_tx,
                 })
                 .map_err(|_| WorkerError::Setup)?;
-            let registration = reply_rx.recv_timeout(PROBE_DEADLINE).ok().flatten();
+            let registration = reply_rx.recv_timeout(self.probe_deadline).ok().flatten();
             let Some(registration) = registration else {
                 // Reserve and Release use one FIFO channel. A late Reserve cannot outlive this release.
                 let _ = self.actor.send(ActorCommand::Release { token });
                 return Err(WorkerError::Busy);
             };
-            let deadline = Instant::now() + PROBE_DEADLINE;
+            let deadline = Instant::now() + self.probe_deadline;
             let child = match prepared.fork_exec(self.test_hook) {
                 Ok(child) => child,
                 Err(error) => {

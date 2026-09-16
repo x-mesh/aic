@@ -18,9 +18,25 @@ fn request() -> WorkerRequest {
     }
 }
 
+/// 워커가 **끝나는 것을 관측해야** 통과하는 테스트용 supervisor.
+///
+/// 프로덕션 프로브 기한(200ms)은 fork/exec부터 응답 또는 워커 종료 관측까지를 전부 덮는다.
+/// 부하 걸린 CI 러너에서는 디버그 빌드 `aicd`를 띄우는 것만으로 그 기한을 넘겨, 필터가 제대로
+/// 동작했는데도 결과가 `Crash` 대신 `Timeout`으로 뒤집힌다(`installed_seccomp_filter_kills_an_
+/// x32_syscall`이 실제로 그렇게 간헐 실패했다). 이 테스트들이 검증하는 것은 필터와 프로토콜
+/// 동작이지 제한 시간이 아니므로, 기한을 관측이 끝날 만큼 넉넉히 준다.
 fn supervisor(hook: WorkerTestHook) -> JvmWorkerSupervisor {
+    hanging_supervisor(hook).with_probe_deadline(OBSERVE_DEADLINE)
+}
+
+/// 기한 만료 **자체**를 검증하는 테스트용 — 프로덕션 기한을 그대로 쓴다. 여기에 긴 기한을 주면
+/// 검증 대상이 사라지고 테스트만 느려진다.
+fn hanging_supervisor(hook: WorkerTestHook) -> JvmWorkerSupervisor {
     JvmWorkerSupervisor::with_executable_and_hook(PathBuf::from(env!("CARGO_BIN_EXE_aicd")), hook)
 }
+
+/// 관측용 기한. 프로브 제한이 아니라 "러너가 아무리 느려도 이 안에는 끝난다"는 상한이다.
+const OBSERVE_DEADLINE: Duration = Duration::from_secs(5);
 
 fn test_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -48,7 +64,7 @@ fn invalid_ready_fails_closed() {
 #[test]
 fn pre_ready_hang_times_out_and_drains() {
     let _guard = test_guard();
-    let mut supervisor = supervisor(WorkerTestHook::PreReadyHang);
+    let mut supervisor = hanging_supervisor(WorkerTestHook::PreReadyHang);
     assert_eq!(
         supervisor.capture(request()).unwrap_err(),
         WorkerError::Timeout
@@ -68,7 +84,7 @@ fn pre_ready_hang_times_out_and_drains() {
 fn post_ready_hang_uses_the_same_deadline() {
     let _guard = test_guard();
     let started = Instant::now();
-    let error = supervisor(WorkerTestHook::PostReadyHang)
+    let error = hanging_supervisor(WorkerTestHook::PostReadyHang)
         .capture(request())
         .unwrap_err();
     assert_eq!(error, WorkerError::Timeout);
@@ -110,7 +126,7 @@ fn trailing_output_is_rejected() {
 #[test]
 fn shutdown_reaps_an_active_worker() {
     let _guard = test_guard();
-    let mut supervisor = supervisor(WorkerTestHook::PreReadyHang);
+    let mut supervisor = hanging_supervisor(WorkerTestHook::PreReadyHang);
     let _ = supervisor.capture(request());
     supervisor.shutdown();
     drop(supervisor);
@@ -120,7 +136,7 @@ fn shutdown_reaps_an_active_worker() {
 fn dropping_a_hung_supervisor_never_waits_for_reap() {
     let _guard = test_guard();
     let started = Instant::now();
-    let mut supervisor = supervisor(WorkerTestHook::PreReadyHang);
+    let mut supervisor = hanging_supervisor(WorkerTestHook::PreReadyHang);
     let _ = supervisor.capture(request());
     drop(supervisor);
     assert!(started.elapsed() < Duration::from_secs(1));
@@ -130,7 +146,7 @@ fn dropping_a_hung_supervisor_never_waits_for_reap() {
 fn global_reservation_blocks_a_second_supervisor_before_fork() {
     let _guard = test_guard();
     let first = thread::spawn(|| {
-        let mut first = supervisor(WorkerTestHook::PreReadyHang);
+        let mut first = hanging_supervisor(WorkerTestHook::PreReadyHang);
         first.capture(request())
     });
     thread::sleep(Duration::from_millis(30));

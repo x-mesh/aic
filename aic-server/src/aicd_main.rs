@@ -325,6 +325,30 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
+    // 중앙(rca-web)이 선언한 목표 버전으로의 셀프업데이트. exporter와 같은
+    // endpoint/token을 쓴다 — 이미 등록된 에이전트가 가진 자격이라 새로 발급할
+    // 것이 없다. 부모 `enabled`가 켜져도 따라 켜지지 않는 이유는, 텔레메트리를
+    // 보내는 것과 디스크의 binary를 갈아끼우는 것이 같은 동의가 아니기 때문이다.
+    let self_update_handle = match exporter_section.as_ref() {
+        Some(ex) if ex.self_update_enabled && !ex.endpoint.trim().is_empty() => {
+            let token = std::env::var("AIC_EXPORTER_TOKEN")
+                .ok()
+                .or_else(|| ex.token.clone());
+            Some(aic_server::self_update::spawn(
+                ex.endpoint.clone(),
+                token,
+                std::time::Duration::from_secs(ex.self_update_interval_secs),
+                shutdown.subscribe(),
+            ))
+        }
+        Some(ex) if ex.self_update_enabled => {
+            // 켜 두고 주소가 없으면 조용히 아무 일도 안 하는 대신 말한다.
+            tracing::warn!("self_update_enabled인데 exporter endpoint가 비어 있어 셀프업데이트를 띄우지 않는다");
+            None
+        }
+        _ => None,
+    };
+
     // SRE t7: OTLP events exporter (opt-in, [aicd.exporter] enabled=true + events_enabled=true).
     // CommandRecordStore tap을 구독해 finished command record를 실시간으로 push한다. host
     // metrics(exporter_handle)와 독립적으로 켜고 끌 수 있어 별도 task로 뜬다.
@@ -632,6 +656,9 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     }
     // exporter task도 동일 shutdown watch를 구독하므로 graceful 종료된다.
     if let Some(h) = exporter_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = self_update_handle {
         let _ = h.await;
     }
     // t7: events/connections exporter도 동일 shutdown watch를 구독하므로 graceful 종료된다.

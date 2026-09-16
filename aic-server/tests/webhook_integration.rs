@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use aic_server::webhook_server::{serve, WebhookConfig};
+use aic_server::webhook_server::{serve_with_listener, WebhookConfig};
 use tokio::sync::watch;
 
 /// webhook-events.jsonl이 실제 HOME 대신 temp에 쓰이도록 XDG_STATE_HOME을 1회 설정.
@@ -38,10 +38,12 @@ async fn start_server_full(
 ) -> (String, watch::Sender<bool>) {
     isolate_state_dir();
     let (tx, rx) = watch::channel(false);
-    // 포트 0 = OS 할당. bind 후 실제 주소를 알아내기 위해 먼저 listener를 잡는다.
+    // 포트 0 = OS 할당. listener를 **놓지 않고 그대로 넘긴다** — 예전에는 주소만 알아내려고
+    // 놓았다가 serve가 다시 bind했는데, 그 사이에 포트 0으로 bind하는 다른 테스트 프로세스가
+    // 같은 포트를 가져가면 serve의 bind가 실패하고(그 에러는 spawn 안에서 버려진다) 요청이
+    // `Connection refused`로 떨어졌다. 넘기면 그 창이 없고, 이미 listen 중이라 기동 대기도 없다.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener); // serve가 다시 bind. (테스트 편의 — race 가능성은 낮음)
 
     let cfg = WebhookConfig {
         listen_addr: addr.to_string(),
@@ -53,10 +55,9 @@ async fn start_server_full(
         aic_bin,
     };
     tokio::spawn(async move {
-        let _ = serve(cfg, rx).await;
+        let _ = serve_with_listener(listener, cfg, rx).await;
     });
-    // 서버 기동 대기.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // 기동 대기 없음: listener가 이미 listen 상태라 accept 전에 온 연결도 backlog에 쌓인다.
     (format!("http://{addr}"), tx)
 }
 
