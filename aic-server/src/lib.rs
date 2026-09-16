@@ -16,6 +16,7 @@ pub mod output_processor;
 pub mod process_inventory_store;
 pub mod pty_manager;
 pub mod ring_buffer;
+pub mod self_update;
 pub mod session_processor_pool;
 pub mod session_registry;
 pub mod session_runtime;
