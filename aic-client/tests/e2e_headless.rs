@@ -6,7 +6,16 @@
 
 #![cfg(unix)]
 
-use std::process::Command;
+use std::process::{Child, Command};
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// HOME/XDG를 임시로 격리한 aic 명령을 만든다(실제 홈 오염 방지 + keychain 우회).
 fn aic_cmd(home: &std::path::Path) -> Command {
@@ -777,21 +786,25 @@ fn workload_status_and_history_read_local_history() {
 #[test]
 fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
+    let workload = tmp.path().join("sleep");
+    std::fs::copy("/bin/sleep", &workload).unwrap();
+    let _workload = ChildGuard(Command::new(&workload).arg("60").spawn().unwrap());
     let discover = aic_cmd(tmp.path())
         .args(["workload", "discover", "--json"])
         .output()
         .unwrap();
     assert!(discover.status.success());
     let report: serde_json::Value = serde_json::from_slice(&discover.stdout).unwrap();
+    let expected_id = format!("exe:{}", workload.display());
     let candidate = report["report"]["candidates"]
         .as_array()
         .and_then(|candidates| {
             candidates.iter().find(|candidate| {
-                !candidate["selector"].is_null()
+                candidate["id"] == expected_id
                     && candidate["ambiguity"].as_array().is_some_and(Vec::is_empty)
             })
         })
-        .expect("현재 aic 프로세스에서 활성화 가능한 workload 후보가 있어야 함");
+        .expect("테스트가 시작한 workload 후보가 있어야 함");
     let id = candidate["id"].as_str().unwrap();
     let fingerprint = candidate["fingerprint"].as_str().unwrap();
     let postgresql = candidate["adapter"] == "postgre_sql";
