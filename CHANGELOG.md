@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.41.9] - 2026-09-17
+
+### Added
+
+- Linux에서 aicd를 system 서비스로 설치한다. `sudo aic daemon install --system`이 `/etc/systemd/system/aicd.service`를 쓰고 데몬을 root로 띄우며, 로그는 `/var/log/aic`에 0700 권한으로 남는다. 비루트 데몬은 다른 사용자 프로세스의 실행 경로를 읽지 못해 워크로드 탐지가 약해지므로 root로 돌린다. 플래그가 없으면 지금까지처럼 사용자 단위로 설치한다.
+
+### Fixed
+
+- 로그 디렉토리가 `XDG_STATE_HOME`을 존중한다. 이전에는 `server.log`와 `aicd.err.log`가 HOME 기준 경로로 고정되어, 그 변수를 옮긴 환경에서 `webhook-events.jsonl` 같은 다른 상태 파일과 서로 다른 디렉토리로 흩어졌다.
+
 ## [0.41.8] - 2026-09-17
 
 ### Fixed
