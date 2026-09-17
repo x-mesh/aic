@@ -130,28 +130,40 @@ fn conflicting_user_daemon() -> Option<String> {
         .map(|s| s.success())
         .unwrap_or(false);
 
+    // **파일이 남아 있기만 해도 막는다.** `systemctl --user disable`은 유닛 파일을 지우지
+    // 않으므로, 비활성이어도 무언가 `start`하면 옛 binary가 되살아나 런타임 lock을 가져간다.
+    // 그러면 system 유닛이 기동에 실패하고 systemd가 2초마다 재시도한다(실서버에서 그랬다).
+    let user_unit_file = linux_unit_path().ok().filter(|p| p.exists());
+
     let lock = aic_common::aicd_lock_path();
     let holder = std::fs::read_to_string(&lock)
         .ok()
         .and_then(|t| t.trim().lines().next()?.trim().parse::<i32>().ok())
         .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0);
 
-    if !user_unit_active && holder.is_none() {
+    if !user_unit_active && user_unit_file.is_none() && holder.is_none() {
         return None;
     }
-    let mut lines = vec!["이미 사용자 단위 aicd가 있어 system 설치를 중단합니다.".to_string()];
+    let mut lines = vec!["사용자 단위 aicd가 남아 있어 system 설치를 중단합니다.".to_string()];
     if let Some(pid) = holder {
         lines.push(format!("  실행 중: PID {pid} (lock {})", lock.display()));
     }
     if user_unit_active {
         lines.push("  활성 유닛: systemctl --user aicd.service".to_string());
+    } else if let Some(path) = &user_unit_file {
+        lines.push(format!("  남은 유닛 파일: {}", path.display()));
     }
     lines.push("  먼저 정리하세요:".to_string());
+    if holder.is_some() {
+        lines.push("    aic daemon stop".to_string());
+    }
     if user_unit_active {
         lines.push("    systemctl --user disable --now aicd".to_string());
     }
-    if holder.is_some() {
-        lines.push("    aic daemon stop".to_string());
+    if let Some(path) = &user_unit_file {
+        // 파일을 지우지 않으면 disable해도 되살아날 수 있다 — 이번 사고의 실제 경로였다.
+        lines.push(format!("    rm -f {}", path.display()));
+        lines.push("    systemctl --user daemon-reload".to_string());
     }
     Some(lines.join("\n"))
 }
@@ -444,16 +456,25 @@ pub fn uninstall() -> Result<UninstallReport> {
             std::env::consts::OS
         ));
     }
-    let unit_path = match platform {
-        Platform::Macos => macos_plist_path()?,
-        Platform::Linux => linux_unit_path()?,
-        Platform::Unsupported => unreachable!(),
-    };
+    // 지금 이 호스트를 관리하는 유닛을 지운다. system으로 설치한 호스트에서 user 경로만
+    // 지우면 `/etc/systemd/system`의 유닛이 남아 계속 데몬을 띄운다.
+    let (unit_path, system) = current_unit().unwrap_or_else(|| {
+        let fallback = match platform {
+            Platform::Macos => macos_plist_path().unwrap_or_default(),
+            _ => linux_unit_path().unwrap_or_default(),
+        };
+        (fallback, false)
+    });
 
     // load/enable 해제는 파일 존재 여부와 무관하게 시도 — best-effort.
     match platform {
         Platform::Macos => {
             let _ = launchctl_unload(&unit_path);
+        }
+        Platform::Linux if system => {
+            let _ = Command::new("systemctl")
+                .args(["disable", "--now", SYSTEMD_UNIT])
+                .output();
         }
         Platform::Linux => {
             let _ = systemctl_user_disable_now();
@@ -468,6 +489,16 @@ pub fn uninstall() -> Result<UninstallReport> {
     } else {
         false
     };
+
+    // 파일만 지우고 reload하지 않으면 systemd가 유닛을 계속 기억한다 — 다음 `start`가 사라진
+    // 유닛으로 성공하거나, 남은 상태가 다음 설치와 엉킨다.
+    if removed && platform == Platform::Linux {
+        if system {
+            let _ = Command::new("systemctl").arg("daemon-reload").output();
+        } else {
+            let _ = systemctl_user_command().arg("daemon-reload").output();
+        }
+    }
 
     Ok(UninstallReport {
         platform,
