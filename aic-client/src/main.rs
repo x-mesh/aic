@@ -3608,6 +3608,9 @@ async fn handle_daemon_stop() {
 async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Option<&str>) {
     let sock = aic_common::aicd_socket_path();
     let was_running = matches!(UdsClient::new(sock.clone()).ping().await, Ok(true));
+    // 재시작이 실제로 일어났는지는 PID로만 확인할 수 있다. ping은 옛 데몬이 살아 있어도
+    // 답하므로, 재시작에 실패한 상태를 "정상"으로 읽는다(실서버에서 그렇게 지나갔다).
+    let pid_before = daemon_pid().await;
     handle_daemon_restart(true).await;
 
     // 설치된 쪽의 버전을 쓴다. 이 프로세스의 `CARGO_PKG_VERSION`은 교체 **전** 버전이라,
@@ -3629,6 +3632,16 @@ async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Opti
     }
 
     if daemon_answers_within(UPDATE_HEALTH_DEADLINE).await {
+        // 응답은 하는데 PID가 그대로면 새 binary가 아직 메모리에 오르지 않았다. binary 자체는
+        // 정상이라 롤백 대상이 아니다 — 되돌리면 멀쩡한 업데이트를 무르는 셈이다.
+        if pid_before.is_some() && pid_before == daemon_pid().await {
+            let reason = "재시작이 반영되지 않았습니다(PID 그대로) — 새 binary는 설치됐지만                           옛 데몬이 계속 돕니다"
+                .to_string();
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} {reason}");
+            eprintln!("  조치: aic daemon restart (또는 sudo systemctl restart aicd)");
+            record.result = "restart_not_applied".to_string();
+            record.reason = Some(reason);
+        }
         aic_client::update::record_update(&record);
         return;
     }
@@ -3672,6 +3685,15 @@ async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Opti
 
 /// 업데이트 후 aicd의 응답을 기다리는 상한. 재시작은 unit 매니저를 거치므로 즉시 뜨지 않는다.
 const UPDATE_HEALTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 지금 도는 aicd의 PID. 응답하지 않으면 `None`.
+async fn daemon_pid() -> Option<u32> {
+    UdsClient::new(aic_common::aicd_socket_path())
+        .get_metrics()
+        .await
+        .ok()
+        .map(|m| m.pid)
+}
 
 /// 기한 안에 aicd가 ping에 답하면 true.
 async fn daemon_answers_within(deadline: std::time::Duration) -> bool {
@@ -5854,6 +5876,7 @@ fn print_last_update_record() {
         "ok" => format!("{COL_GREEN}성공{COL_RESET}"),
         "restart_skipped" => format!("{COL_DIM}교체됨(데몬 미실행){COL_RESET}"),
         "rolled_back" => format!("{COL_YELLOW}롤백됨{COL_RESET}"),
+        "restart_not_applied" => format!("{COL_YELLOW}재시작 미반영{COL_RESET}"),
         "rollback_failed" => format!("{COL_RED}롤백 실패{COL_RESET}"),
         other => other.to_string(),
     };

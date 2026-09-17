@@ -704,7 +704,7 @@ fn systemctl_user_disable_now() -> Result<()> {
 /// singleton PID lock에 걸려 실패한다. 매니저에게 재시작을 시키면 죽이고 띄우는 일이
 /// 한 주체 안에서 순서대로 일어난다.
 pub fn restart_via_unit() -> Result<bool> {
-    let Some(unit) = current_unit_path() else {
+    let Some((unit, system)) = current_unit() else {
         return Ok(false);
     };
     if !unit.exists() {
@@ -728,10 +728,17 @@ pub fn restart_via_unit() -> Result<bool> {
             Ok(true)
         }
         Platform::Linux => {
-            let out = systemctl_user_command()
-                .args(["restart", SYSTEMD_UNIT])
-                .output()
-                .with_context(|| "systemctl --user restart 실행 실패")?;
+            let out = if system {
+                Command::new("systemctl")
+                    .args(["restart", SYSTEMD_UNIT])
+                    .output()
+                    .with_context(|| "systemctl restart 실행 실패")?
+            } else {
+                systemctl_user_command()
+                    .args(["restart", SYSTEMD_UNIT])
+                    .output()
+                    .with_context(|| "systemctl --user restart 실행 실패")?
+            };
             if !out.status.success() {
                 return Err(anyhow!(
                     "systemctl --user restart {SYSTEMD_UNIT} 실패: {}",
@@ -746,9 +753,31 @@ pub fn restart_via_unit() -> Result<bool> {
 
 /// 현재 설치 상태(파일 존재 여부)만 빠르게 확인한다. `aic daemon status`에서 사용.
 pub fn current_unit_path() -> Option<PathBuf> {
+    current_unit().map(|(path, _)| path)
+}
+
+/// 지금 이 호스트에서 aicd를 관리하는 유닛과 그 스코프(`true`면 system).
+///
+/// **존재만으로 판단하면 오진한다.** `systemctl --user disable`은 유닛 파일을 지우지 않으므로,
+/// system으로 전환한 호스트에도 user 유닛 파일이 남는다. 그 파일을 보고 `systemctl --user
+/// restart`를 부르면 성공 코드가 돌아오는데 실제 system 유닛은 그대로다 — 업데이트가 끝났다고
+/// 보고하면서 옛 데몬이 계속 도는 상태가 된다(실서버에서 그렇게 됐다).
+pub fn current_unit() -> Option<(PathBuf, bool)> {
     match detect_platform() {
-        Platform::Macos => macos_plist_path().ok(),
-        Platform::Linux => linux_unit_path().ok(),
+        Platform::Macos => macos_plist_path()
+            .ok()
+            .filter(|p| p.exists())
+            .map(|p| (p, false)),
+        Platform::Linux => {
+            let system = linux_system_unit_path();
+            if aic_common::paths::is_system_service() && system.exists() {
+                return Some((system, true));
+            }
+            linux_unit_path()
+                .ok()
+                .filter(|p| p.exists())
+                .map(|p| (p, false))
+        }
         Platform::Unsupported => None,
     }
 }
@@ -815,6 +844,21 @@ mod tests {
         assert!(p.contains("/var/log/aic/aicd.err.log"));
         // valid XML 시작
         assert!(p.starts_with("<?xml"));
+    }
+
+    #[test]
+    fn a_leftover_user_unit_does_not_hijack_the_system_scope() {
+        // `systemctl --user disable`은 유닛 파일을 지우지 않는다. 그 파일만 보고 user 스코프로
+        // 판단하면 `systemctl --user restart`가 성공 코드를 돌려주는데 정작 system 유닛은
+        // 그대로다 — 업데이트를 끝냈다고 보고하면서 옛 데몬이 계속 돈다(실서버에서 그랬다).
+        //
+        // 이 테스트는 판정 규칙만 고정한다: system 스코프에서는 `/etc/systemd/system` 쪽이
+        // 우선이고, 그 경로는 user 유닛 경로와 절대 같지 않다.
+        let system = linux_system_unit_path();
+        assert_eq!(system, Path::new("/etc/systemd/system/aicd.service"));
+        if let Ok(user) = linux_unit_path() {
+            assert_ne!(system, user);
+        }
     }
 
     #[test]
