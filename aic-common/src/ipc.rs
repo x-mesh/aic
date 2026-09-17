@@ -178,6 +178,11 @@ pub enum IpcRequest {
     PushLogLines {
         lines: Vec<LogLine>,
     },
+    /// 셀프업데이트가 지금 어떤 상태인지 묻는다.
+    ///
+    /// exporter와 같은 이유로 필요하다: 이 기능은 aicd 안에서 조용히 돌기 때문에, 켜 두었는지
+    /// 중앙이 목표를 주고 있는지 마지막 확인이 언제였는지를 사람이 알 방법이 로그뿐이었다.
+    GetSelfUpdateStatus,
     /// 최근 프로세스 인벤토리 변화(생성/소멸/변경)를 **최신순**으로 `count`개까지 돌려준다.
     ///
     /// aicd가 host metrics tick마다 전수 프로세스를 이전 tick과 diff해 링에 쌓아 둔 것을 읽는다
@@ -232,6 +237,8 @@ pub enum IpcResponse {
     },
     /// `GetVersion` 응답 — 응답한 데몬 **프로세스**의 빌드 identity.
     Version(DaemonVersion),
+    /// `GetSelfUpdateStatus` 응답.
+    SelfUpdateStatus(SelfUpdateStatus),
     /// `GetExporterStatus` 응답. exporter가 꺼져 있으면 `enabled: false`인 기본값이 온다 —
     /// "꺼짐"과 "켜졌는데 실패 중"은 사용자에게 전혀 다른 상태라 응답 자체를 생략하지 않는다.
     ExporterStatus(ExporterStatus),
@@ -350,6 +357,35 @@ pub struct ExporterStatus {
     /// `None`이면 실패한 적이 없거나 이 필드를 모르는 구버전 aicd다.
     #[serde(default)]
     pub last_failure: Option<ExporterFailure>,
+}
+
+/// 셀프업데이트 상태.
+///
+/// `configured`와 `live`를 나눈 이유는 [`ExporterStatus`]와 같다: "설정을 안 켰다"와 "켰는데
+/// 뜨지 못했다"는 사용자가 할 일이 다르다. 전자는 config를 고치면 되고, 후자는 aicd 로그에서
+/// 기동 실패 원인을 봐야 한다.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SelfUpdateStatus {
+    /// config `[aicd.exporter] self_update_enabled`.
+    pub configured: bool,
+    /// 확인 task가 실제로 살아 있는가.
+    pub live: bool,
+    /// 확인 주기(초). 호스트마다 최대 절반만큼 흩어지므로 실제 간격과는 다를 수 있다.
+    #[serde(default)]
+    pub interval_secs: u64,
+    /// 마지막 확인 후 경과 초. `None`이면 **아직 한 번도 확인하지 않았다** — 기동 직후이거나
+    /// 첫 주기가 오지 않았다는 뜻이라, "방금 확인함"과 뭉개지 않는다.
+    #[serde(default)]
+    pub last_check_secs_ago: Option<u64>,
+    /// 중앙이 마지막 확인에서 선언한 목표 버전. `None`이면 선언하지 않았거나 응답을 받지 못했다.
+    #[serde(default)]
+    pub desired_version: Option<String>,
+    /// 마지막 확인의 결과 한 줄. 왜 업데이트하지 않았는지가 여기 들어간다.
+    #[serde(default)]
+    pub last_outcome: Option<String>,
+    /// 지금 도는 데몬의 버전.
+    #[serde(default)]
+    pub current_version: String,
 }
 
 /// exporter push가 마지막으로 실패한 사건.
@@ -503,6 +539,34 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.agent_enabled, Some(false));
         assert_eq!(back.agent_configured, Some(true));
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn self_update_status_from_old_daemon_decodes_with_defaults() {
+        // 구버전 aicd는 이 응답을 아예 모르지만, 필드가 일부만 온 경우에도 역직렬화가 깨지면
+        // 신버전 클라이언트가 상태를 통째로 읽지 못한다.
+        let partial = r#"{"configured":true,"live":true}"#;
+        let s: SelfUpdateStatus = serde_json::from_str(partial).unwrap();
+        assert!(s.configured && s.live);
+        assert_eq!(s.last_check_secs_ago, None);
+        assert_eq!(s.desired_version, None);
+        assert_eq!(s.interval_secs, 0);
+    }
+
+    #[test]
+    fn self_update_status_roundtrips() {
+        let s = SelfUpdateStatus {
+            configured: true,
+            live: true,
+            interval_secs: 3600,
+            last_check_secs_ago: Some(42),
+            desired_version: Some("0.42.0".to_string()),
+            last_outcome: Some("목표가 현재보다 낮음".to_string()),
+            current_version: "0.41.6".to_string(),
+        };
+        let back: SelfUpdateStatus =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
     }
 

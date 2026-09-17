@@ -267,6 +267,7 @@ async fn ipc_pushed_log_lines_reach_collector() {
         registry_path: None,
         metrics: Arc::new(aic_server::metrics::AicdMetrics::new()),
         agent_bus: aic_server::agent_event_bus::AgentEventBus::new(),
+        self_update_health: Arc::new(aic_server::self_update::SelfUpdateHealth::new()),
         exporter_health: None,
         // ★ 이게 t12가 배선한 지점 ★ — 이전엔 None이었다.
         logs_tx: Some(line_tx),

@@ -393,6 +393,7 @@ async fn process_request(
         IpcRequest::ListSessions
         | IpcRequest::AgentEvent(_)
         | IpcRequest::GetExporterStatus
+        | IpcRequest::GetSelfUpdateStatus
         | IpcRequest::FlushSpool
         | IpcRequest::PushLogLines { .. }
         | IpcRequest::GetRecentProcessChanges { .. }

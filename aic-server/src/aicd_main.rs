@@ -262,6 +262,13 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         (None, None)
     };
 
+    let self_update_health = std::sync::Arc::new(aic_server::self_update::SelfUpdateHealth::new());
+    if let Some(ex) = exporter_section.as_ref() {
+        self_update_health.set_configured(
+            ex.self_update_enabled,
+            std::time::Duration::from_secs(ex.self_update_interval_secs),
+        );
+    }
     let control_ctx = ControlContext {
         shutdown: shutdown.clone(),
         registry: registry.clone(),
@@ -269,6 +276,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         registry_path: Some(registry_path.clone()),
         metrics,
         agent_bus,
+        self_update_health: self_update_health.clone(),
         exporter_health: exporter_health.clone(),
         flush_tx,
         // t12: logs exporter가 배선되어 채널이 생겼으면(`logs_precheck.parent_enabled`) 그 Sender를
@@ -338,6 +346,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
                 ex.endpoint.clone(),
                 token,
                 std::time::Duration::from_secs(ex.self_update_interval_secs),
+                self_update_health.clone(),
                 shutdown.subscribe(),
             ))
         }

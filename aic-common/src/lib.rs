@@ -28,8 +28,9 @@ pub mod workload;
 pub use error::AicError;
 pub use ipc::{
     decode_frame, encode_frame, AgentEvent, DaemonVersion, ExporterFailure, ExporterStatus,
-    IpcRequest, IpcResponse, MetricsSnapshot, SpoolFlushResult, AGENT_KIND_FINDING_CREATED,
-    AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED, AGENT_KIND_TOOL_RUN_COMMAND,
+    IpcRequest, IpcResponse, MetricsSnapshot, SelfUpdateStatus, SpoolFlushResult,
+    AGENT_KIND_FINDING_CREATED, AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED,
+    AGENT_KIND_TOOL_RUN_COMMAND,
 };
 pub use paths::{
     aicd_attach_socket_path, aicd_attach_socket_path_for_bind, aicd_lock_path,

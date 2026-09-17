@@ -250,6 +250,22 @@ impl UdsClient {
         }
     }
 
+    /// 셀프업데이트 상태 조회(aicd 전용).
+    ///
+    /// 이 요청을 모르는 구버전 aicd는 `Error`로 답한다 — 그건 "기능 없음"이라 `None`이다.
+    pub async fn get_self_update_status(
+        &self,
+    ) -> Result<Option<aic_common::SelfUpdateStatus>, AicError> {
+        match self.send_request(IpcRequest::GetSelfUpdateStatus).await? {
+            IpcResponse::SelfUpdateStatus(s) => Ok(Some(s)),
+            IpcResponse::Error { .. } => Ok(None),
+            other => Err(AicError::IpcError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("예상치 못한 응답: {other:?}"),
+            ))),
+        }
+    }
+
     /// 데몬 metric snapshot 조회.
     pub async fn get_metrics(&self) -> Result<aic_common::MetricsSnapshot, AicError> {
         match self.send_request(IpcRequest::GetMetrics).await? {

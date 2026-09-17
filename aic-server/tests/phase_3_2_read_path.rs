@@ -211,6 +211,7 @@ impl AicdHarness {
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),
             agent_bus: aic_server::agent_event_bus::AgentEventBus::new(),
+            self_update_health: Arc::new(aic_server::self_update::SelfUpdateHealth::new()),
             exporter_health: None,
             logs_tx: None,
             flush_tx: None,

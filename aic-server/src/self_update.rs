@@ -23,6 +23,90 @@ struct AgentConfig {
     desired_version: Option<String>,
 }
 
+/// 확인 task가 남기는 상태. `GetSelfUpdateStatus`가 이걸 읽어 간다.
+///
+/// `Mutex` 하나로 둔 이유: 확인은 기본 1시간에 한 번이라 경합이 없고, 담을 값이 문자열 둘이라
+/// 원자 타입으로 쪼갤 수 없다.
+#[derive(Debug, Default)]
+pub struct SelfUpdateHealth {
+    configured: std::sync::atomic::AtomicBool,
+    live: std::sync::atomic::AtomicBool,
+    interval_secs: std::sync::atomic::AtomicU64,
+    last: std::sync::Mutex<Option<LastCheck>>,
+}
+
+#[derive(Debug, Clone)]
+struct LastCheck {
+    unix_secs: u64,
+    desired_version: Option<String>,
+    outcome: String,
+}
+
+impl SelfUpdateHealth {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// config에서 켜 두었는지 기록한다(aicd_main이 기동 시 1회).
+    pub fn set_configured(&self, configured: bool, interval: Duration) {
+        use std::sync::atomic::Ordering;
+        self.configured.store(configured, Ordering::Relaxed);
+        self.interval_secs
+            .store(interval.as_secs(), Ordering::Relaxed);
+    }
+
+    /// 확인 task의 생존 여부. task 안의 가드가 종료 시 끈다.
+    pub fn set_live(&self, live: bool) {
+        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 확인 한 번의 결과를 남긴다. 중앙에 닿지 못한 경우도 결과다 — 그걸 남기지 않으면
+    /// "한 번도 확인 안 함"과 "계속 실패 중"을 구분할 수 없다.
+    pub fn record_check(&self, desired_version: Option<String>, outcome: impl Into<String>) {
+        let entry = LastCheck {
+            unix_secs: unix_now_secs(),
+            desired_version,
+            outcome: outcome.into(),
+        };
+        if let Ok(mut slot) = self.last.lock() {
+            *slot = Some(entry);
+        }
+    }
+
+    pub fn snapshot(&self) -> aic_common::SelfUpdateStatus {
+        use std::sync::atomic::Ordering;
+        let last = self.last.lock().ok().and_then(|slot| slot.clone());
+        aic_common::SelfUpdateStatus {
+            configured: self.configured.load(Ordering::Relaxed),
+            live: self.live.load(Ordering::Relaxed),
+            interval_secs: self.interval_secs.load(Ordering::Relaxed),
+            last_check_secs_ago: last
+                .as_ref()
+                .map(|l| unix_now_secs().saturating_sub(l.unix_secs)),
+            desired_version: last.as_ref().and_then(|l| l.desired_version.clone()),
+            last_outcome: last.map(|l| l.outcome),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// 확인 task가 죽으면 `live`를 반드시 되돌리는 RAII 가드. exporter의 `AgentLiveGuard`와 같은
+/// 이유다 — "떴다"를 래치하면 task가 panic으로 죽은 뒤에도 살아 있다고 보고한다.
+struct LiveGuard(std::sync::Arc<SelfUpdateHealth>);
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.set_live(false);
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// 확인 한 번의 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -118,7 +202,13 @@ fn hostname_seed() -> u64 {
 }
 
 /// 목표 버전을 한 번 확인하고, 필요하면 `aic update`를 돌린다.
-async fn tick(client: &reqwest::Client, endpoint: &str, token: Option<&str>, current: &str) {
+async fn tick(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: Option<&str>,
+    current: &str,
+    health: &SelfUpdateHealth,
+) {
     let mut req = client.get(config_url(endpoint));
     if let Some(t) = token {
         req = req.bearer_auth(t);
@@ -129,11 +219,13 @@ async fn tick(client: &reqwest::Client, endpoint: &str, token: Option<&str>, cur
             // 중앙에 못 닿는 것은 정상 상태의 하나다(네트워크 단절, 재배포 중).
             // 다음 주기에 다시 묻는다.
             tracing::debug!(error = %err, "목표 버전 조회 실패 — 다음 주기에 재시도");
+            health.record_check(None, format!("중앙에 닿지 못함: {err}"));
             return;
         }
     };
     if !resp.status().is_success() {
         tracing::warn!(status = %resp.status(), "목표 버전 조회가 거부됨 — 수집 토큰을 확인하세요");
+        health.record_check(None, format!("조회 거부됨 (HTTP {})", resp.status()));
         return;
     }
     // reqwest의 `json` 기능은 이 크레이트에서 의도적으로 꺼져 있다(protobuf만
@@ -142,6 +234,7 @@ async fn tick(client: &reqwest::Client, endpoint: &str, token: Option<&str>, cur
         Ok(b) => b,
         Err(err) => {
             tracing::warn!(error = %err, "목표 버전 응답을 읽지 못함");
+            health.record_check(None, format!("응답을 읽지 못함: {err}"));
             return;
         }
     };
@@ -149,6 +242,7 @@ async fn tick(client: &reqwest::Client, endpoint: &str, token: Option<&str>, cur
         Ok(c) => c,
         Err(err) => {
             tracing::warn!(error = %err, "목표 버전 응답을 해석하지 못함");
+            health.record_check(None, format!("응답을 해석하지 못함: {err}"));
             return;
         }
     };
@@ -156,9 +250,14 @@ async fn tick(client: &reqwest::Client, endpoint: &str, token: Option<&str>, cur
     match decide(cfg.desired_version.as_deref(), current) {
         Decision::Stay { why } => {
             tracing::debug!(why, current, desired = ?cfg.desired_version, "업데이트하지 않음");
+            health.record_check(cfg.desired_version.clone(), why);
         }
         Decision::Update { tag } => {
             tracing::info!(current, %tag, "목표 버전으로 셀프업데이트 시작");
+            health.record_check(
+                cfg.desired_version.clone(),
+                format!("{tag}으로 업데이트 시작"),
+            );
             run_update(&tag).await;
         }
     }
@@ -224,10 +323,13 @@ pub fn spawn(
     endpoint: String,
     token: Option<String>,
     interval: Duration,
+    health: std::sync::Arc<SelfUpdateHealth>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let current = env!("CARGO_PKG_VERSION").to_string();
+    health.set_live(true);
     tokio::spawn(async move {
+        let _live = LiveGuard(health.clone());
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent(concat!("aicd/", env!("CARGO_PKG_VERSION")))
@@ -256,14 +358,63 @@ pub fn spawn(
                     return;
                 }
             }
-            tick(&client, &endpoint, token.as_deref(), &current).await;
+            tick(&client, &endpoint, token.as_deref(), &current, &health).await;
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{config_url, decide, Decision};
+    use super::{config_url, decide, Decision, SelfUpdateHealth};
+    use std::time::Duration;
+
+    #[test]
+    fn an_unconfigured_health_says_so_instead_of_looking_idle() {
+        // "안 켰다"와 "켰는데 아직 확인 안 함"은 사용자가 할 일이 다르다.
+        let h = SelfUpdateHealth::new();
+        let s = h.snapshot();
+        assert!(!s.configured);
+        assert!(!s.live);
+        assert_eq!(s.last_check_secs_ago, None);
+        assert_eq!(s.current_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn configured_and_live_are_independent_axes() {
+        // 켜 두었는데 task가 뜨지 못한 상태를 표현할 수 있어야, "설정을 켜라"는 오진 대신
+        // "로그를 보라"고 안내할 수 있다.
+        let h = SelfUpdateHealth::new();
+        h.set_configured(true, Duration::from_secs(3600));
+        let s = h.snapshot();
+        assert!(s.configured);
+        assert!(!s.live, "설정만으로 살아 있다고 보고하면 안 된다");
+        assert_eq!(s.interval_secs, 3600);
+    }
+
+    #[test]
+    fn a_check_records_the_target_and_the_verdict() {
+        let h = SelfUpdateHealth::new();
+        h.set_configured(true, Duration::from_secs(60));
+        h.set_live(true);
+        h.record_check(Some("0.42.0".to_string()), "목표가 현재보다 낮음");
+
+        let s = h.snapshot();
+        assert!(s.live);
+        assert_eq!(s.desired_version.as_deref(), Some("0.42.0"));
+        assert_eq!(s.last_outcome.as_deref(), Some("목표가 현재보다 낮음"));
+        assert!(s.last_check_secs_ago.is_some_and(|secs| secs <= 1));
+    }
+
+    #[test]
+    fn an_unreachable_central_is_still_a_recorded_check() {
+        // 이걸 남기지 않으면 "한 번도 확인 안 함"과 "계속 실패 중"이 같아 보인다.
+        let h = SelfUpdateHealth::new();
+        h.record_check(None, "중앙에 닿지 못함: connection refused");
+        let s = h.snapshot();
+        assert_eq!(s.desired_version, None);
+        assert!(s.last_outcome.is_some_and(|o| o.contains("닿지 못함")));
+        assert!(s.last_check_secs_ago.is_some());
+    }
 
     fn tag(d: Decision) -> String {
         match d {

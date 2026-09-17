@@ -44,6 +44,9 @@ pub struct ControlContext {
     /// OTLP exporter 전송 건강. exporter가 비활성이면 `None` — `GetExporterStatus`는 그때
     /// `enabled: false`를 돌려준다("꺼짐"과 "켜졌는데 실패 중"은 다른 상태다).
     pub exporter_health: Option<Arc<crate::otlp_exporter::ExporterHealth>>,
+    /// 셀프업데이트 상태. 기능이 꺼져 있어도 `Some`이다 — `configured: false`를 답해야
+    /// "안 켰다"와 "조회 실패"를 구분할 수 있다.
+    pub self_update_health: Arc<crate::self_update::SelfUpdateHealth>,
     /// `aic-client`가 `PushLogLines`로 넘긴 자체 로그를 흘려보낼 채널(RFC-006 t11).
     ///
     /// logs exporter(`otlp_exporter::logs::serve_logs`)가 아직 `aicd_main`에 배선되지
@@ -176,6 +179,9 @@ async fn process_control_request(request: IpcRequest, ctx: &ControlContext) -> I
             commit: env!("AIC_BUILD_COMMIT").to_string(),
             build_info: env!("AIC_BUILD_INFO").to_string(),
         }),
+        IpcRequest::GetSelfUpdateStatus => {
+            IpcResponse::SelfUpdateStatus(ctx.self_update_health.snapshot())
+        }
         IpcRequest::GetExporterStatus => IpcResponse::ExporterStatus(
             ctx.exporter_health
                 .as_ref()
@@ -571,6 +577,7 @@ mod tests {
             registry_path: None,
             metrics: Arc::new(AicdMetrics::new()),
             agent_bus: AgentEventBus::new(),
+            self_update_health: Arc::new(crate::self_update::SelfUpdateHealth::new()),
             // exporter 미구성 — GetExporterStatus는 `enabled: false`를 돌려준다.
             exporter_health: None,
             // 아직 배선 전(t12) — PushLogLines 핸들러가 no-op으로 Pong만 응답하는지 검증.

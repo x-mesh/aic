@@ -5474,6 +5474,14 @@ async fn print_status_json(session: Option<&str>) {
             );
         }
     }
+    // aicd는 별도 소켓이라 세션 생존과 무관하게 묻는다. 구버전이면 키 자체를 넣지 않는다.
+    let aicd = UdsClient::new(aic_common::aicd_socket_path());
+    if let Ok(Some(su)) = aicd.get_self_update_status().await {
+        obj.insert(
+            "self_update".into(),
+            serde_json::to_value(&su).unwrap_or(serde_json::Value::Null),
+        );
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&obj).unwrap_or_else(|_| "{}".into())
@@ -5682,7 +5690,55 @@ async fn print_status_once(session: Option<&str>) {
             }
         }
     }
+
+    print_self_update_status().await;
 }
+
+/// 셀프업데이트 상태를 aicd에 물어 출력한다.
+///
+/// `aic status`가 보는 소켓은 `aic-session`이고 이 기능은 aicd 안에서 돌기 때문에, 별도로
+/// 물어야 한다. aicd가 없거나 구버전이면 줄 자체를 넣지 않는다 — 모르는 상태를 "꺼짐"으로
+/// 단정하면 멀쩡한 설정을 의심하게 된다.
+async fn print_self_update_status() {
+    let client = UdsClient::new(aic_common::aicd_socket_path());
+    let Ok(Some(s)) = client.get_self_update_status().await else {
+        return;
+    };
+
+    println!();
+    println!("  자동 업데이트:");
+    println!("    현재 버전: {}", s.current_version);
+    if !s.configured {
+        println!(
+            "    상태:      {COL_DIM}꺼짐{COL_RESET} (config `[aicd.exporter] self_update_enabled`)"
+        );
+        return;
+    }
+    if !s.live {
+        println!(
+            "    상태:      {COL_YELLOW}켜 두었으나 동작하지 않음{COL_RESET}              — aicd 로그에서 기동 실패 원인을 확인하세요"
+        );
+        return;
+    }
+    println!(
+        "    상태:      {COL_GREEN}동작 중{COL_RESET} ({}초 주기)",
+        s.interval_secs
+    );
+    match s.last_check_secs_ago {
+        Some(secs) => println!("    마지막 확인: {secs}초 전"),
+        None => println!("    마지막 확인: {COL_DIM}아직 없음(첫 주기 대기){COL_RESET}"),
+    }
+    println!(
+        "    목표 버전: {}",
+        s.desired_version
+            .as_deref()
+            .unwrap_or("(중앙이 선언하지 않음)")
+    );
+    if let Some(outcome) = &s.last_outcome {
+        println!("    판정:      {outcome}");
+    }
+}
+
 /// `aic doctor [--json]`: 환경 진단 리포트 출력. FAIL이 하나라도 있으면 exit 1.
 async fn handle_doctor_fix(dry_run: bool) {
     println!(
