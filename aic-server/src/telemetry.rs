@@ -102,14 +102,9 @@ fn install_panic_hook() {
     }));
 }
 
-/// 로그 디렉토리 경로. `~/.local/state/aic`.
+/// 로그 디렉토리 경로. system 서비스면 `/var/log/aic`, 아니면 XDG state.
 pub fn log_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".local")
-        .join("state")
-        .join("aic")
+    aic_common::paths::log_dir()
 }
 
 fn apply_dir_perm_0700(path: &Path) {
@@ -126,9 +121,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_dir_under_home() {
-        let dir = log_dir();
-        assert!(dir.ends_with(".local/state/aic"));
+    fn log_dir_follows_the_shared_resolver() {
+        // 예전에는 HOME을 직접 조립해 XDG_STATE_HOME을 무시했다. 그래서 그 변수를 옮긴 환경에서
+        // server.log와 webhook-events.jsonl이 서로 다른 디렉토리로 흩어졌다.
+        assert_eq!(log_dir(), aic_common::paths::log_dir());
+        if aic_common::paths::is_system_service() {
+            assert_eq!(log_dir(), std::path::Path::new("/var/log/aic"));
+        } else {
+            assert_eq!(log_dir(), aic_common::paths::state_dir());
+        }
     }
 
     #[test]

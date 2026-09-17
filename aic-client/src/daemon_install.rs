@@ -89,6 +89,11 @@ pub fn macos_plist_path() -> Result<PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
+/// Linux systemd **system** unit 경로. root로 설치할 때 쓴다.
+pub fn linux_system_unit_path() -> PathBuf {
+    PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT)
+}
+
 /// Linux systemd user unit 경로. `XDG_CONFIG_HOME`이 있으면 우선 사용.
 pub fn linux_unit_path() -> Result<PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
@@ -101,10 +106,12 @@ pub fn linux_unit_path() -> Result<PathBuf> {
     Ok(base.join("systemd").join("user").join(SYSTEMD_UNIT))
 }
 
-/// stdout/stderr가 redirect될 로그 디렉토리. `~/.local/state/aic`로 통일 —
-/// telemetry 모듈이 쓰는 디렉토리와 동일.
+/// stdout/stderr가 redirect될 로그 디렉토리.
+///
+/// aicd의 `telemetry`와 **같은 해석**을 써야 `server.log`와 `aicd.err.log`가 한 디렉토리에
+/// 모인다. 예전에는 여기서 HOME을 직접 조립해 `XDG_STATE_HOME`을 무시했다.
 pub fn log_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".local").join("state").join("aic"))
+    Ok(aic_common::paths::log_dir())
 }
 
 /// `current_exe()`(보통 `aic`) 옆에 있는 `aicd` 절대경로를 반환한다.
@@ -195,6 +202,14 @@ pub fn render_macos_plist(aicd_path: &Path, log_dir: &Path) -> String {
 /// 으로 판단해 **두 번째 aicd를 띄운다**. 서로 다른 디렉토리라 lock도 겹치지 않아 아무도
 /// 에러를 내지 않는다 — 정확히 중복 기동 방지가 막으려던 그 상황이다.
 pub fn render_linux_service(aicd_path: &Path, log_dir: &Path) -> String {
+    render_linux_service_for(aicd_path, log_dir, false)
+}
+
+/// `system`이면 system 유닛(root로 기동, `multi-user.target`)을, 아니면 기존 user 유닛을 만든다.
+///
+/// system 유닛에 `User=`를 넣지 않는 것은 의도다 — SRE 도구로서 다른 사용자 소유 프로세스의
+/// `/proc/<pid>/exe`를 읽어야 워크로드 탐지가 정확해지고, 그 읽기는 root만 가능하다.
+pub fn render_linux_service_for(aicd_path: &Path, log_dir: &Path, system: bool) -> String {
     let aicd = aicd_path.display();
     let stdout = log_dir.join("aicd.out.log");
     let stderr = log_dir.join("aicd.err.log");
@@ -202,11 +217,16 @@ pub fn render_linux_service(aicd_path: &Path, log_dir: &Path) -> String {
         Some(dir) => format!("\nEnvironment=AIC_RUNTIME_DIR={dir}"),
         None => String::new(),
     };
+    let target = if system {
+        "multi-user.target"
+    } else {
+        "default.target"
+    };
     format!(
         r#"[Unit]
 Description=aic supervisor daemon (aicd)
 Documentation=https://github.com/x-mesh/aic
-After=default.target
+After={target}
 
 [Service]
 Type=simple
@@ -218,7 +238,7 @@ StandardOutput=append:{stdout}
 StandardError=append:{stderr}
 
 [Install]
-WantedBy=default.target
+WantedBy={target}
 "#,
         stdout = stdout.display(),
         stderr = stderr.display(),
@@ -242,7 +262,26 @@ fn effective_runtime_dir_env() -> Option<String> {
 
 /// auto-start unit을 설치한다. `no_load`가 true면 파일만 쓰고 load/enable은 안 한다.
 pub fn install(no_load: bool) -> Result<InstallReport> {
+    install_with_scope(no_load, aic_common::paths::is_system_service())
+}
+
+/// `system`이면 `/etc/systemd/system`에 유닛을 깔고 `systemctl`을 system 모드로 부른다.
+///
+/// 호출부가 명시하는 이유: root로 무언가를 설치하러 온 사람이 의도치 않게 전역 서비스를 만들면
+/// 안 된다. `aic daemon install --system`이 유일한 진입점이고, 기본값은 지금까지의 사용자 설치다.
+pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> {
     let platform = detect_platform();
+    if system && platform != Platform::Linux {
+        return Err(anyhow!(
+            "--system 설치는 Linux에서만 지원합니다 (현재: {})",
+            std::env::consts::OS
+        ));
+    }
+    if system && unsafe { libc::geteuid() } != 0 {
+        return Err(anyhow!(
+            "--system 설치는 root 권한이 필요합니다 (sudo aic daemon install --system)"
+        ));
+    }
     if platform == Platform::Unsupported {
         return Err(anyhow!(
             "지원하지 않는 OS: {} (macOS / Linux만 지원)",
@@ -254,9 +293,17 @@ pub fn install(no_load: bool) -> Result<InstallReport> {
     let logs = log_dir()?;
     std::fs::create_dir_all(&logs)
         .with_context(|| format!("로그 디렉토리 생성 실패: {}", logs.display()))?;
+    // 로그에는 실행한 명령과 경로가 들어간다. `/var/log` 아래는 기본 umask로 만들면 755가 되어
+    // 같은 호스트의 다른 사용자에게 읽힌다. aicd의 telemetry가 쓰는 권한과 같게 맞춘다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700));
+    }
 
     let unit_path = match platform {
         Platform::Macos => macos_plist_path()?,
+        Platform::Linux if system => linux_system_unit_path(),
         Platform::Linux => linux_unit_path()?,
         Platform::Unsupported => unreachable!(),
     };
@@ -267,7 +314,7 @@ pub fn install(no_load: bool) -> Result<InstallReport> {
 
     let body = match platform {
         Platform::Macos => render_macos_plist(&aicd, &logs),
-        Platform::Linux => render_linux_service(&aicd, &logs),
+        Platform::Linux => render_linux_service_for(&aicd, &logs, system),
         Platform::Unsupported => unreachable!(),
     };
 
@@ -286,6 +333,7 @@ pub fn install(no_load: bool) -> Result<InstallReport> {
     } else {
         match platform {
             Platform::Macos => launchctl_load(&unit_path)?,
+            Platform::Linux if system => systemctl_system_enable_now()?,
             Platform::Linux => systemctl_user_enable_now()?,
             Platform::Unsupported => unreachable!(),
         }
@@ -511,6 +559,31 @@ pub fn ensure_linger() -> Linger {
     }
 }
 
+/// system 유닛을 등록하고 즉시 기동한다. `--user`가 없다는 점 외에 흐름은 같다.
+fn systemctl_system_enable_now() -> Result<bool> {
+    let reload = Command::new("systemctl")
+        .arg("daemon-reload")
+        .output()
+        .with_context(|| "systemctl daemon-reload 실행 실패 (systemd가 있는지 확인)")?;
+    if !reload.status.success() {
+        return Err(anyhow!(
+            "systemctl daemon-reload 실패: {}",
+            String::from_utf8_lossy(&reload.stderr).trim()
+        ));
+    }
+    let enable = Command::new("systemctl")
+        .args(["enable", "--now", SYSTEMD_UNIT])
+        .output()
+        .with_context(|| "systemctl enable --now 실행 실패")?;
+    if !enable.status.success() {
+        return Err(anyhow!(
+            "systemctl enable --now 실패: {}",
+            String::from_utf8_lossy(&enable.stderr).trim()
+        ));
+    }
+    Ok(true)
+}
+
 fn systemctl_user_enable_now() -> Result<bool> {
     let reload = systemctl_user_command()
         .arg("daemon-reload")
@@ -664,6 +737,38 @@ mod tests {
         assert!(p.contains("/var/log/aic/aicd.err.log"));
         // valid XML 시작
         assert!(p.starts_with("<?xml"));
+    }
+
+    #[test]
+    fn system_unit_targets_multi_user_and_lives_under_etc() {
+        // user 유닛은 로그인 세션에 묶인다. SRE 도구로 서버에 놓을 때는 부팅과 함께 떠야 하고,
+        // 로그도 사람과 수집기가 보는 자리에 있어야 한다.
+        let s = render_linux_service_for(
+            Path::new("/usr/local/bin/aicd"),
+            Path::new("/var/log/aic"),
+            true,
+        );
+        assert!(s.contains("WantedBy=multi-user.target"));
+        assert!(s.contains("After=multi-user.target"));
+        assert!(s.contains("StandardError=append:/var/log/aic/aicd.err.log"));
+        // User=를 넣지 않는 것은 의도다 — root여야 다른 사용자 프로세스의 exe를 읽는다.
+        assert!(!s.contains("User="));
+        assert_eq!(
+            linux_system_unit_path(),
+            Path::new("/etc/systemd/system/aicd.service")
+        );
+    }
+
+    #[test]
+    fn user_unit_keeps_the_session_target() {
+        // 기본값은 지금까지의 사용자 설치다. 회귀가 나면 로그인 세션에 묶이던 동작이 바뀐다.
+        let s = render_linux_service_for(
+            Path::new("/home/u/.local/bin/aicd"),
+            Path::new("/home/u/.local/state/aic"),
+            false,
+        );
+        assert!(s.contains("WantedBy=default.target"));
+        assert!(!s.contains("multi-user.target"));
     }
 
     #[test]

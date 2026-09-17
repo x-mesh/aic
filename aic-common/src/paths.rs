@@ -481,6 +481,36 @@ pub fn local_command_record_path() -> PathBuf {
     session_dir().join("last-command.json")
 }
 
+/// 이 프로세스가 **system 서비스로** 돌고 있는가(Linux에서 root).
+///
+/// SRE 도구로 서버에 놓을 때 aicd는 `/etc/systemd/system`에 설치돼 root로 돈다. 그때 로그를
+/// `/root/.local/state/aic`에 두면 중앙 로그 수집이 보는 자리가 아니고, 사람이 찾기도 어렵다.
+///
+/// macOS는 항상 false다 — 설치 경로가 LaunchAgent(사용자 단위)뿐이라 판정할 대상이 없다.
+pub fn is_system_service() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// aicd와 aic가 남기는 로그의 디렉터리.
+///
+/// system 서비스면 `/var/log/aic`, 아니면 [`state_dir`]. 로그만 갈라도 되는 이유는 읽는 쪽이
+/// 사람이나 수집기뿐이기 때문이다 — 소켓이나 상태 파일과 달리 경로가 갈려도 프로세스 사이의
+/// 통신이 깨지지 않는다.
+pub fn log_dir() -> PathBuf {
+    if is_system_service() {
+        PathBuf::from("/var/log/aic")
+    } else {
+        state_dir()
+    }
+}
+
 /// 영속 상태 디렉터리 (XDG State). `$XDG_STATE_HOME/aic` 또는 `~/.local/state/aic`.
 /// session_dir(runtime, ephemeral)과 달리 재부팅을 넘어 보존되는 로그/이벤트용.
 pub fn state_dir() -> PathBuf {
@@ -647,6 +677,24 @@ pub fn resolve_active_socket(explicit_id: Option<&str>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn log_dir_splits_on_service_scope() {
+        // 로그만 갈라도 되는 이유는 읽는 쪽이 사람과 수집기뿐이라, 소켓이나 상태 파일과 달리
+        // 경로가 갈려도 프로세스 사이의 통신이 깨지지 않기 때문이다.
+        if is_system_service() {
+            assert_eq!(log_dir(), PathBuf::from("/var/log/aic"));
+        } else {
+            assert_eq!(log_dir(), state_dir());
+        }
+    }
+
+    #[test]
+    fn system_service_is_never_true_off_linux() {
+        #[cfg(not(target_os = "linux"))]
+        assert!(!is_system_service());
+    }
+
     use super::*;
 
     #[test]

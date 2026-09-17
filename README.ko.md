@@ -134,6 +134,23 @@ aic daemon install     # macOS launchd / Linux systemd user unit 자동 분기
 `brew services`는 macOS launchd만 잘 붙고 Linux systemd 쪽은 좀 부실해서,
 `aic daemon install`이 양 OS 모두 일관되게 처리합니다.
 
+##### Linux system 서비스
+
+서버에 놓을 때는 aicd를 system 서비스로 설치합니다.
+
+```bash
+sudo aic daemon install --system
+```
+
+`/etc/systemd/system/aicd.service`를 쓰고 데몬을 root로 띄웁니다. 로그는 `/var/log/aic`에
+남습니다. 사용자 설치는 `$XDG_STATE_HOME/aic`를 씁니다.
+
+root로 돌리는 것은 의도입니다. 비루트 데몬은 다른 사용자 프로세스의 `/proc/<pid>/exe`를
+읽지 못해 워크로드 탐지가 약한 증거로 떨어집니다.
+
+`--system`은 root 권한이 필요하고 Linux에서만 동작합니다. 플래그가 없으면 지금까지처럼
+사용자 단위로 설치합니다.
+
 #### Source 빌드
 
 ```bash

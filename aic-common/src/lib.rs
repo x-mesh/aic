@@ -36,9 +36,10 @@ pub use paths::{
     aicd_attach_socket_path, aicd_attach_socket_path_for_bind, aicd_lock_path,
     aicd_lock_path_candidates, aicd_lock_path_for_bind, aicd_registry_path,
     aicd_registry_path_for_bind, aicd_socket_path, aicd_socket_path_for_bind, default_socket_path,
-    ensure_runtime_dir, extract_session_id, list_session_sockets, local_command_record_path,
-    local_hook_pending_path, resolve_active_socket, resolve_socket_path, runtime_dir_is_trusted,
-    session_dir, session_id_in_use, session_socket_path, session_socket_path_for_bind,
+    ensure_runtime_dir, extract_session_id, is_system_service, list_session_sockets,
+    local_command_record_path, local_hook_pending_path, log_dir, resolve_active_socket,
+    resolve_socket_path, runtime_dir_is_trusted, session_dir, session_id_in_use,
+    session_socket_path, session_socket_path_for_bind,
 };
 pub use peercred::{ensure_peer_is_self, peer_uid};
 pub use session::{

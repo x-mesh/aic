@@ -1178,6 +1178,10 @@ enum DaemonOp {
         /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
         #[arg(long)]
         no_load: bool,
+        /// Linux에서 system 서비스로 설치한다(`/etc/systemd/system`, root 실행, 로그는
+        /// `/var/log/aic`). root 권한이 필요하다. 지정하지 않으면 사용자 단위로 설치한다.
+        #[arg(long)]
+        system: bool,
     },
     /// 자동 시작 unit을 unload + 제거한다.
     Uninstall,
@@ -1685,7 +1689,7 @@ async fn main() {
             DaemonOp::Start { foreground } => handle_daemon_start(foreground).await,
             DaemonOp::Stop => handle_daemon_stop().await,
             DaemonOp::Restart { if_running } => handle_daemon_restart(if_running).await,
-            DaemonOp::Install { no_load } => handle_daemon_install(no_load),
+            DaemonOp::Install { no_load, system } => handle_daemon_install(no_load, system),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
         Some(Commands::Session { op }) => match op {
@@ -2617,11 +2621,12 @@ fn print_linger_status(linger: &aic_client::daemon_install::Linger) {
 }
 
 /// `aic daemon install [--no-load]`: OS-native auto-start unit 설치.
-fn handle_daemon_install(no_load: bool) {
-    match aic_client::daemon_install::install(no_load) {
+fn handle_daemon_install(no_load: bool, system: bool) {
+    match aic_client::daemon_install::install_with_scope(no_load, system) {
         Ok(report) => {
             let plat = match report.platform {
                 aic_client::daemon_install::Platform::Macos => "macOS launchd",
+                aic_client::daemon_install::Platform::Linux if system => "Linux systemd (system)",
                 aic_client::daemon_install::Platform::Linux => "Linux systemd --user",
                 aic_client::daemon_install::Platform::Unsupported => "unsupported",
             };
@@ -2640,6 +2645,7 @@ fn handle_daemon_install(no_load: bool) {
                     aic_client::daemon_install::Platform::Macos => {
                         "launchctl bootstrap gui/$UID <plist>"
                     }
+                    _ if system => "systemctl enable --now aicd.service",
                     _ => "systemctl --user enable --now aicd.service",
                 };
                 println!("  loaded:  {COL_DIM}no (--no-load) — 직접: {cmd}{COL_RESET}");

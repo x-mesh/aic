@@ -148,6 +148,23 @@ aic daemon install     # auto-branches between macOS launchd and Linux systemd u
 `brew services` works well with macOS launchd but its Linux-systemd
 support is spotty, so `aic daemon install` handles both OSes consistently.
 
+##### System service on Linux
+
+For a server, install aicd as a system service:
+
+```bash
+sudo aic daemon install --system
+```
+
+This command writes `/etc/systemd/system/aicd.service` and starts the daemon as root.
+Logs go to `/var/log/aic`. The user install writes logs to `$XDG_STATE_HOME/aic`.
+
+The system service runs as root on purpose. A non-root daemon cannot read
+`/proc/<pid>/exe` of another user's process, so workload discovery gets weaker evidence.
+
+`--system` requires root and works on Linux only. Without the flag, `aic daemon install`
+keeps the per-user install.
+
 #### Build from source
 
 ```bash
