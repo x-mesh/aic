@@ -1848,6 +1848,9 @@ async fn main() {
             DebugOp::Bundle => handle_debug_bundle().await,
         },
         Some(Commands::Update { check, force, to }) => {
+            // 교체 전 버전을 잡아 둔다. 교체 후에는 이 프로세스가 아직 옛 코드로 돌지만
+            // `CARGO_PKG_VERSION`은 컴파일 시점 값이라 그대로 쓸 수 있다.
+            let from_version = env!("CARGO_PKG_VERSION").to_string();
             match aic_client::update::run(aic_client::update::UpdateOptions {
                 check,
                 force,
@@ -1857,7 +1860,7 @@ async fn main() {
             {
                 // binary를 갈아끼웠으면 이미 떠 있는 aicd는 아직 옛 코드로 돈다.
                 // 여기서 재시작까지 해야 update가 실제로 적용된다 (안내만 하면 빠뜨린다).
-                Ok(aic_client::update::Outcome::Replaced) => {
+                Ok(aic_client::update::Outcome::Replaced { tag }) => {
                     // update는 binary만 갈아끼우므로 shell hook 파일(~/.aic/hooks.*·hook-events.*)은
                     // 그대로다. 파일이 유실(rc의 source 라인만 남고 파일은 삭제)되거나 포맷이 낡으면
                     // command 수집이 조용히 멈춘다(rc는 없는 파일을 source하려다 실패). init한 흔적이
@@ -1868,7 +1871,7 @@ async fn main() {
                     // — 아래 restart는 aicd가 안 떠 있으면 skip하고 끝나기 때문이다(그 호스트가
                     // 정확히 그 상태다).
                     heal_linger_after_update();
-                    handle_daemon_restart(true).await;
+                    verify_or_rollback_after_update(&from_version, tag.as_deref()).await;
                 }
                 Ok(aic_client::update::Outcome::Unchanged) => {}
                 Err(e) => {
@@ -3595,6 +3598,94 @@ async fn handle_daemon_stop() {
 /// old aicd가 socket을 완전히 놓을 때까지 기다리지 않으면 `handle_daemon_start`가
 /// 아직 응답하는 old daemon을 보고 "이미 실행 중"으로 no-op 하므로, ping이 죽을
 /// 때까지 폴링한 뒤 start 한다. 미실행이면 stop을 건너뛰고 곧장 start.
+/// 교체 후 aicd가 살아 돌아오는지 확인하고, 응답이 없으면 이전 binary로 되돌린다.
+///
+/// 판정 기준은 **응답 여부 하나**다. 버전까지 비교하면 새 버전이 `GetVersion` 응답 형식을
+/// 바꿨을 때 멀쩡한 업데이트를 되돌린다.
+///
+/// aicd가 원래 떠 있지 않았으면 재시작이 skip되므로 확인할 대상이 없다 — 그때는 교체 사실만
+/// 기록한다. 되돌릴 것이 없는 상태에서 "실패"로 적으면 다음 진단이 엉뚱한 곳을 본다.
+async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Option<&str>) {
+    let sock = aic_common::aicd_socket_path();
+    let was_running = matches!(UdsClient::new(sock.clone()).ping().await, Ok(true));
+    handle_daemon_restart(true).await;
+
+    // 설치된 쪽의 버전을 쓴다. 이 프로세스의 `CARGO_PKG_VERSION`은 교체 **전** 버전이라,
+    // 핀 설치나 다운그레이드에서 `0.41.9 → 0.41.9` 같은 무의미한 기록이 남는다.
+    let to_version = installed_tag
+        .map(|t| t.trim_start_matches('v').to_string())
+        .unwrap_or_else(|| "(외부 매니저)".to_string());
+    let mut record = aic_client::update::UpdateRecord {
+        at: chrono::Utc::now(),
+        from: from_version.to_string(),
+        to: to_version,
+        result: "ok".to_string(),
+        reason: None,
+    };
+    if !was_running {
+        record.result = "restart_skipped".to_string();
+        aic_client::update::record_update(&record);
+        return;
+    }
+
+    if daemon_answers_within(UPDATE_HEALTH_DEADLINE).await {
+        aic_client::update::record_update(&record);
+        return;
+    }
+
+    let reason = format!(
+        "재시작 후 {}초 동안 aicd가 응답하지 않음",
+        UPDATE_HEALTH_DEADLINE.as_secs()
+    );
+    eprintln!("{COL_YELLOW}⚠{COL_RESET} {reason} — 이전 binary로 되돌립니다");
+    record.result = "rolled_back".to_string();
+    record.reason = Some(reason);
+
+    match aic_client::update::install_dir()
+        .and_then(|dir| aic_client::update::restore_from_backup(&dir))
+    {
+        Ok(()) => {
+            handle_daemon_restart(true).await;
+            let recovered = daemon_answers_within(UPDATE_HEALTH_DEADLINE).await;
+            println!(
+                "{} 롤백 완료 — aicd {}",
+                if recovered {
+                    format!("{COL_GREEN}✓{COL_RESET}")
+                } else {
+                    format!("{COL_RED}✗{COL_RESET}")
+                },
+                if recovered {
+                    "응답 정상"
+                } else {
+                    "여전히 응답 없음 — `aic daemon start`로 직접 확인하세요"
+                }
+            );
+        }
+        Err(e) => {
+            record.result = "rollback_failed".to_string();
+            record.reason = Some(format!("{}: {e}", record.reason.take().unwrap_or_default()));
+            eprintln!("{COL_RED}✗{COL_RESET} 롤백 실패: {e}");
+        }
+    }
+    aic_client::update::record_update(&record);
+}
+
+/// 업데이트 후 aicd의 응답을 기다리는 상한. 재시작은 unit 매니저를 거치므로 즉시 뜨지 않는다.
+const UPDATE_HEALTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 기한 안에 aicd가 ping에 답하면 true.
+async fn daemon_answers_within(deadline: std::time::Duration) -> bool {
+    let sock = aic_common::aicd_socket_path();
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if matches!(UdsClient::new(sock.clone()).ping().await, Ok(true)) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
 async fn handle_daemon_restart(if_running: bool) {
     let sock = aic_common::aicd_socket_path();
     let client = UdsClient::new(sock.clone());
@@ -5488,6 +5579,12 @@ async fn print_status_json(session: Option<&str>) {
             serde_json::to_value(&su).unwrap_or(serde_json::Value::Null),
         );
     }
+    if let Some(rec) = aic_client::update::last_update_record() {
+        obj.insert(
+            "last_update".into(),
+            serde_json::to_value(&rec).unwrap_or(serde_json::Value::Null),
+        );
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&obj).unwrap_or_else(|_| "{}".into())
@@ -5718,30 +5815,54 @@ async fn print_self_update_status() {
         println!(
             "    상태:      {COL_DIM}꺼짐{COL_RESET} (config `[aicd.exporter] self_update_enabled`)"
         );
-        return;
-    }
-    if !s.live {
+    } else if !s.live {
         println!(
-            "    상태:      {COL_YELLOW}켜 두었으나 동작하지 않음{COL_RESET}              — aicd 로그에서 기동 실패 원인을 확인하세요"
+            "    상태:      {COL_YELLOW}켜 두었으나 동작하지 않음{COL_RESET} — aicd 로그에서 기동 실패 원인을 확인하세요"
         );
+    } else {
+        println!(
+            "    상태:      {COL_GREEN}동작 중{COL_RESET} ({}초 주기)",
+            s.interval_secs
+        );
+        match s.last_check_secs_ago {
+            Some(secs) => println!("    마지막 확인: {secs}초 전"),
+            None => println!("    마지막 확인: {COL_DIM}아직 없음(첫 주기 대기){COL_RESET}"),
+        }
+        println!(
+            "    목표 버전: {}",
+            s.desired_version
+                .as_deref()
+                .unwrap_or("(중앙이 선언하지 않음)")
+        );
+        if let Some(outcome) = &s.last_outcome {
+            println!("    판정:      {outcome}");
+        }
+    }
+    // 이력은 셀프업데이트를 꺼 두었어도 남는다 — `aic update`를 손으로 돌린 결과도 여기 들어간다.
+    print_last_update_record();
+}
+
+/// 마지막 업데이트 결과 한 줄. 롤백이었다면 사유까지 붙인다.
+///
+/// 이력이 없으면 아무것도 출력하지 않는다 — 업데이트한 적 없는 호스트에 빈 줄을 띄우지 않는다.
+fn print_last_update_record() {
+    let Some(rec) = aic_client::update::last_update_record() else {
         return;
-    }
+    };
+    let when = rec.at.format("%Y-%m-%d %H:%M UTC");
+    let verdict = match rec.result.as_str() {
+        "ok" => format!("{COL_GREEN}성공{COL_RESET}"),
+        "restart_skipped" => format!("{COL_DIM}교체됨(데몬 미실행){COL_RESET}"),
+        "rolled_back" => format!("{COL_YELLOW}롤백됨{COL_RESET}"),
+        "rollback_failed" => format!("{COL_RED}롤백 실패{COL_RESET}"),
+        other => other.to_string(),
+    };
     println!(
-        "    상태:      {COL_GREEN}동작 중{COL_RESET} ({}초 주기)",
-        s.interval_secs
+        "    마지막 갱신: {} → {} · {verdict} ({when})",
+        rec.from, rec.to
     );
-    match s.last_check_secs_ago {
-        Some(secs) => println!("    마지막 확인: {secs}초 전"),
-        None => println!("    마지막 확인: {COL_DIM}아직 없음(첫 주기 대기){COL_RESET}"),
-    }
-    println!(
-        "    목표 버전: {}",
-        s.desired_version
-            .as_deref()
-            .unwrap_or("(중앙이 선언하지 않음)")
-    );
-    if let Some(outcome) = &s.last_outcome {
-        println!("    판정:      {outcome}");
+    if let Some(reason) = &rec.reason {
+        println!("      사유:    {reason}");
     }
 }
 

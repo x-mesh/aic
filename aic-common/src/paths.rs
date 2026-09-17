@@ -62,10 +62,19 @@ pub fn session_dir() -> PathBuf {
     session_dir_for_os(std::env::consts::OS)
 }
 
+/// system 서비스의 런타임 디렉토리. `/run`은 tmpfs이고 root 소유라, 다른 로컬 사용자가
+/// 선점할 수 있는 `/tmp` 아래와 달리 소켓·lock을 두기에 안전하다.
+const SYSTEM_RUNTIME_DIR: &str = "/run/aic";
+
 /// OS 문자열을 주입받아 세션 디렉토리를 결정한다 (테스트용).
 fn session_dir_for_os(os: &str) -> PathBuf {
     if let Some(dir) = explicit_runtime_dir() {
         return dir;
+    }
+    // system 서비스는 uid가 0이라 user 설치와 `/tmp/aic-0`을 공유한다. 그 상태로 둘 다 뜨면
+    // 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은 영원히 실패한다(systemd가 2초마다 재시도한다).
+    if os == "linux" && is_system_service() {
+        return PathBuf::from(SYSTEM_RUNTIME_DIR);
     }
     match os {
         "linux" => {
@@ -307,6 +316,24 @@ fn session_dir_candidates_for_os(os: &str) -> Vec<PathBuf> {
     if os != "linux" {
         return vec![canonical];
     }
+    // root로 실행 중이면 system 서비스의 디렉토리를 **먼저** 보되, 기존 관례 경로를 전부 뒤에
+    // 남긴다. `canonical`은 이미 `/run/aic`로 바뀌어 있으므로 그것만 믿으면 안 된다 — user
+    // 유닛으로 뜬 aicd는 `XDG_RUNTIME_DIR`를 받아 `/run/user/0/aic`에 bind하고, 그 경로가
+    // 후보에서 빠지면 root의 `aic`가 멀쩡히 도는 데몬을 못 찾는다(실서버에서 실제로 그랬다).
+    if is_system_service() {
+        let mut candidates = vec![PathBuf::from(SYSTEM_RUNTIME_DIR)];
+        let push = |dir: PathBuf, candidates: &mut Vec<PathBuf>| {
+            if !candidates.contains(&dir) {
+                candidates.push(dir);
+            }
+        };
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+            push(PathBuf::from(xdg).join("aic"), &mut candidates);
+        }
+        push(run_user_session_dir(), &mut candidates);
+        push(tmp_session_dir(), &mut candidates);
+        return candidates;
+    }
     // linux의 두 관례를 서로의 대체 후보로 둔다. XDG가 **설정돼 있으면** `/run/user/{uid}`는
     // 후보에 넣지 않는다 — 격리 환경(테스트/컨테이너)이 의도적으로 다른 런타임 디렉토리를
     // 가리킨 상황이라, 거기서 시스템 데몬으로 새는 편이 못 찾는 것보다 나쁘다.
@@ -524,6 +551,14 @@ pub fn state_dir() -> PathBuf {
     }
 }
 
+/// 업데이트 결과 이력(JSONL) 경로. `aic update`가 쓰고 `aic status`가 읽는다.
+///
+/// 메모리가 아니라 디스크에 남기는 이유: 업데이트는 데몬 재시작을 동반하므로, 무엇이 언제
+/// 어느 버전으로 움직였는지는 재시작을 넘어 남아야 한다. 롤백이 일어났다면 특히 그렇다.
+pub fn update_history_path() -> PathBuf {
+    state_dir().join("update-history.jsonl")
+}
+
 /// aicd webhook 수신·처리 이벤트 로그(JSONL) 경로 (SRE R2). `aic webhook list`가 읽는다.
 pub fn webhook_events_path() -> PathBuf {
     state_dir().join("webhook-events.jsonl")
@@ -677,6 +712,51 @@ pub fn resolve_active_socket(explicit_id: Option<&str>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn system_service_gets_its_own_runtime_dir() {
+        // root는 uid가 0이라 system과 user 설치가 `/tmp/aic-0`을 공유했다. 그 상태로 둘 다 뜨면
+        // 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은 영원히 실패한다(실측: systemd가 2초마다 재시도).
+        if is_system_service() {
+            assert_eq!(session_dir_for_os("linux"), PathBuf::from("/run/aic"));
+            let candidates = session_dir_candidates_for_os("linux");
+            assert_eq!(candidates.first(), Some(&PathBuf::from("/run/aic")));
+            // 이미 돌던 데몬을 계속 찾아야 한다. user 유닛은 XDG를 받아 `/run/user/0/aic`에
+            // bind하므로, 그 경로가 빠지면 root의 `aic`가 멀쩡한 데몬을 놓친다.
+            assert!(
+                candidates.iter().any(|c| c.starts_with("/run/user/")),
+                "user 유닛 경로가 후보에서 빠졌다: {candidates:?}"
+            );
+            assert!(
+                candidates.iter().any(|c| c.starts_with("/tmp/aic-")),
+                "옛 설치 경로가 후보에서 빠졌다: {candidates:?}"
+            );
+        } else {
+            assert_ne!(session_dir_for_os("linux"), PathBuf::from("/run/aic"));
+        }
+    }
+
+    #[test]
+    fn an_explicit_runtime_dir_still_wins_over_system_scope() {
+        // 격리를 선언한 인스턴스가 시스템 데몬으로 새면 격리가 아니다. 기존 규칙을 지킨다.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(RUNTIME_DIR_ENV);
+        std::env::set_var(RUNTIME_DIR_ENV, "/srv/aic-isolated");
+
+        assert_eq!(
+            session_dir_for_os("linux"),
+            PathBuf::from("/srv/aic-isolated")
+        );
+        assert_eq!(
+            session_dir_candidates_for_os("linux"),
+            vec![PathBuf::from("/srv/aic-isolated")]
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(RUNTIME_DIR_ENV, v),
+            None => std::env::remove_var(RUNTIME_DIR_ENV),
+        }
+    }
 
     #[test]
     fn log_dir_splits_on_service_scope() {

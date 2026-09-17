@@ -467,10 +467,14 @@ pub struct UpdateOptions {
 ///
 /// 호출부는 이걸로 "aicd를 재시작해야 하는가"를 판단한다 — binary만 갈아끼우면
 /// 이미 떠 있는 데몬은 옛 코드로 계속 돌기 때문이다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// binary가 교체되었다(Manual), 또는 외부 매니저가 교체했을 수 있다(Brew).
-    Replaced,
+    ///
+    /// `tag`은 **설치된 쪽**의 버전이다. 호출부가 `CARGO_PKG_VERSION`으로 대신 쓰면 안 된다 —
+    /// 그 값은 지금 도는 프로세스의 컴파일 시점 버전이라, 교체 결과와 다를 수 있다(핀 설치나
+    /// 다운그레이드에서 실제로 어긋난다). Brew는 외부 매니저가 정하므로 `None`이다.
+    Replaced { tag: Option<String> },
     /// binary는 그대로다 — `--check`, 이미 최신, cargo 설치(자동 교체 거부).
     Unchanged,
 }
@@ -538,12 +542,15 @@ pub async fn run(opts: UpdateOptions) -> Result<Outcome> {
     }
 
     match install.source {
-        Source::Brew => run_brew_upgrade().map(|()| Outcome::Replaced),
+        Source::Brew => run_brew_upgrade().map(|()| Outcome::Replaced { tag: None }),
         Source::Cargo => print_cargo_hint().map(|()| Outcome::Unchanged),
         // Manual은 위에서 target이 Some임이 보장된다(None이면 fetch_latest_tag가 이미 중단).
-        Source::Manual => run_manual_upgrade(&install, target.as_deref().unwrap())
-            .await
-            .map(|()| Outcome::Replaced),
+        Source::Manual => {
+            let tag = target.as_deref().unwrap().to_string();
+            run_manual_upgrade(&install, &tag)
+                .await
+                .map(|()| Outcome::Replaced { tag: Some(tag) })
+        }
     }
 }
 
@@ -605,11 +612,159 @@ async fn run_manual_upgrade(install: &Install, tag: &str) -> Result<()> {
     Ok(())
 }
 
+// ── 업데이트 이력과 롤백 ──────────────────────────────────────
+
+/// 업데이트 한 건의 결과. `aic status`가 마지막 한 건을 읽어 보여준다.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UpdateRecord {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub from: String,
+    pub to: String,
+    /// `ok` | `rolled_back` | `restart_skipped`
+    pub result: String,
+    /// 롤백했다면 그 이유.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 이력 한 줄을 append한다. 실패해도 업데이트 자체를 실패로 만들지 않는다 — 기록은 부가
+/// 정보이고, 여기서 에러를 올리면 이미 끝난 교체를 되돌릴 수도 없으면서 명령만 실패로 보인다.
+pub fn record_update(record: &UpdateRecord) {
+    let path = aic_common::paths::update_history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut line) = serde_json::to_string(record) else {
+        return;
+    };
+    line.push('\n');
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 마지막 업데이트 이력 한 건. 파일이 없거나 비어 있으면 `None`.
+pub fn last_update_record() -> Option<UpdateRecord> {
+    let text = std::fs::read_to_string(aic_common::paths::update_history_path()).ok()?;
+    text.lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<UpdateRecord>(line).ok())
+}
+
+/// `atomic_replace`가 남긴 `.bak`으로 세 binary를 되돌린다.
+///
+/// **세 개를 함께 되돌린다.** 일부만 되돌리면 `aic`와 `aicd`의 버전이 어긋나 IPC 계약이 깨진다.
+/// 하나라도 `.bak`이 없으면 되돌릴 수 없는 상태이므로 시도하지 않고 그 사실을 알린다.
+pub fn restore_from_backup(dir: &Path) -> Result<()> {
+    let pairs: Vec<(PathBuf, PathBuf)> = BINARIES
+        .iter()
+        .map(|bin| (dir.join(bin), dir.join(format!("{bin}.bak"))))
+        .filter(|(target, _)| target.exists())
+        .collect();
+    if pairs.is_empty() {
+        bail!("되돌릴 binary가 없습니다: {}", dir.display());
+    }
+    if let Some((target, bak)) = pairs.iter().find(|(_, bak)| !bak.exists()) {
+        bail!(
+            "{}의 백업이 없어 되돌릴 수 없습니다 (target: {})",
+            bak.display(),
+            target.display()
+        );
+    }
+    for (target, bak) in &pairs {
+        std::fs::copy(bak, target)
+            .with_context(|| format!("복구 실패: {} ← {}", target.display(), bak.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    Ok(())
+}
+
+/// 설치 디렉토리(롤백 대상 경로)를 알려 준다.
+pub fn install_dir() -> Result<PathBuf> {
+    Ok(detect_install()?.dir)
+}
+
 // ── 테스트 ────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rollback_refuses_a_partial_backup_set() {
+        // 일부만 되돌리면 aic와 aicd의 버전이 어긋나 IPC 계약이 깨진다. 되돌릴 수 없는
+        // 상태라면 손대지 않고 그 사실을 알려야 한다.
+        let dir = tempfile::tempdir().unwrap();
+        for bin in BINARIES {
+            std::fs::write(dir.path().join(bin), b"new").unwrap();
+        }
+        // aic만 백업이 있고 나머지는 없다.
+        std::fs::write(dir.path().join("aic.bak"), b"old").unwrap();
+
+        let err = restore_from_backup(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("백업이 없어"), "{err}");
+        // 실패했으면 아무것도 건드리지 않았어야 한다.
+        assert_eq!(std::fs::read(dir.path().join("aic")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn rollback_restores_every_binary_together() {
+        let dir = tempfile::tempdir().unwrap();
+        for bin in BINARIES {
+            std::fs::write(dir.path().join(bin), b"new").unwrap();
+            std::fs::write(dir.path().join(format!("{bin}.bak")), b"old").unwrap();
+        }
+        restore_from_backup(dir.path()).unwrap();
+        for bin in BINARIES {
+            assert_eq!(
+                std::fs::read(dir.path().join(bin)).unwrap(),
+                b"old",
+                "{bin}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_skips_binaries_that_were_never_installed() {
+        // 사이드카가 다른 위치에 설치된 호스트는 교체 때도 건너뛴다. 없는 것을 되돌리라고
+        // 요구하면 멀쩡한 롤백이 실패한다.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aic"), b"new").unwrap();
+        std::fs::write(dir.path().join("aic.bak"), b"old").unwrap();
+        restore_from_backup(dir.path()).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("aic")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn an_update_record_roundtrips_through_jsonl() {
+        let rec = UpdateRecord {
+            at: chrono::Utc::now(),
+            from: "0.41.8".to_string(),
+            to: "0.41.9".to_string(),
+            result: "rolled_back".to_string(),
+            reason: Some("재시작 후 15초 동안 aicd가 응답하지 않음".to_string()),
+        };
+        let line = serde_json::to_string(&rec).unwrap();
+        let back: UpdateRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.from, "0.41.8");
+        assert_eq!(back.result, "rolled_back");
+        assert!(back.reason.is_some_and(|r| r.contains("응답하지 않음")));
+        // 성공 기록에는 reason 키 자체가 없어야 한다(읽는 쪽이 빈 사유를 표시하지 않도록).
+        let ok = UpdateRecord {
+            reason: None,
+            ..rec
+        };
+        assert!(!serde_json::to_string(&ok).unwrap().contains("reason"));
+    }
 
     #[test]
     fn semver_compares_basic() {

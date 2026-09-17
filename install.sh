@@ -7,6 +7,7 @@
 # Env overrides:
 #   AIC_VERSION=v0.3.0       특정 버전 고정 (default: latest)
 #   AIC_INSTALL_DIR=/path    설치 경로 (default: /usr/local/bin → fallback ~/.local/bin)
+#   AIC_SKIP_DAEMON=1        aicd 자동 등록 생략 (default: 등록)
 #
 # RCA one-click enrollment:
 #   curl -fsSL https://rca.example/install/aic | sh -s -- \
@@ -146,7 +147,23 @@ info "installed ${version} → $target_dir/{$(echo "$BINS" | tr ' ' ',')}"
 
 if [ -n "$enroll_key" ]; then
   info "enrolling this host with RCA"
+  # enroll이 성공하면 그 안에서 aicd 등록까지 끝난다(root로 실행하면 system 유닛).
   "$target_dir/aic" enroll --server "$enroll_server" --auth-key "$enroll_key"
+elif [ -z "${AIC_SKIP_DAEMON:-}" ]; then
+  # 등록 없이 설치만 한 경우에도 데몬을 띄워 둔다 — 안내만 하면 빠뜨리고, 그러면 명령 수집과
+  # 워크로드 모니터링이 조용히 동작하지 않는다. root + Linux면 system 유닛으로 깔린다.
+  #
+  # 실패해도 설치 자체는 성공이므로 스크립트를 중단하지 않는다. 기존에 돌던 사용자 단위
+  # aicd가 있으면 여기서 막히는데, 그 안내 문구가 정리 방법을 알려 준다.
+  # CLI는 `--system`을 명시해야 system 유닛을 깐다(자동 감지는 enroll 경로에만 적용된다).
+  # root로 Linux 서버에 설치하는 흐름이 곧 system 서비스 배포이므로 여기서 붙여 준다.
+  daemon_scope=""
+  if [ "$(id -u)" = "0" ] && [ "$(uname -s)" = "Linux" ]; then
+    daemon_scope="--system"
+  fi
+  info "registering aicd ${daemon_scope:-(user)}"
+  # shellcheck disable=SC2086  # daemon_scope는 빈 값이거나 단일 플래그다
+  "$target_dir/aic" daemon install $daemon_scope || info "aicd 등록을 건너뜁니다 — 위 안내를 따른 뒤 'aic daemon install ${daemon_scope}'을 다시 실행하세요"
 fi
 
 case ":$PATH:" in
@@ -159,7 +176,10 @@ cat <<'EOF'
 다음 단계:
   aic config              # provider/api_key/model 대화형 설정
   aic init zsh            # ~/.zshrc에 hook source 라인 추가 (bash도 가능)
-  aic daemon install      # aicd를 launchd/systemd에 등록 (선택)
+  aic status              # aicd 등록 상태 확인
+
+서버에 system 서비스로 두려면(Linux, root):
+  sudo aic daemon install --system
 
 업데이트: aic update
 EOF

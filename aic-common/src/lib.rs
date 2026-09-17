@@ -39,7 +39,7 @@ pub use paths::{
     ensure_runtime_dir, extract_session_id, is_system_service, list_session_sockets,
     local_command_record_path, local_hook_pending_path, log_dir, resolve_active_socket,
     resolve_socket_path, runtime_dir_is_trusted, session_dir, session_id_in_use,
-    session_socket_path, session_socket_path_for_bind,
+    session_socket_path, session_socket_path_for_bind, update_history_path,
 };
 pub use peercred::{ensure_peer_is_self, peer_uid};
 pub use session::{

@@ -89,6 +89,73 @@ pub fn macos_plist_path() -> Result<PathBuf> {
         .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
+/// system 유닛에 박을 `aicd` 경로.
+///
+/// 기본 해석([`resolve_aicd_path`])은 `current_exe()` 옆을 먼저 본다. 그래서
+/// `sudo ~/.local/bin/aic daemon install --system`으로 설치하면 유닛이 **특정 사용자의 홈 아래**
+/// binary를 가리킨다. 그 홈이 사라지거나 마운트가 풀리면 부팅 시 서비스가 뜨지 못한다.
+/// system 서비스는 공용 경로의 binary를 써야 한다.
+fn resolve_system_aicd_path() -> Result<PathBuf> {
+    for dir in ["/usr/local/bin", "/usr/bin"] {
+        let candidate = PathBuf::from(dir).join("aicd");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    let fallback = resolve_aicd_path()?;
+    if is_under_home(&fallback) {
+        return Err(anyhow!(
+            "system 유닛이 사용자 홈 아래 binary({})를 가리키게 됩니다. \
+             /usr/local/bin에 설치한 뒤 다시 실행하세요: sudo install -m 0755 {} /usr/local/bin/aicd",
+            fallback.display(),
+            fallback.display()
+        ));
+    }
+    Ok(fallback)
+}
+
+/// 경로가 사용자 홈 아래인가. system 서비스가 의존하면 안 되는 위치를 걸러낸다.
+fn is_under_home(path: &Path) -> bool {
+    path.starts_with("/home") || path.starts_with("/root") || path.starts_with("/Users")
+}
+
+/// system 설치를 막아야 하는 기존 user 데몬이 있으면 그 사유를 돌려준다.
+///
+/// 확인 대상은 둘이다: 활성 user 유닛과, 지금 lock을 쥔 프로세스. 어느 쪽이든 남아 있으면
+/// system 유닛이 뜨지 못한다.
+fn conflicting_user_daemon() -> Option<String> {
+    let user_unit_active = systemctl_user_command()
+        .args(["is-active", "--quiet", SYSTEMD_UNIT])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let lock = aic_common::aicd_lock_path();
+    let holder = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.trim().lines().next()?.trim().parse::<i32>().ok())
+        .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0);
+
+    if !user_unit_active && holder.is_none() {
+        return None;
+    }
+    let mut lines = vec!["이미 사용자 단위 aicd가 있어 system 설치를 중단합니다.".to_string()];
+    if let Some(pid) = holder {
+        lines.push(format!("  실행 중: PID {pid} (lock {})", lock.display()));
+    }
+    if user_unit_active {
+        lines.push("  활성 유닛: systemctl --user aicd.service".to_string());
+    }
+    lines.push("  먼저 정리하세요:".to_string());
+    if user_unit_active {
+        lines.push("    systemctl --user disable --now aicd".to_string());
+    }
+    if holder.is_some() {
+        lines.push("    aic daemon stop".to_string());
+    }
+    Some(lines.join("\n"))
+}
+
 /// Linux systemd **system** unit 경로. root로 설치할 때 쓴다.
 pub fn linux_system_unit_path() -> PathBuf {
     PathBuf::from("/etc/systemd/system").join(SYSTEMD_UNIT)
@@ -282,6 +349,13 @@ pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> 
             "--system 설치는 root 권한이 필요합니다 (sudo aic daemon install --system)"
         ));
     }
+    if system {
+        // system 유닛과 user 유닛이 같이 떠 있으면 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은
+        // 영원히 실패한다. systemd가 재시작을 반복해 로그만 쌓이므로, 설치 단계에서 막는다.
+        if let Some(conflict) = conflicting_user_daemon() {
+            return Err(anyhow!("{conflict}"));
+        }
+    }
     if platform == Platform::Unsupported {
         return Err(anyhow!(
             "지원하지 않는 OS: {} (macOS / Linux만 지원)",
@@ -289,7 +363,11 @@ pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> 
         ));
     }
 
-    let aicd = resolve_aicd_path()?;
+    let aicd = if system {
+        resolve_system_aicd_path()?
+    } else {
+        resolve_aicd_path()?
+    };
     let logs = log_dir()?;
     std::fs::create_dir_all(&logs)
         .with_context(|| format!("로그 디렉토리 생성 실패: {}", logs.display()))?;
