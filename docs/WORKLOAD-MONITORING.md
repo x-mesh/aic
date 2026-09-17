@@ -52,6 +52,18 @@ aic workload monitor "$WORKLOAD_ID" --json
 
 JVM, Kafka, and Consul are discovery-only adapters. AIC does not create history samples for these adapters.
 
+### Executable evidence and privileges
+
+On Linux, discovery reads the executable path from `/proc/<pid>/exe`. This read requires ptrace access.
+
+If AIC runs as a non-root user, it cannot read that path for a process of a different user. Discovery then uses argv[0] from the command line.
+
+AIC accepts argv[0] only when the value is an absolute path to an existing file. A process can set argv[0], so this evidence is weaker than the kernel path.
+
+If no executable path resolves, the candidate gets the `executable_unavailable` ambiguity. AIC refuses to enable an ambiguous candidate.
+
+To collect the strongest evidence, run discovery as root or as the owner of the service process.
+
 ## Adapter contract
 
 Thirteen adapters support metric collection. Five adapters require an explicit connection before enablement.

@@ -44,8 +44,6 @@ const CONTAINER_ID_MIN_HEX: usize = 12;
 const CONTAINER_ID_MAX_HEX: usize = 64;
 const CONTAINER_ID_PREFIX: &str = "container";
 const CONTAINERIZED_WORKLOAD_AMBIGUITY: &str = "containerized_workload";
-#[cfg(any(target_os = "linux", test))]
-const ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY: &str = "isolation_evidence_unavailable";
 const MAX_SUMMARY_BYTES: usize = 512;
 const MAX_RELATIONSHIP_PROPOSALS: usize = 32;
 const DRIVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -164,11 +162,7 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .filter(|(pid, _)| pid.as_u32() != scanner_pid)
         .map(|(pid, process)| {
             let pid = pid.as_u32();
-            let exe = process.exe().map(|p| p.to_string_lossy().to_string());
             let mut ambiguity = Vec::new();
-            if exe.is_none() {
-                ambiguity.push("executable_unavailable".to_string());
-            }
             let mut cmd = process
                 .cmd()
                 .iter()
@@ -181,6 +175,13 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
             if cmd.is_empty() {
                 cmd.push(process.name().to_string_lossy().to_string());
             }
+            let exe = process
+                .exe()
+                .map(|p| p.to_string_lossy().to_string())
+                .or_else(|| executable_from_argv0(&cmd));
+            if exe.is_none() {
+                ambiguity.push("executable_unavailable".to_string());
+            }
             let cgroup = read_cgroup_text(pid, &mut ambiguity);
             let systemd_unit = cgroup.as_deref().and_then(systemd_unit_from_cgroup);
             let process_namespaces = read_namespace_ids(pid);
@@ -189,12 +190,6 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
                 own_namespaces,
                 process_namespaces,
             );
-            #[cfg(target_os = "linux")]
-            if isolation_evidence_ambiguity(container.as_ref(), own_namespaces, process_namespaces)
-                .is_some()
-            {
-                ambiguity.push(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY.to_string());
-            }
             ProcessRow {
                 pid,
                 start_time: process.start_time(),
@@ -297,7 +292,7 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
     DiscoveryReport {
         schema_version: WORKLOAD_SCHEMA_VERSION,
         evidence_coverage:
-            "process_name, executable, bounded_command, pid, start_time, linux_cgroup, linux_container_cgroup, linux_pid_namespace, linux_mount_namespace".to_string(),
+            "process_name, executable, cmdline_argv0, bounded_command, pid, start_time, linux_cgroup, linux_container_cgroup, linux_pid_namespace, linux_mount_namespace".to_string(),
         candidates,
     }
 }
@@ -799,6 +794,14 @@ fn read_cgroup_text(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
     }
 }
 
+/// 비루트는 다른 사용자 프로세스의 `/proc/<pid>/exe`를 읽지 못한다. argv[0]은 프로세스가
+/// 바꿀 수 있으므로, 절대 경로이면서 실재하는 파일일 때만 대체 증거로 받는다.
+fn executable_from_argv0(cmd: &[String]) -> Option<String> {
+    let argv0 = cmd.first()?;
+    let path = std::path::Path::new(argv0);
+    (path.is_absolute() && path.is_file()).then(|| argv0.clone())
+}
+
 fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let unit = line.rsplit('/').next()?.trim();
@@ -882,26 +885,6 @@ fn container_evidence(
                 }
             })
         })
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn isolation_evidence_ambiguity(
-    container: Option<&ContainerEvidence>,
-    own: NamespaceIds,
-    process: NamespaceIds,
-) -> Option<&'static str> {
-    if container.is_some() {
-        return None;
-    }
-    let same_pid_namespace = own
-        .pid
-        .zip(process.pid)
-        .is_some_and(|(own, process)| own == process);
-    let same_root = own
-        .root
-        .zip(process.root)
-        .is_some_and(|(own, process)| own == process);
-    (!same_pid_namespace || !same_root).then_some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
 }
 
 fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
@@ -1798,15 +1781,47 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_isolation_evidence_stays_fail_closed() {
-        let own = NamespaceIds::default();
-        let process = NamespaceIds::default();
-        let container = container_evidence(None, own, process);
-        assert!(container.is_none());
+    fn argv0_replaces_an_unreadable_executable_only_when_it_resolves() {
+        let existing = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         assert_eq!(
-            isolation_evidence_ambiguity(container.as_ref(), own, process),
-            Some(ISOLATION_EVIDENCE_UNAVAILABLE_AMBIGUITY)
+            executable_from_argv0(std::slice::from_ref(&existing)),
+            Some(existing.clone())
         );
+        assert_eq!(executable_from_argv0(&[]), None);
+        assert_eq!(executable_from_argv0(&["redis-server".to_string()]), None);
+        assert_eq!(
+            executable_from_argv0(&["/nonexistent/redis-server".to_string()]),
+            None
+        );
+        let directory = std::path::Path::new(&existing)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(executable_from_argv0(&[directory]), None);
+    }
+
+    #[test]
+    fn unreadable_namespaces_leave_the_cgroup_verdict_intact() {
+        // 비루트는 다른 사용자 프로세스의 /proc/<pid>/ns/*와 /proc/<pid>/root를 읽지 못한다.
+        let own = NamespaceIds {
+            pid: Some(1),
+            mnt: Some(2),
+            root: Some(FileIdentity {
+                device: 1,
+                inode: 1,
+            }),
+        };
+        let unreadable = NamespaceIds::default();
+        assert!(container_evidence(None, own, unreadable).is_none());
+        let id = "0123456789abcdef0123456789abcdef";
+        let marker = container_marker_from_cgroup(&format!("0::/system.slice/docker-{id}.scope"));
+        let evidence = container_evidence(marker, own, unreadable).unwrap();
+        assert_eq!(evidence.runtime, ContainerRuntime::Docker);
+        assert_eq!(evidence.key, id);
     }
 
     #[test]

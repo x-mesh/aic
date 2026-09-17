@@ -393,6 +393,8 @@ Use this lifecycle:
 
 The daemon reads saved definitions. It does not discover new processes automatically.
 
+A non-root run cannot read the executable path of another user's process. Discovery falls back to argv[0] when that value is an absolute path to an existing file. See [Workload monitor operations](docs/WORKLOAD-MONITORING.md).
+
 A running daemon loads a new definition on the next collection cycle. This delay can take 60 seconds.
 
 PostgreSQL, MySQL or MariaDB, MongoDB, Nginx, and HAProxy require explicit connection options.
