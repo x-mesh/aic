@@ -4,6 +4,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `install.sh`의 기본 설치 경로가 실행 사용자에 따라 갈린다. root면 `/usr/local/bin`, 그 외에는 `~/.local/bin`이다. 이전에는 비root 설치도 sudo로 `/usr/local/bin`에 깔려 binary가 root 소유로 남았고, 그러면 `aic update`와 자동 업데이트가 sudo를 요구하는데 aicd에는 TTY가 없어 교체가 계속 실패했다.
+- `AIC_INSTALL_DIR`로 지정한 경로에 쓰기 권한이 없으면 sudo로 설치한다. 이전에는 기본 경로에만 sudo를 적용해서, 명시한 경로가 조용히 `~/.local/bin`으로 대체됐다.
+
 ## [0.42.2] - 2026-09-18
 
 ### Fixed

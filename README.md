@@ -123,8 +123,13 @@ curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
 
 Detects OS/arch (`linux`/`darwin` × `amd64`/`arm64`), downloads the
 matching release archive, verifies its SHA-256 against the published
-`checksums.txt`, and installs `aic` + `aic-session` + `aicd` to
-`/usr/local/bin` (with sudo fallback) or `~/.local/bin`.
+`checksums.txt`, and installs `aic` + `aic-session` + `aicd`.
+
+The install directory depends on the user. If you run the installer as
+root, it installs to `/usr/local/bin`. Otherwise it installs to
+`~/.local/bin`. A user install must stay writable by that user, because
+`aic update` and the self-update task replace the binaries in place.
+`aicd` has no terminal and cannot answer a sudo prompt.
 
 Override targets:
 
@@ -202,7 +207,7 @@ aic update --force     # reinstall even if already on the latest version
 | Install source | Action |
 |---|---|
 | Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | forwards to `brew upgrade x-mesh/tap/aic` |
-| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | downloads + verifies sha256 + atomic-replaces all 3 binaries (sudo fallback for `/usr/local/bin`) |
+| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | downloads + verifies sha256 + atomic-replaces all 3 binaries (sudo only when the target directory is not writable) |
 | `cargo install` (`~/.cargo/bin`) | refuses self-replace, prints the equivalent `cargo install` command |
 
 After upgrading the binaries on disk, restart `aicd` to pick up the new

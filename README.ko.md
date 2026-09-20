@@ -109,8 +109,12 @@ curl -fsSL https://raw.githubusercontent.com/x-mesh/aic/main/install.sh | sh
 
 OS/아키텍처(`linux`/`darwin` × `amd64`/`arm64`)를 감지해서 맞는 release
 archive를 받고, `checksums.txt`로 SHA-256을 검증한 다음 `aic` +
-`aic-session` + `aicd` 셋을 `/usr/local/bin`(쓰기 권한 없으면 sudo) 또는
-`~/.local/bin`에 설치합니다.
+`aic-session` + `aicd` 셋을 설치합니다.
+
+설치 경로는 실행 사용자에 따라 갈립니다. root로 실행하면 `/usr/local/bin`,
+그 외에는 `~/.local/bin`입니다. 사용자 설치가 쓰기 가능한 경로에 있어야
+`aic update`와 자동 업데이트가 binary를 교체할 수 있습니다. aicd에는 TTY가
+없어 sudo 비밀번호를 입력할 수 없습니다.
 
 옵션:
 
@@ -188,7 +192,7 @@ aic update --force     # 같은 버전이어도 강제 재설치
 | 설치 출처 | 동작 |
 |---|---|
 | Homebrew (`/opt/homebrew`, `/usr/local/Cellar`, linuxbrew) | `brew upgrade x-mesh/tap/aic`로 위임 |
-| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | release archive 다운 + sha256 검증 + 세 binary atomic 교체 (`/usr/local/bin`은 필요 시 sudo) |
+| Manual / `install.sh` (`/usr/local/bin`, `~/.local/bin`) | release archive 다운 + sha256 검증 + 세 binary atomic 교체 (쓰기 권한이 없는 경로만 sudo) |
 | `cargo install` (`~/.cargo/bin`) | 자동 교체 거부, 동일 동작의 `cargo install` 명령 안내 |
 
 디스크의 binary를 교체한 뒤 새 버전을 적용하려면 `aicd`를 재시작하세요:

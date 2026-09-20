@@ -6,7 +6,7 @@
 #
 # Env overrides:
 #   AIC_VERSION=v0.3.0       특정 버전 고정 (default: latest)
-#   AIC_INSTALL_DIR=/path    설치 경로 (default: /usr/local/bin → fallback ~/.local/bin)
+#   AIC_INSTALL_DIR=/path    설치 경로 (default: root면 /usr/local/bin, 아니면 ~/.local/bin)
 #   AIC_SKIP_DAEMON=1        aicd 자동 등록 생략 (default: 등록)
 #
 # RCA one-click enrollment:
@@ -106,7 +106,14 @@ fi
 tar -xzf "$tmp/$asset" -C "$tmp" || err "압축 해제 실패"
 
 # --- install ----------------------------------------------------------------
-default_dir=/usr/local/bin
+# 비root 설치가 /usr/local/bin으로 가면 binary가 root 소유로 남아 셀프업데이트가 sudo를
+# 요구한다. aicd에는 TTY가 없어 그 sudo는 반드시 실패하므로, 자동 업데이트가 조용히 멈춘다.
+# root 설치(= Linux system 서비스 배포)만 공용 경로를 쓴다.
+if [ "$(id -u)" = "0" ]; then
+  default_dir=/usr/local/bin
+else
+  default_dir="$HOME/.local/bin"
+fi
 target_dir=${AIC_INSTALL_DIR:-$default_dir}
 
 install_one() {
@@ -115,7 +122,7 @@ install_one() {
   bin=$(basename "$src")
   if [ -w "$dst_dir" ]; then
     install -m 0755 "$src" "$dst_dir/$bin"
-  elif [ "$dst_dir" = "$default_dir" ] && command -v sudo >/dev/null 2>&1; then
+  elif command -v sudo >/dev/null 2>&1; then
     sudo install -m 0755 "$src" "$dst_dir/$bin"
   else
     return 1
@@ -132,8 +139,8 @@ install_all_to() {
   done
 }
 
-if [ "$target_dir" = "$default_dir" ] && [ ! -w "$default_dir" ] && command -v sudo >/dev/null 2>&1; then
-  info "${default_dir}에 쓰기 권한 없음 — sudo로 설치"
+if [ ! -w "$target_dir" ] && command -v sudo >/dev/null 2>&1; then
+  info "${target_dir}에 쓰기 권한 없음 — sudo로 설치"
 fi
 
 if ! install_all_to "$target_dir"; then
