@@ -32,8 +32,11 @@ ai:
             - credentials.json
         trailer: false
         audit: false
-ship:
-    version_files: [aic-common/Cargo.toml, aic-server/Cargo.toml, aic-client/Cargo.toml]
+# ship 섹션은 의도적으로 비워 둔다. 이 저장소는 `git-kit ship`으로 릴리스하지 않는다.
+# 릴리스 커밋은 Cargo.toml 3개 외에 Cargo.lock과 fuzz/Cargo.lock까지 함께 올려야 하는데
+# (CI의 fuzz job이 --locked로 검증한다), ship의 version_files는 단일 version 줄만 바꾸므로
+# lockfile을 표현하지 못한다. v0.42.3에서 이 불일치로 main/develop CI가 깨졌다.
+# 절차는 RELEASING.md, 버전 bump는 `make bump-version` / `make tag`를 쓴다.
 
 # policies: (commented-out, opt-in)
 #   secret_patterns:
