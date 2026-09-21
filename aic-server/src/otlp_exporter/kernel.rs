@@ -27,6 +27,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::live_config::{self, LiveExporterConfig};
+
 use super::backoff::Backoff;
 use super::encode;
 use super::host_metrics::{HostSample, MetricPoint, MetricValue, ResourceAttrs};
@@ -52,6 +54,9 @@ pub struct KernelConfig {
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. 다른 exporter task와 공유한다.
     pub health: Arc<super::ExporterHealth>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. `Some`이면 매 tick 여기서 주기와 토큰을 꺼내
+    /// 쓰고, 위의 같은 이름 필드들은 기동 시 값(폴백)으로만 남는다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// host가 loopback인지 강제한다 — 커널 evidence를 원격에서 당겨오지 않는다.
@@ -326,10 +331,25 @@ async fn serve_kernel_with(
     // 첫 tick을 지났는지. OOM 기준선 판정에 쓴다(카운터는 prev_counters로 같은 판정을 한다).
     let mut first_seen = false;
 
+    // 재적용 알림 구독. 주기가 길면 다음 tick까지 기다렸다 바뀌는 것이 설정을 고친 사람에게는
+    // "반영 안 됨"과 같아 보이므로, 변경이 들어오면 즉시 깨어나 주기를 다시 잡는다.
+    let mut cfg_changed = cfg.live.as_ref().map(|l| l.subscribe());
+
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // 이 tick이 쓸 설정을 한 번 고정한다. 라이브 스냅샷이 없으면 기동 시 값 그대로다.
+        let snap = cfg.live.as_ref().map(|l| l.get());
+        let token = live_config::effective_token(cfg.live.as_ref(), &cfg.token);
+        if let Some(s) = &snap {
+            live_config::retune_ticker(
+                &mut ticker,
+                live_config::live_interval(s.kernel_interval_secs),
+                "kernel",
+            );
+        }
+
         tokio::select! {
             _ = ticker.tick() => {
                 let bundle = match collect_once(client, &collect_url).await {
@@ -388,6 +408,7 @@ async fn serve_kernel_with(
                     delivered = push_oom_events(
                         client,
                         &cfg,
+                        token.as_deref(),
                         &logs_url,
                         &oom_events,
                         &host_name,
@@ -449,7 +470,7 @@ async fn serve_kernel_with(
                     }
                     continue;
                 }
-                match super::push(client, &url, cfg.token.as_deref(), body.clone()).await {
+                match super::push(client, &url, token.as_deref(), body.clone()).await {
                     Ok(()) => {
                         backoff.on_success();
                         cfg.health.record_ok();
@@ -468,6 +489,10 @@ async fn serve_kernel_with(
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+            }
+            _ = live_config::changed(&mut cfg_changed) => {
+                // 루프 상단에서 새 스냅샷을 잡고 주기를 다시 계산한다. 수집을 앞당기지는 않는다.
+                continue;
             }
         }
     }
@@ -488,6 +513,7 @@ async fn serve_kernel_with(
 async fn push_oom_events(
     client: &reqwest::Client,
     cfg: &KernelConfig,
+    token: Option<&str>,
     logs_url: &str,
     events: &[OomEvent],
     host_name: &str,
@@ -544,7 +570,7 @@ async fn push_oom_events(
             }
         };
     }
-    match super::push_logs(client, logs_url, cfg.token.as_deref(), body.clone()).await {
+    match super::push_logs(client, logs_url, token, body.clone()).await {
         Ok(_) => {
             backoff.on_success();
             cfg.health.record_ok();

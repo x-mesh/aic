@@ -27,6 +27,8 @@ use tokio::time::Instant;
 
 use aic_common::{AicdLogsConfig, LogLine};
 
+use crate::live_config::{self, LiveExporterConfig};
+
 use super::super::backoff::Backoff;
 use super::super::logs_proto::{self, ResourceAttrs};
 use super::super::{ExporterHealth, SignalKind, Spool};
@@ -66,6 +68,9 @@ pub struct LogsExporterConfig {
     /// 드롭 사유별 카운터(severity/rate_limit) — `encode.rs`가 `aic.log.dropped`로 노출한다.
     /// 다른 exporter task와 공유해 metrics tick이 최신 값을 읽게 한다.
     pub drop_counters: Arc<DropCounters>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. 토큰 회전을 다른 exporter task와 **같은 tick에**
+    /// 따라가기 위해 들고 있는다 — 여기만 기동 시 토큰에 머물면 회전 직후 app 로그만 401이 난다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// 배치 축적 + flush 상태를 묶는다. `serve_logs`의 select 루프에서 참조를 여러 번 흩뿌리는
@@ -231,7 +236,7 @@ impl LogsFlusher {
         match super::super::push_logs(
             &self.client,
             &self.url,
-            self.cfg.token.as_deref(),
+            live_config::effective_token(self.cfg.live.as_ref(), &self.cfg.token).as_deref(),
             body.clone(),
         )
         .await
@@ -431,6 +436,7 @@ mod tests {
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -494,6 +500,7 @@ mod tests {
                 ..Default::default()
             },
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(2048);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -553,6 +560,7 @@ mod tests {
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -598,6 +606,7 @@ mod tests {
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -643,6 +652,7 @@ mod tests {
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -699,6 +709,7 @@ mod tests {
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -756,6 +767,7 @@ mod tests {
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -806,6 +818,7 @@ mod tests {
             health,
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -844,6 +857,7 @@ mod tests {
             health: health.clone(),
             logs_cfg: aic_common::AicdLogsConfig::default(),
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (_tx, rx) = mpsc::channel(16);
         let (sd_tx, sd_rx) = watch::channel(false);
@@ -926,6 +940,7 @@ mod tests {
             health,
             logs_cfg,
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let drop_counters = cfg.drop_counters.clone();
         let (tx, rx) = mpsc::channel(16);
@@ -1044,6 +1059,7 @@ mod tests {
             health,
             logs_cfg,
             drop_counters: Arc::new(DropCounters::new()),
+            live: None,
         };
         let (tx, rx) = mpsc::channel(1024);
         let (sd_tx, sd_rx) = watch::channel(false);

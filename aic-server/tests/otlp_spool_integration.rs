@@ -94,6 +94,7 @@ async fn spool_drains_all_downtime_batches_after_collector_recovers() {
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
+        live: None,
     };
     let handle = tokio::spawn(async move {
         {
@@ -205,6 +206,7 @@ async fn flush_drains_entire_spool_on_request_bypassing_rate_limit() {
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
+        live: None,
     };
     let (flush_tx, flush_rx) = tokio::sync::mpsc::channel::<FlushRequest>(4);
     let handle = tokio::spawn(async move { serve(cfg, sd_rx, flush_rx).await });

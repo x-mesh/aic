@@ -42,6 +42,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::sync::watch;
 
+use crate::live_config::{self, LiveExporterConfig};
+
 use super::backoff::Backoff;
 use super::encode;
 use super::host_metrics::{HostSample, MetricPoint, MetricValue, ResourceAttrs};
@@ -588,6 +590,9 @@ pub struct DockerConfig {
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. 다른 exporter task와 공유해 chat status bar가 한 번에 읽는다.
     pub health: Arc<super::ExporterHealth>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. `Some`이면 매 tick 여기서 주기·토큰·`docker_bin`을
+    /// 꺼내 쓰고, 위의 같은 이름 필드들은 기동 시 값(폴백)으로만 남는다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// docker exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
@@ -671,14 +676,35 @@ async fn serve_docker_with(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut backoff = Backoff::new();
 
+    // 재적용 알림 구독. 변경이 들어오면 즉시 깨어나 주기와 `docker_bin`을 다시 잡는다.
+    let mut cfg_changed = cfg.live.as_ref().map(|l| l.subscribe());
+    // 직전 tick에 쓴 `docker_bin` 설정. 바뀌었는지 보려면 비교 대상이 필요하다.
+    let mut configured_bin = cfg.configured_bin.clone();
+
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // 이 tick이 쓸 설정을 한 번 고정한다. 라이브 스냅샷이 없으면 기동 시 값 그대로다.
+        let snap = cfg.live.as_ref().map(|l| l.get());
+        let token = live_config::effective_token(cfg.live.as_ref(), &cfg.token);
+        if let Some(s) = &snap {
+            live_config::retune_ticker(
+                &mut ticker,
+                live_config::live_interval(s.docker_interval_secs),
+                "docker",
+            );
+            let next_bin = s.docker_bin.as_deref().map(PathBuf::from);
+            if next_bin != configured_bin {
+                configured_bin = next_bin;
+                state.reconfigure();
+            }
+        }
+
         tokio::select! {
             _ = ticker.tick() => {
                 // 아직 못 찾았으면 이번 tick에 다시 찾아본다(위 doc "나중에 설치된 docker").
-                let Some((bin, _announced)) = state.ensure(resolve, cfg.configured_bin.as_deref()) else {
+                let Some((bin, _announced)) = state.ensure(resolve, configured_bin.as_deref()) else {
                     continue;
                 };
                 match capture_docker_df(&bin, cfg.timeout).await {
@@ -718,7 +744,7 @@ async fn serve_docker_with(
                             continue;
                         }
 
-                        match super::push(&client, &url, cfg.token.as_deref(), body.clone()).await {
+                        match super::push(&client, &url, token.as_deref(), body.clone()).await {
                             Ok(()) => {
                                 backoff.on_success();
                                 cfg.health.record_ok();
@@ -758,6 +784,10 @@ async fn serve_docker_with(
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+            }
+            _ = live_config::changed(&mut cfg_changed) => {
+                // 루프 상단에서 새 스냅샷을 잡고 주기와 경로를 다시 계산한다. 캡처를 앞당기지는 않는다.
+                continue;
             }
         }
     }
@@ -881,6 +911,15 @@ impl BinState {
                 None
             }
         }
+    }
+
+    /// config의 `docker_bin`이 바뀌었다 — 캐시한 경로를 버리고 다음 [`BinState::ensure`]가 새
+    /// 우선순위로 다시 찾게 한다. 이게 없으면 경로를 고쳐도 [`BinState::ensure`]가 캐시를 먼저
+    /// 반환해(`self.current`) 옛 실행 파일을 계속 쓴다. 새 경로에 대한 판단은 아직 없으므로
+    /// "나쁘다"던 기록도 함께 지운다 — 남겨두면 새 경로의 첫 실패가 조용히 묻힌다.
+    fn reconfigure(&mut self) {
+        self.current = None;
+        self.announced_bad = Announced::Nothing;
     }
 
     /// 캡처가 성공했다 — 이 경로는 지금 멀쩡하다. "나쁘다"던 기록을 지워, **다음 번 장애는 새로
@@ -2538,6 +2577,7 @@ mod tests {
                 "/definitely/does/not/exist/docker",
             )),
             configured_bin: None,
+            live: None,
             timeout: Duration::from_secs(5),
             spool: spool.clone(),
             health: health.clone(),
@@ -2607,6 +2647,7 @@ mod tests {
             interval: Duration::from_millis(15),
             docker_bin: None, // 기동 시 못 찾았다.
             configured_bin: Some(bin_path.clone()),
+            live: None,
             timeout: Duration::from_secs(5),
             spool: spool.clone(),
             health: health.clone(),
@@ -3093,6 +3134,7 @@ mod tests {
             interval: Duration::from_millis(15),
             docker_bin: Some(path_a.clone()),
             configured_bin: None,
+            live: None,
             timeout: Duration::from_secs(5),
             spool: spool.clone(),
             health: health.clone(),
@@ -3229,6 +3271,7 @@ mod tests {
             interval: Duration::from_millis(5),
             docker_bin: Some(bin.clone()),
             configured_bin: None,
+            live: None,
             timeout: Duration::from_secs(5),
             spool: spool.clone(),
             health,

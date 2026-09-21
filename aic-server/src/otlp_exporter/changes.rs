@@ -21,6 +21,8 @@ use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::sync::watch;
 
+use crate::live_config::{self, LiveExporterConfig};
+
 use super::backoff::Backoff;
 use super::logs_proto::{self, ChangeEntry, ResourceAttrs};
 use super::{SignalKind, Spool};
@@ -56,6 +58,9 @@ pub struct ChangesConfig {
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. exporter task들이 공유해 chat status bar가 한 번에 읽는다.
     pub health: Arc<super::ExporterHealth>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. `Some`이면 매 tick 여기서 주기와 토큰을 꺼내
+    /// 쓰고, 위의 같은 이름 필드들은 기동 시 값(폴백)으로만 남는다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// 한 프로세스의 관측값 — diff에 필요한 최소치만.
@@ -280,10 +285,25 @@ pub async fn serve_changes(
     let host_id = super::host_metrics::host_id(&host_name);
     let os_type = std::env::consts::OS.to_string();
 
+    // 재적용 알림 구독. 주기가 길면 다음 tick까지 기다렸다 바뀌는 것이 설정을 고친 사람에게는
+    // "반영 안 됨"과 같아 보이므로, 변경이 들어오면 즉시 깨어나 주기를 다시 잡는다.
+    let mut cfg_changed = cfg.live.as_ref().map(|l| l.subscribe());
+
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // 이 tick이 쓸 설정을 한 번 고정한다. 라이브 스냅샷이 없으면 기동 시 값 그대로다.
+        let snap = cfg.live.as_ref().map(|l| l.get());
+        let token = live_config::effective_token(cfg.live.as_ref(), &cfg.token);
+        if let Some(s) = &snap {
+            live_config::retune_ticker(
+                &mut ticker,
+                live_config::live_interval(s.changes_interval_secs),
+                "changes",
+            );
+        }
+
         tokio::select! {
             _ = ticker.tick() => {
                 // sysinfo의 전체 프로세스 refresh는 blocking이다 — task 루프를 막지 않도록
@@ -352,7 +372,7 @@ pub async fn serve_changes(
                     continue;
                 }
 
-                match super::push_logs(&client, &url, cfg.token.as_deref(), body.clone()).await {
+                match super::push_logs(&client, &url, token.as_deref(), body.clone()).await {
                     Ok(_) => {
                         backoff.on_success();
                         cfg.health.record_ok();
@@ -371,6 +391,10 @@ pub async fn serve_changes(
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+            }
+            _ = live_config::changed(&mut cfg_changed) => {
+                // 루프 상단에서 새 스냅샷을 잡고 주기를 다시 계산한다. 수집을 앞당기지는 않는다.
+                continue;
             }
         }
     }

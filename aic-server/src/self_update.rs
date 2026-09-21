@@ -324,6 +324,7 @@ pub fn spawn(
     token: Option<String>,
     interval: Duration,
     health: std::sync::Arc<SelfUpdateHealth>,
+    live: Option<std::sync::Arc<crate::live_config::LiveExporterConfig>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -341,24 +342,60 @@ pub fn spawn(
                 return;
             }
         };
-        let period = jittered(interval);
+        let mut cfg_changed = live.as_ref().map(|l| l.subscribe());
+        let mut period = jittered(interval);
         tracing::info!(
             endpoint = %endpoint,
             period_secs = period.as_secs(),
             current = %current,
             "셀프업데이트 활성 — 중앙이 선언한 목표 버전을 주기적으로 확인한다"
         );
+        // 다음 확인 시각의 기준점 = 마지막 확인(첫 회는 기동) 시각. 주기가 바뀌면 여기에 새 주기를
+        // 더해 다시 계산한다 — 변경 시점 기준으로 다시 재면 설정을 연달아 고치는 동안 확인이
+        // 영원히 밀린다. 줄인 주기가 이미 지났으면 곧바로 확인한다.
+        let mut anchor = tokio::time::Instant::now();
         loop {
             // 뜨자마자 받지 않는다. 재시작 루프에 빠진 호스트가 매 기동마다
             // 중앙을 두드리는 것을 막는다.
             tokio::select! {
-                _ = tokio::time::sleep(period) => {}
+                _ = tokio::time::sleep_until(anchor + period) => {}
+                _ = crate::live_config::changed(&mut cfg_changed) => {
+                    // 주기만 다시 잡고 계속 기다린다 — 설정을 고쳤다고 해서 binary 교체 확인을
+                    // 앞당기지는 않는다.
+                    if let Some(l) = &live {
+                        let configured =
+                            crate::live_config::live_interval(l.get().self_update_interval_secs);
+                        let next = jittered(configured);
+                        if next != period {
+                            tracing::info!(
+                                from_secs = period.as_secs(),
+                                to_secs = next.as_secs(),
+                                "셀프업데이트 주기 변경 적용"
+                            );
+                            period = next;
+                            // `aic status`가 읽는 값도 같이 옮긴다 — 안 그러면 실제 주기와 보고가
+                            // 갈려서 "반영됐나"를 확인할 방법이 사라진다. jitter는 호스트마다 다른
+                            // 값이라 설정값 그대로 싣는다.
+                            health.set_configured(true, configured);
+                        }
+                    }
+                    continue;
+                }
                 _ = shutdown.changed() => {
                     tracing::debug!("셀프업데이트 종료");
                     return;
                 }
             }
-            tick(&client, &endpoint, token.as_deref(), &current, &health).await;
+            let request_token = crate::live_config::effective_token(live.as_ref(), &token);
+            tick(
+                &client,
+                &endpoint,
+                request_token.as_deref(),
+                &current,
+                &health,
+            )
+            .await;
+            anchor = tokio::time::Instant::now();
         }
     })
 }

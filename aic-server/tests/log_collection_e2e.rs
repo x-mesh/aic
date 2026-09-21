@@ -121,6 +121,7 @@ fn logs_exporter_config(
         health,
         logs_cfg,
         drop_counters,
+        live: None,
     }
 }
 
@@ -346,6 +347,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         health: health.clone(),
         logs_cfg,
         drop_counters: Arc::clone(&drop_counters),
+        live: None,
     };
     let (sd_tx, sd_rx) = watch::channel(false);
     let logs_handle = tokio::spawn(serve_logs(logs_cfg_full, line_rx, sd_rx));
@@ -364,6 +366,7 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
+        live: None,
     };
     let (msd_tx, msd_rx) = watch::channel(false);
     let metrics_handle = tokio::spawn(async move {

@@ -628,6 +628,12 @@ Use registered backends from `aic chat`:
 
 Natural-language requests can call `prometheus_query`, `loki_query`, or `es_search`.
 
+### Live reload
+
+Some `[aicd.exporter]` settings apply without a daemon restart. Read
+[Config live reload](docs/CONFIG-LIVE-RELOAD.md) for the list, the reload timing, and the
+settings that still need a restart.
+
 ### MCP servers
 
 `aic chat` can call tools from [Model Context Protocol](https://modelcontextprotocol.io) servers.

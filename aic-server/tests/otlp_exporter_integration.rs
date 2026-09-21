@@ -93,6 +93,7 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
+        live: None,
     };
     let handle = tokio::spawn(async move {
         {
@@ -164,6 +165,7 @@ async fn exporter_without_token_sends_no_auth_header() {
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
+        live: None,
     };
     let handle = tokio::spawn(async move {
         {
@@ -222,6 +224,7 @@ async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
         // OTLP 인벤토리 전송은 꺼 둔다 — 링은 이 플래그와 무관하게 동작해야 한다.
         process_inventory_enabled: false,
         process_inventory_store: Some(store.clone()),
+        live: None,
     };
     let handle = tokio::spawn(async move {
         let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
@@ -271,4 +274,172 @@ async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
         "observed_at이 0이면 chat이 `-`를 그린다"
     );
     assert!(!found.name.is_empty(), "이름이 비면 chat에 빈 칸이 나간다");
+}
+
+/// 라이브 설정 재적용이 도달하는지 — 기동 시 값이 아니라 **지금 스냅샷**의 토큰으로 나가야 한다.
+///
+/// 토큰 회전은 데몬 재시작 없이 되어야 하는 대표 사례다. 재시작하면 그 사이 수집이 비고, 그
+/// 공백은 spool이 메워주지 못한다(꺼져 있던 동안은 수집 자체를 안 한다).
+#[tokio::test]
+async fn a_rotated_token_reaches_the_collector_without_a_restart() {
+    // `LiveExporterConfig`는 env 토큰을 config보다 우선한다 — 그 환경에서는 이 검증 자체가 성립하지
+    // 않으므로(의도된 우선순위) 돌리지 않는다.
+    if std::env::var("AIC_EXPORTER_TOKEN").is_ok() {
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<Captured>(32);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let endpoint = format!("http://{addr}");
+    let base = aic_common::AicdExporterConfig {
+        enabled: true,
+        endpoint: endpoint.clone(),
+        token: Some("first-token".to_string()),
+        // 라이브 스냅샷의 하한이 1초다 — `ExporterConfig::interval`은 첫 tick 전에 이 값으로 덮인다.
+        interval_secs: 1,
+        process_enabled: false,
+        process_inventory_enabled: false,
+        ..aic_common::AicdExporterConfig::default()
+    };
+    let live = Arc::new(aic_server::live_config::LiveExporterConfig::new(
+        base.clone(),
+    ));
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(endpoint.clone(), spool.clone()));
+    let cfg = ExporterConfig {
+        endpoint,
+        token: Some("first-token".to_string()),
+        interval: Duration::from_secs(1),
+        service_version: "9.9.9".to_string(),
+        spool,
+        drain_batch_limit: 20,
+        spool_max_age: None,
+        health,
+        drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
+        process_inventory_enabled: false,
+        process_inventory_store: None,
+        live: Some(live.clone()),
+    };
+    let handle = tokio::spawn(async move {
+        let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+        serve(cfg, sd_rx, frx).await
+    });
+
+    let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("collector가 첫 요청을 받지 못함")
+        .expect("채널이 닫힘");
+    assert_eq!(first.authorization.as_deref(), Some("Bearer first-token"));
+
+    live.store(aic_common::AicdExporterConfig {
+        token: Some("second-token".to_string()),
+        ..base.clone()
+    });
+
+    // 회전 직전에 시작된 tick은 아직 옛 토큰을 들고 있다 — 새 토큰이 나타나는지를 본다.
+    let mut rotated = false;
+    for _ in 0..5 {
+        let c = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("회전 후 요청이 오지 않음")
+            .expect("채널이 닫힘");
+        if c.authorization.as_deref() == Some("Bearer second-token") {
+            rotated = true;
+            break;
+        }
+    }
+    assert!(rotated, "토큰을 회전했는데 옛 토큰으로만 나갔다");
+
+    sd_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// 라이브 주기 변경이 실제로 ticker에 걸리는지 — 주기를 크게 늘리면 push가 멎어야 한다.
+///
+/// 이게 없으면 "스냅샷은 바뀌었지만 ticker는 기동 값 그대로"인 상태를 잡지 못한다.
+#[tokio::test]
+async fn raising_the_interval_stops_the_pushes() {
+    if std::env::var("AIC_EXPORTER_TOKEN").is_ok() {
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<Captured>(64);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let endpoint = format!("http://{addr}");
+    let base = aic_common::AicdExporterConfig {
+        enabled: true,
+        endpoint: endpoint.clone(),
+        token: None,
+        interval_secs: 1,
+        process_enabled: false,
+        process_inventory_enabled: false,
+        ..aic_common::AicdExporterConfig::default()
+    };
+    let live = Arc::new(aic_server::live_config::LiveExporterConfig::new(
+        base.clone(),
+    ));
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(endpoint.clone(), spool.clone()));
+    let cfg = ExporterConfig {
+        endpoint,
+        token: None,
+        interval: Duration::from_secs(1),
+        service_version: "9.9.9".to_string(),
+        spool,
+        drain_batch_limit: 20,
+        spool_max_age: None,
+        health,
+        drop_counters: Arc::new(DropCounters::new()),
+        process_enabled: false,
+        process_inventory_enabled: false,
+        process_inventory_store: None,
+        live: Some(live.clone()),
+    };
+    let handle = tokio::spawn(async move {
+        let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+        serve(cfg, sd_rx, frx).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("collector가 첫 요청을 받지 못함")
+        .expect("채널이 닫힘");
+
+    live.store(aic_common::AicdExporterConfig {
+        interval_secs: 3600,
+        ..base.clone()
+    });
+
+    // 변경 시점에 이미 시작된 tick 하나는 끝까지 간다 — 그 뒤로는 조용해야 한다.
+    // 주기가 그대로였다면 3초 동안 두세 번은 더 왔다.
+    let mut after = 0;
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    while let Ok(Some(_)) = tokio::time::timeout_at(until, rx.recv()).await {
+        after += 1;
+    }
+    assert!(after <= 1, "주기를 3600초로 올렸는데 {after}번 더 push했다");
+
+    sd_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }

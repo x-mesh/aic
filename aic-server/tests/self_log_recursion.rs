@@ -90,6 +90,7 @@ async fn self_log_does_not_recurse_under_push_failure() {
         health,
         logs_cfg: aic_common::AicdLogsConfig::default(),
         drop_counters: Arc::new(aic_server::otlp_exporter::logs::DropCounters::new()),
+        live: None,
     };
     let (sd_tx, sd_rx) = watch::channel(false);
     let handle = tokio::spawn(serve_logs(cfg, log_rx, sd_rx));

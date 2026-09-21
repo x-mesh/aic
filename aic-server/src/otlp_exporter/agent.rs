@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use tokio::sync::{broadcast, watch};
 
+use crate::live_config::{self, LiveExporterConfig};
+
 use super::backoff::Backoff;
 use super::logs_proto::{self, ResourceAttrs};
 use super::{SignalKind, Spool};
@@ -44,6 +46,9 @@ pub struct AgentConfig {
     pub spool: Arc<Spool>,
     /// 전송 건강 카운터. 네 exporter task가 공유해 chat status bar가 한 번에 읽는다.
     pub health: Arc<super::ExporterHealth>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. `Some`이면 매 tick 여기서 주기와 토큰을 꺼내
+    /// 쓰고, 위의 같은 이름 필드들은 기동 시 값(폴백)으로만 남는다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// agent exporter를 실행한다. `shutdown`이 true가 되면 graceful하게 종료한다.
@@ -125,7 +130,7 @@ pub async fn serve_agent(
                             continue;
                         }
 
-                        match super::push_logs(&client, &url, cfg.token.as_deref(), body.clone()).await {
+                        match super::push_logs(&client, &url, live_config::effective_token(cfg.live.as_ref(), &cfg.token).as_deref(), body.clone()).await {
                             Ok(_) => {
                                 backoff.on_success();
                                 cfg.health.record_ok();

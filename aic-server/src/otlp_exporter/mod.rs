@@ -66,6 +66,7 @@ pub use kernel::{ensure_loopback, serve_kernel, KernelConfig};
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
 pub use spool::{DropReason, SignalKind, Spool};
 
+use crate::live_config::{self, LiveExporterConfig};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -112,6 +113,10 @@ pub struct ExporterConfig {
     /// 남길지는 별개 판단이다. OTLP를 안 켰다고 로컬 관측까지 사라지면 chat이 쓸모없어지므로,
     /// 링은 이 값이 `Some`이기만 하면 채운다. 둘 다 꺼져 있으면 diff 자체를 건너뛴다.
     pub process_inventory_store: Option<Arc<crate::process_inventory_store::ProcessInventoryStore>>,
+    /// 실행 중 다시 읽는 `[aicd.exporter]` 스냅샷. `Some`이면 매 tick 여기서 주기·토큰·드레인
+    /// 한도·프로세스 플래그를 꺼내 쓰고, 위의 같은 이름 필드들은 기동 시 값(폴백)으로만 남는다.
+    /// `endpoint`·`spool`처럼 자원을 다시 만들어야 하는 값은 여기서도 재적용되지 않는다.
+    pub live: Option<Arc<LiveExporterConfig>>,
 }
 
 /// HTTP 요청 전체 타임아웃 — hung collector가 exporter task를 무한 대기시키지 않게 한다.
@@ -184,8 +189,9 @@ pub async fn serve(
     // 직전 tick에 collector가 process 레코드를 버렸는지 — 전이(0↔>0)에서만 로그해 상시 조건이
     // 매 tick warn을 뿜지 않게 한다(지속 신호는 aic.log.dropped `collector_dropped` 게이지가 든다).
     let mut process_dropped_last = false;
-    // 프로세스 인벤토리 CDC의 diff 상태(이전 tick 인벤토리). tick 간 delta를 계산한다 — config가
-    // 꺼져 있으면 diff를 아예 돌리지 않으므로 prev가 낡을 일이 없다(config는 실행 중 불변).
+    // 프로세스 인벤토리 CDC의 diff 상태(이전 tick 인벤토리). tick 간 delta를 계산한다.
+    // `process_inventory_enabled`를 실행 중에 꺼도 prev가 낡지 않는다 — 링 store가 있는 한 diff는
+    // 계속 돌기 때문이다(아래 게이트 참고). exporter가 뜬 경우 store는 항상 `Some`이다.
     let mut inv_tracker =
         process_inventory::InventoryTracker::new(PROCESS_INVENTORY_KEYFRAME_TICKS);
     let mut inv_dropped_last = false;
@@ -194,10 +200,38 @@ pub async fn serve(
     // 직전 스캔이 없어 `None`이고, 그때는 attr을 생략해 수신측이 스캔 시각 폴백을 쓴다.
     let mut prev_inventory_scan_unix: Option<u64> = None;
 
+    // 재적용 알림 구독. 주기가 길면(기본 60초) 다음 tick까지 기다렸다 바뀌는 것이 설정을 고친
+    // 사람에게는 "반영 안 됨"과 같아 보이므로, 변경이 들어오면 즉시 깨어나 주기를 다시 잡는다.
+    let mut cfg_changed = cfg.live.as_ref().map(|l| l.subscribe());
+
     loop {
         if *shutdown.borrow() {
             break;
         }
+        // 이 tick이 쓸 설정을 한 번 고정한다 — tick 도중에 값이 갈리면 같은 배치의 앞뒤가 서로
+        // 다른 설정으로 만들어진다. 라이브 스냅샷이 없으면(테스트) 기동 시 값 그대로다.
+        let snap = cfg.live.as_ref().map(|l| l.get());
+        let token = live_config::effective_token(cfg.live.as_ref(), &cfg.token);
+        let process_enabled = snap
+            .as_ref()
+            .map_or(cfg.process_enabled, |s| s.process_enabled);
+        let process_inventory_enabled = snap.as_ref().map_or(cfg.process_inventory_enabled, |s| {
+            s.process_inventory_enabled
+        });
+        let drain_batch_limit = snap
+            .as_ref()
+            .map_or(cfg.drain_batch_limit, |s| s.spool_drain_batch_limit);
+        let spool_max_age = snap.as_ref().map_or(cfg.spool_max_age, |s| {
+            s.spool_max_age_secs.map(Duration::from_secs)
+        });
+        if let Some(s) = &snap {
+            live_config::retune_ticker(
+                &mut ticker,
+                live_config::live_interval(s.interval_secs),
+                "host-metrics",
+            );
+        }
+
         tokio::select! {
             _ = ticker.tick() => {
                 // sysinfo refresh(statvfs 등)는 blocking 가능 → spawn_blocking으로 감싸 task 루프를
@@ -234,7 +268,7 @@ pub async fn serve(
                 // 별도 task로 두 번 열거하지 않는다). process_enabled=false거나 읽을 수 있는 프로세스가
                 // 없으면 None → push/spool 모두 건너뛴다. metrics(/v1/metrics)와 달리 이건
                 // logs(/v1/logs)라 이름/PID 차원을 담는다.
-                let process_body = if cfg.process_enabled && !sample.top_processes.is_empty() {
+                let process_body = if process_enabled && !sample.top_processes.is_empty() {
                     let entries: Vec<logs_proto::ProcessEntry<'_>> = sample
                         .top_processes
                         .iter()
@@ -276,7 +310,7 @@ pub async fn serve(
                 // 하나라도 필요하면 diff를 돌린다(diff는 tick당 해시맵 비교 한 번이라 저렴하다).
                 // 둘 다 꺼져 있으면 tracker를 아예 안 돌려 prev가 낡을 일도 없다.
                 let mut inventory_body = None;
-                if cfg.process_inventory_enabled || cfg.process_inventory_store.is_some() {
+                if process_inventory_enabled || cfg.process_inventory_store.is_some() {
                     let scan_unix = unix_nanos_now() / 1_000_000_000;
                     let changeset = inv_tracker
                         .diff(&sample.process_inventory, host_metrics::enrich_process_owner);
@@ -309,7 +343,7 @@ pub async fn serve(
                                 .collect();
                             store.push_many(changes).await;
                         }
-                        if cfg.process_inventory_enabled {
+                        if process_inventory_enabled {
                             let changes: Vec<logs_proto::InventoryChange<'_>> = changeset
                                 .records
                                 .iter()
@@ -380,7 +414,7 @@ pub async fn serve(
                 // (0) 나이 cap — 드레인 전에 너무 오래된 배치를 네트워크 없이 드롭한다. 낡은 telemetry가
                 // FIFO 머리를 막아 최근 이벤트가 그 뒤에 갇히는 걸 막는다(수천 배치 백로그에서 20/tick
                 // 드레인으론 최근 것이 몇 시간 늦게 나간다). `None`이면 이 단계는 없다(기존 동작).
-                if let Some(max_age) = cfg.spool_max_age {
+                if let Some(max_age) = spool_max_age {
                     // 유실 warn은 `prune_older_than`이 직접 남긴다(rate-limited) — 예전에는 여기
                     // `debug!`가 유일한 흔적이라 기본 로그에서 통째로 사라졌다.
                     cfg.spool.prune_older_than(max_age);
@@ -389,11 +423,11 @@ pub async fn serve(
                 // (1) 드레인 — 밀린 배치를 FIFO로 먼저 흘려보낸다(새 데이터보다 오래된 데이터 우선).
                 let drain_report = drain_spool(
                     &cfg.spool,
-                    cfg.drain_batch_limit,
+                    drain_batch_limit,
                     &client,
                     &url,
                     &logs_endpoint,
-                    cfg.token.as_deref(),
+                    token.as_deref(),
                 )
                 .await;
                 if drain_report.drained > 0 || drain_report.failed {
@@ -421,7 +455,7 @@ pub async fn serve(
                 }
 
                 // (2) 신규 샘플 송신.
-                if let Err(e) = push(&client, &url, cfg.token.as_deref(), body.clone()).await {
+                if let Err(e) = push(&client, &url, token.as_deref(), body.clone()).await {
                     tracing::warn!(error = %e, "OTLP metrics push 실패 — spool에 적재");
                     if let Err(e2) = cfg.spool.append(SignalKind::Metrics, &body) {
                         tracing::warn!(error = %e2, "OTLP metrics spool append 실패 — 이 샘플 유실");
@@ -434,7 +468,7 @@ pub async fn serve(
                 // 같은 tick의 backoff/health에 합산한다(tick_failed). collector 도달 실패면 spool에
                 // 적재해 복구 후 드레인되게 한다(connections/events와 동일 규약, SignalKind::Logs).
                 if let Some(pbody) = process_body {
-                    match push_logs(&client, &logs_endpoint, cfg.token.as_deref(), pbody.clone()).await {
+                    match push_logs(&client, &logs_endpoint, token.as_deref(), pbody.clone()).await {
                         Ok(rejected) => {
                             // collector가 200으로 받았지만 partial_success로 버린 레코드(미지 scope
                             // 등, 예: rca가 aic.process decoder 부재로 전량 드롭). 지속 신호는
@@ -470,7 +504,7 @@ pub async fn serve(
                 // (4) 프로세스 인벤토리 CDC logs 송신(변화가 있을 때만). process top-N과 동일 규약
                 // (독립 성패, tick_failed 합산, 실패 시 SignalKind::Logs로 spool 적재).
                 if let Some(ibody) = inventory_body {
-                    match push_logs(&client, &logs_endpoint, cfg.token.as_deref(), ibody.clone()).await {
+                    match push_logs(&client, &logs_endpoint, token.as_deref(), ibody.clone()).await {
                         Ok(rejected) => {
                             // 수신측(rca)에 aic.process.inventory decoder가 아직 없으면 여기로 온다
                             // (partial_success 폐기). 지속 신호는 게이지가 들고 전이에서만 로그한다.
@@ -520,11 +554,15 @@ pub async fn serve(
                     break;
                 }
             }
+            _ = live_config::changed(&mut cfg_changed) => {
+                // 루프 상단에서 새 스냅샷을 잡고 주기를 다시 계산한다. 수집을 앞당기지는 않는다.
+                continue;
+            }
             Some(req) = flush_rx.recv() => {
                 // chat `/flush` — 사용자가 "지금 밀어 넣어도 된다"고 판단했다. rate-limit(tick당
                 // drain_batch_limit)을 우회해 **지금 전량 드레인**한다. backoff.ready()도 건너뛴다
                 // (명시적 요청). 나이 cap이 설정돼 있으면 낡은 것부터 버리고 시작한다.
-                if let Some(max_age) = cfg.spool_max_age {
+                if let Some(max_age) = spool_max_age {
                     let _ = cfg.spool.prune_older_than(max_age);
                 }
                 // drain은 첫 일시 실패에서 멈추므로(FIFO 보존) collector가 죽어 있으면 빨리 반환한다 —
@@ -535,7 +573,7 @@ pub async fn serve(
                     &client,
                     &url,
                     &logs_endpoint,
-                    cfg.token.as_deref(),
+                    token.as_deref(),
                 )
                 .await;
                 if report.failed {

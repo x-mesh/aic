@@ -215,6 +215,12 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     // doc 참고). 섹션을 한 번만 읽어 세 load_*_config에 넘긴다(이전엔 함수마다 파일을 따로
     // 읽었다).
     let exporter_section = read_exporter_section();
+    // 실행 중 config 변경을 받아 **tick 안에서 소비되는 값만** 다음 tick부터 갈아 끼운다
+    // (live_config 모듈 doc — endpoint·spool 상한·`*_enabled`는 여전히 재시작이 필요하다).
+    // exporter 섹션 자체가 없으면 task도 안 뜨므로 스냅샷도 만들지 않는다.
+    let live_exporter = exporter_section
+        .clone()
+        .map(|ex| Arc::new(aic_server::live_config::LiveExporterConfig::new(ex)));
     let exporter_spool = open_exporter_spool(exporter_section.as_ref());
     // [aicd.logs] 섹션(SRE R2/RFC-006). 섹션이 없거나 config 자체를 못 읽어도 항상
     // `AicdLogsConfig::default()`가 나온다(하위 수집기 전부 off) — Option을 쓰지 않는 이유는
@@ -254,6 +260,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_health.clone(),
         log_drop_counters.clone(),
         Some(process_inventory_store.clone()),
+        live_exporter.clone(),
     );
     let (flush_tx, flush_rx) = if exporter_cfg.is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(4);
@@ -288,6 +295,16 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
             .as_ref()
             .map(|_| process_inventory_store.clone()),
     };
+
+    // config 파일을 지켜보다 `[aicd.exporter]`를 다시 읽어 라이브 스냅샷에 넣는다.
+    let config_reload_handle = live_exporter.clone().map(|live| {
+        spawn_exporter_config_reload(
+            live,
+            aic_common::paths::config_file_path(),
+            EXPORTER_CONFIG_RELOAD_INTERVAL,
+            shutdown.subscribe(),
+        )
+    });
 
     // 주기적 stale 세션 reconcile — request 트래픽이 없어도 active → detached 전환이 수렴하도록.
     let reconcile_handle = spawn_reconcile_loop(control_ctx.clone());
@@ -347,6 +364,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
                 token,
                 std::time::Duration::from_secs(ex.self_update_interval_secs),
                 self_update_health.clone(),
+                live_exporter.clone(),
                 shutdown.subscribe(),
             ))
         }
@@ -366,6 +384,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             let ev_shutdown = shutdown.subscribe();
@@ -384,6 +403,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             let conn_shutdown = shutdown.subscribe();
@@ -423,6 +443,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             let ch_shutdown = shutdown.subscribe();
@@ -443,6 +464,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             let dk_shutdown = shutdown.subscribe();
@@ -462,6 +484,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             let kn_shutdown = shutdown.subscribe();
@@ -488,6 +511,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_section.clone(),
         exporter_spool.clone(),
         exporter_health.clone(),
+        live_exporter.clone(),
     ) {
         Some(cfg) => {
             // **구독은 이미 성립했다**(load_agent_config가 spawn 전에 subscribe한다). 구독이 성립한
@@ -521,6 +545,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         exporter_health.clone(),
         logs_section.clone(),
         log_drop_counters.clone(),
+        live_exporter.clone(),
     );
     let logs_handle = match (logs_exporter_cfg, logs_rx) {
         (Some(cfg), Some(rx)) => {
@@ -708,6 +733,9 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     let _ = workload_handle.await;
 
     reconcile_handle.abort();
+    if let Some(h) = config_reload_handle {
+        h.abort();
+    }
     // 소켓 파일 정리 — AttachServer 는 Drop 구현이 없으므로 명시 remove.
     let _ = std::fs::remove_file(&attach_sock_path);
     if let Err(e) = registry.save_snapshot(&registry_path).await {
@@ -742,12 +770,63 @@ fn load_webhook_config() -> Option<aic_server::webhook_server::WebhookConfig> {
     })
 }
 
+/// config 파일을 다시 읽는 주기. 파일 mtime만 보고 넘어가는 tick이 대부분이라 짧게 잡아도
+/// 비용이 `stat` 한 번이다 — 설정을 고친 사람이 반영을 기다리는 시간이 이보다 길어지면
+/// "안 먹는다"고 판단하게 된다.
+const EXPORTER_CONFIG_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// config 파일이 바뀌면 `[aicd.exporter]`를 다시 읽어 라이브 스냅샷에 넣는다.
+///
+/// mtime이 그대로면 읽지 않는다 — 매 주기 파싱하면 파싱 실패 WARN이 주기마다 반복돼 로그가
+/// 쓸모없어진다. 파일이 사라졌거나 파싱에 실패하면 직전 스냅샷을 그대로 둔다: 읽지 못한 것을
+/// "꺼졌다"로 해석해 수집을 멈추면, 편집 중 잠깐 깨진 파일 하나로 텔레메트리가 끊긴다.
+fn spawn_exporter_config_reload(
+    live: Arc<aic_server::live_config::LiveExporterConfig>,
+    path: std::path::PathBuf,
+    period: std::time::Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_mtime = config_mtime(&path);
+        let mut ticker = tokio::time::interval(period);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval`의 첫 tick은 즉시 완료된다 — 방금 읽은 파일을 곧바로 다시 읽을 이유가 없다.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            let mtime = config_mtime(&path);
+            if mtime == last_mtime {
+                continue;
+            }
+            last_mtime = mtime;
+            let Some(next) = read_exporter_section_from(&path) else {
+                continue;
+            };
+            if live.store(next) {
+                tracing::info!(path = %path.display(), "[aicd.exporter] 재적용");
+            }
+        }
+    })
+}
+
+fn config_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 /// config.toml `[aicd.exporter]` 섹션을 읽는다. 세 exporter task(host metrics/events/connections)가
 /// 공유하는 단일 파싱 지점 — spool을 셋이 공유해야 해서(t8) 예전처럼 함수마다 따로 읽지 않는다.
 /// 파일이 없거나 파싱에 실패하면 `None`(= 세 exporter 모두 비활성, 기존 동작과 동일).
 fn read_exporter_section() -> Option<aic_common::AicdExporterConfig> {
-    let path = aic_common::paths::config_file_path();
-    let content = std::fs::read_to_string(&path).ok()?;
+    read_exporter_section_from(&aic_common::paths::config_file_path())
+}
+
+/// [`read_exporter_section`]의 경로를 받는 형태. 재적용 task는 자기가 지켜보던 그 파일을 읽어야
+/// 하고, 테스트는 임시 파일을 읽혀야 한다.
+fn read_exporter_section_from(path: &std::path::Path) -> Option<aic_common::AicdExporterConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
     let app: aic_common::AppConfig = toml::from_str(&content)
         .map_err(|e| tracing::warn!(error = %e, "config 파싱 실패 — exporter 비활성"))
         .ok()?;
@@ -826,6 +905,7 @@ fn load_logs_exporter_config(
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
     logs_cfg: AicdLogsConfig,
     drop_counters: Arc<DropCounters>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<LogsExporterConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.logs_enabled {
@@ -849,6 +929,7 @@ fn load_logs_exporter_config(
         health,
         logs_cfg,
         drop_counters,
+        live,
     })
 }
 
@@ -887,6 +968,7 @@ fn load_exporter_config(
     process_inventory_store: Option<
         Arc<aic_server::process_inventory_store::ProcessInventoryStore>,
     >,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::ExporterConfig> {
     let ex = ex?;
     if !ex.enabled {
@@ -932,6 +1014,7 @@ fn load_exporter_config(
         // 같은 diff를 로컬 링에도 남긴다 — chat의 `GetRecentProcessChanges`가 읽는다. OTLP 전송
         // 플래그와 무관하게 채워지므로, collector를 안 켜도 chat 실시간 확인은 동작한다.
         process_inventory_store,
+        live,
     })
 }
 
@@ -953,6 +1036,7 @@ fn load_events_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::EventsConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.events_enabled {
@@ -972,6 +1056,7 @@ fn load_events_config(
         store,
         spool,
         health,
+        live,
     })
 }
 
@@ -991,6 +1076,7 @@ fn load_agent_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::AgentConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.agent_enabled {
@@ -1011,6 +1097,7 @@ fn load_agent_config(
         rx: bus.subscribe(),
         spool,
         health,
+        live,
     })
 }
 
@@ -1018,6 +1105,7 @@ fn load_connections_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::ConnectionsConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.connections_enabled {
@@ -1039,6 +1127,7 @@ fn load_connections_config(
         timeout: std::time::Duration::from_secs(15),
         spool,
         health,
+        live,
     })
 }
 
@@ -1078,6 +1167,7 @@ fn load_changes_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::ChangesConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.changes_enabled {
@@ -1097,6 +1187,7 @@ fn load_changes_config(
         interval: std::time::Duration::from_secs(ex.changes_interval_secs.max(1)),
         spool,
         health,
+        live,
     })
 }
 
@@ -1123,6 +1214,7 @@ fn load_kernel_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::KernelConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.kernel_enabled {
@@ -1159,6 +1251,7 @@ fn load_kernel_config(
         interval: std::time::Duration::from_secs(interval_secs),
         spool,
         health,
+        live,
     })
 }
 
@@ -1166,6 +1259,7 @@ fn load_docker_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
     health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
 ) -> Option<aic_server::otlp_exporter::DockerConfig> {
     let ex = ex?;
     if !ex.enabled || !ex.docker_enabled {
@@ -1199,12 +1293,85 @@ fn load_docker_config(
         timeout: std::time::Duration::from_secs(15),
         spool,
         health,
+        live,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 파일시스템의 mtime 해상도가 1초인 경우가 있어, 고친 것을 "안 바뀐 것"으로 보지 않으려면
+    /// 초를 넘겨야 한다. 재적용 판정이 mtime 기반이므로 테스트도 같은 제약을 받는다.
+    const MTIME_TICK: std::time::Duration = std::time::Duration::from_millis(1100);
+
+    fn write_exporter_config(path: &std::path::Path, interval_secs: u64) {
+        let toml_str = format!(
+            "{BASE}\n\
+             [aicd.exporter]\n\
+             enabled = true\n\
+             endpoint = \"http://127.0.0.1:1\"\n\
+             interval_secs = {interval_secs}\n"
+        );
+        std::fs::write(path, toml_str).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_config_edit_reaches_the_live_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_exporter_config(&path, 60);
+        let live = Arc::new(aic_server::live_config::LiveExporterConfig::new(
+            read_exporter_section_from(&path).expect("초기 config 파싱"),
+        ));
+        let mut changed = live.subscribe();
+
+        let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_exporter_config_reload(
+            live.clone(),
+            path.clone(),
+            std::time::Duration::from_millis(50),
+            sd_rx,
+        );
+
+        tokio::time::sleep(MTIME_TICK).await;
+        write_exporter_config(&path, 17);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.changed())
+            .await
+            .expect("재적용 알림이 오지 않았다")
+            .expect("알림 채널이 닫혔다");
+        assert_eq!(live.get().interval_secs, 17);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_broken_config_keeps_the_last_good_snapshot() {
+        // 편집 중 잠깐 깨진 파일 하나로 텔레메트리가 끊기면 안 된다 — 읽지 못한 것을 "꺼졌다"로
+        // 해석하지 않는다.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_exporter_config(&path, 60);
+        let live = Arc::new(aic_server::live_config::LiveExporterConfig::new(
+            read_exporter_section_from(&path).expect("초기 config 파싱"),
+        ));
+
+        let (_sd_tx, sd_rx) = tokio::sync::watch::channel(false);
+        let handle = spawn_exporter_config_reload(
+            live.clone(),
+            path.clone(),
+            std::time::Duration::from_millis(50),
+            sd_rx,
+        );
+
+        tokio::time::sleep(MTIME_TICK).await;
+        std::fs::write(&path, "[aicd.exporter\nenabled = tru").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        assert!(live.get().enabled);
+        assert_eq!(live.get().interval_secs, 60);
+        handle.abort();
+    }
 
     fn parse(toml_str: &str) -> AppConfig {
         toml::from_str(toml_str).expect("valid AppConfig toml")
@@ -1314,6 +1481,7 @@ method = "prompt_marker"
             Some(health),
             AicdLogsConfig::default(),
             Arc::new(DropCounters::new()),
+            None,
         );
         assert!(cfg.is_none());
     }
@@ -1339,6 +1507,7 @@ method = "prompt_marker"
             Some(health),
             Arc::new(DropCounters::new()),
             None,
+            None,
         );
         assert!(
             cfg.is_none(),
@@ -1360,7 +1529,8 @@ method = "prompt_marker"
         assert!(load_kernel_config(
             Some(base.clone()),
             Some(spool.clone()),
-            Some(health.clone())
+            Some(health.clone()),
+            None
         )
         .is_none());
         // 자기 플래그만 켜고 부모를 끄면 역시 뜨지 않는다.
@@ -1369,16 +1539,19 @@ method = "prompt_marker"
             kernel_enabled: true,
             ..base.clone()
         };
-        assert!(
-            load_kernel_config(Some(child_only), Some(spool.clone()), Some(health.clone()))
-                .is_none()
-        );
+        assert!(load_kernel_config(
+            Some(child_only),
+            Some(spool.clone()),
+            Some(health.clone()),
+            None
+        )
+        .is_none());
         // 둘 다 켜면 뜬다.
         let both = AicdExporterConfig {
             kernel_enabled: true,
             ..base
         };
-        let cfg = load_kernel_config(Some(both), Some(spool), Some(health))
+        let cfg = load_kernel_config(Some(both), Some(spool), Some(health), None)
             .expect("두 게이트를 통과하면 config가 만들어져야 한다");
         assert_eq!(cfg.agent_url, "http://127.0.0.1:9090");
     }
@@ -1395,7 +1568,7 @@ method = "prompt_marker"
             kernel_url: "http://10.0.0.5:9090".to_string(),
             ..AicdExporterConfig::default()
         };
-        assert!(load_kernel_config(Some(ex), Some(spool), Some(health)).is_none());
+        assert!(load_kernel_config(Some(ex), Some(spool), Some(health), None).is_none());
     }
 
     /// 반대 조합 — 켜져 있어도 endpoint가 없으면 보낼 곳이 없어 비활성이다.
@@ -1413,6 +1586,7 @@ method = "prompt_marker"
             Some(spool),
             Some(health),
             Arc::new(DropCounters::new()),
+            None,
             None,
         );
         assert!(
@@ -1437,6 +1611,7 @@ method = "prompt_marker"
             Some(health),
             Arc::new(DropCounters::new()),
             None,
+            None,
         )
         .expect("게이트를 통과하면 Some이어야 한다");
         assert_eq!(cfg.endpoint, "http://127.0.0.1:4318/");
@@ -1459,6 +1634,7 @@ method = "prompt_marker"
             Some(health),
             AicdLogsConfig::default(),
             Arc::new(DropCounters::new()),
+            None,
         );
         assert!(cfg.is_none());
     }
@@ -1486,6 +1662,7 @@ method = "prompt_marker"
             Some(health),
             logs_cfg,
             Arc::new(DropCounters::new()),
+            None,
         )
         .expect("게이트 통과 시 Some이어야 함");
         assert_eq!(cfg.batch_max_lines, 42);
@@ -1508,6 +1685,7 @@ method = "prompt_marker"
             None,
             AicdLogsConfig::default(),
             Arc::new(DropCounters::new()),
+            None,
         );
         assert!(cfg.is_none());
     }
