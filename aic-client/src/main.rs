@@ -1936,6 +1936,66 @@ struct EnrollmentResponse {
     llm_endpoint: Option<String>,
     #[serde(default)]
     llm_api_key: Option<String>,
+    /// rca-web 콘솔이 등록 키에 붙여 발급한 설치 설정(x-mesh/aic#29 R1).
+    /// 서버가 보내지 않는 것이 정상이라 `#[serde(default)]`로 받는다.
+    #[serde(default)]
+    config: Vec<EnrollmentConfigEntry>,
+}
+
+/// 등록 응답이 함께 싣는 설치 설정 한 항목.
+///
+/// `value`가 항상 문자열인 이유: 서버는 각 설정의 타입을 모른다. 타입을 아는 쪽은 aic이므로
+/// 대상 필드에 맞춰 해석한다.
+#[derive(Debug, Deserialize)]
+struct EnrollmentConfigEntry {
+    path: String,
+    value: String,
+}
+
+/// 등록 응답으로 바꿀 수 있는 설정 경로(x-mesh/aic#29 R3).
+///
+/// `aic config set`은 사람이 직접 실행하므로 `get`이 읽는 경로를 전부 연다. 이 목록은
+/// **원격 서버가 호스트 설정을 바꾸는** 경로라 따로 좁힌다. 넓히기는 한 줄이고 좁히기는
+/// 이미 나간 동작을 되돌리는 일이다.
+const ENROLLMENT_SETTABLE_PATHS: &[&str] =
+    &["aicd.exporter.self_update_enabled", "session.capture_mode"];
+
+/// 같은 응답이 직접 채우는 경로(x-mesh/aic#29 R2). 설정 목록이 이 값을 덮으면 방금 받은
+/// 접속 주소와 토큰을 잃는다.
+const ENROLLMENT_SERVER_OWNED_PATHS: &[&str] = &["aicd.exporter.endpoint", "aicd.exporter.token"];
+
+/// 등록 응답이 실어 보낸 설치 설정을 적용한다.
+///
+/// 항목 하나가 실패해도 **등록 전체를 실패시키지 않는다**(x-mesh/aic#29 R4). 일회용 등록
+/// 키는 이 시점에 이미 소비됐고, 텔레메트리 연결이 설정 한 줄보다 중요하다. 실패를 올리면
+/// 운영자는 멀쩡한 등록을 실패로 읽고 새 키를 발급해 재시도한다.
+fn apply_enrollment_config(config: &mut AppConfig, entries: &[EnrollmentConfigEntry]) {
+    for entry in entries {
+        let path = entry.path.trim();
+        if ENROLLMENT_SERVER_OWNED_PATHS.contains(&path) {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} {path}는 등록 응답이 직접 채우는 값입니다 — \
+                 설치 설정의 값은 무시합니다"
+            );
+            continue;
+        }
+        if !ENROLLMENT_SETTABLE_PATHS.contains(&path) {
+            eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} {path}는 등록으로 바꿀 수 있는 설정이 아닙니다 — \
+                 건너뜁니다"
+            );
+            continue;
+        }
+        match apply_config_set(config, path, &entry.value) {
+            Ok(()) => println!(
+                "{COL_GREEN}✓{COL_RESET} 설치 설정 적용: {path} = {}",
+                entry.value.trim()
+            ),
+            Err(e) => eprintln!(
+                "{COL_YELLOW}⚠{COL_RESET} 설치 설정 {path}를 적용하지 못했습니다: {e} — 건너뜁니다"
+            ),
+        }
+    }
 }
 
 /// RCA가 보낸 provider_type 문자열 → [`ProviderType`]. 모르는 값은 None —
@@ -2060,6 +2120,9 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
         }
     }
     config.llm.default_provider = enrolled.provider.clone();
+    // endpoint/token을 쓴 **다음**에 적용한다 — 서버가 소유하는 두 경로를 지키려면 그 값이
+    // 이미 config에 들어가 있어야 한다(x-mesh/aic#29 R1, R2).
+    apply_enrollment_config(&mut config, &enrolled.config);
     save_config(&config)?;
 
     // install은 unit을 없으면 만들고 시작한다. 이미 떠 있던 aicd는 config를 메모리에
@@ -6828,6 +6891,7 @@ mod enrollment_response_tests {
             llm_provider_type: None,
             llm_endpoint: None,
             llm_api_key: None,
+            config: Vec::new(),
         }
     }
 
@@ -11917,5 +11981,100 @@ mod config_set_tests {
         let mut c = cfg();
         apply_config_set(&mut c, "server.max_buffer_lines", "1200").unwrap();
         assert_eq!(c.server.max_buffer_lines, 1200);
+    }
+}
+
+#[cfg(test)]
+mod enrollment_config_tests {
+    use super::*;
+
+    fn entry(path: &str, value: &str) -> EnrollmentConfigEntry {
+        EnrollmentConfigEntry {
+            path: path.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    /// 이 테스트가 지키는 것: 서버가 `config`를 보내지 않는 경우가 정상인 것(R1).
+    /// 구버전 서버 응답에는 이 필드가 없다.
+    #[test]
+    fn a_response_without_config_still_parses() {
+        let json = r#"{
+            "enrollment_id": "enr_1", "host_name": "h1",
+            "endpoint": "https://rca.example", "ingest_token": "tok",
+            "provider": "openai", "model": "gpt-4o-mini"
+        }"#;
+        let parsed: EnrollmentResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.config.is_empty());
+    }
+
+    /// 이 테스트가 지키는 것: 허용 경로가 실제로 기록되는 것(R1).
+    #[test]
+    fn an_allowed_path_is_written() {
+        let mut c = default_config();
+        assert!(!c.aicd.exporter.self_update_enabled);
+        apply_enrollment_config(
+            &mut c,
+            &[entry("aicd.exporter.self_update_enabled", "true")],
+        );
+        assert!(c.aicd.exporter.self_update_enabled);
+    }
+
+    /// 이 테스트가 지키는 것: 응답이 직접 채운 접속 주소와 토큰을 설정 목록이 덮지 못하는 것(R2).
+    #[test]
+    fn server_owned_paths_are_left_alone() {
+        let mut c = default_config();
+        c.aicd.exporter.endpoint = "https://real.example".to_string();
+        c.aicd.exporter.token = Some("real-token".to_string());
+        apply_enrollment_config(
+            &mut c,
+            &[
+                entry("aicd.exporter.endpoint", "https://attacker.example"),
+                entry("aicd.exporter.token", "stolen"),
+            ],
+        );
+        assert_eq!(c.aicd.exporter.endpoint, "https://real.example");
+        assert_eq!(c.aicd.exporter.token.as_deref(), Some("real-token"));
+    }
+
+    /// 이 테스트가 지키는 것: 허용 목록 밖은 건너뛰는 것(R3).
+    /// `aic config set`은 이 경로를 쓸 수 있지만, 원격 서버가 바꾸는 자리는 좁혀 둔다.
+    #[test]
+    fn a_path_outside_the_allowlist_is_skipped() {
+        let mut c = default_config();
+        let before = c.server.max_buffer_lines;
+        apply_enrollment_config(&mut c, &[entry("server.max_buffer_lines", "1")]);
+        assert_eq!(c.server.max_buffer_lines, before);
+    }
+
+    /// 이 테스트가 지키는 것: 한 항목이 실패해도 나머지가 적용되는 것(R4).
+    /// 일회용 등록 키는 이미 소비됐으므로 여기서 멈추면 안 된다.
+    #[test]
+    fn a_bad_entry_does_not_stop_the_rest() {
+        let mut c = default_config();
+        apply_enrollment_config(
+            &mut c,
+            &[
+                entry("aicd.exporter.self_update_enabled", "언젠가"),
+                entry("session.capture_mode", "nope"),
+                entry("aicd.exporter.self_update_enabled", "true"),
+            ],
+        );
+        assert!(
+            c.aicd.exporter.self_update_enabled,
+            "앞 항목이 실패해도 뒤 항목은 적용돼야 한다"
+        );
+    }
+
+    /// 이 테스트가 지키는 것: 허용 목록에 비밀이 섞여 들어오지 않는 것.
+    /// 적용 결과를 그대로 출력하므로, 비밀 경로가 목록에 들어오면 값이 터미널과 설치 로그에 남는다.
+    #[test]
+    fn the_allowlist_holds_no_secret_paths() {
+        for path in ENROLLMENT_SETTABLE_PATHS {
+            assert!(
+                !is_secret_config_path(path),
+                "{path}는 비밀이라 등록 응답으로 설정할 수 없다 — 출력에 평문으로 남는다"
+            );
+        }
     }
 }
