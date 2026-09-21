@@ -1965,22 +1965,18 @@ struct EnrollmentConfigEntry {
     value: String,
 }
 
-/// 등록 응답으로 바꿀 수 있는 설정 경로(x-mesh/aic#29 R3).
-///
-/// `aic config set`은 사람이 직접 실행하므로 `get`이 읽는 경로를 전부 연다. 이 목록은
-/// **원격 서버가 호스트 설정을 바꾸는** 경로라 따로 좁힌다. 넓히기는 한 줄이고 좁히기는
-/// 이미 나간 동작을 되돌리는 일이다.
-const ENROLLMENT_SETTABLE_PATHS: &[&str] =
-    &["aicd.exporter.self_update_enabled", "session.capture_mode"];
-
 /// 같은 응답이 직접 채우는 경로(x-mesh/aic#29 R2).
 ///
-/// 허용 목록에 없으니 실제 차단은 그쪽이 하고, 이 목록은 **왜 건너뛰었는지**를 구분해 말하기
-/// 위해 둔다. 두 목록이 겹치지 않는다는 불변식은 `server_owned_paths_never_enter_the_allowlist`가
-/// 지킨다 — 겹치는 순간 방금 받은 접속 주소와 토큰을 설정 목록이 덮는다.
+/// 등록 응답이 방금 채운 접속 주소와 토큰을 설치 설정이 덮으면, 교환해 받은 자격이 임의의
+/// 값으로 바뀐다. 설정 경로 중 유일하게 차단하는 자리다.
 const ENROLLMENT_SERVER_OWNED_PATHS: &[&str] = &["aicd.exporter.endpoint", "aicd.exporter.token"];
 
 /// 등록 응답이 실어 보낸 설치 설정을 적용한다.
+///
+/// 받는 경로는 `aic config set`과 같다. 한때 두 경로짜리 허용 목록으로 좁혔지만, 운영에서
+/// 필요한 설정이 매번 목록 밖이라 호스트마다 config.toml을 손으로 고치게 됐다. 목록은
+/// `main.rs` 안의 상수라 서버가 무엇이 허용되는지 알 방법도 없었다. 신뢰 경계는 같은 응답이
+/// LLM API 키와 ingest token을 내려보내는 시점에 이미 그어져 있다.
 ///
 /// 항목 하나가 실패해도 **등록 전체를 실패시키지 않는다**(x-mesh/aic#29 R4). 일회용 등록
 /// 키는 이 시점에 이미 소비됐고, 텔레메트리 연결이 설정 한 줄보다 중요하다. 실패를 올리면
@@ -2006,18 +2002,11 @@ fn apply_enrollment_config(config: &mut AppConfig, entries: &[serde_json::Value]
             );
             continue;
         }
-        if !ENROLLMENT_SETTABLE_PATHS.contains(&path) {
-            eprintln!(
-                "{COL_YELLOW}⚠{COL_RESET} {path}는 등록으로 바꿀 수 있는 설정이 아닙니다 — \
-                 건너뜁니다"
-            );
-            continue;
-        }
         match apply_config_set(config, path, &entry.value) {
             Ok(()) => {
                 println!(
                     "{COL_GREEN}✓{COL_RESET} 설치 설정 적용: {path} = {}",
-                    entry.value.trim()
+                    set_value_for_display(path, &entry.value)
                 );
                 // 텔레메트리를 보내는 것과 디스크의 binary를 갈아끼우는 것은 같은 동의가 아니다
                 // (aicd_main.rs의 self_update 분리 근거). 그 동의를 중앙이 자기 응답으로 부여하는
@@ -2397,18 +2386,10 @@ fn handle_config_set(path: &str, value: &str) {
         std::process::exit(1);
     }
 
-    // 비밀은 되읽어 주지 않는다 — `aic config show`가 마스킹하는 값을 set이 평문으로 찍으면
-    // 터미널 스크롤백과 CI 로그에 그대로 남는다. 값을 비운 경우는 마스킹하면 `***`가 되어
-    // 무언가 채운 것처럼 보이므로 따로 말한다.
-    let trimmed = value.trim();
-    let shown = if trimmed.eq_ignore_ascii_case("unset") || trimmed.eq_ignore_ascii_case("null") {
-        "(비움)".to_string()
-    } else if is_secret_config_path(path) {
-        mask_api_key(trimmed)
-    } else {
-        trimmed.to_string()
-    };
-    println!("{COL_GREEN}✔{COL_RESET} {path} = {shown}");
+    println!(
+        "{COL_GREEN}✔{COL_RESET} {path} = {}",
+        set_value_for_display(path, &value)
+    );
 
     // capture_mode를 **건드렸을 때만** 셸 hook 안내를 낸다. 범용 set이 열리기 전에는 이
     // 경로밖에 없어 조건이 필요 없었지만, 지금은 exporter 값 하나를 바꿔도 셸 설정 안내가
@@ -2616,6 +2597,22 @@ fn parse_number_value(raw: &str) -> anyhow::Result<serde_json::Value> {
         return Ok(serde_json::Value::Number(n));
     }
     anyhow::bail!("숫자가 필요합니다 — 받은 값: {raw}")
+}
+
+/// 설정을 바꿨다고 알릴 때 화면에 찍을 값.
+///
+/// 비밀은 되읽어 주지 않는다 — `aic config show`가 마스킹하는 값을 평문으로 찍으면 터미널
+/// 스크롤백과 CI 로그, `curl | sh` 설치 로그에 그대로 남는다. 값을 비운 경우는 마스킹하면
+/// `***`가 되어 무언가 채운 것처럼 보이므로 따로 말한다.
+fn set_value_for_display(path: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("unset") || trimmed.eq_ignore_ascii_case("null") {
+        "(비움)".to_string()
+    } else if is_secret_config_path(path) {
+        mask_api_key(trimmed)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// 비밀이 담기는 경로인가. `handle_config_show`가 마스킹하는 것과 같은 자리다.
@@ -12098,23 +12095,23 @@ mod enrollment_config_tests {
         );
     }
 
-    /// 이 테스트가 지키는 것: 서버가 직접 채우는 경로가 허용 목록에 섞여 들어오지 않는 것(R2).
+    /// 이 테스트가 지키는 것: 등록 응답의 설정 값이 설치 로그에 평문으로 남지 않는 것.
     ///
-    /// 실제 차단은 허용 목록이 한다. 두 목록이 겹치는 순간 설정 목록이 방금 받은 접속 주소와
-    /// 토큰을 덮어쓴다.
+    /// 허용 목록을 걷어내면서 비밀 경로도 등록으로 설정할 수 있게 됐다. 적용 결과는 한 줄씩
+    /// 출력되고 `curl | sh` 설치 로그에 그대로 쌓인다.
     #[test]
-    fn server_owned_paths_never_enter_the_allowlist() {
-        for path in ENROLLMENT_SERVER_OWNED_PATHS {
-            assert!(
-                !ENROLLMENT_SETTABLE_PATHS.contains(path),
-                "{path}는 응답이 직접 채우는 값이라 등록으로 바꿀 수 없어야 한다"
-            );
-        }
+    fn a_secret_value_is_masked_in_the_applied_line() {
+        let shown = set_value_for_display("llm.providers.ai-mesh.api_key", "sk-secret-value-1234");
+        assert!(!shown.contains("secret-value"), "평문이 남았다: {shown}");
+        assert_eq!(
+            set_value_for_display("aicd.exporter.endpoint", "https://a"),
+            "https://a"
+        );
     }
 
-    /// 이 테스트가 지키는 것: 허용 경로가 실제로 기록되는 것(R1).
+    /// 이 테스트가 지키는 것: 등록 응답의 설정이 실제로 기록되는 것(R1).
     #[test]
-    fn an_allowed_path_is_written() {
+    fn a_config_entry_is_written() {
         let mut c = default_config();
         assert!(!c.aicd.exporter.self_update_enabled);
         apply_enrollment_config(
@@ -12141,13 +12138,22 @@ mod enrollment_config_tests {
         assert_eq!(c.aicd.exporter.token.as_deref(), Some("real-token"));
     }
 
-    /// 이 테스트가 지키는 것: 허용 목록 밖은 건너뛰는 것(R3).
-    /// `aic config set`은 이 경로를 쓸 수 있지만, 원격 서버가 바꾸는 자리는 좁혀 둔다.
+    /// 이 테스트가 지키는 것: 등록 설정이 `aic config set`과 같은 경로를 받는 것.
+    /// 예전에는 두 경로짜리 허용 목록이 이 값을 막아, 함대에서는 호스트마다 손으로 고쳤다.
     #[test]
-    fn a_path_outside_the_allowlist_is_skipped() {
+    fn a_path_beyond_the_old_allowlist_is_applied() {
+        let mut c = default_config();
+        apply_enrollment_config(&mut c, &[entry("server.max_buffer_lines", "4242")]);
+        assert_eq!(c.server.max_buffer_lines, 4242);
+    }
+
+    /// 이 테스트가 지키는 것: 없는 경로는 여전히 거부되는 것.
+    /// 경로를 전부 연다는 것이 오타까지 받아 준다는 뜻은 아니다.
+    #[test]
+    fn an_unknown_path_is_still_rejected() {
         let mut c = default_config();
         let before = c.server.max_buffer_lines;
-        apply_enrollment_config(&mut c, &[entry("server.max_buffer_lines", "1")]);
+        apply_enrollment_config(&mut c, &[entry("server.max_bufer_lines", "1")]);
         assert_eq!(c.server.max_buffer_lines, before);
     }
 
@@ -12168,17 +12174,5 @@ mod enrollment_config_tests {
             c.aicd.exporter.self_update_enabled,
             "앞 항목이 실패해도 뒤 항목은 적용돼야 한다"
         );
-    }
-
-    /// 이 테스트가 지키는 것: 허용 목록에 비밀이 섞여 들어오지 않는 것.
-    /// 적용 결과를 그대로 출력하므로, 비밀 경로가 목록에 들어오면 값이 터미널과 설치 로그에 남는다.
-    #[test]
-    fn the_allowlist_holds_no_secret_paths() {
-        for path in ENROLLMENT_SETTABLE_PATHS {
-            assert!(
-                !is_secret_config_path(path),
-                "{path}는 비밀이라 등록 응답으로 설정할 수 없다 — 출력에 평문으로 남는다"
-            );
-        }
     }
 }
