@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-09-21
+
+### Added
+
+- `aic config set`이 `aic config get`으로 읽히는 모든 경로를 쓴다. 이전에는 `session.capture_mode` 하나만 설정할 수 있어, 나머지는 설정 파일을 직접 고쳐야 했다. 읽기와 쓰기가 어긋나 있으면 어떤 값이 명령으로 바뀌는지 매번 확인해야 하고, 파일을 손으로 고치다 TOML 테이블 밖에 키를 붙이면 그 설정이 조용히 무시된다.
+
+  ```sh
+  aic config set aicd.exporter.self_update_enabled true
+  aic config set aicd.exporter.interval_secs 30
+  ```
+
+  값 자리에 `-`를 주면 표준 입력에서 읽는다. API 키나 토큰을 셸 기록에 남기지 않는 통로다. `unset`은 값을 비운다.
+
+  ```sh
+  aic config set llm.providers.ai-mesh.api_key - < key.txt
+  ```
+
+- `aicd` 설정을 바꾸면 재시작 명령을 함께 안내한다. 이 값들은 데몬이 기동할 때 한 번만 읽으므로, 바꿔 놓고 반영을 기다리면 아무 일도 일어나지 않는다.
+- `[aicd.exporter]`의 하위 설정을 켤 때 부모 설정이 꺼져 있거나 `endpoint`가 비어 있으면 알린다. 이 상태에서는 값을 켜도 exporter가 뜨지 않는데, 이전에는 데몬 로그에만 경고가 남았다.
+
+### Fixed
+
+- `aic config set`이 없는 경로와 표 전체를 가리키는 경로를 거부한다. 오타가 새 설정 항목으로 저장되면 그 값은 어디에도 쓰이지 않는다.
+- API 키와 토큰을 설정할 때 입력한 값을 그대로 되출력하지 않는다. `aic config show`가 가리는 값이 설정할 때 평문으로 남던 문제를 고친다.
+
 ## [0.42.4] - 2026-09-21
 
 ### Fixed
