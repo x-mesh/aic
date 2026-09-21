@@ -1688,7 +1688,11 @@ async fn main() {
             DaemonOp::Status => handle_daemon_status().await,
             DaemonOp::Start { foreground } => handle_daemon_start(foreground).await,
             DaemonOp::Stop => handle_daemon_stop().await,
-            DaemonOp::Restart { if_running } => handle_daemon_restart(if_running).await,
+            DaemonOp::Restart { if_running } => {
+                if !handle_daemon_restart(if_running).await {
+                    std::process::exit(1);
+                }
+            }
             DaemonOp::Install { no_load, system } => handle_daemon_install(no_load, system),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
@@ -2523,6 +2527,36 @@ async fn handle_daemon_status() {
         if installed {
             println!("    {COL_DIM}unit: {}{COL_RESET}", unit.display());
         }
+    }
+
+    print_unit_conflict_warning().await;
+}
+
+/// user 단위와 system 유닛이 같이 설치된 상태를 드러낸다.
+///
+/// 이 상태는 다른 출력 어디에도 드러나지 않는다 — ping에 답하는 쪽은 멀쩡히 살아 있고,
+/// lock을 못 잡은 쪽만 systemd 안에서 조용히 재시작을 반복하기 때문이다. 상태를 물었을 때
+/// 먼저 말해 주지 않으면 운영자는 바꾼 설정이 왜 안 먹는지부터 찾게 된다.
+async fn print_unit_conflict_warning() {
+    // 이 검사는 `systemctl` 하위 프로세스를 띄우는 blocking 호출이다. `aic status --watch`가
+    // interval마다 부르므로 그대로 두면 매 tick tokio 워커가 묶이고, user bus가 늦게 붙는
+    // 호스트에서는 watch 화면 전체가 멈춘다.
+    let probe = tokio::task::spawn_blocking(|| {
+        let (_, system) = aic_client::daemon_install::current_unit()?;
+        aic_client::daemon_install::detect_unit_conflict(system)
+    })
+    .await;
+    let Ok(Some(conflict)) = probe else {
+        return;
+    };
+    println!();
+    println!(
+        "  {COL_YELLOW}⚠ 중복 유닛{COL_RESET}: {}",
+        conflict.summary()
+    );
+    println!("    {COL_DIM}정리:{COL_RESET}");
+    for cmd in conflict.cleanup_commands() {
+        println!("      {cmd}");
     }
 }
 
@@ -3611,7 +3645,8 @@ async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Opti
     // 재시작이 실제로 일어났는지는 PID로만 확인할 수 있다. ping은 옛 데몬이 살아 있어도
     // 답하므로, 재시작에 실패한 상태를 "정상"으로 읽는다(실서버에서 그렇게 지나갔다).
     let pid_before = daemon_pid().await;
-    handle_daemon_restart(true).await;
+    // 반환값을 흘려보낸다 — 재시작이 막혔더라도 아래 이력 기록까지는 반드시 도달해야 한다.
+    let _ = handle_daemon_restart(true).await;
 
     // 설치된 쪽의 버전을 쓴다. 이 프로세스의 `CARGO_PKG_VERSION`은 교체 **전** 버전이라,
     // 핀 설치나 다운그레이드에서 `0.41.9 → 0.41.9` 같은 무의미한 기록이 남는다.
@@ -3658,7 +3693,7 @@ async fn verify_or_rollback_after_update(from_version: &str, installed_tag: Opti
         .and_then(|dir| aic_client::update::restore_from_backup(&dir))
     {
         Ok(()) => {
-            handle_daemon_restart(true).await;
+            let _ = handle_daemon_restart(true).await;
             let recovered = daemon_answers_within(UPDATE_HEALTH_DEADLINE).await;
             println!(
                 "{} 롤백 완료 — aicd {}",
@@ -3708,7 +3743,12 @@ async fn daemon_answers_within(deadline: std::time::Duration) -> bool {
     false
 }
 
-async fn handle_daemon_restart(if_running: bool) {
+/// 재시작을 시도하고, 시작조차 못 했으면 `false`를 돌려준다.
+///
+/// **종료 코드로 바꾸는 판단은 CLI 진입점이 한다.** `verify_or_rollback_after_update`가
+/// 이 함수 뒤에서 업데이트 이력과 롤백 결과를 기록하므로, 여기서 프로세스를 죽이면
+/// 되돌렸다는 사실조차 남지 않는다.
+async fn handle_daemon_restart(if_running: bool) -> bool {
     let sock = aic_common::aicd_socket_path();
     let client = UdsClient::new(sock.clone());
 
@@ -3718,7 +3758,7 @@ async fn handle_daemon_restart(if_running: bool) {
     // 띄우는 부작용을 내지 않으면서, 이미 돌고 있던 구버전만 새 binary로 갈아끼운다.
     if if_running && !was_running {
         println!("{COL_DIM}aicd가 실행 중이 아닙니다 — 재시작 skip{COL_RESET}");
-        return;
+        return true;
     }
 
     // config 파싱을 먼저 검증한다 — unit 경유 재시작은 handle_daemon_start를 거치지 않으므로
@@ -3728,13 +3768,22 @@ async fn handle_daemon_restart(if_running: bool) {
         abort_daemon_on_bad_config("재시작", msg);
     }
 
+    // 두 스코프에 유닛이 같이 있으면 unit 경유 재시작도, 아래 직접 재기동도 lock을 잡지 못한다.
+    // 아래 fallback까지 내려가면 실패를 두 번 반복하고 원인은 그대로 남으므로 여기서 멈춘다.
+    if let Some((_, system)) = aic_client::daemon_install::current_unit() {
+        if let Some(conflict) = aic_client::daemon_install::detect_unit_conflict(system) {
+            eprintln!("{COL_RED}✗{COL_RESET} {}", conflict.remediation("재시작"));
+            return false;
+        }
+    }
+
     // 자동 시작 unit이 관리 중이면 매니저에게 맡긴다 — 우리가 죽이면 KeepAlive가
     // 곧바로 되살리기 때문에, 직접 spawn하면 두 기동이 PID lock을 두고 경쟁한다.
     match aic_client::daemon_install::restart_via_unit() {
         Ok(true) => {
             println!("{COL_GREEN}✓{COL_RESET} aicd 재시작 (autostart unit 경유)");
             wait_for_daemon_up(&client, UNIT_RESTART_WAIT_MS).await;
-            return;
+            return true;
         }
         Ok(false) => {} // unit 미설치 — 아래 수동 경로로.
         Err(e) => {
@@ -3777,6 +3826,7 @@ async fn handle_daemon_restart(if_running: bool) {
     }
 
     handle_daemon_start(false).await;
+    true
 }
 
 /// unit 매니저 경유 재시작을 기다리는 상한.
@@ -5816,6 +5866,7 @@ async fn print_status_once(session: Option<&str>) {
         }
     }
 
+    print_unit_conflict_warning().await;
     print_self_update_status().await;
 }
 

@@ -119,53 +119,222 @@ fn is_under_home(path: &Path) -> bool {
     path.starts_with("/home") || path.starts_with("/root") || path.starts_with("/Users")
 }
 
-/// system 설치를 막아야 하는 기존 user 데몬이 있으면 그 사유를 돌려준다.
+/// systemd 유닛이 user·system 두 스코프에 동시에 존재할 때의 충돌 상태.
 ///
-/// 확인 대상은 둘이다: 활성 user 유닛과, 지금 lock을 쥔 프로세스. 어느 쪽이든 남아 있으면
-/// system 유닛이 뜨지 못한다.
-fn conflicting_user_daemon() -> Option<String> {
-    let user_unit_active = systemctl_user_command()
-        .args(["is-active", "--quiet", SYSTEMD_UNIT])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+/// **왜 root에서만 겹치는가**: 런타임 디렉토리는 `is_system_service()`(= euid 0)로 갈린다.
+/// root의 사용자 단위로 뜬 aicd도 euid가 0이라 system 유닛과 같은 `/run/aic`를 쓰고, 같은
+/// lock을 두고 다툰다. 먼저 잡은 쪽이 이기고 진 쪽은 `RestartSec=2`로 영원히 재시도한다.
+/// 일반 사용자의 사용자 단위는 uid가 달라 경로가 갈리므로 이 진단에 걸리지 않는다.
+#[derive(Debug, Clone)]
+pub struct UnitConflict {
+    /// 지금 설치·재시작하려는 스코프. `true`면 system.
+    target_system: bool,
+    /// 반대 스코프에 남아 있는 유닛 파일.
+    other_unit: Option<PathBuf>,
+    /// 그 유닛이 지금 활성인가.
+    other_active: bool,
+    /// 런타임 lock을 쥐고 살아 있는 프로세스.
+    holder: Option<i32>,
+    /// lock 보유자가 뜬 스코프. `/proc`에서 읽지 못하면 `None`.
+    holder_system: Option<bool>,
+}
 
-    // **파일이 남아 있기만 해도 막는다.** `systemctl --user disable`은 유닛 파일을 지우지
-    // 않으므로, 비활성이어도 무언가 `start`하면 옛 binary가 되살아나 런타임 lock을 가져간다.
-    // 그러면 system 유닛이 기동에 실패하고 systemd가 2초마다 재시도한다(실서버에서 그랬다).
-    let user_unit_file = linux_unit_path().ok().filter(|p| p.exists());
+impl UnitConflict {
+    /// 반대 스코프의 이름. 안내 문구가 가리키는 대상이다.
+    fn other_label(&self) -> &'static str {
+        if self.target_system {
+            "사용자 단위"
+        } else {
+            "system 단위"
+        }
+    }
+
+    /// 반대 스코프를 다루는 `systemctl` 호출 형태.
+    fn systemctl_prefix(&self) -> &'static str {
+        if self.target_system {
+            "systemctl --user"
+        } else {
+            "systemctl"
+        }
+    }
+
+    /// `aic status`에 한 줄로 얹을 요약.
+    pub fn summary(&self) -> String {
+        let mut s = format!("{} aicd가 함께 설치되어 있습니다", self.other_label());
+        if let (Some(pid), Some(system)) = (self.holder, self.holder_system) {
+            let scope = if system {
+                "system 단위"
+            } else {
+                "사용자 단위"
+            };
+            s.push_str(&format!(" — 지금 lock을 쥔 쪽은 {scope}(PID {pid})입니다"));
+        }
+        s
+    }
+
+    /// lock을 쥔 쪽이 실제로 길을 막고 있는가. 판정은 `detect_unit_conflict`와 같은 함수를 쓴다 —
+    /// 여기서 갈라지면 충돌 요인으로 치지도 않은 데몬을 멈추라고 안내하게 된다.
+    fn holder_blocks(&self) -> bool {
+        holder_blocks_scope(self.target_system, self.holder, self.holder_system)
+    }
+
+    /// 충돌을 푸는 명령을 순서대로 돌려준다.
+    ///
+    /// 유닛 파일 삭제가 들어가는 이유: `systemctl disable`은 파일을 지우지 않으므로, 비활성인
+    /// 채 남은 유닛을 무언가 `start`하면 옛 binary가 되살아나 lock을 다시 가져간다.
+    pub fn cleanup_commands(&self) -> Vec<String> {
+        let mut cmds = Vec::new();
+        if self.holder_blocks() {
+            cmds.push("aic daemon stop".to_string());
+        }
+        if self.other_active {
+            cmds.push(format!("{} disable --now aicd", self.systemctl_prefix()));
+        }
+        if let Some(path) = &self.other_unit {
+            cmds.push(format!("rm -f {}", path.display()));
+            cmds.push(format!("{} daemon-reload", self.systemctl_prefix()));
+        }
+        cmds
+    }
+
+    /// 설치·재시작을 멈추면서 보여 줄 사유와 정리 절차.
+    pub fn remediation(&self, action: &str) -> String {
+        let mut lines = vec![format!(
+            "{} aicd가 남아 있어 {action}{} 중단합니다.",
+            self.other_label(),
+            object_particle(action)
+        )];
+        if let Some(pid) = self.holder {
+            let scope = match self.holder_system {
+                Some(true) => " (system 단위)",
+                Some(false) => " (사용자 단위)",
+                None => "",
+            };
+            lines.push(format!(
+                "  실행 중: PID {pid}{scope} — lock {}",
+                aic_common::aicd_lock_path().display()
+            ));
+        }
+        if self.other_active {
+            lines.push(format!(
+                "  활성 유닛: {} {SYSTEMD_UNIT}",
+                self.systemctl_prefix()
+            ));
+        } else if let Some(path) = &self.other_unit {
+            lines.push(format!("  남은 유닛 파일: {}", path.display()));
+        }
+        lines.push("  먼저 정리하세요:".to_string());
+        for cmd in self.cleanup_commands() {
+            lines.push(format!("    {cmd}"));
+        }
+        lines.join("\n")
+    }
+}
+
+/// lock 보유자가 지금 하려는 일을 막고 있는가.
+///
+/// 같은 스코프의 데몬이라면 막고 있는 것이 아니다 — 그때 충돌의 원인은 잔존 유닛 파일이지
+/// 돌고 있는 데몬이 아니다. 스코프를 못 읽었을 때는 system 쪽에서만 보수적으로 막는다:
+/// 전역 유닛이 조용히 재시작 루프에 빠지는 쪽이, 사용자 설치가 한 번 막히는 것보다 비싸다.
+fn holder_blocks_scope(
+    target_system: bool,
+    holder: Option<i32>,
+    holder_system: Option<bool>,
+) -> bool {
+    match (holder, holder_system) {
+        (None, _) => false,
+        (Some(_), Some(system)) => system != target_system,
+        (Some(_), None) => target_system,
+    }
+}
+
+/// 한글 낱말 뒤에 붙일 목적격 조사. 받침이 있으면 `을`, 없으면 `를`이다.
+fn object_particle(word: &str) -> &'static str {
+    match word.chars().next_back() {
+        // 한글 음절은 0xAC00부터 종성 28개 단위로 늘어선다 — 나누어떨어지면 받침이 없다.
+        Some(c) if ('가'..='힣').contains(&c) && (c as u32 - 0xAC00).is_multiple_of(28) => "를",
+        _ => "을",
+    }
+}
+
+/// 지금 설치·재시작하려는 스코프와 다투는 aicd가 있으면 그 상태를 돌려준다.
+///
+/// 확인 대상은 셋이다: 반대 스코프의 유닛 파일, 그 유닛의 활성 여부, 그리고 지금 런타임
+/// lock을 쥔 프로세스. **파일이 남아 있기만 해도 충돌로 본다** — 이번 사고의 실제 경로였다.
+pub fn detect_unit_conflict(target_system: bool) -> Option<UnitConflict> {
+    if detect_platform() != Platform::Linux {
+        return None;
+    }
+    // 반대 스코프가 system인데 지금이 root가 아니면 런타임 디렉토리가 uid로 갈려 애초에 같은
+    // lock을 두고 다투지 않는다. 멀쩡한 사용자 설치를 막지 않는다.
+    if !target_system && unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+
+    let (other_unit, other_active) = if target_system {
+        let active = systemctl_user_command()
+            .args(["is-active", "--quiet", SYSTEMD_UNIT])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        (linux_unit_path().ok().filter(|p| p.exists()), active)
+    } else {
+        let active = Command::new("systemctl")
+            .args(["is-active", "--quiet", SYSTEMD_UNIT])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        (
+            Some(linux_system_unit_path()).filter(|p| p.exists()),
+            active,
+        )
+    };
 
     let lock = aic_common::aicd_lock_path();
     let holder = std::fs::read_to_string(&lock)
         .ok()
         .and_then(|t| t.trim().lines().next()?.trim().parse::<i32>().ok())
         .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0);
+    let holder_system = holder.and_then(process_unit_scope);
 
-    if !user_unit_active && user_unit_file.is_none() && holder.is_none() {
+    let holder_conflicts = holder_blocks_scope(target_system, holder, holder_system);
+
+    if other_unit.is_none() && !other_active && !holder_conflicts {
         return None;
     }
-    let mut lines = vec!["사용자 단위 aicd가 남아 있어 system 설치를 중단합니다.".to_string()];
-    if let Some(pid) = holder {
-        lines.push(format!("  실행 중: PID {pid} (lock {})", lock.display()));
+    Some(UnitConflict {
+        target_system,
+        other_unit,
+        other_active,
+        holder,
+        holder_system,
+    })
+}
+
+/// 프로세스를 띄운 systemd 스코프. `true`면 system 유닛, `false`면 사용자 단위.
+fn process_unit_scope(pid: i32) -> Option<bool> {
+    let raw = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    scope_from_cgroup(&raw)
+}
+
+/// `/proc/<pid>/cgroup` 본문에서 스코프를 읽는다.
+///
+/// 사용자 단위는 `user@<uid>.service` 아래에, system 단위는 `system.slice` 아래에 놓인다.
+/// 사용자 쪽을 먼저 보는 이유: 사용자 세션 경로에도 `.slice`가 여러 겹 쌓여 있어, system만
+/// 찾으면 사용자 단위를 system으로 오판할 수 있다.
+///
+/// `user.slice`까지 보는 이유: `aic daemon start`로 직접 띄운 데몬은 유닛이 아니라 로그인
+/// 세션에 붙어 `/user.slice/user-0.slice/session-N.scope`에 놓인다. `user@`만 찾으면 그 데몬이
+/// 스코프 불명으로 떨어져, 사용자 단위가 하나도 없는 호스트에서 system 설치와 재시작이
+/// "사용자 단위가 남아 있다"며 막힌다.
+fn scope_from_cgroup(cgroup: &str) -> Option<bool> {
+    if cgroup.contains("user@") || cgroup.contains("user.slice") {
+        return Some(false);
     }
-    if user_unit_active {
-        lines.push("  활성 유닛: systemctl --user aicd.service".to_string());
-    } else if let Some(path) = &user_unit_file {
-        lines.push(format!("  남은 유닛 파일: {}", path.display()));
+    if cgroup.contains("system.slice") {
+        return Some(true);
     }
-    lines.push("  먼저 정리하세요:".to_string());
-    if holder.is_some() {
-        lines.push("    aic daemon stop".to_string());
-    }
-    if user_unit_active {
-        lines.push("    systemctl --user disable --now aicd".to_string());
-    }
-    if let Some(path) = &user_unit_file {
-        // 파일을 지우지 않으면 disable해도 되살아날 수 있다 — 이번 사고의 실제 경로였다.
-        lines.push(format!("    rm -f {}", path.display()));
-        lines.push("    systemctl --user daemon-reload".to_string());
-    }
-    Some(lines.join("\n"))
+    None
 }
 
 /// Linux systemd **system** unit 경로. root로 설치할 때 쓴다.
@@ -296,6 +465,23 @@ pub fn render_linux_service_for(aicd_path: &Path, log_dir: &Path, system: bool) 
         Some(dir) => format!("\nEnvironment=AIC_RUNTIME_DIR={dir}"),
         None => String::new(),
     };
+    // systemd는 `User=`가 없는 system 유닛에 HOME을 넣지 않는다. 그러면 aicd가 config·state
+    // 경로를 홈 기준으로 풀지 못해 설정을 하나도 못 읽은 채 뜬다(실서버에서 그랬다).
+    // `HOME` 대신 passwd를 읽는 이유: `sudo aic daemon install --system`에서 `HOME`은 sudo를
+    // 부른 사람의 홈일 수 있는데, 유닛이 가리켜야 하는 것은 데몬이 실제로 돌 root의 홈이다.
+    // 사용자 단위는 systemd user manager가 HOME을 물려주므로 건드리지 않는다.
+    let home_env = match (system, aic_common::paths::passwd_home()) {
+        (true, Some(home)) => match home.to_str() {
+            // systemd는 `Environment=`를 공백으로 쪼갠다. 감싸지 않으면 공백이 든 홈 경로가
+            // 잘려 들어가, 이 줄이 고치려던 "설정을 못 읽는" 상태가 형태만 바꿔 재현된다.
+            // 개행·복귀문자는 INI 자체를 깨뜨리므로 거른다(`effective_runtime_dir_env`와 같은 이유).
+            Some(h) if !h.trim().is_empty() && !h.contains(['\n', '\r']) => {
+                format!("\nEnvironment=\"HOME={h}\"")
+            }
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
     let target = if system {
         "multi-user.target"
     } else {
@@ -312,7 +498,7 @@ Type=simple
 ExecStart={aicd}
 Restart=on-failure
 RestartSec=2
-Environment=AIC_LOG=info{runtime_dir_env}
+Environment=AIC_LOG=info{runtime_dir_env}{home_env}
 StandardOutput=append:{stdout}
 StandardError=append:{stderr}
 
@@ -361,12 +547,16 @@ pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> 
             "--system 설치는 root 권한이 필요합니다 (sudo aic daemon install --system)"
         ));
     }
-    if system {
-        // system 유닛과 user 유닛이 같이 떠 있으면 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은
-        // 영원히 실패한다. systemd가 재시작을 반복해 로그만 쌓이므로, 설치 단계에서 막는다.
-        if let Some(conflict) = conflicting_user_daemon() {
-            return Err(anyhow!("{conflict}"));
-        }
+    // system 유닛과 사용자 단위가 같이 떠 있으면 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은
+    // 영원히 실패한다. systemd가 재시작을 반복해 로그만 쌓이므로, 설치 단계에서 막는다.
+    // 어느 쪽을 깔든 반대쪽을 본다 — 한 방향만 막으면 반대 순서로 같은 사고가 난다.
+    if let Some(conflict) = detect_unit_conflict(system) {
+        let action = if system {
+            "system 설치"
+        } else {
+            "사용자 단위 설치"
+        };
+        return Err(anyhow!("{}", conflict.remediation(action)));
     }
     if platform == Platform::Unsupported {
         return Err(anyhow!(
@@ -741,6 +931,12 @@ pub fn restart_via_unit() -> Result<bool> {
     if !unit.exists() {
         return Ok(false);
     }
+    // 반대 스코프의 aicd가 lock을 쥐고 있으면 `systemctl restart`는 성공 코드를 돌려주면서도
+    // 유닛은 기동 실패를 반복한다. 그대로 두면 업데이트가 끝났다고 보고하면서 옛 데몬이 계속
+    // 도는 상태가 되므로, 재시작을 시작하기 전에 멈춘다.
+    if let Some(conflict) = detect_unit_conflict(system) {
+        return Err(anyhow!("{}", conflict.remediation("재시작")));
+    }
     match detect_platform() {
         Platform::Macos => {
             let uid = unsafe { libc::getuid() };
@@ -1043,5 +1239,134 @@ mod tests {
         if let Some(prev) = prev {
             std::env::set_var("XDG_RUNTIME_DIR", prev);
         }
+    }
+
+    /// 이 테스트가 지키는 것: lock 보유자가 어느 스코프에서 떴는지 구분하는 것.
+    /// 깨지면 두 유닛이 같이 설치된 호스트에서 "누가 lock을 쥐었나"를 못 읽어,
+    /// 안내가 엉뚱한 쪽을 정리하라고 시킨다.
+    #[test]
+    fn cgroup_tells_a_user_unit_from_a_system_unit() {
+        // 실서버(okrr-intranet-2)에서 그대로 읽은 두 형태.
+        assert_eq!(
+            scope_from_cgroup(
+                "0::/user.slice/user-0.slice/user@0.service/app.slice/aicd.service\n"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            scope_from_cgroup("0::/system.slice/aicd.service\n"),
+            Some(true)
+        );
+        assert_eq!(scope_from_cgroup("0::/\n"), None);
+    }
+
+    /// 이 테스트가 지키는 것: 안내가 **반대 스코프**를 가리키는 것.
+    /// 깨지면 사용자 단위를 깔다 막힌 사람에게 사용자 단위를 지우라고 안내한다.
+    #[test]
+    fn a_user_scope_install_is_told_to_clean_the_system_unit() {
+        let conflict = UnitConflict {
+            target_system: false,
+            other_unit: Some(PathBuf::from("/etc/systemd/system/aicd.service")),
+            other_active: true,
+            holder: Some(4242),
+            holder_system: Some(true),
+        };
+        let text = conflict.remediation("사용자 단위 설치");
+        assert!(text.contains("/etc/systemd/system/aicd.service"), "{text}");
+        assert!(text.contains("systemctl disable --now aicd"), "{text}");
+        assert!(
+            !text.contains("--user"),
+            "반대 스코프를 가리켜야 한다: {text}"
+        );
+        assert!(text.contains("aic daemon stop"), "{text}");
+    }
+
+    /// 이 테스트가 지키는 것: system 설치 쪽 안내가 예전 그대로 사용자 단위를 겨냥하는 것.
+    /// 파일 삭제와 daemon-reload가 빠지면 disable해도 유닛이 되살아난다.
+    #[test]
+    fn a_system_install_is_told_to_clean_the_user_unit() {
+        let conflict = UnitConflict {
+            target_system: true,
+            other_unit: Some(PathBuf::from("/root/.config/systemd/user/aicd.service")),
+            other_active: false,
+            holder: None,
+            holder_system: None,
+        };
+        let text = conflict.remediation("system 설치");
+        assert!(
+            text.contains("rm -f /root/.config/systemd/user/aicd.service"),
+            "{text}"
+        );
+        assert!(text.contains("systemctl --user daemon-reload"), "{text}");
+        // 죽은 데몬이 없으면 stop을 시키지 않는다.
+        assert!(!text.contains("aic daemon stop"), "{text}");
+    }
+
+    /// 이 테스트가 지키는 것: 요약이 lock을 쥔 쪽을 이름으로 밝히는 것.
+    /// `aic status`에서 이 한 줄이 없으면 운영자는 재시작 루프의 원인을 못 찾는다.
+    #[test]
+    fn the_summary_names_the_scope_holding_the_lock() {
+        let conflict = UnitConflict {
+            target_system: true,
+            other_unit: Some(PathBuf::from("/root/.config/systemd/user/aicd.service")),
+            other_active: true,
+            holder: Some(1813286),
+            holder_system: Some(false),
+        };
+        let summary = conflict.summary();
+        assert!(summary.contains("사용자 단위"), "{summary}");
+        assert!(summary.contains("1813286"), "{summary}");
+    }
+
+    /// 이 테스트가 지키는 것: system 유닛이 HOME을 들고 가는 것.
+    /// 깨지면 systemd가 HOME 없이 aicd를 띄우고, aicd는 config를 못 읽은 채 exporter와
+    /// 셀프업데이트를 전부 off로 올린다 — 에러 하나 없이.
+    #[test]
+    fn a_system_unit_carries_home_so_config_resolves() {
+        let body = render_linux_service_for(
+            Path::new("/usr/local/bin/aicd"),
+            Path::new("/var/log/aic"),
+            true,
+        );
+        if aic_common::paths::passwd_home().is_some() {
+            assert!(body.contains("Environment=\"HOME="), "{body}");
+        }
+    }
+
+    /// 이 테스트가 지키는 것: 사용자 단위는 HOME을 박지 않는 것.
+    /// user manager가 물려주는 값이 정답이라, 설치 시점 값을 굳히면 홈이 바뀐 계정에서 어긋난다.
+    #[test]
+    fn a_user_unit_leaves_home_to_the_session_manager() {
+        let body = render_linux_service_for(
+            Path::new("/usr/local/bin/aicd"),
+            Path::new("/var/log/aic"),
+            false,
+        );
+        assert!(!body.contains("Environment=\"HOME="), "{body}");
+    }
+
+    /// 이 테스트가 지키는 것: 같은 스코프의 데몬에는 중지를 권하지 않는 것.
+    /// 잔존 유닛 파일이 원인일 때 멀쩡히 돌고 있는 데몬을 멈추라고 하면 텔레메트리만 끊긴다.
+    #[test]
+    fn a_daemon_in_the_same_scope_is_not_asked_to_stop() {
+        let conflict = UnitConflict {
+            target_system: true,
+            other_unit: Some(PathBuf::from("/root/.config/systemd/user/aicd.service")),
+            other_active: false,
+            holder: Some(1828830),
+            holder_system: Some(true),
+        };
+        let cmds = conflict.cleanup_commands();
+        assert!(!cmds.iter().any(|c| c.contains("daemon stop")), "{cmds:?}");
+        assert!(cmds.iter().any(|c| c.starts_with("rm -f")), "{cmds:?}");
+    }
+
+    /// 이 테스트가 지키는 것: 목적격 조사가 받침을 따르는 것.
+    /// 실서버 출력에 "설치을 중단합니다"가 그대로 찍혔다.
+    #[test]
+    fn the_particle_follows_the_final_consonant() {
+        assert_eq!(object_particle("사용자 단위 설치"), "를");
+        assert_eq!(object_particle("system 설치"), "를");
+        assert_eq!(object_particle("재시작"), "을");
     }
 }

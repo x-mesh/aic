@@ -538,16 +538,64 @@ pub fn log_dir() -> PathBuf {
     }
 }
 
+/// passwd 데이터베이스가 말하는 현재 uid의 홈. `HOME`을 신뢰할 수 없는 자리에서 쓴다.
+///
+/// `getpwuid`가 아니라 `getpwuid_r`을 쓰는 이유: 전자는 호출마다 같은 정적 버퍼를 돌려줘
+/// aicd의 멀티스레드 런타임에서 서로 덮어쓴다.
+pub fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // glibc가 권하는 초기 크기. 모자라면 ERANGE가 나고, 그때는 홈을 못 읽은 것으로 본다 —
+    // 홈 경로가 1KiB를 넘는 계정을 위해 재시도 루프를 두지는 않는다.
+    const PASSWD_BUF_BYTES: usize = 1024;
+
+    let mut buf = vec![0 as libc::c_char; PASSWD_BUF_BYTES];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            // 런타임 경로 분기의 기준인 `is_system_service()`가 `geteuid()`라 판정을 맞춘다.
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    if dir.to_bytes().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+/// 홈 디렉터리. `HOME`이 비어 있으면 passwd 데이터베이스에서 읽는다.
+///
+/// **왜 `HOME`만으로 부족한가**: systemd는 `User=`가 없는 system 유닛에 `HOME`을 넣지 않는다.
+/// 그 환경에서 예전 fallback은 리터럴 `~`를 돌려줬고, config 경로가
+/// `/~/.config/aic/config.toml`이 되어 aicd가 설정을 하나도 못 읽은 채 exporter와
+/// 셀프업데이트를 전부 off로 띄웠다(실서버에서 그랬다).
+fn home_dir() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if !home.as_os_str().is_empty() {
+            return home;
+        }
+    }
+    // passwd에도 없는 경우는 uid에 대응하는 계정이 없는 컨테이너 정도다. 예전 동작을 그대로
+    // 둔다 — 여기서 임의의 경로를 고르면 남의 홈에 쓰게 될 수 있다.
+    passwd_home().unwrap_or_else(|| PathBuf::from("~"))
+}
+
 /// 영속 상태 디렉터리 (XDG State). `$XDG_STATE_HOME/aic` 또는 `~/.local/state/aic`.
 /// session_dir(runtime, ephemeral)과 달리 재부팅을 넘어 보존되는 로그/이벤트용.
 pub fn state_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         PathBuf::from(xdg).join("aic")
     } else {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"));
-        home.join(".local").join("state").join("aic")
+        home_dir().join(".local").join("state").join("aic")
     }
 }
 
@@ -570,11 +618,8 @@ pub fn config_file_path() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         PathBuf::from(xdg).join("aic").join("config.toml")
     } else {
-        // aic-common은 lean하게 유지(dirs 미사용) — HOME에서 직접 결정.
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~"));
-        home.join(".config").join("aic").join("config.toml")
+        // aic-common은 lean하게 유지(dirs 미사용) — HOME/passwd에서 직접 결정.
+        home_dir().join(".config").join("aic").join("config.toml")
     }
 }
 
@@ -586,10 +631,7 @@ pub fn config_file_path() -> PathBuf {
 /// 쉽다. 디렉토리는 `Spool::open`이 0700 권한으로 생성한다(다른 로컬 사용자가 spool된 —
 /// 이미 redact된 — protobuf payload를 못 읽게).
 pub fn otlp_spool_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".aic").join("otlp-spool")
+    home_dir().join(".aic").join("otlp-spool")
 }
 
 /// aicd 로그 수집기(journald/file/container) 체크포인트 디렉토리 (RFC-006). `~/.aic/log-checkpoints/`.
@@ -598,10 +640,7 @@ pub fn otlp_spool_dir() -> PathBuf {
 /// 세션 runtime도 XDG state도 아닌 "재시작 후 이어 읽기 위한 로컬 커서 저장소"라는 별도
 /// 범주다. 디렉토리는 `CheckpointStore::open`이 0700 권한으로 생성한다.
 pub fn log_checkpoint_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".aic").join("log-checkpoints")
+    home_dir().join(".aic").join("log-checkpoints")
 }
 
 /// shell hook start/end 사이의 임시 metadata 경로.
@@ -1464,5 +1503,31 @@ mod tests {
         let _ = fs::remove_dir_all(&dir); // ensure missing
         let paths = list_session_sockets_in(&dir);
         assert!(paths.is_empty());
+    }
+
+    /// 이 테스트가 지키는 것: `HOME` 없이도 홈을 찾는 것.
+    /// 깨지면 systemd system 유닛으로 뜬 aicd가 `/~/.config/aic/config.toml`을 읽으려다
+    /// 조용히 실패하고, 설정이 하나도 반영되지 않은 채 동작한다(실서버에서 그랬다).
+    #[test]
+    fn home_resolves_without_the_home_env() {
+        // `state_dir`·`config_file_path`가 모두 HOME을 읽으므로, 락 없이 지우면 병렬로 도는
+        // 다른 테스트가 그 창에 끼어 간헐 실패한다(모듈 상단 `ENV_LOCK` 주석 참고).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        std::env::remove_var("HOME");
+
+        let resolved = home_dir();
+        let passwd = passwd_home();
+
+        if let Some(prev) = prev {
+            std::env::set_var("HOME", prev);
+        }
+
+        // uid에 대응하는 passwd 엔트리가 없는 컨테이너에서는 예전 동작이 남는다.
+        if let Some(passwd) = passwd {
+            assert_eq!(resolved, passwd);
+            assert!(resolved.is_absolute(), "{resolved:?}");
+            assert_ne!(resolved, PathBuf::from("~"));
+        }
     }
 }
