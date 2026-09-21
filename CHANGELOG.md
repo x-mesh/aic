@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-09-21
+
 ### Changed
 
 - 등록으로 바꿀 수 있는 설정이 `aic config set`과 같은 범위가 됐다. 0.44.0은 `aicd.exporter.self_update_enabled`와 `session.capture_mode` 두 개만 받았는데, 운영에서 필요한 설정이 매번 그 밖에 있어 결국 호스트마다 `config.toml`을 손으로 고치고 데몬을 재시작하게 됐다. 허용 목록은 `aic` 안의 상수일 뿐 밖으로 알려지지 않아, 등록 키를 발급하는 쪽은 무엇이 적용될지 알 방법도 없었다. 접속 주소와 ingest 토큰을 무시하는 것은 그대로다.
