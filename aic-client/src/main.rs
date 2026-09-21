@@ -2243,7 +2243,7 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
             "\n{COL_YELLOW}⚠{COL_RESET} enrollment는 완료됐습니다 \
              (key 교환·config 저장 성공) — aicd 자동 시작 등록만 남았습니다.\n\
              \x20 원인: {e}\n\
-             \x20 조치: 위 문제를 해결한 뒤 `aic daemon install`을 실행하세요. \
+             \x20 조치: 위 안내가 가리키는 정리를 끝낸 뒤 `aic daemon install`을 실행하세요. \
              enroll을 다시 하거나 새 key를 발급할 필요는 없습니다."
         );
     }

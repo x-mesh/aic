@@ -213,7 +213,34 @@ impl UnitConflict {
     /// 않는다. lock을 쥔 쪽이 유닛이 아니라 손으로 띄운 프로세스라면 여기서 해결되지 않고,
     /// 호출부가 남은 충돌을 다시 진단한다.
     pub fn reclaim(&self) -> Result<Vec<String>> {
+        use std::os::unix::fs::MetadataExt;
+
         let mut done = Vec::new();
+
+        // 지울 수 있는 파일인지 **멈추기 전에** 확인한다. 데몬을 세운 뒤 삭제가 막히면 옛 유닛도
+        // 새 유닛도 없는 호스트가 된다.
+        //
+        // 소유자를 보는 이유: `linux_unit_path()`는 `HOME`/`XDG_CONFIG_HOME` 기반이라
+        // `sudo -E`나 `su -m`처럼 환경이 보존된 실행에서는 **호출자의** 홈을 가리킬 수 있다.
+        // 그대로 두면 남의 유닛 파일을 지운다.
+        if let Some(path) = &self.other_unit {
+            if path.exists() {
+                let owner = std::fs::metadata(path)
+                    .with_context(|| {
+                        format!("유닛 파일 정보를 읽지 못했습니다: {}", path.display())
+                    })?
+                    .uid();
+                let me = unsafe { libc::geteuid() };
+                if owner != me {
+                    return Err(anyhow!(
+                        "유닛 파일 {}의 소유자(uid {owner})가 현재 사용자(uid {me})와 달라 \
+                         정리하지 않습니다 — 직접 확인한 뒤 지우세요",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
         if self.other_active {
             let stopped = self
                 .systemctl_for_other()
@@ -221,10 +248,19 @@ impl UnitConflict {
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
-            if stopped {
-                done.push(format!("{} disable --now aicd", self.systemctl_prefix()));
+            // 멈추지 못한 채 파일을 지우면 고아 데몬이 lock을 쥔 채 남고, 뒤이어 출력할 정리
+            // 안내는 이미 사라진 유닛을 가리켜 실행조차 되지 않는다.
+            if !stopped {
+                return Err(anyhow!(
+                    "남아 있는 {} aicd를 멈추지 못했습니다 — 유닛 파일은 그대로 두었습니다. \
+                     `{} disable --now aicd`를 직접 실행한 뒤 다시 시도하세요",
+                    self.other_label(),
+                    self.systemctl_prefix()
+                ));
             }
+            done.push(format!("{} disable --now aicd", self.systemctl_prefix()));
         }
+
         if let Some(path) = &self.other_unit {
             if path.exists() {
                 std::fs::remove_file(path)
@@ -233,8 +269,15 @@ impl UnitConflict {
             }
             // 파일만 지우고 reload하지 않으면 systemd가 유닛을 계속 기억한다 — 남은 상태가
             // 바로 다음에 이어지는 설치와 엉킨다.
-            let _ = self.systemctl_for_other().arg("daemon-reload").output();
-            done.push(format!("{} daemon-reload", self.systemctl_prefix()));
+            let reloaded = self
+                .systemctl_for_other()
+                .arg("daemon-reload")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if reloaded {
+                done.push(format!("{} daemon-reload", self.systemctl_prefix()));
+            }
         }
         Ok(done)
     }
@@ -611,6 +654,16 @@ pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<In
         if !force {
             return Err(anyhow!("{}", conflict.remediation(action)));
         }
+        // `--force`는 사용자 단위만 정리한다. `--system`을 빠뜨린 채 force를 치면 구성 관리가
+        // 깐 전역 서비스가 확인 없이 사라진다 — 전역 유닛 제거는 `aic daemon uninstall`이라는
+        // 명시적 의사표시로만 한다.
+        if !system {
+            return Err(anyhow!(
+                "{}\n  --force는 사용자 단위만 정리합니다. system 유닛을 정리하려면 \
+                 `sudo aic daemon uninstall`을 쓰거나 `--system`으로 설치하세요.",
+                conflict.remediation(action)
+            ));
+        }
         eprintln!(
             "남아 있는 {} aicd를 정리하고 설치를 계속합니다:",
             conflict.other_label()
@@ -684,6 +737,18 @@ pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<In
             Platform::Unsupported => unreachable!(),
         }
     };
+
+    // **이미 돌고 있는 유닛은 `enable --now`로 갱신되지 않는다.** 유닛 본문이 같으면 파일도
+    // 다시 쓰지 않으므로, 재설치는 binary만 바꾸고 옛 프로세스를 그대로 남긴다 — 옛 토큰과 옛
+    // binary로 계속 도는 상태가 정확히 이 변경이 없애려던 것이다. force는 재설치를 복구 수단으로
+    // 쓰는 경로이므로 여기서 명시적으로 재시작한다.
+    if force && loaded {
+        match restart_via_unit() {
+            Ok(true) => eprintln!("  유닛을 재시작해 새 binary를 반영했습니다"),
+            Ok(false) => {}
+            Err(e) => eprintln!("  ⚠ 유닛 재시작 실패: {e}"),
+        }
+    }
 
     // enable만으로는 로그아웃 후 생존이 보장되지 않는다(위 ensure_linger 주석 참고).
     // launchd에는 linger 개념이 없고, --no-load는 매니저를 건드리지 않겠다는 뜻이라 둘 다 제외.
@@ -1460,10 +1525,14 @@ mod tests {
             done.iter().any(|step| step.starts_with("rm -f")),
             "수행 목록에 파일 제거가 없다: {done:?}"
         );
-        assert!(
-            done.iter().any(|step| step.ends_with("daemon-reload")),
-            "파일만 지우고 reload하지 않으면 systemd가 유닛을 계속 기억한다: {done:?}"
-        );
+        // `daemon-reload`는 **성공했을 때만** 목록에 오른다. systemctl이 없는 호스트(macOS)에서는
+        // 빠지는 것이 맞다 — 목록은 안내가 아니라 "실제로 해낸 일"이다.
+        for step in &done {
+            assert!(
+                step.starts_with("rm -f") || step.ends_with("daemon-reload"),
+                "해내지 않은 일이 목록에 있다: {step}"
+            );
+        }
     }
 
     /// 이 테스트가 지키는 것: 지울 유닛이 없으면 아무것도 건드리지 않는 것.
@@ -1492,15 +1561,24 @@ mod tests {
                 holder: None,
                 holder_system: None,
             };
-            let prefix = conflict.systemctl_prefix();
-            if target_system {
-                assert_eq!(
-                    prefix, "systemctl --user",
-                    "system 설치의 반대는 사용자 단위다"
-                );
-            } else {
-                assert_eq!(prefix, "systemctl", "사용자 설치의 반대는 system 단위다");
-            }
+            // 안내 문구가 아니라 실제로 실행될 `Command`를 본다 — 문구만 맞고 호출이
+            // 뒤집히면 방금 깐 유닛을 스스로 지운다.
+            let cmd = conflict.systemctl_for_other();
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let user_scoped = args.iter().any(|a| a == "--user");
+            assert_eq!(
+                user_scoped, target_system,
+                "system 설치의 반대는 사용자 단위, 사용자 설치의 반대는 system 단위다 \
+                 (target_system={target_system}, args={args:?})"
+            );
+            assert_eq!(
+                user_scoped,
+                conflict.systemctl_prefix().contains("--user"),
+                "실행되는 Command와 안내 문구가 갈라졌다"
+            );
         }
     }
 }
