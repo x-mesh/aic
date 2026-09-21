@@ -779,6 +779,38 @@ pub struct AicdExporterConfig {
     pub enrollment_id: Option<String>,
 }
 
+/// aicd가 config 파일 변경을 확인하는 주기(초).
+///
+/// `aic config set`이 "언제 반영되는가"를 사람에게 말하려면 이 값을 알아야 한다. aicd 안에만
+/// 두면 안내 문구가 실제 주기와 갈린다.
+pub const CONFIG_RELOAD_INTERVAL_SECS: u64 = 10;
+
+/// aicd가 실행 중에 다시 읽어 반영하는 설정 경로.
+///
+/// 여기 없는 `aicd.*` 경로는 데몬을 재시작해야 반영된다. 이 목록은 aicd의 `live_config`가 실제로
+/// 반영하는 것과 **같아야 한다** — 갈리면 사용자가 필요 없는 재시작을 하거나, 반영되지 않은 값을
+/// 반영됐다고 믿는다.
+pub const LIVE_RELOADABLE_CONFIG_PATHS: &[&str] = &[
+    "aicd.exporter.token",
+    "aicd.exporter.interval_secs",
+    "aicd.exporter.connections_interval_secs",
+    "aicd.exporter.changes_interval_secs",
+    "aicd.exporter.docker_interval_secs",
+    "aicd.exporter.kernel_interval_secs",
+    "aicd.exporter.self_update_enabled",
+    "aicd.exporter.self_update_interval_secs",
+    "aicd.exporter.spool_drain_batch_limit",
+    "aicd.exporter.spool_max_age_secs",
+    "aicd.exporter.process_enabled",
+    "aicd.exporter.process_inventory_enabled",
+    "aicd.exporter.docker_bin",
+];
+
+/// 그 경로를 aicd가 재시작 없이 반영하는가.
+pub fn is_live_reloadable(path: &str) -> bool {
+    LIVE_RELOADABLE_CONFIG_PATHS.contains(&path)
+}
+
 impl Default for AicdExporterConfig {
     fn default() -> Self {
         Self {
@@ -1125,6 +1157,37 @@ pub struct AnalysisResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_live_reloadable_path_names_a_real_field() {
+        // 오타 하나면 `aic config set`이 그 경로에 "재시작이 필요 없습니다"를 영영 내지 않는다.
+        // 조용히 틀리는 종류라 목록과 struct를 여기서 묶어 둔다.
+        let value = serde_json::to_value(AicdExporterConfig::default()).expect("직렬화");
+        let fields = value.as_object().expect("객체");
+        for path in LIVE_RELOADABLE_CONFIG_PATHS {
+            let field = path
+                .strip_prefix("aicd.exporter.")
+                .unwrap_or_else(|| panic!("{path}는 [aicd.exporter] 경로가 아니다"));
+            assert!(fields.contains_key(field), "{path}에 해당하는 필드가 없다");
+        }
+    }
+
+    #[test]
+    fn settings_that_need_a_restart_stay_off_the_list() {
+        // task를 띄울지 결정하거나 기동 시 자원을 잡는 값이 목록에 들어가면, 사용자는 반영되지
+        // 않은 값을 반영됐다고 믿는다.
+        for path in [
+            "aicd.exporter.enabled",
+            "aicd.exporter.endpoint",
+            "aicd.exporter.logs_enabled",
+            "aicd.exporter.kernel_enabled",
+            "aicd.exporter.kernel_url",
+            "aicd.exporter.spool_max_bytes",
+            "aicd.exporter.enrollment_id",
+        ] {
+            assert!(!is_live_reloadable(path), "{path}는 재시작이 필요하다");
+        }
+    }
+
     use super::*;
     use chrono::Utc;
 

@@ -2428,17 +2428,33 @@ fn read_config_value(value: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// 셀프업데이트 설정 경로. 부모 게이트(`[aicd.exporter] enabled`)와 독립이라 다른 exporter
+/// 하위 값과 안내가 다르다 — 텔레메트리를 보내는 것과 디스크의 binary를 교체하는 것은 같은
+/// 동의가 아니라서, aicd는 endpoint만 보고 이 task를 띄운다.
+const SELF_UPDATE_CONFIG_PATHS: &[&str] = &[
+    "aicd.exporter.self_update_enabled",
+    "aicd.exporter.self_update_interval_secs",
+];
+
 /// 값을 바꾼 뒤 실제로 필요한 다음 걸음을 알린다.
 ///
-/// aicd가 읽는 값은 **기동 시 한 번만** 읽힌다. 파일을 고쳐 놓고 반영을 기다리는 일을 막는다.
+/// aicd가 다시 읽는 값과 기동 시 한 번만 읽는 값은 다음 걸음이 다르다. 재시작이 필요 없는데
+/// 재시작하라고 하면 쓸데없이 수집이 비고, 필요한데 말하지 않으면 파일을 고쳐 놓고 반영을
+/// 기다리게 된다.
 fn print_config_set_followup(config: &AppConfig, path: &str) {
     if !path.starts_with("aicd.") {
         return;
     }
-    // exporter 하위 플래그는 부모 게이트가 꺼져 있으면 아무 일도 하지 않는다. aicd는 로그에만
-    // 경고를 남기므로, 켜는 자리에서 말해 주지 않으면 왜 안 도는지를 따로 찾게 된다.
-    if path.starts_with("aicd.exporter.") && path != "aicd.exporter.enabled" {
-        let exporter = &config.aicd.exporter;
+    let exporter = &config.aicd.exporter;
+    if SELF_UPDATE_CONFIG_PATHS.contains(&path) {
+        if exporter.endpoint.trim().is_empty() {
+            println!(
+                "  {COL_YELLOW}⚠{COL_RESET} [aicd.exporter] endpoint가 비어 있습니다 — 셀프업데이트가 뜨지 않습니다"
+            );
+        }
+    } else if path.starts_with("aicd.exporter.") && path != "aicd.exporter.enabled" {
+        // exporter 하위 플래그는 부모 게이트가 꺼져 있으면 아무 일도 하지 않는다. aicd는 로그에만
+        // 경고를 남기므로, 켜는 자리에서 말해 주지 않으면 왜 안 도는지를 따로 찾게 된다.
         if !exporter.enabled {
             println!(
                 "  {COL_YELLOW}⚠{COL_RESET} [aicd.exporter] enabled = false — 이 값은 아직 동작하지 않습니다"
@@ -2449,9 +2465,16 @@ fn print_config_set_followup(config: &AppConfig, path: &str) {
             );
         }
     }
-    println!(
-        "  {COL_DIM}aicd는 기동 시 설정을 읽습니다 — 반영하려면: {COL_RESET}{COL_BOLD}aic daemon restart{COL_RESET}"
-    );
+    if aic_common::is_live_reloadable(path) {
+        println!(
+            "  {COL_DIM}aicd가 최대 {}초 안에 설정을 다시 읽습니다 — 재시작이 필요 없습니다{COL_RESET}",
+            aic_common::CONFIG_RELOAD_INTERVAL_SECS
+        );
+    } else {
+        println!(
+            "  {COL_DIM}aicd는 기동 시 이 값을 읽습니다 — 반영하려면: {COL_RESET}{COL_BOLD}aic daemon restart{COL_RESET}"
+        );
+    }
 }
 
 fn apply_config_set(config: &mut AppConfig, path: &str, value: &str) -> anyhow::Result<()> {

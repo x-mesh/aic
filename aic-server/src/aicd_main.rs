@@ -355,7 +355,9 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     // 것이 없다. 부모 `enabled`가 켜져도 따라 켜지지 않는 이유는, 텔레메트리를
     // 보내는 것과 디스크의 binary를 갈아끼우는 것이 같은 동의가 아니기 때문이다.
     let self_update_handle = match exporter_section.as_ref() {
-        Some(ex) if ex.self_update_enabled && !ex.endpoint.trim().is_empty() => {
+        // endpoint만 있으면 task를 띄운다. 켜고 끄는 것은 루프가 매 주기 확인하므로, 꺼진 채로
+        // 떠 있어도 중앙을 두드리지 않는다 — 대신 나중에 켤 때 데몬을 재시작하지 않아도 된다.
+        Some(ex) if !ex.endpoint.trim().is_empty() => {
             let token = std::env::var("AIC_EXPORTER_TOKEN")
                 .ok()
                 .or_else(|| ex.token.clone());

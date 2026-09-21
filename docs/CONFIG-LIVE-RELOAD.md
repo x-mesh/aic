@@ -24,6 +24,7 @@ collector가 죽어 있는 동안 쌓아 두었다가 재전송하는 버퍼이�
 | `changes_interval_secs` | 30 | 다음 tick |
 | `docker_interval_secs` | 60 | 다음 tick |
 | `kernel_interval_secs` | 60 | 다음 tick |
+| `self_update_enabled` | false | 다음 확인 주기 |
 | `self_update_interval_secs` | 3600 | 마지막 확인 시각 기준으로 재계산 |
 | `spool_drain_batch_limit` | 20 | 다음 tick |
 | `spool_max_age_secs` | 없음 | 다음 tick |
@@ -40,6 +41,15 @@ logs)에 **동시에** 적용된다. 일부만 바뀌면 회전 직후 나머지
 `self_update_interval_secs`를 줄였는데 그만큼이 이미 지났으면 곧바로 확인한다. 기준은 변경 시각이
 아니라 마지막 확인 시각이다. 변경 시각을 기준으로 다시 재면 설정을 연달아 고치는 동안 확인이
 영원히 밀린다.
+
+`self_update_enabled`는 조건이 하나 붙는다. `aicd`는 **`endpoint`가 설정돼 있으면** 셀프업데이트
+task를 띄우고, 꺼져 있는 동안 그 task는 중앙에 묻지 않고 대기만 한다. 그래서 켜고 끄는 것은
+재시작 없이 된다. `endpoint`가 비어 있는 상태로 기동했다면 task 자체가 없으므로, 주소를 채운 뒤
+한 번은 재시작해야 한다.
+
+셀프업데이트는 `[aicd.exporter] enabled`와 독립이다. 텔레메트리를 보내는 것과 디스크의 binary를
+교체하는 것은 같은 동의가 아니라서 게이트를 따로 둔다. exporter를 꺼 두어도 셀프업데이트는
+동작한다.
 
 ## 반영 흐름
 
@@ -58,9 +68,25 @@ logs)에 **동시에** 적용된다. 일부만 바뀌면 회전 직후 나머지
 ## 바꾸는 방법
 
 ```sh
+# 자체 업데이트를 켜고 확인 주기를 10분으로
+aic config set aicd.exporter.self_update_enabled true
 aic config set aicd.exporter.self_update_interval_secs 600
+
+# 수집 주기를 30초로
 aic config set aicd.exporter.interval_secs 30
+
+# ingest 토큰 회전. 값이 shell history에 남지 않게 stdin으로 넣는다
+aic config set aicd.exporter.token - < new-token.txt
 ```
+
+`aic config set`은 바꾼 값이 언제 적용되는지 마지막 줄에 알린다.
+
+```
+✔ aicd.exporter.self_update_enabled = true
+  aicd가 최대 10초 안에 설정을 다시 읽습니다 — 재시작이 필요 없습니다
+```
+
+재시작이 필요한 값에는 대신 `aic daemon restart`를 안내한다. 어느 쪽인지 외울 필요가 없다.
 
 `aic config set`은 임시 파일에 쓰고 rename한다. rename은 같은 파일시스템 안에서 원자적이므로,
 `aicd`가 읽는 순간에는 이전 완성본이나 새 완성본 중 하나만 보인다. 부분 작성 파일을 파싱해 exporter가
@@ -76,14 +102,37 @@ aic config set aicd.exporter.interval_secs 30
 - `수집 주기 변경 적용` — 어느 exporter의 주기가 몇 초에서 몇 초로 바뀌었는지 `exporter` 필드가
   가리킨다.
 - `셀프업데이트 주기 변경 적용` — 셀프업데이트 확인 주기가 바뀌었다.
+- `셀프업데이트 스위치 변경 적용` — `self_update_enabled`가 바뀌었다. `enabled` 필드가 지금 값이다.
 
-`self_update_interval_secs`는 `aic status`에도 실린다.
+셀프업데이트 설정은 `aic status`에도 실린다.
 
 ```sh
-aic status --json | jq .self_update.interval_secs
+aic status --json | jq .self_update
 ```
 
+`aic status`의 "자동 업데이트" 줄에서도 같은 값을 읽는다. 껐으면 `꺼짐`, 켰으면 `동작 중 (N초
+주기)`로 바뀐다.
+
 값이 바뀌지 않으면 스냅샷이 교체되지 않은 것이다. 설정 경로 철자와 파일 mtime을 확인한다.
+
+### 설정이 무시되는 가장 흔한 원인
+
+점 표기 키를 다른 테이블 **안**에 적으면 TOML은 그 테이블의 하위 키로 해석한다.
+
+```toml
+[rca_agent]
+enabled = false
+aicd.exporter.self_update_enabled = true   # rca_agent.aicd.exporter.… 가 된다
+```
+
+이 줄은 오류를 내지 않고 조용히 무시된다. `aic config get`으로 확인한다.
+
+```sh
+aic config get aicd.exporter.self_update_enabled
+```
+
+`aic config set`은 값을 항상 올바른 테이블에 쓰므로 이 함정이 없다. 파일을 손으로 고칠 이유가
+없다면 명령을 쓴다.
 
 ## 재시작이 필요한 설정
 
@@ -94,7 +143,6 @@ aic status --json | jq .self_update.interval_secs
 |---|---|
 | `enabled` | exporter task 전체를 띄울지 결정한다 |
 | `events_enabled`, `connections_enabled`, `agent_enabled`, `changes_enabled`, `logs_enabled`, `docker_enabled`, `dns_enabled`, `kernel_enabled` | 각 task를 띄울지 결정한다 |
-| `self_update_enabled` | 셀프업데이트 task를 띄울지 결정한다 |
 | `endpoint` | 전송 URL을 기동 시 조립한다. 도중에 바꾸면 spool에 쌓인 배치의 목적지가 갈린다 |
 | `kernel_url` | 같은 이유. loopback 검증도 기동 시 한 번 한다 |
 | `spool_max_bytes` | spool을 열 때 쿼터가 정해진다 |

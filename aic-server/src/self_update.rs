@@ -344,11 +344,15 @@ pub fn spawn(
         };
         let mut cfg_changed = live.as_ref().map(|l| l.subscribe());
         let mut period = jittered(interval);
+        // 지금 켜져 있는가. config에서 끄면 task는 살아 있되 중앙을 두드리지 않는다 — 다시 켤 때
+        // 재시작이 필요 없어야 하므로 task 자체는 유지한다. 라이브 스냅샷이 없으면(테스트) 항상 켜짐.
+        let mut enabled = live.as_ref().is_none_or(|l| l.get().self_update_enabled);
         tracing::info!(
             endpoint = %endpoint,
             period_secs = period.as_secs(),
+            enabled,
             current = %current,
-            "셀프업데이트 활성 — 중앙이 선언한 목표 버전을 주기적으로 확인한다"
+            "셀프업데이트 task 시작 — 켜져 있는 동안 중앙이 선언한 목표 버전을 주기적으로 확인한다"
         );
         // 다음 확인 시각의 기준점 = 마지막 확인(첫 회는 기동) 시각. 주기가 바뀌면 여기에 새 주기를
         // 더해 다시 계산한다 — 변경 시점 기준으로 다시 재면 설정을 연달아 고치는 동안 확인이
@@ -360,12 +364,17 @@ pub fn spawn(
             tokio::select! {
                 _ = tokio::time::sleep_until(anchor + period) => {}
                 _ = crate::live_config::changed(&mut cfg_changed) => {
-                    // 주기만 다시 잡고 계속 기다린다 — 설정을 고쳤다고 해서 binary 교체 확인을
-                    // 앞당기지는 않는다.
+                    // 스위치와 주기만 다시 잡고 계속 기다린다 — 설정을 고쳤다고 해서 binary 교체
+                    // 확인을 앞당기지는 않는다.
                     if let Some(l) = &live {
+                        let snap = l.get();
                         let configured =
-                            crate::live_config::live_interval(l.get().self_update_interval_secs);
+                            crate::live_config::live_interval(snap.self_update_interval_secs);
                         let next = jittered(configured);
+                        if snap.self_update_enabled != enabled {
+                            enabled = snap.self_update_enabled;
+                            tracing::info!(enabled, "셀프업데이트 스위치 변경 적용");
+                        }
                         if next != period {
                             tracing::info!(
                                 from_secs = period.as_secs(),
@@ -373,11 +382,11 @@ pub fn spawn(
                                 "셀프업데이트 주기 변경 적용"
                             );
                             period = next;
-                            // `aic status`가 읽는 값도 같이 옮긴다 — 안 그러면 실제 주기와 보고가
-                            // 갈려서 "반영됐나"를 확인할 방법이 사라진다. jitter는 호스트마다 다른
-                            // 값이라 설정값 그대로 싣는다.
-                            health.set_configured(true, configured);
                         }
+                        // `aic status`가 읽는 값도 같이 옮긴다 — 안 그러면 실제 상태와 보고가
+                        // 갈려서 "반영됐나"를 확인할 방법이 사라진다. jitter는 호스트마다 다른
+                        // 값이라 설정값 그대로 싣는다.
+                        health.set_configured(enabled, configured);
                     }
                     continue;
                 }
@@ -385,6 +394,12 @@ pub fn spawn(
                     tracing::debug!("셀프업데이트 종료");
                     return;
                 }
+            }
+            if !enabled {
+                // 꺼져 있는 동안은 중앙에 묻지 않는다. 다음 주기를 지금부터 다시 센다 — 안 그러면
+                // 켜는 순간 "밀린 주기"가 한꺼번에 지나간 것으로 보여 즉시 확인해 버린다.
+                anchor = tokio::time::Instant::now();
+                continue;
             }
             let request_token = crate::live_config::effective_token(live.as_ref(), &token);
             tick(
