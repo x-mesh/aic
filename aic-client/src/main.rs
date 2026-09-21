@@ -1937,9 +1937,14 @@ struct EnrollmentResponse {
     #[serde(default)]
     llm_api_key: Option<String>,
     /// rca-web 콘솔이 등록 키에 붙여 발급한 설치 설정(x-mesh/aic#29 R1).
-    /// 서버가 보내지 않는 것이 정상이라 `#[serde(default)]`로 받는다.
+    ///
+    /// **날것의 `Value`로 받는 이유**: `Vec<EnrollmentConfigEntry>`로 받으면 `#[serde(default)]`가
+    /// 필드 **부재**만 흡수하고, `null`이나 항목 하나의 타입 불일치(예: `value`에 문자열 대신
+    /// `true`)는 응답 전체의 역직렬화를 깨뜨린다. 그 실패는 `handle_enroll`의 `response.json()`에서
+    /// 그대로 올라가 등록을 중단시키는데, 일회용 키는 그 시점에 이미 소비된 뒤라 되돌릴 수 없다.
+    /// 형태 오류도 항목 단위로 건너뛰어야 R4를 지킨다.
     #[serde(default)]
-    config: Vec<EnrollmentConfigEntry>,
+    config: Option<Vec<serde_json::Value>>,
 }
 
 /// 등록 응답이 함께 싣는 설치 설정 한 항목.
@@ -1960,8 +1965,11 @@ struct EnrollmentConfigEntry {
 const ENROLLMENT_SETTABLE_PATHS: &[&str] =
     &["aicd.exporter.self_update_enabled", "session.capture_mode"];
 
-/// 같은 응답이 직접 채우는 경로(x-mesh/aic#29 R2). 설정 목록이 이 값을 덮으면 방금 받은
-/// 접속 주소와 토큰을 잃는다.
+/// 같은 응답이 직접 채우는 경로(x-mesh/aic#29 R2).
+///
+/// 허용 목록에 없으니 실제 차단은 그쪽이 하고, 이 목록은 **왜 건너뛰었는지**를 구분해 말하기
+/// 위해 둔다. 두 목록이 겹치지 않는다는 불변식은 `server_owned_paths_never_enter_the_allowlist`가
+/// 지킨다 — 겹치는 순간 방금 받은 접속 주소와 토큰을 설정 목록이 덮는다.
 const ENROLLMENT_SERVER_OWNED_PATHS: &[&str] = &["aicd.exporter.endpoint", "aicd.exporter.token"];
 
 /// 등록 응답이 실어 보낸 설치 설정을 적용한다.
@@ -1969,8 +1977,19 @@ const ENROLLMENT_SERVER_OWNED_PATHS: &[&str] = &["aicd.exporter.endpoint", "aicd
 /// 항목 하나가 실패해도 **등록 전체를 실패시키지 않는다**(x-mesh/aic#29 R4). 일회용 등록
 /// 키는 이 시점에 이미 소비됐고, 텔레메트리 연결이 설정 한 줄보다 중요하다. 실패를 올리면
 /// 운영자는 멀쩡한 등록을 실패로 읽고 새 키를 발급해 재시도한다.
-fn apply_enrollment_config(config: &mut AppConfig, entries: &[EnrollmentConfigEntry]) {
-    for entry in entries {
+fn apply_enrollment_config(config: &mut AppConfig, entries: &[serde_json::Value]) {
+    let mut capture_mode_changed = false;
+    for raw in entries {
+        // 항목 하나의 형태가 어긋나도 나머지는 적용한다(R4).
+        let entry: EnrollmentConfigEntry = match serde_json::from_value(raw.clone()) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!(
+                    "{COL_YELLOW}⚠{COL_RESET} 설치 설정 항목의 형식을 알 수 없어 건너뜁니다: {e}"
+                );
+                continue;
+            }
+        };
         let path = entry.path.trim();
         if ENROLLMENT_SERVER_OWNED_PATHS.contains(&path) {
             eprintln!(
@@ -1987,14 +2006,43 @@ fn apply_enrollment_config(config: &mut AppConfig, entries: &[EnrollmentConfigEn
             continue;
         }
         match apply_config_set(config, path, &entry.value) {
-            Ok(()) => println!(
-                "{COL_GREEN}✓{COL_RESET} 설치 설정 적용: {path} = {}",
-                entry.value.trim()
-            ),
+            Ok(()) => {
+                println!(
+                    "{COL_GREEN}✓{COL_RESET} 설치 설정 적용: {path} = {}",
+                    entry.value.trim()
+                );
+                // 텔레메트리를 보내는 것과 디스크의 binary를 갈아끼우는 것은 같은 동의가 아니다
+                // (aicd_main.rs의 self_update 분리 근거). 그 동의를 중앙이 자기 응답으로 부여하는
+                // 자리라, 비대화형 `curl | sh` 설치에서도 한 줄은 눈에 남게 한다.
+                if path == "aicd.exporter.self_update_enabled"
+                    && config.aicd.exporter.self_update_enabled
+                {
+                    println!(
+                        "  {COL_YELLOW}⚠{COL_RESET} 이 호스트는 이제 중앙이 선언한 버전으로 \
+                         스스로 업데이트합니다 — 끄려면: {COL_BOLD}aic config set \
+                         aicd.exporter.self_update_enabled false{COL_RESET}"
+                    );
+                }
+                if path.starts_with("session.capture") {
+                    capture_mode_changed = true;
+                }
+            }
             Err(e) => eprintln!(
                 "{COL_YELLOW}⚠{COL_RESET} 설치 설정 {path}를 적용하지 못했습니다: {e} — 건너뜁니다"
             ),
         }
+    }
+
+    // 셸 hook은 config만 바꿔서는 동작하지 않는다. 이미 `aic init`으로 PTY 마커가 박힌 호스트를
+    // 재등록하면 `.zshrc`가 그대로라 실제로는 계속 PTY로 캡처하는데, 화면에는 적용됐다는 줄만
+    // 남는다. `aic config set`이 같은 자리에서 내는 안내를 여기서도 낸다.
+    if capture_mode_changed
+        && matches!(
+            config.session.capture_mode,
+            SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
+        )
+    {
+        print_hook_capture_setup_hint(config.session.capture_mode);
     }
 }
 
@@ -2122,7 +2170,7 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     config.llm.default_provider = enrolled.provider.clone();
     // endpoint/token을 쓴 **다음**에 적용한다 — 서버가 소유하는 두 경로를 지키려면 그 값이
     // 이미 config에 들어가 있어야 한다(x-mesh/aic#29 R1, R2).
-    apply_enrollment_config(&mut config, &enrolled.config);
+    apply_enrollment_config(&mut config, enrolled.config.as_deref().unwrap_or(&[]));
     save_config(&config)?;
 
     // install은 unit을 없으면 만들고 시작한다. 이미 떠 있던 aicd는 config를 메모리에
@@ -6891,7 +6939,7 @@ mod enrollment_response_tests {
             llm_provider_type: None,
             llm_endpoint: None,
             llm_api_key: None,
-            config: Vec::new(),
+            config: None,
         }
     }
 
@@ -11988,11 +12036,8 @@ mod config_set_tests {
 mod enrollment_config_tests {
     use super::*;
 
-    fn entry(path: &str, value: &str) -> EnrollmentConfigEntry {
-        EnrollmentConfigEntry {
-            path: path.to_string(),
-            value: value.to_string(),
-        }
+    fn entry(path: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({ "path": path, "value": value })
     }
 
     /// 이 테스트가 지키는 것: 서버가 `config`를 보내지 않는 경우가 정상인 것(R1).
@@ -12005,7 +12050,58 @@ mod enrollment_config_tests {
             "provider": "openai", "model": "gpt-4o-mini"
         }"#;
         let parsed: EnrollmentResponse = serde_json::from_str(json).unwrap();
-        assert!(parsed.config.is_empty());
+        assert!(parsed.config.is_none());
+    }
+
+    /// 이 테스트가 지키는 것: 설정 목록의 **형태**가 어긋나도 등록이 죽지 않는 것(R4).
+    ///
+    /// `#[serde(default)]`만으로는 필드 부재밖에 못 막는다. `null`이나 항목 하나의 타입
+    /// 불일치가 응답 전체의 역직렬화를 깨면, 일회용 키가 이미 소비된 뒤에 등록이 실패한다.
+    #[test]
+    fn a_malformed_config_never_fails_the_response() {
+        let head = r#""enrollment_id": "e", "host_name": "h", "endpoint": "https://r",
+            "ingest_token": "t", "provider": "p", "model": "m""#;
+
+        for body in [
+            format!("{{{head}, \"config\": null}}"),
+            format!("{{{head}, \"config\": [{{\"path\": \"a\", \"value\": true}}]}}"),
+            format!("{{{head}, \"config\": [{{\"nope\": 1}}]}}"),
+        ] {
+            let parsed: Result<EnrollmentResponse, _> = serde_json::from_str(&body);
+            assert!(parsed.is_ok(), "등록을 막으면 안 된다: {body} → {parsed:?}");
+        }
+    }
+
+    /// 이 테스트가 지키는 것: 형태가 깨진 항목을 건너뛰고 **나머지를 적용하는** 것(R4).
+    #[test]
+    fn a_malformed_entry_does_not_stop_the_rest() {
+        let mut c = default_config();
+        apply_enrollment_config(
+            &mut c,
+            &[
+                serde_json::json!({ "path": "aicd.exporter.self_update_enabled", "value": true }),
+                serde_json::json!("문자열 항목"),
+                entry("aicd.exporter.self_update_enabled", "true"),
+            ],
+        );
+        assert!(
+            c.aicd.exporter.self_update_enabled,
+            "형태가 깨진 앞 항목이 뒤 항목을 막으면 안 된다"
+        );
+    }
+
+    /// 이 테스트가 지키는 것: 서버가 직접 채우는 경로가 허용 목록에 섞여 들어오지 않는 것(R2).
+    ///
+    /// 실제 차단은 허용 목록이 한다. 두 목록이 겹치는 순간 설정 목록이 방금 받은 접속 주소와
+    /// 토큰을 덮어쓴다.
+    #[test]
+    fn server_owned_paths_never_enter_the_allowlist() {
+        for path in ENROLLMENT_SERVER_OWNED_PATHS {
+            assert!(
+                !ENROLLMENT_SETTABLE_PATHS.contains(path),
+                "{path}는 응답이 직접 채우는 값이라 등록으로 바꿀 수 없어야 한다"
+            );
+        }
     }
 
     /// 이 테스트가 지키는 것: 허용 경로가 실제로 기록되는 것(R1).
