@@ -1330,11 +1330,11 @@ enum ConfigOp {
         /// dot으로 구분된 path (예: `llm.default_provider`, `server.max_buffer_lines`)
         path: String,
     },
-    /// dotted path 값을 설정 (예: `aic config set session.capture_mode hybrid`)
+    /// dotted path 값을 설정 (예: `aic config set aicd.exporter.self_update_enabled true`)
     Set {
-        /// dot으로 구분된 path. 현재는 `session.capture_mode`를 지원한다.
+        /// dot으로 구분된 path. `aic config get`이 읽는 경로를 그대로 쓴다.
         path: String,
-        /// 설정할 값
+        /// 설정할 값. `-`면 stdin에서 읽고, `unset`은 값을 비운다.
         value: String,
     },
 }
@@ -2260,7 +2260,15 @@ fn handle_config_set(path: &str, value: &str) {
         }
     };
 
-    if let Err(e) = apply_config_set(&mut config, path, value) {
+    let value = match read_config_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{COL_RED}✗{COL_RESET} {e}");
+            std::process::exit(2);
+        }
+    };
+
+    if let Err(e) = apply_config_set(&mut config, path, &value) {
         eprintln!("{COL_RED}✗{COL_RESET} {e}");
         std::process::exit(2);
     }
@@ -2270,25 +2278,231 @@ fn handle_config_set(path: &str, value: &str) {
         std::process::exit(1);
     }
 
-    println!("{COL_GREEN}✔{COL_RESET} {path} = {}", value.trim());
-    if matches!(
-        config.session.capture_mode,
-        SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
-    ) {
+    // 비밀은 되읽어 주지 않는다 — `aic config show`가 마스킹하는 값을 set이 평문으로 찍으면
+    // 터미널 스크롤백과 CI 로그에 그대로 남는다. 값을 비운 경우는 마스킹하면 `***`가 되어
+    // 무언가 채운 것처럼 보이므로 따로 말한다.
+    let trimmed = value.trim();
+    let shown = if trimmed.eq_ignore_ascii_case("unset") || trimmed.eq_ignore_ascii_case("null") {
+        "(비움)".to_string()
+    } else if is_secret_config_path(path) {
+        mask_api_key(trimmed)
+    } else {
+        trimmed.to_string()
+    };
+    println!("{COL_GREEN}✔{COL_RESET} {path} = {shown}");
+
+    // capture_mode를 **건드렸을 때만** 셸 hook 안내를 낸다. 범용 set이 열리기 전에는 이
+    // 경로밖에 없어 조건이 필요 없었지만, 지금은 exporter 값 하나를 바꿔도 셸 설정 안내가
+    // 따라 나오게 된다.
+    if path.trim().starts_with("session.capture")
+        && matches!(
+            config.session.capture_mode,
+            SessionCaptureMode::Hook | SessionCaptureMode::Hybrid
+        )
+    {
         print_hook_capture_setup_hint(config.session.capture_mode);
     }
+    print_config_set_followup(&config, path);
+}
+
+/// 값 자리의 `-`는 stdin에서 읽는다.
+///
+/// 인자로 넘긴 값은 shell history에 남는다. api_key나 token을 넣는 자리에서는 그게 곧 유출이라
+/// 파이프로 넣을 통로를 둔다: `aic config set llm.providers.x.api_key - < key.txt`
+fn read_config_value(value: &str) -> anyhow::Result<String> {
+    if value != "-" {
+        return Ok(value.to_string());
+    }
+    use anyhow::Context as _;
+    use std::io::Read;
+
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("stdin에서 값을 읽지 못했습니다")?;
+    // 끝의 개행만 턴다 — 값 안의 공백은 의미가 있을 수 있다.
+    let trimmed = buf.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        anyhow::bail!("stdin이 비어 있습니다");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// 값을 바꾼 뒤 실제로 필요한 다음 걸음을 알린다.
+///
+/// aicd가 읽는 값은 **기동 시 한 번만** 읽힌다. 파일을 고쳐 놓고 반영을 기다리는 일을 막는다.
+fn print_config_set_followup(config: &AppConfig, path: &str) {
+    if !path.starts_with("aicd.") {
+        return;
+    }
+    // exporter 하위 플래그는 부모 게이트가 꺼져 있으면 아무 일도 하지 않는다. aicd는 로그에만
+    // 경고를 남기므로, 켜는 자리에서 말해 주지 않으면 왜 안 도는지를 따로 찾게 된다.
+    if path.starts_with("aicd.exporter.") && path != "aicd.exporter.enabled" {
+        let exporter = &config.aicd.exporter;
+        if !exporter.enabled {
+            println!(
+                "  {COL_YELLOW}⚠{COL_RESET} [aicd.exporter] enabled = false — 이 값은 아직 동작하지 않습니다"
+            );
+        } else if exporter.endpoint.trim().is_empty() {
+            println!(
+                "  {COL_YELLOW}⚠{COL_RESET} [aicd.exporter] endpoint가 비어 있습니다 — exporter가 뜨지 않습니다"
+            );
+        }
+    }
+    println!(
+        "  {COL_DIM}aicd는 기동 시 설정을 읽습니다 — 반영하려면: {COL_RESET}{COL_BOLD}aic daemon restart{COL_RESET}"
+    );
 }
 
 fn apply_config_set(config: &mut AppConfig, path: &str, value: &str) -> anyhow::Result<()> {
     match path.trim() {
+        // capture_mode는 enum 파서와 hook 설정 안내가 따로 붙어 있어 범용 경로로 넘기지 않는다.
         "session.capture_mode" | "session.capture-mode" => {
             config.session.capture_mode = parse_session_capture_mode(value)?;
             Ok(())
         }
-        other => {
-            anyhow::bail!("지원하지 않는 config path: {other}. 현재 지원: session.capture_mode")
+        other => set_via_json(config, other, value),
+    }
+}
+
+/// `aic config get`과 같은 축으로 값을 쓴다 — 직렬화한 JSON에서 경로를 찾아 바꾸고, 다시
+/// `AppConfig`로 역직렬화해 타입을 검증한다.
+///
+/// **왜 get과 같은 경로를 전부 여는가**: 한쪽만 지원하면 "읽히는데 왜 안 써지지"를 매번
+/// 확인하게 되고, 사용자는 파일을 직접 고치는 우회로 간다. 그 우회가 TOML 테이블 **밖**에
+/// 키를 붙여 설정이 조용히 무시되는 사고로 이어졌다(실서버에서 그랬다).
+fn set_via_json(config: &mut AppConfig, path: &str, raw: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let json = serde_json::to_value(&*config).context("설정 직렬화 실패")?;
+    let current = leaf_value(&json, path)?.clone();
+
+    // 역직렬화가 곧 타입 검증이다. 후보가 여럿인 경우(아래 `coerce_candidates` 참고)
+    // 통과하는 첫 후보를 쓴다.
+    let mut last_err: Option<serde_json::Error> = None;
+    for candidate in coerce_candidates(&current, raw)? {
+        let mut probe = json.clone();
+        let (parent, key) = resolve_leaf_mut(&mut probe, path)?;
+        parent[key.as_str()] = candidate;
+        match serde_json::from_value::<AppConfig>(probe) {
+            Ok(next) => {
+                *config = next;
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e),
         }
     }
+    match last_err {
+        Some(e) => anyhow::bail!("값이 이 설정의 타입과 맞지 않습니다: {e}"),
+        None => anyhow::bail!("값을 해석하지 못했습니다: {raw}"),
+    }
+}
+
+/// 경로가 가리키는 리프 값. 없는 경로와 리프가 아닌 자리를 여기서 거른다.
+fn leaf_value<'a>(
+    root: &'a serde_json::Value,
+    path: &str,
+) -> anyhow::Result<&'a serde_json::Value> {
+    let mut current = root;
+    for part in path.split('.').filter(|s| !s.is_empty()) {
+        current = current
+            .get(part)
+            .ok_or_else(|| anyhow::anyhow!("없는 설정 경로입니다: {path} (구간: {part})"))?;
+    }
+    if current.is_object() || current.is_array() {
+        // 새 키를 만들 수 있게 하면 오타가 조용히 무의미한 키로 저장된다 — 그게 이번 사고의
+        // 실패 방식이었다. 항목을 새로 추가하는 일은 대화형 `aic config`의 몫이다.
+        anyhow::bail!("{path}는 여러 값을 담는 자리입니다 — 하위 키를 직접 지정하세요");
+    }
+    Ok(current)
+}
+
+/// 리프의 **부모** 오브젝트와 마지막 키. 값을 바꿔 넣을 자리를 돌려준다.
+fn resolve_leaf_mut<'a>(
+    root: &'a mut serde_json::Value,
+    path: &str,
+) -> anyhow::Result<(&'a mut serde_json::Value, String)> {
+    let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+    let Some((last, parents)) = parts.split_last() else {
+        anyhow::bail!("설정 경로가 비어 있습니다");
+    };
+    let mut current = root;
+    for part in parents {
+        current = current
+            .get_mut(*part)
+            .ok_or_else(|| anyhow::anyhow!("없는 설정 경로입니다: {path} (구간: {part})"))?;
+    }
+    Ok((current, (*last).to_string()))
+}
+
+/// 입력 문자열을 **현재 값의 타입**에 맞춘 후보들로 바꾼다.
+///
+/// `Option` 필드가 `None`이면 JSON에서 `null`이라 현재 타입을 알 수 없다. 그때만 후보가
+/// 여럿이 되고, 호출부의 역직렬화가 어느 것이 맞는지 판정한다. 예를 들어 `token`(`Option<String>`)에
+/// `3600`을 넣으면 숫자 후보가 먼저 떨어지고 문자열 후보가 남는다.
+fn coerce_candidates(
+    current: &serde_json::Value,
+    raw: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    use serde_json::Value;
+
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("unset") || raw.eq_ignore_ascii_case("null") {
+        return Ok(vec![Value::Null]);
+    }
+    match current {
+        Value::Bool(_) => Ok(vec![parse_bool_value(raw)?]),
+        Value::Number(_) => Ok(vec![parse_number_value(raw)?]),
+        Value::String(_) => Ok(vec![Value::String(raw.to_string())]),
+        Value::Null => {
+            let mut candidates = Vec::new();
+            if let Ok(n) = parse_number_value(raw) {
+                candidates.push(n);
+            }
+            if let Ok(b) = parse_bool_value(raw) {
+                candidates.push(b);
+            }
+            candidates.push(Value::String(raw.to_string()));
+            Ok(candidates)
+        }
+        // leaf_value가 먼저 거르므로 여기까지 오지 않는다.
+        Value::Object(_) | Value::Array(_) => {
+            anyhow::bail!("여러 값을 담는 자리에는 단일 값을 넣을 수 없습니다")
+        }
+    }
+}
+
+fn parse_bool_value(raw: &str) -> anyhow::Result<serde_json::Value> {
+    match raw.to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Ok(serde_json::Value::Bool(true)),
+        "false" | "0" | "off" | "no" => Ok(serde_json::Value::Bool(false)),
+        other => {
+            anyhow::bail!("참/거짓 값이 필요합니다 (true/false, on/off, 1/0) — 받은 값: {other}")
+        }
+    }
+}
+
+fn parse_number_value(raw: &str) -> anyhow::Result<serde_json::Value> {
+    if let Ok(n) = raw.parse::<u64>() {
+        return Ok(serde_json::Value::Number(n.into()));
+    }
+    if let Ok(n) = raw.parse::<i64>() {
+        return Ok(serde_json::Value::Number(n.into()));
+    }
+    if let Some(n) = raw
+        .parse::<f64>()
+        .ok()
+        .and_then(serde_json::Number::from_f64)
+    {
+        return Ok(serde_json::Value::Number(n));
+    }
+    anyhow::bail!("숫자가 필요합니다 — 받은 값: {raw}")
+}
+
+/// 비밀이 담기는 경로인가. `handle_config_show`가 마스킹하는 것과 같은 자리다.
+fn is_secret_config_path(path: &str) -> bool {
+    let last = path.rsplit('.').next().unwrap_or("");
+    matches!(last, "api_key" | "token")
 }
 
 fn parse_session_capture_mode(value: &str) -> anyhow::Result<SessionCaptureMode> {
@@ -11357,8 +11571,10 @@ mod tests {
         apply_config_set(&mut cfg, "session.capture-mode", "hook").unwrap();
         assert_eq!(cfg.session.capture_mode, SessionCaptureMode::Hook);
 
-        let err = apply_config_set(&mut cfg, "server.max_buffer_lines", "1000").unwrap_err();
-        assert!(err.to_string().contains("지원하지 않는 config path"));
+        // `server.max_buffer_lines`는 이제 범용 경로로 지원된다(config_set_tests 참고).
+        // 여기서 지키는 것은 **오타 경로가 여전히 거부되는 것**이다.
+        let err = apply_config_set(&mut cfg, "server.max_bufer_lines", "1000").unwrap_err();
+        assert!(err.to_string().contains("없는 설정 경로"), "{err}");
     }
 
     #[test]
@@ -11596,5 +11812,110 @@ source /root/.aic/hook-events.bash
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod config_set_tests {
+    use super::*;
+
+    fn cfg() -> AppConfig {
+        default_config()
+    }
+
+    /// 이 테스트가 지키는 것: 참/거짓 값을 사람이 쓰는 여러 표기로 받는 것.
+    #[test]
+    fn a_bool_leaf_takes_common_spellings() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "aicd.exporter.self_update_enabled", "true").unwrap();
+        assert!(c.aicd.exporter.self_update_enabled);
+        apply_config_set(&mut c, "aicd.exporter.self_update_enabled", "off").unwrap();
+        assert!(!c.aicd.exporter.self_update_enabled);
+    }
+
+    #[test]
+    fn a_number_leaf_refuses_words() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "aicd.exporter.interval_secs", "30").unwrap();
+        assert_eq!(c.aicd.exporter.interval_secs, 30);
+        assert!(apply_config_set(&mut c, "aicd.exporter.interval_secs", "자주").is_err());
+    }
+
+    /// 이 테스트가 지키는 것: 없는 경로를 만들어 내지 않는 것.
+    /// 새 키가 조용히 생기면 오타가 무의미한 설정으로 저장된다 — 이번 사고의 실패 방식이다.
+    #[test]
+    fn an_unknown_path_is_refused() {
+        let mut c = cfg();
+        let err =
+            apply_config_set(&mut c, "aicd.exporter.slef_update_enabled", "true").unwrap_err();
+        assert!(err.to_string().contains("없는 설정 경로"), "{err}");
+    }
+
+    /// 이 테스트가 지키는 것: 테이블 경로에 단일 값을 넣지 못하게 하는 것.
+    #[test]
+    fn a_table_path_points_at_its_children() {
+        let mut c = cfg();
+        let err = apply_config_set(&mut c, "aicd.exporter", "true").unwrap_err();
+        assert!(err.to_string().contains("하위 키"), "{err}");
+    }
+
+    /// 이 테스트가 지키는 것: 비어 있는 `Option` 필드가 제 타입으로 채워지는 것.
+    /// `None`은 JSON에서 `null`이라 현재 타입을 알 수 없다 — 같은 `3600`이 숫자 필드에는
+    /// 숫자로, 문자열 필드에는 문자열로 들어가야 한다.
+    #[test]
+    fn an_empty_option_takes_the_type_that_deserializes() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "aicd.exporter.spool_max_age_secs", "3600").unwrap();
+        assert_eq!(c.aicd.exporter.spool_max_age_secs, Some(3600));
+
+        apply_config_set(&mut c, "aicd.exporter.token", "3600").unwrap();
+        assert_eq!(c.aicd.exporter.token.as_deref(), Some("3600"));
+    }
+
+    #[test]
+    fn unset_clears_an_optional_value() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "aicd.exporter.token", "secret").unwrap();
+        apply_config_set(&mut c, "aicd.exporter.token", "unset").unwrap();
+        assert_eq!(c.aicd.exporter.token, None);
+    }
+
+    /// 이 테스트가 지키는 것: 타입이 어긋난 입력이 저장되지 않는 것.
+    #[test]
+    fn a_wrong_type_never_reaches_the_config() {
+        let mut c = cfg();
+        let before = c.aicd.exporter.enabled;
+        assert!(apply_config_set(&mut c, "aicd.exporter.enabled", "언젠가").is_err());
+        assert_eq!(
+            c.aicd.exporter.enabled, before,
+            "실패한 set이 값을 바꾸면 안 된다"
+        );
+    }
+
+    /// 이 테스트가 지키는 것: 비밀이 담기는 자리를 출력에서 가리는 것.
+    #[test]
+    fn secret_paths_are_recognized() {
+        assert!(is_secret_config_path("llm.providers.ai-mesh.api_key"));
+        assert!(is_secret_config_path("aicd.exporter.token"));
+        assert!(!is_secret_config_path("aicd.exporter.endpoint"));
+    }
+
+    /// 이 테스트가 지키는 것: capture_mode가 자기 파서를 계속 쓰는 것.
+    /// 범용 경로로 흡수되면 enum 검증과 hook 안내가 사라진다.
+    #[test]
+    fn capture_mode_keeps_its_own_parser() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "session.capture_mode", "hybrid").unwrap();
+        assert_eq!(c.session.capture_mode, SessionCaptureMode::Hybrid);
+        let err = apply_config_set(&mut c, "session.capture_mode", "nope").unwrap_err();
+        assert!(err.to_string().contains("capture mode"), "{err}");
+    }
+
+    /// 이 테스트가 지키는 것: exporter 밖의 경로도 열려 있는 것.
+    #[test]
+    fn paths_outside_the_exporter_are_settable_too() {
+        let mut c = cfg();
+        apply_config_set(&mut c, "server.max_buffer_lines", "1200").unwrap();
+        assert_eq!(c.server.max_buffer_lines, 1200);
     }
 }
