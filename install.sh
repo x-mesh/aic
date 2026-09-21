@@ -169,8 +169,10 @@ elif [ -z "${AIC_SKIP_DAEMON:-}" ]; then
     daemon_scope="--system"
   fi
   info "registering aicd ${daemon_scope:-(user)}"
+  # --force: 이 스크립트를 다시 실행하는 것이 곧 복구 절차다. 반대 스코프에 남은 aic 자신의
+  # 유닛을 정리하지 않으면 바이너리만 바뀌고 옛 데몬이 옛 토큰으로 계속 돈다.
   # shellcheck disable=SC2086  # daemon_scope는 빈 값이거나 단일 플래그다
-  "$target_dir/aic" daemon install $daemon_scope || info "aicd 등록을 건너뜁니다 — 위 안내를 따른 뒤 'aic daemon install ${daemon_scope}'을 다시 실행하세요"
+  "$target_dir/aic" daemon install --force $daemon_scope || info "aicd 등록을 건너뜁니다 — 위 안내를 따른 뒤 'aic daemon install --force ${daemon_scope}'을 다시 실행하세요"
 fi
 
 case ":$PATH:" in

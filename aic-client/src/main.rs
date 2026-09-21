@@ -1175,6 +1175,10 @@ enum DaemonOp {
     },
     /// 부팅 시 자동 시작용 OS unit을 설치한다 (macOS launchd / Linux systemd --user).
     Install {
+        /// 반대 스코프에 남은 aic 자신의 유닛을 정리하고 설치한다. 재설치를 복구 수단으로
+        /// 쓰는 경로(enroll, install.sh)가 쓴다.
+        #[arg(long)]
+        force: bool,
         /// unit 파일만 쓰고 launchctl/systemctl load는 하지 않는다.
         #[arg(long)]
         no_load: bool,
@@ -1693,7 +1697,11 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
-            DaemonOp::Install { no_load, system } => handle_daemon_install(no_load, system),
+            DaemonOp::Install {
+                no_load,
+                system,
+                force,
+            } => handle_daemon_install(no_load, system, force),
             DaemonOp::Uninstall => handle_daemon_uninstall(),
         },
         Some(Commands::Session { op }) => match op {
@@ -2181,7 +2189,7 @@ async fn handle_enroll(server: &str, auth_key: &str, dry_run: bool) -> anyhow::R
     // 하나로 명령 전체를 실패로 보고하면, 운영자는 멀쩡한 등록을 실패로 읽고 새 key를
     // 발급해 재시도한다(로그인 셸 밖 `curl | sh` 설치에서 실측). 그래서 여기서는
     // 에러를 삼키지 않고 **경고로 격하한 뒤 남은 한 걸음을 안내**한다.
-    let daemon_status = match aic_client::daemon_install::install(false) {
+    let daemon_status = match aic_client::daemon_install::install_reclaiming(false) {
         Ok(report) => {
             if report.loaded {
                 if let Err(e) = aic_client::daemon_install::restart_via_unit() {
@@ -2982,9 +2990,9 @@ fn print_linger_status(linger: &aic_client::daemon_install::Linger) {
     }
 }
 
-/// `aic daemon install [--no-load]`: OS-native auto-start unit 설치.
-fn handle_daemon_install(no_load: bool, system: bool) {
-    match aic_client::daemon_install::install_with_scope(no_load, system) {
+/// `aic daemon install [--no-load] [--system] [--force]`: OS-native auto-start unit 설치.
+fn handle_daemon_install(no_load: bool, system: bool, force: bool) {
+    match aic_client::daemon_install::install_with_scope(no_load, system, force) {
         Ok(report) => {
             let plat = match report.platform {
                 aic_client::daemon_install::Platform::Macos => "macOS launchd",

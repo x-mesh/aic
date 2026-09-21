@@ -197,6 +197,48 @@ impl UnitConflict {
         cmds
     }
 
+    /// 반대 스코프를 부를 `systemctl`. 문자열 안내를 만드는 `systemctl_prefix`와 짝이다.
+    fn systemctl_for_other(&self) -> Command {
+        if self.target_system {
+            systemctl_user_command()
+        } else {
+            Command::new("systemctl")
+        }
+    }
+
+    /// `cleanup_commands()`가 안내하는 정리를 실제로 수행하고, 해낸 항목을 돌려준다.
+    ///
+    /// 지우는 것은 `other_unit` 하나뿐이다. 그 경로는 `detect_unit_conflict`가 **이 uid의**
+    /// 자리로만 채우므로(비root는 그 함수가 조기 반환한다), 다른 사용자가 띄운 데몬에는 닿지
+    /// 않는다. lock을 쥔 쪽이 유닛이 아니라 손으로 띄운 프로세스라면 여기서 해결되지 않고,
+    /// 호출부가 남은 충돌을 다시 진단한다.
+    pub fn reclaim(&self) -> Result<Vec<String>> {
+        let mut done = Vec::new();
+        if self.other_active {
+            let stopped = self
+                .systemctl_for_other()
+                .args(["disable", "--now", SYSTEMD_UNIT])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if stopped {
+                done.push(format!("{} disable --now aicd", self.systemctl_prefix()));
+            }
+        }
+        if let Some(path) = &self.other_unit {
+            if path.exists() {
+                std::fs::remove_file(path)
+                    .with_context(|| format!("유닛 파일 삭제 실패: {}", path.display()))?;
+                done.push(format!("rm -f {}", path.display()));
+            }
+            // 파일만 지우고 reload하지 않으면 systemd가 유닛을 계속 기억한다 — 남은 상태가
+            // 바로 다음에 이어지는 설치와 엉킨다.
+            let _ = self.systemctl_for_other().arg("daemon-reload").output();
+            done.push(format!("{} daemon-reload", self.systemctl_prefix()));
+        }
+        Ok(done)
+    }
+
     /// 설치·재시작을 멈추면서 보여 줄 사유와 정리 절차.
     pub fn remediation(&self, action: &str) -> String {
         let mut lines = vec![format!(
@@ -527,14 +569,24 @@ fn effective_runtime_dir_env() -> Option<String> {
 
 /// auto-start unit을 설치한다. `no_load`가 true면 파일만 쓰고 load/enable은 안 한다.
 pub fn install(no_load: bool) -> Result<InstallReport> {
-    install_with_scope(no_load, aic_common::paths::is_system_service())
+    install_with_scope(no_load, aic_common::paths::is_system_service(), false)
+}
+
+/// 설치하되, aic 자신이 반대 스코프에 남긴 유닛은 정리하고 진행한다.
+///
+/// 재설치를 복구 수단으로 쓰는 경로(enroll, install.sh)에서만 쓴다. 바이너리만 덮어쓰고
+/// 옛 데몬을 그대로 두면 옛 토큰과 옛 binary로 계속 도는데, 정리를 사람이 손으로 해야 하면
+/// 100대 규모에서 재설치는 복구 수단이 되지 못한다. 사람이 직접 치는 `aic daemon install`은
+/// 지금처럼 진단만 하고 멈춘다 — 무엇이 지워지는지 모르는 채 유닛이 사라지면 안 된다.
+pub fn install_reclaiming(no_load: bool) -> Result<InstallReport> {
+    install_with_scope(no_load, aic_common::paths::is_system_service(), true)
 }
 
 /// `system`이면 `/etc/systemd/system`에 유닛을 깔고 `systemctl`을 system 모드로 부른다.
 ///
 /// 호출부가 명시하는 이유: root로 무언가를 설치하러 온 사람이 의도치 않게 전역 서비스를 만들면
 /// 안 된다. `aic daemon install --system`이 유일한 진입점이고, 기본값은 지금까지의 사용자 설치다.
-pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> {
+pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<InstallReport> {
     let platform = detect_platform();
     if system && platform != Platform::Linux {
         return Err(anyhow!(
@@ -556,7 +608,21 @@ pub fn install_with_scope(no_load: bool, system: bool) -> Result<InstallReport> 
         } else {
             "사용자 단위 설치"
         };
-        return Err(anyhow!("{}", conflict.remediation(action)));
+        if !force {
+            return Err(anyhow!("{}", conflict.remediation(action)));
+        }
+        eprintln!(
+            "남아 있는 {} aicd를 정리하고 설치를 계속합니다:",
+            conflict.other_label()
+        );
+        for step in conflict.reclaim()? {
+            eprintln!("  {step}");
+        }
+        // 정리한 뒤에도 막혀 있으면 우리 유닛이 아닌 무언가가 lock을 쥐고 있다(손으로 띄운
+        // 프로세스, 다른 사용자의 데몬). 그건 지우지 않고 지금까지처럼 진단만 한다.
+        if let Some(remaining) = detect_unit_conflict(system) {
+            return Err(anyhow!("{}", remaining.remediation(action)));
+        }
     }
     if platform == Platform::Unsupported {
         return Err(anyhow!(
@@ -1368,5 +1434,73 @@ mod tests {
         assert_eq!(object_particle("사용자 단위 설치"), "를");
         assert_eq!(object_particle("system 설치"), "를");
         assert_eq!(object_particle("재시작"), "을");
+    }
+
+    /// 이 테스트가 지키는 것: 정리 경로가 반대 스코프 유닛 파일을 실제로 지우는 것.
+    ///
+    /// 진단만 하고 멈추면 바이너리만 바뀌고 옛 데몬이 옛 토큰으로 계속 돈다 —
+    /// 재설치를 복구 수단으로 쓸 수 없게 된다(x-mesh toss-20260921-e995b21c).
+    #[test]
+    fn reclaim_removes_the_other_scope_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join("aicd.service");
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+
+        let conflict = UnitConflict {
+            target_system: true,
+            other_unit: Some(unit.clone()),
+            other_active: false,
+            holder: None,
+            holder_system: None,
+        };
+        let done = conflict.reclaim().unwrap();
+
+        assert!(!unit.exists(), "반대 스코프 유닛 파일이 남았다");
+        assert!(
+            done.iter().any(|step| step.starts_with("rm -f")),
+            "수행 목록에 파일 제거가 없다: {done:?}"
+        );
+        assert!(
+            done.iter().any(|step| step.ends_with("daemon-reload")),
+            "파일만 지우고 reload하지 않으면 systemd가 유닛을 계속 기억한다: {done:?}"
+        );
+    }
+
+    /// 이 테스트가 지키는 것: 지울 유닛이 없으면 아무것도 건드리지 않는 것.
+    /// lock을 쥔 쪽이 손으로 띄운 프로세스인 경우가 여기다 — 그건 호출부가 다시 진단한다.
+    #[test]
+    fn reclaim_without_a_unit_file_does_nothing() {
+        let conflict = UnitConflict {
+            target_system: false,
+            other_unit: None,
+            other_active: false,
+            holder: Some(1234),
+            holder_system: Some(true),
+        };
+        assert!(conflict.reclaim().unwrap().is_empty());
+    }
+
+    /// 이 테스트가 지키는 것: 정리가 **반대** 스코프를 겨냥하는 것.
+    /// 자기 스코프를 지우면 방금 깐 유닛을 스스로 없앤다.
+    #[test]
+    fn reclaim_targets_the_scope_opposite_the_install() {
+        for target_system in [true, false] {
+            let conflict = UnitConflict {
+                target_system,
+                other_unit: None,
+                other_active: false,
+                holder: None,
+                holder_system: None,
+            };
+            let prefix = conflict.systemctl_prefix();
+            if target_system {
+                assert_eq!(
+                    prefix, "systemctl --user",
+                    "system 설치의 반대는 사용자 단위다"
+                );
+            } else {
+                assert_eq!(prefix, "systemctl", "사용자 설치의 반대는 system 단위다");
+            }
+        }
     }
 }
