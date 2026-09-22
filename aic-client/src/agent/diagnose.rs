@@ -408,6 +408,21 @@ pub async fn run_headless_diagnose_opts(
         evidence.insert_str(0, &format!("{block}\n"));
     }
 
+    // LLM 호출 비용 — provider가 보고한 토큰과 실제 경과 시간. follow-up 라운드가 돌면 호출이
+    // 2회이므로 합산한다. audit에 남겨야 "분석 한 번에 얼마나 드는가"를 추정이 아니라 실측으로 말한다.
+    let mut llm_calls = 0u32;
+    let mut llm_input_tokens = 0u64;
+    let mut llm_output_tokens = 0u64;
+    let mut llm_elapsed_ms = 0u64;
+    let mut record_call = |d: &LlmDispatcher, started: std::time::Instant| {
+        llm_calls += 1;
+        llm_elapsed_ms += started.elapsed().as_millis() as u64;
+        if let Some(u) = d.last_usage() {
+            llm_input_tokens += u.input_tokens;
+            llm_output_tokens += u.output_tokens;
+        }
+    };
+
     let mut analysis = match dispatcher {
         Some(d) => {
             let prompt = if opts.follow_up {
@@ -415,7 +430,10 @@ pub async fn run_headless_diagnose_opts(
             } else {
                 build_diagnose_prompt(symptom, &evidence)
             };
-            match d.send(&prompt).await {
+            let started = std::time::Instant::now();
+            let sent = d.send(&prompt).await;
+            record_call(d, started);
+            match sent {
                 Ok(text) => Some(text.trim().to_string()),
                 Err(e) => {
                     let _ = crate::audit::append(
@@ -482,7 +500,10 @@ pub async fn run_headless_diagnose_opts(
             if executed > 0 {
                 let prompt2 =
                     build_followup_reanalysis_prompt(symptom, &first, &evidence, &fu_evidence);
-                match d.send(&prompt2).await {
+                let started = std::time::Instant::now();
+                let sent = d.send(&prompt2).await;
+                record_call(d, started);
+                match sent {
                     Ok(text) => analysis = Some(text.trim().to_string()),
                     // 재분석 실패 시 1차 분석 유지 — follow-up 증거는 bundle에 남는다.
                     Err(e) => {
@@ -505,6 +526,11 @@ pub async fn run_headless_diagnose_opts(
             "analyzed": analysis.is_some(),
             "followup_executed": followup_evidence.is_some(),
             "followup_rejected": followup_rejected.len(),
+            "llm_calls": llm_calls,
+            // provider가 usage를 싣지 않으면 0이다 — 호출 수와 함께 봐야 "안 썼다"와 구분된다.
+            "llm_input_tokens": llm_input_tokens,
+            "llm_output_tokens": llm_output_tokens,
+            "llm_elapsed_ms": llm_elapsed_ms,
         }),
     );
 
