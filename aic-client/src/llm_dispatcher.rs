@@ -127,6 +127,12 @@ pub struct LlmDispatcher {
     config: LlmConfig,
     http_client: Client,
     circuit: Arc<CircuitBreaker>,
+    /// 마지막 tool-calling 요청에서 provider가 보고한 토큰 사용량.
+    ///
+    /// 운영 경로는 읽지 않는다. 품질·비용을 비교하는 평가에서는 provider가 실제로 청구할 값이
+    /// 필요한데, 저장소의 다른 토큰 수치는 전부 문자 수 추정이라 그 자리에 쓸 수 없다.
+    /// `Arc`로 두어 `clone()`한 디스패처가 같은 값을 본다.
+    last_usage: Arc<std::sync::Mutex<Option<crate::agent::types::TokenUsage>>>,
 }
 
 impl Clone for LlmDispatcher {
@@ -135,6 +141,7 @@ impl Clone for LlmDispatcher {
             config: self.config.clone(),
             http_client: self.http_client.clone(),
             circuit: Arc::clone(&self.circuit),
+            last_usage: Arc::clone(&self.last_usage),
         }
     }
 }
@@ -155,7 +162,22 @@ impl LlmDispatcher {
             config,
             http_client,
             circuit: Arc::new(CircuitBreaker::new()),
+            last_usage: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// 마지막 `send_messages` 호출에서 provider가 보고한 토큰 사용량.
+    ///
+    /// provider가 `usage`를 싣지 않았거나 아직 호출하지 않았으면 `None`이다. 호출마다 덮어쓰므로
+    /// 순차 호출에서만 의미가 있다.
+    pub fn last_usage(&self) -> Option<crate::agent::types::TokenUsage> {
+        *self.last_usage.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// provider 응답에서 꺼낸 사용량을 기록한다. 보고하지 않았으면 직전 값을 지운다 —
+    /// 남겨두면 다음 호출의 비용으로 잘못 집계된다.
+    fn record_usage(&self, usage: Option<crate::agent::types::TokenUsage>) {
+        *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = usage;
     }
 
     /// 프롬프트를 설정된 백엔드로 전송하고 응답을 반환한다.
@@ -497,6 +519,7 @@ impl LlmDispatcher {
                 message: format!("응답 파싱 실패: {e}"),
             })?;
 
+        self.record_usage(crate::agent::types::parse_openai_usage(&json));
         match crate::agent::types::parse_openai_response(&json) {
             Some(r) => {
                 self.circuit.record_success();
@@ -607,6 +630,7 @@ impl LlmDispatcher {
                 message: format!("응답 파싱 실패: {e}"),
             })?;
 
+        self.record_usage(crate::agent::types::parse_anthropic_usage(&json));
         match crate::agent::types::parse_anthropic_response(&json) {
             Some(r) => {
                 self.circuit.record_success();

@@ -30,6 +30,38 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// provider가 응답에 실어 보낸 토큰 사용량.
+///
+/// 필드 이름이 provider마다 다르므로(OpenAI `prompt_tokens`/`completion_tokens`, Anthropic
+/// `input_tokens`/`output_tokens`) 여기서 하나로 흡수한다. 저장소의 다른 토큰 수치는 전부
+/// 문자 수 추정치라, 비용을 실제로 비교해야 하는 자리에서는 이 값이 필요하다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// OpenAI 호환 응답의 `usage`. 보고하지 않는 provider도 있어 `None`을 돌려줄 수 있다.
+pub fn parse_openai_usage(json: &Value) -> Option<TokenUsage> {
+    let u = json.get("usage")?;
+    Some(TokenUsage {
+        input_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: u
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+/// Anthropic 응답의 `usage`.
+pub fn parse_anthropic_usage(json: &Value) -> Option<TokenUsage> {
+    let u = json.get("usage")?;
+    Some(TokenUsage {
+        input_tokens: u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        output_tokens: u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+    })
+}
+
 /// LLM에 노출할 도구 스펙. `parameters`는 JSON Schema.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
@@ -264,6 +296,38 @@ fn parse_tool_call(v: &Value) -> Option<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openai_usage_maps_prompt_and_completion_tokens() {
+        let v = json!({"usage": {"prompt_tokens": 120, "completion_tokens": 7}});
+        let u = parse_openai_usage(&v).expect("usage");
+        assert_eq!(u.input_tokens, 120);
+        assert_eq!(u.output_tokens, 7);
+    }
+
+    #[test]
+    fn anthropic_usage_uses_its_own_field_names() {
+        let v = json!({"usage": {"input_tokens": 300, "output_tokens": 11}});
+        let u = parse_anthropic_usage(&v).expect("usage");
+        assert_eq!(u.input_tokens, 300);
+        assert_eq!(u.output_tokens, 11);
+    }
+
+    #[test]
+    fn a_response_without_usage_reports_none() {
+        // 0으로 채워 돌려주면 "보고하지 않았다"와 "정말 0이다"가 같아 보이고, 비용 집계가
+        // 조용히 0으로 내려간다.
+        assert!(parse_openai_usage(&json!({"choices": []})).is_none());
+        assert!(parse_anthropic_usage(&json!({"content": []})).is_none());
+    }
+
+    #[test]
+    fn a_partial_usage_object_counts_the_field_it_has() {
+        // 한쪽만 싣는 provider가 있다. 통째로 버리면 있는 정보까지 잃는다.
+        let u = parse_openai_usage(&json!({"usage": {"prompt_tokens": 42}})).expect("usage");
+        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.output_tokens, 0);
+    }
 
     #[test]
     fn system_message_serializes_role_and_content() {
