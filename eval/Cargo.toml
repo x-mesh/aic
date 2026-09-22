@@ -1,0 +1,25 @@
+# 워크스페이스 밖에 둔다(루트 Cargo.toml의 exclude). aic-client나 aic-server에 [[bin]]을
+# 추가하면 .goreleaser.yaml과 Makefile의 install 타겟이 그것까지 사용자 설치물에 넣는다 —
+# 검증 도구는 운영 인터페이스와 분리한다는 PRD 요구를 구조로 지키려면 배포 경로 밖이어야 한다.
+# fuzz/와 같은 패턴이다.
+[package]
+name = "aic-eval"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+aic-client = { path = "../aic-client" }
+aic-common = { path = "../aic-common" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[[bin]]
+name = "aic-eval"
+path = "src/main.rs"
