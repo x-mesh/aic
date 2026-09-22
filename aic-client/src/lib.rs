@@ -12,6 +12,7 @@ pub mod error_analyzer;
 pub mod feedback;
 pub mod history;
 pub mod hook_install;
+pub mod jev;
 pub mod keychain;
 pub mod llm_dispatcher;
 pub mod local_record;

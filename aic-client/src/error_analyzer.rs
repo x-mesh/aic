@@ -184,6 +184,70 @@ impl ErrorAnalyzer {
         })
     }
 
+    /// 원인 계열 — **다음 조치가 달라지는 단위**로 나눈 닫힌 집합.
+    ///
+    /// 문구는 `docs/ERROR-CAUSE-EVALUATION.md`에서 측정한 것과 글자 그대로 같다. 바꾸면 그 수치가
+    /// 이 표에 적용되지 않는다. 표면 어휘가 아니라 조치를 기준으로 쓴 이유도 거기 있다 — git의
+    /// `could not read Username ... Device not configured`는 글자만 보면 장치 문제지만 조치는
+    /// 자격 증명 설정이다.
+    pub const CAUSE_CATEGORIES: &'static [(&'static str, &'static str)] = &[
+        ("not_found", "지정한 대상이 존재하지 않는다(파일·경로·브랜치·컨테이너·리소스·이름). 조치는 이름이나 경로를 고치는 것이다."),
+        ("usage", "명령을 잘못 썼다(인자 누락, 알 수 없는 옵션, 잘못된 조합). 조치는 사용법을 고치는 것이다."),
+        ("malformed_input", "주어진 데이터나 코드가 형식에 맞지 않아 파싱·컴파일이 실패했다. 조치는 그 내용을 고치는 것이다."),
+        ("network", "상대에 도달하지 못했다(이름 해석 실패, 연결 거부, 타임아웃). 조치는 연결 경로와 상대 기동 여부를 확인하는 것이다."),
+        ("tls", "TLS 인증서가 검증되지 않는다(만료·자가서명·호스트 불일치). 조치는 인증서나 신뢰 설정을 고치는 것이다."),
+        ("auth", "자격 증명이 없거나 거부됐다. 조치는 로그인·토큰·권한 부여다."),
+        ("remote_error", "상대가 요청을 받고 오류를 돌려줬다(서버 오류, 속도 제한). 조치는 재시도하거나 상대 상태를 확인하는 것이다."),
+        ("state", "대상의 현재 상태가 명령의 전제와 다르다(초기화 안 됨, 설정 없음, 이미 존재, 진행 중 아님). 조치는 전제를 맞추는 것이다."),
+        ("dependency", "실행에 필요한 모듈·패키지가 환경에 없다. 조치는 설치다."),
+        ("resource", "자원 한도에 걸렸다(파일 디스크립터, 메모리, 파일 크기, 디스크). 조치는 한도를 조정하거나 사용량을 줄이는 것이다."),
+    ];
+
+    /// 분류 모델에 줄 질문. 측정에 쓴 문구 그대로다.
+    pub const CAUSE_QUESTION: &'static str =
+        "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 \
+출력을 보고 실패의 **원인 계열**을 하나 고른다. 기준은 표면에 나온 낱말이 아니라 **다음에 해야 할 \
+조치**다 — 같은 낱말이라도 조치가 다르면 다른 범주다.";
+
+    /// 분류 모델에 줄 입력. 명령·종료 코드·정리한 출력이 전부다.
+    ///
+    /// 출력은 [`clean_output_lines`]를 거쳐 셸 프롬프트·명령 에코 같은 잡음을 뺀다 — LLM 프롬프트와
+    /// 같은 정리를 쓰지 않으면 두 경로가 서로 다른 것을 본다.
+    pub fn cause_input(record: &CommandRecord) -> String {
+        let cleaned = clean_output_lines(&record.output_lines, record.command.as_deref());
+        let tail = if cleaned.len() > MAX_OUTPUT_LINES {
+            cleaned[cleaned.len() - MAX_OUTPUT_LINES..].join("\n")
+        } else {
+            cleaned.join("\n")
+        };
+        format!(
+            "$ {}\nexit_code={}\n--- output ---\n{}",
+            record.command.as_deref().unwrap_or("(unknown command)"),
+            record.exit_code,
+            tail
+        )
+    }
+
+    /// 분류 결과를 프롬프트에 힌트로 얹는다. 없으면 프롬프트를 그대로 둔다.
+    ///
+    /// 단정이 아니라 힌트인 이유: 측정에서 분류 정확도가 0.906이었다. 열 번에 한 번은 틀리므로,
+    /// 프롬프트가 그것을 사실로 받으면 그 틀린 전제 위에 설명을 쓴다.
+    pub fn with_cause_hint(prompt: String, cause: Option<&str>) -> String {
+        let Some(cause) = cause else {
+            return prompt;
+        };
+        let desc = Self::CAUSE_CATEGORIES
+            .iter()
+            .find(|(id, _)| *id == cause)
+            .map(|(_, d)| *d)
+            .unwrap_or_default();
+        format!(
+            "{prompt}\n\n# Cause hint (classifier, not verified)\n\
+A separate classifier labelled this failure `{cause}` ({desc}). \
+Use it as a starting hypothesis. If the output contradicts it, ignore the label and follow the output."
+        )
+    }
+
     /// `CommandRecord`에서 에러 분석용 LLM 프롬프트를 생성한다.
     ///
     /// 프롬프트는 영어 라벨(`EXPLANATION:`/`COMMAND:`/`INFO:`)을 강제하고,
@@ -1104,6 +1168,57 @@ mod tests {
     }
 
     // ── build_prompt ───────────────────────────────────────────
+
+    #[test]
+    fn the_cause_hint_is_a_hypothesis_not_a_fact() {
+        // 측정에서 분류 정확도는 0.906이었다. 프롬프트가 라벨을 사실로 받으면 열 번에 한 번은
+        // 틀린 전제 위에 설명을 쓴다.
+        let p = ErrorAnalyzer::with_cause_hint("BASE".into(), Some("network"));
+        assert!(p.starts_with("BASE"), "{p}");
+        assert!(p.contains("not verified"), "{p}");
+        assert!(p.contains("ignore the label"), "{p}");
+        assert!(p.contains("상대에 도달하지 못했다"), "{p}");
+    }
+
+    #[test]
+    fn no_cause_leaves_the_prompt_untouched() {
+        assert_eq!(ErrorAnalyzer::with_cause_hint("BASE".into(), None), "BASE");
+    }
+
+    #[test]
+    fn an_unknown_cause_id_still_produces_a_usable_prompt() {
+        // 목록 밖 값은 클라이언트가 막지만, 막지 못해도 프롬프트가 깨지면 안 된다.
+        let p = ErrorAnalyzer::with_cause_hint("BASE".into(), Some("made_up"));
+        assert!(p.contains("made_up"), "{p}");
+    }
+
+    #[test]
+    fn the_cause_input_carries_the_command_exit_and_cleaned_output() {
+        let record = make_record(
+            Some("curl https://x"),
+            7,
+            vec!["curl: (7) Failed to connect"],
+        );
+        let s = ErrorAnalyzer::cause_input(&record);
+        assert!(s.contains("$ curl https://x"), "{s}");
+        assert!(s.contains("exit_code=7"), "{s}");
+        assert!(s.contains("Failed to connect"), "{s}");
+    }
+
+    #[test]
+    fn the_category_ids_are_unique_and_described() {
+        let mut ids: Vec<&str> = ErrorAnalyzer::CAUSE_CATEGORIES
+            .iter()
+            .map(|(i, _)| *i)
+            .collect();
+        let n = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "중복 범주 id");
+        assert!(ErrorAnalyzer::CAUSE_CATEGORIES
+            .iter()
+            .all(|(_, d)| d.contains("조치")));
+    }
 
     #[test]
     fn build_prompt_with_none_command() {

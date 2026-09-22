@@ -7747,6 +7747,7 @@ fn default_config() -> AppConfig {
         rca: aic_common::RcaConfig::default(),
         outbound: aic_common::OutboundConfig::default(),
         rca_agent: aic_common::RcaAgentConfig::default(),
+        jev: aic_common::JevConfig::default(),
     }
 }
 
@@ -10780,10 +10781,21 @@ async fn handle_record(
             }
             debug_log!("cache    MISS key={cache_key}");
 
+            // 원인 계열 분류 — 결정적 테이블이 잡지 못한 실패에만 돈다(잡힌 것은 위에서 반환됐다).
+            // 분류가 붙으면 사용자에게 먼저 보여주고 설명 프롬프트에 힌트로 얹는다. 미설정·실패·
+            // 시간 초과는 조용히 건너뛴다 — 분류는 부가 정보이지 분석의 전제가 아니다.
+            let cause = classify_failure_cause(&config.jev, &rec).await;
+            if let Some(c) = &cause {
+                print_cause_line(c);
+            }
+
             let prompt_start = Instant::now();
-            let prompt = aic_client::project_context::append_to_prompt(
-                ErrorAnalyzer::build_prompt(&rec, lang),
-                project_context.as_deref(),
+            let prompt = ErrorAnalyzer::with_cause_hint(
+                aic_client::project_context::append_to_prompt(
+                    ErrorAnalyzer::build_prompt(&rec, lang),
+                    project_context.as_deref(),
+                ),
+                cause.as_ref().map(|c| c.value.as_str()),
             );
             debug_step!(prompt_start, "prompt   {} chars", prompt.len());
 
@@ -11212,6 +11224,53 @@ fn section_labels(lang: &str) -> (&'static str, &'static str, &'static str) {
 /// 분석 결과를 섹션 단위로 포맷해 출력한다.
 /// `▸ 원인` (cyan) → `▸ 다음 시도` (green + `$ cmd`) → `▸ 참고` (dim) 순서.
 /// <think> 블록이 있으면 먼저 흐린 회색으로 표시.
+/// 실패 출력에서 원인 계열을 고른다. 미설정·오류·시간 초과는 `None`이다.
+///
+/// 결과는 audit에 남긴다 — 어느 계열이 얼마나 나오는지는 호스트를 운영하며 쌓여야 알 수 있고,
+/// 분류를 설명 생성 앞에 둘지(비용 절감) 뒤에 둘지는 그 분포를 보고 정한다.
+async fn classify_failure_cause(
+    cfg: &aic_common::JevConfig,
+    record: &aic_common::CommandRecord,
+) -> Option<aic_client::jev::Choice> {
+    let criteria: std::collections::BTreeMap<&str, &str> =
+        ErrorAnalyzer::CAUSE_CATEGORIES.iter().copied().collect();
+    let started = Instant::now();
+    let picked = aic_client::jev::choose(
+        cfg,
+        &ErrorAnalyzer::cause_input(record),
+        ErrorAnalyzer::CAUSE_QUESTION,
+        &criteria,
+    )
+    .await;
+    if let Some(c) = &picked {
+        debug_log!(
+            "cause    {} conf={:?} · {}ms",
+            c.value,
+            c.confidence,
+            started.elapsed().as_millis()
+        );
+        let _ = aic_client::audit::append(
+            "error_cause_classified",
+            serde_json::json!({
+                "category": c.value,
+                "confidence": c.confidence,
+                "exit_code": record.exit_code,
+                "elapsed_ms": started.elapsed().as_millis() as u64,
+            }),
+        );
+    }
+    picked
+}
+
+/// 분류 결과 한 줄. **검증되지 않은 추정**임을 드러낸다 — 측정에서 열 번에 한 번은 틀렸다.
+fn print_cause_line(choice: &aic_client::jev::Choice) {
+    let conf = choice
+        .confidence
+        .map(|c| format!(" ({c:.2})"))
+        .unwrap_or_default();
+    println!("{COL_DIM}추정 원인 계열: {}{conf}{COL_RESET}", choice.value);
+}
+
 fn print_analysis_result(result: &AnalysisResult, lang: &str) {
     let (cause_label, fix_label, info_label) = section_labels(lang);
 
@@ -11828,6 +11887,7 @@ source /root/.aic/hook-events.bash
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: aic_common::JevConfig::default(),
         }
     }
 
