@@ -50,22 +50,41 @@ fn tool_spec() -> ToolSpec {
 pub struct LlmArm {
     dispatcher: LlmDispatcher,
     provider: String,
+    model: String,
 }
 
 impl LlmArm {
-    /// 사용자의 `config.toml`에 설정된 provider를 그대로 쓴다. 평가 시작 전에 provider와
-    /// 모델 ID를 고정해 결과에 함께 기록해야 한다.
-    pub fn from_config() -> Result<Self> {
-        let config = ConfigManager::load().context("config.toml을 읽지 못했습니다")?;
-        let provider = config.llm.default_provider.clone();
+    /// 사용자의 `config.toml`에 설정된 provider를 쓰되 **모델 ID를 고정한다**.
+    ///
+    /// provider 기본 모델에 맡기면 그 값이 언제 바뀌었는지 결과만 보고는 알 수 없다. PRD가
+    /// 평가 시작 전에 정확한 모델 ID를 고정하라고 요구하는 이유다. config에도 `--llm-model`에도
+    /// 없으면 실행하지 않는다.
+    pub fn from_config(model_override: Option<&str>) -> Result<Self> {
+        let mut llm = ConfigManager::load()
+            .context("config.toml을 읽지 못했습니다")?
+            .llm;
+        let provider = llm.default_provider.clone();
+        let entry = llm
+            .providers
+            .get_mut(&provider)
+            .with_context(|| format!("config.toml에 provider {provider}가 없습니다"))?;
+        if let Some(m) = model_override {
+            entry.model = Some(m.to_string());
+        }
+        let model = entry.model.clone().context(
+            "모델 ID가 고정되지 않았습니다 — config.toml의 provider에 model을 적거나 \
+             --llm-model로 지정하세요",
+        )?;
         Ok(Self {
-            dispatcher: LlmDispatcher::from_config(config.llm),
+            dispatcher: LlmDispatcher::from_config(llm),
             provider,
+            model,
         })
     }
 
-    pub fn provider(&self) -> &str {
-        &self.provider
+    /// 결과에 기록할 식별자. provider와 모델을 함께 남긴다.
+    pub fn identity(&self) -> String {
+        format!("{}/{}", self.provider, self.model)
     }
 
     pub async fn categorize(&self, symptom: &str) -> ArmOutcome {

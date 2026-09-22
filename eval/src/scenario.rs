@@ -102,8 +102,7 @@ impl Scenario {
         if !self.useful_probes.is_empty() {
             return self.useful_probes.iter().cloned().collect();
         }
-        let required: BTreeSet<&str> =
-            self.required_probes.iter().map(String::as_str).collect();
+        let required: BTreeSet<&str> = self.required_probes.iter().map(String::as_str).collect();
         self.allowed_categories
             .iter()
             .flat_map(|cat| {

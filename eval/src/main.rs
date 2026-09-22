@@ -21,6 +21,8 @@ const DEFAULT_RESULTS: &str = "target/results.jsonl";
 /// bootstrap 반복 수. 고정 시드와 함께 쓰므로 실행마다 같은 구간이 나온다.
 const BOOTSTRAP_ITERATIONS: usize = 2000;
 const BOOTSTRAP_SEED: u64 = 20260922;
+/// Jev의 공개 단가(2026-09-22 확인): 입력 100만 토큰당 0.042 USD, 출력은 무료.
+const JEV_INPUT_USD_PER_TOKEN: f64 = 0.042 / 1_000_000.0;
 
 #[derive(Parser)]
 #[command(name = "aic-eval", about = "증상별 진단 항목 선택 비교 실험")]
@@ -53,6 +55,9 @@ enum Command {
         out: PathBuf,
         #[arg(long, default_value = "jev-1.13.0")]
         jev_model: String,
+        /// LLM 비교군의 모델 ID. config.toml의 provider 설정을 덮어쓴다.
+        #[arg(long)]
+        llm_model: Option<String>,
     },
     /// 범주별로 어떤 probe가 붙는지 보여준다. 필수 집합을 정할 때 쓴다.
     Probes {
@@ -66,6 +71,9 @@ enum Command {
     Score {
         #[arg(long, default_value = DEFAULT_RESULTS)]
         results: PathBuf,
+        /// trait별 하위 집합을 보고하려면 라벨 파일이 필요하다.
+        #[arg(long, default_value = DEFAULT_DATA)]
+        data: PathBuf,
         /// 비교의 기준이 될 비교군. 차이의 신뢰구간을 이 비교군 대비로 낸다.
         #[arg(long, default_value = "improved")]
         baseline: String,
@@ -83,11 +91,25 @@ async fn main() -> Result<()> {
             repeats,
             out,
             jev_model,
-        } => run(&data, &arms, split.as_deref(), repeats, &out, &jev_model).await,
-        Command::Probes { category, docker } => {
-            show_probes(category.as_deref(), docker)
+            llm_model,
+        } => {
+            run(
+                &data,
+                &arms,
+                split.as_deref(),
+                repeats,
+                &out,
+                &jev_model,
+                llm_model.as_deref(),
+            )
+            .await
         }
-        Command::Score { results, baseline } => score(&results, &baseline),
+        Command::Probes { category, docker } => show_probes(category.as_deref(), docker),
+        Command::Score {
+            results,
+            data,
+            baseline,
+        } => score(&results, &data, &baseline),
     }
 }
 
@@ -138,12 +160,12 @@ enum Runner {
 }
 
 impl Runner {
-    fn build(name: &str, jev_model: &str) -> Result<Self> {
+    fn build(name: &str, jev_model: &str, llm_model: Option<&str>) -> Result<Self> {
         Ok(match name {
             "current" => Runner::Current,
             "improved" => Runner::Improved,
             "jev" => Runner::Jev(Box::new(JevClient::from_env(jev_model)?)),
-            "llm" => Runner::Llm(Box::new(LlmArm::from_config()?)),
+            "llm" => Runner::Llm(Box::new(LlmArm::from_config(llm_model)?)),
             other => bail!("알 수 없는 비교군: {other}"),
         })
     }
@@ -153,7 +175,7 @@ impl Runner {
         match self {
             Runner::Current | Runner::Improved => None,
             Runner::Jev(c) => Some(c.model().to_string()),
-            Runner::Llm(a) => Some(a.provider().to_string()),
+            Runner::Llm(a) => Some(a.identity()),
         }
     }
 
@@ -192,6 +214,7 @@ async fn run(
     repeats: u32,
     out: &std::path::Path,
     jev_model: &str,
+    llm_model: Option<&str>,
 ) -> Result<()> {
     let ds = Dataset::load(data)?;
     let split = match split {
@@ -212,7 +235,7 @@ async fn run(
     let revision = git_revision();
     let mut runners = Vec::new();
     for name in arm_names {
-        runners.push((name.clone(), Runner::build(name, jev_model)?));
+        runners.push((name.clone(), Runner::build(name, jev_model, llm_model)?));
     }
 
     if let Some(parent) = out.parent() {
@@ -267,7 +290,7 @@ async fn run(
     Ok(())
 }
 
-fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
+fn score(results: &std::path::Path, data: &std::path::Path, baseline: &str) -> Result<()> {
     let raw = std::fs::read_to_string(results)
         .with_context(|| format!("결과를 읽지 못했습니다: {}", results.display()))?;
     let records: Vec<CaseRecord> = raw
@@ -280,6 +303,15 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
         bail!("결과가 비어 있습니다");
     }
 
+    // 반복이 있으면 **최초 실행만** 주 평가로 쓴다(PRD 5절). 여러 번 중 좋은 쪽을 고르거나
+    // 평균을 내면, 실제 운영에서 한 번만 묻는 조건보다 관대한 수치가 나온다.
+    let primary: Vec<CaseRecord> = records.iter().filter(|r| r.repeat == 1).cloned().collect();
+    let repeats = records.iter().map(|r| r.repeat).max().unwrap_or(1);
+    if repeats > 1 {
+        println!("(반복 {repeats}회 중 최초 실행을 주 평가로 사용합니다)");
+        println!();
+    }
+
     let mut arm_names: Vec<String> = records.iter().map(|r| r.arm.clone()).collect();
     arm_names.sort();
     arm_names.dedup();
@@ -290,7 +322,7 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
     );
     let mut summaries = Vec::new();
     for arm in &arm_names {
-        let s = scoring::summarize(arm, &records);
+        let s = scoring::summarize(arm, &primary);
         println!(
             "{:<10} {:>6} {:>9.3} {:>9.3} {:>9.2} {:>8.3} {:>8.3} {:>9} {:>9}",
             s.arm,
@@ -315,7 +347,7 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
     println!();
     println!("{baseline} 대비 확보율 차이 (짝지은 bootstrap 95% CI, 시나리오 단위 재표집)");
     for arm in arm_names.iter().filter(|a| *a != baseline) {
-        let grouped = group_by_scenario(&records, arm, baseline, &|s| s.coverage);
+        let grouped = group_by_scenario(&primary, arm, baseline, &|s| s.coverage);
         let pairs: usize = grouped.iter().map(Vec::len).sum();
         if pairs == 0 {
             println!("  {arm:<10} 비교 가능한 사례 없음");
@@ -327,10 +359,101 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
     }
 
     println!();
+    println!("토큰과 비용 (실행 전체 합계)");
+    for s in &summaries {
+        if s.total_input_tokens == 0 && s.total_output_tokens == 0 {
+            println!("  {:<10} 원격 호출 없음", s.arm);
+            continue;
+        }
+        // Jev만 공개 단가를 안다. 다른 provider는 단가를 모르므로 토큰만 싣는다 —
+        // 모르는 값을 0으로 채우면 비용이 없는 것처럼 보인다.
+        let cost = if s.arm == "jev" {
+            format!(
+                "${:.5}",
+                s.total_input_tokens as f64 * JEV_INPUT_USD_PER_TOKEN
+            )
+        } else {
+            "단가 미상".to_string()
+        };
+        println!(
+            "  {:<10} 입력 {:>7}  출력 {:>6}  {}",
+            s.arm, s.total_input_tokens, s.total_output_tokens, cost
+        );
+    }
+
+    println!();
     println!("불필요 probe (두 비교군이 모두 정상 반환한 사례에서만)");
     for arm in arm_names.iter().filter(|a| *a != baseline) {
-        let (a, b, n) = scoring::unnecessary_paired(&records, arm, baseline);
+        let (a, b, n) = scoring::unnecessary_paired(&primary, arm, baseline);
         println!("  {arm:<10} {a:.2} vs {baseline} {b:.2}  (n={n})");
+    }
+
+    // PRD 5절이 요구하는 하위 집합 보고. 명확한 단일 증상에서 품질이 떨어지면, 전체 평균이
+    // 올라갔어도 후속 연동을 보류한다 — 쉬운 사례를 망가뜨리는 개선은 순이득이 아니다.
+    if let Ok(ds) = Dataset::load(data) {
+        let traits_of: std::collections::HashMap<&str, &Vec<String>> = ds
+            .scenarios
+            .iter()
+            .map(|s| (s.id.as_str(), &s.traits))
+            .collect();
+        let mut all_traits: Vec<&str> = traits_of
+            .values()
+            .flat_map(|v| v.iter().map(String::as_str))
+            .collect();
+        all_traits.sort_unstable();
+        all_traits.dedup();
+
+        println!();
+        println!("trait별 확보율 (주 평가)");
+        print!("  {:<22}", "trait");
+        for arm in &arm_names {
+            print!(" {arm:>10}");
+        }
+        println!("  {:>5}", "n");
+        for t in all_traits {
+            let subset: Vec<CaseRecord> = primary
+                .iter()
+                .filter(|r| {
+                    traits_of
+                        .get(r.scenario_id.as_str())
+                        .is_some_and(|v| v.iter().any(|x| x == t))
+                })
+                .cloned()
+                .collect();
+            let mut cells = Vec::new();
+            let mut n = 0;
+            for arm in &arm_names {
+                let s = scoring::summarize(arm, &subset);
+                n = s.scored_cases;
+                cells.push(s.mean_coverage);
+            }
+            if n == 0 {
+                continue;
+            }
+            print!("  {t:<22}");
+            for c in cells {
+                print!(" {c:>10.3}");
+            }
+            println!("  {n:>5}");
+        }
+    }
+
+    if repeats > 1 {
+        println!();
+        println!("반복별 확보율 (주 평가는 1회차)");
+        for arm in &arm_names {
+            print!("  {arm:<10}");
+            for rep in 1..=repeats {
+                let subset: Vec<CaseRecord> = records
+                    .iter()
+                    .filter(|r| r.repeat == rep)
+                    .cloned()
+                    .collect();
+                let s = scoring::summarize(arm, &subset);
+                print!(" {}회 {:.3}", rep, s.mean_coverage);
+            }
+            println!();
+        }
     }
 
     println!();
@@ -338,7 +461,7 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
     for arm in &arm_names {
         for lang in Lang::ALL {
             let subset: Vec<CaseRecord> =
-                records.iter().filter(|r| r.lang == lang).cloned().collect();
+                primary.iter().filter(|r| r.lang == lang).cloned().collect();
             let s = scoring::summarize(arm, &subset);
             println!(
                 "  {:<10} {:<3} {:.3} (n={})",
@@ -350,7 +473,6 @@ fn score(results: &std::path::Path, baseline: &str) -> Result<()> {
         }
     }
 
-    let repeats = records.iter().map(|r| r.repeat).max().unwrap_or(1);
     if repeats > 1 {
         println!();
         println!("반복 일치율 (같은 입력을 {repeats}번 물었을 때 같은 범주가 나온 비율)");
