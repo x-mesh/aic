@@ -107,6 +107,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_LLM_MODEL)]
         llm_model: String,
     },
+    /// 실제 `aic diagnose --json`(또는 raw evidence) 파일에서 결정적 follow-up 후보를 뽑아 보여준다.
+    /// 합성 데이터가 아닌 진짜 출력에 추출 규칙이 도는지 확인할 때 쓴다. 네트워크 없음.
+    FollowupCandidates {
+        /// `aic diagnose --json` 출력 파일 또는 `## section` 형식의 raw evidence. 여러 번 줄 수 있다.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
     /// follow-up 원시 결과를 집계한다. 네트워크 없음.
     FollowupScore {
         #[arg(long, default_value = "target/followup.jsonl")]
@@ -217,6 +224,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::FollowupCandidates { files } => followup_candidates(&files),
         Command::FollowupScore { results } => followup_score(&results),
         Command::Probes { category, docker } => show_probes(category.as_deref(), docker),
         Command::Score {
@@ -989,6 +997,47 @@ async fn followup_run(
         }
     }
     println!("✔ {done}건을 {}에 기록했습니다", out.display());
+    Ok(())
+}
+
+/// `aic diagnose --json` 봉투에서 evidence를 꺼낸다. JSON이 아니면 파일 전체를 evidence로 본다.
+fn evidence_of(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| {
+            v.pointer("/diagnosis/evidence")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn followup_candidates(files: &[PathBuf]) -> Result<()> {
+    for f in files {
+        let raw = std::fs::read_to_string(f)
+            .with_context(|| format!("읽지 못했습니다: {}", f.display()))?;
+        let evidence = evidence_of(&raw);
+        let secs: Vec<&str> = evidence
+            .lines()
+            .filter_map(|l| l.strip_prefix("## "))
+            .collect();
+        println!("=== {} ({} 섹션)", f.display(), secs.len());
+        println!("  섹션: {}", secs.join(" "));
+        let cands = followup::candidates(&evidence);
+        if cands.is_empty() {
+            println!("  후보 없음 → follow-up 불필요(none)");
+        }
+        for (tmpl, args) in &cands {
+            println!("  {tmpl}: {}", args.join(", "));
+        }
+        // 뽑은 후보가 실제 게이트를 통과하는지까지 본다 — 통과하지 못하면 production에서 실행되지 않는다.
+        for line in followup::candidate_lines(&evidence) {
+            if let Err(e) = aic_client::agent::diagnose::resolve_followup_line(&line, &evidence) {
+                println!("  [게이트 거부] {line} — {e}");
+            }
+        }
+        println!();
+    }
     Ok(())
 }
 
