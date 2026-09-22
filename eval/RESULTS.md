@@ -544,3 +544,81 @@ cargo run --release -- judge-score --results target/judge-final.jsonl --data dat
 
 - `results/judge-dev.jsonl.gz` — 개발 45건(v2, 주 조정 실행)
 - `results/judge-final.jsonl.gz` — 최종 90건 × 3회 = 270건
+
+---
+
+# Jev follow-up 선택 평가 (별도 실험)
+
+> 실행일: 2026-09-22 · 구현 기준: `1930539` 이후 작업 트리
+> 데이터: `data/followup-bundles.json`(생성기 `data/gen-followup-bundles.py`, seed 20260922), 26 번들(개발 10 / 최종 16)
+> 모델: Jev `jev-1.13.0` 질문 버전 `v2`, LLM `ai-mesh/kiro/gpt-5.6-luna`(production 프롬프트 그대로)
+> 결론과 배운 것은 [`docs/PROBE-FOLLOWUP-EVALUATION.md`](../docs/PROBE-FOLLOWUP-EVALUATION.md)
+
+top-1/top-3는 신호 있는 번들 기준, none 정답은 신호 없는 번들 기준이다. 실패(응답 계약 위반)는
+오답으로 센다. 두 비교군 모두 실패 0건이었다.
+
+## 최종 분할 16 번들(신호 12 / 없음 4), 1회차
+
+| 비교군 | top-1 | top-3 | none 정답 | 게이트 거부 | p50 | p95 | 입력 토큰(1회차 16회 합) |
+|---|---|---|---|---|---|---|---|
+| jev | 0.833 | 1.000 | 0.500 | — | 246ms | 332ms | 52,719 |
+| llm | 0.333 | 0.750 | 0.000 | 0.000 | 10,052ms | 14,090ms | 미측정 |
+
+jev 입력 토큰은 호출당 약 3,300으로, 메뉴 70개와 인자 후보를 매 요청에 싣는 값이다. 3회 반복 48회 전체는
+약 158,000 토큰(≈ 0.0066 USD)이다.
+
+## 개발 분할 10 번들(신호 8 / 없음 2), 1회 실행
+
+| 비교군 | top-1 | top-3 | none 정답 | p50 | p95 | 입력 토큰(1회) |
+|---|---|---|---|---|---|---|
+| jev | 1.000 | 1.000 | 1.000 | 249ms | 594ms | 32,596 |
+| llm | 0.375 | 0.750 | 0.000 | 7,947ms | 14,596ms | 미측정 |
+
+## 반복 일치율(같은 번들 3회, 첫 선택이 전부 같은 비율)
+
+| 비교군 | 최종 16 | 불일치 번들 |
+|---|---|---|
+| jev | 0.938 | pf-08 (`proc_fd 905` / `proc_fd 100` / `proc_fd 100`) |
+| llm | 0.438 | 9개 |
+
+## 사례별(최종 1회차)
+
+| 번들 | 정답 | jev | llm |
+|---|---|---|---|
+| dk-02 | docker_{logs,inspect_container,health,logs_since} worker-3 | ✔ docker_health worker-3 | ✔ docker_health worker-3 |
+| dk-03 | 같은 4종 db-1 | ✔ docker_inspect_container db-1 | ✔ docker_inspect_container db-1 |
+| dk-04 | docker_{logs,inspect_container} api-2·db-1 (정답 결함, docs 참고) | ✘ proc_fd 905 | ✘ docker_logs_since api-2 |
+| fu-04 | journal_unit a.service·b.socket·c.mount·d.timer | ✔ journal_unit a.service | ✘ journal_errors |
+| fu-05 | journal_unit f~l.service | ✔ journal_unit f.service | ✘ journal_errors |
+| fu-06 | journal_unit docker.socket | ✔ | ✔ |
+| k8-02 | k8s_pod_{describe,logs} ingest-5d2a-q9 | ✔ k8s_pod_describe | ✘ k8s_crashloop_pods |
+| nn-03 | none | ✔ none | ✘ proc_changes |
+| nn-04 | none | ✔ none | ✘ vmstat_iowait |
+| nn-05 | none | ✘ proc_fd 904 | ✘ memory |
+| nn-06 | none | ✘ proc_fd 904 | ✘ uptime |
+| pf-04 | proc_fd 73006 | ✔ | ✘ fd |
+| pf-05 | proc_fd 555 | ✔ | ✔ |
+| pf-06 | proc_fd 900 | ✔ | ✘ fd |
+| pf-07 | proc_fd 901 | ✔ | ✘ fd |
+| pf-08 | proc_fd 103 (정답 결함, docs 참고) | ✘ proc_fd 905 | ✘ fd |
+
+jev 오답 4건은 모두 `proc_fd_top` 표의 스캐너 비신호 행(`50 904 tiny`/한도 100000, `900 905 mid2`/
+한도 없음)을 `proc_fd` 대상으로 고른 것이다. jev confidence는 정답 46건이 0.39 이상(중앙값 0.86),
+오답 12건이 0.46~0.89라 임계로 가를 수 없다.
+
+## 재현
+
+```sh
+cd eval
+cargo run -- followup-validate --data data/followup-bundles.json
+TYPESAFE_API_KEY=... cargo run --release -- followup-run --arm jev --arm llm --split dev --repeats 3 --out target/followup-dev.jsonl
+TYPESAFE_API_KEY=... cargo run --release -- followup-run --arm jev --arm llm --split final --repeats 3 --out target/followup-final.jsonl
+cargo run --release -- followup-score --results target/followup-final.jsonl
+```
+
+LLM 비교군은 `aic` 설정의 `ai-mesh` provider를 쓴다. `--llm-model`로 모델을 바꿀 수 있다.
+
+## 보존물
+
+- `results/followup-dev-20260922.jsonl.gz` — 개발 10 × 2 비교군 × 1회 = 20건
+- `results/followup-final-20260922.jsonl.gz` — 최종 16 × 2 비교군 × 3회 = 96건
