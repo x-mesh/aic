@@ -740,6 +740,18 @@ pub(crate) static FOLLOWUP_TEMPLATES: &[FollowupTemplate] = &[
 ];
 
 /// id로 follow-up 템플릿을 찾는다.
+/// follow-up 템플릿의 (id, 설명) 쌍 전부.
+///
+/// follow-up 선택을 다른 방법으로 하는 실험이 "목록 밖 템플릿을 냈는가"를 판정하고 선택지 설명을
+/// 프롬프트에 그대로 쓰려면 목록이 공개돼야 한다. `FollowupTemplate`은 내부 표현이라 공개하지 않고
+/// 이 쌍만 연다(`probe_exists`와 같은 관례).
+pub fn followup_templates() -> Vec<(&'static str, &'static str)> {
+    FOLLOWUP_TEMPLATES
+        .iter()
+        .map(|t| (t.id, t.description))
+        .collect()
+}
+
 pub(crate) fn template_by_id(id: &str) -> Option<&'static FollowupTemplate> {
     FOLLOWUP_TEMPLATES.iter().find(|t| t.id == id)
 }
@@ -756,6 +768,12 @@ pub(crate) fn catalog() -> &'static [ProbeSpec] {
 /// 목록에 있는지"를 코드로 확인해야 한다. `ProbeSpec`은 내부 표현이라 공개하지 않고 이 질문만 연다.
 pub fn probe_exists(id: &str) -> bool {
     probe_by_id(id).is_some()
+}
+
+/// CATALOG의 (id, 설명) 쌍 전부. follow-up 메뉴를 다른 방법으로 제시하는 실험이 LLM 프롬프트와
+/// 같은 선택지를 쓰려면 설명까지 필요하다.
+pub fn probe_descriptions() -> Vec<(&'static str, &'static str)> {
+    CATALOG.iter().map(|p| (p.id, p.description)).collect()
 }
 
 /// CATALOG의 모든 probe ID.

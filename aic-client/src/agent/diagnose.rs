@@ -520,7 +520,7 @@ pub async fn run_headless_diagnose_opts(
 
 /// 1차 분석 텍스트에서 첫 ```aic-followup``` fenced block의 비어있지 않은 줄들을 추출한다.
 /// 블록이 없으면 None(= follow-up 제안 없음, zero-cost fallback). 순수 함수(테스트 가능).
-pub(crate) fn extract_followup_block(analysis: &str) -> Option<Vec<String>> {
+pub fn extract_followup_block(analysis: &str) -> Option<Vec<String>> {
     let mut lines = analysis.lines();
     lines.find(|l| l.trim() == "```aic-followup")?;
     let mut out = Vec::new();
@@ -542,10 +542,7 @@ pub(crate) fn extract_followup_block(analysis: &str) -> Option<Vec<String>> {
 /// 직렬 게이트 1~3층: (1) catalog probe id 또는 템플릿 id만 허용(자유 명령 경로 없음),
 /// (2) 템플릿 인자는 charset 검증 AND 1차 증거에 실존하는 값만(LLM 창작 인자 거부),
 /// (3) 해석된 최종 명령도 risk_guard Safe여야 한다. validator(4층)는 실행 직전 호출부에서.
-pub(crate) fn resolve_followup_line(
-    line: &str,
-    evidence: &str,
-) -> Result<(String, String), String> {
+pub fn resolve_followup_line(line: &str, evidence: &str) -> Result<(String, String), String> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let (id, arg) = match tokens.as_slice() {
         [id] => (*id, None),
@@ -834,7 +831,7 @@ pub(crate) fn build_diagnose_prompt(symptom: Option<&str>, evidence: &str) -> St
 
 /// follow-up 모드 1차 프롬프트 — 기본 프롬프트에 catalog ID 메뉴와 fenced block 계약을 덧붙인다.
 /// LLM은 catalog/템플릿 id만 제안할 수 있고(자유 명령 금지), 인자는 증거에 등장한 값만 허용된다.
-pub(crate) fn build_diagnose_prompt_followup(symptom: Option<&str>, evidence: &str) -> String {
+pub fn build_diagnose_prompt_followup(symptom: Option<&str>, evidence: &str) -> String {
     let mut menu = String::new();
     for p in super::probes::catalog() {
         menu.push_str(&format!("- {} — {}\n", p.id, p.description));
