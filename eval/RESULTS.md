@@ -425,3 +425,122 @@ memory를 무효화하는 사례)은 네 비교군 모두 1.000이었다. `미�
 
 - `results/final3-20260922.jsonl.gz` — 3차 최종 평가 2,880건
 - `results/dev200-rules-20260922.jsonl.gz` — 임계값 결정에 쓴 개발 데이터 1,200건
+
+# Jev 판정 재현 평가 (probe-judgment, 별도 실험)
+
+> 계획은 [docs/PRD-JEV-PROBE-JUDGMENT.md](../docs/PRD-JEV-PROBE-JUDGMENT.md), 결론은
+> [docs/PROBE-JUDGMENT-EVALUATION.md](../docs/PROBE-JUDGMENT-EVALUATION.md).
+> 위 라운드들(probe **선택**)과는 다른 질문이다 — 여기는 `scan_findings`의 9개 probe 판정을
+> Jev의 Choice가 재현하는지를 잰다.
+
+> 실행일: 2026-09-22 · 구현 기준: `fb25038` 이후 작업 트리(`scanned_severities` 추가 포함)
+> 데이터: `data/probe-judgments.json` schema_version 1, 확정일 2026-09-22, 개발 45 + 최종 90
+> 모델: Jev `jev-1.13.0`, 질문 버전 `v2`(v1에서 1회 조정)
+
+## 질문 조정 — 개발 45섹션, v1 → v2
+
+v1: 첫 실행에서 API 실패 0건·oversize 0건이었지만 스캐너 재현율·정밀도 모두 0.833으로 진행
+문턱(0.90/0.95)에 못 미쳤다. 사례별로 보면 `proc_fd_top`의 "명시적 한도가 없고 절대량만 큰"
+두 사례(`proc_fd_top-dev-2`, `-dev-5`)가 낮은 confidence(0.25)로 `none`을 골랐다 — 한도 정보가
+없으면 큰 수치도 정상으로 읽는 경향으로 보였다.
+
+`instructions`에 한 문장을 더했다: "명시적인 한도나 정원이 안 보여도, 그 수치 자체가 상식적인
+기준으로 비정상적으로 크면 경고 이상으로 본다." probe 이름이나 수치 임계는 넣지 않았다(R3 유지).
+질문 버전을 v2로 올리고 개발 45섹션을 다시 돌렸다.
+
+| 버전 | 재현율 | 정밀도 | 비고 |
+|---|---|---|---|
+| v1 | 0.833 (20/24) | 0.833 (20/4 FP) | `proc_fd_top` 2건 FN |
+| v2 | 0.875 (21/24) | 0.840 (21/4 FP) | `proc_fd_top` 2건 해결, 대신 `fd-dev-1`(97% 정답)이 새로 `none`(conf 0.35)으로 틀림 |
+
+v2가 두 지표 모두 조금 낫고 일반 원칙(probe 비의존)이라 채택했다. `fd-dev-1`의 새 실패는
+표본 45건에서의 단일 사례라 모델의 비결정성(반복 일치율 0.933, 아래 참고)과 구분할 수 없다 —
+질문 자체의 결함이라 단정하지 않는다. 이 조정 1회로 멈췄다: 남은 불일치 대부분이 스캐너의
+정확한 수치 임계(disk 90%, inode 90%, fd 80%, swap 80%, proc_fd_top 50%/10,000)를 모른 채로는
+구조적으로 못 맞히는 경계 사례였고, 그 임계를 질문에 넣는 것은 R3가 금지한다(사실상 스캐너를
+프롬프트로 재구현하게 된다).
+
+## 토큰 예산 실측
+
+첫 개발 실행에서 사례별 `usage.input_tokens`를 state 바이트 길이에 회귀했다. 질문
+정의(`criteria`+`instructions`, 두 질문 고정)가 사례마다 동일하므로 기울기가 곧 state의
+실측 바이트/토큰 비율이다: **약 4.06 바이트/토큰**(고정 오버헤드 약 604 토큰). 가정한
+`CONSERVATIVE_BYTES_PER_TOKEN = 2.0`(바이트/토큰)은 실측보다 더 보수적이다(같은 바이트 수에
+더 많은 토큰을 추정) — "추정이 실측보다 관대"한 방향이 아니므로 상수를 낮추지 않았다.
+`STATE_TOKEN_BUDGET = 16,000`(state만 32,000바이트, 실측 비율로는 약 7,900토큰)은 문서상
+결합 한도 32k 토큰 대비 충분한 여유를 남긴다.
+
+## 최종 분할(1회차) — 주 지표
+
+| 지표 | 값 | 95% CI(bootstrap, n_iter=2000, 사례 단위) |
+|---|---|---|
+| 스캐너 재현율 | **0.878** (36/41) | [0.780, 0.976] |
+| 스캐너 대비 정밀도 | **0.750** (36/48) | [0.625, 0.875] |
+| 심각도 일치율(warn 대 crit, n=36) | 0.750 | — |
+
+혼동행렬(90건, oversize 0·API 실패 0): TP 36 · FP 12 · FN 5 · TN 37.
+
+## probe별
+
+| probe | 재현율 | 정밀도 | 등급일치 |
+|---|---|---|---|
+| disk | 1.000 | 0.571 | 1.000 |
+| dmesg_oom | 1.000 | 1.000 | 1.000 |
+| failed_units | 1.000 | 1.000 | 0.200 |
+| fd | **0.250** | 1.000 | 1.000 |
+| inodes | 1.000 | 0.444 | 1.000 |
+| journal_daemon_errors | 1.000 | 1.000 | 0.400 |
+| proc_fd_top | 0.800 | 0.800 | 1.000 |
+| proc_states | 0.800 | 1.000 | 0.500 |
+| swap_usage | 1.000 | 0.571 | 1.000 |
+
+## 반복과 재현성
+
+최종 90섹션을 3회 반복했다(1회차를 주 평가로 사용). 같은 입력이 3회 모두 같은 라벨을 낸 비율은
+**0.933**(84/90) — jev.rs의 probe-선택 실험과 마찬가지로 완전한 결정론은 아니다.
+
+## confidence 구간별 정확도(개발 분할 전용)
+
+2단계 게이트 후보 임계는 이 표에서만 고른다. 최종 분할로 고르면 과적합이다.
+
+| 구간 | n | 정확도 |
+|---|---|---|
+| [0.00, 0.50) | 11 | 0.727 |
+| [0.50, 0.70) | 8 | 0.875 |
+| [0.70, 0.90) | 8 | 0.625 |
+| [0.90, 0.99) | 10 | 0.800 |
+| [0.99, 1.01) | 8 | 0.875 |
+
+confidence와 정확도가 단조 관계는 아니다(probe-선택 실험과 다른 결과) — [0.70, 0.90) 구간이
+가장 낮다. 표본이 각 구간 8~11건뿐이라 2단계 폴백 임계 후보로 쓰기엔 근거가 약하다.
+
+## Noul 보조 신호(참고, 게이트 미반영)
+
+같은 state에 Noul 질문(`abnormal`)을 함께 보냈다(T5, 라이브 1회 확인). 주 지표는 Choice만 쓴다.
+
+| 임계값 | 재현율 | 정밀도 |
+|---|---|---|
+| 0.10 | 1.000 | 0.532 |
+| 0.30 | 0.951 | 0.629 |
+| 0.50 | 0.805 | 0.717 |
+| 0.70 | 0.512 | 0.750 |
+| 0.90 | 0.220 | 1.000 |
+
+Choice(재현율 0.878/정밀도 0.750)를 동시에 능가하는 임계값은 없다 — 정밀도를 Choice 수준
+(0.750)으로 올리는 0.70 근방에서는 재현율이 0.512로 떨어진다. 2단계에서 Noul을 보조로 배선할
+근거는 약하다.
+
+## 재현
+
+```sh
+cd eval
+cargo run -- judge-validate --data data/probe-judgments.json
+TYPESAFE_API_KEY=... cargo run --release -- judge-run --data data/probe-judgments.json --split dev --out target/judge-dev.jsonl
+TYPESAFE_API_KEY=... cargo run --release -- judge-run --data data/probe-judgments.json --split final --repeats 3 --out target/judge-final.jsonl
+cargo run --release -- judge-score --results target/judge-final.jsonl --data data/probe-judgments.json
+```
+
+## 보존물
+
+- `results/judge-dev.jsonl.gz` — 개발 45건(v2, 주 조정 실행)
+- `results/judge-final.jsonl.gz` — 최종 90건 × 3회 = 270건
