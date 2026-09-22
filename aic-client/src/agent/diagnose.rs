@@ -1489,6 +1489,44 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
     findings
 }
 
+/// `scan_findings` 판정을 `(probe_id, "warn"|"crit")` 쌍으로 노출한다. `aic-eval`(TypeSafe Jev가
+/// 이 판정을 재현하는지 검증하는 작업, `docs/PRD-JEV-PROBE-JUDGMENT.md`)이 정답 라벨을 스캐너
+/// 판정에서 파생시키려면 crate 경계 밖에서 이 판정에 접근해야 한다 — `probes::probe_exists`가
+/// 평가 크레이트에 실재 확인만 딱 필요한 만큼 여는 것과 같은 선례다. `Finding`·`Confidence`·
+/// `SourceQuality`·`Severity`(crate 내부 타입)는 노출하지 않고, 문자열 라벨로만 돌려준다.
+///
+/// 한 섹션에 여러 발견이 나오면 가장 높은 심각도 하나로 합친다(crit > warn, `Severity`의 `Ord`가
+/// 선언 순서 Normal < Warn < Crit을 그대로 준다). 발견이 없는 섹션은 결과에서 빠진다.
+pub fn scanned_severities(evidence: &str) -> Vec<(String, &'static str)> {
+    let mut by_probe: HashMap<String, Severity> = HashMap::new();
+    for f in scan_findings(evidence) {
+        by_probe
+            .entry(f.probe_id)
+            .and_modify(|sev| *sev = (*sev).max(f.severity))
+            .or_insert(f.severity);
+    }
+    let mut out: Vec<(String, &'static str)> = by_probe
+        .into_iter()
+        .map(|(id, sev)| {
+            (
+                id,
+                match sev {
+                    Severity::Crit => "crit",
+                    Severity::Warn => "warn",
+                    // scan_findings의 모든 match arm은 Warn 또는 Crit만 만든다(Normal 발견은
+                    // 존재하지 않는다 — "발견 없음"이 곧 정상이다). 그 불변이 깨지면 정상을
+                    // 경고로 오분류해 조용히 넘기는 대신 여기서 즉시 드러낸다.
+                    Severity::Normal => {
+                        unreachable!("scan_findings는 Normal severity를 만들지 않는다")
+                    }
+                },
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// 스캔된 finding을 aicd(OTLP `aic.agent`)로 넘긴다. aicd 미실행/exporter 비활성이면 조용히
 /// 버려진다. `Severity`(Normal/Warn/Crit)를 OTLP severity 표기로 매핑한다 — Crit은 이미 벌어진
 /// 사고(OOM kill 등)라 ERROR, 임계 위반은 WARN이다.
@@ -2438,6 +2476,24 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
         // Linux 항상-100% read-only 마운트(snap/iso9660 광학/ESP)는 제외.
         assert!(scan_findings("## disk\n/dev/sr0 700M 700M 0 100% /media/cdrom\n").is_empty());
         assert!(scan_findings("## disk\n/dev/sda1 512M 490M 22M 96% /boot/efi\n").is_empty());
+    }
+
+    #[test]
+    fn scanned_severities_matches_scan_findings_on_a_positive_and_a_negative_fixture() {
+        // scan_findings_disk_full_excludes_pseudo_fs와 같은 양성 fixture: disk 95% → warn 하나.
+        let positive = "## disk\nFilesystem Size Used Avail Use% Mounted on\n\
+/dev/sda1 100G 95G 5G 95% /\ntmpfs 16G 16G 0 100% /dev/shm\n\
+/dev/sdb1 50G 20G 30G 40% /data\n";
+        assert_eq!(
+            scanned_severities(positive),
+            vec![("disk".to_string(), "warn")]
+        );
+        assert_eq!(scan_findings(positive).len(), 1);
+
+        // scan_findings_clean_and_macos_placeholder_yield_nothing와 같은 음성 fixture: 임계 미달.
+        let negative = "## disk\n/dev/sda1 100G 10G 90G 10% /\n";
+        assert!(scanned_severities(negative).is_empty());
+        assert!(scan_findings(negative).is_empty());
     }
 
     #[test]
