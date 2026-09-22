@@ -15,6 +15,37 @@ pub mod rules_followup;
 use std::collections::BTreeMap;
 
 use aic_client::agent::diagnose::select_probes_for_category;
+use anyhow::{Context, Result};
+
+/// TypeSafe 직접 호출 주소. `JEV_ENDPOINT`가 있으면 그것을 쓴다(예: ai-mesh 프록시).
+const DEFAULT_JEV_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+
+/// Jev 호출에 쓸 (endpoint, api_key). 키는 `JEV_API_KEY`, 없으면 `TYPESAFE_API_KEY`.
+///
+/// 세 Jev 클라이언트가 같은 규칙으로 읽어야 한 비교군만 다른 주소를 치는 일이 없다. 값은 로그에
+/// 남기지 않는다 — 결과 기록에는 endpoint의 host만 적는다.
+pub fn jev_env(arm: &str) -> Result<(String, String)> {
+    let api_key = std::env::var("JEV_API_KEY")
+        .or_else(|_| std::env::var("TYPESAFE_API_KEY"))
+        .with_context(|| {
+            format!("JEV_API_KEY(또는 TYPESAFE_API_KEY)가 설정돼 있지 않습니다 — {arm} 비교군을 실행할 수 없습니다")
+        })?;
+    let endpoint =
+        std::env::var("JEV_ENDPOINT").unwrap_or_else(|_| DEFAULT_JEV_ENDPOINT.to_string());
+    Ok((endpoint, api_key))
+}
+
+/// 결과 기록용 endpoint 표기: host만. 경로·키는 남기지 않는다.
+pub fn endpoint_host(endpoint: &str) -> String {
+    endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or(endpoint)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// 비교군 한 번의 판정 결과.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

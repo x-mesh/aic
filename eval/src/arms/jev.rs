@@ -11,7 +11,6 @@ use serde_json::json;
 
 use super::ArmOutcome;
 
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 /// 질문 하나짜리 요청이라 id는 고정이다.
 const QUESTION_ID: &str = "category";
 
@@ -49,21 +48,22 @@ fn instructions() -> String {
 
 pub struct JevClient {
     http: reqwest::Client,
+    endpoint: String,
     api_key: String,
     model: String,
 }
 
 impl JevClient {
-    /// `TYPESAFE_API_KEY`에서 키를 읽는다. 없으면 이 비교군을 실행할 수 없다.
+    /// `JEV_ENDPOINT`·`JEV_API_KEY`(없으면 `TYPESAFE_API_KEY`)를 읽는다. 없으면 이 비교군을 실행할 수 없다.
     pub fn from_env(model: &str) -> Result<Self> {
-        let api_key = std::env::var("TYPESAFE_API_KEY")
-            .context("TYPESAFE_API_KEY가 설정돼 있지 않습니다 — jev 비교군을 실행할 수 없습니다")?;
+        let (endpoint, api_key) = crate::arms::jev_env("jev")?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("HTTP 클라이언트 생성 실패")?;
         Ok(Self {
             http,
+            endpoint,
             api_key,
             model: model.to_string(),
         })
@@ -116,7 +116,7 @@ impl JevClient {
     async fn send_once(&self, body: &serde_json::Value) -> Result<serde_json::Value, SendError> {
         let resp = self
             .http
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(body)
             .send()

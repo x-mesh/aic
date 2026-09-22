@@ -954,7 +954,7 @@ async fn followup_run(
                     split: b.split,
                     arm: "jev".into(),
                     repeat: rep,
-                    model: Some(c.model().to_string()),
+                    model: Some(format!("{}@{}", c.model(), c.endpoint_host())),
                     question_version: Some(arms::jev_followup::QUESTION_VERSION.into()),
                     input_sha256: hash.clone(),
                     accepted: b.accepted.clone(),

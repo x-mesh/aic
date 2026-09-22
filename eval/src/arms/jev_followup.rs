@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 
 use crate::followup::{candidates, template_ids};
 
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const TEMPLATE_QUESTION: &str = "template";
 /// "follow-up이 필요 없다" 선택지. 템플릿 id와 겹치지 않는 이름이어야 한다.
 pub const NONE_CHOICE: &str = "none";
@@ -208,6 +207,7 @@ pub fn parse_answer(
 
 pub struct FollowupClient {
     http: reqwest::Client,
+    endpoint: String,
     api_key: String,
     model: String,
 }
@@ -219,15 +219,14 @@ enum SendError {
 
 impl FollowupClient {
     pub fn from_env(model: &str) -> Result<Self> {
-        let api_key = std::env::var("TYPESAFE_API_KEY").context(
-            "TYPESAFE_API_KEY가 설정돼 있지 않습니다 — jev follow-up 비교군을 실행할 수 없습니다",
-        )?;
+        let (endpoint, api_key) = crate::arms::jev_env("jev follow-up")?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("HTTP 클라이언트 생성 실패")?;
         Ok(Self {
             http,
+            endpoint,
             api_key,
             model: model.to_string(),
         })
@@ -235,6 +234,11 @@ impl FollowupClient {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// 결과 기록용. 프록시(ai-mesh)와 직접 호출은 지연이 다르므로 어느 쪽인지 남긴다.
+    pub fn endpoint_host(&self) -> String {
+        crate::arms::endpoint_host(&self.endpoint)
     }
 
     pub async fn choose(&self, evidence: &str) -> FollowupOutcome {
@@ -291,7 +295,7 @@ impl FollowupClient {
     async fn send_once(&self, body: &Value) -> Result<Value, SendError> {
         let resp = self
             .http
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(body)
             .send()

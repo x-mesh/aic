@@ -32,7 +32,7 @@ cargo run -- validate
 cargo run -- run --arm current --arm improved --split dev
 
 # 모델을 포함한 실행. 키가 있어야 한다.
-TYPESAFE_API_KEY=... cargo run -- run --arm jev --split dev
+JEV_API_KEY=... cargo run -- run --arm jev --split dev
 
 # 채점과 보고
 cargo run -- score --results target/results
@@ -42,7 +42,9 @@ cargo run -- score --results target/results
 
 ## 환경변수
 
-- `TYPESAFE_API_KEY` — Jev 비교군에 필요하다.
+- `JEV_API_KEY`(없으면 `TYPESAFE_API_KEY`) — Jev 비교군에 필요하다.
+- `JEV_ENDPOINT` — 생략하면 `https://api.typesafe.ai/v1/systemone`. ai-mesh 프록시를 쓸 때 지정한다.
+  결과의 `model` 필드에 `<model>@<host>`로 남는다.
 - LLM 비교군은 `~/.config/aic/config.toml`의 provider 설정을 쓰고, 모델은
   `kiro/gpt-5.6-luna`로 고정한다(`--llm-model`로 바꿀 수 있다). provider 기본값에 맡기면 그
   값이 언제 바뀌었는지 결과만 보고는 알 수 없다.

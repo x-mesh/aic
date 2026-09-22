@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde_json::json;
 
-const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const QUESTION_ID: &str = "severity";
 /// 보조 Noul 질문. T5가 라이브 1회로 wire 형식을 확인했다(`docs/PRD-JEV-PROBE-JUDGMENT.md` 9절:
 /// 응답은 `{"type":"noul","noul":<0..1>}` 하나뿐이고 별도 confidence가 없다). 같은 state에 붙여
@@ -172,23 +171,23 @@ pub fn is_oversize(state: &str) -> bool {
 
 pub struct JudgeClient {
     http: reqwest::Client,
+    endpoint: String,
     api_key: String,
     model: String,
 }
 
 impl JudgeClient {
-    /// `TYPESAFE_API_KEY`에서 키를 읽는다. 네트워크 진입점은 이 생성자를 실제로 부르는
+    /// `JEV_ENDPOINT`·`JEV_API_KEY`(없으면 `TYPESAFE_API_KEY`)를 읽는다. 네트워크 진입점은 이 생성자를 실제로 부르는
     /// `judge-run` 서브커맨드 하나뿐이다 — 단위 테스트는 호출하지 않는다(R8).
     pub fn from_env(model: &str) -> Result<Self> {
-        let api_key = std::env::var("TYPESAFE_API_KEY").context(
-            "TYPESAFE_API_KEY가 설정돼 있지 않습니다 — judge 비교군을 실행할 수 없습니다",
-        )?;
+        let (endpoint, api_key) = crate::arms::jev_env("judge")?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("HTTP 클라이언트 생성 실패")?;
         Ok(Self {
             http,
+            endpoint,
             api_key,
             model: model.to_string(),
         })
@@ -255,7 +254,7 @@ impl JudgeClient {
     async fn send_once(&self, body: &serde_json::Value) -> Result<serde_json::Value, SendError> {
         let resp = self
             .http
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(body)
             .send()
