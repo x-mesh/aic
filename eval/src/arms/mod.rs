@@ -45,6 +45,52 @@ impl ArmOutcome {
     }
 }
 
+/// 확률 분포 상위 `n`개 범주의 probe 합집합.
+///
+/// 단일 범주로는 확보율 상한이 낮다(PRD 3절의 한계). Choice가 전체 분포를 주므로 "2등까지
+/// 조사한다"를 만들 수 있다. LLM의 tool calling은 분포를 주지 않아 이 경로를 쓸 수 없다.
+pub fn probes_for_top_n(outcome: &ArmOutcome, docker_available: bool, n: usize) -> Vec<String> {
+    let Some(probs) = outcome.probabilities.as_ref() else {
+        // 분포가 없으면 1등만 쓴다 — 없는 정보를 지어내지 않는다.
+        return outcome
+            .category
+            .as_deref()
+            .map(|c| single(c, docker_available))
+            .unwrap_or_default();
+    };
+    let mut ranked: Vec<(&String, &f64)> = probs.iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (cat, _) in ranked.iter().take(n.max(1)) {
+        out.extend(
+            probes_for(cat, docker_available)
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    out.into_iter().collect()
+}
+
+/// confidence가 임계값 미만일 때만 2등까지 넓힌다.
+///
+/// 확신할 때 넓히면 관계없는 probe만 늘고, 애매할 때 좁히면 증거를 놓친다. 임계값은 개발
+/// 데이터로 정한다 — 최종 평가 결과를 보고 고르면 그 수치는 과적합이다.
+pub fn probes_adaptive(
+    outcome: &ArmOutcome,
+    docker_available: bool,
+    threshold: f64,
+) -> Vec<String> {
+    let widen = outcome.confidence.unwrap_or(1.0) < threshold;
+    probes_for_top_n(outcome, docker_available, if widen { 2 } else { 1 })
+}
+
+fn single(category: &str, docker_available: bool) -> Vec<String> {
+    probes_for(category, docker_available)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// 고른 범주로 probe ID 목록을 만든다.
 ///
 /// `full_sweep`은 항상 false다 — 평가 입력에는 언제나 증상 문자열이 있고, 증상 없는 전체 점검은

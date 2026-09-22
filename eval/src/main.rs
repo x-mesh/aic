@@ -22,6 +22,8 @@ const DEFAULT_RESULTS: &str = "target/results.jsonl";
 /// 벤치마크의 LLM 비교군 모델. provider 기본값에 맡기지 않는 이유는 `LlmArm::from_config`
 /// doc 참고 — 언제 바뀌었는지 결과만 보고는 알 수 없다.
 const DEFAULT_LLM_MODEL: &str = "kiro/gpt-5.6-luna";
+/// `jev-adaptive`의 기본 임계값. 개발 데이터에서 정한다 — 근거는 RESULTS.md 참고.
+const DEFAULT_ADAPTIVE_THRESHOLD: f64 = 0.70;
 /// bootstrap 반복 수. 고정 시드와 함께 쓰므로 실행마다 같은 구간이 나온다.
 const BOOTSTRAP_ITERATIONS: usize = 2000;
 const BOOTSTRAP_SEED: u64 = 20260922;
@@ -62,6 +64,9 @@ enum Command {
         /// LLM 비교군의 모델 ID. config.toml의 provider 설정을 덮어쓴다.
         #[arg(long, default_value = DEFAULT_LLM_MODEL)]
         llm_model: String,
+        /// jev-adaptive의 confidence 임계값. 미만이면 2등 범주까지 합친다.
+        #[arg(long, default_value_t = DEFAULT_ADAPTIVE_THRESHOLD)]
+        adaptive_threshold: f64,
     },
     /// confidence를 라우팅 신호로 쓸 수 있는지 분석한다. 새 API 호출이 없다.
     Confidence {
@@ -105,16 +110,18 @@ async fn main() -> Result<()> {
             out,
             jev_model,
             llm_model,
+            adaptive_threshold,
         } => {
-            run(
-                &data,
-                &arms,
-                split.as_deref(),
+            run(RunOptions {
+                data: &data,
+                arm_names: &arms,
+                split: split.as_deref(),
                 repeats,
-                &out,
-                &jev_model,
-                Some(llm_model.as_str()),
-            )
+                out: &out,
+                jev_model: &jev_model,
+                llm_model: Some(llm_model.as_str()),
+                adaptive_threshold,
+            })
             .await
         }
         Command::Confidence { results, data, arm } => {
@@ -177,15 +184,26 @@ enum Runner {
     Current,
     Improved,
     Jev(Box<JevClient>),
+    /// Jev와 같은 호출을 쓰되 probe 선택에서 확률 분포를 활용한다.
+    JevAdaptive(Box<JevClient>, f64),
     Llm(Box<LlmArm>),
 }
 
 impl Runner {
-    fn build(name: &str, jev_model: &str, llm_model: Option<&str>) -> Result<Self> {
+    fn build(
+        name: &str,
+        jev_model: &str,
+        llm_model: Option<&str>,
+        adaptive_threshold: f64,
+    ) -> Result<Self> {
         Ok(match name {
             "current" => Runner::Current,
             "improved" => Runner::Improved,
             "jev" => Runner::Jev(Box::new(JevClient::from_env(jev_model)?)),
+            "jev-adaptive" => Runner::JevAdaptive(
+                Box::new(JevClient::from_env(jev_model)?),
+                adaptive_threshold,
+            ),
             "llm" => Runner::Llm(Box::new(LlmArm::from_config(llm_model)?)),
             other => bail!("알 수 없는 비교군: {other}"),
         })
@@ -195,15 +213,21 @@ impl Runner {
     fn model(&self) -> Option<String> {
         match self {
             Runner::Current | Runner::Improved => None,
-            Runner::Jev(c) => Some(c.model().to_string()),
+            Runner::Jev(c) | Runner::JevAdaptive(c, _) => Some(c.model().to_string()),
             Runner::Llm(a) => Some(a.identity()),
         }
     }
 
+    /// 어떤 질문·규칙으로 얻은 수치인지 결과에 남긴다. 규칙 비교군도 버전이 필요하다 —
+    /// 어휘를 보강하면 같은 이름의 비교군이 다른 것을 재기 때문이다.
     fn question_version(&self) -> Option<String> {
         match self {
-            Runner::Current | Runner::Improved => None,
+            Runner::Current => Some(format!("rules:{}", rules::RULES_VERSION)),
+            Runner::Improved => Some(format!("rules:{}", rules::RULES_VERSION)),
             Runner::Jev(_) => Some(arms::jev::QUESTION_VERSION.to_string()),
+            Runner::JevAdaptive(_, t) => {
+                Some(format!("{}+adaptive@{t}", arms::jev::QUESTION_VERSION))
+            }
             Runner::Llm(_) => Some(arms::llm::QUESTION_VERSION.to_string()),
         }
     }
@@ -212,8 +236,25 @@ impl Runner {
         match self {
             Runner::Current => local(rules::current(symptom)),
             Runner::Improved => local(rules::improved(symptom)),
-            Runner::Jev(c) => c.categorize(symptom).await,
+            Runner::Jev(c) | Runner::JevAdaptive(c, _) => c.categorize(symptom).await,
             Runner::Llm(a) => a.categorize(symptom).await,
+        }
+    }
+
+    /// 판정 결과에서 probe 목록을 만든다. 적응형만 확률 분포를 쓴다.
+    fn probes(&self, outcome: &ArmOutcome, docker_available: bool) -> Vec<String> {
+        match self {
+            Runner::JevAdaptive(_, t) => arms::probes_adaptive(outcome, docker_available, *t),
+            _ => outcome
+                .category
+                .as_deref()
+                .map(|cat| {
+                    arms::probes_for(cat, docker_available)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -228,15 +269,29 @@ fn local(category: &str) -> ArmOutcome {
     }
 }
 
-async fn run(
-    data: &std::path::Path,
-    arm_names: &[String],
-    split: Option<&str>,
+/// 한 번의 실행 설정. 인자를 늘어놓으면 호출부에서 순서를 헷갈린다.
+struct RunOptions<'a> {
+    data: &'a std::path::Path,
+    arm_names: &'a [String],
+    split: Option<&'a str>,
     repeats: u32,
-    out: &std::path::Path,
-    jev_model: &str,
-    llm_model: Option<&str>,
-) -> Result<()> {
+    out: &'a std::path::Path,
+    jev_model: &'a str,
+    llm_model: Option<&'a str>,
+    adaptive_threshold: f64,
+}
+
+async fn run(opts: RunOptions<'_>) -> Result<()> {
+    let RunOptions {
+        data,
+        arm_names,
+        split,
+        repeats,
+        out,
+        jev_model,
+        llm_model,
+        adaptive_threshold,
+    } = opts;
     let ds = Dataset::load(data)?;
     let split = match split {
         None => None,
@@ -256,7 +311,10 @@ async fn run(
     let revision = git_revision();
     let mut runners = Vec::new();
     for name in arm_names {
-        runners.push((name.clone(), Runner::build(name, jev_model, llm_model)?));
+        runners.push((
+            name.clone(),
+            Runner::build(name, jev_model, llm_model, adaptive_threshold)?,
+        ));
     }
 
     if let Some(parent) = out.parent() {
@@ -273,16 +331,7 @@ async fn run(
                 for lang in Lang::ALL {
                     let symptom = sc.text(lang);
                     let outcome = runner.categorize(symptom).await;
-                    let selected: Vec<String> = outcome
-                        .category
-                        .as_deref()
-                        .map(|cat| {
-                            arms::probes_for(cat, sc.docker_available)
-                                .into_iter()
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let selected = runner.probes(&outcome, sc.docker_available);
                     let score = scoring::score_case(sc, &outcome, &selected);
                     let record = CaseRecord {
                         scenario_id: sc.id.clone(),
