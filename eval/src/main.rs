@@ -183,6 +183,8 @@ fn validate(data: &std::path::Path) -> Result<()> {
 enum Runner {
     Current,
     Improved,
+    /// 개선 규칙과 같은 판정을 쓰되 점수 간격이 좁으면 2등 범주까지 조사한다.
+    ImprovedAdaptive(f64),
     Jev(Box<JevClient>),
     /// Jev와 같은 호출을 쓰되 probe 선택에서 확률 분포를 활용한다.
     JevAdaptive(Box<JevClient>, f64),
@@ -199,6 +201,7 @@ impl Runner {
         Ok(match name {
             "current" => Runner::Current,
             "improved" => Runner::Improved,
+            "improved-adaptive" => Runner::ImprovedAdaptive(adaptive_threshold),
             "jev" => Runner::Jev(Box::new(JevClient::from_env(jev_model)?)),
             "jev-adaptive" => Runner::JevAdaptive(
                 Box::new(JevClient::from_env(jev_model)?),
@@ -212,7 +215,7 @@ impl Runner {
     /// 결과에 함께 기록할 모델·provider 식별자.
     fn model(&self) -> Option<String> {
         match self {
-            Runner::Current | Runner::Improved => None,
+            Runner::Current | Runner::Improved | Runner::ImprovedAdaptive(_) => None,
             Runner::Jev(c) | Runner::JevAdaptive(c, _) => Some(c.model().to_string()),
             Runner::Llm(a) => Some(a.identity()),
         }
@@ -224,6 +227,9 @@ impl Runner {
         match self {
             Runner::Current => Some(format!("rules:{}", rules::RULES_VERSION)),
             Runner::Improved => Some(format!("rules:{}", rules::RULES_VERSION)),
+            Runner::ImprovedAdaptive(t) => {
+                Some(format!("rules:{}+adaptive@{t}", rules::RULES_VERSION))
+            }
             Runner::Jev(_) => Some(arms::jev::QUESTION_VERSION.to_string()),
             Runner::JevAdaptive(_, t) => {
                 Some(format!("{}+adaptive@{t}", arms::jev::QUESTION_VERSION))
@@ -236,6 +242,7 @@ impl Runner {
         match self {
             Runner::Current => local(rules::current(symptom)),
             Runner::Improved => local(rules::improved(symptom)),
+            Runner::ImprovedAdaptive(_) => rules::improved_outcome(symptom),
             Runner::Jev(c) | Runner::JevAdaptive(c, _) => c.categorize(symptom).await,
             Runner::Llm(a) => a.categorize(symptom).await,
         }
@@ -244,7 +251,9 @@ impl Runner {
     /// 판정 결과에서 probe 목록을 만든다. 적응형만 확률 분포를 쓴다.
     fn probes(&self, outcome: &ArmOutcome, docker_available: bool) -> Vec<String> {
         match self {
-            Runner::JevAdaptive(_, t) => arms::probes_adaptive(outcome, docker_available, *t),
+            Runner::JevAdaptive(_, t) | Runner::ImprovedAdaptive(t) => {
+                arms::probes_adaptive(outcome, docker_available, *t)
+            }
             _ => outcome
                 .category
                 .as_deref()

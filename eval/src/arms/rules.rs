@@ -25,201 +25,88 @@ struct Keywords {
 
 /// 규칙 버전. 어휘나 점수를 고치면 올린다. 원시 결과에 버전이 없으면 어느 규칙으로 얻은
 /// 수치인지 나중에 가릴 수 없다.
-pub const RULES_VERSION: &str = "v2";
+pub const RULES_VERSION: &str = "v3";
 
 /// 순서는 현행 분기와 같다. 동점일 때 현행과 같은 답을 내기 위함이다.
 const TABLE: &[Keywords] = &[
     Keywords {
         category: "k8s",
         subjects: &[
-            "k8s",
-            "kubernetes",
-            "kubectl",
-            "kube",
-            "쿠버",
-            "pod",
-            "파드",
-            "namespace",
-            "네임스페이스",
-            "노드",
-            "node",
-            "hpa",
-            "replica",
-            "레플리카",
-            "resourcequota",
-            "quota",
-            "쿼터",
-            "deployment",
-            "디플로이",
-            "ingress",
-            "kubelet",
-            "cluster",
-            "클러스터",
-            "taint",
-            "evict",
+            "k8s", "kubernetes", "kubectl", "kube", "쿠버", "pod", "파드", "namespace",
+            "네임스페이스", "노드", "node", "hpa", "replica", "레플리카", "resourcequota",
+            "quota", "쿼터", "deployment", "디플로이", "ingress", "kubelet", "cluster",
+            "클러스터", "taint", "evict", "rollout", "롤아웃", "failedscheduling",
         ],
         modifiers: &["crashloop", "oomkilled", "imagepull", "pending", "notready"],
     },
     Keywords {
         category: "docker",
         subjects: &[
-            "docker",
-            "도커",
-            "container",
-            "컨테이너",
-            "이미지",
-            "image",
-            "dangling",
-            "compose",
-            "dockerd",
+            "docker", "도커", "container", "컨테이너", "이미지", "image", "dangling",
+            "compose", "dockerd", "healthcheck", "헬스체크", "layer", "레이어", "overlay",
+            "prune",
         ],
         modifiers: &[],
     },
     Keywords {
         category: "cpu",
         subjects: &[
-            "cpu",
-            "load",
-            "부하",
-            "코어",
-            "core",
-            "스레드",
-            "thread",
-            "클럭",
-            "clock",
-            "주파수",
-            "frequency",
-            "throttl",
-            "온도",
-            "thermal",
-            "발열",
-            "iowait",
+            "cpu", "load", "부하", "코어", "core", "클럭", "clock", "주파수", "frequency",
+            "throttl", "온도", "thermal", "발열", "iowait",
         ],
+        // 사용률·스레드·포화는 대상이 아니라 측정값이다. 대상으로 올리면 "df에서 사용률이 95%"가
+        // cpu로 끌려간다 — df가 disk 대상인데 동점에서 cpu가 앞서기 때문이다.
         modifiers: &[
-            "느림", "느려", "slow", "hang", "행", "busy", "높", "high", "포화",
+            "느림", "느려", "slow", "hang", "행", "busy", "높", "high", "포화", "saturate",
+            "사용률", "utilization", "스레드", "thread", "컨텍스트", "context",
         ],
     },
     Keywords {
         category: "memory",
         subjects: &[
-            "memory",
-            "mem",
-            "메모리",
-            "swap",
-            "스왑",
-            "ram",
-            "oom",
-            "rss",
-            "heap",
-            "힙",
+            "memory", "mem", "메모리", "swap", "스왑", "ram", "oom", "rss", "heap", "힙",
+            "tmpfs", "available", "폴트", "fault",
         ],
-        modifiers: &["leak", "누수", "부족", "exhaust", "소진"],
+        modifiers: &["leak", "누수", "부족", "exhaust", "소진", "회수", "reclaim"],
     },
     Keywords {
         category: "disk",
         subjects: &[
-            "disk",
-            "디스크",
-            "storage",
-            "스토리지",
-            "inode",
-            "공간",
-            "space",
-            "volume",
-            "볼륨",
-            "df",
-            "파일시스템",
-            "filesystem",
-            "용량",
-            "capacity",
-            "mount",
-            "마운트",
-            "partition",
-            "파티션",
-            "/tmp",
-            "/var",
-            "블록",
-            "iops",
+            "disk", "디스크", "storage", "스토리지", "inode", "공간", "space", "volume",
+            "볼륨", "df", "du", "파일시스템", "filesystem", "용량", "capacity", "mount",
+            "마운트", "partition", "파티션", "/tmp", "/var", "블록", "iops", "snapshot",
+            "스냅샷", "디렉터리", "directory", "저널", "journal", "덤프", "dump",
         ],
-        modifiers: &["full", "가득", "readonly", "읽기"],
+        modifiers: &["full", "가득", "readonly", "읽기", "쓰기", "write"],
     },
     Keywords {
         category: "network",
         subjects: &[
-            "network",
-            "net",
-            "네트워크",
-            "port",
-            "포트",
-            "dns",
-            "socket",
-            "소켓",
-            "연결",
-            "connection",
-            "패킷",
-            "packet",
-            "ss",
-            "netstat",
-            "syn",
-            "tcp",
-            "udp",
-            "http",
-            "gateway",
-            "게이트웨이",
-            "라우팅",
-            "routing",
-            "인터페이스",
-            "interface",
-            "mtu",
-            "conntrack",
-            "방화벽",
-            "firewall",
-            "curl",
-            "ping",
-            "nslookup",
-            "resolver",
-            "리졸버",
-            "backlog",
-            "time_wait",
+            "network", "net", "네트워크", "port", "포트", "dns", "socket", "소켓", "연결",
+            "connection", "패킷", "packet", "ss", "netstat", "syn", "tcp", "udp", "http",
+            "gateway", "게이트웨이", "라우팅", "routing", "경로", "route", "인터페이스",
+            "interface", "mtu", "conntrack", "방화벽", "firewall", "curl", "ping",
+            "nslookup", "resolver", "리졸버", "backlog", "time_wait", "close_wait",
+            "keepalive", "업스트림", "upstream", "도메인", "domain", "인바운드", "inbound",
+            "트래픽", "traffic",
         ],
-        modifiers: &["latency", "지연", "timeout", "타임아웃", "끊"],
+        modifiers: &[
+            "latency", "지연", "timeout", "타임아웃", "끊", "리셋", "reset", "거부",
+            "refuse", "손실", "loss",
+        ],
     },
     Keywords {
         category: "process",
         subjects: &[
-            "process",
-            "proc",
-            "프로세스",
-            "service",
-            "서비스",
-            "zombie",
-            "좀비",
-            "daemon",
-            "데몬",
-            "디스크립터",
-            "descriptor",
-            "fd",
-            "pid",
-            "systemd",
-            "systemctl",
-            "launchd",
-            "unit",
-            "유닛",
-            "워커",
-            "worker",
-            "defunct",
-            "nginx",
+            "process", "proc", "프로세스", "service", "서비스", "zombie", "좀비", "daemon",
+            "데몬", "디스크립터", "descriptor", "fd", "pid", "systemd", "systemctl",
+            "launchd", "unit", "유닛", "워커", "worker", "defunct", "nginx", "핸들",
+            "handle", "데드락", "deadlock", "권한", "permission", "executable",
+            "activating",
         ],
         modifiers: &[
-            "crash",
-            "죽",
-            "down",
-            "응답",
-            "respond",
-            "restart",
-            "재시작",
-            "사라",
-            "failed",
+            "crash", "죽", "down", "응답", "respond", "restart", "재시작", "사라", "failed",
+            "회수", "reap",
         ],
     },
 ];
@@ -247,9 +134,66 @@ const NEGATIONS: &[&str] = &[
     "okay",
 ];
 
-/// 부정어가 대상을 무효화하는 거리(어절 단위). "CPU는 정상" 같은 바로 뒤 수식을 잡되,
-/// 문장을 건너뛰어 엉뚱한 대상을 지우지 않을 만큼 좁게 둔다.
-const NEGATION_WINDOW: usize = 2;
+/// 부정어가 대상을 무효화하는 거리(어절 단위). "CPU와 디스크는 정상인데"처럼 대상 둘을
+/// 한꺼번에 부정하는 문장이 있어 앞쪽 대상에서도 부정어에 닿아야 한다. 문장 전체로 넓히면
+/// 뒤 절의 부정이 앞 절의 대상을 지운다.
+const NEGATION_WINDOW: usize = 3;
+
+/// 개선 규칙의 결과를 Jev의 Choice와 같은 모양으로 만든다.
+///
+/// 2차 라운드에서 유일하게 유의했던 우위는 `jev-adaptive`였고, 그것은 확률 분포로 2등까지
+/// 조사하는 **전략**의 효과였다(단일 선택 Jev는 규칙과 동등했다). 규칙도 범주별 점수를
+/// 계산하므로 같은 전략을 쓸 수 있다 — 모델 호출 없이 같은 이득이 나오는지 보기 위함이다.
+///
+/// `confidence`는 `1등 / (1등 + 2등)`이다. 2등이 붙어 있을수록 낮아져 "판단이 갈린다"를
+/// 나타낸다. Jev의 분산 기반 confidence와 값의 의미는 다르지만 방향은 같다.
+pub fn improved_outcome(symptom: &str) -> crate::arms::ArmOutcome {
+    let scores = scored(symptom);
+    let total: i32 = scores.iter().map(|(_, s)| *s).sum();
+    let probabilities: std::collections::BTreeMap<String, f64> = if total > 0 {
+        scores
+            .iter()
+            .map(|(cat, s)| ((*cat).to_string(), *s as f64 / total as f64))
+            .collect()
+    } else {
+        // 아무 키워드도 안 맞았다 = generic 하나만 후보다.
+        std::collections::BTreeMap::from([("generic".to_string(), 1.0)])
+    };
+    let top = scores.first().map_or(0, |(_, s)| *s);
+    let second = scores.get(1).map_or(0, |(_, s)| *s);
+    let confidence = if top == 0 {
+        1.0
+    } else {
+        top as f64 / (top + second) as f64
+    };
+    crate::arms::ArmOutcome {
+        category: Some(scores.first().map_or("generic", |(c, _)| *c).to_string()),
+        raw_category: None,
+        confidence: Some(confidence),
+        probabilities: Some(probabilities),
+        attempts: 1,
+        ..Default::default()
+    }
+}
+
+/// 점수가 0보다 큰 범주를 내림차순으로. 동점은 [`TABLE`] 순서를 지킨다.
+fn scored(symptom: &str) -> Vec<(&'static str, i32)> {
+    let lower = symptom.to_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(&'static str, i32)> = TABLE
+        .iter()
+        .filter_map(|kw| {
+            let s = score_category(kw, &lower, &tokens);
+            (s > 0).then_some((kw.category, s))
+        })
+        .collect();
+    // 안정 정렬이라 동점에서 TABLE 순서가 유지된다.
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
 
 /// 개선 규칙. 대상과 수식어를 나눠 점수를 합산하고 최고점을 고른다.
 pub fn improved(symptom: &str) -> &'static str {
@@ -388,5 +332,63 @@ mod tests {
                 "improved: {symptom}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_clear_symptom_gets_high_confidence() {
+        let o = improved_outcome("메모리 누수가 의심됩니다");
+        assert_eq!(o.category.as_deref(), Some("memory"));
+        assert!(o.confidence.unwrap() > 0.9, "{:?}", o.confidence);
+    }
+
+    #[test]
+    fn a_split_judgement_gets_low_confidence() {
+        // 대상 둘이 같은 점수면 판단이 갈린 것이다. 이때 2등까지 조사할 근거가 된다.
+        let o = improved_outcome("pod 네트워크 문제");
+        assert_eq!(o.category.as_deref(), Some("k8s"));
+        let c = o.confidence.unwrap();
+        assert!((c - 0.5).abs() < 0.01, "동점이면 0.5여야 한다: {c}");
+    }
+
+    #[test]
+    fn an_unmatched_symptom_reports_generic_with_full_confidence() {
+        // 후보가 하나뿐이면 갈릴 것이 없다 — 넓혀도 얻는 게 없으므로 확장하지 않는다.
+        let o = improved_outcome("뭔가 이상합니다");
+        assert_eq!(o.category.as_deref(), Some("generic"));
+        assert_eq!(o.confidence, Some(1.0));
+    }
+
+    #[test]
+    fn the_outcome_category_matches_the_plain_rule() {
+        for symptom in [
+            "네트워크가 느려요",
+            "메모리 사용량이 높아",
+            "pod CrashLoopBackOff",
+            "df에서 사용률이 95%로 나옵니다",
+            "스레드 하나가 데드락으로 보입니다",
+        ] {
+            assert_eq!(
+                improved_outcome(symptom).category.as_deref(),
+                Some(improved(symptom)),
+                "증상: {symptom}"
+            );
+        }
+    }
+
+    #[test]
+    fn probabilities_rank_the_same_way_as_scores() {
+        let o = improved_outcome("컨테이너 하나가 CPU를 다 쓰고 있습니다");
+        let probs = o.probabilities.unwrap();
+        let top = o.category.unwrap();
+        let best = probs
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert_eq!(*best.0, top);
     }
 }
