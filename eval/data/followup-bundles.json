@@ -6,7 +6,7 @@
       "id": "fu-01",
       "split": "dev",
       "symptom": "서비스가 죽었습니다",
-      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\nmysqld.service loaded failed failed DB\n\n--- stderr ---\n\n",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                 PORTS                  NAMES         SIZE\nd10eebdc09eb   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Up 7 days              0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\n1d67105a30b1   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 3 days (healthy)    8080/tcp               auth-svc      0B (virtual 96.4MB)\n694d1e73389f   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 5 days              5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\n7f4e4fd1de58   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 12 hours                                   cron-runner   4.1kB (virtual 71MB)\n3e4c34a55b1e   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 2 weeks (healthy)   5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\nmysqld.service loaded failed failed DB\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit nginx.service",
         "journal_unit redis.service",
@@ -20,9 +20,9 @@
     },
     {
       "id": "fu-02",
-      "split": "dev",
-      "symptom": "서비스가 죽었습니다",
-      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ncron.service loaded failed failed Scheduler\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n",
+      "split": "final",
+      "symptom": "앱이 안 뜹니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ncron.service loaded failed failed Scheduler\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit cron.service"
       ],
@@ -34,9 +34,9 @@
     },
     {
       "id": "fu-03",
-      "split": "dev",
+      "split": "final",
       "symptom": "서비스가 죽었습니다",
-      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● app.timer loaded failed failed Backup timer\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n",
+      "evidence": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● app.timer loaded failed failed Backup timer\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit app.timer"
       ],
@@ -48,9 +48,9 @@
     },
     {
       "id": "fu-04",
-      "split": "final",
-      "symptom": "서비스가 죽었습니다",
-      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\na.service loaded failed failed A\nb.socket loaded failed failed B\nc.mount loaded failed failed C\nd.timer loaded failed failed D\ne.target loaded failed failed E\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n",
+      "split": "dev",
+      "symptom": "앱이 안 뜹니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\na.service loaded failed failed A\nb.socket loaded failed failed B\nc.mount loaded failed failed C\nd.timer loaded failed failed D\ne.target loaded failed failed E\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit a.service",
         "journal_unit b.socket",
@@ -67,7 +67,7 @@
       "id": "fu-05",
       "split": "final",
       "symptom": "서비스가 죽었습니다",
-      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nf.service loaded failed failed F\ng.service loaded failed failed G\nh.service loaded failed failed H\ni.service loaded failed failed I\nj.service loaded failed failed J\nk.service loaded failed failed K\nl.service loaded failed failed L\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n",
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nf.service loaded failed failed F\ng.service loaded failed failed G\nh.service loaded failed failed H\ni.service loaded failed failed I\nj.service loaded failed failed J\nk.service loaded failed failed K\nl.service loaded failed failed L\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit f.service",
         "journal_unit g.service",
@@ -86,8 +86,8 @@
     {
       "id": "fu-06",
       "split": "final",
-      "symptom": "서비스가 죽었습니다",
-      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndocker.socket loaded failed failed Docker Socket\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n",
+      "symptom": "앱이 안 뜹니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndocker.socket loaded failed failed Docker Socket\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
       "accepted": [
         "journal_unit docker.socket"
       ],
@@ -98,12 +98,72 @@
       ]
     },
     {
+      "id": "fu-07",
+      "split": "dev",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\n● kubelet.service                loaded failed failed kubelet: The Kubernetes Node Agent\n\n--- stderr ---\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit kubelet.service"
+      ],
+      "source": "synthetic:systemctl-failed",
+      "traits": [
+        "signal:failed_units",
+        "single-target"
+      ]
+    },
+    {
+      "id": "fu-08",
+      "split": "final",
+      "symptom": "앱이 안 뜹니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\n● var-lib-data.mount             loaded failed failed /var/lib/data\n\n--- stderr ---\n",
+      "accepted": [
+        "journal_unit var-lib-data.mount"
+      ],
+      "source": "synthetic:systemctl-failed",
+      "traits": [
+        "signal:failed_units",
+        "single-target"
+      ]
+    },
+    {
+      "id": "fu-09",
+      "split": "final",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\n● logrotate.timer                loaded failed failed Daily rotation of log files\n● etcd.service                   loaded failed failed etcd key-value store\n\n--- stderr ---\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS      RESTARTS   AGE\nprod        backup-28812345-x9k2l   0/1     Completed   0          3h\n\n--- stderr ---\n",
+      "accepted": [
+        "journal_unit logrotate.timer",
+        "journal_unit etcd.service"
+      ],
+      "source": "synthetic:systemctl-failed",
+      "traits": [
+        "signal:failed_units",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "fu-10",
+      "split": "dev",
+      "symptom": "앱이 안 뜹니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\n● sshd.socket                    loaded failed failed OpenSSH Server Socket\n● containerd.service             loaded failed failed containerd container runtime\n● docker.service                 loaded failed failed Docker Application Container Engine\n\n--- stderr ---\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   Ready                      <none>          300d   v1.28.9\n\n--- stderr ---\n",
+      "accepted": [
+        "journal_unit sshd.socket",
+        "journal_unit containerd.service",
+        "journal_unit docker.service"
+      ],
+      "source": "synthetic:systemctl-failed",
+      "traits": [
+        "signal:failed_units",
+        "multi-target"
+      ]
+    },
+    {
       "id": "pf-01",
       "split": "dev",
       "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 4242"
+        "proc_fd 4242",
+        "proc_net leaky"
       ],
       "source": "fixture:proc_fd_top-dev-1",
       "traits": [
@@ -112,11 +172,12 @@
     },
     {
       "id": "pf-02",
-      "split": "dev",
-      "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n   500   200 svc\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "split": "final",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n   500   200 svc\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE     NAME                    READY   STATUS      RESTARTS   AGE\nprod          backup-28812345-x9k2l   0/1     Completed   0          3h\nkube-system   apiserver-check-q7s2m   0/1     Completed   0          5m\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 200"
+        "proc_fd 200",
+        "proc_net svc"
       ],
       "source": "fixture:proc_fd_top-dev-2",
       "traits": [
@@ -125,11 +186,12 @@
     },
     {
       "id": "pf-03",
-      "split": "dev",
+      "split": "final",
       "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n\n--- stderr ---\n\n",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 777"
+        "proc_fd 777",
+        "proc_net huge"
       ],
       "source": "fixture:proc_fd_top-dev-5",
       "traits": [
@@ -138,11 +200,12 @@
     },
     {
       "id": "pf-04",
-      "split": "final",
-      "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "split": "dev",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 73006"
+        "proc_fd 73006",
+        "proc_net gk"
       ],
       "source": "fixture:proc_fd_top-final-1",
       "traits": [
@@ -153,9 +216,10 @@
       "id": "pf-05",
       "split": "final",
       "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 2000\n     FD     PID COMMAND\n  1800   555 chrome\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 2000\n     FD     PID COMMAND\n  1800   555 chrome\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 555"
+        "proc_fd 555",
+        "proc_net chrome"
       ],
       "source": "fixture:proc_fd_top-final-2",
       "traits": [
@@ -165,10 +229,11 @@
     {
       "id": "pf-06",
       "split": "final",
-      "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 50000\n     FD     PID COMMAND\n  10000    900 worker\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 50000\n     FD     PID COMMAND\n  10000    900 worker\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 900"
+        "proc_fd 900",
+        "proc_net worker"
       ],
       "source": "fixture:proc_fd_top-final-3",
       "traits": [
@@ -177,11 +242,12 @@
     },
     {
       "id": "pf-07",
-      "split": "final",
+      "split": "dev",
       "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4000\n     FD     PID COMMAND\n  2000    901 svcb\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4000\n     FD     PID COMMAND\n  2000    901 svcb\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 901"
+        "proc_fd 901",
+        "proc_net svcb"
       ],
       "source": "fixture:proc_fd_top-final-4",
       "traits": [
@@ -191,12 +257,100 @@
     {
       "id": "pf-08",
       "split": "final",
-      "symptom": "파일 디스크립터 누수가 의심됩니다",
-      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 5000\n     FD     PID COMMAND\n   4000    100 proc1\n   4100    101 proc2\n   4200    102 proc3\n   4300    103 proc4\n\n--- stderr ---\n\n",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 5000\n     FD     PID COMMAND\n   4000    100 proc1\n   4100    101 proc2\n   4200    102 proc3\n   4300    103 proc4\n\n--- stderr ---\n\n",
       "accepted": [
-        "proc_fd 103"
+        "proc_fd 100",
+        "proc_net proc1",
+        "proc_fd 101",
+        "proc_net proc2",
+        "proc_fd 102",
+        "proc_net proc3"
       ],
       "source": "fixture:proc_fd_top-final-9",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-09",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n  12000    3101 java\n    300    3102 sshd\n\n--- stderr ---\n",
+      "accepted": [
+        "proc_fd 3101",
+        "proc_net java"
+      ],
+      "source": "synthetic:proc-fd-top",
+      "traits": [
+        "signal:proc_fd_top",
+        "abs-rule",
+        "no-limit-line"
+      ]
+    },
+    {
+      "id": "pf-10",
+      "split": "dev",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1048576\n     FD     PID COMMAND\n  15000    4210 envoy\n    800    4211 node\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 4210",
+        "proc_net envoy"
+      ],
+      "source": "synthetic:proc-fd-top",
+      "traits": [
+        "signal:proc_fd_top",
+        "abs-rule"
+      ]
+    },
+    {
+      "id": "pf-11",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4096\n     FD     PID COMMAND\n   2100    5001 gunicorn\n   2048    5002 celery\n    100    5003 cron\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 5001",
+        "proc_net gunicorn",
+        "proc_fd 5002",
+        "proc_net celery"
+      ],
+      "source": "synthetic:proc-fd-top",
+      "traits": [
+        "signal:proc_fd_top",
+        "multi-target",
+        "boundary-50pct"
+      ]
+    },
+    {
+      "id": "pf-12",
+      "split": "final",
+      "symptom": "Too many open files 오류가 납니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 8192\n     FD     PID COMMAND\n   7000    6001 ingest-a\n   6500    6002 ingest-b\n   6000    6003 ingest-c\n   5500    6004 ingest-d\n   4200    6005 ingest-e\n\n--- stderr ---\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 1.0G 7.0G\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 6001",
+        "proc_net ingest-a",
+        "proc_fd 6002",
+        "proc_net ingest-b",
+        "proc_fd 6003",
+        "proc_net ingest-c"
+      ],
+      "source": "synthetic:proc-fd-top",
+      "traits": [
+        "signal:proc_fd_top",
+        "multi-target",
+        "cap-3"
+      ]
+    },
+    {
+      "id": "pf-13",
+      "split": "dev",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1024\n     FD     PID COMMAND\n    600    7001 redis-server\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                 PORTS                NAMES      SIZE\n5ede96654cc5   nginx:1.25    \"/docker-entrypoint.…\"   7 days ago    Up 7 days              0.0.0.0:80->80/tcp   web-1      1.09kB (virtual 187MB)\n0e4cd338dd2b   myapp:2.1     \"python -m app\"          2 hours ago   Up 3 days (healthy)                         api-2      0B (virtual 412MB)\ne5d4b171fd3b   redis:7       \"docker-entrypoint.s…\"   3 days ago    Up 5 days              6379/tcp             cache-1    0B (virtual 117MB)\nde50303855f7   myapp:2.1     \"python -m worker\"       2 hours ago   Up 12 hours                                 worker-3   12.3kB (virtual 412MB)\n1149944ac2f1   postgres:16   \"docker-entrypoint.s…\"   5 days ago    Up 2 weeks (healthy)   5432/tcp             db-1       63B (virtual 431MB)\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 7001",
+        "proc_net redis-server"
+      ],
+      "source": "synthetic:proc-fd-top",
       "traits": [
         "signal:proc_fd_top"
       ]
@@ -205,14 +359,14 @@
       "id": "dk-01",
       "split": "dev",
       "symptom": "컨테이너가 이상합니다",
-      "evidence": "## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Restarting (1) 12 seconds ago   api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n",
+      "evidence": "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                          PORTS                NAMES      SIZE\nbd8d719d344e   nginx:1.25    \"/docker-entrypoint.…\"   7 days ago    Up 7 days                       0.0.0.0:80->80/tcp   web-1      1.09kB (virtual 187MB)\n659759e71eaa   myapp:2.1     \"python -m app\"          2 hours ago   Restarting (1) 12 seconds ago                        api-2      0B (virtual 412MB)\ne4fbad984bbe   redis:7       \"docker-entrypoint.s…\"   3 days ago    Up 5 days                       6379/tcp             cache-1    0B (virtual 117MB)\nc54620d388ca   myapp:2.1     \"python -m worker\"       2 hours ago   Up 12 hours                                          worker-3   12.3kB (virtual 412MB)\n6a7649de9157   postgres:16   \"docker-entrypoint.s…\"   5 days ago    Up 2 weeks (healthy)            5432/tcp             db-1       63B (virtual 431MB)\n\n--- stderr ---\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   Ready                      <none>          300d   v1.28.9\n\n--- stderr ---\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
       "accepted": [
         "docker_logs api-2",
+        "docker_logs_since api-2",
         "docker_inspect_container api-2",
-        "docker_health api-2",
-        "docker_logs_since api-2"
+        "docker_health api-2"
       ],
-      "source": "synthetic:docker-ps-table",
+      "source": "synthetic:docker-ps-s",
       "traits": [
         "signal:docker_ps"
       ]
@@ -220,15 +374,15 @@
     {
       "id": "dk-02",
       "split": "final",
-      "symptom": "컨테이너가 이상합니다",
-      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 2 hours (unhealthy)          worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n",
+      "symptom": "서비스 응답이 없습니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                   PORTS                  NAMES         SIZE\n79ef78a53b91   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Up 7 days                0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\n28461bb1bb05   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 2 hours (unhealthy)   8080/tcp               auth-svc      0B (virtual 96.4MB)\nd38e719dadb9   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 5 days                5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\n5c94f8d3f59e   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 12 hours                                     cron-runner   4.1kB (virtual 71MB)\n4820f6dfde1c   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 2 weeks (healthy)     5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n",
       "accepted": [
-        "docker_logs worker-3",
-        "docker_inspect_container worker-3",
-        "docker_health worker-3",
-        "docker_logs_since worker-3"
+        "docker_logs auth-svc",
+        "docker_logs_since auth-svc",
+        "docker_inspect_container auth-svc",
+        "docker_health auth-svc"
       ],
-      "source": "synthetic:docker-ps-table",
+      "source": "synthetic:docker-ps-s",
       "traits": [
         "signal:docker_ps"
       ]
@@ -237,40 +391,157 @@
       "id": "dk-03",
       "split": "final",
       "symptom": "컨테이너가 이상합니다",
-      "evidence": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       worker-3\na1b2c3d4e5f6   postgres:16    Exited (137) 5 minutes ago      db-1\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                          COMMAND                  CREATED        STATUS                           PORTS                  NAMES      SIZE\n782f8f57ace2   ghcr.io/acme/frontend:2024.9   \"nginx -g 'daemon of…\"   26 hours ago   Up 7 days                        0.0.0.0:3000->80/tcp   frontend   0B (virtual 52.1MB)\nec9fe3b70278   ghcr.io/acme/backend:2024.9    \"gunicorn app:app\"       26 hours ago   Up 3 days (healthy)              8000/tcp               backend    18.7kB (virtual 210MB)\n872dc0bf4a9c   redis:7-alpine                 \"docker-entrypoint.s…\"   6 days ago     Up 5 days                        6379/tcp               redis-1    0B (virtual 41.4MB)\n61f9cbff009d   ghcr.io/acme/backend:2024.9    \"bundle exec sidekiq\"    26 hours ago   Restarting (137) 8 seconds ago                          sidekiq    0B (virtual 210MB)\nfe587980d78f   mongo:7                        \"docker-entrypoint.s…\"   6 days ago     Up 2 weeks (healthy)             27017/tcp              mongo      0B (virtual 754MB)\n\n--- stderr ---\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n",
       "accepted": [
-        "docker_logs db-1",
-        "docker_inspect_container db-1",
-        "docker_health db-1",
-        "docker_logs_since db-1"
+        "docker_logs sidekiq",
+        "docker_logs_since sidekiq",
+        "docker_inspect_container sidekiq",
+        "docker_health sidekiq"
       ],
-      "source": "synthetic:docker-ps-table",
+      "source": "synthetic:docker-ps-s",
       "traits": [
         "signal:docker_ps"
       ]
     },
     {
       "id": "dk-04",
+      "split": "dev",
+      "symptom": "서비스 응답이 없습니다",
+      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                             PORTS                NAMES      SIZE\n06606bfe27a9   nginx:1.25    \"/docker-entrypoint.…\"   7 days ago    Up 7 days                          0.0.0.0:80->80/tcp   web-1      1.09kB (virtual 187MB)\ne8368890e9f3   myapp:2.1     \"python -m app\"          2 hours ago   Up 3 days (healthy)                                     api-2      0B (virtual 412MB)\n79a648aaef73   redis:7       \"docker-entrypoint.s…\"   3 days ago    Up 10 seconds (health: starting)   6379/tcp             cache-1    0B (virtual 117MB)\nd8e292cc4a08   myapp:2.1     \"python -m worker\"       2 hours ago   Up 2 hours (unhealthy)                                  worker-3   12.3kB (virtual 412MB)\nace41ee86d61   postgres:16   \"docker-entrypoint.s…\"   5 days ago    Up 2 weeks (healthy)               5432/tcp             db-1       63B (virtual 431MB)\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs worker-3",
+        "docker_logs_since worker-3",
+        "docker_inspect_container worker-3",
+        "docker_health worker-3"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps",
+        "distractor:health-starting"
+      ]
+    },
+    {
+      "id": "dk-05",
       "split": "final",
       "symptom": "컨테이너가 이상합니다",
-      "evidence": "## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Restarting (1) 12 seconds ago   api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Exited (137) 5 minutes ago                       worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                 PORTS                  NAMES         SIZE\n6d5c42c6bf91   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Up 7 days              0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\nd44ca17f12aa   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 3 days (healthy)    8080/tcp               auth-svc      0B (virtual 96.4MB)\n5086f762f00e   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 3 days (Paused)     5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\n031adf48def9   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 12 hours                                   cron-runner   4.1kB (virtual 71MB)\nd92508ae6351   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 2 weeks (healthy)   5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs queue",
+        "docker_logs_since queue",
+        "docker_inspect_container queue",
+        "docker_health queue"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps",
+        "status:paused"
+      ]
+    },
+    {
+      "id": "dk-06",
+      "split": "final",
+      "symptom": "서비스 응답이 없습니다",
+      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                          COMMAND                  CREATED        STATUS                            PORTS                  NAMES      SIZE\n5a1fb3deed18   ghcr.io/acme/frontend:2024.9   \"nginx -g 'daemon of…\"   26 hours ago   Up 7 days                         0.0.0.0:3000->80/tcp   frontend   0B (virtual 52.1MB)\n9f6694ca2d99   ghcr.io/acme/backend:2024.9    \"gunicorn app:app\"       26 hours ago   Up 3 days (healthy)               8000/tcp               backend    18.7kB (virtual 210MB)\ndffcd9212e71   redis:7-alpine                 \"docker-entrypoint.s…\"   6 days ago     Up 4 seconds (health: starting)   6379/tcp               redis-1    0B (virtual 41.4MB)\ne1d09bff8e4f   ghcr.io/acme/backend:2024.9    \"bundle exec sidekiq\"    26 hours ago   Up 12 hours                                              sidekiq    0B (virtual 210MB)\n339a947f10f9   mongo:7                        \"docker-entrypoint.s…\"   6 days ago     Restarting (1) 3 seconds ago      27017/tcp              mongo      0B (virtual 754MB)\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs mongo",
+        "docker_logs_since mongo",
+        "docker_inspect_container mongo",
+        "docker_health mongo"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps",
+        "distractor:health-starting"
+      ]
+    },
+    {
+      "id": "dk-07",
+      "split": "dev",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                          PORTS                NAMES      SIZE\n66164a287efa   nginx:1.25    \"/docker-entrypoint.…\"   7 days ago    Up 7 days                       0.0.0.0:80->80/tcp   web-1      1.09kB (virtual 187MB)\n8315baa6b063   myapp:2.1     \"python -m app\"          2 hours ago   Restarting (1) 12 seconds ago                        api-2      0B (virtual 412MB)\n948bc62da96f   redis:7       \"docker-entrypoint.s…\"   3 days ago    Up 5 days                       6379/tcp             cache-1    0B (virtual 117MB)\n0c616c7442c3   myapp:2.1     \"python -m worker\"       2 hours ago   Up 12 hours                                          worker-3   12.3kB (virtual 412MB)\n206e0b1134c8   postgres:16   \"docker-entrypoint.s…\"   5 days ago    Up 5 days (unhealthy)           5432/tcp             db-1       63B (virtual 431MB)\n\n--- stderr ---\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n",
       "accepted": [
         "docker_logs api-2",
+        "docker_logs_since api-2",
         "docker_inspect_container api-2",
+        "docker_health api-2",
         "docker_logs db-1",
-        "docker_inspect_container db-1"
+        "docker_logs_since db-1",
+        "docker_inspect_container db-1",
+        "docker_health db-1"
       ],
-      "source": "synthetic:docker-ps-table",
+      "source": "synthetic:docker-ps-s",
       "traits": [
         "signal:docker_ps",
         "multi-target"
       ]
     },
     {
+      "id": "dk-08",
+      "split": "final",
+      "symptom": "서비스 응답이 없습니다",
+      "evidence": "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                          PORTS                  NAMES         SIZE\n33de957307a5   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Restarting (3) 40 seconds ago   0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\nd55b713f964d   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 3 days (healthy)             8080/tcp               auth-svc      0B (virtual 96.4MB)\n45613c1996ad   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 5 days                       5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\nb42153df2954   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 9 hours (unhealthy)                                 cron-runner   4.1kB (virtual 71MB)\n7951c4e04554   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 2 weeks (healthy)            5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs nginx-proxy",
+        "docker_logs_since nginx-proxy",
+        "docker_inspect_container nginx-proxy",
+        "docker_health nginx-proxy",
+        "docker_logs cron-runner",
+        "docker_logs_since cron-runner",
+        "docker_inspect_container cron-runner",
+        "docker_health cron-runner"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "dk-09",
+      "split": "final",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME   READY   STATUS   RESTARTS   AGE\n\n--- stderr ---\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                          COMMAND                  CREATED        STATUS                         PORTS                  NAMES      SIZE\n083f87827128   ghcr.io/acme/frontend:2024.9   \"nginx -g 'daemon of…\"   26 hours ago   Up 1 hour (unhealthy)          0.0.0.0:3000->80/tcp   frontend   0B (virtual 52.1MB)\n472e19e6e6a0   ghcr.io/acme/backend:2024.9    \"gunicorn app:app\"       26 hours ago   Restarting (1) 5 seconds ago   8000/tcp               backend    18.7kB (virtual 210MB)\n9a86ba07a87c   redis:7-alpine                 \"docker-entrypoint.s…\"   6 days ago     Up 20 minutes (Paused)         6379/tcp               redis-1    0B (virtual 41.4MB)\n6c8bd08b606e   ghcr.io/acme/backend:2024.9    \"bundle exec sidekiq\"    26 hours ago   Up 12 hours                                           sidekiq    0B (virtual 210MB)\n930456f2c788   mongo:7                        \"docker-entrypoint.s…\"   6 days ago     Up 2 weeks (healthy)           27017/tcp              mongo      0B (virtual 754MB)\n\n--- stderr ---\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs frontend",
+        "docker_logs_since frontend",
+        "docker_inspect_container frontend",
+        "docker_health frontend",
+        "docker_logs backend",
+        "docker_logs_since backend",
+        "docker_inspect_container backend",
+        "docker_health backend",
+        "docker_logs redis-1",
+        "docker_logs_since redis-1",
+        "docker_inspect_container redis-1",
+        "docker_health redis-1"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "dk-10",
+      "split": "dev",
+      "symptom": "서비스 응답이 없습니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                      PORTS                  NAMES         SIZE\n5e3d47b7ddee   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Up 7 days                   0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\nb170d688bd0a   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 3 days (healthy)         8080/tcp               auth-svc      0B (virtual 96.4MB)\n177e8e4457d4   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 5 days                   5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\n69fdca996e68   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 12 hours                                        cron-runner   4.1kB (virtual 71MB)\n8d28161eb063   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 11 minutes (unhealthy)   5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n",
+      "accepted": [
+        "docker_logs pg-primary",
+        "docker_logs_since pg-primary",
+        "docker_inspect_container pg-primary",
+        "docker_health pg-primary"
+      ],
+      "source": "synthetic:docker-ps-s",
+      "traits": [
+        "signal:docker_ps"
+      ]
+    },
+    {
       "id": "k8-01",
       "split": "dev",
       "symptom": "pod이 계속 재시작합니다",
-      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                        READY   STATUS             RESTARTS   AGE\nprod        payments-7f9c-x1            0/1     CrashLoopBackOff   14         3d\nprod        payments-7f9c-x2            1/1     Running            0          3d\nprod        ingest-5d2a-q9              1/1     Running            0          3d\nprod        cache-0                     1/1     Running            0          3d\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME               READY   STATUS             RESTARTS      AGE\nprod        payments-7f9c-x1   0/1     CrashLoopBackOff   14 (2m ago)   3d\n\n--- stderr ---\n",
       "accepted": [
         "k8s_pod_describe payments-7f9c-x1",
         "k8s_pod_logs payments-7f9c-x1"
@@ -283,11 +554,41 @@
     {
       "id": "k8-02",
       "split": "final",
-      "symptom": "pod이 계속 재시작합니다",
-      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                        READY   STATUS             RESTARTS   AGE\nprod        payments-7f9c-x1            1/1     Running            0          3d\nprod        payments-7f9c-x2            1/1     Running            0          3d\nprod        ingest-5d2a-q9              0/1     ImagePullBackOff   0          3d\nprod        cache-0                     1/1     Running            0          3d\n\n--- stderr ---\n",
+      "symptom": "배포가 안 뜹니다",
+      "evidence": "## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS             RESTARTS   AGE\nprod        ingest-5d2a-q9          0/1     ImagePullBackOff   0          25m\nprod        backup-28812345-x9k2l   0/1     Completed          0          3h\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
       "accepted": [
-        "k8s_pod_describe ingest-5d2a-q9",
-        "k8s_pod_logs ingest-5d2a-q9"
+        "k8s_pod_describe ingest-5d2a-q9"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "distractor:completed",
+        "no-logs"
+      ]
+    },
+    {
+      "id": "k8-03",
+      "split": "final",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME             READY   STATUS   RESTARTS      AGE\napi-6c8d-abcde   0/1     Error    3 (10m ago)   1h\n\n--- stderr ---\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe api-6c8d-abcde",
+        "k8s_pod_logs api-6c8d-abcde"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "no-namespace-column"
+      ]
+    },
+    {
+      "id": "k8-04",
+      "split": "dev",
+      "symptom": "배포가 안 뜹니다",
+      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME       READY   STATUS      RESTARTS     AGE\nprod        worker-0   0/1     OOMKilled   7 (1m ago)   2d\n\n--- stderr ---\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe worker-0",
+        "k8s_pod_logs worker-0"
       ],
       "source": "synthetic:kubectl-get-pods",
       "traits": [
@@ -295,69 +596,331 @@
       ]
     },
     {
+      "id": "k8-05",
+      "split": "final",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME      READY   STATUS    RESTARTS   AGE\nprod        cache-1   0/1     Pending   0          12m\n\n--- stderr ---\n",
+      "accepted": [
+        "k8s_pod_describe cache-1"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "no-logs"
+      ]
+    },
+    {
+      "id": "k8-06",
+      "split": "final",
+      "symptom": "배포가 안 뜹니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE     NAME                    READY   STATUS      RESTARTS   AGE\nprod          search-84f6-zz1         0/1     Evicted     0          4h\nprod          backup-28812345-x9k2l   0/1     Completed   0          3h\nkube-system   apiserver-check-q7s2m   0/1     Completed   0          5m\n\n--- stderr ---\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe search-84f6-zz1"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "distractor:completed",
+        "no-logs"
+      ]
+    },
+    {
+      "id": "k8-07",
+      "split": "dev",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME                READY   STATUS                  RESTARTS      AGE\nmigrate-job-7t2rq   0/1     Init:CrashLoopBackOff   5 (30s ago)   9m\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe migrate-job-7t2rq"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "no-namespace-column",
+        "no-logs"
+      ]
+    },
+    {
+      "id": "k8-08",
+      "split": "final",
+      "symptom": "배포가 안 뜹니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME            READY   STATUS                       RESTARTS   AGE\nprod        auth-5b7d-k2m   0/1     CreateContainerConfigError   0          2m\n\n--- stderr ---\n",
+      "accepted": [
+        "k8s_pod_describe auth-5b7d-k2m"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "no-logs"
+      ]
+    },
+    {
+      "id": "k8-09",
+      "split": "final",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME               READY   STATUS             RESTARTS      AGE\nprod        payments-7f9c-x1   0/1     CrashLoopBackOff   14 (2m ago)   3d\nprod        ingest-5d2a-q9     0/1     ErrImagePull       0             3m\n\n--- stderr ---\n",
+      "accepted": [
+        "k8s_pod_describe payments-7f9c-x1",
+        "k8s_pod_logs payments-7f9c-x1",
+        "k8s_pod_describe ingest-5d2a-q9"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "k8-10",
+      "split": "dev",
+      "symptom": "배포가 안 뜹니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS                   RESTARTS   AGE\nprod        gateway-0               0/1     ContainerStatusUnknown   2          6h\nprod        gateway-1               0/1     Unknown                  0          6h\nprod        backup-28812345-x9k2l   0/1     Completed                0          3h\n\n--- stderr ---\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe gateway-0",
+        "k8s_pod_describe gateway-1"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods",
+        "multi-target",
+        "distractor:completed"
+      ]
+    },
+    {
+      "id": "kn-01",
+      "split": "dev",
+      "symptom": "노드가 이상합니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME                        STATUS     ROLES           AGE    VERSION\nip-10-0-1-23.ec2.internal   Ready      control-plane   120d   v1.29.4\nip-10-0-2-45.ec2.internal   NotReady   <none>          120d   v1.29.4\nip-10-0-3-67.ec2.internal   Ready      <none>          98d    v1.29.4\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_node_describe ip-10-0-2-45.ec2.internal"
+      ],
+      "source": "synthetic:kubectl-get-nodes",
+      "traits": [
+        "signal:k8s_nodes"
+      ]
+    },
+    {
+      "id": "kn-02",
+      "split": "final",
+      "symptom": "pod이 스케줄되지 않습니다",
+      "evidence": "## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   NotReady                   <none>          300d   v1.28.9\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_node_describe node-c"
+      ],
+      "source": "synthetic:kubectl-get-nodes",
+      "traits": [
+        "signal:k8s_nodes",
+        "distractor:cordoned"
+      ]
+    },
+    {
+      "id": "kn-03",
+      "split": "final",
+      "symptom": "노드가 이상합니다",
+      "evidence": "## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS      RESTARTS   AGE\nprod        backup-28812345-x9k2l   0/1     Completed   0          3h\n\n--- stderr ---\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME                   STATUS     ROLES    AGE   VERSION\ngke-prod-pool-1-7f2a   NotReady   <none>   40d   v1.30.2\ngke-prod-pool-1-9c1b   NotReady   <none>   40d   v1.30.2\ngke-prod-pool-1-e4d0   Ready      <none>   40d   v1.30.2\n\n--- stderr ---\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_node_describe gke-prod-pool-1-7f2a",
+        "k8s_node_describe gke-prod-pool-1-9c1b"
+      ],
+      "source": "synthetic:kubectl-get-nodes",
+      "traits": [
+        "signal:k8s_nodes",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "kn-04",
+      "split": "dev",
+      "symptom": "pod이 스케줄되지 않습니다",
+      "evidence": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME           STATUS    ROLES           AGE   VERSION\nk8s-master-1   Ready     control-plane   2y    v1.27.3\nk8s-worker-1   Unknown   <none>          2y    v1.27.3\nk8s-worker-2   Ready     <none>          2y    v1.27.3\n\n--- stderr ---\n",
+      "accepted": [
+        "k8s_node_describe k8s-worker-1"
+      ],
+      "source": "synthetic:kubectl-get-nodes",
+      "traits": [
+        "signal:k8s_nodes",
+        "status:unknown"
+      ]
+    },
+    {
+      "id": "kn-05",
+      "split": "final",
+      "symptom": "노드가 이상합니다",
+      "evidence": "## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME        STATUS                        ROLES    AGE   VERSION\nworker-01   Ready                         <none>   77d   v1.29.4\nworker-02   Ready                         <none>   77d   v1.29.4\nworker-03   Ready                         <none>   77d   v1.29.4\nworker-04   Ready                         <none>   77d   v1.29.4\nworker-05   Ready                         <none>   77d   v1.29.4\nworker-06   Ready                         <none>   77d   v1.29.4\nworker-07   NotReady,SchedulingDisabled   <none>   77d   v1.29.4\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_node_describe worker-07"
+      ],
+      "source": "synthetic:kubectl-get-nodes",
+      "traits": [
+        "signal:k8s_nodes",
+        "many-rows"
+      ]
+    },
+    {
       "id": "nn-01",
       "split": "dev",
-      "symptom": "서버가 좀 이상합니다",
-      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "symptom": null,
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "fixture-only"
       ]
     },
     {
       "id": "nn-02",
-      "split": "dev",
-      "symptom": null,
-      "evidence": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n",
+      "split": "final",
+      "symptom": "서버가 좀 이상합니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 1.0G 7.0G\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "fixture-only"
       ]
     },
     {
       "id": "nn-03",
       "split": "final",
-      "symptom": "서버가 좀 이상합니다",
-      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "symptom": "배포 후 느려진 것 같습니다",
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "fixture-only"
       ]
     },
     {
       "id": "nn-04",
-      "split": "final",
+      "split": "dev",
       "symptom": null,
-      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME   READY   STATUS   RESTARTS   AGE\n\n--- stderr ---\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 1.0G 7.0G\n\n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "fixture-only"
       ]
     },
     {
       "id": "nn-05",
       "split": "final",
-      "symptom": null,
-      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE         COMMAND                  CREATED       STATUS                 PORTS                NAMES      SIZE\n20eafe34f361   nginx:1.25    \"/docker-entrypoint.…\"   7 days ago    Up 7 days              0.0.0.0:80->80/tcp   web-1      1.09kB (virtual 187MB)\n3f4e034df902   myapp:2.1     \"python -m app\"          2 hours ago   Up 3 days (healthy)                         api-2      0B (virtual 412MB)\n4f678d8ba1f4   redis:7       \"docker-entrypoint.s…\"   3 days ago    Up 5 days              6379/tcp             cache-1    0B (virtual 117MB)\nf3e5d80db8b0   myapp:2.1     \"python -m worker\"       2 hours ago   Up 12 hours                                 worker-3   12.3kB (virtual 412MB)\n6b0c8670dcbc   postgres:16   \"docker-entrypoint.s…\"   5 days ago    Up 2 weeks (healthy)   5432/tcp             db-1       63B (virtual 431MB)\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "trap:docker_ps"
       ]
     },
     {
       "id": "nn-06",
       "split": "final",
       "symptom": null,
-      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "evidence": "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                          COMMAND                  CREATED        STATUS                 PORTS                  NAMES      SIZE\n279cad15e97a   ghcr.io/acme/frontend:2024.9   \"nginx -g 'daemon of…\"   26 hours ago   Up 7 days              0.0.0.0:3000->80/tcp   frontend   0B (virtual 52.1MB)\n6f31ed47b12d   ghcr.io/acme/backend:2024.9    \"gunicorn app:app\"       26 hours ago   Up 3 days (healthy)    8000/tcp               backend    18.7kB (virtual 210MB)\n7a305ee1cf97   redis:7-alpine                 \"docker-entrypoint.s…\"   6 days ago     Up 5 days              6379/tcp               redis-1    0B (virtual 41.4MB)\n726c1814adbb   ghcr.io/acme/backend:2024.9    \"bundle exec sidekiq\"    26 hours ago   Up 12 hours                                   sidekiq    0B (virtual 210MB)\n6fe5d23f61fa   mongo:7                        \"docker-entrypoint.s…\"   6 days ago     Up 2 weeks (healthy)   27017/tcp              mongo      0B (virtual 754MB)\n\n--- stderr ---\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n",
       "accepted": [],
-      "source": "fixture:none-only",
+      "source": "fixture:none-only+synthetic:healthy-tables",
       "traits": [
-        "no-signal"
+        "no-signal",
+        "trap:docker_ps"
+      ]
+    },
+    {
+      "id": "nn-07",
+      "split": "dev",
+      "symptom": "서버가 좀 이상합니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 1.0G 7.0G\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE                       COMMAND                   CREATED       STATUS                 PORTS                  NAMES         SIZE\n5eb3d2e1f9ae   nginx:1.27-alpine           \"/docker-entrypoint.…\"    3 weeks ago   Up 7 days              0.0.0.0:443->443/tcp   nginx-proxy   2.1kB (virtual 43.2MB)\n279abffff7f8   registry.local/auth:4.2.0   \"/app/auth serve\"         9 hours ago   Up 3 days (healthy)    8080/tcp               auth-svc      0B (virtual 96.4MB)\n92f67a7fd811   rabbitmq:3.13-management    \"docker-entrypoint.s…\"    3 weeks ago   Up 5 days              5672/tcp, 15672/tcp    queue         1.02MB (virtual 260MB)\n7e5318cd0877   registry.local/cron:1.9     \"/usr/bin/supercronic…\"   9 hours ago   Up 12 hours                                   cron-runner   4.1kB (virtual 71MB)\ne3fa0fd16ee5   postgres:15                 \"docker-entrypoint.s…\"    3 weeks ago   Up 2 weeks (healthy)   5432/tcp               pg-primary    0B (virtual 417MB)\n\n--- stderr ---\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:docker_ps"
+      ]
+    },
+    {
+      "id": "nn-08",
+      "split": "final",
+      "symptom": "배포 후 느려진 것 같습니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE     NAME                    READY   STATUS      RESTARTS   AGE\nprod          backup-28812345-x9k2l   0/1     Completed   0          3h\nkube-system   apiserver-check-q7s2m   0/1     Completed   0          5m\n\n--- stderr ---\n## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:k8s_pods"
+      ]
+    },
+    {
+      "id": "nn-09",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS      RESTARTS   AGE\nprod        backup-28812345-x9k2l   0/1     Completed   0          3h\n\n--- stderr ---\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:k8s_pods"
+      ]
+    },
+    {
+      "id": "nn-10",
+      "split": "dev",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                    READY   STATUS      RESTARTS   AGE\nprod        backup-28812345-x9k2l   0/1     Completed   0          3h\n\n--- stderr ---\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:k8s_pods"
+      ]
+    },
+    {
+      "id": "nn-11",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   Ready                      <none>          300d   v1.28.9\n\n--- stderr ---\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:k8s_nodes"
+      ]
+    },
+    {
+      "id": "nn-12",
+      "split": "final",
+      "symptom": "서버가 좀 이상합니다",
+      "evidence": "## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   Ready                      <none>          300d   v1.28.9\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:k8s_nodes"
+      ]
+    },
+    {
+      "id": "nn-13",
+      "split": "dev",
+      "symptom": "배포 후 느려진 것 같습니다",
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:proc_fd_top"
+      ]
+    },
+    {
+      "id": "nn-14",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n## k8s_nodes\ncommand: kubectl get nodes | head -n 40\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAME     STATUS                     ROLES           AGE    VERSION\nnode-a   Ready                      control-plane   300d   v1.28.9\nnode-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\nnode-c   Ready                      <none>          300d   v1.28.9\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only+synthetic:healthy-tables",
+      "traits": [
+        "no-signal",
+        "trap:proc_fd_top"
       ]
     }
   ]
