@@ -1,0 +1,364 @@
+{
+  "schema_version": 1,
+  "generated": "2026-09-22",
+  "bundles": [
+    {
+      "id": "fu-01",
+      "split": "dev",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\nmysqld.service loaded failed failed DB\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit nginx.service",
+        "journal_unit redis.service",
+        "journal_unit mysqld.service"
+      ],
+      "source": "fixture:failed_units-dev-1",
+      "traits": [
+        "signal:failed_units",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "fu-02",
+      "split": "dev",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ncron.service loaded failed failed Scheduler\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit cron.service"
+      ],
+      "source": "fixture:failed_units-dev-2",
+      "traits": [
+        "signal:failed_units",
+        "single-target"
+      ]
+    },
+    {
+      "id": "fu-03",
+      "split": "dev",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● app.timer loaded failed failed Backup timer\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit app.timer"
+      ],
+      "source": "fixture:failed_units-dev-5",
+      "traits": [
+        "signal:failed_units",
+        "single-target"
+      ]
+    },
+    {
+      "id": "fu-04",
+      "split": "final",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\na.service loaded failed failed A\nb.socket loaded failed failed B\nc.mount loaded failed failed C\nd.timer loaded failed failed D\ne.target loaded failed failed E\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit a.service",
+        "journal_unit b.socket",
+        "journal_unit c.mount",
+        "journal_unit d.timer"
+      ],
+      "source": "fixture:failed_units-final-1",
+      "traits": [
+        "signal:failed_units",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "fu-05",
+      "split": "final",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nf.service loaded failed failed F\ng.service loaded failed failed G\nh.service loaded failed failed H\ni.service loaded failed failed I\nj.service loaded failed failed J\nk.service loaded failed failed K\nl.service loaded failed failed L\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit f.service",
+        "journal_unit g.service",
+        "journal_unit h.service",
+        "journal_unit i.service",
+        "journal_unit j.service",
+        "journal_unit k.service",
+        "journal_unit l.service"
+      ],
+      "source": "fixture:failed_units-final-2",
+      "traits": [
+        "signal:failed_units",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "fu-06",
+      "split": "final",
+      "symptom": "서비스가 죽었습니다",
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndocker.socket loaded failed failed Docker Socket\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n",
+      "accepted": [
+        "journal_unit docker.socket"
+      ],
+      "source": "fixture:failed_units-final-3",
+      "traits": [
+        "signal:failed_units",
+        "single-target"
+      ]
+    },
+    {
+      "id": "pf-01",
+      "split": "dev",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 4242"
+      ],
+      "source": "fixture:proc_fd_top-dev-1",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-02",
+      "split": "dev",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n   500   200 svc\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 200"
+      ],
+      "source": "fixture:proc_fd_top-dev-2",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-03",
+      "split": "dev",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 777"
+      ],
+      "source": "fixture:proc_fd_top-dev-5",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-04",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 73006"
+      ],
+      "source": "fixture:proc_fd_top-final-1",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-05",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 2000\n     FD     PID COMMAND\n  1800   555 chrome\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 555"
+      ],
+      "source": "fixture:proc_fd_top-final-2",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-06",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 50000\n     FD     PID COMMAND\n  10000    900 worker\n\n--- stderr ---\n\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 900"
+      ],
+      "source": "fixture:proc_fd_top-final-3",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-07",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4000\n     FD     PID COMMAND\n  2000    901 svcb\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 901"
+      ],
+      "source": "fixture:proc_fd_top-final-4",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "pf-08",
+      "split": "final",
+      "symptom": "파일 디스크립터 누수가 의심됩니다",
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 5000\n     FD     PID COMMAND\n   4000    100 proc1\n   4100    101 proc2\n   4200    102 proc3\n   4300    103 proc4\n\n--- stderr ---\n\n",
+      "accepted": [
+        "proc_fd 103"
+      ],
+      "source": "fixture:proc_fd_top-final-9",
+      "traits": [
+        "signal:proc_fd_top"
+      ]
+    },
+    {
+      "id": "dk-01",
+      "split": "dev",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Restarting (1) 12 seconds ago   api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs api-2",
+        "docker_inspect_container api-2",
+        "docker_health api-2",
+        "docker_logs_since api-2"
+      ],
+      "source": "synthetic:docker-ps-table",
+      "traits": [
+        "signal:docker_ps"
+      ]
+    },
+    {
+      "id": "dk-02",
+      "split": "final",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 2 hours (unhealthy)          worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs worker-3",
+        "docker_inspect_container worker-3",
+        "docker_health worker-3",
+        "docker_logs_since worker-3"
+      ],
+      "source": "synthetic:docker-ps-table",
+      "traits": [
+        "signal:docker_ps"
+      ]
+    },
+    {
+      "id": "dk-03",
+      "split": "final",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Up 5 days                       worker-3\na1b2c3d4e5f6   postgres:16    Exited (137) 5 minutes ago      db-1\n\n--- stderr ---\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs db-1",
+        "docker_inspect_container db-1",
+        "docker_health db-1",
+        "docker_logs_since db-1"
+      ],
+      "source": "synthetic:docker-ps-table",
+      "traits": [
+        "signal:docker_ps"
+      ]
+    },
+    {
+      "id": "dk-04",
+      "split": "final",
+      "symptom": "컨테이너가 이상합니다",
+      "evidence": "## docker_ps\ncommand: docker ps --format table\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nCONTAINER ID   IMAGE          STATUS                          NAMES\na1b2c3d4e5f6   nginx:1.25     Up 7 days                       web-1\na1b2c3d4e5f6   myapp:2.1      Restarting (1) 12 seconds ago   api-2\na1b2c3d4e5f6   redis:7        Up 3 days (healthy)             cache-1\na1b2c3d4e5f6   myapp:2.1      Exited (137) 5 minutes ago                       worker-3\na1b2c3d4e5f6   postgres:16    Up 5 days                       db-1\n\n--- stderr ---\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "accepted": [
+        "docker_logs api-2",
+        "docker_inspect_container api-2",
+        "docker_logs db-1",
+        "docker_inspect_container db-1"
+      ],
+      "source": "synthetic:docker-ps-table",
+      "traits": [
+        "signal:docker_ps",
+        "multi-target"
+      ]
+    },
+    {
+      "id": "k8-01",
+      "split": "dev",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                        READY   STATUS             RESTARTS   AGE\nprod        payments-7f9c-x1            0/1     CrashLoopBackOff   14         3d\nprod        payments-7f9c-x2            1/1     Running            0          3d\nprod        ingest-5d2a-q9              1/1     Running            0          3d\nprod        cache-0                     1/1     Running            0          3d\n\n--- stderr ---\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n",
+      "accepted": [
+        "k8s_pod_describe payments-7f9c-x1",
+        "k8s_pod_logs payments-7f9c-x1"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods"
+      ]
+    },
+    {
+      "id": "k8-02",
+      "split": "final",
+      "symptom": "pod이 계속 재시작합니다",
+      "evidence": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## k8s_pods_notready\ncommand: kubectl get pods -A\nexit_code=0 duration_ms=1 truncated=false cwd=.\n--- stdout ---\nNAMESPACE   NAME                        READY   STATUS             RESTARTS   AGE\nprod        payments-7f9c-x1            1/1     Running            0          3d\nprod        payments-7f9c-x2            1/1     Running            0          3d\nprod        ingest-5d2a-q9              0/1     ImagePullBackOff   0          3d\nprod        cache-0                     1/1     Running            0          3d\n\n--- stderr ---\n",
+      "accepted": [
+        "k8s_pod_describe ingest-5d2a-q9",
+        "k8s_pod_logs ingest-5d2a-q9"
+      ],
+      "source": "synthetic:kubectl-get-pods",
+      "traits": [
+        "signal:k8s_pods"
+      ]
+    },
+    {
+      "id": "nn-01",
+      "split": "dev",
+      "symptom": "서버가 좀 이상합니다",
+      "evidence": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    },
+    {
+      "id": "nn-02",
+      "split": "dev",
+      "symptom": null,
+      "evidence": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    },
+    {
+      "id": "nn-03",
+      "split": "final",
+      "symptom": "서버가 좀 이상합니다",
+      "evidence": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    },
+    {
+      "id": "nn-04",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    },
+    {
+      "id": "nn-05",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    },
+    {
+      "id": "nn-06",
+      "split": "final",
+      "symptom": null,
+      "evidence": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "accepted": [],
+      "source": "fixture:none-only",
+      "traits": [
+        "no-signal"
+      ]
+    }
+  ]
+}

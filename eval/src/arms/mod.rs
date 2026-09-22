@@ -5,8 +5,10 @@
 //! 갈라지고, 그 시점부터 이 실험은 운영과 다른 것을 재게 된다.
 
 pub mod jev;
+pub mod jev_followup;
 pub mod jev_judge;
 pub mod llm;
+pub mod llm_followup;
 pub mod rules;
 
 use std::collections::BTreeMap;
