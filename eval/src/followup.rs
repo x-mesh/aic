@@ -95,21 +95,42 @@ fn arg_charset_ok(arg: &str) -> bool {
 /// 대상 후보가 이보다 많으면 이미 사람이 읽기 어려운 출력이다.
 const MAX_CANDIDATES: usize = 30;
 
-/// 헤더 오프셋으로 자른 열. docker/kubectl 표는 표시 폭 기준으로 정렬하므로 바이트가 아니라 문자
-/// 단위로 센다 — COMMAND 열의 `…`가 뒤 열을 밀지 않게.
-fn column(line: &str, from: usize, to: Option<usize>) -> String {
-    let it = line.chars().skip(from);
-    match to {
-        Some(t) if t > from => it.take(t - from).collect(),
-        _ => it.collect(),
-    }
-}
-
-/// `docker ps` STATUS. 실행 중이면서 헬스체크가 실패하지 않은 컨테이너만 정상이다. probe는 `-a` 없이
-/// 돌므로 종료된 컨테이너는 애초에 표에 없다.
-fn docker_status_is_problem(status: &str) -> bool {
-    let s = status.trim();
-    !s.starts_with("Up") || s.contains("(unhealthy)") || s.contains("(Paused)")
+/// `docker ps -s` 한 줄에서 (컨테이너 이름, 문제 여부). 헤더 줄이거나 형태가 어긋나면 `None`.
+///
+/// **헤더 오프셋으로 열을 자르지 않는다.** probe 출력은 redaction을 거친 뒤에 파싱되는데,
+/// PORTS의 IPv4가 `[REDACTED:ipv4]`로 바뀌면서 셀 길이가 늘어 NAMES·SIZE 열이 행마다 다른 만큼
+/// 오른쪽으로 밀린다(실측: 한 행 +16, 다른 행 +8). docker는 원본 폭으로 이미 패딩을 끝냈으므로
+/// 헤더 위치는 더 이상 데이터 위치가 아니다. 그래서 양끝의 고정 토큰을 앵커로 쓴다.
+///
+/// - SIZE는 `<크기> (virtual <크기>)`다. `(virtual` 앞앞 토큰이 NAMES다(없으면 뒤에서 둘째).
+/// - STATUS는 `Up`·`Restarting`·`Exited` 같은 고정 낱말로 시작한다. 그 지점부터 NAMES 직전까지가
+///   STATUS + PORTS이며, PORTS에는 `(unhealthy)`·`(Paused)`가 섞이지 않는다.
+fn docker_ps_row(line: &str) -> Option<(&str, bool)> {
+    /// docker가 STATUS 첫 낱말로 쓰는 값. IMAGE·COMMAND 열은 따옴표나 `:` 태그를 달고 있어 겹치지 않는다.
+    const STATUS_HEADS: &[&str] = &[
+        "Up",
+        "Exited",
+        "Created",
+        "Restarting",
+        "Removal",
+        "Dead",
+        "Paused",
+    ];
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let names_at = match toks.iter().rposition(|t| *t == "(virtual") {
+        Some(i) => i.checked_sub(2)?,
+        None => toks.len().checked_sub(2)?,
+    };
+    let status_at = toks
+        .iter()
+        .take(names_at)
+        .position(|t| STATUS_HEADS.contains(t))?;
+    let segment = &toks[status_at..names_at];
+    let problem = segment[0] != "Up"
+        || segment
+            .iter()
+            .any(|t| *t == "(unhealthy)" || *t == "(Paused)");
+    Some((toks[names_at], problem))
 }
 
 /// `kubectl get pods` STATUS. probe가 `grep -v Running`을 거치므로 표에 남는 정상 행은 끝난 Job뿐이다.
@@ -187,26 +208,13 @@ pub fn candidates(evidence: &str) -> BTreeMap<&'static str, Vec<String>> {
                     }
                 }
             }
-            // docker_ps(`docker ps -s`): NAMES 뒤에 SIZE 열이 있어 마지막 토큰이 이름이 아니다. 열은
-            // 헤더 오프셋으로 자른다.
+            // docker_ps(`docker ps -s`): NAMES 뒤에 SIZE 열이 있어 마지막 토큰이 이름이 아니다.
             "docker_ps" => {
-                let Some(header) = lines.first() else {
-                    continue;
-                };
-                let (Some(status_at), Some(names_at)) =
-                    (header.find("STATUS"), header.find("NAMES"))
-                else {
-                    continue;
-                };
-                let status_end = header.find("PORTS").or(Some(names_at));
-                let names_end = header.find("SIZE");
                 for line in lines.iter().skip(1) {
-                    let status = column(line, status_at, status_end);
-                    let names = column(line, names_at, names_end);
-                    let Some(name) = names.split_whitespace().next() else {
+                    let Some((name, problem)) = docker_ps_row(line) else {
                         continue;
                     };
-                    if status.trim().is_empty() || !docker_status_is_problem(&status) {
+                    if !problem {
                         continue;
                     }
                     for t in [
@@ -494,6 +502,40 @@ per-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stde
             "0B (virtual 187MB)",
         ]]);
         assert!(candidates(&healthy).is_empty());
+    }
+
+    #[test]
+    fn redacted_ports_do_not_shift_the_name_out_of_the_row() {
+        // 실측(2026-09-22, macOS+OrbStack): probe 출력은 redaction 뒤에 파싱되는데 PORTS의 IPv4가
+        // `[REDACTED:ipv4]`로 늘어나 NAMES가 헤더 위치보다 행마다 다르게(+8·+16) 밀린다. 헤더
+        // 오프셋으로 자르면 이름이 잘리고(게이트에서 거부) STATUS 칸이 어긋나 정상 컨테이너가
+        // 문제로 잡힌다. 아래 두 줄은 그때 실제로 나온 형태다(이름만 바꿨다).
+        let ev = "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0\n--- stdout ---\n\
+CONTAINER ID   IMAGE                               COMMAND                   CREATED        STATUS                PORTS                                                                                                NAMES                                  SIZE\n\
+7a548a168c8b   acme/nginx:1.13.7                   \"/run.sh\"                 6 days ago     Up 6 days             [REDACTED:ipv4]:80->80/tcp, [::]:80->80/tcp, [REDACTED:ipv4]:443->443/tcp, [::]:443->443/tcp                         web-intranet-v2-nginx-1                6.77kB (virtual 271MB)\n\
+7d65febad023   acme/php73:7.3.20                   \"bash -c 'dpkg -i /v…\"   6 days ago     Up 6 days (unhealthy) 80/tcp, 443/tcp, [REDACTED:ipv4]:32769->9000/tcp, [::]:32769->9000/tcp                                       web-intranet-v2-php-1                  16.5MB (virtual 929MB)\n\n--- stderr ---\n";
+        let c = candidates(ev);
+        // 정상 nginx는 후보가 아니고, unhealthy php만 후보이며 이름이 온전하다.
+        assert_eq!(
+            c.get("docker_logs").cloned().unwrap_or_default(),
+            vec!["web-intranet-v2-php-1".to_string()]
+        );
+        assert!(resolve_followup_line("docker_logs web-intranet-v2-php-1", ev).is_ok());
+    }
+
+    #[test]
+    fn a_container_with_no_published_ports_still_parses() {
+        // PORTS가 비면 STATUS 바로 뒤가 NAMES다 — 앵커가 토큰 개수에 기대면 여기서 깨진다.
+        let ev = "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0\n--- stdout ---\n\
+CONTAINER ID   IMAGE       COMMAND       CREATED       STATUS                        PORTS   NAMES     SIZE\n\
+1a2b3c4d5e6f   acme:2.1    \"./worker\"    2 hours ago   Restarting (137) 8 seconds ago         worker-3   0B (virtual 412MB)\n\n--- stderr ---\n";
+        assert_eq!(
+            candidates(ev)
+                .get("docker_health")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["worker-3".to_string()]
+        );
     }
 
     #[test]
