@@ -37,6 +37,7 @@ pub mod obs_tools;
 // main.rs(`aic rca collect`)가 RcaAgentClient를 직접 쓰므로 pub.
 pub mod probes;
 pub mod rca_agent;
+pub mod symptom_rules;
 // `/local`의 proc_changes 섹션 + `/procs` — 최근 프로세스 생성/소멸. probe가 `aic proc-changes`로
 // 호출하므로 proc_fd와 같은 이유로 pub.
 pub mod proc_changes;

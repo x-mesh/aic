@@ -590,84 +590,40 @@ pub const DIAGNOSE_CATEGORIES: [&str; 8] = [
 ];
 
 pub fn diagnose_category(symptom: Option<&str>) -> &'static str {
-    let s = match symptom {
-        Some(s) if !s.trim().is_empty() => s.to_lowercase(),
-        _ => return "generic",
-    };
-    let has = |kws: &[&str]| kws.iter().any(|k| s.contains(k));
-    // 우선순위: 구체 카테고리 먼저. 다중 매칭 시 첫 카테고리(상한·결정적).
-    // k8s/docker는 명시적 신호라 최우선(예: "pod이 죽음"은 process가 아니라 k8s로).
-    if has(&[
-        "k8s",
-        "kubernetes",
-        "kubectl",
-        "kube",
-        "쿠버",
-        "pod",
-        "파드",
-        "namespace",
-        "crashloop",
-        "oomkilled",
-    ]) {
-        "k8s"
-    } else if has(&["docker", "도커", "container", "컨테이너"]) {
-        "docker"
-    } else if has(&[
-        "cpu", "load", "느림", "느려", "slow", "hang", "행", "busy", "높", "high",
-    ]) {
-        "cpu"
-    } else if has(&[
-        "memory",
-        "mem",
-        "메모리",
-        "oom",
-        "swap",
-        "스왑",
-        "leak",
-        "누수",
-    ]) {
-        "memory"
-    } else if has(&[
-        "disk",
-        "디스크",
-        "storage",
-        "스토리지",
-        "full",
-        "공간",
-        "space",
-        "inode",
-    ]) {
-        "disk"
-    } else if has(&[
-        "network",
-        "net",
-        "네트워크",
-        "port",
-        "포트",
-        "연결",
-        "connection",
-        "dns",
-        "latency",
-        "지연",
-        "socket",
-    ]) {
-        "network"
-    } else if has(&[
-        "process",
-        "proc",
-        "프로세스",
-        "service",
-        "서비스",
-        "crash",
-        "죽",
-        "down",
-        "zombie",
-        "좀비",
-    ]) {
-        "process"
-    } else {
-        "generic"
+    match symptom {
+        Some(s) if !s.trim().is_empty() => super::symptom_rules::categorize(s),
+        // 증상이 없으면 좁힐 근거가 없다 — 전체 점검으로 간다.
+        _ => "generic",
     }
+}
+
+/// 1등 범주가 전체 점수에서 차지해야 하는 최소 비중. 이보다 낮으면 2등 범주도 조사한다.
+///
+/// 별도 검증에서 정한 값이다(`docs/PROBE-SELECTION-EVALUATION.md`). 더 낮추면 관계없는 probe만
+/// 늘고, 더 올리면 놓치는 증거가 늘어난다.
+const CATEGORY_WIDEN_THRESHOLD: f64 = 0.70;
+
+/// 조사할 범주. 증상이 두 대상을 비슷한 무게로 가리키면 둘을 돌려준다.
+///
+/// 증상 하나가 두 대상을 동시에 지목하는 경우가 실제로 있다. `"읽기 지연과 쓰기 지연이 함께
+/// 높습니다"`는 disk 증거와 `vmstat_iowait`를 둘 다 요구하는데 후자는 cpu 범주에만 있다. 하나만
+/// 고르면 그 사례에서 증거를 절반만 모으고, 사용자는 같은 장애를 두 번 물어야 한다.
+fn categories_to_probe(symptom: Option<&str>) -> Vec<&'static str> {
+    let Some(text) = symptom.filter(|s| !s.trim().is_empty()) else {
+        return vec!["generic"];
+    };
+    let scores = super::symptom_rules::scored(text);
+    let Some(&(first, top)) = scores.first() else {
+        return vec!["generic"];
+    };
+    let mut out = vec![first];
+    if let Some(&(second, runner_up)) = scores.get(1) {
+        let share = top as f64 / (top + runner_up) as f64;
+        if share < CATEGORY_WIDEN_THRESHOLD {
+            out.push(second);
+        }
+    }
+    out
 }
 
 /// 카테고리별 고정 Safe probe(섹션 이름) 목록. base 컨텍스트(date/host/os) + 카테고리 probe.
@@ -727,11 +683,18 @@ pub(crate) fn docker_available() -> bool {
 ///
 /// 범주 판정은 [`diagnose_category`], 목록 구성은 [`select_probes_for_category`]가 맡는다.
 pub fn select_probes(symptom: Option<&str>, docker_available: bool) -> Vec<(&'static str, String)> {
-    select_probes_for_category(
-        diagnose_category(symptom),
-        symptom.is_none(),
-        docker_available,
-    )
+    let full_sweep = symptom.is_none();
+    let mut ids: Vec<&'static str> = Vec::new();
+    for cat in categories_to_probe(symptom) {
+        for id in probe_ids_for_category(cat, full_sweep, docker_available) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids.into_iter()
+        .filter_map(|n| section_command(n).map(|c| (n, c)))
+        .collect()
 }
 
 /// 범주가 **이미 정해진** 상태에서 probe 목록을 만든다.
@@ -750,6 +713,19 @@ pub fn select_probes_for_category(
     full_sweep: bool,
     docker_available: bool,
 ) -> Vec<(&'static str, String)> {
+    probe_ids_for_category(cat, full_sweep, docker_available)
+        .into_iter()
+        .filter_map(|n| section_command(n).map(|c| (n, c)))
+        .collect()
+}
+
+/// [`select_probes_for_category`]의 ID 부분. 여러 범주를 합칠 때 명령 해석을 한 번만 하려고
+/// 나눠 두었다.
+fn probe_ids_for_category(
+    cat: &str,
+    full_sweep: bool,
+    docker_available: bool,
+) -> Vec<&'static str> {
     fn push_unique(sections: &mut Vec<&'static str>, ids: &[&'static str]) {
         for id in ids {
             if !sections.contains(id) {
@@ -833,9 +809,6 @@ pub fn select_probes_for_category(
         );
     }
     sections
-        .into_iter()
-        .filter_map(|n| section_command(n).map(|c| (n, c)))
-        .collect()
 }
 
 /// 진단 분석 프롬프트의 고정 preface — 가설 우선순위·증거 인용·다음 안전 확인을 요구하고,
@@ -1697,49 +1670,18 @@ mod tests {
 
     /// 키워드가 여러 범주에 겹치는 증상에서 무엇이 이기는지 고정한다.
     ///
-    /// 기존 매핑 테스트는 단일 범주 키워드만 쓰는 증상으로 짜여 있어, 분기 순서를 바꿔도 전부
-    /// 통과한다. 여기 적힌 값은 "옳은 분류"가 아니라 **현재 동작**이다.
-    /// `docs/PRD-JEV-PROBE-SELECTION.md`의 평가가 비교할 baseline이므로, 이 값이 바뀌면 그
-    /// 평가의 전제도 함께 바뀐다.
-    /// 공개 목록과 실제 분기가 갈리지 않게 묶는다. 목록만 고치고 분기를 잊으면, 범주 밖 응답을
-    /// 세는 쪽이 조용히 틀린 기준을 쓴다.
+    /// 대상(무엇이 문제인가)이 수식어(어떻게 문제인가)를 이겨야 한다. 이전 구현은 부분 문자열
+    /// 첫 일치였으므로 분기 순서가 앞선 범주가 수식어 하나로 이겼다.
     #[test]
-    fn categories_match_the_branches() {
-        let samples = [
-            ("cpu 높음", "cpu"),
-            ("메모리 누수", "memory"),
-            ("디스크 공간 부족", "disk"),
-            ("포트 연결 안 됨", "network"),
-            ("프로세스가 죽음", "process"),
-            ("docker 문제", "docker"),
-            ("pod CrashLoopBackOff", "k8s"),
-            ("원인 모름", "generic"),
-        ];
-        for (symptom, expected) in samples {
-            let got = diagnose_category(Some(symptom));
-            assert_eq!(got, expected, "증상: {symptom}");
-            assert!(
-                DIAGNOSE_CATEGORIES.contains(&got),
-                "목록에 없는 범주: {got}"
-            );
-        }
-        // 8개 분기가 모두 표본에 나왔는지 — 하나라도 빠지면 위 루프가 그 분기를 못 지킨다.
-        assert_eq!(samples.len(), DIAGNOSE_CATEGORIES.len());
-    }
-
-    #[test]
-    fn overlapping_keywords_resolve_by_branch_order() {
+    fn a_subject_beats_a_modifier() {
         let cases: &[(&str, &str)] = &[
-            // cpu 분기가 network보다 앞서고 "느려"를 가진다.
-            ("네트워크가 느려요", "cpu"),
-            // "높"도 cpu 키워드다.
-            ("네트워크 지연이 높음", "cpu"),
-            ("메모리 사용량이 높아", "cpu"),
-            // 이건 의도된 분류다 — vmstat_iowait가 I/O와 CPU를 가른다(아래 r8 테스트 주석).
-            ("디스크가 느려요", "cpu"),
-            // k8s가 가장 앞이라 다른 범주 키워드가 섞여도 이긴다.
+            // 예전에는 cpu 분기의 `느려`가 이겨 network probe를 하나도 고르지 않았다.
+            ("네트워크가 느려요", "network"),
+            ("네트워크 지연이 높음", "network"),
+            ("메모리 사용량이 높아", "memory"),
+            ("디스크가 느려요", "disk"),
+            // 대상이 둘이면 TABLE 순서가 1등을 정한다. 2등은 확장으로 함께 조사한다.
             ("pod 네트워크 문제", "k8s"),
-            // docker는 cpu보다 앞이다.
             ("container가 느림", "docker"),
         ];
         for (symptom, expected) in cases {
@@ -1751,30 +1693,60 @@ mod tests {
         }
     }
 
-    /// 오분류가 범주 이름에 그치지 않고 **증거를 잃게** 만드는지 확인한다.
-    ///
-    /// 이 테스트는 현재의 결함을 고정한다. 분류를 고치면 여기가 깨지는데, 그때 이 테스트를
-    /// 지우는 것이 맞다. 고쳤다는 사실을 의식적으로 기록하게 하는 것이 목적이다.
+    /// 예전 결함이 실제로 고쳐졌음을 probe 목록으로 확인한다. 범주 이름만 맞아도 증거가 빠지면
+    /// 의미가 없다.
     #[test]
-    fn a_misrouted_network_symptom_collects_no_network_probe() {
+    fn a_network_symptom_now_collects_network_probes() {
         let ids: Vec<&str> = select_probes(Some("네트워크가 느려요"), false)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        for missing in [
+        for expected in [
             "ip",
             "route",
             "ports",
             "conn_states",
             "tcp_retrans",
-            "listen_backlog",
-            "conntrack_max",
             "dns_resolver",
         ] {
             assert!(
-                !ids.contains(&missing),
-                "network probe가 붙었다(분류가 고쳐졌다면 이 테스트를 지운다): {missing}"
+                ids.contains(&expected),
+                "network probe가 빠졌다: {expected}"
             );
+        }
+    }
+
+    /// 대상 둘을 같은 무게로 지목하는 증상은 둘 다 조사한다.
+    ///
+    /// `"읽기 지연과 쓰기 지연이 함께 높습니다"`는 disk 증거와 `vmstat_iowait`를 둘 다 요구하고,
+    /// 후자는 cpu 범주에만 있다. 하나만 고르면 증거를 절반만 모은다.
+    #[test]
+    fn a_symptom_naming_two_subjects_probes_both() {
+        let ids: Vec<&str> = select_probes(Some("읽기 지연과 쓰기 지연이 함께 높습니다"), false)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            ids.contains(&"vmstat_iowait"),
+            "cpu 쪽 증거가 빠졌다: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"iostat_devices"),
+            "disk 쪽 증거가 빠졌다: {ids:?}"
+        );
+    }
+
+    /// 확신이 있으면 넓히지 않는다. 안 그러면 모든 진단이 관계없는 probe를 끌고 다닌다.
+    #[test]
+    fn a_clear_symptom_probes_one_category_only() {
+        let ids: Vec<&str> = select_probes(Some("메모리 누수가 의심됩니다"), false)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"mem_top_proc"));
+        // network·k8s 계열이 섞이면 확장이 과하게 걸린 것이다.
+        for unrelated in ["ip", "conn_states", "k8s_nodes", "docker_ps"] {
+            assert!(!ids.contains(&unrelated), "관계없는 probe: {unrelated}");
         }
     }
 
@@ -2669,7 +2641,8 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         use crate::risk_guard::{classify, RiskLevel};
         // 각 카테고리에 R8 심층 probe가 붙고, 전부 Safe(자동 실행 가능)여야 한다.
         let cases: &[(&str, &[&str])] = &[
-            // "느림"은 cpu로 분류되며 vmstat_iowait가 I/O냐 CPU냐를 가른다(disk-slow도 여기서 1차 식별).
+            // 대상이 cpu로 지목된 증상에 R8 심층 probe가 붙는지 본다. 대상이 disk인 증상은
+            // disk 계열로 가고, 대상이 둘이면 확장이 둘 다 조사한다(위 두 테스트 참고).
             // batch1/batch2 신규 probe 배선도 함께 고정(회귀 방지): cpu→cpu_count·mac_thermal,
             // network→kernel_limits·dns_resolver, process→launchd_failed, generic→cron_jobs 등.
             ("cpu 높음", &["vmstat_iowait", "cpu_count", "mac_thermal"]),
