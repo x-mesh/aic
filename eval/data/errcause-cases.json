@@ -1,0 +1,1956 @@
+{
+  "schema_version": 1,
+  "generated": "2026-09-23",
+  "categories": {
+    "not_found": "지정한 대상이 존재하지 않는다(파일·경로·브랜치·컨테이너·리소스·이름). 조치는 이름이나 경로를 고치는 것이다.",
+    "usage": "명령을 잘못 썼다(인자 누락, 알 수 없는 옵션, 잘못된 조합). 조치는 사용법을 고치는 것이다.",
+    "malformed_input": "주어진 데이터나 코드가 형식에 맞지 않아 파싱·컴파일이 실패했다. 조치는 그 내용을 고치는 것이다.",
+    "network": "상대에 도달하지 못했다(이름 해석 실패, 연결 거부, 타임아웃). 조치는 연결 경로와 상대 기동 여부를 확인하는 것이다.",
+    "tls": "TLS 인증서가 검증되지 않는다(만료·자가서명·호스트 불일치). 조치는 인증서나 신뢰 설정을 고치는 것이다.",
+    "auth": "자격 증명이 없거나 거부됐다. 조치는 로그인·토큰·권한 부여다.",
+    "remote_error": "상대가 요청을 받고 오류를 돌려줬다(서버 오류, 속도 제한). 조치는 재시도하거나 상대 상태를 확인하는 것이다.",
+    "state": "대상의 현재 상태가 명령의 전제와 다르다(초기화 안 됨, 설정 없음, 이미 존재, 진행 중 아님). 조치는 전제를 맞추는 것이다.",
+    "dependency": "실행에 필요한 모듈·패키지가 환경에 없다. 조치는 설치다.",
+    "resource": "자원 한도에 걸렸다(파일 디스크립터, 메모리, 파일 크기, 디스크). 조치는 한도를 조정하거나 사용량을 줄이는 것이다."
+  },
+  "cases": [
+    {
+      "id": "ec-bd751ebb",
+      "command": "cat /definitely/not/here/config.yaml",
+      "exit_code": 1,
+      "output": "cat: /definitely/not/here/config.yaml: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-344b7351",
+      "command": "ls -l /var/log/nope-does-not-exist",
+      "exit_code": 1,
+      "output": "ls: /var/log/nope-does-not-exist: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-00525f30",
+      "command": "cd /no/such/dir && pwd",
+      "exit_code": 1,
+      "output": "/bin/sh: line 0: cd: /no/such/dir: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-d174cee7",
+      "command": "cp missing-source.txt dest.txt",
+      "exit_code": 1,
+      "output": "cp: missing-source.txt: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-c591ec59",
+      "command": "tar -xzf empty.tar.gz",
+      "exit_code": 1,
+      "output": "tar: Error opening archive: Unrecognized archive format",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-e085d1a6",
+      "command": "rm /System/nonexistent-protected-thing",
+      "exit_code": 1,
+      "output": "rm: /System/nonexistent-protected-thing: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-dd610ca1",
+      "command": "jq . notjson.txt",
+      "exit_code": 5,
+      "output": "jq: parse error: Invalid literal at line 1, column 5",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-7f7a7f73",
+      "command": "jq .a bad.json",
+      "exit_code": 5,
+      "output": "jq: parse error: Unmatched '}' at line 1, column 15",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-c0223843",
+      "command": "python3 -c \"import json,sys; json.load(open('bad.json'))\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import json,sys; json.load(open('bad.json'))\n                     ~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/json/__init__.py\", line 298, in load\n    return loads(fp.read(),\n        cls=cls, object_hook=object_hook,\n        parse_float=parse_float, parse_int=parse_int,\n        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/json/__init__.py\", line 352, in loads\n    return _default_decoder.decode(s)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/json/decoder.py\", line 345, in decode\n    obj, end = self.raw_decode(s, idx=_w(s, 0).end())\n               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/json/decoder.py\", line 363, in raw_decode\n    raise JSONDecodeError(\"Expecting value\", s, err.value) from None\njson.decoder.JSONDecodeError: Expecting value: line 1 column 15 (char 14)",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-455450f1",
+      "command": "python3 bad.py",
+      "exit_code": 1,
+      "output": "File \"/tmp/work/bad.py\", line 1\n    def f(:\n          ^\nSyntaxError: invalid syntax",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-1e6d0047",
+      "command": "python3 importer.py",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"/tmp/work/importer.py\", line 1, in <module>\n    import totally_absent_module_xyz\nModuleNotFoundError: No module named 'totally_absent_module_xyz'",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-0fedc37f",
+      "command": "python3 rt.py",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"/tmp/work/rt.py\", line 2, in <module>\n    print(d['missing'])\n          ~^^^^^^^^^^^\nKeyError: 'missing'",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-50ac6ed8",
+      "command": "sh bad.sh",
+      "exit_code": 2,
+      "output": "bad.sh: line 4: syntax error: unexpected end of file",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-478d8baa",
+      "command": "bash -n bad.sh",
+      "exit_code": 2,
+      "output": "bad.sh: 줄 4: 문법 오류: 1행의 `if' 명령에 예기치 않은 파일의 끝",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-6709f37b",
+      "command": "python3 -c \"import yaml,sys; yaml.safe_load(open('bad.yaml'))\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import yaml,sys; yaml.safe_load(open('bad.yaml'))\n                     ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/__init__.py\", line 125, in safe_load\n    return load(stream, SafeLoader)\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/__init__.py\", line 81, in load\n    return loader.get_single_data()\n           ~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/constructor.py\", line 49, in get_single_data\n    node = self.get_single_node()\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/composer.py\", line 36, in get_single_node\n    document = self.compose_document()\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/composer.py\", line 55, in compose_document\n    node = self.compose_node(None, None)\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/composer.py\", line 84, in compose_node\n    node = self.compose_mapping_node(anchor)\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/composer.py\", line 127, in compose_mapping_node\n    while not self.check_event(MappingEndEvent):\n              ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/parser.py\", line 98, in check_event\n    self.current_event = self.state()\n                         ~~~~~~~~~~^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/parser.py\", line 428, in parse_block_mapping_key\n    if self.check_token(KeyToken):\n       ~~~~~~~~~~~~~~~~^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/scanner.py\", line 116, in check_token\n    self.fetch_more_tokens()\n    ~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/scanner.py\", line 223, in fetch_more_tokens\n    return self.fetch_value()\n           ~~~~~~~~~~~~~~~~^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/site-packages/yaml/scanner.py\", line 577, in fetch_value\n    raise ScannerError(None, None,\n            \"mapping values are not allowed here\",\n            self.get_mark())\nyaml.scanner.ScannerError: mapping values are not allowed here\n  in \"bad.yaml\", line 2, column 4",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-8f9f5766",
+      "command": "rustc --edition 2021 bad.rs -o /dev/null",
+      "exit_code": 1,
+      "output": "error[E0308]: mismatched types\n --> bad.rs:1:26\n  |\n1 | fn main() { let x: i32 = \"str\"; }\n  |                    ---   ^^^^^ expected `i32`, found `&str`\n  |                    |\n  |                    expected due to this\n\nerror: aborting due to 1 previous error\n\nFor more information about this error, try `rustc --explain E0308`.",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-ddb96de7",
+      "command": "ls --totally-bogus-flag",
+      "exit_code": 1,
+      "output": "ls: unrecognized option `--totally-bogus-flag'\nusage: ls [-@ABCFGHILOPRSTUWXabcdefghiklmnopqrstuvwxy1%,] [--color=when] [-D format] [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-6f99ebe4",
+      "command": "grep",
+      "exit_code": 2,
+      "output": "usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz] [-A num] [-B num] [-C[num]]\n\t[-e pattern] [-f file] [--binary-files=value] [--color=when]\n\t[--context[=num]] [--directories=action] [--label] [--line-buffered]\n\t[--null] [pattern] [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-5300d17a",
+      "command": "curl",
+      "exit_code": 2,
+      "output": "curl: try 'curl --help' or 'curl --manual' for more information",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-3ef3d527",
+      "command": "git checkout",
+      "exit_code": 128,
+      "output": "fatal: (현재 폴더 또는 상위 폴더 중 일부가) 깃 저장소가 아닙니다: .git",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-680254ba",
+      "command": "tar",
+      "exit_code": 1,
+      "output": "tar: Must specify one of -c, -r, -t, -u, -x",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-be64f9c4",
+      "command": "sed -e",
+      "exit_code": 1,
+      "output": "sed: option requires an argument -- e\nusage: sed script [-EHalnru] [-i extension] [file ...]\n\tsed [-EHalnu] [-i extension] [-e script] ... [-f script_file] ... [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-c027a379",
+      "command": "awk",
+      "exit_code": 1,
+      "output": "usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-247f398f",
+      "command": "docker run",
+      "exit_code": 1,
+      "output": "docker: 'docker run' requires at least 1 argument\n\nUsage:  docker run [OPTIONS] IMAGE [COMMAND] [ARG...]\n\nSee 'docker run --help' for more information",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-43ec2d64",
+      "command": "curl -sS --max-time 5 http://127.0.0.1:1/",
+      "exit_code": 7,
+      "output": "curl: (7) Failed to connect to 127.0.0.1 port 1 after 0 ms: Couldn't connect to server",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b5b6e757",
+      "command": "curl -sS --max-time 5 http://nonexistent-host.invalid/",
+      "exit_code": 6,
+      "output": "curl: (6) Could not resolve host: nonexistent-host.invalid",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-4704d3b7",
+      "command": "curl -sS --max-time 3 https://10.255.255.1/",
+      "exit_code": 28,
+      "output": "curl: (28) Connection timed out after 3004 milliseconds",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-3c8aa48d",
+      "command": "ping -c 1 -W 2 nonexistent-host.invalid",
+      "exit_code": 68,
+      "output": "ping: cannot resolve nonexistent-host.invalid: Unknown host",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-7b9018c1",
+      "command": "ssh -o BatchMode=yes -o ConnectTimeout=3 nonexistent-host.invalid",
+      "exit_code": 255,
+      "output": "Pseudo-terminal will not be allocated because stdin is not a terminal.\nssh: Could not resolve hostname nonexistent-host.invalid: nodename nor servname provided, or not known",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-1724acce",
+      "command": "git clone https://nonexistent-host.invalid/x/y.git",
+      "exit_code": 128,
+      "output": "'y'에 복제합니다...\nfatal: unable to access 'https://nonexistent-host.invalid/x/y.git/': Could not resolve host: nonexistent-host.invalid",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-f2a29f2b",
+      "command": "git status",
+      "exit_code": 128,
+      "output": "fatal: (현재 폴더 또는 상위 폴더 중 일부가) 깃 저장소가 아닙니다: .git",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-f931c082",
+      "command": "git log -1",
+      "exit_code": 128,
+      "output": "fatal: (현재 폴더 또는 상위 폴더 중 일부가) 깃 저장소가 아닙니다: .git",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b5ac89e1",
+      "command": "git rebase --continue",
+      "exit_code": 128,
+      "output": "fatal: (현재 폴더 또는 상위 폴더 중 일부가) 깃 저장소가 아닙니다: .git",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-dd8f114f",
+      "command": "kubectl get pods",
+      "exit_code": 1,
+      "output": "E0923 07:50:10.643491   28999 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:50:10.645299   28999 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:50:10.647262   28999 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:50:10.649002   28999 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:50:10.650630   28999 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nThe connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      "accepted": [
+        "state",
+        "network"
+      ],
+      "traits": [
+        "ambiguous",
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-742b5736",
+      "command": "kubectl config current-context",
+      "exit_code": 1,
+      "output": "error: current-context is not set",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-188a21fb",
+      "command": "mkdir existing && mkdir existing",
+      "exit_code": 1,
+      "output": "mkdir: existing: File exists",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-cb2e8582",
+      "command": "ln -s a b && ln -s a b",
+      "exit_code": 1,
+      "output": "ln: b: File exists",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-9694e6c0",
+      "command": "python3 -c \"import numpy_absent_xyz\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import numpy_absent_xyz\nModuleNotFoundError: No module named 'numpy_absent_xyz'",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b39a22aa",
+      "command": "node -e \"require('totally-absent-pkg-xyz')\"",
+      "exit_code": 1,
+      "output": "node:internal/modules/cjs/loader:1595\n  throw err;\n  ^\n\nError: Cannot find module 'totally-absent-pkg-xyz'\nRequire stack:\n- /tmp/work/[eval]\n    at Module._resolveFilename (node:internal/modules/cjs/loader:1591:15)\n    at wrapResolveFilename (node:internal/modules/cjs/loader:1145:27)\n    at defaultResolveImplForCJSLoading (node:internal/modules/cjs/loader:1169:10)\n    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1196:12)\n    at Module._load (node:internal/modules/cjs/loader:1368:5)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)\n    at Module.require (node:internal/modules/cjs/loader:1701:12)\n    at require (node:internal/modules/helpers:316:16)\n    at [eval]:1:1\n    at runScriptInThisContext (node:internal/vm:219:10) {\n  code: 'MODULE_NOT_FOUND',\n  requireStack: [\n    '/tmp/work/[eval]'\n  ]\n}\n\nNode.js v26.9.0",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-eb36f628",
+      "command": "cargo run -p no-such-crate-xyz",
+      "exit_code": 101,
+      "output": "error: package(s) `no-such-crate-xyz` not found in workspace `/srv/app`",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-d3772d20",
+      "command": "pip3 install --dry-run totally-absent-pkg-xyz-9999",
+      "exit_code": 1,
+      "output": "ERROR: Could not find a version that satisfies the requirement totally-absent-pkg-xyz-9999 (from versions: none)\nERROR: No matching distribution found for totally-absent-pkg-xyz-9999\n",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-0dd6d211",
+      "command": "npm view totally-absent-pkg-xyz-9999",
+      "exit_code": 1,
+      "output": "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/totally-absent-pkg-xyz-9999 - Not found\nnpm error 404\nnpm error 404  The requested resource 'totally-absent-pkg-xyz-9999@*' could not be found or you do not have permission to access it.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\nnpm error A complete log of this run can be found in: /home/user/.npm/_logs/2026-09-22T22_50_12_093Z-debug-0.log",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "surface:404"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-f81f25ff",
+      "command": "brew info totally-absent-formula-xyz",
+      "exit_code": 1,
+      "output": "Error: No available formula with the name \"totally-absent-formula-xyz\".",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-bd37f05b",
+      "command": "curl -sS --max-time 8 -f https://api.github.com/user",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 401",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-9f4fe3f7",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/500",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 500",
+      "accepted": [
+        "remote_error"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-71c8bf3b",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/429",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 429",
+      "accepted": [
+        "remote_error"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-75938394",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/403",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 403",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-67c44e47",
+      "command": "git ls-remote https://github.com/x-mesh/definitely-not-a-repo-xyz.git",
+      "exit_code": 128,
+      "output": "fatal: could not read Username for 'https://github.com': Device not configured",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-e8bdbe43",
+      "command": "docker pull totally-absent-image-xyz:latest",
+      "exit_code": 1,
+      "output": "Error response from daemon: pull access denied for totally-absent-image-xyz, repository does not exist or may require 'docker login': denied: requested access to the resource is denied",
+      "accepted": [
+        "auth",
+        "not_found"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-a8e19e89",
+      "command": "ulimit -n 3; exec 3</dev/null; exec 4</dev/null; exec 5</dev/null; cat /etc/hosts",
+      "exit_code": 1,
+      "output": "/bin/sh: /dev/null: Too many open files",
+      "accepted": [
+        "resource"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-a0a90c85",
+      "command": "git checkout no-such-branch",
+      "exit_code": 1,
+      "output": "error: pathspec 'no-such-branch' did not match any file(s) known to git",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-575bef66",
+      "command": "git show deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "exit_code": 128,
+      "output": "fatal: bad object deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-dafcc11c",
+      "command": "git merge no-such-branch",
+      "exit_code": 1,
+      "output": "merge: no-such-branch - 병합할 수 있는 항목이 아닙니다",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-512daff1",
+      "command": "git rebase --abort",
+      "exit_code": 128,
+      "output": "fatal: no rebase in progress",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-79a9d86a",
+      "command": "git stash pop",
+      "exit_code": 1,
+      "output": "스태시 항목이 없습니다.",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-c7fa77b2",
+      "command": "git cherry-pick deadbeef",
+      "exit_code": 128,
+      "output": "fatal: bad revision 'deadbeef'",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-8f6e64c9",
+      "command": "git push",
+      "exit_code": 128,
+      "output": "fatal: No configured push destination.\nEither specify the URL from the command-line or configure a remote repository using\n\n    git remote add <name> <url>\n\nand then push using the remote name\n\n    git push <name>\n\nTo push to multiple remotes at once, configure a remote group using\n\n    git config remotes.<groupname> \"<remote1> <remote2>\"\n\nand then push using the group name\n\n    git push <groupname>",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-d065adf8",
+      "command": "git pull",
+      "exit_code": 1,
+      "output": "현재 브랜치에 추적 정보가 없습니다.\n어떤 브랜치를 대상으로 병합할지 지정하십시오.\n자세한 정보는 git-pull(1) 페이지를 참고하십시오.\n\n    git pull <리모트> <브랜치>\n\n이 브랜치에 대한 추적 정보를 설정하려면 다음과 같이 할 수 있습니다:\n\n    git branch --set-upstream-to=<리모트>/<브랜치> main",
+      "accepted": [
+        "state"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-94f28aeb",
+      "command": "git branch -d main",
+      "exit_code": 1,
+      "output": "error: cannot delete branch 'main' used by worktree at '/tmp/work/repo'",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-75d9faa9",
+      "command": "git worktree remove nope",
+      "exit_code": 128,
+      "output": "fatal: 'nope'은(는) 작업 폴더가 아닙니다",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-7adf37e6",
+      "command": "git tag -d no-such-tag",
+      "exit_code": 1,
+      "output": "error: 'no-such-tag' 태그가 없습니다.",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "locale:ko"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-bae2f69e",
+      "command": "git apply /dev/null",
+      "exit_code": 128,
+      "output": "error: No valid patches in input (allow with \"--allow-empty\")",
+      "accepted": [
+        "usage",
+        "malformed_input"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-522d8f11",
+      "command": "make nosuchtarget",
+      "exit_code": 2,
+      "output": "make: *** No rule to make target `nosuchtarget'.  Stop.",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-914662ae",
+      "command": "make -f NoSuchMakefile all",
+      "exit_code": 2,
+      "output": "make: NoSuchMakefile: No such file or directory\nmake: *** No rule to make target `NoSuchMakefile'.  Stop.",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-7adb9daa",
+      "command": "cargo metadata --format-version 1",
+      "exit_code": 101,
+      "output": "error: unexpected character 'o' while parsing major version number\n --> Cargo.toml:3:11\n  |\n3 | version = \"oops\"\n  |           ^^^^^^",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-5f0d063c",
+      "command": "cargo build --features no-such-feature",
+      "exit_code": 101,
+      "output": "error: none of the selected packages contains this feature: no-such-feature\nselected packages: aic-common, aic-server, aic-client",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-1b6f5812",
+      "command": "node bad.js",
+      "exit_code": 1,
+      "output": "/tmp/work/bad.js:2\n\n\n\nSyntaxError: Unexpected end of input\n    at wrapSafe (node:internal/modules/cjs/loader:1888:18)\n    at Module._compile (node:internal/modules/cjs/loader:1930:20)\n    at Object..js (node:internal/modules/cjs/loader:2096:10)\n    at Module.load (node:internal/modules/cjs/loader:1678:32)\n    at Module._load (node:internal/modules/cjs/loader:1470:12)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)\n    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)\n    at node:internal/main/run_main_module:33:47\n\nNode.js v26.9.0",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-f13923dc",
+      "command": "node -e \"JSON.parse('{')\"",
+      "exit_code": 1,
+      "output": "<anonymous_script>:1\n{\n\nSyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)\n    at JSON.parse (<anonymous>)\n    at [eval]:1:6\n    at runScriptInThisContext (node:internal/vm:219:10)\n    at node:internal/process/execution:485:12\n    at [eval]-wrapper:6:24\n    at runScriptInContext (node:internal/process/execution:483:60)\n    at evalFunction (node:internal/process/execution:317:30)\n    at evalTypeScript (node:internal/process/execution:329:3)\n    at node:internal/main/eval_string:71:3\n\nNode.js v26.9.0",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-49ed7845",
+      "command": "npm run nosuchscript",
+      "exit_code": 254,
+      "output": "npm error code ENOENT\nnpm error syscall open\nnpm error path /tmp/work/package.json\nnpm error errno -2\nnpm error enoent Could not read package.json: Error: ENOENT: no such file or directory, open '/tmp/work/package.json'\nnpm error enoent This is related to npm not being able to find a file.\nnpm error enoent\nnpm error A complete log of this run can be found in: /home/user/.npm/_logs/2026-09-22T22_51_35_330Z-debug-0.log",
+      "accepted": [
+        "not_found",
+        "state"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-8f28c55e",
+      "command": "sqlite3 :memory: < bad.sql",
+      "exit_code": 1,
+      "output": "Parse error near line 1: near \"SELEKT\": syntax error\n  SELEKT * FROM nothing;\n  ^--- error here",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-78fcd31a",
+      "command": "unzip empty.zip",
+      "exit_code": 9,
+      "output": "Archive:  empty.zip\n\n  End-of-central-directory signature not found.  Either this file is not\n  a zipfile, or it constitutes one disk of a multi-part archive.  In the\n  latter case the central directory and zipfile comment will be found on\n  the last disk(s) of this archive.\nunzip:  cannot find zipfile directory in one of empty.zip or\n        empty.zip.zip, and cannot find empty.zip.ZIP, period.",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-26e2b7ef",
+      "command": "docker logs no-such-container-xyz",
+      "exit_code": 1,
+      "output": "Error response from daemon: No such container: no-such-container-xyz",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-a76a5693",
+      "command": "docker inspect no-such-container-xyz",
+      "exit_code": 1,
+      "output": "[]\n\nerror: no such object: no-such-container-xyz",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-d9a6e3a7",
+      "command": "docker exec no-such-container-xyz ls",
+      "exit_code": 1,
+      "output": "Error response from daemon: No such container: no-such-container-xyz",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-5f6a5913",
+      "command": "docker run --no-such-flag alpine",
+      "exit_code": 125,
+      "output": "unknown flag: --no-such-flag\n\nUsage:  docker run [OPTIONS] IMAGE [COMMAND] [ARG...]\n\nRun 'docker run --help' for more information",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-63642a20",
+      "command": "docker network inspect no-such-net-xyz",
+      "exit_code": 1,
+      "output": "[]\n\nError response from daemon: network no-such-net-xyz not found",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-a4d6712d",
+      "command": "docker stop no-such-container-xyz",
+      "exit_code": 1,
+      "output": "Error response from daemon: No such container: no-such-container-xyz",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-0afa29bd",
+      "command": "kubectl get pods -n no-such-ns",
+      "exit_code": 1,
+      "output": "E0923 07:51:35.670119   30486 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.671935   30486 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.675139   30486 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.676831   30486 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.679076   30486 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nThe connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      "accepted": [
+        "state",
+        "network"
+      ],
+      "traits": [
+        "ambiguous",
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-2af0f0ea",
+      "command": "kubectl describe pod no-such-pod",
+      "exit_code": 1,
+      "output": "E0923 07:51:35.708578   30490 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.711468   30490 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.713376   30490 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.715610   30490 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.717238   30490 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nThe connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      "accepted": [
+        "state",
+        "network"
+      ],
+      "traits": [
+        "ambiguous",
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-03d0e8eb",
+      "command": "kubectl apply -f /dev/null",
+      "exit_code": 1,
+      "output": "error: no objects passed to apply",
+      "accepted": [
+        "usage",
+        "malformed_input"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b739572a",
+      "command": "kubectl logs no-such-pod",
+      "exit_code": 1,
+      "output": "E0923 07:51:35.771442   30492 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.773187   30492 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.775289   30492 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:51:35.777028   30492 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nThe connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      "accepted": [
+        "state",
+        "network"
+      ],
+      "traits": [
+        "ambiguous",
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-3c2ffde1",
+      "command": "curl -sS --max-time 8 https://expired.badssl.com/",
+      "exit_code": 60,
+      "output": "curl: (60) SSL certificate problem: certificate has expired\nMore details here: https://curl.se/docs/sslcerts.html\n\ncurl failed to verify the legitimacy of the server and therefore could not\nestablish a secure connection to it. To learn more about this situation and\nhow to fix it, please visit the web page mentioned above.",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-63b3ae4c",
+      "command": "curl -sS --max-time 8 https://self-signed.badssl.com/",
+      "exit_code": 60,
+      "output": "curl: (60) SSL certificate problem: self signed certificate\nMore details here: https://curl.se/docs/sslcerts.html\n\ncurl failed to verify the legitimacy of the server and therefore could not\nestablish a secure connection to it. To learn more about this situation and\nhow to fix it, please visit the web page mentioned above.",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-72d51a35",
+      "command": "curl -sS --max-time 8 https://wrong.host.badssl.com/",
+      "exit_code": 60,
+      "output": "curl: (60) SSL: no alternative certificate subject name matches target host name 'wrong.host.badssl.com'\nMore details here: https://curl.se/docs/sslcerts.html\n\ncurl failed to verify the legitimacy of the server and therefore could not\nestablish a secure connection to it. To learn more about this situation and\nhow to fix it, please visit the web page mentioned above.",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-92876791",
+      "command": "curl -sS --max-time 5 ftp://nonexistent-host.invalid/x",
+      "exit_code": 6,
+      "output": "curl: (6) Could not resolve host: nonexistent-host.invalid",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b56a39b4",
+      "command": "curl -sS --max-time 5 notaproto://example.com",
+      "exit_code": 1,
+      "output": "curl: (1) Protocol \"notaproto\" not supported",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-8374a9fc",
+      "command": "openssl s_client -connect nonexistent-host.invalid:443 -brief </dev/null",
+      "exit_code": 1,
+      "output": "80BF0EFC01000000:error:10080002:BIO routines:BIO_lookup_ex:system lib:crypto/bio/bio_addr.c:767:nodename nor servname provided, or not known\nconnect:errno=0",
+      "accepted": [
+        "network"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-8679c18d",
+      "command": "scp -o BatchMode=yes -o ConnectTimeout=3 f.txt nonexistent-host.invalid:/tmp/",
+      "exit_code": 255,
+      "output": "scp: stat local \"f.txt\": No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-a242d466",
+      "command": "rsync -e 'ssh -o BatchMode=yes -o ConnectTimeout=3' f.txt nonexistent-host.invalid:/tmp/",
+      "exit_code": 255,
+      "output": "ssh: Could not resolve hostname nonexistent-host.invalid: nodename nor servname provided, or not known\nrsync: connection unexpectedly closed (0 bytes received so far) [sender]\nrsync error: unexplained error (code 255) at io.c(303) [sender=3.5.1]",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-72c68df5",
+      "command": "find . -nosuchpredicate",
+      "exit_code": 1,
+      "output": "find: -nosuchpredicate: unknown primary or operator",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-9c7f7348",
+      "command": "xargs --nosuchflag < /dev/null",
+      "exit_code": 1,
+      "output": "xargs: unrecognized option `--nosuchflag'\nusage: xargs [-0opt] [-E eofstr] [-I replstr [-R replacements] [-S replsize]]\n             [-J replstr] [-L number] [-n number [-x]] [-P maxprocs]\n             [-s size] [utility [argument ...]]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-d5adb375",
+      "command": "chmod 644 no-such-file.txt",
+      "exit_code": 1,
+      "output": "chmod: no-such-file.txt: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-b5751d24",
+      "command": "du -sh /no/such/path",
+      "exit_code": 1,
+      "output": "du: /no/such/path: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-88d6700a",
+      "command": "df /no/such/mount",
+      "exit_code": 1,
+      "output": "df: /no/such/mount: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-1834267b",
+      "command": "stat /no/such/thing",
+      "exit_code": 1,
+      "output": "stat: /no/such/thing: stat: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-c6a162c8",
+      "command": "diff onlyone.txt",
+      "exit_code": 2,
+      "output": "usage: diff [-aBbdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]\n            [-I pattern] [-F pattern] [-L label] file1 file2\n       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]\n            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]\n            [-F pattern] -C number file1 file2\n       diff [-aBbdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]\n            [--normal] [--strip-trailing-cr] [--tabsize] -D string file1 file2\n       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]\n            [--no-ignore-case] [--normal] [--tabsize] [--strip-trailing-cr]\n            [-F pattern] -U number file1 file2\n       diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n            [--no-ignore-case] [--normal] [--tabsize] [-I pattern] [-L label]\n            [-F pattern] [-S name] [-X file] [-x pattern] dir1 dir2\n       diff [-aBbditwW] [--expand-tabs] [--ignore-all-space]\n            [--ignore-blank-lines] [--ignore-case] [--minimal]\n            [--no-ignore-file-name-case] [--strip-trailing-cr]\n            [--suppress-common-lines] [--tabsize] [--text] [--width]\n            -y | --side-by-side file1 file2\n       diff [--help] [--version]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-88409ff5",
+      "command": "sort -k",
+      "exit_code": 2,
+      "output": "sort: option requires an argument -- k\nUsage: sort [-bcCdfigMmnrsuz] [-kPOS1[,POS2] ... ] [+POS1 [-POS2]] [-S memsize] [-T tmpdir] [-t separator] [-o outfile] [--batch-size size] [--files0-from file] [--heapsort] [--mergesort] [--radixsort] [--qsort] [--mmap] [--parallel thread_no] [--human-numeric-sort] [--version-sort] [--random-sort [--random-source file]] [--compress-program program] [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-21da3f91",
+      "command": "cut -f",
+      "exit_code": 1,
+      "output": "cut: option requires an argument -- f\nusage: cut -b list [-n] [file ...]\n       cut -c list [file ...]\n       cut -f list [-s] [-w | -d delim] [file ...]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-1281f34a",
+      "command": "column -t /no/such/file",
+      "exit_code": 1,
+      "output": "column: /no/such/file: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-dba01843",
+      "command": "python3 -c \"open('/no/such/dir/out.txt','w')\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    open('/no/such/dir/out.txt','w')\n    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nFileNotFoundError: [Errno 2] No such file or directory: '/no/such/dir/out.txt'",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [
+        "non-surface"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-37eb7f6a",
+      "command": "python3 -c \"import csv; list(csv.DictReader(open('bad.csv')))['x']\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import csv; list(csv.DictReader(open('bad.csv')))['x']\n                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^\nTypeError: list indices must be integers or slices, not str",
+      "accepted": [
+        "malformed_input",
+        "usage"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-046f1fe5",
+      "command": "python3 -m nosuchmodule_xyz",
+      "exit_code": 1,
+      "output": "/home/user/.pyenv/versions/3.13.13/bin/python3: No module named nosuchmodule_xyz",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-3872dd08",
+      "command": "python3 -c \"import subprocess; subprocess.run(['nosuchbin_xyz'], check=True)\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import subprocess; subprocess.run(['nosuchbin_xyz'], check=True)\n                       ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/subprocess.py\", line 554, in run\n    with Popen(*popenargs, **kwargs) as process:\n         ~~~~~^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/subprocess.py\", line 1039, in __init__\n    self._execute_child(args, executable, preexec_fn, close_fds,\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                        pass_fds, cwd, env,\n                        ^^^^^^^^^^^^^^^^^^^\n    ...<5 lines>...\n                        gid, gids, uid, umask,\n                        ^^^^^^^^^^^^^^^^^^^^^^\n                        start_new_session, process_group)\n                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/subprocess.py\", line 1991, in _execute_child\n    raise child_exception_type(errno_num, err_msg, err_filename)\nFileNotFoundError: [Errno 2] No such file or directory: 'nosuchbin_xyz'",
+      "accepted": [
+        "dependency",
+        "not_found"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "dev"
+    },
+    {
+      "id": "ec-18bd7f00",
+      "command": "pip3 download totally-absent-pkg-xyz-9999 -d .",
+      "exit_code": 1,
+      "output": "ERROR: Could not find a version that satisfies the requirement totally-absent-pkg-xyz-9999 (from versions: none)\nERROR: No matching distribution found for totally-absent-pkg-xyz-9999\n",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-14f03d2a",
+      "command": "bash -c 'ulimit -f 1; head -c 100000 /dev/zero > big.bin'",
+      "exit_code": 153,
+      "output": "bash: 줄 1: 30535 Filesize limit exceeded: 25head -c 100000 /dev/zero > big.bin",
+      "accepted": [
+        "resource"
+      ],
+      "traits": [],
+      "split": "dev"
+    },
+    {
+      "id": "ec-cf1f54c1",
+      "command": "cat /etc/no-such-config.conf",
+      "exit_code": 1,
+      "output": "cat: /etc/no-such-config.conf: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-f2bd7948",
+      "command": "ls /opt/absent-dir-zzz",
+      "exit_code": 1,
+      "output": "ls: /opt/absent-dir-zzz: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-98607eae",
+      "command": "mv /no/such/src /tmp/dst",
+      "exit_code": 1,
+      "output": "mv: rename /no/such/src to /tmp/dst: No such file or directory",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-674bc247",
+      "command": "git branch -d absent-branch-zzz",
+      "exit_code": 1,
+      "output": "error: branch 'absent-branch-zzz' not found",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-03a78ce8",
+      "command": "git remote remove absent-remote-zzz",
+      "exit_code": 2,
+      "output": "error: No such remote: 'absent-remote-zzz'",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-6a6e6305",
+      "command": "docker image inspect absent-image-zzz",
+      "exit_code": 1,
+      "output": "[]\n\nError response from daemon: No such image: absent-image-zzz:latest",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3b386047",
+      "command": "docker volume inspect absent-vol-zzz",
+      "exit_code": 1,
+      "output": "[]\n\nError response from daemon: get absent-vol-zzz: no such volume",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-cdda6c44",
+      "command": "make -C /no/such/dir all",
+      "exit_code": 2,
+      "output": "make: *** /no/such/dir: No such file or directory.  Stop.",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-ba90375a",
+      "command": "go doc absent/pkg/zzz",
+      "exit_code": 1,
+      "output": "doc: package absent/pkg/zzz is not in std (/opt/homebrew/opt/go/libexec/src/absent/pkg/zzz)",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-a916915e",
+      "command": "ps --nosuchflag",
+      "exit_code": 1,
+      "output": "ps: illegal option -- -\nusage: ps [-AaCcEefhjlMmrSTvwXx] [-O fmt | -o fmt] [-G gid[,gid...]]\n          [-g grp[,grp...]] [-u [uid,uid...]]\n          [-p pid[,pid...]] [-t tty[,tty...]] [-U user[,user...]]\n       ps [-L]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-c80f5bc1",
+      "command": "kill",
+      "exit_code": 1,
+      "output": "kill: usage: kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3c01627c",
+      "command": "ln",
+      "exit_code": 1,
+      "output": "usage: ln [-s [-F] | -L | -P] [-f | -i] [-hnv] source_file [target_file]\n       ln [-s [-F] | -L | -P] [-f | -i] [-hnv] source_file ... target_dir",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-a3cd9f3e",
+      "command": "mount --nosuchflag",
+      "exit_code": 64,
+      "output": "mount: illegal option -- -\nusage: mount [-dfFrkuvw] [-o options] [-t external_type] special mount_point\n       mount [-adfFrkuvw] [-t external_type]\n       mount [-dfrkuvw] special | mount_point",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-1dd0cb7b",
+      "command": "openssl x509 -nosuchopt",
+      "exit_code": 1,
+      "output": "x509: Unknown option or message digest: nosuchopt\nx509: Use -help for summary.",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-563bb08d",
+      "command": "tar -c",
+      "exit_code": 1,
+      "output": "tar: no files or directories specified",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3627ab39",
+      "command": "git commit -m",
+      "exit_code": 129,
+      "output": "error: switch `m' requires a value",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-b48577ef",
+      "command": "docker build",
+      "exit_code": 1,
+      "output": "ERROR: docker: 'docker buildx build' requires 1 argument\n\nUsage:  docker buildx build [OPTIONS] PATH | URL | -\n\nRun 'docker buildx build --help' for more information",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-f7290130",
+      "command": "kubectl get",
+      "exit_code": 1,
+      "output": "You must specify the type of resource to get. Use \"kubectl api-resources\" for a complete list of supported resources.\n\nerror: Required resource not specified.\nUse \"kubectl explain <resource>\" for a detailed description of that resource (e.g. kubectl explain pods).\nSee 'kubectl get -h' for help and examples",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3346557d",
+      "command": "curl --nosuchflag https://example.com",
+      "exit_code": 2,
+      "output": "curl: option --nosuchflag: is unknown\ncurl: try 'curl --help' or 'curl --manual' for more information",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-1ee60e08",
+      "command": "jq --nosuchflag .",
+      "exit_code": 2,
+      "output": "jq: Unknown option --nosuchflag\nUse jq --help for help with command-line options,\nor see the jq manpage, or online docs at https://jqlang.org",
+      "accepted": [
+        "usage"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-f2bc83be",
+      "command": "jq . a.json",
+      "exit_code": 5,
+      "output": "jq: parse error: Unmatched '}' at line 1, column 12",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-83f24e19",
+      "command": "python3 a.py",
+      "exit_code": 1,
+      "output": "File \"/tmp/work/a.py\", line 1\n    x = (1,2\n        ^\nSyntaxError: '(' was never closed",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-5813f36c",
+      "command": "cc a.c -o /dev/null",
+      "exit_code": 1,
+      "output": "a.c:1:20: error: incompatible pointer to integer conversion returning 'char[2]' from a function with result type 'int' [-Wint-conversion]\n    1 | int main(){ return \"x\"; }\n      |                    ^~~\n1 error generated.",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3a34c3f1",
+      "command": "go build a.go",
+      "exit_code": 1,
+      "output": "# command-line-arguments\n./a.go:2:19: declared and not used: x\n./a.go:2:27: cannot use \"s\" (untyped string constant) as int value in variable declaration",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-0827590a",
+      "command": "npx --yes typescript@5 tsc --noEmit a.ts",
+      "exit_code": 1,
+      "output": "npm error could not determine executable to run\nnpm error A complete log of this run can be found in: /home/user/.npm/_logs/2026-09-22T22_54_37_323Z-debug-0.log",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-0990caaf",
+      "command": "python3 -c \"import xml.etree.ElementTree as e;e.parse('a.xml')\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import xml.etree.ElementTree as e;e.parse('a.xml')\n                                      ~~~~~~~^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/xml/etree/ElementTree.py\", line 1210, in parse\n    tree.parse(source, parser)\n    ~~~~~~~~~~^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/xml/etree/ElementTree.py\", line 573, in parse\n    self._root = parser._parse_whole(source)\n                 ~~~~~~~~~~~~~~~~~~~^^^^^^^^\nxml.etree.ElementTree.ParseError: mismatched tag: line 1, column 8",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-0728154b",
+      "command": "python3 -c \"import configparser as c;p=c.ConfigParser();p.read('a.ini')\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import configparser as c;p=c.ConfigParser();p.read('a.ini')\n                                                ~~~~~~^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/configparser.py\", line 737, in read\n    self._read(fp, filename)\n    ~~~~~~~~~~^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/configparser.py\", line 1052, in _read\n    ParsingError._raise_all(self._read_inner(fp, fpname))\n                            ~~~~~~~~~~~~~~~~^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/configparser.py\", line 1081, in _read_inner\n    self._handle_rest(st, line, fpname)\n    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^\n  File \"/home/user/.pyenv/versions/3.13.13/lib/python3.13/configparser.py\", line 1105, in _handle_rest\n    raise MissingSectionHeaderError(fpname, st.lineno, line)\nconfigparser.MissingSectionHeaderError: File contains no section headers.\nfile: 'a.ini', line: 1\n'[s\\n'",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3e6e1aa4",
+      "command": "tar -xf a.tar",
+      "exit_code": 1,
+      "output": "tar: Error opening archive: Unrecognized archive format",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-16cee9ca",
+      "command": "gunzip -t a.gz",
+      "exit_code": 1,
+      "output": "gunzip: a.gz: not in gzip format",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-f9d49e67",
+      "command": "base64 -d a.json",
+      "exit_code": 64,
+      "output": "base64: invalid argument a.json\nUsage:\tbase64 [-Ddh] [-b num] [-i in_file] [-o out_file]\n  -b, --break       break encoded output up into lines of length num\n  -D, -d, --decode  decode input\n  -h, --help        display this message\n  -i, --input       input file (default: \"-\" for stdin)\n  -o, --output      output file (default: \"-\" for stdout)",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-578843ff",
+      "command": "openssl x509 -in a.json -noout",
+      "exit_code": 1,
+      "output": "Could not find certificate from a.json",
+      "accepted": [
+        "malformed_input"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-5f951169",
+      "command": "curl -sS --max-time 5 http://127.0.0.1:9/",
+      "exit_code": 7,
+      "output": "curl: (7) Failed to connect to 127.0.0.1 port 9 after 0 ms: Couldn't connect to server",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-7f5f2260",
+      "command": "curl -sS --max-time 5 http://absent-host-zzz.invalid/",
+      "exit_code": 6,
+      "output": "curl: (6) Could not resolve host: absent-host-zzz.invalid",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-c1ce5017",
+      "command": "telnet absent-host-zzz.invalid 80",
+      "exit_code": 1,
+      "output": "absent-host-zzz.invalid: nodename nor servname provided, or not known",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-e057367e",
+      "command": "host absent-host-zzz.invalid",
+      "exit_code": 1,
+      "output": "Host absent-host-zzz.invalid not found: 3(NXDOMAIN)",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-31e0a8f0",
+      "command": "nslookup absent-host-zzz.invalid",
+      "exit_code": 1,
+      "output": "Server:\t\t100.100.100.100\nAddress:\t100.100.100.100#53\n\n** server can't find absent-host-zzz.invalid: NXDOMAIN",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-843ecc58",
+      "command": "git fetch https://absent-host-zzz.invalid/a.git",
+      "exit_code": 128,
+      "output": "fatal: unable to access 'https://absent-host-zzz.invalid/a.git/': Could not resolve host: absent-host-zzz.invalid",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-d396f435",
+      "command": "npm ping --registry=https://absent-host-zzz.invalid",
+      "exit_code": 124,
+      "output": "[timeout]",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-07aad24a",
+      "command": "pip3 download x --index-url https://absent-host-zzz.invalid -d .",
+      "exit_code": 1,
+      "output": "Looking in indexes: https://absent-host-zzz.invalid\n\nWARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NameResolutionError(\"HTTPSConnection(host='absent-host-zzz.invalid', port=443): Failed to resolve 'absent-host-zzz.invalid' ([Errno 8] nodename nor servname provided, or not known)\")': /x/\nWARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NameResolutionError(\"HTTPSConnection(host='absent-host-zzz.invalid', port=443): Failed to resolve 'absent-host-zzz.invalid' ([Errno 8] nodename nor servname provided, or not known)\")': /x/\nWARNING: Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NameResolutionError(\"HTTPSConnection(host='absent-host-zzz.invalid', port=443): Failed to resolve 'absent-host-zzz.invalid' ([Errno 8] nodename nor servname provided, or not known)\")': /x/\nWARNING: Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NameResolutionError(\"HTTPSConnection(host='absent-host-zzz.invalid', port=443): Failed to resolve 'absent-host-zzz.invalid' ([Errno 8] nodename nor servname provided, or not known)\")': /x/\nWARNING: Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NameResolutionError(\"HTTPSConnection(host='absent-host-zzz.invalid', port=443): Failed to resolve 'absent-host-zzz.invalid' ([Errno 8] nodename nor servname provided, or not known)\")': /x/\nERROR: Could not find a version that satisfies the requirement x (from versions: none)\nERROR: No matching distribution found for x\n",
+      "accepted": [
+        "network"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-f489ace4",
+      "command": "curl -sS --max-time 8 https://untrusted-root.badssl.com/",
+      "exit_code": 60,
+      "output": "curl: (60) SSL certificate problem: self signed certificate in certificate chain\nMore details here: https://curl.se/docs/sslcerts.html\n\ncurl failed to verify the legitimacy of the server and therefore could not\nestablish a secure connection to it. To learn more about this situation and\nhow to fix it, please visit the web page mentioned above.",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-d90172bd",
+      "command": "openssl s_client -connect expired.badssl.com:443 -verify_return_error -brief </dev/null",
+      "exit_code": 1,
+      "output": "Connecting to 104.154.89.105\ndepth=0 OU=Domain Control Validated, OU=PositiveSSL Wildcard, CN=*.badssl.com\nverify error:num=10:certificate has expired\nnotAfter=Apr 12 23:59:59 2015 GMT\n80BF0EFC01000000:error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed:ssl/statem/statem_clnt.c:2126:\n80BF0EFC01000000:error:0A000197:SSL routines:SSL_shutdown:shutdown while in init:ssl/ssl_lib.c:2804:",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-66c6d993",
+      "command": "git -c http.sslVerify=true ls-remote https://self-signed.badssl.com/x.git",
+      "exit_code": 128,
+      "output": "fatal: unable to access 'https://self-signed.badssl.com/x.git/': SSL certificate problem: self signed certificate",
+      "accepted": [
+        "tls"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-5f83e896",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/401",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 401",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-aa7b7775",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/407",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 407",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-63919d21",
+      "command": "curl -sS --max-time 8 -f https://api.github.com/user/repos",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 401",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-14b4c95d",
+      "command": "curl -sS --max-time 8 -f -u bad:creds https://httpbin.org/basic-auth/u/p",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 401",
+      "accepted": [
+        "auth"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-87bd0d5c",
+      "command": "docker push absent-registry-zzz.invalid/x:1",
+      "exit_code": 1,
+      "output": "The push refers to repository [absent-registry-zzz.invalid/x]\n\nAn image does not exist locally with the tag: absent-registry-zzz.invalid/x",
+      "accepted": [
+        "auth",
+        "network"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "final"
+    },
+    {
+      "id": "ec-fe9a60b9",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/502",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 502",
+      "accepted": [
+        "remote_error"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-e61f86da",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/503",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 503",
+      "accepted": [
+        "remote_error"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-96eac1b1",
+      "command": "curl -sS --max-time 8 -f https://httpbin.org/status/504",
+      "exit_code": 56,
+      "output": "curl: (56) The requested URL returned error: 504",
+      "accepted": [
+        "remote_error"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-8b517616",
+      "command": "git rebase --skip",
+      "exit_code": 128,
+      "output": "fatal: no rebase in progress",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-89670440",
+      "command": "git bisect good",
+      "exit_code": 1,
+      "output": "You need to start by \"git bisect start\"",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-ee88a0aa",
+      "command": "git revert --continue",
+      "exit_code": 128,
+      "output": "error: 빼오기(cherry-pick) 또는 되돌리기(revert)가 진행 중이지 않습니다\nfatal: 되돌리기 실패",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-7f790f7b",
+      "command": "git merge --abort",
+      "exit_code": 128,
+      "output": "fatal: 중지할 병합 작업이 없습니다. (MERGE_HEAD가 없음)",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-5335ed4c",
+      "command": "mkdir -p d && rmdir d && rmdir d",
+      "exit_code": 1,
+      "output": "rmdir: d: No such file or directory",
+      "accepted": [
+        "state",
+        "not_found"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "final"
+    },
+    {
+      "id": "ec-74f86131",
+      "command": "kubectl cluster-info",
+      "exit_code": 1,
+      "output": "To further debug and diagnose cluster problems, use 'kubectl cluster-info dump'.\n\nE0923 07:55:35.716696   34475 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:55:35.718626   34475 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:55:35.720264   34475 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:55:35.721875   34475 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nE0923 07:55:35.723441   34475 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list: Get \\\"http://localhost:8080/api?timeout=32s\\\": dial tcp [::1]:8080: connect: connection refused\"\nThe connection to the server localhost:8080 was refused - did you specify the right host or port?",
+      "accepted": [
+        "state",
+        "network"
+      ],
+      "traits": [
+        "ambiguous"
+      ],
+      "split": "final"
+    },
+    {
+      "id": "ec-24d0b478",
+      "command": "docker compose ps",
+      "exit_code": 1,
+      "output": "no configuration file provided: not found",
+      "accepted": [
+        "state"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-3ea79bdf",
+      "command": "python3 -c \"import requests_absent_zzz\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import requests_absent_zzz\nModuleNotFoundError: No module named 'requests_absent_zzz'",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-1bb06954",
+      "command": "python3 -c \"import pandas_absent_zzz\"",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import pandas_absent_zzz\nModuleNotFoundError: No module named 'pandas_absent_zzz'",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-566e20fe",
+      "command": "node -e \"require('express-absent-zzz')\"",
+      "exit_code": 1,
+      "output": "node:internal/modules/cjs/loader:1595\n  throw err;\n  ^\n\nError: Cannot find module 'express-absent-zzz'\nRequire stack:\n- /tmp/work/[eval]\n    at Module._resolveFilename (node:internal/modules/cjs/loader:1591:15)\n    at wrapResolveFilename (node:internal/modules/cjs/loader:1145:27)\n    at defaultResolveImplForCJSLoading (node:internal/modules/cjs/loader:1169:10)\n    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1196:12)\n    at Module._load (node:internal/modules/cjs/loader:1368:5)\n    at wrapModuleLoad (node:internal/modules/cjs/loader:261:19)\n    at Module.require (node:internal/modules/cjs/loader:1701:12)\n    at require (node:internal/modules/helpers:316:16)\n    at [eval]:1:1\n    at runScriptInThisContext (node:internal/vm:219:10) {\n  code: 'MODULE_NOT_FOUND',\n  requireStack: [\n    '/tmp/work/[eval]'\n  ]\n}\n\nNode.js v26.9.0",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-c7c3b561",
+      "command": "python3 -m pip_absent_zzz",
+      "exit_code": 1,
+      "output": "/home/user/.pyenv/versions/3.13.13/bin/python3: No module named pip_absent_zzz",
+      "accepted": [
+        "dependency"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-bb13130c",
+      "command": "pip3 install -r req.txt --dry-run",
+      "exit_code": 1,
+      "output": "ERROR: Could not find a version that satisfies the requirement absent-pkg-name-zzz9999==1.0.0 (from versions: none)\nERROR: No matching distribution found for absent-pkg-name-zzz9999==1.0.0\n",
+      "accepted": [
+        "not_found"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-b70fc66b",
+      "command": "bash -c 'ulimit -n 4; for i in 1 2 3 4 5 6; do exec 3</dev/null; done; cat /etc/hosts'",
+      "exit_code": -6,
+      "output": "bash: 줄 1: /dev/null: Too many open files\nbash: 줄 1: /dev/null: Too many open files\nbash: 줄 1: /dev/null: Too many open files\nbash: 줄 1: /dev/null: Too many open files\nbash: 줄 1: /dev/null: Too many open files",
+      "accepted": [
+        "resource"
+      ],
+      "traits": [],
+      "split": "final"
+    },
+    {
+      "id": "ec-08705c04",
+      "command": "bash -c 'ulimit -u 1; python3 -c \"import os;[os.fork() for _ in range(50)]\"'",
+      "exit_code": 1,
+      "output": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import os;[os.fork() for _ in range(50)]\n               ~~~~~~~^^\nBlockingIOError: [Errno 35] Resource temporarily unavailable",
+      "accepted": [
+        "resource"
+      ],
+      "traits": [],
+      "split": "final"
+    }
+  ]
+}
