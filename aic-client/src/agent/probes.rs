@@ -750,6 +750,19 @@ pub(crate) fn catalog() -> &'static [ProbeSpec] {
 }
 
 /// id로 probe를 찾는다.
+/// CATALOG에 이 ID가 있는가.
+///
+/// 범주를 다른 방법으로 고르는 실험(`docs/PRD-JEV-PROBE-SELECTION.md`)이 "최종 probe ID가 기존
+/// 목록에 있는지"를 코드로 확인해야 한다. `ProbeSpec`은 내부 표현이라 공개하지 않고 이 질문만 연다.
+pub fn probe_exists(id: &str) -> bool {
+    probe_by_id(id).is_some()
+}
+
+/// CATALOG의 모든 probe ID.
+pub fn probe_ids() -> Vec<&'static str> {
+    CATALOG.iter().map(|p| p.id).collect()
+}
+
 pub(crate) fn probe_by_id(id: &str) -> Option<&'static ProbeSpec> {
     catalog().iter().find(|p| p.id == id)
 }

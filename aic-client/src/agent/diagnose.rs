@@ -581,7 +581,15 @@ pub(crate) fn resolve_followup_line(
 }
 
 /// 증상 키워드 → 진단 카테고리(결정적, 순수 함수). 무매칭/None은 "generic".
-pub(crate) fn diagnose_category(symptom: Option<&str>) -> &'static str {
+/// [`diagnose_category`]가 돌려줄 수 있는 범주 전부.
+///
+/// 범주를 다른 방법으로 고르는 실험이 "모델이 목록 밖 값을 냈는가"를 판정하려면 목록이 코드에
+/// 있어야 한다. 아래 분기와 어긋나면 `categories_match_the_branches` 테스트가 깨진다.
+pub const DIAGNOSE_CATEGORIES: [&str; 8] = [
+    "cpu", "memory", "disk", "network", "process", "docker", "k8s", "generic",
+];
+
+pub fn diagnose_category(symptom: Option<&str>) -> &'static str {
     let s = match symptom {
         Some(s) if !s.trim().is_empty() => s.to_lowercase(),
         _ => return "generic",
@@ -717,11 +725,29 @@ pub(crate) fn docker_available() -> bool {
 
 /// 증상에 대한 (섹션, 명령) probe 목록을 결정적으로 고른다. 순수 함수(테스트 가능).
 ///
+/// 범주 판정은 [`diagnose_category`], 목록 구성은 [`select_probes_for_category`]가 맡는다.
+pub fn select_probes(symptom: Option<&str>, docker_available: bool) -> Vec<(&'static str, String)> {
+    select_probes_for_category(
+        diagnose_category(symptom),
+        symptom.is_none(),
+        docker_available,
+    )
+}
+
+/// 범주가 **이미 정해진** 상태에서 probe 목록을 만든다.
+///
+/// [`select_probes`]가 증상에서 범주를 정한 뒤 이 함수를 부른다. 범주를 다른 방법으로 고르는
+/// 실험(`docs/PRD-JEV-PROBE-SELECTION.md`)이 같은 구성 로직을 쓰려면 진입점이 나뉘어야 한다 —
+/// 목록을 복제하면 두 벌이 갈라지고, 그 시점부터 실험은 운영과 다른 것을 재게 된다.
+///
+/// `full_sweep`은 증상 없이 호출된 전체 점검인지다. 그때만 daemon별 journal error를 붙인다.
+///
 /// `docker_available`이면 사용자가 docker를 의심하지 않은 일반 증상에도 카테고리에 맞는 docker probe를
 /// 후보에 추가한다(원인 발견 최대화). 미설치면 추가하지 않아 노이즈가 없다. "docker" 카테고리는
 /// `category_sections`가 이미 docker probe를 포함하므로 건너뛴다.
-pub(crate) fn select_probes(
-    symptom: Option<&str>,
+pub fn select_probes_for_category(
+    cat: &str,
+    full_sweep: bool,
     docker_available: bool,
 ) -> Vec<(&'static str, String)> {
     fn push_unique(sections: &mut Vec<&'static str>, ids: &[&'static str]) {
@@ -731,11 +757,10 @@ pub(crate) fn select_probes(
             }
         }
     }
-    let cat = diagnose_category(symptom);
     let mut sections = category_sections(cat);
     // 인자 없는 generic 진단은 사용자가 명시적으로 요청한 전체 점검이므로 모든 journal error를
     // daemon별로 집계한다. 증상 문자열이 있는 targeted 진단과 health/snapshot 경로에는 추가하지 않는다.
-    if symptom.is_none() {
+    if full_sweep {
         push_unique(&mut sections, &["journal_daemon_errors"]);
     }
     // 카테고리별 흔한 "범인" probe — 가용성 조건 없이(unix 표준 명령) 붙인다.
@@ -1668,6 +1693,116 @@ mod tests {
         assert_eq!(diagnose_category(Some("something weird")), "generic");
         assert_eq!(diagnose_category(None), "generic");
         assert_eq!(diagnose_category(Some("   ")), "generic");
+    }
+
+    /// 키워드가 여러 범주에 겹치는 증상에서 무엇이 이기는지 고정한다.
+    ///
+    /// 기존 매핑 테스트는 단일 범주 키워드만 쓰는 증상으로 짜여 있어, 분기 순서를 바꿔도 전부
+    /// 통과한다. 여기 적힌 값은 "옳은 분류"가 아니라 **현재 동작**이다.
+    /// `docs/PRD-JEV-PROBE-SELECTION.md`의 평가가 비교할 baseline이므로, 이 값이 바뀌면 그
+    /// 평가의 전제도 함께 바뀐다.
+    /// 공개 목록과 실제 분기가 갈리지 않게 묶는다. 목록만 고치고 분기를 잊으면, 범주 밖 응답을
+    /// 세는 쪽이 조용히 틀린 기준을 쓴다.
+    #[test]
+    fn categories_match_the_branches() {
+        let samples = [
+            ("cpu 높음", "cpu"),
+            ("메모리 누수", "memory"),
+            ("디스크 공간 부족", "disk"),
+            ("포트 연결 안 됨", "network"),
+            ("프로세스가 죽음", "process"),
+            ("docker 문제", "docker"),
+            ("pod CrashLoopBackOff", "k8s"),
+            ("원인 모름", "generic"),
+        ];
+        for (symptom, expected) in samples {
+            let got = diagnose_category(Some(symptom));
+            assert_eq!(got, expected, "증상: {symptom}");
+            assert!(
+                DIAGNOSE_CATEGORIES.contains(&got),
+                "목록에 없는 범주: {got}"
+            );
+        }
+        // 8개 분기가 모두 표본에 나왔는지 — 하나라도 빠지면 위 루프가 그 분기를 못 지킨다.
+        assert_eq!(samples.len(), DIAGNOSE_CATEGORIES.len());
+    }
+
+    #[test]
+    fn overlapping_keywords_resolve_by_branch_order() {
+        let cases: &[(&str, &str)] = &[
+            // cpu 분기가 network보다 앞서고 "느려"를 가진다.
+            ("네트워크가 느려요", "cpu"),
+            // "높"도 cpu 키워드다.
+            ("네트워크 지연이 높음", "cpu"),
+            ("메모리 사용량이 높아", "cpu"),
+            // 이건 의도된 분류다 — vmstat_iowait가 I/O와 CPU를 가른다(아래 r8 테스트 주석).
+            ("디스크가 느려요", "cpu"),
+            // k8s가 가장 앞이라 다른 범주 키워드가 섞여도 이긴다.
+            ("pod 네트워크 문제", "k8s"),
+            // docker는 cpu보다 앞이다.
+            ("container가 느림", "docker"),
+        ];
+        for (symptom, expected) in cases {
+            assert_eq!(
+                diagnose_category(Some(symptom)),
+                *expected,
+                "증상: {symptom}"
+            );
+        }
+    }
+
+    /// 오분류가 범주 이름에 그치지 않고 **증거를 잃게** 만드는지 확인한다.
+    ///
+    /// 이 테스트는 현재의 결함을 고정한다. 분류를 고치면 여기가 깨지는데, 그때 이 테스트를
+    /// 지우는 것이 맞다. 고쳤다는 사실을 의식적으로 기록하게 하는 것이 목적이다.
+    #[test]
+    fn a_misrouted_network_symptom_collects_no_network_probe() {
+        let ids: Vec<&str> = select_probes(Some("네트워크가 느려요"), false)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        for missing in [
+            "ip",
+            "route",
+            "ports",
+            "conn_states",
+            "tcp_retrans",
+            "listen_backlog",
+            "conntrack_max",
+            "dns_resolver",
+        ] {
+            assert!(
+                !ids.contains(&missing),
+                "network probe가 붙었다(분류가 고쳐졌다면 이 테스트를 지운다): {missing}"
+            );
+        }
+    }
+
+    /// 선택된 probe ID가 전부 CATALOG에 있는지 — 모델이 범주를 고르게 되어도 유지해야 할
+    /// 불변 조건의 기초다. 명령 문자열이 아니라 ID로 검사한다.
+    #[test]
+    fn every_selected_probe_id_exists_in_the_catalog() {
+        let symptoms = [
+            None,
+            Some("cpu 높음"),
+            Some("메모리 누수"),
+            Some("디스크 공간 부족"),
+            Some("포트 연결 안 됨"),
+            Some("프로세스가 죽음"),
+            Some("docker 문제"),
+            Some("pod CrashLoopBackOff"),
+            Some("원인 모름"),
+        ];
+        for symptom in symptoms {
+            for docker in [false, true] {
+                for (id, _) in select_probes(symptom, docker) {
+                    assert!(
+                        crate::agent::probes::probe_by_id(id).is_some(),
+                        "CATALOG에 없는 ID: {id} (증상 {symptom:?}, docker={docker})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
