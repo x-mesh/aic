@@ -732,3 +732,84 @@ cargo run --release -- followup-score --results target/followup2-final.jsonl
 
 - `results/followup2-dev-20260922.jsonl.gz` — 개발 24 × (rules, jev) × 1회 = 48건
 - `results/followup2-final-20260922.jsonl.gz` — 최종 38 × (rules, jev, llm) × 3회 = 342건
+
+---
+
+# 원인 범주 분류 (명령 실패 stderr, 별도 실험)
+
+> 실행일: 2026-09-23 · 구현 기준: `e10bf20` 이후 작업 트리
+> 데이터: `data/errcause-cases.json` 169건(dev 105 / final 64), 범주 10개, 다중 라벨 13건
+> 모델: Jev `jev-latest`(응답 `jev-1.13.0`, ai-mesh 경유) 질문 `errcause-v1` · LLM `ai-mesh/kiro/gpt-5.6-luna`
+> 규칙 `errcause-rules-v1`: 키워드 표, **개발 분할만 보고 작성**
+> 결론과 배운 것은 [`docs/ERROR-CAUSE-EVALUATION.md`](../docs/ERROR-CAUSE-EVALUATION.md)
+
+모수는 `error_analyzer::deterministic_known_error`가 못 잡는 실패다. 데이터는 부작용 없는 명령을
+실제로 실행해 받은 출력이며, 최종 분할은 출력을 읽지 않고 명령 의도로만 라벨을 달았다.
+
+## 최종 분할 64건 (출력 미열람 라벨), 1회차
+
+| 비교군 | 정확도 | top-3 | 기권율 | 반복 일치율(3회) | p50 | p95 | 입력 토큰 |
+|---|---|---|---|---|---|---|---|
+| jev | 0.906 | 0.969 | 0.000 | 1.000 | 246ms | 441ms | 61,464 |
+| llm | 0.922 | 0.922 | 0.000 | 1.000 | 890ms | 2,724ms | 49,834 |
+| rules | 0.672 | 0.672 | 0.250 | 1.000 | 0ms | 0ms | 0 |
+
+jev 비용은 64회 약 0.0026 USD(호출당 960 토큰). llm은 provider 단가 미확인.
+
+## 개발 분할 105건 (규칙을 쓴 데이터), 1회
+
+| 비교군 | 정확도 | top-3 | 기권율 | p50 | p95 |
+|---|---|---|---|---|---|
+| jev | 0.981 | 1.000 | 0.000 | 249ms | 389ms |
+| llm | 0.952 | 0.952 | 0.000 | 1,076ms | 2,988ms |
+| rules | 0.952 | 0.952 | 0.038 | 0ms | 0ms |
+
+규칙은 개발 0.952 → 최종 0.672. 모델은 jev 0.981 → 0.906, llm 0.952 → 0.922.
+
+## 짝지은 비교 (최종, 1회차)
+
+| 비교 | 앞만 맞음 | 뒤만 맞음 | 둘 다 | 둘 다 오답 | 부호검정 p |
+|---|---|---|---|---|---|
+| jev vs rules | 16 | 1 | 42 | 5 | 0.00027 |
+| llm vs rules | 17 | 1 | 42 | 4 | 0.00014 |
+| jev vs llm | 0 | 1 | 58 | 5 | 1.0 |
+
+## 범주별 (최종, 1회차)
+
+| 범주 | n | jev | llm | rules |
+|---|---|---|---|---|
+| not_found | 10 | 9 | 9 | 7 |
+| usage | 11 | 11 | 11 | 8 |
+| malformed_input | 11 | 9 | 9 | 4 |
+| network | 8 | 7 | 8 | 5 |
+| state | 7 | 6 | 6 | 3 |
+| auth | 5 | 4 | 4 | 4 |
+| dependency | 4 | 4 | 4 | 4 |
+| tls | 3 | 3 | 3 | 3 |
+| remote_error | 3 | 3 | 3 | 3 |
+| resource | 2 | 2 | 2 | 2 |
+
+규칙의 기권 16건은 `malformed_input` 6 · `not_found` 3 · `usage` 3 · `network` 2 · `state` 2로
+퍼져 있다. 특정 계열이 아니라 처음 보는 어휘 전반에서 무너진다.
+
+## 라벨 오류 (사후 확인)
+
+최종 분할을 출력을 보지 않고 라벨한 대가로 3건이 틀렸다(`docker push` → not_found,
+`base64 -d` → usage, `npx tsc` → dependency/usage). 세 비교군에 똑같이 적용되므로 비교는 유효하다.
+정정하면 jev 0.953 · llm 0.969 · rules 0.703이고 결론은 바뀌지 않는다.
+
+## 재현
+
+```sh
+cd eval
+cargo run -- errcause-validate
+cargo run --release -- errcause-run --arm rules --split final --out target/x.jsonl   # 네트워크 없음
+JEV_API_KEY=... JEV_ENDPOINT=... cargo run --release -- errcause-run \
+  --arm rules --arm jev --arm llm --split final --repeats 3 --out target/errcause-final.jsonl
+cargo run --release -- errcause-score --results target/errcause-final.jsonl
+```
+
+## 보존물
+
+- `results/errcause-dev-20260923.jsonl.gz` — 개발 105 × 3 비교군 × 1회 = 315건
+- `results/errcause-final-20260923.jsonl.gz` — 최종 64 × 3 비교군 × 3회 = 576건
