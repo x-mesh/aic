@@ -1,5 +1,8 @@
 # 비교 실험 결과
 
+> 이 문서는 라운드별 수치와 재현 방법을 담는다. 결론과 배운 것은
+> [`docs/PROBE-SELECTION-EVALUATION.md`](../docs/PROBE-SELECTION-EVALUATION.md)에 있다.
+
 > 실행일: 2026-09-22 · 구현 기준: `e315c59` 이후 작업 트리
 > 데이터: `data/scenarios.json` schema_version 1, 확정일 2026-09-22
 > 최종 평가: 80 시나리오 × 한국어·영어 = 160 입력, 반복 3회, 주 평가는 1회차

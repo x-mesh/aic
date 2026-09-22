@@ -1,6 +1,6 @@
 # PRD: Jev를 이용한 증상별 진단 항목 선택 검증
 
-> 상태: 확정 — 평가 미실행
+> 상태: 평가 완료 — 결과와 결론은 [PROBE-SELECTION-EVALUATION.md](PROBE-SELECTION-EVALUATION.md)
 > 작성일: 2026-09-22 · 개정: 2026-09-22(구현 대조 후 OS 축 제거, 정답 규칙과 외부 계약 확정)
 > 대상: aic 저장소의 독립적인 기능 검증 작업
 

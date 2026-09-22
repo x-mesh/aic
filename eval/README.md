@@ -1,6 +1,7 @@
 # aic-eval
 
-`docs/PRD-JEV-PROBE-SELECTION.md`의 비교 실험을 실행한다.
+`docs/PRD-JEV-PROBE-SELECTION.md`의 비교 실험을 실행한다. 결론은
+`docs/PROBE-SELECTION-EVALUATION.md`, 라운드별 수치는 `RESULTS.md`에 있다.
 
 증상 문자열에서 진단 범주를 고르는 네 가지 방식을 같은 데이터로 재고, 각 방식이 첫 진단에서
 필요한 증거(probe)를 얼마나 확보하는지 비교한다.
