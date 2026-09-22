@@ -1,0 +1,1505 @@
+{
+  "schema_version": 1,
+  "generated": "2026-09-22",
+  "cases": [
+    {
+      "id": "disk-dev-1",
+      "split": "dev",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nFilesystem      Size  Used Avail Use% Mounted on\n/dev/sda1        100G   98G    2G  98% /\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "disk-dev-2",
+      "split": "dev",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1        50G   45G    5G  90% /data\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "disk-dev-3",
+      "split": "dev",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1        50G   44G    6G  89% /data\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "disk-dev-4",
+      "split": "dev",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G   10G   90G  10% /\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "disk-dev-5",
+      "split": "dev",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nFilesystem      Size   Used  Avail Capacity iused ifree %iused Mounted on\n/dev/disk3s5   494Gi  460Gi   30Gi    94%  1234567 987654   55% /System/Volumes/Data\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "disk-final-1",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       200G  199G    1G  99% /var\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "disk-final-2",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/disk1s2   500Gi  480Gi   20Gi  96% 500000 400000 55% /Users\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "disk-final-3",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sdb1        20G   18G    2G  90% /opt\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "disk-final-4",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/disk2s1   100Gi   90Gi   10Gi  90% 10000 5000 66% /home\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "disk-final-5",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sdc1        20G 17.7G  2.3G  89% /srv\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "disk-final-6",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sdd1        40G 35.5G  4.5G  89% /private/data\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "disk-final-7",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "disk-final-8",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       100G    5G   95G   5% /\n/dev/sdb1       200G   20G  180G  10% /data\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -h 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "disk-final-9",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1       512M  490M   22M  96% /boot/efi\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "clean-negative",
+        "excluded-mount"
+      ]
+    },
+    {
+      "id": "disk-final-10",
+      "split": "final",
+      "probe_id": "disk",
+      "section": "## disk\ncommand: df -h\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sr0        700M  700M    0 100% /media/cdrom\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "clean-negative",
+        "excluded-mount"
+      ]
+    },
+    {
+      "id": "inodes-dev-1",
+      "split": "dev",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 6553000 600 100% /\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "inodes-dev-2",
+      "split": "dev",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 5898240 655360 90% /\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "inodes-dev-3",
+      "split": "dev",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 5832704 720896 89% /\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "inodes-dev-4",
+      "split": "dev",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 100000 6453600 2% /\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "inodes-dev-5",
+      "split": "dev",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nbackupnas:/nas 100000000 50000000 50000000 50% 0 0 - /mnt/backup\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap의 dash-iused 케이스 변형) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "inodes-final-1",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 1000000 999000 1000 100% /var\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "inodes-final-2",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nFilesystem 512-blocks Used Available Capacity iused ifree %iused Mounted on\n/dev/disk4s1 900000 850000 50000 20% 8000000 200000 97% /Users\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "inodes-final-3",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sdb1 500000 450000 50000 90% /opt\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "inodes-final-4",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/disk5s1 700000 600000 100000 30% 90000 10000 90% /home\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "inodes-final-5",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sdc1 500000 445000 55000 89% /srv\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "inodes-final-6",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/disk6s1 700000 600000 100000 30% 89000 11000 89% /data\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs macOS df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "inodes-final-7",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/sda1 6553600 50000 6503600 1% /\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs df -i 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "inodes-final-8",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOrbStack:/OrbStack 318638672 113308056 205330616 96% 0 0 - /Users/jinwoo/OrbStack\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "inodes-final-9",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndevfs 486 486 0 100% 842 0 100% /dev\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative",
+        "excluded-mount"
+      ]
+    },
+    {
+      "id": "inodes-final-10",
+      "split": "final",
+      "probe_id": "inodes",
+      "section": "## inodes\ncommand: df -i\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n/dev/disk3s6 100 95 5 95% 5 1000 2% /data\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-dev-1",
+      "split": "dev",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n[12345.6] Out of memory: Killed process 4821 (java)\n[12346.1] Out of memory: Killed process 4899 (java)\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-dev-2",
+      "split": "dev",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkernel: java invoked oom-killer, order=0\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-dev-3",
+      "split": "dev",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nzoom call started, room booked\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-dev-4",
+      "split": "dev",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: read kernel buffer failed\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-dev-5",
+      "split": "dev",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkernel: process demoapp (61234) triggered oom_reaper\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs macOS dmesg | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-1",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n[100.1] Out of memory: Killed process 111 (worker)\n[100.2] Out of memory: Killed process 112 (worker)\n[100.3] Out of memory: Killed process 113 (worker)\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-2",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nOUT OF MEMORY: killed process 202 (chrome)\nOUT OF MEMORY: killed process 203 (chrome)\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-3",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ninvoking oom_reaper for pid 42\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-4",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nMemory cgroup out of memory: Killed process 900 (worker)\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-5",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSystem notice: oom_score_adj set for zoombot service\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-6",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nboot log: zoom call, oom_score reserved, room ready\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-7",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndmesg: klogctl failed: Operation not permitted\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-8",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-9",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkernel: (default) memorystatus_thread: performing jetsam kill, oom_reaper waking up\n\n--- stderr ---\n\n",
+      "expected": "crit",
+      "source": "probes.rs macOS dmesg | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "dmesg_oom-final-10",
+      "split": "final",
+      "probe_id": "dmesg_oom",
+      "section": "## dmesg_oom\ncommand: dmesg -T | grep -i oom | head -n 30\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n[Wed Sep 16 03:14:07 2026] EDAC MC0: 1 CE memory read error\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs dmesg -T | grep -i oom 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-dev-1",
+      "split": "dev",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_SYSTEMD_UNIT\":\"cron.service\",\"SYSLOG_IDENTIFIER\":\"cron\",\"MESSAGE\":\"Error: bad username; while reading /etc/crontab\"}\n{\"UNIT\":\"motd-news.service\",\"_SYSTEMD_UNIT\":\"init.scope\",\"SYSLOG_IDENTIFIER\":\"systemd\",\"MESSAGE\":\"Failed at step EXEC spawning helper: Permission denied\"}\n{\"_SYSTEMD_UNIT\":\"cron.service\",\"SYSLOG_IDENTIFIER\":\"cron\",\"MESSAGE\":\"Error: bad minute; while reading /etc/cron.d/backup\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_groups_all_journal_priority_errors_by_daemon) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-dev-2",
+      "split": "dev",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_SYSTEMD_UNIT\":\"myapp.service\",\"MESSAGE\":\"Connection refused\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-dev-3",
+      "split": "dev",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-dev-4",
+      "split": "dev",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-dev-5",
+      "split": "dev",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=127 duration_ms=5 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\njournalctl: command not found\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(targeted_text_journal_keeps_cron_parse_finding_without_duplicate) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-1",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_SYSTEMD_UNIT\":\"nginx.service\",\"MESSAGE\":\"worker process exited on signal 11\"}\n{\"_SYSTEMD_UNIT\":\"nginx.service\",\"MESSAGE\":\"worker process exited on signal 11\"}\n{\"_SYSTEMD_UNIT\":\"redis.service\",\"MESSAGE\":\"Cannot open config file\"}\n{\"_SYSTEMD_UNIT\":\"mysqld.service\",\"MESSAGE\":\"InnoDB: Database page corruption\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-2",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_SYSTEMD_UNIT\":\"daemon00.service\",\"MESSAGE\":\"failure 0\"}\n{\"_SYSTEMD_UNIT\":\"daemon01.service\",\"MESSAGE\":\"failure 1\"}\n{\"_SYSTEMD_UNIT\":\"daemon02.service\",\"MESSAGE\":\"failure 2\"}\n{\"_SYSTEMD_UNIT\":\"daemon03.service\",\"MESSAGE\":\"failure 3\"}\n{\"_SYSTEMD_UNIT\":\"daemon04.service\",\"MESSAGE\":\"failure 4\"}\n{\"_SYSTEMD_UNIT\":\"daemon05.service\",\"MESSAGE\":\"failure 5\"}\n{\"_SYSTEMD_UNIT\":\"daemon06.service\",\"MESSAGE\":\"failure 6\"}\n{\"_SYSTEMD_UNIT\":\"daemon07.service\",\"MESSAGE\":\"failure 7\"}\n{\"_SYSTEMD_UNIT\":\"daemon08.service\",\"MESSAGE\":\"failure 8\"}\n{\"_SYSTEMD_UNIT\":\"daemon09.service\",\"MESSAGE\":\"failure 9\"}\n{\"_SYSTEMD_UNIT\":\"daemon10.service\",\"MESSAGE\":\"failure 10\"}\n{\"_SYSTEMD_UNIT\":\"daemon11.service\",\"MESSAGE\":\"failure 11\"}\n{\"_SYSTEMD_UNIT\":\"daemon12.service\",\"MESSAGE\":\"failure 12\"}\n{\"_SYSTEMD_UNIT\":\"daemon13.service\",\"MESSAGE\":\"failure 13\"}\n{\"_SYSTEMD_UNIT\":\"daemon14.service\",\"MESSAGE\":\"failure 14\"}\n{\"_SYSTEMD_UNIT\":\"daemon15.service\",\"MESSAGE\":\"failure 15\"}\n{\"_SYSTEMD_UNIT\":\"daemon16.service\",\"MESSAGE\":\"failure 16\"}\n{\"_SYSTEMD_UNIT\":\"daemon17.service\",\"MESSAGE\":\"failure 17\"}\n{\"_SYSTEMD_UNIT\":\"daemon18.service\",\"MESSAGE\":\"failure 18\"}\n{\"_SYSTEMD_UNIT\":\"daemon19.service\",\"MESSAGE\":\"failure 19\"}\n{\"_SYSTEMD_UNIT\":\"daemon20.service\",\"MESSAGE\":\"failure 20\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-3",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_SYSTEMD_UNIT\":\"cron.service\",\"SYSLOG_IDENTIFIER\":\"cron\",\"MESSAGE\":\"Error: bad hour; while reading /etc/crontab\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-4",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"SYSLOG_IDENTIFIER\":\"sshd\",\"MESSAGE\":\"Failed password for invalid user admin from remote host\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-5",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-6",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   \t  \n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-7",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-8",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n \n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-9",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=126 duration_ms=5 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\njournalctl: unrecognized option '--output-fields'\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(targeted_text_journal_keeps_cron_parse_finding_without_duplicate) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "journal_daemon_errors-final-10",
+      "split": "final",
+      "probe_id": "journal_daemon_errors",
+      "section": "## journal_daemon_errors\ncommand: journalctl -p err --since today -n 200 --no-pager -r -o json --output-fields=UNIT,_SYSTEMD_UNIT,SYSLOG_IDENTIFIER,_COMM,MESSAGE\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n{\"_COMM\":\"myapp\",\"MESSAGE\":\"segfault at 0 ip 0000 sp 0000 error 4 in myapp\"}\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs journalctl -o json 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "proc_states-dev-1",
+      "split": "dev",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  50 Z\n   3 R\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_oom_zombie_failed_units) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_states-dev-2",
+      "split": "dev",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n  10 Z\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_states-dev-3",
+      "split": "dev",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   9 Z\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_states-dev-4",
+      "split": "dev",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 120 S\n  30 S\n   5 R\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_states-dev-5",
+      "split": "dev",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n  15 Z+\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "proc_states-final-1",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 200 S\n  80 Z\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_states-final-2",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n  45 Z\n 300 S\n   2 R\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs macOS ps -axo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_states-final-3",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n  10 Z\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_states-final-4",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 500 S\n  10 Z\n   1 R\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_states-final-5",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   9 Z\n 500 S\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_states-final-6",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   1 Z\n 800 S\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_states-final-7",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n 300 S\n  20 R\n   5 D\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_states-final-8",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n   3 Z\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_oom_zombie_failed_units) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_states-final-9",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n  12 Z<\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "proc_states-final-10",
+      "split": "final",
+      "probe_id": "proc_states",
+      "section": "## proc_states\ncommand: ps -eo stat | sort | uniq -c | sort -rn | head -n 15\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n N/A Z\n 100 S\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs ps -eo stat | sort | uniq -c 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "failed_units-dev-1",
+      "split": "dev",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● nginx.service loaded failed failed Web\nredis.service loaded failed failed KV\nmysqld.service loaded failed failed DB\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_oom_zombie_failed_units) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "failed_units-dev-2",
+      "split": "dev",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ncron.service loaded failed failed Scheduler\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "failed_units-dev-3",
+      "split": "dev",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n0 loaded units listed.\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "failed_units-dev-4",
+      "split": "dev",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "failed_units-dev-5",
+      "split": "dev",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● app.timer loaded failed failed Backup timer\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "failed_units-final-1",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\na.service loaded failed failed A\nb.socket loaded failed failed B\nc.mount loaded failed failed C\nd.timer loaded failed failed D\ne.target loaded failed failed E\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "failed_units-final-2",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nf.service loaded failed failed F\ng.service loaded failed failed G\nh.service loaded failed failed H\ni.service loaded failed failed I\nj.service loaded failed failed J\nk.service loaded failed failed K\nl.service loaded failed failed L\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "failed_units-final-3",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ndocker.socket loaded failed failed Docker Socket\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "failed_units-final-4",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● dev-sda1.device loaded failed failed Disk Device\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "failed_units-final-5",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nFailed to list units: Interactive authentication required.\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "failed_units-final-6",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nNo failed units.\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "failed_units-final-7",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=15 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_clean_and_macos_placeholder_yield_nothing) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "failed_units-final-8",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "failed_units-final-9",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n● system-getty.slice loaded failed failed Getty Slice\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "failed_units-final-10",
+      "split": "final",
+      "probe_id": "failed_units",
+      "section": "## failed_units\ncommand: systemctl --failed --no-pager --no-legend | head -n 40\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nUnit myservice is running fine, no issues detected.\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs systemctl --failed 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-dev-1",
+      "split": "dev",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 350000\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "fd-dev-2",
+      "split": "dev",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 800\nkern.maxfiles: 1000\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "fd-dev-3",
+      "split": "dev",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 790\nkern.maxfiles: 1000\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "fd-dev-4",
+      "split": "dev",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 14457\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "fd-dev-5",
+      "split": "dev",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 900 0 1000\nfs.file-max = 1000\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-1",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 360000\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "fd-final-2",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 950 10 1000\nfs.file-max = 1000\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs sysctl fs.file-nr fs.file-max 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-3",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 8000\nkern.maxfiles: 10000\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "fd-final-4",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 400 0 500\nfs.file-max = 500\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs sysctl fs.file-nr fs.file-max 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-5",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 7999\nkern.maxfiles: 10000\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "fd-final-6",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 399 0 500\nfs.file-max = 500\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl fs.file-nr fs.file-max 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-7",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 1000\nkern.maxfiles: 500000\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "fd-final-8",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl fs.file-nr fs.file-max\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nfs.file-nr = 1216 0 9223372036854775807\nfs.file-max = 9223372036854775807\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative",
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-9",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.num_files: 350000\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "fd-final-10",
+      "split": "final",
+      "probe_id": "fd",
+      "section": "## fd\ncommand: sysctl kern.num_files kern.maxfiles\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nkern.maxfiles: 368640\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl kern.num_files kern.maxfiles 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "proc_fd_top-dev-1",
+      "split": "dev",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_proc_fd_flags_process_near_its_limit) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-dev-2",
+      "split": "dev",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n   500   200 svc\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-dev-3",
+      "split": "dev",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 1000\n     FD     PID COMMAND\n   490   200 svc\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-dev-4",
+      "split": "dev",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_proc_fd_is_quiet_on_normal_output) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-dev-5",
+      "split": "dev",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_proc_fd_without_limit_uses_absolute_axis_only) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-1",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_proc_fd_flags_absolute_volume_even_when_ratio_is_low) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-2",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 2000\n     FD     PID COMMAND\n  1800   555 chrome\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-3",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 50000\n     FD     PID COMMAND\n  10000    900 worker\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-4",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4000\n     FD     PID COMMAND\n  2000    901 svcb\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-5",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 50000\n     FD     PID COMMAND\n   9999    902 svcc\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-6",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 4000\n     FD     PID COMMAND\n   1999    903 svcd\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-7",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 100000\n     FD     PID COMMAND\n     50    904 tiny\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-8",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-9",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nper-proc limit: 5000\n     FD     PID COMMAND\n   4000    100 proc1\n   4100    101 proc2\n   4200    102 proc3\n   4300    103 proc4\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "proc_fd_top-final-10",
+      "split": "final",
+      "probe_id": "proc_fd_top",
+      "section": "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n     FD     PID COMMAND\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs aic proc-fd-top 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant",
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-dev-1",
+      "split": "dev",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 7.0G 1.0G\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-dev-2",
+      "split": "dev",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 10.0G 8.0G 2.0G\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-dev-3",
+      "split": "dev",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 100.0G 79.0G 21.0G\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-dev-4",
+      "split": "dev",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 1.0G 7.0G\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-dev-5",
+      "split": "dev",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: sysctl -n vm.swapusage\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ntotal = 5120.00M  used = 4900.00M  free = 220.00M  (encrypted)\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "swap_usage-final-1",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 16.0G 15.0G 1.0G\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-final-2",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 4.0G 4.0G 0B\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "obvious-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-final-3",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 5.0G 4.0G 1.0G\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-final-4",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 25.0G 20.0G 5.0G\n\n--- stderr ---\n\n",
+      "expected": "warn",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-positive"
+      ]
+    },
+    {
+      "id": "swap_usage-final-5",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 5.0G 3.95G 1.05G\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-final-6",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 2.0G 1.5G 0.5G\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "boundary-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-final-7",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 8.0G 0B 8.0G\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-final-8",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\nSwap: 0B 0B 0B\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "aic-client 기존 스캐너 단위 테스트(scan_findings_inodes_fd_swap) 파생",
+      "traits": [
+        "clean-negative"
+      ]
+    },
+    {
+      "id": "swap_usage-final-9",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: sysctl -n vm.swapusage\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\ntotal = 2048.00M  used = 2000.00M  free = 48.00M\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs sysctl -n vm.swapusage 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    },
+    {
+      "id": "swap_usage-final-10",
+      "split": "final",
+      "probe_id": "swap_usage",
+      "section": "## swap_usage\ncommand: free -h | grep Swap\nexit_code=0 duration_ms=10 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\n",
+      "expected": "none",
+      "source": "probes.rs free -h | grep Swap 명령이 규정하는 출력 형태로 새로 작성",
+      "traits": [
+        "format-variant"
+      ]
+    }
+  ]
+}
