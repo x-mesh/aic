@@ -4,6 +4,8 @@
 
 mod arms;
 mod confidence;
+mod judge_scoring;
+mod judgment;
 mod scenario;
 mod scoring;
 
@@ -13,12 +15,15 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use arms::{jev::JevClient, llm::LlmArm, rules, ArmOutcome};
+use arms::{jev::JevClient, jev_judge::JudgeClient, llm::LlmArm, rules, ArmOutcome};
+use judgment::JudgmentDataset;
 use scenario::{Dataset, Lang, Scenario, Split};
 use scoring::CaseRecord;
 
 const DEFAULT_DATA: &str = "data/scenarios.json";
+const DEFAULT_JUDGMENT_DATA: &str = "data/probe-judgments.json";
 const DEFAULT_RESULTS: &str = "target/results.jsonl";
+const DEFAULT_JUDGE_RESULTS: &str = "target/judge-results.jsonl";
 /// 벤치마크의 LLM 비교군 모델. provider 기본값에 맡기지 않는 이유는 `LlmArm::from_config`
 /// doc 참고 — 언제 바뀌었는지 결과만 보고는 알 수 없다.
 const DEFAULT_LLM_MODEL: &str = "kiro/gpt-5.6-luna";
@@ -96,6 +101,35 @@ enum Command {
         #[arg(long, default_value = "improved")]
         baseline: String,
     },
+    /// `docs/PRD-JEV-PROBE-JUDGMENT.md`의 판정 fixture 라벨이 실제 scanned_severities와
+    /// 일치하는지 확인한다. 네트워크를 쓰지 않는다.
+    JudgeValidate {
+        #[arg(long, default_value = DEFAULT_JUDGMENT_DATA)]
+        data: PathBuf,
+    },
+    /// `docs/PRD-JEV-PROBE-JUDGMENT.md`의 Choice 판정 비교군을 실행해 원시 결과를 남긴다.
+    /// 유일한 네트워크 진입점이다 — `cargo test`는 이 커맨드를 부르지 않는다.
+    JudgeRun {
+        #[arg(long, default_value = DEFAULT_JUDGMENT_DATA)]
+        data: PathBuf,
+        /// dev | final. 생략하면 전부.
+        #[arg(long)]
+        split: Option<String>,
+        /// 같은 입력을 몇 번 반복할지.
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+        #[arg(long, default_value = DEFAULT_JUDGE_RESULTS)]
+        out: PathBuf,
+        #[arg(long, default_value = "jev-1.13.0")]
+        jev_model: String,
+    },
+    /// judge-run 원시 결과를 혼동행렬·신뢰구간으로 채점한다. 네트워크를 쓰지 않는다.
+    JudgeScore {
+        #[arg(long, default_value = DEFAULT_JUDGE_RESULTS)]
+        results: PathBuf,
+        #[arg(long, default_value = DEFAULT_JUDGMENT_DATA)]
+        data: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -138,7 +172,147 @@ async fn main() -> Result<()> {
             data,
             baseline,
         } => score(&results, &data, &baseline),
+        Command::JudgeValidate { data } => judge_validate(&data),
+        Command::JudgeRun {
+            data,
+            split,
+            repeats,
+            out,
+            jev_model,
+        } => {
+            judge_run(JudgeRunOptions {
+                data: &data,
+                split: split.as_deref(),
+                repeats,
+                out: &out,
+                jev_model: &jev_model,
+            })
+            .await
+        }
+        Command::JudgeScore { results, data } => {
+            let records: Vec<JudgeRecord> = load_judge_records(&results)?;
+            let ds = JudgmentDataset::load(&data)?;
+            judge_scoring::report(&records, &ds);
+            Ok(())
+        }
     }
+}
+
+fn load_judge_records(results: &std::path::Path) -> Result<Vec<JudgeRecord>> {
+    let raw = std::fs::read_to_string(results)
+        .with_context(|| format!("결과를 읽지 못했습니다: {}", results.display()))?;
+    let records: Vec<JudgeRecord> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .context("결과 파싱 실패")?;
+    if records.is_empty() {
+        bail!("결과가 비어 있습니다");
+    }
+    Ok(records)
+}
+
+fn judge_validate(data: &std::path::Path) -> Result<()> {
+    let ds = JudgmentDataset::load(data)?;
+    println!(
+        "✔ {} 사례, schema_version {}",
+        ds.cases.len(),
+        ds.schema_version
+    );
+    println!("  확정일: {}", ds.generated);
+    println!();
+    println!("  {:<24} {:>5} {:>6}", "probe", "dev", "final");
+    for (probe, dev, fin) in ds.counts() {
+        println!("  {probe:<24} {dev:>5} {fin:>6}");
+    }
+    println!();
+    println!("  선언 라벨이 scanned_severities와 전부 일치합니다.");
+    Ok(())
+}
+
+/// judge-run 원시 결과 한 줄. `scoring::CaseRecord`와 같은 형태(사례 식별자 + `outcome` 중첩)를
+/// 따른다 — 원시 결과의 필드 구성을 실험마다 다시 고민하지 않도록 기존 관례를 그대로 쓴다.
+/// `judge_scoring`(T7)이 채점에 쓰므로 crate 내부로 연다.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct JudgeRecord {
+    pub(crate) case_id: String,
+    pub(crate) split: judgment::Split,
+    pub(crate) probe_id: String,
+    pub(crate) repeat: u32,
+    pub(crate) model: String,
+    pub(crate) question_version: String,
+    /// 실제로 보낸 state(섹션에서 stderr를 뺀 나머지)의 해시. 같은 입력을 썼는지 나중에 대조한다.
+    pub(crate) input_sha256: String,
+    pub(crate) expected: judgment::Expected,
+    pub(crate) outcome: arms::jev_judge::JudgeOutcome,
+}
+
+struct JudgeRunOptions<'a> {
+    data: &'a std::path::Path,
+    split: Option<&'a str>,
+    repeats: u32,
+    out: &'a std::path::Path,
+    jev_model: &'a str,
+}
+
+async fn judge_run(opts: JudgeRunOptions<'_>) -> Result<()> {
+    let JudgeRunOptions {
+        data,
+        split,
+        repeats,
+        out,
+        jev_model,
+    } = opts;
+    let ds = JudgmentDataset::load(data)?;
+    let split = match split {
+        None => None,
+        Some("dev") => Some(judgment::Split::Dev),
+        Some("final") => Some(judgment::Split::Final),
+        Some(other) => bail!("알 수 없는 split: {other}"),
+    };
+    let cases: Vec<&judgment::JudgmentCase> = ds
+        .cases
+        .iter()
+        .filter(|c| split.is_none_or(|want| c.split == want))
+        .collect();
+    if cases.is_empty() {
+        bail!("실행할 사례가 없습니다");
+    }
+
+    let client = JudgeClient::from_env(jev_model)?;
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::File::create(out)
+        .with_context(|| format!("결과 파일을 만들지 못했습니다: {}", out.display()))?;
+
+    let total = cases.len() * repeats as usize;
+    let mut done = 0usize;
+    for repeat in 1..=repeats {
+        for case in &cases {
+            let outcome = client.judge(&case.section).await;
+            let record = JudgeRecord {
+                case_id: case.id.clone(),
+                split: case.split,
+                probe_id: case.probe_id.clone(),
+                repeat,
+                model: client.model().to_string(),
+                question_version: arms::jev_judge::QUESTION_VERSION.to_string(),
+                input_sha256: scoring::input_hash(&arms::jev_judge::build_state(&case.section)),
+                expected: case.expected,
+                outcome,
+            };
+            writeln!(file, "{}", serde_json::to_string(&record)?)?;
+            done += 1;
+            if done.is_multiple_of(20) || done == total {
+                eprintln!("  {done}/{total}");
+            }
+        }
+    }
+    println!("✔ {done}건을 {}에 기록했습니다", out.display());
+    Ok(())
 }
 
 fn show_probes(category: Option<&str>, docker: bool) -> Result<()> {
