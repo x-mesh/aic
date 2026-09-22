@@ -40,6 +40,8 @@ pub struct FollowupOutcome {
     pub template_confidence: Option<f64>,
     pub template_probabilities: Option<BTreeMap<String, f64>>,
     pub arg_confidence: Option<f64>,
+    /// 응답의 `model`. `jev-latest` 같은 별칭으로 부르면 실제로 어느 버전이 답했는지 여기 남는다.
+    pub resolved_model: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub attempts: u32,
@@ -150,6 +152,10 @@ pub fn parse_answer(
         raw_template: raw.clone(),
         template_confidence: t.get("confidence").and_then(Value::as_f64),
         template_probabilities: probs,
+        resolved_model: json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         input_tokens: json.pointer("/usage/input_tokens").and_then(Value::as_u64),
         output_tokens: json.pointer("/usage/output_tokens").and_then(Value::as_u64),
         attempts,
