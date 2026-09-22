@@ -135,7 +135,7 @@ impl HeadlessDiagnosis {
         let mut md = format!("# diagnose: {sym}\n\n## evidence\n\n{}\n", self.evidence);
         if let Some(f) = &self.followup_evidence {
             md.push_str(&format!(
-                "\n## follow-up evidence (LLM 제안 → 게이트 통과 자동 실행)\n\n{f}\n"
+                "\n## follow-up evidence (게이트 통과 자동 실행)\n\n{f}\n"
             ));
         }
         if !self.followup_rejected.is_empty() {
@@ -154,7 +154,8 @@ impl HeadlessDiagnosis {
 /// `run_headless_diagnose_opts` 동작 옵션. 기본값은 기존 one-shot과 동일(하위 호환).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiagnoseOptions {
-    /// LLM이 제안한 follow-up probe를 1라운드 자동 실행해 재분석한다(opt-in).
+    /// follow-up probe를 1라운드 자동 실행한다(opt-in). 제안자는 결정적 스캔이 우선이고, 지목된
+    /// 대상이 없을 때만 LLM이다(그때만 재분석까지 2회 호출).
     /// 게이트: catalog/템플릿 전용 + 인자 증거-실존 + risk_guard Safe + validator(직렬).
     pub follow_up: bool,
     /// 로컬 rca-agent에서 짧은 window(`KERNEL_WINDOW_SECS`) 커널 evidence를 수집해
@@ -376,6 +377,79 @@ pub async fn run_headless_diagnose(
 /// `run_headless_diagnose` + 옵션. `opts.follow_up`이면 1차 분석의 ```aic-followup``` 블록을
 /// 게이트(catalog/템플릿 → 인자 증거-실존 → risk_guard Safe → validator) 직렬 통과시킨 뒤
 /// 자동 실행하고, 합산 증거로 1회 재분석한다. 블록 없음/전부 거부면 1차 결과 그대로(zero-cost).
+/// 결정적 스캔이 지목한 후속 확인 줄(중복 제거, 발견 순서).
+///
+/// 스캐너는 실제 게이트를 통과하는 값만 `suggested_followup`에 달므로 여기서 다시 거르지 않는다.
+fn deterministic_followups(findings: &[Finding]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in findings
+        .iter()
+        .filter_map(|f| f.suggested_followup.as_ref())
+    {
+        if !out.contains(line) {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+/// follow-up 줄들을 직렬 게이트(catalog/템플릿 → 인자 증거-실존 → validator)에 통과시켜 실행하고
+/// `## followup:<name>` 증거를 모은다. 반환은 `(증거, 거부 사유)`.
+///
+/// 제안자가 LLM이든 결정적 스캔이든 게이트와 상한은 같다 — 제안 출처로 권한이 달라지면 게이트의
+/// 의미가 없어진다.
+fn run_followup_lines(
+    lines: &[String],
+    evidence: &str,
+    sandbox: &Sandbox,
+    corr_prefix: &str,
+) -> (String, Vec<String>) {
+    let mut fu_evidence = String::new();
+    let mut rejected: Vec<String> = Vec::new();
+    let mut executed = 0usize;
+    for line in lines {
+        if executed >= MAX_FOLLOWUP_CMDS {
+            rejected.push(format!("{line} — 명령 수 상한({MAX_FOLLOWUP_CMDS}) 초과"));
+            continue;
+        }
+        if fu_evidence.len() >= MAX_FOLLOWUP_OUTPUT_BYTES {
+            rejected.push(format!(
+                "{line} — 출력 예산({MAX_FOLLOWUP_OUTPUT_BYTES}B) 소진"
+            ));
+            continue;
+        }
+        let (name, cmd) = match resolve_followup_line(line, evidence) {
+            Ok(v) => v,
+            Err(reason) => {
+                rejected.push(format!("{line} — {reason}"));
+                continue;
+            }
+        };
+        // 직렬 게이트 마지막 층: 실행 전 validator(메타문자/샌드박스 정책).
+        if let Err(e) = super::run_command::validate_command(&cmd, sandbox) {
+            rejected.push(format!("{line} — validator 거부: {e}"));
+            continue;
+        }
+        let corr = format!("{corr_prefix}.fu{executed}");
+        let args = serde_json::json!({ "command": cmd });
+        let mut out = super::run_command::execute_with_corr(&args, sandbox, &corr, |_, _, _| false)
+            .unwrap_or_else(|e| format!("[tool error] {e}"));
+        // 합산 16KB cap — 초과분은 char 경계 안전하게 잘라낸다.
+        let budget = MAX_FOLLOWUP_OUTPUT_BYTES.saturating_sub(fu_evidence.len());
+        if out.len() > budget {
+            let mut cut = budget;
+            while cut > 0 && !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            out.push_str("\n[truncated: follow-up 출력 예산 도달]");
+        }
+        fu_evidence.push_str(&format!("## followup:{name}\n{out}\n\n"));
+        executed += 1;
+    }
+    (fu_evidence, rejected)
+}
+
 pub async fn run_headless_diagnose_opts(
     symptom: Option<&str>,
     sandbox: &Sandbox,
@@ -423,12 +497,30 @@ pub async fn run_headless_diagnose_opts(
         }
     };
 
+    // 결정적 follow-up — 스캐너가 대상을 지목했으면(실패 유닛·문제 컨테이너·비정상 pod/노드·누수 PID)
+    // LLM에게 무엇을 볼지 묻지 않고 바로 실행한다. 1차 분석 호출이 통째로 빠져 진단 한 번의 LLM
+    // 호출이 2회에서 1회가 되고, 같은 증거에 항상 같은 follow-up이 돈다.
+    let mut followup_evidence: Option<String> = None;
+    let mut followup_rejected: Vec<String> = Vec::new();
+    if opts.follow_up {
+        let planned = deterministic_followups(&auto_findings);
+        if !planned.is_empty() {
+            let (fu, rejected) = run_followup_lines(&planned, &evidence, sandbox, corr_prefix);
+            followup_rejected = rejected;
+            if !fu.is_empty() {
+                followup_evidence = Some(fu);
+            }
+        }
+    }
+
     let mut analysis = match dispatcher {
         Some(d) => {
-            let prompt = if opts.follow_up {
-                build_diagnose_prompt_followup(symptom, &evidence)
-            } else {
-                build_diagnose_prompt(symptom, &evidence)
+            let prompt = match (&followup_evidence, opts.follow_up) {
+                // 증거가 이미 다 모였다 — 다음에 볼 것을 물을 이유가 없으므로 메뉴 없는 분석 1회.
+                (Some(fu), _) => build_diagnose_prompt(symptom, &format!("{evidence}\n{fu}")),
+                // 지목된 대상이 없다 — 무엇을 더 볼지 LLM에게 묻는다(호출 2회 경로).
+                (None, true) => build_diagnose_prompt_followup(symptom, &evidence),
+                (None, false) => build_diagnose_prompt(symptom, &evidence),
             };
             let started = std::time::Instant::now();
             let sent = d.send(&prompt).await;
@@ -447,57 +539,15 @@ pub async fn run_headless_diagnose_opts(
         None => None,
     };
 
-    // follow-up 라운드(1회 고정) — 1차 분석의 제안 블록을 게이트 통과분만 실행해 재분석.
-    let mut followup_evidence: Option<String> = None;
-    let mut followup_rejected: Vec<String> = Vec::new();
-    if opts.follow_up {
+    // LLM 제안 follow-up 라운드(1회 고정) — 결정적 제안이 없었을 때만. 있었다면 이미 실행했고
+    // 분석도 그 증거를 포함해 한 번에 끝냈다.
+    if opts.follow_up && followup_evidence.is_none() {
         if let (Some(d), Some(first)) = (dispatcher, analysis.clone()) {
             let lines = extract_followup_block(&first).unwrap_or_default();
-            let mut fu_evidence = String::new();
-            let mut executed = 0usize;
-            for line in lines {
-                if executed >= MAX_FOLLOWUP_CMDS {
-                    followup_rejected
-                        .push(format!("{line} — 명령 수 상한({MAX_FOLLOWUP_CMDS}) 초과"));
-                    continue;
-                }
-                if fu_evidence.len() >= MAX_FOLLOWUP_OUTPUT_BYTES {
-                    followup_rejected.push(format!(
-                        "{line} — 출력 예산({MAX_FOLLOWUP_OUTPUT_BYTES}B) 소진"
-                    ));
-                    continue;
-                }
-                let (name, cmd) = match resolve_followup_line(&line, &evidence) {
-                    Ok(v) => v,
-                    Err(reason) => {
-                        followup_rejected.push(format!("{line} — {reason}"));
-                        continue;
-                    }
-                };
-                // 직렬 게이트 마지막 층: 실행 전 validator(메타문자/샌드박스 정책).
-                if let Err(e) = super::run_command::validate_command(&cmd, sandbox) {
-                    followup_rejected.push(format!("{line} — validator 거부: {e}"));
-                    continue;
-                }
-                let corr = format!("{corr_prefix}.fu{executed}");
-                let args = serde_json::json!({ "command": cmd });
-                let mut out =
-                    super::run_command::execute_with_corr(&args, sandbox, &corr, |_, _, _| false)
-                        .unwrap_or_else(|e| format!("[tool error] {e}"));
-                // 합산 16KB cap — 초과분은 char 경계 안전하게 잘라낸다.
-                let budget = MAX_FOLLOWUP_OUTPUT_BYTES.saturating_sub(fu_evidence.len());
-                if out.len() > budget {
-                    let mut cut = budget;
-                    while cut > 0 && !out.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    out.truncate(cut);
-                    out.push_str("\n[truncated: follow-up 출력 예산 도달]");
-                }
-                fu_evidence.push_str(&format!("## followup:{name}\n{out}\n\n"));
-                executed += 1;
-            }
-            if executed > 0 {
+            let (fu_evidence, rejected) =
+                run_followup_lines(&lines, &evidence, sandbox, corr_prefix);
+            followup_rejected = rejected;
+            if !fu_evidence.is_empty() {
                 let prompt2 =
                     build_followup_reanalysis_prompt(symptom, &first, &evidence, &fu_evidence);
                 let started = std::time::Instant::now();
@@ -526,6 +576,12 @@ pub async fn run_headless_diagnose_opts(
             "analyzed": analysis.is_some(),
             "followup_executed": followup_evidence.is_some(),
             "followup_rejected": followup_rejected.len(),
+            // 제안 출처 — 결정적 스캔이면 분석 호출이 1회로 끝난다. 절감 여부를 이 값으로 가른다.
+            "followup_source": if !deterministic_followups(&auto_findings).is_empty() {
+                "scanner"
+            } else {
+                "llm"
+            },
             "llm_calls": llm_calls,
             // provider가 usage를 싣지 않으면 0이다 — 호출 수와 함께 봐야 "안 썼다"와 구분된다.
             "llm_input_tokens": llm_input_tokens,
@@ -805,6 +861,9 @@ fn probe_ids_for_category(
                 "proc_states",
                 "mem_top_proc",
                 "fd",
+                // `fd`는 호스트 전역 합계라 프로세스 하나의 누수가 묻힌다(probes.rs의 실측 주석 참고).
+                // 프로세스 축을 같이 넣어야 "누구가 쥐고 있나"까지 한 번에 나온다.
+                "proc_fd_top",
                 "failed_units",
                 "journal_errors",
                 "launchd_failed",
@@ -925,6 +984,11 @@ const PROC_FD_PCT_WARN: u64 = 50;
 const PROC_FD_ABS_WARN: u64 = 10_000;
 /// `proc_fd_top` 한 섹션에서 보고할 프로세스 최대 개수 — 한 번에 수십 줄이 뜨면 신호가 묻힌다.
 const PROC_FD_FINDING_CAP: usize = 3;
+
+/// 한 섹션에서 보고할 컨테이너/쿠버네티스 대상 최대 개수. 재시작 폭풍이면 수십 개가 한꺼번에 뜨는데,
+/// 그 상태에서 개별 대상 나열은 신호가 아니라 잡음이다(`PROC_FD_FINDING_CAP`과 같은 이유).
+const DOCKER_FINDING_CAP: usize = 3;
+const K8S_FINDING_CAP: usize = 3;
 /// 인자 없는 generic `/diagnose`에서 표시할 journal error daemon 최대 수.
 const JOURNAL_DAEMON_CAP: usize = 20;
 /// journal source identifier 최대 문자 수. 비정상 field가 finding 한 줄을 잠식하지 않게 제한한다.
@@ -1362,14 +1426,6 @@ fn scan_fd(body: &str) -> Vec<String> {
 ///
 /// 입력은 [`super::proc_fd::render`]의 출력이다: `per-proc limit: N` 한 줄(모르면 없음) + `FD PID
 /// COMMAND` 표. 한도 줄이 없으면 절대량 축만 적용한다 — 분모를 모르면서 비율을 지어내지 않는다.
-fn scan_proc_fd(body: &str) -> Vec<String> {
-    scan_proc_fd_rows(body)
-        .into_iter()
-        .map(|(_, msg)| msg)
-        .collect()
-}
-
-/// [`scan_proc_fd`]의 (pid, 메시지) 형태. 경고 PID를 쓰는 쪽이 메시지를 다시 파싱하지 않게 한다.
 fn scan_proc_fd_rows(body: &str) -> Vec<(u64, String)> {
     let mut limit: Option<u64> = None;
     let mut out = Vec::new();
@@ -1435,6 +1491,127 @@ pub fn scanned_proc_fd_pids(evidence: &str) -> Vec<u64> {
         .collect()
 }
 
+/// `docker ps -s` 한 줄에서 (컨테이너 이름, STATUS 요약). 헤더·형태 불일치면 `None`.
+///
+/// **헤더 오프셋으로 열을 자르지 않는다.** 이 함수의 입력은 redaction을 거친 스냅샷인데, PORTS의
+/// IPv4가 `[REDACTED:ipv4]`로 길어지면서 NAMES·SIZE 열이 행마다 다른 만큼 오른쪽으로 밀린다(실측
+/// 2026-09-22: 같은 표에서 +8과 +16이 섞였다). docker는 원본 폭으로 패딩을 끝낸 뒤라 헤더 위치가
+/// 더는 데이터 위치가 아니다. 그래서 양끝의 고정 토큰을 앵커로 쓴다 — SIZE의 `(virtual` 앞앞이
+/// NAMES이고, STATUS는 고정 낱말로 시작한다.
+fn docker_ps_row(line: &str) -> Option<(&str, String)> {
+    /// docker가 STATUS 첫 낱말로 쓰는 값. IMAGE는 `:` 태그를, COMMAND는 따옴표를 달고 있어 겹치지 않는다.
+    const STATUS_HEADS: &[&str] = &[
+        "Up",
+        "Exited",
+        "Created",
+        "Restarting",
+        "Removal",
+        "Dead",
+        "Paused",
+    ];
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let names_at = match toks.iter().rposition(|t| *t == "(virtual") {
+        Some(i) => i.checked_sub(2)?,
+        None => toks.len().checked_sub(2)?,
+    };
+    let status_at = toks
+        .iter()
+        .take(names_at)
+        .position(|t| STATUS_HEADS.contains(t))?;
+    // STATUS + PORTS 구간. PORTS에는 `(unhealthy)`·`(Paused)`가 섞이지 않으므로 그대로 훑어도 된다.
+    let segment = &toks[status_at..names_at];
+    let healthy = segment[0] == "Up"
+        && !segment
+            .iter()
+            .any(|t| *t == "(unhealthy)" || *t == "(Paused)");
+    if healthy {
+        return None;
+    }
+    // 메시지에 쓸 상태 요약 — PORTS가 붙기 전까지만. `Up ... (unhealthy)`는 두 낱말로 접는다.
+    let status: String = if segment[0] == "Up" {
+        "실행 중이나 헬스체크 실패".to_string()
+    } else {
+        segment
+            .iter()
+            .take_while(|t| !t.contains("/tcp") && !t.contains("/udp") && !t.contains("->"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some((toks[names_at], status))
+}
+
+/// `docker ps -s`에서 정상이 아닌 컨테이너를 `(메시지, 후속 확인)`으로 뽑는다(순수).
+///
+/// probe는 `-a` 없이 돌므로 표에 남는 것은 실행 중이거나 재시작 중인 컨테이너뿐이다. 그래서 `Up`이
+/// 아니거나 헬스체크가 실패한 행만 발견이 된다. 후속 확인은 `docker_inspect_container`다 —
+/// RestartPolicy·OOMKilled·ExitCode가 한 번에 나오고, 재시작 루프라 로그가 비어도 답을 준다.
+fn scan_docker_ps(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .skip(1)
+        .filter_map(docker_ps_row)
+        .take(DOCKER_FINDING_CAP)
+        .map(|(name, status)| {
+            (
+                format!("컨테이너 {name} 상태 이상: {status}"),
+                format!("docker_inspect_container {name}"),
+            )
+        })
+        .collect()
+}
+
+/// `kubectl get pods`(probe가 `grep -v Running`을 거친 출력)에서 문제 pod을 뽑는다(순수).
+///
+/// 남아 있는 정상 행은 끝난 Job(`Completed`/`Succeeded`)뿐이라 그것만 제외한다. 후속 확인은
+/// `k8s_pod_describe`다 — Events와 exit code가 나오고, 컨테이너가 뜬 적 없는 pod(ImagePullBackOff·
+/// Pending)에도 동작한다(`kubectl logs`는 그런 pod에 오류만 돌려준다).
+fn scan_k8s_pods(body: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    // `-A`면 첫 열이 NAMESPACE, 아니면 NAME이다. 헤더로 판별한다.
+    let name_col = lines
+        .first()
+        .and_then(|h| h.split_whitespace().next())
+        .map_or(0, |h| usize::from(h == "NAMESPACE"));
+    lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let (name, status) = (toks.get(name_col)?, toks.get(name_col + 2)?);
+            if matches!(*status, "Running" | "Completed" | "Succeeded") {
+                return None;
+            }
+            Some((
+                format!("pod {name} 비정상 상태: {status}"),
+                format!("k8s_pod_describe {name}"),
+            ))
+        })
+        .take(K8S_FINDING_CAP)
+        .collect()
+}
+
+/// `kubectl get nodes`에서 스케줄 불가 노드를 뽑는다(순수). cordon(`Ready,SchedulingDisabled`)은
+/// 의도된 상태라 제외하고 `NotReady`·`Unknown`만 본다.
+fn scan_k8s_nodes(body: &str) -> Vec<(String, String)> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .skip(1)
+        .filter_map(|line| {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            let (name, status) = (toks.first()?, toks.get(1)?);
+            if !status.starts_with("NotReady") && *status != "Unknown" {
+                return None;
+            }
+            Some((
+                format!("노드 {name} 상태 {status}"),
+                format!("k8s_node_describe {name}"),
+            ))
+        })
+        .take(K8S_FINDING_CAP)
+        .collect()
+}
+
 fn scan_swap(body: &str) -> Vec<String> {
     // 단위 접미사(B/K/M/G/T, 'i' 허용: Gi/Mi)를 바이트(f64)로. 실패는 None. 'B'(예: free의 swap-off "0B")를
     // 명시 처리해 0이 Some(0.0)으로 파싱되게 한다 — 그러면 swap-off가 total<=0.0 가드 하나로 결정적으로 걸린다.
@@ -1495,13 +1672,21 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
     for (name, body) in sections {
         // 매처는 run_and_format 래퍼의 stdout 본문만 본다(command:/exit_code= 메타라인 오탐 방지).
         let stdout = section_stdout(&body);
-        let (severity, messages) = match name {
-            "disk" => (Severity::Warn, scan_disk_full(stdout)),
-            "inodes" => (Severity::Warn, scan_inodes(stdout)),
-            "dmesg_oom" => (Severity::Crit, scan_oom(stdout)),
+        // 발견마다 후속 확인 대상이 다를 수 있으므로 (메시지, 후속 확인) 쌍으로 모은다. 대상이
+        // 없는 스캐너는 `None`이다 — 깔끔한 단일-인자 템플릿이 없다(디스크 사용률에 붙일 인자가 없다).
+        let plain = |messages: Vec<String>| -> Vec<(String, Option<String>)> {
+            messages.into_iter().map(|m| (m, None)).collect()
+        };
+        let targeted = |rows: Vec<(String, String)>| -> Vec<(String, Option<String>)> {
+            rows.into_iter().map(|(m, fu)| (m, Some(fu))).collect()
+        };
+        let (severity, entries): (Severity, Vec<(String, Option<String>)>) = match name {
+            "disk" => (Severity::Warn, plain(scan_disk_full(stdout))),
+            "inodes" => (Severity::Warn, plain(scan_inodes(stdout))),
+            "dmesg_oom" => (Severity::Crit, plain(scan_oom(stdout))),
             // no-arg 진단은 structured scanner가 같은 cron 오류를 더 정확히 보고하므로 중복 억제.
             "journal_errors" if !has_structured_journal => {
-                (Severity::Warn, scan_crontab_parse_errors(stdout))
+                (Severity::Warn, plain(scan_crontab_parse_errors(stdout)))
             }
             "journal_daemon_errors" => {
                 let mut messages = scan_journal_daemon_errors(stdout);
@@ -1510,31 +1695,45 @@ pub(crate) fn scan_findings(evidence: &str) -> Vec<Finding> {
                         "journal error 출력이 64 KiB 상한에서 잘려 최신 일부만 집계됨".to_string(),
                     );
                 }
-                (Severity::Warn, messages)
+                (Severity::Warn, plain(messages))
             }
-            "proc_states" => (Severity::Warn, scan_zombies(stdout)),
-            "failed_units" => (Severity::Warn, scan_failed_units(stdout)),
-            "fd" => (Severity::Warn, scan_fd(stdout)),
-            "proc_fd_top" => (Severity::Warn, scan_proc_fd(stdout)),
-            "swap_usage" => (Severity::Warn, scan_swap(stdout)),
+            "proc_states" => (Severity::Warn, plain(scan_zombies(stdout))),
+            // 실패 유닛은 한 줄로 합쳐 보고하므로(이름은 5개까지) 대표 하나에만 hint를 단다.
+            "failed_units" => {
+                let hint = first_failed_unit(stdout).map(|u| format!("journal_unit {u}"));
+                (
+                    Severity::Warn,
+                    scan_failed_units(stdout)
+                        .into_iter()
+                        .map(|m| (m, hint.clone()))
+                        .collect(),
+                )
+            }
+            "fd" => (Severity::Warn, plain(scan_fd(stdout))),
+            "proc_fd_top" => (
+                Severity::Warn,
+                targeted(
+                    scan_proc_fd_rows(stdout)
+                        .into_iter()
+                        .map(|(pid, m)| (m, format!("proc_fd {pid}")))
+                        .collect(),
+                ),
+            ),
+            "swap_usage" => (Severity::Warn, plain(scan_swap(stdout))),
+            "docker_ps" => (Severity::Warn, targeted(scan_docker_ps(stdout))),
+            "k8s_pods_notready" | "k8s_crashloop_pods" => {
+                (Severity::Warn, targeted(scan_k8s_pods(stdout)))
+            }
+            "k8s_nodes" => (Severity::Warn, targeted(scan_k8s_nodes(stdout))),
             _ => continue,
         };
-        // failed_units만 후속 확인(journal_unit) hint를 단다. **실제 게이트(resolve_followup_line)를
-        // 통과하는 값만** 노출해 렌더/--json의 suggested_followup이 항상 실행 가능하도록 한다 — 예:
-        // getty@tty1.service 같은 systemd template/instance unit은 arg_valid가 `@`를 거부하므로 hint 미부착
-        // (발견 자체는 표시). 나머지 스캐너는 깔끔한 단일-인자 템플릿이 없어 None(후속).
-        let followup = if name == "failed_units" {
-            first_failed_unit(stdout)
-                .map(|u| format!("journal_unit {u}"))
-                .filter(|line| resolve_followup_line(line, evidence).is_ok())
-        } else {
-            None
-        };
-        findings.extend(
-            messages
-                .into_iter()
-                .map(|m| Finding::new(severity, name, m).with_followup(followup.clone())),
-        );
+        findings.extend(entries.into_iter().map(|(m, fu)| {
+            // **실제 게이트(resolve_followup_line)를 통과하는 값만** 노출해 렌더/--json의
+            // suggested_followup이 항상 실행 가능하도록 한다 — 예: getty@tty1.service 같은 systemd
+            // template/instance unit은 arg_valid가 `@`를 거부하므로 hint 미부착(발견 자체는 표시).
+            let fu = fu.filter(|line| resolve_followup_line(line, evidence).is_ok());
+            Finding::new(severity, name, m).with_followup(fu)
+        }));
     }
     findings
 }
@@ -2192,6 +2391,111 @@ mod tests {
     }
 
     #[test]
+    fn redacted_ports_do_not_shift_the_container_name_out_of_the_row() {
+        // 실측(2026-09-22, macOS+OrbStack): 이 스캐너의 입력은 redaction을 거친 스냅샷이라 PORTS의
+        // IPv4가 `[REDACTED:ipv4]`로 길어져 NAMES 열이 행마다 다르게(+8·+16) 밀린다. 헤더 오프셋으로
+        // 자르면 이름이 잘려 게이트에서 거부되고, STATUS 칸이 어긋나 정상 컨테이너가 문제로 잡힌다.
+        // 아래 두 줄은 그때 실제로 나온 형태다(이름만 바꿨다).
+        let ev = "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0\n--- stdout ---\n\
+CONTAINER ID   IMAGE                               COMMAND                   CREATED        STATUS                PORTS                                                                                                NAMES                                  SIZE\n\
+7a548a168c8b   acme/nginx:1.13.7                   \"/run.sh\"                 6 days ago     Up 6 days             [REDACTED:ipv4]:80->80/tcp, [::]:80->80/tcp, [REDACTED:ipv4]:443->443/tcp, [::]:443->443/tcp                         web-intranet-v2-nginx-1                6.77kB (virtual 271MB)\n\
+7d65febad023   acme/php73:7.3.20                   \"bash -c 'dpkg -i /v…\"   6 days ago     Up 6 days (unhealthy) 80/tcp, 443/tcp, [REDACTED:ipv4]:32769->9000/tcp, [::]:32769->9000/tcp                                       web-intranet-v2-php-1                  16.5MB (virtual 929MB)\n\n--- stderr ---\n";
+        let f = scan_findings(ev);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].probe_id, "docker_ps");
+        assert!(f[0].message.contains("web-intranet-v2-php-1"), "{f:?}");
+        assert_eq!(
+            f[0].suggested_followup.as_deref(),
+            Some("docker_inspect_container web-intranet-v2-php-1")
+        );
+        // hint는 실제 게이트를 통과해야 한다 — 통과 못 하면 결정적 경로가 그것을 실행할 수 없다.
+        assert!(resolve_followup_line(f[0].suggested_followup.as_ref().unwrap(), ev).is_ok());
+    }
+
+    #[test]
+    fn a_container_with_no_published_ports_still_parses() {
+        // PORTS가 비면 STATUS 바로 뒤가 NAMES다 — 토큰 개수에 기대는 앵커는 여기서 깨진다.
+        let ev = "## docker_ps\ncommand: docker ps -s | head -n 30\nexit_code=0\n--- stdout ---\n\
+CONTAINER ID   IMAGE       COMMAND       CREATED       STATUS                        PORTS   NAMES     SIZE\n\
+1a2b3c4d5e6f   acme:2.1    \"./worker\"    2 hours ago   Restarting (137) 8 seconds ago         worker-3   0B (virtual 412MB)\n\n--- stderr ---\n";
+        let f = scan_findings(ev);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert!(f[0].message.contains("Restarting"), "{f:?}");
+        assert_eq!(
+            f[0].suggested_followup.as_deref(),
+            Some("docker_inspect_container worker-3")
+        );
+    }
+
+    #[test]
+    fn completed_pods_and_cordoned_nodes_are_not_findings() {
+        // probe가 `grep -v Running`을 거치므로 표에 남는 정상 행은 끝난 Job뿐이고, cordon은 의도된
+        // 상태다. 둘을 발견으로 세면 정상 클러스터에서 매번 follow-up이 돈다.
+        let pods = "## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running\nexit_code=0\n--- stdout ---\n\
+NAMESPACE   NAME                    READY   STATUS             RESTARTS      AGE\n\
+prod        payments-7f9c-x1        0/1     CrashLoopBackOff   14 (2m ago)   3d\n\
+prod        backup-28812345-x9k2l   0/1     Completed          0             3h\n\n--- stderr ---\n";
+        let f = scan_findings(pods);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(
+            f[0].suggested_followup.as_deref(),
+            Some("k8s_pod_describe payments-7f9c-x1")
+        );
+        let nodes = "## k8s_nodes\ncommand: kubectl get nodes\nexit_code=0\n--- stdout ---\n\
+NAME     STATUS                     ROLES           AGE    VERSION\n\
+node-a   Ready                      control-plane   300d   v1.28.9\n\
+node-b   Ready,SchedulingDisabled   <none>          300d   v1.28.9\n\
+node-c   NotReady                   <none>          300d   v1.28.9\n\n--- stderr ---\n";
+        let f = scan_findings(nodes);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(
+            f[0].suggested_followup.as_deref(),
+            Some("k8s_node_describe node-c")
+        );
+    }
+
+    #[test]
+    fn a_cluster_without_a_server_yields_no_findings() {
+        // 실측: 클러스터가 없으면 kubectl은 stdout을 비우고 오류를 stderr로 내며 exit 0이다.
+        // stderr를 읽으면 없는 pod을 대상으로 follow-up을 돌린다.
+        let ev = "## k8s_pods_notready\ncommand: kubectl get pods -A | grep -v Running\n\
+exit_code=0 duration_ms=170 truncated=false cwd=.\n--- stdout ---\n\n--- stderr ---\n\
+E0922 17:26:13.875636   49737 memcache.go:265] \"Unhandled Error\" err=\"couldn't get current server API group list\"\n\
+Error from server (NotFound): the server could not find the requested resource\n";
+        assert!(scan_findings(ev).is_empty());
+    }
+
+    #[test]
+    fn each_leaking_pid_gets_its_own_followup_target() {
+        // 한 섹션에 여러 대상이 있으면 발견마다 대상이 달라야 한다 — 전에는 섹션 하나에 hint 하나였다.
+        let ev = "## proc_fd_top\ncommand: aic proc-fd-top\nexit_code=0\n--- stdout ---\n\
+per-proc limit: 5000\n     FD     PID COMMAND\n   4000    100 proc1\n   4100    101 proc2\n     10    102 tiny\n\n--- stderr ---\n";
+        let hints: Vec<String> = scan_findings(ev)
+            .into_iter()
+            .filter_map(|f| f.suggested_followup)
+            .collect();
+        assert_eq!(hints, vec!["proc_fd 100", "proc_fd 101"]);
+    }
+
+    #[test]
+    fn deterministic_followups_dedupe_and_keep_finding_order() {
+        let ev = "## failed_units\ncommand: systemctl --failed\nexit_code=0\n--- stdout ---\n\
+● nginx.service loaded failed failed Web\n\n--- stderr ---\n\
+## k8s_nodes\ncommand: kubectl get nodes\nexit_code=0\n--- stdout ---\n\
+NAME     STATUS     ROLES    AGE    VERSION\nnode-c   NotReady   <none>   300d   v1.28.9\n\n--- stderr ---\n";
+        let lines = deterministic_followups(&scan_findings(ev));
+        assert_eq!(
+            lines,
+            vec!["journal_unit nginx.service", "k8s_node_describe node-c"]
+        );
+        // 지목된 대상이 없으면 빈 목록 — 그때만 LLM에게 묻는다.
+        assert!(deterministic_followups(&scan_findings(
+            "## disk\ncommand: df -h\nexit_code=0\n--- stdout ---\n/dev/sda1 100G 95G 5G 95% /\n\n--- stderr ---\n"
+        ))
+        .is_empty());
+    }
+
+    #[test]
     fn scanned_proc_fd_pids_follow_the_scanner_not_the_table() {
         // 한도 없는 900은 절대량 경고선 아래라 경고가 아니고, 한도 대비 90%인 4242만 경고다. follow-up
         // 후보를 좁히는 쪽이 이 판정을 그대로 받아야 정상 행을 대상으로 고르지 않는다.
@@ -2465,7 +2769,10 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
     #[test]
     fn scan_proc_fd_flags_process_near_its_limit() {
         let body = "per-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n     10      1 launchd\n";
-        let found = scan_proc_fd(body);
+        let found: Vec<String> = scan_proc_fd_rows(body)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("leaky"), "{found:?}");
         assert!(found[0].contains("90%"), "{found:?}");
@@ -2476,7 +2783,10 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
     #[test]
     fn scan_proc_fd_flags_absolute_volume_even_when_ratio_is_low() {
         let body = "per-proc limit: 245760\n     FD     PID COMMAND\n  21019  73006 gk\n";
-        let found = scan_proc_fd(body);
+        let found: Vec<String> = scan_proc_fd_rows(body)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("21019"), "{found:?}");
         assert!(found[0].contains("8%"), "비율 맥락이 빠졌다: {found:?}");
@@ -2486,7 +2796,10 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
     #[test]
     fn scan_proc_fd_without_limit_uses_absolute_axis_only() {
         let body = "     FD     PID COMMAND\n  50000    777 huge\n    900    778 mid\n";
-        let found = scan_proc_fd(body);
+        let found: Vec<String> = scan_proc_fd_rows(body)
+            .into_iter()
+            .map(|(_, m)| m)
+            .collect();
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("huge"), "{found:?}");
         assert!(found[0].contains("확인하지 못했"), "{found:?}");
@@ -2497,7 +2810,7 @@ exit_code=0 duration_ms=31 truncated=false cwd=.\n--- stdout ---\n\
     #[test]
     fn scan_proc_fd_is_quiet_on_normal_output() {
         let body = "per-proc limit: 245760\n     FD     PID COMMAND\n    568    690 stable\n     21  29054 aicd\n";
-        assert!(scan_proc_fd(body).is_empty());
+        assert!(scan_proc_fd_rows(body).is_empty());
     }
 
     #[test]

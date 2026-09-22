@@ -433,7 +433,9 @@ enum Commands {
         /// LLM 분석을 끄고 redacted 증거만 수집한다.
         #[arg(long)]
         no_analyze: bool,
-        /// LLM이 제안한 follow-up probe를 1라운드 자동 실행해 재분석한다.
+        /// follow-up probe를 1라운드 자동 실행한다. 결정적 스캔이 대상을 지목했으면(실패 유닛·문제
+        /// 컨테이너·비정상 pod/노드·fd 누수 PID) 그것을 먼저 실행하고 분석을 1회로 끝내며, 지목된
+        /// 대상이 없을 때만 LLM에게 무엇을 더 볼지 묻고 재분석한다(호출 2회).
         /// 게이트: probe catalog/템플릿 전용 + 인자 증거-실존 + risk_guard Safe + validator.
         #[arg(long)]
         follow_up: bool,
