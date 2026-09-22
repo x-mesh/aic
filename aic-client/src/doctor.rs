@@ -1457,6 +1457,7 @@ mod tests {
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: Default::default(),
         };
 
         let result = check_provider(&cfg);
@@ -1490,6 +1491,7 @@ mod tests {
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: Default::default(),
         };
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Fail);
@@ -1552,6 +1554,7 @@ mod tests {
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: Default::default(),
         };
         let result = check_provider(&cfg);
         assert_eq!(result.status, Status::Warn);
@@ -1620,6 +1623,7 @@ mod tests {
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: Default::default(),
         };
         let path = cfg
             .server

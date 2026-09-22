@@ -84,6 +84,7 @@ fn arb_app_config() -> impl Strategy<Value = AppConfig> {
                     rca: RcaConfig::default(),
                     outbound: OutboundConfig::default(),
                     rca_agent: RcaAgentConfig::default(),
+                    jev: JevConfig::default(),
                 }
             },
         )

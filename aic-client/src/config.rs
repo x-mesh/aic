@@ -85,6 +85,7 @@ impl ConfigManager {
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: aic_common::JevConfig::default(),
         }
     }
 }
@@ -399,6 +400,7 @@ boundary_strategy = { method = "prompt_marker" }
             rca: aic_common::RcaConfig::default(),
             outbound: aic_common::OutboundConfig::default(),
             rca_agent: aic_common::RcaAgentConfig::default(),
+            jev: aic_common::JevConfig::default(),
         })
     }
 

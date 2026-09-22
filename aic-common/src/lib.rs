@@ -347,6 +347,54 @@ pub struct AppConfig {
     /// rca-agent(커널 eBPF evidence collector) pull 연동 설정. 레거시 호환 default — 미설정 시 비활성.
     #[serde(default)]
     pub rca_agent: RcaAgentConfig,
+    /// 분류 전용 모델(TypeSafe Jev) 설정. 레거시 호환 default — 미설정 시 비활성.
+    #[serde(default)]
+    pub jev: JevConfig,
+}
+
+/// 분류 전용 모델 설정.
+///
+/// 생성형 LLM과 별개다. 닫힌 선택지에서 하나를 고르는 일에만 쓰며, 문장을 만들지 않는다.
+/// 기본 비활성 — 외부로 명령 출력을 보내는 일이라 명시적 opt-in을 유지한다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JevConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_jev_endpoint")]
+    pub endpoint: String,
+    /// 평문 또는 `keychain:<name>` 참조. 비어 있으면 `JEV_API_KEY` 환경변수를 본다.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_jev_model")]
+    pub model: String,
+    /// 한 번의 분류에 기다릴 최대 시간. 넘으면 분류 없이 진행한다 — 분류는 부가 정보이지
+    /// 분석의 전제가 아니므로, 외부 서비스가 느리다고 로컬 분석까지 막으면 안 된다.
+    #[serde(default = "default_jev_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_jev_endpoint(),
+            api_key: None,
+            model: default_jev_model(),
+            timeout_secs: default_jev_timeout_secs(),
+        }
+    }
+}
+
+fn default_jev_endpoint() -> String {
+    "https://api.typesafe.ai/v1/systemone".to_string()
+}
+
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
+}
+
+fn default_jev_timeout_secs() -> u64 {
+    5
 }
 
 /// RCA 워크플로 설정 (SRE).
@@ -1309,6 +1357,7 @@ mod tests {
             rca: RcaConfig::default(),
             outbound: OutboundConfig::default(),
             rca_agent: RcaAgentConfig::default(),
+            jev: JevConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AppConfig = serde_json::from_str(&json).unwrap();
