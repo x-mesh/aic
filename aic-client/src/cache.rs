@@ -21,6 +21,11 @@ pub struct CachedAnalysis {
     pub provider: String,
     pub model: String,
     pub result: AnalysisResult,
+    /// 분류기가 붙인 원인 계열. 같은 실패를 두 번째로 볼 때 이 줄이 사라지면 사용자는 기능이
+    /// 꺼졌다고 읽는다 — 분류는 캐시 적중 시 다시 돌지 않으므로 여기 함께 남긴다.
+    /// 기존 캐시 파일과 호환되도록 default.
+    #[serde(default)]
+    pub cause: Option<String>,
 }
 
 /// 캐시 디렉토리 (`~/.cache/aic/analyses`).
@@ -170,6 +175,7 @@ mod tests {
             provider: "test".into(),
             model: "test-model".into(),
             result: make_result(),
+            cause: None,
         };
         save_to(temp.path(), &cached).unwrap();
         let loaded = load_from(temp.path(), &cached.key).unwrap();
@@ -186,6 +192,7 @@ mod tests {
             provider: "x".into(),
             model: "y".into(),
             result: make_result(),
+            cause: None,
         };
         save_to(temp.path(), &cached).unwrap();
         let path = temp.path().join(format!("{}.json", cached.key));
@@ -194,5 +201,49 @@ mod tests {
         let loaded = load_from(temp.path(), &cached.key);
         assert!(loaded.is_none());
         assert!(!path.exists()); // 자동 삭제 확인
+    }
+
+    #[test]
+    fn an_old_cache_file_without_a_cause_still_loads() {
+        // 이 필드는 나중에 생겼다. 기존 캐시가 역직렬화에서 깨지면 사용자는 이유 없이 모든
+        // 분석을 다시 돌리게 된다.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let legacy = serde_json::json!({
+            "key": "k1",
+            "cached_at": "2026-09-23T00:00:00Z",
+            "provider": "p",
+            "model": "m",
+            "result": {"explanation": "e", "suggested_command": null, "additional_info": null}
+        });
+        std::fs::create_dir_all(dir.path()).expect("mkdir");
+        std::fs::write(dir.path().join("k1.json"), legacy.to_string()).expect("write");
+        let hit = load_from(dir.path(), "k1").expect("로드됨");
+        assert!(hit.cause.is_none());
+        assert_eq!(hit.result.explanation, "e");
+    }
+
+    #[test]
+    fn a_saved_cause_survives_the_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cached = CachedAnalysis {
+            key: "k2".to_string(),
+            cached_at: Utc::now(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            cause: Some("tls".to_string()),
+            result: AnalysisResult {
+                explanation: "e".to_string(),
+                suggested_command: None,
+                additional_info: None,
+            },
+        };
+        save_to(dir.path(), &cached).expect("save");
+        assert_eq!(
+            load_from(dir.path(), "k2")
+                .expect("로드됨")
+                .cause
+                .as_deref(),
+            Some("tls")
+        );
     }
 }

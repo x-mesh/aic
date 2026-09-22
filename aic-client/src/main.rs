@@ -10773,6 +10773,14 @@ async fn handle_record(
                 let age_min = (chrono::Utc::now() - hit.cached_at).num_minutes();
                 debug_log!("cache    HIT key={cache_key} age={age_min}min");
                 println!("{COL_DIM}(캐시 — {age_min}분 전 분석){COL_RESET}");
+                // 분류는 캐시 적중 시 다시 돌지 않는다. 저장해 둔 값을 그대로 보여 줘야 같은
+                // 실패에서 줄이 나타났다 사라졌다 하지 않는다.
+                if let Some(cause) = &hit.cause {
+                    print_cause_line(&aic_client::jev::Choice {
+                        value: cause.clone(),
+                        confidence: None,
+                    });
+                }
                 print_analysis_result(&hit.result, lang);
                 if let Some(cmd) = &hit.result.suggested_command {
                     maybe_run_suggested(cmd, lang);
@@ -10913,6 +10921,7 @@ async fn handle_record(
                         provider: provider_name.to_string(),
                         model: model_name.to_string(),
                         result: result.clone(),
+                        cause: cause.as_ref().map(|c| c.value.clone()),
                     });
                     print_analysis_result(&result, lang);
                     if let Some(cmd) = &result.suggested_command {
