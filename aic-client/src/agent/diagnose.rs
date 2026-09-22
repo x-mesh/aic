@@ -1337,6 +1337,14 @@ fn scan_fd(body: &str) -> Vec<String> {
 /// 입력은 [`super::proc_fd::render`]의 출력이다: `per-proc limit: N` 한 줄(모르면 없음) + `FD PID
 /// COMMAND` 표. 한도 줄이 없으면 절대량 축만 적용한다 — 분모를 모르면서 비율을 지어내지 않는다.
 fn scan_proc_fd(body: &str) -> Vec<String> {
+    scan_proc_fd_rows(body)
+        .into_iter()
+        .map(|(_, msg)| msg)
+        .collect()
+}
+
+/// [`scan_proc_fd`]의 (pid, 메시지) 형태. 경고 PID를 쓰는 쪽이 메시지를 다시 파싱하지 않게 한다.
+fn scan_proc_fd_rows(body: &str) -> Vec<(u64, String)> {
     let mut limit: Option<u64> = None;
     let mut out = Vec::new();
 
@@ -1362,24 +1370,43 @@ fn scan_proc_fd(body: &str) -> Vec<String> {
 
         let pct = limit.map(|m| fd.saturating_mul(100) / m);
         if let Some(p) = pct.filter(|p| *p >= PROC_FD_PCT_WARN) {
-            out.push(format!(
+            out.push((
+                pid,
+                format!(
                 "{name}(pid {pid}) fd {fd}개 — 프로세스 한도의 {p}% (>= {PROC_FD_PCT_WARN}%) — \
                  'Too many open files'로 곧 죽을 수 있다"
+            ),
             ));
         } else if fd >= PROC_FD_ABS_WARN {
             let ratio = pct
                 .map(|p| format!("OS 한도로는 {p}%라 여유롭지만"))
                 .unwrap_or_else(|| "OS 한도는 확인하지 못했으나".to_string());
-            out.push(format!(
+            out.push((pid, format!(
                 "{name}(pid {pid}) fd {fd}개 — {ratio} 절대량이 비정상적이다(>= {PROC_FD_ABS_WARN}). \
                  애플리케이션 자체 fd 예산이 포화일 수 있으니 증가 추세를 확인하라"
-            ));
+            )));
         }
         if out.len() >= PROC_FD_FINDING_CAP {
             break;
         }
     }
     out
+}
+
+/// `proc_fd_top` 섹션에서 스캐너가 경고한 PID(표 순서, 최대 [`PROC_FD_FINDING_CAP`]개).
+///
+/// follow-up 후보를 스캐너 판정으로 좁히는 쪽(eval 하네스)이 finding 메시지를 파싱하지 않도록 연다.
+/// 수치를 한도와 견주는 판단은 [`scan_proc_fd_rows`] 한 곳에만 있어야 한다.
+pub fn scanned_proc_fd_pids(evidence: &str) -> Vec<u64> {
+    iter_sections(evidence)
+        .iter()
+        .filter(|(name, _)| *name == "proc_fd_top")
+        .flat_map(|(_, body)| {
+            scan_proc_fd_rows(section_stdout(body))
+                .into_iter()
+                .map(|(pid, _)| pid)
+        })
+        .collect()
 }
 
 fn scan_swap(body: &str) -> Vec<String> {
@@ -2136,6 +2163,17 @@ mod tests {
         assert!(md.contains("## follow-up rejected"));
         assert!(md.contains("형식 위반"));
         assert!(md.contains("## analysis"));
+    }
+
+    #[test]
+    fn scanned_proc_fd_pids_follow_the_scanner_not_the_table() {
+        // 한도 없는 900은 절대량 경고선 아래라 경고가 아니고, 한도 대비 90%인 4242만 경고다. follow-up
+        // 후보를 좁히는 쪽이 이 판정을 그대로 받아야 정상 행을 대상으로 고르지 않는다.
+        let ev = "## proc_fd_top\ncommand: x\nexit_code=0\n--- stdout ---\n\
+per-proc limit: 1000\n     FD     PID COMMAND\n    900   4242 leaky\n    120    301 svcd\n\n--- stderr ---\n\
+## proc_fd_top\ncommand: x\nexit_code=0\n--- stdout ---\n     FD     PID COMMAND\n    900    905 mid2\n\n--- stderr ---\n";
+        assert_eq!(scanned_proc_fd_pids(ev), vec![4242]);
+        assert!(scanned_proc_fd_pids("## disk\n/dev/sda1 100G 95G 5G 95% /\n").is_empty());
     }
 
     #[test]
