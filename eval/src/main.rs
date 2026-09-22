@@ -4,6 +4,8 @@
 
 mod arms;
 mod confidence;
+mod followup;
+mod followup_scoring;
 mod judge_scoring;
 mod judgment;
 mod scenario;
@@ -81,6 +83,34 @@ enum Command {
         data: PathBuf,
         #[arg(long, default_value = "jev")]
         arm: String,
+    },
+    /// follow-up 번들의 정답 줄이 게이트를 통과하고 후보 추출이 정답을 포함하는지 확인한다. 네트워크 없음.
+    FollowupValidate {
+        #[arg(long, default_value = "data/followup-bundles.json")]
+        data: PathBuf,
+    },
+    /// follow-up 선택을 Jev와 LLM으로 돌려 원시 결과를 남긴다.
+    FollowupRun {
+        #[arg(long, default_value = "data/followup-bundles.json")]
+        data: PathBuf,
+        /// jev | llm. 여러 번 줄 수 있다.
+        #[arg(long = "arm", required = true)]
+        arms: Vec<String>,
+        #[arg(long)]
+        split: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+        #[arg(long, default_value = "target/followup.jsonl")]
+        out: PathBuf,
+        #[arg(long, default_value = "jev-1.13.0")]
+        jev_model: String,
+        #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+        llm_model: String,
+    },
+    /// follow-up 원시 결과를 집계한다. 네트워크 없음.
+    FollowupScore {
+        #[arg(long, default_value = "target/followup.jsonl")]
+        results: PathBuf,
     },
     /// 범주별로 어떤 probe가 붙는지 보여준다. 필수 집합을 정할 때 쓴다.
     Probes {
@@ -166,6 +196,28 @@ async fn main() -> Result<()> {
             confidence::adaptive_report(&records, &ds, &arm);
             Ok(())
         }
+        Command::FollowupValidate { data } => followup_validate(&data),
+        Command::FollowupRun {
+            data,
+            arms,
+            split,
+            repeats,
+            out,
+            jev_model,
+            llm_model,
+        } => {
+            followup_run(
+                &data,
+                &arms,
+                split.as_deref(),
+                repeats,
+                &out,
+                &jev_model,
+                &llm_model,
+            )
+            .await
+        }
+        Command::FollowupScore { results } => followup_score(&results),
         Command::Probes { category, docker } => show_probes(category.as_deref(), docker),
         Command::Score {
             results,
@@ -816,4 +868,213 @@ fn git_revision() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn followup_validate(data: &std::path::Path) -> Result<()> {
+    let ds = followup::FollowupDataset::load(data)?;
+    let (dev, fin, none) = ds.counts();
+    println!(
+        "✔ {} 번들 (dev {dev} / final {fin}), 신호 없음 {none}",
+        ds.bundles.len()
+    );
+    println!("  모든 정답 줄이 게이트를 통과하고 후보 추출이 정답을 포함합니다.");
+    Ok(())
+}
+
+async fn followup_run(
+    data: &std::path::Path,
+    arm_names: &[String],
+    split: Option<&str>,
+    repeats: u32,
+    out: &std::path::Path,
+    jev_model: &str,
+    llm_model: &str,
+) -> Result<()> {
+    use arms::jev_followup::FollowupClient;
+    use arms::llm_followup::LlmFollowupArm;
+    use followup_scoring::FollowupRecord;
+
+    let ds = followup::FollowupDataset::load(data)?;
+    let want = match split {
+        None => None,
+        Some("dev") => Some(followup::Split::Dev),
+        Some("final") => Some(followup::Split::Final),
+        Some(o) => bail!("알 수 없는 split: {o}"),
+    };
+    let bundles: Vec<&followup::Bundle> = ds
+        .bundles
+        .iter()
+        .filter(|b| want.is_none_or(|w| b.split == w))
+        .collect();
+    if bundles.is_empty() {
+        bail!("실행할 번들이 없습니다");
+    }
+    let mut jev: Option<FollowupClient> = None;
+    let mut llm: Option<LlmFollowupArm> = None;
+    for a in arm_names {
+        match a.as_str() {
+            "jev" => jev = Some(FollowupClient::from_env(jev_model)?),
+            "llm" => llm = Some(LlmFollowupArm::from_config(Some(llm_model))?),
+            o => bail!("알 수 없는 비교군: {o}"),
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::File::create(out)?;
+    let total = bundles.len() * arm_names.len() * repeats as usize;
+    let mut done = 0usize;
+    for rep in 1..=repeats {
+        for b in &bundles {
+            let hash = scoring::input_hash(&b.evidence);
+            if let Some(c) = &jev {
+                let o = c.choose(&b.evidence).await;
+                let rec = FollowupRecord {
+                    bundle_id: b.id.clone(),
+                    split: b.split,
+                    arm: "jev".into(),
+                    repeat: rep,
+                    model: Some(c.model().to_string()),
+                    question_version: Some(arms::jev_followup::QUESTION_VERSION.into()),
+                    input_sha256: hash.clone(),
+                    accepted: b.accepted.clone(),
+                    jev: Some(o),
+                    llm: None,
+                };
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if let Some(a) = &llm {
+                let o = a.choose(b.symptom.as_deref(), &b.evidence).await;
+                let rec = FollowupRecord {
+                    bundle_id: b.id.clone(),
+                    split: b.split,
+                    arm: "llm".into(),
+                    repeat: rep,
+                    model: Some(a.identity().to_string()),
+                    question_version: None,
+                    input_sha256: hash,
+                    accepted: b.accepted.clone(),
+                    jev: None,
+                    llm: Some(o),
+                };
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if done.is_multiple_of(5) || done == total {
+                eprintln!("  {done}/{total}");
+            }
+        }
+    }
+    println!("✔ {done}건을 {}에 기록했습니다", out.display());
+    Ok(())
+}
+
+fn followup_score(results: &std::path::Path) -> Result<()> {
+    use followup_scoring::{summarize, FollowupRecord};
+    let raw = std::fs::read_to_string(results)
+        .with_context(|| format!("결과를 읽지 못했습니다: {}", results.display()))?;
+    let records: Vec<FollowupRecord> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    if records.is_empty() {
+        bail!("결과가 비어 있습니다");
+    }
+    let mut arms: Vec<String> = records.iter().map(|r| r.arm.clone()).collect();
+    arms.sort();
+    arms.dedup();
+    println!(
+        "{:<6} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>8}",
+        "비교군",
+        "n",
+        "top1",
+        "top3",
+        "none정답",
+        "실패율",
+        "게이트거부",
+        "p50(ms)",
+        "p95(ms)",
+        "입력토큰"
+    );
+    for a in &arms {
+        let s = summarize(a, &records);
+        println!(
+            "{:<6} {:>4} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>10} {:>9} {:>9} {:>8}",
+            s.arm,
+            s.n,
+            s.top1_correct,
+            s.top3_correct,
+            s.none_correct,
+            s.failure_rate,
+            s.gate_reject_rate
+                .map_or("-".to_string(), |g| format!("{g:.3}")),
+            s.latency_p50_ms,
+            s.latency_p95_ms,
+            s.total_input_tokens
+        );
+    }
+    println!();
+    println!(
+        "(top1/top3는 신호 있는 사례 기준, none정답은 신호 없는 사례 기준. 실패는 오답으로 센다.)"
+    );
+    let repeats = records.iter().map(|r| r.repeat).max().unwrap_or(1);
+    if repeats > 1 {
+        println!();
+        println!("반복 일치율 (같은 번들 {repeats}회, 첫 선택이 전부 같은 비율)");
+        for a in &arms {
+            match followup_scoring::repeat_agreement(a, &records) {
+                Some((rate, n)) => println!("  {a:<6} {rate:.3} (번들 {n}개)"),
+                None => println!("  {a:<6} 반복 없음"),
+            }
+        }
+    }
+    // 사례별 대조 — 어디서 갈리는지 보려면 줄 단위가 필요하다.
+    println!();
+    println!("사례별 (1회차)");
+    let mut ids: Vec<&str> = records.iter().map(|r| r.bundle_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        let mut cells = Vec::new();
+        let mut accepted: &[String] = &[];
+        for a in &arms {
+            if let Some(r) = records
+                .iter()
+                .find(|r| r.bundle_id == id && r.arm == *a && r.repeat == 1)
+            {
+                accepted = &r.accepted;
+                let got = match (&r.jev, &r.llm) {
+                    (Some(j), _) => j
+                        .line
+                        .clone()
+                        .or_else(|| j.template.clone())
+                        .or_else(|| j.error.clone())
+                        .unwrap_or_default(),
+                    (_, Some(l)) => l.accepted_lines.first().cloned().unwrap_or_else(|| {
+                        if l.lines.is_empty() {
+                            "(빈 블록)".into()
+                        } else {
+                            format!("(전부 거부) {}", l.lines[0])
+                        }
+                    }),
+                    _ => String::new(),
+                };
+                let ok = if accepted.is_empty() {
+                    got == "none" || got == "(빈 블록)"
+                } else {
+                    accepted.contains(&got)
+                };
+                cells.push(format!("{a}={}{}", if ok { "✔ " } else { "✘ " }, got));
+            }
+        }
+        let truth = if accepted.is_empty() {
+            "none".to_string()
+        } else {
+            accepted.join(" | ")
+        };
+        println!("  {id:<6} 정답[{truth}]  {}", cells.join("   "));
+    }
+    Ok(())
 }
