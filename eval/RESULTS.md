@@ -622,3 +622,113 @@ LLM 비교군은 `aic` 설정의 `ai-mesh` provider를 쓴다. `--llm-model`로 
 
 - `results/followup-dev-20260922.jsonl.gz` — 개발 10 × 2 비교군 × 1회 = 20건
 - `results/followup-final-20260922.jsonl.gz` — 최종 16 × 2 비교군 × 3회 = 96건
+
+---
+
+# Jev follow-up 선택 평가 — 2라운드 (후보를 좁힌 뒤)
+
+> 실행일: 2026-09-22 · 구현 기준: `be40f7d` 이후 작업 트리
+> 데이터: `data/followup-bundles.json`(생성기 `data/gen-followup-bundles.py`, seed 20260922), 62 번들(개발 24 / 최종 38)
+> 모델: Jev `jev-latest`(응답 `jev-1.13.0`) 질문 버전 `v3`, ai-mesh 프록시 경유 · LLM `ai-mesh/kiro/gpt-5.6-luna`(production 프롬프트 그대로)
+> 규칙 비교군 `rules-v1`: 결정적 후보의 첫 항목을 고정 우선순위로 고른다(네트워크 없음)
+> 결론과 배운 것은 [`docs/PROBE-FOLLOWUP-EVALUATION.md`](../docs/PROBE-FOLLOWUP-EVALUATION.md)의 "2라운드" 절
+
+1라운드와 달리 인자 후보가 **문제 행**으로 좁혀져 있다: `proc_fd`는 `scan_proc_fd` 경고 PID만,
+docker/k8s는 STATUS가 정상이 아닌 행만. 정답 집합은 그 후보 집합과 같고 `followup-validate`가
+동일성을 검사한다. 따라서 규칙 비교군의 1.000은 구성상 보장된 값이다.
+
+## 최종 분할 38 번들(신호 29 / 없음 9), 1회차
+
+| 비교군 | top-1 | top-3 | none 정답 | 실패율 | 게이트 거부 | p50 | p95 | 입력 토큰 |
+|---|---|---|---|---|---|---|---|---|
+| rules | 1.000 | 1.000 | 1.000 | 0.000 | — | 0ms | 0ms | 0 |
+| jev | 0.897 | 0.931 | 0.778 | 0.053 | — | 288ms | 365ms | 109,925 |
+| llm | 0.655 | 0.931 | 0.111 | 0.000 | 0.000 | 10,920ms | 25,304ms | 미측정 |
+
+3회 전체(114건)로는 jev p50 278ms / p95 414ms, llm p50 10,198ms / p95 21,604ms. jev 입력 토큰은
+342건 합 329,775(호출당 ≈2,900).
+
+## 개발 분할 24 번들(신호 19 / 없음 5), 1회
+
+| 비교군 | top-1 | none 정답 | p50 | p95 | 입력 토큰 |
+|---|---|---|---|---|---|
+| rules | 1.000 (19/19) | 1.000 (5/5) | 0ms | 0ms | 0 |
+| jev | 1.000 (19/19) | 0.800 (4/5) | 242ms | 288ms | 70,173 |
+
+jev의 유일한 오답 nn-10: 증상 "컨테이너가 이상합니다" + 증거에는 `Completed` pod만 → `none` 대신
+`k8s_events_warning`(confidence 0.41).
+
+## 반복 (최종 38 번들 × 3회)
+
+| 비교군 | 반복 일치율 | 회차별 top-1 | 회차별 none |
+|---|---|---|---|
+| rules | 1.000 | 29/29 · 29/29 · 29/29 | 9/9 × 3 |
+| jev | 0.974 | 26/29 × 3 | 7/9 × 3 |
+| llm | 0.526 | 19/29 · 21/29 · 18/29 | 1/9 · 0/9 · 0/9 |
+
+jev가 흔들린 1건은 nn-09(`k8s_events_warning` 2회 / `k8s_pods_notready` 1회)이며 셋 다 오답이다.
+
+## jev 오답 5 번들 (3회 모두 동일)
+
+| 번들 | trait | 정답 | jev | 템플릿 conf | 인자 conf |
+|---|---|---|---|---|---|
+| fu-05 | multi-target | journal_unit f~l.service (7개) | 실패: 인자 `__none__` | 0.93~0.95 | 0.46~0.53 |
+| kn-03 | multi-target | k8s_node_describe gke-prod-pool-1-{7f2a,9c1b} | 실패: 인자 `__none__` | 0.96~0.97 | 0.32~0.33 |
+| dk-05 | status:paused | docker_* queue | `none` | 0.41~0.44 | — |
+| nn-09 | trap:k8s_pods | none | `k8s_events_warning` / `k8s_pods_notready` | 0.29~0.30 | — |
+| nn-14 | trap:proc_fd_top | none | `proc_fd_top` | 0.39~0.52 | — |
+
+## confidence 분리 (개발+최종 jev 138건)
+
+| 신호 | 정답 | 오답 |
+|---|---|---|
+| 템플릿 confidence | n=122, 중앙값 0.83, 하위 10% 0.42, 최소 0.25 | 의미 오답 10건 0.29~0.50 / 인자 실패 6건 0.93~0.96 |
+| 인자 confidence | n=97, 중앙값 0.99, 최소 0.14 | `__none__` 6건 0.32~0.53 |
+
+템플릿 confidence < 0.55 → 의미 오답 10건 전부 포착(폴백 33/138). 인자 답이 `__none__` → 인자 실패
+6건 전부 포착. 두 신호를 합치면 오답 16건이 모두 걸러진다.
+
+## trait별 첫 선택 정답 (최종 1회차)
+
+| trait | rules | jev | llm |
+|---|---|---|---|
+| signal:proc_fd_top | 8/8 | 8/8 | 3/8 |
+| signal:k8s_pods | 6/6 | 6/6 | 4/6 |
+| signal:docker_ps | 6/6 | 5/6 | 6/6 |
+| signal:failed_units | 6/6 | 5/6 | 4/6 |
+| signal:k8s_nodes | 3/3 | 2/3 | 2/3 |
+| no-signal | 9/9 | 7/9 | 1/9 |
+| multi-target | 8/8 | 6/8 | 7/8 |
+| no-logs | 4/4 | 4/4 | 2/4 |
+| trap:docker_ps | 2/2 | 2/2 | 0/2 |
+| trap:k8s_nodes | 2/2 | 2/2 | 0/2 |
+| trap:k8s_pods | 2/2 | 1/2 | 0/2 |
+| trap:proc_fd_top | 1/1 | 0/1 | 0/1 |
+
+`trap:*`은 신호가 없는 번들에 정상 docker/k8s 표나 정상 `proc_fd_top` 행을 섞은 것이다. llm은 네
+함정 7건에서 전부 정상 행을 대상으로 follow-up을 냈다.
+
+## 비교의 공정성
+
+jev와 rules는 좁힌 후보를 받고, llm은 production 프롬프트의 69개 메뉴를 그대로 받는다. 이 표는
+"후보를 좁힌 시스템 대 현행 production"이며 모델끼리의 비교가 아니다.
+
+## 재현
+
+```sh
+cd eval
+cargo run -- followup-validate --data data/followup-bundles.json
+cargo run --release -- followup-run --arm rules --out target/followup2-rules.jsonl        # 네트워크 없음
+JEV_API_KEY=... JEV_ENDPOINT=... cargo run --release -- followup-run \
+  --arm rules --arm jev --arm llm --jev-model jev-latest --split final --repeats 3 \
+  --out target/followup2-final.jsonl
+cargo run --release -- followup-score --results target/followup2-final.jsonl
+```
+
+`JEV_ENDPOINT`를 생략하면 TypeSafe 직접 호출(`https://api.typesafe.ai/v1/systemone`)이다. 키는
+`JEV_API_KEY`, 없으면 `TYPESAFE_API_KEY`를 읽는다.
+
+## 보존물
+
+- `results/followup2-dev-20260922.jsonl.gz` — 개발 24 × (rules, jev) × 1회 = 48건
+- `results/followup2-final-20260922.jsonl.gz` — 최종 38 × (rules, jev, llm) × 3회 = 342건
