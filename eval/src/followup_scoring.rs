@@ -4,6 +4,8 @@
 //! 그것을 맞힌 것이다. 실패(API 오류, 목록 밖, 인자 후보 없음)는 오답으로 센다 — 실패를 빼면
 //! 실패가 잦은 비교군이 좋아 보인다.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::arms::jev_followup::{top_templates, FollowupOutcome, NONE_CHOICE};
@@ -20,6 +22,10 @@ pub struct FollowupRecord {
     pub question_version: Option<String>,
     pub input_sha256: String,
     pub accepted: Vec<String>,
+    /// 번들의 trait(신호 계열, 함정 종류). 계열별 표를 만들 때 쓴다. 1라운드 기록에는 없다.
+    #[serde(default)]
+    pub traits: Vec<String>,
+    /// Jev 또는 규칙 비교군의 결과. 규칙 비교군은 Jev와 같은 형태로 기록한다(`arm`으로 구분).
     pub jev: Option<FollowupOutcome>,
     pub llm: Option<LlmFollowupOutcome>,
 }
@@ -56,6 +62,36 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[((sorted.len() as f64 - 1.0) * p).round() as usize]
 }
 
+/// 첫 선택의 정오. 신호 없는 번들은 "불필요"를 맞혔는지로, 실패는 오답으로 본다.
+pub fn first_pick_ok(r: &FollowupRecord) -> bool {
+    let is_none = r.accepted.is_empty();
+    match (&r.jev, &r.llm) {
+        (Some(j), _) => {
+            if j.is_failure() {
+                return false;
+            }
+            if is_none {
+                j.template.as_deref() == Some(NONE_CHOICE)
+            } else {
+                j.line.as_ref().is_some_and(|l| r.accepted.contains(l))
+            }
+        }
+        (_, Some(l)) => {
+            if l.error.is_some() {
+                return false;
+            }
+            if is_none {
+                l.lines.is_empty()
+            } else {
+                l.accepted_lines
+                    .first()
+                    .is_some_and(|f| r.accepted.contains(f))
+            }
+        }
+        _ => false,
+    }
+}
+
 pub fn summarize(arm: &str, records: &[FollowupRecord]) -> ArmSummary {
     let mine: Vec<&FollowupRecord> = records
         .iter()
@@ -81,6 +117,14 @@ pub fn summarize(arm: &str, records: &[FollowupRecord]) -> ArmSummary {
         } else {
             s.signal_n += 1;
         }
+        let ok = first_pick_ok(r);
+        if is_none {
+            if ok {
+                none_ok += 1;
+            }
+        } else if ok {
+            top1 += 1;
+        }
         if let Some(j) = &r.jev {
             lat.push(j.latency_ms);
             s.total_input_tokens += j.input_tokens.unwrap_or(0);
@@ -88,18 +132,10 @@ pub fn summarize(arm: &str, records: &[FollowupRecord]) -> ArmSummary {
                 failures += 1;
                 continue;
             }
-            if is_none {
-                if j.template.as_deref() == Some(NONE_CHOICE) {
-                    none_ok += 1;
-                }
-                continue;
-            }
-            if j.line.as_ref().is_some_and(|l| r.accepted.contains(l)) {
-                top1 += 1;
-            }
-            if top_templates(j, 3)
-                .iter()
-                .any(|t| accepted_templates.contains(&t.as_str()))
+            if !is_none
+                && top_templates(j, 3)
+                    .iter()
+                    .any(|t| accepted_templates.contains(&t.as_str()))
             {
                 top3 += 1;
             }
@@ -112,22 +148,11 @@ pub fn summarize(arm: &str, records: &[FollowupRecord]) -> ArmSummary {
                 failures += 1;
                 continue;
             }
-            if is_none {
-                if l.lines.is_empty() {
-                    none_ok += 1;
-                }
-                continue;
-            }
-            if l.accepted_lines
-                .first()
-                .is_some_and(|f| r.accepted.contains(f))
-            {
-                top1 += 1;
-            }
-            if l.accepted_lines
-                .iter()
-                .take(3)
-                .any(|f| r.accepted.contains(f))
+            if !is_none
+                && l.accepted_lines
+                    .iter()
+                    .take(3)
+                    .any(|f| r.accepted.contains(f))
             {
                 top3 += 1;
             }
@@ -158,6 +183,25 @@ pub fn summarize(arm: &str, records: &[FollowupRecord]) -> ArmSummary {
     s.latency_p50_ms = percentile(&lat, 0.50);
     s.latency_p95_ms = percentile(&lat, 0.95);
     s
+}
+
+/// `(trait, 정답 수, n)` 행들.
+pub type TraitRows = Vec<(String, usize, usize)>;
+
+/// trait별 첫 선택 정답 수(1회차), trait 이름순. 어느 계열·함정에서 갈리는지 본다.
+pub fn by_trait(arm: &str, records: &[FollowupRecord]) -> TraitRows {
+    let mut acc: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for r in records.iter().filter(|r| r.arm == arm && r.repeat == 1) {
+        let ok = first_pick_ok(r);
+        for t in &r.traits {
+            let e = acc.entry(t.clone()).or_default();
+            e.1 += 1;
+            if ok {
+                e.0 += 1;
+            }
+        }
+    }
+    acc.into_iter().map(|(t, (c, n))| (t, c, n)).collect()
 }
 
 /// 같은 번들을 여러 번 물었을 때 첫 선택이 같은 비율. `(일치 비율, 반복이 있는 번들 수)`.

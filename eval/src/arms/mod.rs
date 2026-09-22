@@ -10,6 +10,7 @@ pub mod jev_judge;
 pub mod llm;
 pub mod llm_followup;
 pub mod rules;
+pub mod rules_followup;
 
 use std::collections::BTreeMap;
 

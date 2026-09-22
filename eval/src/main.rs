@@ -93,7 +93,7 @@ enum Command {
     FollowupRun {
         #[arg(long, default_value = "data/followup-bundles.json")]
         data: PathBuf,
-        /// jev | llm. 여러 번 줄 수 있다.
+        /// jev | llm | rules. 여러 번 줄 수 있다. rules는 결정적 후보의 첫 항목을 고르는 비교군(네트워크 없음).
         #[arg(long = "arm", required = true)]
         arms: Vec<String>,
         #[arg(long)]
@@ -877,7 +877,7 @@ fn followup_validate(data: &std::path::Path) -> Result<()> {
         "✔ {} 번들 (dev {dev} / final {fin}), 신호 없음 {none}",
         ds.bundles.len()
     );
-    println!("  모든 정답 줄이 게이트를 통과하고 후보 추출이 정답을 포함합니다.");
+    println!("  모든 정답이 결정적 후보 집합과 같고 게이트를 통과합니다.");
     Ok(())
 }
 
@@ -911,10 +911,12 @@ async fn followup_run(
     }
     let mut jev: Option<FollowupClient> = None;
     let mut llm: Option<LlmFollowupArm> = None;
+    let mut rules = false;
     for a in arm_names {
         match a.as_str() {
             "jev" => jev = Some(FollowupClient::from_env(jev_model)?),
             "llm" => llm = Some(LlmFollowupArm::from_config(Some(llm_model))?),
+            "rules" => rules = true,
             o => bail!("알 수 없는 비교군: {o}"),
         }
     }
@@ -927,6 +929,24 @@ async fn followup_run(
     for rep in 1..=repeats {
         for b in &bundles {
             let hash = scoring::input_hash(&b.evidence);
+            if rules {
+                let o = arms::rules_followup::choose(&b.evidence);
+                let rec = FollowupRecord {
+                    bundle_id: b.id.clone(),
+                    split: b.split,
+                    arm: "rules".into(),
+                    repeat: rep,
+                    model: Some(arms::rules_followup::RULES_VERSION.into()),
+                    question_version: None,
+                    input_sha256: hash.clone(),
+                    accepted: b.accepted.clone(),
+                    traits: b.traits.clone(),
+                    jev: Some(o),
+                    llm: None,
+                };
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
             if let Some(c) = &jev {
                 let o = c.choose(&b.evidence).await;
                 let rec = FollowupRecord {
@@ -938,6 +958,7 @@ async fn followup_run(
                     question_version: Some(arms::jev_followup::QUESTION_VERSION.into()),
                     input_sha256: hash.clone(),
                     accepted: b.accepted.clone(),
+                    traits: b.traits.clone(),
                     jev: Some(o),
                     llm: None,
                 };
@@ -955,6 +976,7 @@ async fn followup_run(
                     question_version: None,
                     input_sha256: hash,
                     accepted: b.accepted.clone(),
+                    traits: b.traits.clone(),
                     jev: None,
                     llm: Some(o),
                 };
@@ -1028,6 +1050,30 @@ fn followup_score(results: &std::path::Path) -> Result<()> {
                 Some((rate, n)) => println!("  {a:<6} {rate:.3} (번들 {n}개)"),
                 None => println!("  {a:<6} 반복 없음"),
             }
+        }
+    }
+    // trait별 — 어느 계열·함정에서 갈리는지. 1라운드 기록에는 trait이 없어 표가 비어 있다.
+    let traits: std::collections::BTreeSet<String> = records
+        .iter()
+        .flat_map(|r| r.traits.iter().cloned())
+        .collect();
+    if !traits.is_empty() {
+        let per_arm: Vec<(String, followup_scoring::TraitRows)> = arms
+            .iter()
+            .map(|a| (a.clone(), followup_scoring::by_trait(a, &records)))
+            .collect();
+        println!();
+        println!("trait별 첫 선택 정답 (1회차)");
+        for t in &traits {
+            let cells: Vec<String> = per_arm
+                .iter()
+                .map(|(a, rows)| {
+                    rows.iter()
+                        .find(|(x, _, _)| x == t)
+                        .map_or(format!("{a} -"), |(_, c, n)| format!("{a} {c}/{n}"))
+                })
+                .collect();
+            println!("  {t:<28} {}", cells.join("   "));
         }
     }
     // 사례별 대조 — 어디서 갈리는지 보려면 줄 단위가 필요하다.

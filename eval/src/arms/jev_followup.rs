@@ -4,6 +4,10 @@
 //! `arg:<template>`은 그 템플릿의 인자를 후보 중에서 고르는 Choice다. Jev는 한 forward pass로
 //! 전부 답하므로 왕복은 한 번이다. 후보는 증거의 공백 토큰에서 결정적으로 뽑았으므로 무엇을 고르든
 //! 게이트를 통과한다 — Jev는 생성하지 않고 고르기만 한다.
+//!
+//! v3(2라운드): 후보가 있는 템플릿만 메뉴에 올린다. 후보는 문제가 드러난 행으로 좁혀져 있으므로
+//! (`followup::candidates`), Jev의 몫은 "어느 템플릿을(또는 none을) 고르는가"다. 수치를 한도와 견주는
+//! 판단은 스캐너가 이미 했다.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -20,7 +24,7 @@ const TEMPLATE_QUESTION: &str = "template";
 pub const NONE_CHOICE: &str = "none";
 /// 인자 질문의 "이 중 대상이 없다" 선택지. 후보가 하나뿐일 때도 Choice가 두 선택지를 갖게 한다.
 const NO_TARGET: &str = "__none__";
-pub const QUESTION_VERSION: &str = "v2";
+pub const QUESTION_VERSION: &str = "v3";
 const MAX_ATTEMPTS: u32 = 4;
 const BASE_BACKOFF_MS: u64 = 500;
 /// 컨텍스트 한계(state + 가장 긴 질문 32k) 안에 보수적으로 두는 예산.
@@ -85,10 +89,14 @@ pub fn build_questions(evidence: &str) -> Value {
         NONE_CHOICE.to_string(),
         "추가로 돌릴 probe가 없다. 1차 증거만으로 충분하거나, 아래 어느 템플릿도 지금 증거가 가리키는 대상에 맞지 않는다.".to_string(),
     );
-    // LLM 프롬프트의 메뉴와 같은 선택지를 준다: 인자형 템플릿 10개 + catalog probe 59개. 템플릿만
-    // 주면 Jev는 "넓은 probe를 하나 더 돌린다"는 선택을 할 수 없어 LLM과 비교가 기울어진다.
+    // catalog probe 59개는 인자가 없으니 늘 올린다 — 템플릿만 주면 Jev는 "넓은 probe를 하나 더
+    // 돌린다"는 선택을 할 수 없어 LLM과 비교가 기울어진다. 인자형 템플릿은 후보가 있는 것만 올린다:
+    // 후보 없는 템플릿은 골라도 실행할 수 없고, 1라운드에서 그 자리를 정상 행으로 채우는 오답이 나왔다.
+    let cands = candidates(evidence);
     for (id, desc) in followup_templates() {
-        template_criteria.insert(id.to_string(), format!("[인자 필요] {desc}"));
+        if cands.contains_key(id) {
+            template_criteria.insert(id.to_string(), format!("[인자 필요] {desc}"));
+        }
     }
     for (id, desc) in probe_descriptions() {
         template_criteria.insert(id.to_string(), desc.to_string());
@@ -102,7 +110,7 @@ pub fn build_questions(evidence: &str) -> Value {
             "criteria": template_criteria,
         }),
     );
-    for (tmpl, cands) in candidates(evidence) {
+    for (tmpl, cands) in cands {
         let mut criteria: BTreeMap<String, String> = BTreeMap::new();
         criteria.insert(NO_TARGET.to_string(), "이 중에는 대상이 없다".to_string());
         for c in &cands {
@@ -324,16 +332,16 @@ mod tests {
     }
 
     #[test]
-    fn template_criteria_match_the_llm_menu_plus_none() {
-        // 템플릿 10 + catalog 59 + none. LLM이 받는 메뉴와 같은 크기여야 비교가 공정하다.
+    fn template_menu_is_catalog_plus_templates_with_candidates_plus_none() {
+        // catalog 59 + 후보가 있는 템플릿(journal_unit) + none. 후보 없는 템플릿은 골라도 실행할 수
+        // 없어 올리지 않는다.
         let q = build_questions(EV);
         let crit = q["template"]["criteria"].as_object().unwrap();
-        assert_eq!(
-            crit.len(),
-            template_ids().len() + probe_descriptions().len() + 1
-        );
+        assert_eq!(crit.len(), probe_descriptions().len() + 2);
         assert!(crit.contains_key(NONE_CHOICE));
         assert!(crit.contains_key("journal_errors"));
+        assert!(crit.contains_key("journal_unit"));
+        assert!(!crit.contains_key("proc_fd"));
     }
 
     #[test]
