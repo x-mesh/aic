@@ -42,7 +42,9 @@ cargo run -- score --results target/results
 ## 환경변수
 
 - `TYPESAFE_API_KEY` — Jev 비교군에 필요하다.
-- LLM 비교군은 `~/.config/aic/config.toml`의 provider 설정을 그대로 쓴다.
+- LLM 비교군은 `~/.config/aic/config.toml`의 provider 설정을 쓰고, 모델은
+  `kiro/gpt-5.6-luna`로 고정한다(`--llm-model`로 바꿀 수 있다). provider 기본값에 맡기면 그
+  값이 언제 바뀌었는지 결과만 보고는 알 수 없다.
 
 ## probe를 실행하지 않는다
 

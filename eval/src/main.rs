@@ -3,6 +3,7 @@
 //! probe를 **고르기만** 한다. 고른 명령을 호스트에서 실행하지 않는다.
 
 mod arms;
+mod confidence;
 mod scenario;
 mod scoring;
 
@@ -18,6 +19,9 @@ use scoring::CaseRecord;
 
 const DEFAULT_DATA: &str = "data/scenarios.json";
 const DEFAULT_RESULTS: &str = "target/results.jsonl";
+/// 벤치마크의 LLM 비교군 모델. provider 기본값에 맡기지 않는 이유는 `LlmArm::from_config`
+/// doc 참고 — 언제 바뀌었는지 결과만 보고는 알 수 없다.
+const DEFAULT_LLM_MODEL: &str = "kiro/gpt-5.6-luna";
 /// bootstrap 반복 수. 고정 시드와 함께 쓰므로 실행마다 같은 구간이 나온다.
 const BOOTSTRAP_ITERATIONS: usize = 2000;
 const BOOTSTRAP_SEED: u64 = 20260922;
@@ -56,8 +60,17 @@ enum Command {
         #[arg(long, default_value = "jev-1.13.0")]
         jev_model: String,
         /// LLM 비교군의 모델 ID. config.toml의 provider 설정을 덮어쓴다.
-        #[arg(long)]
-        llm_model: Option<String>,
+        #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+        llm_model: String,
+    },
+    /// confidence를 라우팅 신호로 쓸 수 있는지 분석한다. 새 API 호출이 없다.
+    Confidence {
+        #[arg(long, default_value = DEFAULT_RESULTS)]
+        results: PathBuf,
+        #[arg(long, default_value = DEFAULT_DATA)]
+        data: PathBuf,
+        #[arg(long, default_value = "jev")]
+        arm: String,
     },
     /// 범주별로 어떤 probe가 붙는지 보여준다. 필수 집합을 정할 때 쓴다.
     Probes {
@@ -100,9 +113,17 @@ async fn main() -> Result<()> {
                 repeats,
                 &out,
                 &jev_model,
-                llm_model.as_deref(),
+                Some(llm_model.as_str()),
             )
             .await
+        }
+        Command::Confidence { results, data, arm } => {
+            let records = load_records(&results)?;
+            let ds = Dataset::load(&data)?;
+            confidence::report(&records, &ds, &arm);
+            confidence::top_n_report(&records, &ds, &arm);
+            confidence::adaptive_report(&records, &ds, &arm);
+            Ok(())
         }
         Command::Probes { category, docker } => show_probes(category.as_deref(), docker),
         Command::Score {
@@ -290,7 +311,7 @@ async fn run(
     Ok(())
 }
 
-fn score(results: &std::path::Path, data: &std::path::Path, baseline: &str) -> Result<()> {
+fn load_records(results: &std::path::Path) -> Result<Vec<CaseRecord>> {
     let raw = std::fs::read_to_string(results)
         .with_context(|| format!("결과를 읽지 못했습니다: {}", results.display()))?;
     let records: Vec<CaseRecord> = raw
@@ -302,6 +323,11 @@ fn score(results: &std::path::Path, data: &std::path::Path, baseline: &str) -> R
     if records.is_empty() {
         bail!("결과가 비어 있습니다");
     }
+    Ok(records)
+}
+
+fn score(results: &std::path::Path, data: &std::path::Path, baseline: &str) -> Result<()> {
+    let records = load_records(results)?;
 
     // 반복이 있으면 **최초 실행만** 주 평가로 쓴다(PRD 5절). 여러 번 중 좋은 쪽을 고르거나
     // 평균을 내면, 실제 운영에서 한 번만 묻는 조건보다 관대한 수치가 나온다.
