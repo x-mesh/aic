@@ -166,10 +166,10 @@ impl LlmDispatcher {
         }
     }
 
-    /// 마지막 `send_messages` 호출에서 provider가 보고한 토큰 사용량.
+    /// 마지막 LLM 호출에서 provider가 보고한 토큰 사용량.
     ///
-    /// provider가 `usage`를 싣지 않았거나 아직 호출하지 않았으면 `None`이다. 호출마다 덮어쓰므로
-    /// 순차 호출에서만 의미가 있다.
+    /// `send`·`send_messages` 양쪽이 기록한다. provider가 `usage`를 싣지 않았거나(CLI backend,
+    /// 스트리밍) 아직 호출하지 않았으면 `None`이다. 호출마다 덮어쓰므로 순차 호출에서만 의미가 있다.
     pub fn last_usage(&self) -> Option<crate::agent::types::TokenUsage> {
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -338,6 +338,9 @@ impl LlmDispatcher {
             let _ = crate::audit::append("redact_bypassed", serde_json::json!({}));
             prompt
         };
+
+        // SSE 스트림은 usage를 싣지 않는다. 직전 호출 값이 남으면 이 호출의 비용으로 잘못 집계된다.
+        self.record_usage(None);
 
         let raw = provider
             .api_key
@@ -943,6 +946,7 @@ impl LlmDispatcher {
                 message: format!("응답 파싱 실패: {e}"),
             })?;
 
+        self.record_usage(crate::agent::types::parse_openai_usage(&json));
         extract_openai_content(&json)
     }
 
@@ -1004,6 +1008,7 @@ impl LlmDispatcher {
                 message: format!("응답 파싱 실패: {e}"),
             })?;
 
+        self.record_usage(crate::agent::types::parse_anthropic_usage(&json));
         extract_anthropic_content(&json)
     }
 
@@ -1017,6 +1022,9 @@ impl LlmDispatcher {
     ///   - `claude` / `claude-cli` → `-p <prompt>` (non-interactive print)
     ///   - 그 외 → `<prompt>` (legacy 동작)
     fn send_cli(&self, provider: &ProviderConfig, prompt: &str) -> Result<String, AicError> {
+        // CLI backend는 토큰 사용량을 보고하지 않는다. 직전 HTTP 호출 값이 남아 있으면 이 호출의
+        // 비용으로 잘못 집계되므로 먼저 지운다.
+        self.record_usage(None);
         let cli_path = provider
             .cli_path
             .as_deref()
@@ -1177,6 +1185,25 @@ mod tests {
     use super::*;
     use aic_common::{LlmConfig, ProviderConfig, ProviderType};
     use std::collections::HashMap;
+
+    #[test]
+    fn a_response_without_usage_clears_the_previous_call_value() {
+        // `send`는 이제 사용량을 기록한다. provider가 usage를 빼먹은 응답이 오면 직전 호출 값이
+        // 남아서는 안 된다 — 남으면 이번 호출의 비용으로 잘못 집계된다(CLI backend·스트리밍도 같다).
+        let d = LlmDispatcher::from_config(make_config(
+            ProviderType::OpenAiCompatible,
+            Some("k"),
+            None,
+        ));
+        assert!(d.last_usage().is_none());
+        let with = serde_json::json!({"usage": {"prompt_tokens": 120, "completion_tokens": 7}});
+        d.record_usage(crate::agent::types::parse_openai_usage(&with));
+        let u = d.last_usage().expect("기록됨");
+        assert_eq!((u.input_tokens, u.output_tokens), (120, 7));
+        let without = serde_json::json!({"choices": []});
+        d.record_usage(crate::agent::types::parse_openai_usage(&without));
+        assert!(d.last_usage().is_none(), "직전 값이 남았다");
+    }
 
     fn make_config(
         provider_type: ProviderType,
