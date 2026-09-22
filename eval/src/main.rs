@@ -4,6 +4,8 @@
 
 mod arms;
 mod confidence;
+mod errcause;
+mod errcause_scoring;
 mod followup;
 mod followup_scoring;
 mod judge_scoring;
@@ -106,6 +108,34 @@ enum Command {
         jev_model: String,
         #[arg(long, default_value = DEFAULT_LLM_MODEL)]
         llm_model: String,
+    },
+    /// 원인 범주 데이터셋이 규약을 지키는지 확인한다. 네트워크 없음.
+    ErrcauseValidate {
+        #[arg(long, default_value = "data/errcause-cases.json")]
+        data: PathBuf,
+    },
+    /// 명령 실패의 원인 범주를 규칙·Jev·LLM으로 분류해 원시 결과를 남긴다.
+    ErrcauseRun {
+        #[arg(long, default_value = "data/errcause-cases.json")]
+        data: PathBuf,
+        /// rules | jev | llm. 여러 번 줄 수 있다. rules는 네트워크를 쓰지 않는다.
+        #[arg(long = "arm", required = true)]
+        arms: Vec<String>,
+        #[arg(long)]
+        split: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+        #[arg(long, default_value = "target/errcause.jsonl")]
+        out: PathBuf,
+        #[arg(long, default_value = "jev-latest")]
+        jev_model: String,
+        #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+        llm_model: String,
+    },
+    /// 원인 범주 원시 결과를 집계한다. 네트워크 없음.
+    ErrcauseScore {
+        #[arg(long, default_value = "target/errcause.jsonl")]
+        results: PathBuf,
     },
     /// 실제 `aic diagnose --json`(또는 raw evidence) 파일에서 결정적 follow-up 후보를 뽑아 보여준다.
     /// 합성 데이터가 아닌 진짜 출력에 추출 규칙이 도는지 확인할 때 쓴다. 네트워크 없음.
@@ -224,6 +254,28 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Command::ErrcauseValidate { data } => errcause_validate(&data),
+        Command::ErrcauseRun {
+            data,
+            arms,
+            split,
+            repeats,
+            out,
+            jev_model,
+            llm_model,
+        } => {
+            errcause_run(
+                &data,
+                &arms,
+                split.as_deref(),
+                repeats,
+                &out,
+                &jev_model,
+                &llm_model,
+            )
+            .await
+        }
+        Command::ErrcauseScore { results } => errcause_score(&results),
         Command::FollowupCandidates { files } => followup_candidates(&files),
         Command::FollowupScore { results } => followup_score(&results),
         Command::Probes { category, docker } => show_probes(category.as_deref(), docker),
@@ -1170,6 +1222,221 @@ fn followup_score(results: &std::path::Path) -> Result<()> {
             accepted.join(" | ")
         };
         println!("  {id:<6} 정답[{truth}]  {}", cells.join("   "));
+    }
+    Ok(())
+}
+
+fn errcause_validate(data: &std::path::Path) -> Result<()> {
+    let ds = errcause::ErrCauseDataset::load(data)?;
+    let (dev, fin, multi) = ds.counts();
+    println!(
+        "✔ {} 사례 (dev {dev} / final {fin}), 범주 {}개, 다중 라벨 {multi}건",
+        ds.cases.len(),
+        ds.categories.len()
+    );
+    println!("  모든 사례가 production의 결정적 테이블 밖이고 정답이 범주 목록 안에 있습니다.");
+    Ok(())
+}
+
+async fn errcause_run(
+    data: &std::path::Path,
+    arm_names: &[String],
+    split: Option<&str>,
+    repeats: u32,
+    out: &std::path::Path,
+    jev_model: &str,
+    llm_model: &str,
+) -> Result<()> {
+    use arms::jev_errcause::CauseClient;
+    use arms::llm_errcause::LlmCauseArm;
+    use errcause_scoring::CauseRecord;
+
+    let ds = errcause::ErrCauseDataset::load(data)?;
+    let want = match split {
+        None => None,
+        Some("dev") => Some(errcause::Split::Dev),
+        Some("final") => Some(errcause::Split::Final),
+        Some(o) => bail!("알 수 없는 split: {o}"),
+    };
+    let cases: Vec<&errcause::ErrCase> = ds
+        .cases
+        .iter()
+        .filter(|c| want.is_none_or(|w| c.split == w))
+        .collect();
+    if cases.is_empty() {
+        bail!("실행할 사례가 없습니다");
+    }
+    let mut jev: Option<CauseClient> = None;
+    let mut llm: Option<LlmCauseArm> = None;
+    let mut rules = false;
+    for a in arm_names {
+        match a.as_str() {
+            "jev" => jev = Some(CauseClient::from_env(jev_model)?),
+            "llm" => llm = Some(LlmCauseArm::from_config(Some(llm_model))?),
+            "rules" => rules = true,
+            o => bail!("알 수 없는 비교군: {o}"),
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::File::create(out)?;
+    let total = cases.len() * arm_names.len() * repeats as usize;
+    let mut done = 0usize;
+    for rep in 1..=repeats {
+        for c in &cases {
+            let input = errcause::render_input(c);
+            let hash = scoring::input_hash(&input);
+            let base = |arm: &str, model: Option<String>, qv: Option<String>| CauseRecord {
+                case_id: c.id.clone(),
+                split: c.split,
+                arm: arm.to_string(),
+                repeat: rep,
+                model,
+                question_version: qv,
+                input_sha256: hash.clone(),
+                accepted: c.accepted.clone(),
+                traits: c.traits.clone(),
+                jev: None,
+                llm: None,
+            };
+            if rules {
+                let started = std::time::Instant::now();
+                let picked = arms::rules_errcause::classify(&input);
+                let mut rec = base(
+                    "rules",
+                    Some(arms::rules_errcause::RULES_VERSION.into()),
+                    None,
+                );
+                rec.jev = Some(arms::jev_errcause::CauseOutcome {
+                    category: (picked != arms::rules_errcause::UNKNOWN).then(|| picked.to_string()),
+                    raw_category: Some(picked.to_string()),
+                    attempts: 1,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    error: (picked == arms::rules_errcause::UNKNOWN)
+                        .then(|| "어느 키워드에도 걸리지 않음".to_string()),
+                    ..Default::default()
+                });
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if let Some(client) = &jev {
+                let o = client.classify(&input, &ds.categories).await;
+                let mut rec = base(
+                    "jev",
+                    Some(format!("{}@{}", client.model(), client.endpoint_host())),
+                    Some(arms::jev_errcause::QUESTION_VERSION.into()),
+                );
+                rec.jev = Some(o);
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if let Some(arm) = &llm {
+                let o = arm.classify(&input, &ds.categories).await;
+                let mut rec = base("llm", Some(arm.identity().to_string()), None);
+                rec.llm = Some(o);
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if done.is_multiple_of(10) || done == total {
+                eprintln!("  {done}/{total}");
+            }
+        }
+    }
+    println!("✔ {done}건을 {}에 기록했습니다", out.display());
+    Ok(())
+}
+
+fn errcause_score(results: &std::path::Path) -> Result<()> {
+    use errcause_scoring::{summarize, CauseRecord};
+    let raw = std::fs::read_to_string(results)
+        .with_context(|| format!("결과를 읽지 못했습니다: {}", results.display()))?;
+    let records: Vec<CauseRecord> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+    if records.is_empty() {
+        bail!("결과가 비어 있습니다");
+    }
+    let mut arms: Vec<String> = records.iter().map(|r| r.arm.clone()).collect();
+    arms.sort();
+    arms.dedup();
+    println!(
+        "{:<6} {:>4} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}",
+        "비교군", "n", "정확도", "top3", "기권율", "p50(ms)", "p95(ms)", "입력토큰"
+    );
+    for a in &arms {
+        let s = summarize(a, &records);
+        println!(
+            "{:<6} {:>4} {:>8.3} {:>8.3} {:>8.3} {:>9} {:>9} {:>9}",
+            s.arm,
+            s.n,
+            s.accuracy,
+            s.top3,
+            s.abstain_rate,
+            s.latency_p50_ms,
+            s.latency_p95_ms,
+            s.total_input_tokens
+        );
+    }
+    println!();
+    println!("(정답 집합에 하나라도 맞으면 정탐. 기권과 목록 밖 응답은 오답으로 센다.)");
+
+    let repeats = records.iter().map(|r| r.repeat).max().unwrap_or(1);
+    if repeats > 1 {
+        println!();
+        println!("반복 일치율 (같은 사례 {repeats}회)");
+        for a in &arms {
+            match errcause_scoring::repeat_agreement(a, &records) {
+                Some((rate, n)) => println!("  {a:<6} {rate:.3} (사례 {n}개)"),
+                None => println!("  {a:<6} 반복 없음"),
+            }
+        }
+    }
+
+    println!();
+    println!("짝지은 비교 (같은 사례, 1회차)");
+    for i in 0..arms.len() {
+        for j in (i + 1)..arms.len() {
+            let (a, b) = (&arms[i], &arms[j]);
+            let (only_a, only_b, both, neither) = errcause_scoring::paired(a, b, &records);
+            println!(
+                "  {a} vs {b}: {a}만 {only_a} · {b}만 {only_b} · 둘 다 {both} · 둘 다 오답 {neither}"
+            );
+        }
+    }
+
+    for (title, f) in [
+        (
+            "범주별 정답",
+            errcause_scoring::by_category
+                as fn(&str, &[CauseRecord]) -> errcause_scoring::GroupRows,
+        ),
+        ("trait별 정답", errcause_scoring::by_trait),
+    ] {
+        let per_arm: Vec<(String, errcause_scoring::GroupRows)> =
+            arms.iter().map(|a| (a.clone(), f(a, &records))).collect();
+        let keys: std::collections::BTreeSet<String> = per_arm
+            .iter()
+            .flat_map(|(_, rows)| rows.iter().map(|(k, _, _)| k.clone()))
+            .collect();
+        if keys.is_empty() {
+            continue;
+        }
+        println!();
+        println!("{title} (1회차)");
+        for k in keys {
+            let cells: Vec<String> = per_arm
+                .iter()
+                .map(|(a, rows)| {
+                    rows.iter()
+                        .find(|(x, _, _)| *x == k)
+                        .map_or(format!("{a} -"), |(_, c, n)| format!("{a} {c}/{n}"))
+                })
+                .collect();
+            println!("  {k:<18} {}", cells.join("   "));
+        }
     }
     Ok(())
 }
