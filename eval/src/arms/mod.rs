@@ -14,6 +14,7 @@ pub mod llm_followup;
 pub mod rules;
 pub mod rules_errcause;
 pub mod rules_followup;
+pub mod rules_intent;
 
 use std::collections::BTreeMap;
 

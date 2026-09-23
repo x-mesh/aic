@@ -22,19 +22,27 @@ pub struct LlmCauseOutcome {
     pub error: Option<String>,
 }
 
-/// Jev 질문과 같은 내용을 텍스트 프롬프트로 편다. 순수 함수라 네트워크 없이 테스트한다.
-pub fn build_prompt(input: &str, categories: &BTreeMap<String, String>) -> String {
+/// 원인 범주 실험의 지시문. Jev 쪽 `INSTRUCTIONS`와 같은 내용이다.
+pub const ERRCAUSE_INTRO: &str =
+    "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 출력을 보고 \
+실패의 **원인 계열**을 하나 고른다. 기준은 표면에 나온 낱말이 아니라 **다음에 해야 할 조치**다 — \
+같은 낱말이라도 조치가 다르면 다른 범주다.";
+
+/// 지시문과 입력 제목을 바꿔 같은 형태의 프롬프트를 만든다. Jev에 주는 지시문과 같은 문장을 넣어야
+/// 두 비교군이 같은 정보로 겨룬다.
+pub fn build_prompt_with(
+    intro: &str,
+    heading: &str,
+    input: &str,
+    categories: &BTreeMap<String, String>,
+) -> String {
     let list = categories
         .iter()
         .map(|(k, v)| format!("- {k}: {v}"))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 출력을 보고 실패의 **원인 계열**을 \
-하나 고른다. 기준은 표면에 나온 낱말이 아니라 **다음에 해야 할 조치**다 — 같은 낱말이라도 조치가 \
-다르면 다른 범주다.\n\n\
-# 범주\n{list}\n\n\
-# 실패\n{input}\n\n\
+        "{intro}\n\n# 범주\n{list}\n\n# {heading}\n{input}\n\n\
 # 형식\n범주 id 하나만 출력한다. 설명·따옴표·문장부호를 붙이지 않는다."
     )
 }
@@ -87,12 +95,31 @@ impl LlmCauseArm {
         &self.identity
     }
 
+    /// 분류가 아니라 문장 생성에 쓴다(의도 실험의 최종 분할 생성). 응답 원문을 그대로 돌려준다.
+    pub async fn complete(&self, prompt: &str) -> Result<String> {
+        self.dispatcher
+            .send(prompt)
+            .await
+            .map_err(|e| anyhow::anyhow!("생성 실패: {e}"))
+    }
+
     pub async fn classify(
         &self,
         input: &str,
         categories: &BTreeMap<String, String>,
     ) -> LlmCauseOutcome {
-        let prompt = build_prompt(input, categories);
+        self.classify_with(ERRCAUSE_INTRO, "실패", input, categories)
+            .await
+    }
+
+    pub async fn classify_with(
+        &self,
+        intro: &str,
+        heading: &str,
+        input: &str,
+        categories: &BTreeMap<String, String>,
+    ) -> LlmCauseOutcome {
+        let prompt = build_prompt_with(intro, heading, input, categories);
         let started = Instant::now();
         let result = self.dispatcher.send(&prompt).await;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -130,7 +157,7 @@ mod tests {
 
     #[test]
     fn the_prompt_lists_every_category_and_the_failure() {
-        let p = build_prompt("$ curl x\nexit_code=7", &cats());
+        let p = build_prompt_with(ERRCAUSE_INTRO, "실패", "$ curl x\nexit_code=7", &cats());
         assert!(p.contains("- network: 연결 실패"));
         assert!(p.contains("- not_found: 대상 없음"));
         assert!(p.contains("exit_code=7"));

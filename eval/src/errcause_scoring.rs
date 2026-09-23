@@ -151,6 +151,21 @@ fn group(
     acc.into_iter().map(|(k, (c, n))| (k, c, n)).collect()
 }
 
+/// 고른 값별 정밀도 `(고른 값, 그중 정답, 고른 수)`. 경로 라우팅에서는 이 수치가 오라우팅 비용이다 —
+/// `diagnose`로 보낸 것 중 진단 요청이 아닌 비율만큼 쓸데없는 probe가 돈다.
+pub fn precision_by_pick(arm: &str, records: &[CauseRecord]) -> GroupRows {
+    let mut acc: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for r in records.iter().filter(|r| r.arm == arm && r.repeat == 1) {
+        let Some(p) = r.picked() else { continue };
+        let e = acc.entry(p.to_string()).or_default();
+        e.1 += 1;
+        if r.correct() {
+            e.0 += 1;
+        }
+    }
+    acc.into_iter().map(|(k, (c, n))| (k, c, n)).collect()
+}
+
 /// 같은 사례를 여러 번 물었을 때 답이 같은 비율. `(일치 비율, 반복이 있는 사례 수)`.
 pub fn repeat_agreement(arm: &str, records: &[CauseRecord]) -> Option<(f64, usize)> {
     let mut ids: Vec<&str> = records

@@ -8,6 +8,7 @@ mod errcause;
 mod errcause_scoring;
 mod followup;
 mod followup_scoring;
+mod intent;
 mod judge_scoring;
 mod judgment;
 mod scenario;
@@ -137,6 +138,38 @@ enum Command {
         #[arg(long, default_value = "target/errcause.jsonl")]
         results: PathBuf,
     },
+    /// 의도 라우팅 데이터셋이 규약을 지키는지 확인한다. 네트워크 없음.
+    IntentValidate {
+        #[arg(long, default_value = "data/intent-cases.json")]
+        data: PathBuf,
+    },
+    /// 최종 분할을 생성 모델로 만든다. 문장은 출력하지 않는다 — 사람이 읽으면 블라인드가 깨진다.
+    IntentGenerate {
+        #[arg(long, default_value = "data/intent-cases.json")]
+        data: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        per_intent: usize,
+        /// LLM 비교군과 다른 모델이어야 한다. 같은 모델이면 자기가 쓴 문장을 채점한다.
+        #[arg(long, default_value = "kiro/claude-sonnet-5")]
+        model: String,
+    },
+    /// 채팅 입력의 처리 경로를 규칙·Jev·LLM으로 분류해 원시 결과를 남긴다.
+    IntentRun {
+        #[arg(long, default_value = "data/intent-cases.json")]
+        data: PathBuf,
+        #[arg(long = "arm", required = true)]
+        arms: Vec<String>,
+        #[arg(long)]
+        split: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        repeats: u32,
+        #[arg(long, default_value = "target/intent.jsonl")]
+        out: PathBuf,
+        #[arg(long, default_value = "jev-latest")]
+        jev_model: String,
+        #[arg(long, default_value = DEFAULT_LLM_MODEL)]
+        llm_model: String,
+    },
     /// 실제 `aic diagnose --json`(또는 raw evidence) 파일에서 결정적 follow-up 후보를 뽑아 보여준다.
     /// 합성 데이터가 아닌 진짜 출력에 추출 규칙이 도는지 확인할 때 쓴다. 네트워크 없음.
     FollowupCandidates {
@@ -244,6 +277,32 @@ async fn main() -> Result<()> {
             llm_model,
         } => {
             followup_run(
+                &data,
+                &arms,
+                split.as_deref(),
+                repeats,
+                &out,
+                &jev_model,
+                &llm_model,
+            )
+            .await
+        }
+        Command::IntentValidate { data } => intent_validate(&data),
+        Command::IntentGenerate {
+            data,
+            per_intent,
+            model,
+        } => intent_generate(&data, per_intent, &model).await,
+        Command::IntentRun {
+            data,
+            arms,
+            split,
+            repeats,
+            out,
+            jev_model,
+            llm_model,
+        } => {
+            intent_run(
                 &data,
                 &arms,
                 split.as_deref(),
@@ -1407,6 +1466,17 @@ fn errcause_score(results: &std::path::Path) -> Result<()> {
         }
     }
 
+    println!();
+    println!("고른 값별 정밀도 (1회차) — 그 값을 고른 것 중 맞은 비율");
+    for a in &arms {
+        let rows = errcause_scoring::precision_by_pick(a, &records);
+        let cells: Vec<String> = rows
+            .iter()
+            .map(|(k, c, n)| format!("{k} {c}/{n}"))
+            .collect();
+        println!("  {a:<6} {}", cells.join(" · "));
+    }
+
     for (title, f) in [
         (
             "범주별 정답",
@@ -1438,5 +1508,177 @@ fn errcause_score(results: &std::path::Path) -> Result<()> {
             println!("  {k:<18} {}", cells.join("   "));
         }
     }
+    Ok(())
+}
+
+fn intent_validate(data: &std::path::Path) -> Result<()> {
+    let ds = intent::IntentDataset::load(data)?;
+    let (dev, fin, multi) = ds.counts();
+    println!(
+        "✔ {} 사례 (dev {dev} / final {fin}), 경로 {}개, 다중 라벨 {multi}건",
+        ds.cases.len(),
+        ds.categories.len()
+    );
+    Ok(())
+}
+
+async fn intent_generate(data: &std::path::Path, per_intent: usize, model: &str) -> Result<()> {
+    use arms::llm_errcause::LlmCauseArm;
+    let mut ds = intent::IntentDataset::load(data)?;
+    // 다시 생성하면 최종 분할을 통째로 바꾼다. 일부만 바꾸면 어느 문장이 어느 실행에서 왔는지 흐려진다.
+    ds.cases.retain(|c| c.split == intent::Split::Dev);
+    let gen = LlmCauseArm::from_config(Some(model))?;
+    let mut seen: std::collections::BTreeSet<String> = ds
+        .cases
+        .iter()
+        .map(|c| intent::normalize(&c.text))
+        .collect();
+    let routes: Vec<(String, String)> = ds
+        .categories
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (route, def) in &routes {
+        let others = routes
+            .iter()
+            .filter(|(k, _)| k != route)
+            .map(|(k, v)| format!("- {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let raw = gen
+            .complete(&intent::generation_prompt(route, def, &others, per_intent))
+            .await?;
+        let texts = intent::parse_generated(&raw)
+            .with_context(|| format!("{route}: 생성 응답을 읽지 못했습니다"))?;
+        let mut kept = 0usize;
+        let mut dup = 0usize;
+        for t in texts {
+            if !seen.insert(intent::normalize(&t)) {
+                dup += 1;
+                continue;
+            }
+            let lang = if t.is_ascii() { "en" } else { "ko" };
+            let id = format!("in-{}", &scoring::input_hash(&t)[..8]);
+            ds.cases.push(intent::IntentCase {
+                id,
+                split: intent::Split::Final,
+                text: t,
+                accepted: vec![route.clone()],
+                traits: vec![format!("lang:{lang}"), "generated".into()],
+                source: format!("generated:{model}"),
+            });
+            kept += 1;
+        }
+        // 문장 자체는 출력하지 않는다 — 규칙을 쓴 사람이 최종 분할을 읽으면 블라인드가 깨진다.
+        println!("  {route:<13} 생성 {kept}건 (중복 제외 {dup}건)");
+    }
+    ds.save(data)?;
+    let (dev, fin, _) = ds.counts();
+    println!("✔ 저장: dev {dev} / final {fin}");
+    Ok(())
+}
+
+async fn intent_run(
+    data: &std::path::Path,
+    arm_names: &[String],
+    split: Option<&str>,
+    repeats: u32,
+    out: &std::path::Path,
+    jev_model: &str,
+    llm_model: &str,
+) -> Result<()> {
+    use arms::jev_errcause::{CauseClient, CauseOutcome};
+    use arms::llm_errcause::LlmCauseArm;
+    use errcause_scoring::CauseRecord;
+
+    let ds = intent::IntentDataset::load(data)?;
+    let want = match split {
+        None => None,
+        Some("dev") => Some(intent::Split::Dev),
+        Some("final") => Some(intent::Split::Final),
+        Some(o) => bail!("알 수 없는 split: {o}"),
+    };
+    let cases: Vec<&intent::IntentCase> = ds
+        .cases
+        .iter()
+        .filter(|c| want.is_none_or(|w| c.split == w))
+        .collect();
+    if cases.is_empty() {
+        bail!("실행할 사례가 없습니다");
+    }
+    let mut jev: Option<CauseClient> = None;
+    let mut llm: Option<LlmCauseArm> = None;
+    let mut rules = false;
+    for a in arm_names {
+        match a.as_str() {
+            "jev" => jev = Some(CauseClient::from_env(jev_model)?),
+            "llm" => llm = Some(LlmCauseArm::from_config(Some(llm_model))?),
+            "rules" => rules = true,
+            o => bail!("알 수 없는 비교군: {o}"),
+        }
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let mut file = std::fs::File::create(out)?;
+    let total = cases.len() * arm_names.len() * repeats as usize;
+    let mut done = 0usize;
+    for rep in 1..=repeats {
+        for c in &cases {
+            let hash = scoring::input_hash(&c.text);
+            let base = |arm: &str, model: Option<String>| CauseRecord {
+                case_id: c.id.clone(),
+                split: c.split,
+                arm: arm.to_string(),
+                repeat: rep,
+                model,
+                question_version: Some("intent-v1".into()),
+                input_sha256: hash.clone(),
+                accepted: c.accepted.clone(),
+                traits: c.traits.clone(),
+                jev: None,
+                llm: None,
+            };
+            if rules {
+                let started = std::time::Instant::now();
+                let picked = arms::rules_intent::classify(&c.text);
+                let mut rec = base("rules", Some(arms::rules_intent::RULES_VERSION.into()));
+                rec.jev = Some(CauseOutcome {
+                    category: Some(picked.to_string()),
+                    raw_category: Some(picked.to_string()),
+                    attempts: 1,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    ..Default::default()
+                });
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if let Some(client) = &jev {
+                let o = client
+                    .classify_with(&ds.instructions, &c.text, &ds.categories)
+                    .await;
+                let mut rec = base(
+                    "jev",
+                    Some(format!("{}@{}", client.model(), client.endpoint_host())),
+                );
+                rec.jev = Some(o);
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if let Some(arm) = &llm {
+                let o = arm
+                    .classify_with(&ds.instructions, "채팅 입력", &c.text, &ds.categories)
+                    .await;
+                let mut rec = base("llm", Some(arm.identity().to_string()));
+                rec.llm = Some(o);
+                writeln!(file, "{}", serde_json::to_string(&rec)?)?;
+                done += 1;
+            }
+            if done.is_multiple_of(20) || done == total {
+                eprintln!("  {done}/{total}");
+            }
+        }
+    }
+    println!("✔ {done}건을 {}에 기록했습니다", out.display());
     Ok(())
 }

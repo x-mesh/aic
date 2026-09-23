@@ -17,7 +17,7 @@ const BASE_BACKOFF_MS: u64 = 500;
 const STATE_TOKEN_BUDGET: u64 = 24_000;
 const CONSERVATIVE_BYTES_PER_TOKEN: f64 = 2.0;
 
-const INSTRUCTIONS: &str = "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 출력을 보고 \
+pub const INSTRUCTIONS: &str = "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 출력을 보고 \
 실패의 **원인 계열**을 하나 고른다. 기준은 표면에 나온 낱말이 아니라 **다음에 해야 할 조치**다 — \
 같은 낱말이라도 조치가 다르면 다른 범주다.";
 
@@ -58,7 +58,8 @@ impl CauseOutcome {
     }
 }
 
-pub fn build_questions(categories: &BTreeMap<String, String>) -> Value {
+/// 지시문을 바꿔 같은 Choice 질문을 만든다. 다른 분류 실험(의도 라우팅 등)이 이 클라이언트를 쓴다.
+pub fn build_questions_with(instructions: &str, categories: &BTreeMap<String, String>) -> Value {
     let criteria: serde_json::Map<String, Value> = categories
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
@@ -66,7 +67,7 @@ pub fn build_questions(categories: &BTreeMap<String, String>) -> Value {
     json!({
         QUESTION: {
             "type": "choice",
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions,
             "criteria": criteria,
         }
     })
@@ -151,6 +152,15 @@ impl CauseClient {
         input: &str,
         categories: &BTreeMap<String, String>,
     ) -> CauseOutcome {
+        self.classify_with(INSTRUCTIONS, input, categories).await
+    }
+
+    pub async fn classify_with(
+        &self,
+        instructions: &str,
+        input: &str,
+        categories: &BTreeMap<String, String>,
+    ) -> CauseOutcome {
         if (input.len() as f64 / CONSERVATIVE_BYTES_PER_TOKEN).ceil() as u64 > STATE_TOKEN_BUDGET {
             return CauseOutcome {
                 oversize: true,
@@ -162,7 +172,7 @@ impl CauseClient {
         let body = json!({
             "state": input,
             "model": self.model,
-            "questions": build_questions(categories),
+            "questions": build_questions_with(instructions, categories),
         });
         let mut attempts = 0;
         let mut last = String::new();
@@ -233,7 +243,7 @@ mod tests {
 
     #[test]
     fn every_category_becomes_a_choice_option() {
-        let q = build_questions(&cats());
+        let q = build_questions_with(INSTRUCTIONS, &cats());
         let c = q["cause"]["criteria"].as_object().unwrap();
         assert_eq!(c.len(), 2);
         assert!(c.contains_key("network") && c.contains_key("usage"));
