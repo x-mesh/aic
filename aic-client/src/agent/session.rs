@@ -9,12 +9,15 @@
 //! - tool 결과는 `MAX_TOOL_RESULT_BYTES`로 cap.
 //! - 인자 파싱 실패·도구 예외는 모두 tool 에러 메시지로 흡수(loop가 죽지 않음).
 
-use aic_common::{AicError, CommandRecord};
+use aic_common::{AicError, AicdLogsConfig, CommandRecord, JevConfig};
 
 use crate::llm_dispatcher::LlmDispatcher;
 use crate::repl;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use super::debug::adbg;
 use super::obs_tools::ObsClient;
@@ -29,6 +32,462 @@ use super::ui;
 const MAX_ITERATIONS: usize = 8;
 /// 단일 tool 결과를 LLM에 전달할 때의 최대 바이트.
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+const JEV_LOG_MAX_LINES: usize = 200;
+const JEV_LOG_MAX_BYTES: usize = 16 * 1024;
+const JEV_LOG_FILE_TAIL_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogClassificationSource {
+    File { label: String },
+    Probe { id: String },
+    Excerpt { source: String, text: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundedLogExcerpt {
+    text: String,
+    lines: usize,
+    truncated: bool,
+}
+
+fn log_classification_spec(logs: &AicdLogsConfig) -> super::types::ToolSpec {
+    let labels: Vec<String> = logs
+        .files
+        .iter()
+        .map(|entry| entry.label.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    super::types::ToolSpec {
+        name: "jev_classify_logs",
+        description: "명시적으로 로그 분석을 요청한 뒤, 정확히 하나의 허용된 로그 소스를 bounded·redacted 상태로 Jev에 분류한다. 한 호출은 configured file label 하나, journal_errors/dmesg_oom preset 하나, 또는 기존 loki_query/run_command 결과 excerpt 하나만 선택한다. 파일 경로는 받지 않는다. Jev 선택은 보조 원인 label이며 severity, threshold, probe, command를 결정하지 않는다.",
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["file", "probe", "excerpt"],
+                    "description": "정확히 하나의 source 종류"
+                },
+                "label": {
+                    "type": "string",
+                    "enum": labels,
+                    "description": "aicd.logs.files의 정확한 label. path는 사용하지 않는다."
+                },
+                "probe": {
+                    "type": "string",
+                    "enum": ["journal_errors", "dmesg_oom"],
+                    "description": "고정 catalog probe id"
+                },
+                "excerpt_source": {
+                    "type": "string",
+                    "enum": ["loki_query", "run_command"],
+                    "description": "기존 도구 결과의 출처"
+                },
+                "excerpt": {
+                    "type": "string",
+                    "description": "기존 loki_query 또는 run_command 결과의 로그 발췌문"
+                }
+            },
+            "required": ["source"]
+        }),
+    }
+}
+
+fn maybe_add_log_classification_spec(
+    specs: &mut Vec<super::types::ToolSpec>,
+    jev: &JevConfig,
+    logs: &AicdLogsConfig,
+) {
+    if jev.enabled {
+        specs.push(log_classification_spec(logs));
+    }
+}
+
+fn parse_log_classification_source(
+    args: &serde_json::Value,
+    logs: &AicdLogsConfig,
+) -> Result<LogClassificationSource, String> {
+    if args.get("path").is_some() {
+        return Err("파일 경로는 받지 않습니다. configured file label을 사용하세요.".to_string());
+    }
+    let source = args
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "필수 인자 'source'가 없거나 문자열이 아닙니다.".to_string())?;
+    let fields = ["label", "probe", "excerpt"]
+        .iter()
+        .filter(|key| args.get(**key).is_some())
+        .count();
+    if fields != 1 {
+        return Err("정확히 하나의 source 값(label, probe, excerpt)만 지정하세요.".to_string());
+    }
+    match source {
+        "file" => {
+            let label = args
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "file source에는 label이 필요합니다.".to_string())?;
+            let matches = logs
+                .files
+                .iter()
+                .filter(|entry| entry.label == label)
+                .count();
+            if matches == 0 {
+                return Err(format!("등록되지 않은 file label입니다: {label}"));
+            }
+            if matches > 1 {
+                return Err(format!("file label이 중복되어 모호합니다: {label}"));
+            }
+            Ok(LogClassificationSource::File {
+                label: label.to_string(),
+            })
+        }
+        "probe" => {
+            let id = args
+                .get("probe")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "probe source에는 probe가 필요합니다.".to_string())?;
+            if !matches!(id, "journal_errors" | "dmesg_oom") {
+                return Err(format!("허용되지 않은 system probe입니다: {id}"));
+            }
+            Ok(LogClassificationSource::Probe { id: id.to_string() })
+        }
+        "excerpt" => {
+            let source = args
+                .get("excerpt_source")
+                .and_then(serde_json::Value::as_str)
+                .filter(|source| matches!(*source, "loki_query" | "run_command"))
+                .ok_or_else(|| {
+                    "excerpt_source는 loki_query 또는 run_command이어야 합니다.".to_string()
+                })?;
+            let text = args
+                .get("excerpt")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "excerpt source에는 excerpt가 필요합니다.".to_string())?;
+            Ok(LogClassificationSource::Excerpt {
+                source: source.to_string(),
+                text: text.to_string(),
+            })
+        }
+        other => Err(format!("알 수 없는 source입니다: {other}")),
+    }
+}
+
+fn cap_log_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn bound_and_redact_log(raw: &str, source_truncated: bool) -> BoundedLogExcerpt {
+    let all_lines: Vec<&str> = raw.lines().collect();
+    let line_truncated = all_lines.len() > JEV_LOG_MAX_LINES;
+    let selected = if line_truncated {
+        &all_lines[all_lines.len() - JEV_LOG_MAX_LINES..]
+    } else {
+        &all_lines[..]
+    };
+    let joined = selected.join("\n");
+    let (redacted, _) = crate::redaction::redact(&joined);
+    let byte_truncated = redacted.len() > JEV_LOG_MAX_BYTES;
+    let text = cap_log_utf8(&redacted, JEV_LOG_MAX_BYTES);
+    BoundedLogExcerpt {
+        lines: text.lines().count(),
+        truncated: source_truncated || line_truncated || byte_truncated,
+        text,
+    }
+}
+
+fn log_path_is_sensitive(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_lowercase();
+    let components: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+        .filter(|component| !component.is_empty() && component != "/")
+        .collect();
+    const SENSITIVE_DIRS: &[&str] = &[
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".gpg",
+        ".kube",
+        ".docker",
+        "gcloud",
+        ".password-store",
+        ".gem",
+    ];
+    if components
+        .iter()
+        .any(|component| SENSITIVE_DIRS.contains(&component.as_str()))
+    {
+        return true;
+    }
+    if [
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/sudoers",
+        "/etc/ssl/private",
+    ]
+    .iter()
+    .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix}/")))
+    {
+        return true;
+    }
+    if components
+        .first()
+        .is_some_and(|component| component == "proc")
+        && components
+            .last()
+            .is_some_and(|component| component == "environ")
+    {
+        return true;
+    }
+    path.file_name()
+        .map(|name| tools::is_secret_file(&name.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+fn canonical_log_file(path: &Path) -> Result<PathBuf, String> {
+    if log_path_is_sensitive(path) {
+        return Err("민감 경로의 로그 파일은 읽지 않습니다.".to_string());
+    }
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("로그 파일 metadata 조회 실패: {e}"))?;
+    if before.file_type().is_symlink() {
+        return Err("symlink 로그 파일은 읽지 않습니다.".to_string());
+    }
+    if !before.file_type().is_file() {
+        return Err("로그 경로가 regular file이 아닙니다.".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("로그 파일 경로 확인 실패: {e}"))?;
+    if log_path_is_sensitive(&canonical) {
+        return Err("민감 경로(symlink 대상)의 로그 파일은 읽지 않습니다.".to_string());
+    }
+    let canonical_meta = std::fs::symlink_metadata(&canonical)
+        .map_err(|e| format!("정규화한 로그 파일 metadata 조회 실패: {e}"))?;
+    if canonical_meta.file_type().is_symlink() || !canonical_meta.file_type().is_file() {
+        return Err("정규화한 로그 대상이 regular file이 아닙니다.".to_string());
+    }
+    Ok(canonical)
+}
+
+fn read_configured_log(path: &Path) -> Result<(String, bool), String> {
+    let path = canonical_log_file(path)?;
+    let before = std::fs::symlink_metadata(&path)
+        .map_err(|e| format!("로그 파일 metadata 조회 실패: {e}"))?;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("로그 파일을 read-only로 열 수 없습니다: {e}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| format!("열린 로그 파일 metadata 조회 실패: {e}"))?;
+    if !opened.file_type().is_file() {
+        return Err("열린 로그 대상이 regular file이 아닙니다.".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if before.dev() != opened.dev() || before.ino() != opened.ino() {
+            return Err("로그 파일이 열기 전에 교체되었습니다.".to_string());
+        }
+    }
+
+    let start = opened.len().saturating_sub(JEV_LOG_FILE_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("로그 tail 위치로 이동할 수 없습니다: {e}"))?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(JEV_LOG_FILE_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("로그 파일을 읽을 수 없습니다: {e}"))?;
+    let after = file
+        .metadata()
+        .map_err(|e| format!("로그 파일 metadata 재확인 실패: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != after.dev() || opened.ino() != after.ino() {
+            return Err("로그 파일이 읽는 중 교체되었습니다.".to_string());
+        }
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), start > 0))
+}
+
+fn command_basename(command: &str) -> Option<(&str, Vec<&str>)> {
+    let mut tokens = command.split_whitespace();
+    let head = tokens.next()?;
+    let basename = Path::new(head).file_name()?.to_str()?;
+    Some((basename, tokens.collect()))
+}
+
+fn tail_reads_log(args: &[&str]) -> bool {
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-n" | "--lines" | "-c" | "--bytes" => {
+                let Some(value) = args.get(index + 1) else {
+                    return false;
+                };
+                if value.parse::<u64>().is_err() {
+                    return false;
+                }
+                index += 2;
+            }
+            "--" => {
+                paths.extend_from_slice(&args[index + 1..]);
+                break;
+            }
+            value if value.starts_with("--lines=") || value.starts_with("--bytes=") => {
+                let Some(count) = value.split_once('=').map(|(_, count)| count) else {
+                    return false;
+                };
+                if count.parse::<u64>().is_err() {
+                    return false;
+                }
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                if value.len() < 2 || !value[1..].chars().all(|ch| ch.is_ascii_digit()) {
+                    return false;
+                }
+                index += 1;
+            }
+            path => {
+                paths.push(path);
+                index += 1;
+            }
+        }
+    }
+    if paths.len() != 1 || paths[0] == "-" || log_path_is_sensitive(Path::new(paths[0])) {
+        return false;
+    }
+    let path = Path::new(paths[0]);
+    let lower = paths[0].to_lowercase();
+    lower.starts_with("/var/log/")
+        || lower.starts_with("/private/var/log/")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| {
+                let name = name.to_lowercase();
+                name.ends_with(".log") || name.contains(".log.")
+            })
+            .unwrap_or(false)
+}
+
+fn safe_log_filter(segment: &str) -> bool {
+    let Some((head, args)) = command_basename(segment) else {
+        return false;
+    };
+    match head {
+        "grep" => {
+            let mut patterns = 0;
+            for arg in args {
+                if matches!(
+                    arg,
+                    "-i" | "-v" | "-E" | "-F" | "-n" | "-c" | "-o" | "-w" | "-x"
+                ) || arg == "--color=never"
+                {
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    return false;
+                }
+                patterns += 1;
+            }
+            patterns == 1
+        }
+        "head" | "tail" => match args.as_slice() {
+            [] => true,
+            ["-n", count] | ["--lines", count] => count.parse::<u64>().is_ok(),
+            [count] if count.starts_with('-') => {
+                count.len() > 1 && count[1..].chars().all(|ch| ch.is_ascii_digit())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn log_reader_command_allowed(command: &str) -> bool {
+    if [";", "&", "$", "`", ">", "<", "\\", "'", "\"", "\n", "\r"]
+        .iter()
+        .any(|forbidden| command.contains(forbidden))
+    {
+        return false;
+    }
+    let mut segments = command.split('|').map(str::trim);
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let Some((head, args)) = command_basename(first) else {
+        return false;
+    };
+    let source_allowed = match head {
+        "tail" => tail_reads_log(&args),
+        "journalctl" => !args.iter().any(|arg| {
+            matches!(*arg, "--file" | "--directory" | "--root" | "-D")
+                || arg.starts_with("--file=")
+                || arg.starts_with("--directory=")
+                || arg.starts_with("--root=")
+                || (arg.starts_with("-D") && arg.len() > 2)
+        }),
+        "dmesg" => !args
+            .iter()
+            .any(|arg| matches!(*arg, "--file" | "-F") || arg.starts_with("--file=")),
+        _ => false,
+    };
+    source_allowed && segments.all(safe_log_filter)
+}
+
+fn verified_log_excerpt<'a>(
+    records: &'a VecDeque<ToolRecord>,
+    source: &str,
+    excerpt: &str,
+) -> Result<(&'a str, bool), String> {
+    if excerpt.len() > MAX_TOOL_RESULT_BYTES {
+        return Err("도구 결과 크기 상한을 넘는 발췌문은 사용할 수 없습니다.".to_string());
+    }
+    let redacted = crate::redaction::redact(excerpt).0;
+    let record = records
+        .iter()
+        .rev()
+        .find(|record| record.name == source && record.output == redacted)
+        .ok_or_else(|| "현재 세션에서 일치하는 로그 도구 결과를 찾을 수 없습니다.".to_string())?;
+    if matches!(record.status.as_str(), "error" | "blocked" | "denied") {
+        return Err("오류가 난 도구 결과는 로그 분류에 사용할 수 없습니다.".to_string());
+    }
+    if source == "run_command" {
+        if record.status != "executed" {
+            return Err("실행이 확인된 run_command 결과만 사용할 수 있습니다.".to_string());
+        }
+        let command = record.command_display.as_deref().unwrap_or_default();
+        if !log_reader_command_allowed(command) {
+            return Err(
+                "로그 명령과 제한된 필터로 얻은 run_command 결과만 분류할 수 있습니다.".to_string(),
+            );
+        }
+    }
+    let possibly_capped = record.output.len() >= MAX_TOOL_RESULT_BYTES;
+    Ok((&record.output, record.truncated || possibly_capped))
+}
 
 /// LLM provider 미등록 시 세션 시작 1회 경고(배너 직후 note). 채팅 답변만 비활성이고
 /// status bar·진단 slash 명령은 그대로 동작함을 함께 안내한다.
@@ -569,6 +1028,8 @@ pub struct AgentSession {
     /// 관측 백엔드(Prometheus/Loki/ES) 질의 클라이언트(SRE R1). config에 등록 백엔드가
     /// 있을 때만 Some. 등록된 백엔드만 질의 가능 — endpoint allowlist.
     obs: Option<ObsClient>,
+    jev: JevConfig,
+    logs: AicdLogsConfig,
     /// rca-agent(커널 eBPF collector) evidence pull 클라이언트 — config `[rca_agent]`가
     /// enabled이고 URL이 loopback일 때만 Some.
     rca_agent: Option<RcaAgentClient>,
@@ -626,6 +1087,8 @@ impl AgentSession {
             active_rca_id: None,
             out: ChatOut::Direct { spinner: None },
             obs: None,
+            jev: JevConfig::default(),
+            logs: AicdLogsConfig::default(),
             rca_agent: None,
             mcp: None,
             snapshot_recording: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -657,6 +1120,12 @@ impl AgentSession {
                 Err(e) => adbg!("obs client 생성 실패 — 관측 도구 비활성: {}", e),
             }
         }
+        self
+    }
+
+    pub fn with_log_analysis(mut self, jev: &JevConfig, logs: &AicdLogsConfig) -> Self {
+        self.jev = jev.clone();
+        self.logs = logs.clone();
         self
     }
 
@@ -1009,6 +1478,7 @@ impl AgentSession {
             specs.push(tools::write_file_spec());
             specs.push(tools::edit_file_spec());
         }
+        maybe_add_log_classification_spec(&mut specs, &self.jev, &self.logs);
         // 관측 백엔드 도구(R1)는 read-only라 run_command 게이트와 무관하게, 등록 백엔드가
         // 있으면 항상 노출한다.
         if let Some(obs) = &self.obs {
@@ -1178,6 +1648,114 @@ impl AgentSession {
         Ok(())
     }
 
+    async fn execute_log_classification(&self, args: &serde_json::Value, corr: &str) -> String {
+        if !self.jev.enabled {
+            return render_log_unavailable(
+                "unknown",
+                "Jev 로그 분류가 비활성화되어 있습니다.",
+                None,
+            );
+        }
+        let source = match parse_log_classification_source(args, &self.logs) {
+            Ok(source) => source,
+            Err(error) => return render_log_unavailable("unknown", &error, None),
+        };
+        let source_name = match &source {
+            LogClassificationSource::File { label } => format!("file:{label}"),
+            LogClassificationSource::Probe { id } => format!("probe:{id}"),
+            LogClassificationSource::Excerpt { source, .. } => format!("excerpt:{source}"),
+        };
+
+        let (raw, source_truncated) = match source {
+            LogClassificationSource::File { label } => {
+                let Some(entry) = self.logs.files.iter().find(|entry| entry.label == label) else {
+                    return render_log_unavailable(
+                        &source_name,
+                        "configured file label을 찾을 수 없습니다.",
+                        None,
+                    );
+                };
+                match read_configured_log(Path::new(&entry.path)) {
+                    Ok(result) => result,
+                    Err(error) => return render_log_unavailable(&source_name, &error, None),
+                }
+            }
+            LogClassificationSource::Probe { id } => {
+                if !self.allow_run_command {
+                    return render_log_unavailable(
+                        &source_name,
+                        "system preset은 run_command가 활성인 chat에서만 실행할 수 있습니다.",
+                        None,
+                    );
+                }
+                let Some(probe) = super::probes::probe_by_id(&id) else {
+                    return render_log_unavailable(
+                        &source_name,
+                        "catalog probe를 찾을 수 없습니다.",
+                        None,
+                    );
+                };
+                let command = probe.command();
+                let args = serde_json::json!({ "command": command });
+                match super::run_command::execute_with_corr(
+                    &args,
+                    &self.sandbox,
+                    corr,
+                    |_, _, _| false,
+                ) {
+                    Ok(output) => {
+                        let record = ToolRecord::from_result(
+                            corr,
+                            "run_command",
+                            extract_command_line(&output),
+                            &output,
+                        );
+                        if record.status != "executed" {
+                            return render_log_unavailable(
+                                &source_name,
+                                "system log probe가 실행되지 않았습니다.",
+                                None,
+                            );
+                        }
+                        (output, record.truncated)
+                    }
+                    Err(error) => {
+                        return render_log_unavailable(&source_name, &error.to_string(), None)
+                    }
+                }
+            }
+            LogClassificationSource::Excerpt { text, source } => {
+                let (verified, truncated) =
+                    match verified_log_excerpt(&self.tool_records, &source, &text) {
+                        Ok(verified) => verified,
+                        Err(error) => return render_log_unavailable(&source_name, &error, None),
+                    };
+                (verified.to_string(), truncated)
+            }
+        };
+        let bounded = bound_and_redact_log(&raw, source_truncated);
+        let choice = crate::jev::choose_log(&self.jev, &bounded.text).await;
+        let mut result = serde_json::json!({
+            "available": choice.is_some(),
+            "classification": choice
+                .as_ref()
+                .map(|choice| choice.value.as_str())
+                .unwrap_or("unavailable"),
+            "excerpt": bounded.text,
+            "lines": bounded.lines,
+            "source": source_name,
+            "truncated": bounded.truncated,
+        });
+        if let Some(choice) = choice {
+            if let Some(confidence) = choice.confidence {
+                result["confidence"] = serde_json::json!(confidence);
+            }
+        } else {
+            result["error"] = serde_json::json!("Jev classification unavailable");
+        }
+        result.to_string()
+    }
+
     /// 단일 도구 호출을 실행하고 LLM에 회신할 문자열을 만든다(에러도 문자열로 흡수).
     /// `corr`(=`run_id.seq`)로 tool_call ↔ tool_result ↔ run_command card/audit를 묶는다.
     async fn exec_tool(&mut self, call: &ToolCall) -> String {
@@ -1261,6 +1839,8 @@ impl AgentSession {
             } else {
                 Ok("[denied] 파일 쓰기를 사용자가 거부했습니다.".to_string())
             }
+        } else if call.name == "jev_classify_logs" {
+            Ok(self.execute_log_classification(&args, &corr).await)
         } else if matches!(
             call.name.as_str(),
             "prometheus_query" | "loki_query" | "es_search"
@@ -3119,6 +3699,25 @@ impl AgentSession {
     }
 }
 
+fn render_log_unavailable(
+    source: &str,
+    error: &str,
+    excerpt: Option<&BoundedLogExcerpt>,
+) -> String {
+    let mut result = serde_json::json!({
+        "available": false,
+        "classification": "unavailable",
+        "source": source,
+        "error": error,
+    });
+    if let Some(excerpt) = excerpt {
+        result["excerpt"] = serde_json::json!(excerpt.text);
+        result["lines"] = serde_json::json!(excerpt.lines);
+        result["truncated"] = serde_json::json!(excerpt.truncated);
+    }
+    result.to_string()
+}
+
 /// `/local` 분석 단발 LLM 호출의 최대 대기 시간(초). 초과 시 raw fallback.
 /// `/local`·`/diagnose` 분석 데드라인의 **하한**. 실제 값은 dispatcher의 요청 timeout을 따르되
 /// (`LlmDispatcher::request_timeout`), config의 `request_timeout_secs`가 아주 작게 잡힌 환경에서
@@ -3772,6 +4371,315 @@ mod tests {
     use crate::agent::types::parse_openai_response;
     use serde_json::json;
     use std::fs;
+
+    #[test]
+    fn log_analysis_tool_spec_is_explicit_and_uses_configured_labels() {
+        let mut logs = AicdLogsConfig::default();
+        logs.files.push(aic_common::AicdFileLogEntry {
+            label: "api-error".to_string(),
+            path: "/var/log/api.log".to_string(),
+        });
+        let spec = log_classification_spec(&logs);
+        assert_eq!(spec.name, "jev_classify_logs");
+        assert!(spec.description.contains("명시적으로 로그 분석을 요청"));
+        assert!(spec.description.contains("journal_errors"));
+        assert_eq!(
+            spec.parameters["properties"]["label"]["enum"][0],
+            "api-error"
+        );
+        assert!(!spec.parameters.to_string().contains("/var/log/api.log"));
+    }
+
+    #[test]
+    fn log_analysis_tool_is_conditional_on_jev_opt_in() {
+        let logs = AicdLogsConfig::default();
+        let mut specs = Vec::new();
+        maybe_add_log_classification_spec(&mut specs, &JevConfig::default(), &logs);
+        assert!(specs.is_empty());
+        let enabled = JevConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        maybe_add_log_classification_spec(&mut specs, &enabled, &logs);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "jev_classify_logs");
+    }
+
+    #[test]
+    fn log_analysis_source_requires_one_exact_allowed_source() {
+        let logs = AicdLogsConfig {
+            files: vec![
+                aic_common::AicdFileLogEntry {
+                    label: "same".to_string(),
+                    path: "/tmp/a.log".to_string(),
+                },
+                aic_common::AicdFileLogEntry {
+                    label: "same".to_string(),
+                    path: "/tmp/b.log".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            parse_log_classification_source(&json!({"source":"file", "label":"same"}), &logs)
+                .unwrap_err()
+                .contains("중복")
+        );
+        assert!(parse_log_classification_source(
+            &json!({"source":"file", "path":"/tmp/a.log"}),
+            &logs
+        )
+        .unwrap_err()
+        .contains("경로"));
+        assert!(parse_log_classification_source(
+            &json!({"source":"probe", "probe":"journal_errors", "label":"x"}),
+            &logs
+        )
+        .unwrap_err()
+        .contains("정확히 하나"));
+        assert!(parse_log_classification_source(
+            &json!({"source":"probe", "probe":"arbitrary"}),
+            &logs
+        )
+        .unwrap_err()
+        .contains("허용되지 않은"));
+        assert!(parse_log_classification_source(
+            &json!({"source":"excerpt", "excerpt_source":"loki_query", "excerpt":"x"}),
+            &logs
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn log_analysis_excerpt_source_must_match_a_non_error_session_record() {
+        let mut records = VecDeque::new();
+        let output = "2026-09-23T10:00:00Z service unavailable";
+        records.push_back(ToolRecord::from_result("run.1", "loki_query", None, output));
+
+        let (verified, _) = verified_log_excerpt(&records, "loki_query", output).unwrap();
+        assert_eq!(verified, output);
+        assert!(verified_log_excerpt(&records, "loki_query", "modified excerpt").is_err());
+        assert!(verified_log_excerpt(&records, "run_command", output).is_err());
+
+        let failed = "[tool error] backend unavailable";
+        records.push_back(ToolRecord::from_result("run.2", "loki_query", None, failed));
+        assert!(verified_log_excerpt(&records, "loki_query", failed).is_err());
+    }
+
+    #[test]
+    fn log_analysis_run_command_excerpt_requires_an_executed_log_reader() {
+        for command in [
+            "tail -n 5 /var/log/app.log",
+            "journalctl -p err",
+            "dmesg -T",
+        ] {
+            let output = format!(
+                "command: {command}\nexit_code=0 duration_ms=1 truncated=false cwd=/tmp\n--- stdout ---\nentry"
+            );
+            let record =
+                ToolRecord::from_result("run.1", "run_command", Some(command.to_string()), &output);
+            assert_eq!(record.status, "executed");
+            let records = VecDeque::from([record]);
+            assert!(verified_log_excerpt(&records, "run_command", &output).is_ok());
+        }
+
+        let command = "ps aux";
+        let output = format!(
+            "command: {command}\nexit_code=0 duration_ms=1 truncated=false cwd=/tmp\n--- stdout ---\nentry"
+        );
+        let record =
+            ToolRecord::from_result("run.2", "run_command", Some(command.to_string()), &output);
+        assert!(verified_log_excerpt(&VecDeque::from([record]), "run_command", &output).is_err());
+        assert!(log_reader_command_allowed(
+            "dmesg -T | grep -i oom | head -n 30"
+        ));
+        assert!(!log_reader_command_allowed("tail -n 5 /etc/passwd"));
+        assert!(!log_reader_command_allowed(
+            "tail -n 5 /var/log/app.log | cat /etc/passwd"
+        ));
+        assert!(!log_reader_command_allowed(
+            "journalctl --file /tmp/plain.log"
+        ));
+    }
+
+    #[test]
+    fn log_analysis_excerpt_redacts_and_caps_lines_bytes_at_utf8_boundary() {
+        let raw = format!(
+            "{}\nDATABASE_URL=postgres://app:mockpassword@db-primary:5432/orders\n{}",
+            "old\n".repeat(250),
+            "가".repeat(20_000)
+        );
+        let bounded = bound_and_redact_log(&raw, false);
+        assert!(bounded.truncated);
+        assert!(bounded.lines <= JEV_LOG_MAX_LINES);
+        assert!(bounded.text.len() <= JEV_LOG_MAX_BYTES);
+        assert!(bounded.text.is_char_boundary(bounded.text.len()));
+        assert!(!bounded.text.contains("mockpassword"));
+        assert!(bounded.text.contains('가'));
+    }
+
+    #[test]
+    fn log_analysis_unavailable_result_keeps_bounded_excerpt_metadata() {
+        let bounded = BoundedLogExcerpt {
+            text: "redacted".to_string(),
+            lines: 1,
+            truncated: true,
+        };
+        let result: serde_json::Value = serde_json::from_str(&render_log_unavailable(
+            "excerpt:loki_query",
+            "offline",
+            Some(&bounded),
+        ))
+        .unwrap();
+        assert_eq!(result["classification"], "unavailable");
+        assert_eq!(result["excerpt"], "redacted");
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn log_analysis_configured_path_blocks_secret_files_and_symlink_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let aws = dir.path().join(".aws");
+        fs::create_dir(&aws).unwrap();
+        let secret = aws.join("credentials");
+        fs::write(&secret, "do not read").unwrap();
+        let env_file = dir.path().join(".env");
+        fs::write(&env_file, "do not read").unwrap();
+        let alias = dir.path().join("aws-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&aws, &alias).unwrap();
+
+        assert!(read_configured_log(&secret).is_err());
+        assert!(read_configured_log(&env_file).is_err());
+        assert!(read_configured_log(&alias.join("credentials")).is_err());
+        assert!(log_path_is_sensitive(Path::new("/home/u/.ssh/id_rsa")));
+        assert!(log_path_is_sensitive(Path::new(
+            "/etc/ssl/private/server.key"
+        )));
+        assert!(log_path_is_sensitive(Path::new("/proc/1234/environ")));
+
+        let allowed = dir.path().join("service.log");
+        fs::write(&allowed, "latest entry").unwrap();
+        assert_eq!(read_configured_log(&allowed).unwrap().0, "latest entry");
+    }
+
+    #[tokio::test]
+    async fn log_analysis_disabled_classification_stops_before_file_access() {
+        let (session, dir) = test_session();
+        let missing = dir.path().join("missing.log");
+        let logs = AicdLogsConfig {
+            files: vec![aic_common::AicdFileLogEntry {
+                label: "missing".to_string(),
+                path: missing.display().to_string(),
+            }],
+            ..Default::default()
+        };
+        let session = session.with_log_analysis(&JevConfig::default(), &logs);
+        let output = session
+            .execute_log_classification(&json!({"source":"file", "label":"missing"}), "run.1")
+            .await;
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["classification"], "unavailable");
+        assert!(result["error"].as_str().unwrap().contains("비활성화"));
+        assert!(!output.contains("metadata 조회 실패"));
+    }
+
+    #[tokio::test]
+    async fn log_analysis_sends_only_bounded_redacted_text_to_local_jev() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).await.unwrap();
+                headers.push(byte[0]);
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header_text = String::from_utf8(headers).unwrap();
+            let content_length = header_text
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap();
+            let mut body = vec![0; content_length];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let response = json!({
+                "answers": {"q": {"choice": "service_crash", "confidence": 0.91}}
+            })
+            .to_string();
+            let message = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                response.len()
+            );
+            stream.write_all(message.as_bytes()).await.unwrap();
+            request
+        });
+
+        let (session, dir) = test_session();
+        let log_path = dir.path().join("service.log");
+        fs::write(
+            &log_path,
+            format!(
+                "{}\nDATABASE_URL=postgres://app:mockpassword@db-primary:5432/orders\nlatest",
+                "old".repeat(100)
+            ),
+        )
+        .unwrap();
+        let logs = AicdLogsConfig {
+            files: vec![aic_common::AicdFileLogEntry {
+                label: "service".to_string(),
+                path: log_path.display().to_string(),
+            }],
+            ..Default::default()
+        };
+        let jev = JevConfig {
+            enabled: true,
+            endpoint: format!("http://{address}/classify"),
+            api_key: Some("mock-key".to_string()),
+            timeout_secs: 3,
+            ..Default::default()
+        };
+        let session = session.with_log_analysis(&jev, &logs);
+        let output = session
+            .execute_log_classification(&json!({"source":"file", "label":"service"}), "run.1")
+            .await;
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let request = mock.await.unwrap();
+        let sent = request["state"].as_str().unwrap();
+
+        assert_eq!(result["classification"], "service_crash");
+        assert!(!sent.contains("mockpassword"));
+        assert!(sent.len() <= JEV_LOG_MAX_BYTES);
+        assert!(sent.lines().count() <= JEV_LOG_MAX_LINES);
+        assert_eq!(result["excerpt"], sent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_log_rejects_symlink_and_reads_only_tail() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.log");
+        let link = dir.path().join("link.log");
+        fs::write(&target, format!("{}\nlatest", "old\n".repeat(300_000))).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_configured_log(&link).is_err());
+        let (tail, truncated) = read_configured_log(&target).unwrap();
+        assert!(truncated);
+        assert!(tail.contains("latest"));
+    }
 
     #[test]
     fn workload_explain_prompt_is_bounded_and_uses_opaque_references() {

@@ -22,6 +22,32 @@ pub struct Choice {
     pub confidence: Option<f64>,
 }
 
+pub fn log_criteria() -> BTreeMap<&'static str, &'static str> {
+    BTreeMap::from([
+        (
+            "connectivity_or_dependency",
+            "네트워크 연결 또는 외부 의존성 문제",
+        ),
+        ("service_crash", "서비스 또는 프로세스 충돌 및 종료"),
+        ("resource_pressure", "CPU, 메모리 또는 기타 자원 부족"),
+        ("storage_or_io", "저장 장치 또는 입출력 문제"),
+        ("permission_or_auth", "권한 또는 인증 문제"),
+        ("configuration_or_input", "설정 또는 입력 문제"),
+        ("no_clear_cause", "명확한 원인 없음"),
+    ])
+}
+
+pub async fn choose_log(cfg: &aic_common::JevConfig, excerpt: &str) -> Option<Choice> {
+    let criteria = log_criteria();
+    choose(
+        cfg,
+        excerpt,
+        "Choose the one dominant cause category for this bounded log excerpt.",
+        &criteria,
+    )
+    .await
+}
+
 /// 요청 본문. 순수 함수라 네트워크 없이 테스트한다.
 pub fn build_body(
     model: &str,
@@ -172,5 +198,39 @@ mod tests {
             ..Default::default()
         };
         assert!(choose(&cfg, "state", "q", &criteria()).await.is_none());
+    }
+
+    #[test]
+    fn log_taxonomy_is_closed_and_has_no_severity_or_action() {
+        let criteria = log_criteria();
+        assert_eq!(criteria.len(), 7);
+        assert!(criteria.contains_key("connectivity_or_dependency"));
+        assert!(criteria.contains_key("service_crash"));
+        assert!(criteria.contains_key("resource_pressure"));
+        assert!(criteria.contains_key("storage_or_io"));
+        assert!(criteria.contains_key("permission_or_auth"));
+        assert!(criteria.contains_key("configuration_or_input"));
+        assert!(criteria.contains_key("no_clear_cause"));
+        assert!(!criteria.keys().any(|key| key.contains("severity")));
+        assert!(!criteria.keys().any(|key| key.contains("command")));
+    }
+
+    #[test]
+    fn log_choice_keeps_confidence_and_rejects_outside_taxonomy() {
+        let criteria = log_criteria();
+        let valid = json!({
+            "answers": {"q": {"choice": "resource_pressure", "confidence": 0.73}}
+        });
+        let choice = parse_choice(&valid, &criteria).expect("고정 로그 taxonomy 선택");
+        assert_eq!(choice.value, "resource_pressure");
+        assert_eq!(choice.confidence, Some(0.73));
+        let outside = json!({"answers": {"q": {"choice": "critical"}}});
+        assert!(parse_choice(&outside, &criteria).is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_log_classification_is_unavailable_without_network() {
+        let cfg = aic_common::JevConfig::default();
+        assert!(choose_log(&cfg, "redacted log").await.is_none());
     }
 }

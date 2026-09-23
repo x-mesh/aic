@@ -9489,6 +9489,7 @@ async fn handle_chat(
                     lang.to_string(),
                 )
                 .allow_run_command(run_command_enabled)
+                .with_log_analysis(&config.jev, &config.aicd.logs)
                 .with_observability(&config.observability)
                 .with_rca_agent(&config.rca_agent)
                 .with_mcp(&config.mcp)
