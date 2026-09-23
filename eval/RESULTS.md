@@ -813,3 +813,63 @@ cargo run --release -- errcause-score --results target/errcause-final.jsonl
 
 - `results/errcause-dev-20260923.jsonl.gz` — 개발 105 × 3 비교군 × 1회 = 315건
 - `results/errcause-final-20260923.jsonl.gz` — 최종 64 × 3 비교군 × 3회 = 576건
+
+---
+
+# 채팅 의도 라우팅 (별도 실험)
+
+> 실행일: 2026-09-23 · 구현 기준: `3b80ff7`
+> 데이터: `data/intent-cases.json` 227건(dev 107 저자 작성 / final 120 `kiro/claude-sonnet-5` 생성·미열람), 경로 4개
+> 모델: Jev `jev-latest`(ai-mesh 경유) 질문 `intent-v1` · LLM `ai-mesh/kiro/gpt-5.6-luna` · 규칙 `intent-rules-v1`(dev만 보고 작성)
+> 결론과 배운 것은 [`docs/CHAT-INTENT-ROUTING-EVALUATION.md`](../docs/CHAT-INTENT-ROUTING-EVALUATION.md)
+
+## 최종 분할 120건, 1회차
+
+| 비교군 | 정확도 | 반복 일치율(3회) | p50 | p95 | 입력 토큰 |
+|---|---|---|---|---|---|
+| jev | 0.992 | 1.000 | 238ms | 351ms | 77,774 |
+| llm | 0.983 | 0.983 | 863ms | 1,959ms | 59,696 |
+| rules | 0.717 | 1.000 | 0ms | 0ms | 0 |
+
+## 개발 분할 107건, 1회
+
+| 비교군 | 정확도 | p50 | p95 |
+|---|---|---|---|
+| jev | 0.972 | 248ms | 324ms |
+| llm | 0.944 | 859ms | 1,831ms |
+| rules | 0.925 | 0ms | 0ms |
+
+## 짝지은 비교 (최종, 1회차)
+
+| 비교 | 앞만 | 뒤만 | 둘 다 | 둘 다 오답 | 부호검정 p |
+|---|---|---|---|---|---|
+| jev vs rules | 34 | 1 | 85 | 0 | 2.1e-9 |
+| llm vs rules | 34 | 2 | 84 | 0 | 1.9e-8 |
+| jev vs llm | 2 | 1 | 117 | 0 | 1.0 |
+
+## 경로별 재현율과 고른 값별 정밀도 (최종, 1회차)
+
+| 경로 | jev 재현 | llm 재현 | rules 재현 | jev 정밀 | llm 정밀 | rules 정밀 |
+|---|---|---|---|---|---|---|
+| diagnose | 30/30 | 30/30 | 18/30 | 30/30 | 30/31 | 18/18 |
+| explain_last | 30/30 | 28/30 | 21/30 | 30/31 | 28/28 | 21/21 |
+| local | 29/30 | 30/30 | 19/30 | 29/29 | 30/30 | 19/24 |
+| agent | 30/30 | 30/30 | 28/30 | 30/30 | 30/31 | 28/57 |
+
+영어 문장은 7건뿐이다(생성 요청 30% 대비). 사후 확인에서 라벨 오류는 없었다.
+
+## 재현
+
+```sh
+cd eval
+cargo run -- intent-validate
+cargo run --release -- intent-generate --per-intent 30 --model kiro/claude-sonnet-5   # 최종 분할 교체, 문장 미출력
+JEV_API_KEY=... JEV_ENDPOINT=... cargo run --release -- intent-run \
+  --arm rules --arm jev --arm llm --split final --repeats 3 --out target/intent-final.jsonl
+cargo run --release -- errcause-score --results target/intent-final.jsonl
+```
+
+## 보존물
+
+- `results/intent-dev-20260923.jsonl.gz` — 개발 107 × 3 비교군 × 1회 = 321건
+- `results/intent-final-20260923.jsonl.gz` — 최종 120 × 3 비교군 × 3회 = 1,080건
