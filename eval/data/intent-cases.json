@@ -1,0 +1,2869 @@
+{
+  "schema_version": 1,
+  "generated": "2026-09-23",
+  "instructions": "터미널 도우미의 채팅 입력이다. 사용자가 원하는 것을 보고 어느 처리 경로로 보낼지 하나 고른다. 기준은 문장에 나온 낱말이 아니라 사용자가 **지금 무엇을 원하는가**다 — 같은 낱말이라도 요청이 다르면 다른 경로다.",
+  "categories": {
+    "agent": "위 셋이 아닌 요청이다(파일·코드·설정 질문, 특정 작업 수행, 개념 설명, 인사 같은 일반 대화). 처리는 대화형 에이전트가 도구를 골라 처리하는 것이다.",
+    "diagnose": "문제가 있다고 호소하거나 원인을 찾아 달라는 요청이다(느림, 장애, 오류 급증, 반복 재시작, 가득 참). 처리는 증상에 맞는 점검을 모아 원인을 가리는 것이다.",
+    "explain_last": "방금 터미널에서 실행한 명령의 결과나 실패를 설명해 달라는 요청이다. 처리는 마지막 명령 기록을 읽고 설명하는 것이다.",
+    "local": "문제를 호소하지 않고 지금 이 호스트의 상태나 수치를 보여 달라는 요청이다(메모리 사용량, 열린 포트, 프로세스 목록). 처리는 현재 상태를 수집해 보여주는 것이다."
+  },
+  "cases": [
+    {
+      "id": "in-a027b792",
+      "split": "dev",
+      "text": "서버가 갑자기 느려졌어",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-abdb51b1",
+      "split": "dev",
+      "text": "디스크가 꽉 찼대요 원인 좀 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-fb74e662",
+      "split": "dev",
+      "text": "api 응답이 5초 넘게 걸려",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-9169c002",
+      "split": "dev",
+      "text": "pod이 계속 CrashLoopBackOff야",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-c852ef79",
+      "split": "dev",
+      "text": "OOM killer가 자꾸 프로세스를 죽여",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-cf2db85d",
+      "split": "dev",
+      "text": "load average가 20이 넘는데 왜 그런지 봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e27a1e0a",
+      "split": "dev",
+      "text": "nginx가 502를 뱉어요",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-da207d8b",
+      "split": "dev",
+      "text": "컨테이너가 재시작을 반복해",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-3d31e1a8",
+      "split": "dev",
+      "text": "메모리 누수 같은데 확인해줄래",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-534d8e50",
+      "split": "dev",
+      "text": "ssh 접속이 자꾸 멈춰요",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-63b842c9",
+      "split": "dev",
+      "text": "why is the box so slow right now",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-567a0a6a",
+      "split": "dev",
+      "text": "db connection timeouts started an hour ago",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-cfe0f61c",
+      "split": "dev",
+      "text": "디비 커넥션이 자꾸 끊겨",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-7c25f7fd",
+      "split": "dev",
+      "text": "swap을 엄청 쓰고 있는데 이유가 뭘까",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-44d84bd4",
+      "split": "dev",
+      "text": "cron job이 안 돈 것 같아",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-a671b464",
+      "split": "dev",
+      "text": "네트워크 패킷 드랍이 많아",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-07e306ac",
+      "split": "dev",
+      "text": "서비스 죽었어 ㅠㅠ",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-271d922e",
+      "split": "dev",
+      "text": "Too many open files 에러가 나기 시작했어",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-8e149ca9",
+      "split": "dev",
+      "text": "배포 후부터 CPU가 100%야",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-34f2be03",
+      "split": "dev",
+      "text": "디스크 io wait이 높아요 뭐가 문제죠",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-85fcbcce",
+      "split": "dev",
+      "text": "호스트가 응답이 없다가 돌아왔어 무슨 일이지",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-beec6232",
+      "split": "dev",
+      "text": "노드가 NotReady로 떴어",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-535b2e67",
+      "split": "dev",
+      "text": "something is eating all the inodes",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-18344de8",
+      "split": "dev",
+      "text": "시간이 자꾸 어긋나는 것 같아 ntp 문제인가",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-562b0ade",
+      "split": "dev",
+      "text": "도커 데몬이 자꾸 죽네",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-36d361fa",
+      "split": "dev",
+      "text": "요청 에러율이 튀었는데 원인 파악 부탁",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-468f2d4a",
+      "split": "dev",
+      "text": "메모리 사용량 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-eb2607f9",
+      "split": "dev",
+      "text": "지금 CPU 몇 퍼센트야",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-5bd45994",
+      "split": "dev",
+      "text": "열린 포트 목록",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-ca467414",
+      "split": "dev",
+      "text": "디스크 사용량 확인",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-17616d42",
+      "split": "dev",
+      "text": "실행 중인 프로세스 상위 10개",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-4857e6bd",
+      "split": "dev",
+      "text": "uptime 알려줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-1f30dae6",
+      "split": "dev",
+      "text": "현재 떠 있는 컨테이너 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-0e40d4f8",
+      "split": "dev",
+      "text": "show me listening ports",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e7926382",
+      "split": "dev",
+      "text": "what's the current memory usage",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-20c48409",
+      "split": "dev",
+      "text": "커널 버전이 뭐지",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-3dc57081",
+      "split": "dev",
+      "text": "이 서버 사양 좀 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-8b1b8620",
+      "split": "dev",
+      "text": "지금 로그인한 사용자",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-65c20573",
+      "split": "dev",
+      "text": "네트워크 인터페이스 정보",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-4b1eae8e",
+      "split": "dev",
+      "text": "swap 얼마나 쓰고 있어?",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-1255c634",
+      "split": "dev",
+      "text": "시스템 상태 한번 훑어줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e32ee626",
+      "split": "dev",
+      "text": "파일 디스크립터 사용량",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-6266a3ef",
+      "split": "dev",
+      "text": "마운트된 파일시스템 목록",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-5a500e99",
+      "split": "dev",
+      "text": "도커 이미지 용량",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-4a377f71",
+      "split": "dev",
+      "text": "give me a quick snapshot of this host",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-8d0ad2ee",
+      "split": "dev",
+      "text": "현재 load average",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-93d16532",
+      "split": "dev",
+      "text": "타임존이랑 시간 확인",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-81a3c5bf",
+      "split": "dev",
+      "text": "방화벽 규칙 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-81f7076d",
+      "split": "dev",
+      "text": "지금 k8s 노드 상태 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-25067e84",
+      "split": "dev",
+      "text": "블록 디바이스 구성",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-7e8507ca",
+      "split": "dev",
+      "text": "방금 에러 뭐야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-98b8d48c",
+      "split": "dev",
+      "text": "이거 왜 실패했어?",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-072a2cde",
+      "split": "dev",
+      "text": "위 명령 결과 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-2828d9c2",
+      "split": "dev",
+      "text": "방금 거 무슨 뜻이야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-99baaaf5",
+      "split": "dev",
+      "text": "what does that error mean",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-02a0c0da",
+      "split": "dev",
+      "text": "why did that command fail",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-bc67303f",
+      "split": "dev",
+      "text": "exit code 1이 떴는데 왜 그래",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-8e24654d",
+      "split": "dev",
+      "text": "마지막 명령 출력 해석 좀",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-1734dd34",
+      "split": "dev",
+      "text": "저 permission denied는 왜 나는 거야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-a70c6f26",
+      "split": "dev",
+      "text": "방금 빌드 실패한 이유",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-1f789a21",
+      "split": "dev",
+      "text": "이 에러 메시지 해석해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-b5cb2e2f",
+      "split": "dev",
+      "text": "왜 안 돼?",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-a0325922",
+      "split": "dev",
+      "text": "방금 curl 결과 어떻게 읽어야 해",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-5642a05e",
+      "split": "dev",
+      "text": "위에 뜬 warning은 무시해도 돼?",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-08724bc0",
+      "split": "dev",
+      "text": "that traceback, what's going on",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-85b7797c",
+      "split": "dev",
+      "text": "방금 git push 거부된 이유가 뭐야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-8c3331a5",
+      "split": "dev",
+      "text": "테스트가 방금 빨간불인데 뭐 때문이야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-fce8bf75",
+      "split": "dev",
+      "text": "방금 나온 거 요약해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-eca99d08",
+      "split": "dev",
+      "text": "이 출력에서 중요한 게 뭐야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e2df4628",
+      "split": "dev",
+      "text": "마지막 실행 결과 봐줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-76cce093",
+      "split": "dev",
+      "text": "npm install 방금 터진 거 왜 그래",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-6458e134",
+      "split": "dev",
+      "text": "explain the last output",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-5cbc2e48",
+      "split": "dev",
+      "text": "방금 명령어 결과가 이상해",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-9fb8788c",
+      "split": "dev",
+      "text": "kubectl apply 실패 메시지 무슨 말이야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-0e71a1fd",
+      "split": "dev",
+      "text": "에러 코드 137 뜬 거 뭐야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-d3e2ae1a",
+      "split": "dev",
+      "text": "nginx 설정 파일 어디 있어?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-b85a1a74",
+      "split": "dev",
+      "text": "이 스크립트 고쳐줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-32fc9b25",
+      "split": "dev",
+      "text": "HPA가 뭐야?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-26c83310",
+      "split": "dev",
+      "text": "로그 로테이션 설정하는 법 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-9dfa72ef",
+      "split": "dev",
+      "text": "/etc/hosts에 항목 하나 추가해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-7b1c538b",
+      "split": "dev",
+      "text": "이 디렉토리에서 TODO 들어간 파일 찾아줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-fe2551e0",
+      "split": "dev",
+      "text": "write a bash one-liner to count lines in all .rs files",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-58238012",
+      "split": "dev",
+      "text": "what's the difference between SIGTERM and SIGKILL",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-05e633ea",
+      "split": "dev",
+      "text": "docker compose 파일 작성 도와줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-ffcfa535",
+      "split": "dev",
+      "text": "이 레포 구조 설명해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-c3bc3e32",
+      "split": "dev",
+      "text": "cron 표현식으로 매주 월요일 9시는?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-4afa71ff",
+      "split": "dev",
+      "text": "안녕",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e5646870",
+      "split": "dev",
+      "text": "고마워!",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-a028c037",
+      "split": "dev",
+      "text": "이 함수 리팩터링 해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-de38645f",
+      "split": "dev",
+      "text": "terraform plan 결과를 어떻게 읽는지 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-9ccb349e",
+      "split": "dev",
+      "text": "systemd 유닛 파일 템플릿 만들어줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-232ba7f4",
+      "split": "dev",
+      "text": "어제 얘기한 거 이어서 하자",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-bec5711f",
+      "split": "dev",
+      "text": "README 초안 써줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-9bbad30e",
+      "split": "dev",
+      "text": "how do I set up ssh keys",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:en"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-f3dda6fd",
+      "split": "dev",
+      "text": "쿠버네티스 네임스페이스 개념 설명",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-b7622e98",
+      "split": "dev",
+      "text": "이 yaml 문법 맞는지 봐줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-394fd197",
+      "split": "dev",
+      "text": "grep으로 IP 주소만 뽑는 법",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-ebef2374",
+      "split": "dev",
+      "text": "config.toml에서 timeout 값 바꿔줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-bf577222",
+      "split": "dev",
+      "text": "prometheus 쿼리 작성 도와줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-3d3ce051",
+      "split": "dev",
+      "text": "실패한 systemd 유닛 있나 봐줘",
+      "accepted": [
+        "local",
+        "diagnose"
+      ],
+      "traits": [
+        "boundary",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-1d7e03d4",
+      "split": "dev",
+      "text": "디스크 꽉 찼는지 확인해줘",
+      "accepted": [
+        "local",
+        "diagnose"
+      ],
+      "traits": [
+        "boundary",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-42e1fa3c",
+      "split": "dev",
+      "text": "segfault 났는데 이게 뭐지",
+      "accepted": [
+        "explain_last",
+        "diagnose"
+      ],
+      "traits": [
+        "boundary",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-c34aaa80",
+      "split": "dev",
+      "text": "방금 서비스 재시작했는데 또 죽었어",
+      "accepted": [
+        "diagnose",
+        "explain_last"
+      ],
+      "traits": [
+        "boundary",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-49efff74",
+      "split": "dev",
+      "text": "디스크 정리하는 스크립트 만들어줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "trap:keyword",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-ae7354e6",
+      "split": "dev",
+      "text": "메모리 누수 잡는 일반적인 방법 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "trap:keyword",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-e4175bd2",
+      "split": "dev",
+      "text": "CPU 사용률 알람 규칙 작성해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "trap:keyword",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-29ad29f6",
+      "split": "dev",
+      "text": "OOM killer가 어떻게 동작하는지 설명해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "trap:keyword",
+        "lang:ko"
+      ],
+      "source": "author:dev"
+    },
+    {
+      "id": "in-b51e9f9a",
+      "split": "final",
+      "text": "nginx.conf에서 gzip 압축 설정하는 법 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-80066f12",
+      "split": "final",
+      "text": "docker-compose.yml 파일 좀 읽어보고 서비스 목록 정리해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1ab5a7f0",
+      "split": "final",
+      "text": "redis랑 memcached 중에 캐시로 뭐가 나은지 설명해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-b1eea301",
+      "split": "final",
+      "text": "이 프로젝트 .env 파일에 어떤 변수들 있는지 확인해줄래?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-cce0bd70",
+      "split": "final",
+      "text": "systemd 서비스 파일 새로 하나 만들어서 my-app 등록해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a89aefc9",
+      "split": "final",
+      "text": "postgres에서 인덱스 만드는 문법 좀 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e6c92590",
+      "split": "final",
+      "text": "안녕! 오늘 뭐 도와줄 수 있어?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-12642090",
+      "split": "final",
+      "text": "k8s deployment yaml 예시 하나 작성해줘, replica 3개짜리로",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-90e487f7",
+      "split": "final",
+      "text": "이 쉘 스크립트에 있는 버그 찾아서 고쳐줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-39b0490e",
+      "split": "final",
+      "text": "crontab 문법 다시 알려줄래 매주 월요일 3시에 실행하려면",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-5c19b0b1",
+      "split": "final",
+      "text": "nginx랑 apache 차이가 뭐야?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-fb82de8d",
+      "split": "final",
+      "text": "이 디렉토리에 있는 로그 파일들 압축해서 archive 폴더로 옮겨줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-6204d552",
+      "split": "final",
+      "text": "docker image 빌드할 때 multi-stage build 어떻게 쓰는지 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-627dd5a4",
+      "split": "final",
+      "text": "config.yaml 파일에서 timeout 값 30초로 바꿔줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-cfd4bbb2",
+      "split": "final",
+      "text": "git rebase랑 merge 차이 설명 좀",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-8d4ee5cb",
+      "split": "final",
+      "text": "이 파이썬 함수 테스트 코드 작성해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a3879d54",
+      "split": "final",
+      "text": "새 유저 계정 하나 만들고 sudo 권한 줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-11c42ab7",
+      "split": "final",
+      "text": "ssh key 생성하는 명령어 알려줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c2d2be71",
+      "split": "final",
+      "text": "이 repo에 있는 Dockerfile 리뷰해줄래?",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-50376d0d",
+      "split": "final",
+      "text": "nginx reverse proxy 설정 예제 만들어줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-08566a49",
+      "split": "final",
+      "text": "kubectl로 pod 로그 실시간으로 보는 명령어 뭐였지",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-8af13d6f",
+      "split": "final",
+      "text": "고마워 도움 많이 됐어",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-024b0f6e",
+      "split": "final",
+      "text": "이 함수 리팩토링해줘, 가독성 좀 높이고",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-3ed42167",
+      "split": "final",
+      "text": "terraform으로 aws ec2 인스턴스 하나 만드는 코드 짜줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1ba43184",
+      "split": "final",
+      "text": "postgres 백업 스크립트 하나 만들어줘, 매일 새벽 2시에 돌게",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-491d9dc8",
+      "split": "final",
+      "text": "요 config 파일 문법 오류 있는지 검사해줄래",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-ef329c9d",
+      "split": "final",
+      "text": "load balancer랑 reverse proxy 개념이 어떻게 다른지 궁금해",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-449e0be2",
+      "split": "final",
+      "text": "이 브랜치 이름 좀 규칙에 맞게 바꿔줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c1a46ddd",
+      "split": "final",
+      "text": "docker network 종류별로 뭐가 다른지 설명해줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c6b5986b",
+      "split": "final",
+      "text": "README.md 파일 하나 새로 만들어서 프로젝트 설명 넣어줘",
+      "accepted": [
+        "agent"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-d8de885c",
+      "split": "final",
+      "text": "서버가 갑자기 왜 이렇게 느려졌지? 원인 좀 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-0e0680ad",
+      "split": "final",
+      "text": "nginx 502 에러가 계속 떠요 뭐가 문제인지 확인해주세요",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e8fa3faa",
+      "split": "final",
+      "text": "postgres 커넥션이 자꾸 끊기는데 원인이 뭘까요",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-01ea3e17",
+      "split": "final",
+      "text": "pod가 CrashLoopBackOff 상태인데 왜 그런지 봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-5097422e",
+      "split": "final",
+      "text": "디스크 꽉 찼다고 알림 왔는데 뭐가 차지하고 있는지 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-7e116b8b",
+      "split": "final",
+      "text": "redis 응답이 너무 느려졌어 뭐가 문제야",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-4f67a145",
+      "split": "final",
+      "text": "서비스가 계속 재시작되는데 로그 좀 봐서 원인 찾아줄래",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e09cd022",
+      "split": "final",
+      "text": "docker 컨테이너가 갑자기 죽었는데 이유 좀 알아봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e45e17af",
+      "split": "final",
+      "text": "웹사이트 로딩이 너무 오래 걸려요 병목이 어디인지 확인 부탁",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-00c8697c",
+      "split": "final",
+      "text": "systemd 서비스가 fail 상태인데 왜 그런지 진단해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1f252409",
+      "split": "final",
+      "text": "API 에러율이 갑자기 급증했어 뭐가 원인인지 봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-6c51de25",
+      "split": "final",
+      "text": "메모리 부족으로 OOM killed 됐다는데 뭐 때문인지 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a01791e8",
+      "split": "final",
+      "text": "느려 죽겠다 대체 뭐가 문제야 확인해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-975dfc1b",
+      "split": "final",
+      "text": "k8s 노드 하나가 NotReady 상태인데 원인 파악해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-fdd87922",
+      "split": "final",
+      "text": "cron job이 실행이 안 되는데 왜 그런지 좀 봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1c8bd75d",
+      "split": "final",
+      "text": "why is my database queries so slow lately, can you check?",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a6ed6b0e",
+      "split": "final",
+      "text": "load average가 너무 높은데 원인이 뭔지 알아봐줄래",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-4a54fcfe",
+      "split": "final",
+      "text": "이 서버 응답이 계속 timeout 나는데 뭐가 문제인지 찾아줘 ㅠㅠ",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-ac13e519",
+      "split": "final",
+      "text": "elasticsearch 클러스터가 yellow 상태인데 원인 진단 부탁",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-71ccaad4",
+      "split": "final",
+      "text": "certificate 에러 계속 나는데 이유 좀 확인해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-9e55b606",
+      "split": "final",
+      "text": "can you figure out why the app keeps crashing every few minutes",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-71284681",
+      "split": "final",
+      "text": "network latency가 갑자기 튀는데 원인 좀 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-561f2651",
+      "split": "final",
+      "text": "queue가 계속 쌓이는데 소비자 쪽에 문제 있는지 봐줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-b569d323",
+      "split": "final",
+      "text": "이 프로세스 CPU 100% 찍고 있는데 뭐 때문인지 알아봐",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-dbbc7a72",
+      "split": "final",
+      "text": "배포 후에 에러 로그가 폭발적으로 늘었어 원인 파악해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e9f8c4c6",
+      "split": "final",
+      "text": "swap 계속 쓰는데 뭐가 메모리 많이 먹는지 원인 찾아줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-165364c2",
+      "split": "final",
+      "text": "find out why the ssh connection keeps dropping",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-7a822686",
+      "split": "final",
+      "text": "빌드는 성공했는데 배포하면 컨테이너가 계속 재시작돼 왜 이러지",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-dd818a31",
+      "split": "final",
+      "text": "로드밸런서 헬스체크가 계속 실패하는데 원인 좀 봐줄래",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a3118b44",
+      "split": "final",
+      "text": "디비 락 걸려서 쿼리가 안 풀리는데 뭐가 문제인지 확인해줘",
+      "accepted": [
+        "diagnose"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-543e8bfa",
+      "split": "final",
+      "text": "방금 명령 왜 실패했는지 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c8a1e02d",
+      "split": "final",
+      "text": "이 에러 메시지 뭔 뜻이야?",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c3e430c8",
+      "split": "final",
+      "text": "방금 실행한 systemctl restart nginx 결과 좀 explain해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-4dba9e25",
+      "split": "final",
+      "text": "바로 위에 나온 output 해석해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-6cb3036d",
+      "split": "final",
+      "text": "방금 명령 exit code 1 떴는데 이게 뭔 의미인지 알려줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-ff9fb07e",
+      "split": "final",
+      "text": "위에 docker build 로그 왜 저렇게 나온거야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-cdb11895",
+      "split": "final",
+      "text": "explain the last command result please",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-816c802f",
+      "split": "final",
+      "text": "이거 왜 permission denied 뜬거야 방금 명령에서",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-481b55dc",
+      "split": "final",
+      "text": "방금 kubectl apply 결과 해석 좀",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-48af7936",
+      "split": "final",
+      "text": "what does this output mean",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-2110aacc",
+      "split": "final",
+      "text": "방금 psql 명령 실행했는데 결과가 이상해 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-00b51f27",
+      "split": "final",
+      "text": "바로 이전 커맨드 리턴값이 뭘 뜻하는지 알려줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-27dd1423",
+      "split": "final",
+      "text": "방금 redis-cli 명령 응답 뜻 좀 풀어줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-b000ad3f",
+      "split": "final",
+      "text": "이 stack trace 방금 거 설명 부탁",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-5161f03d",
+      "split": "final",
+      "text": "방금 실행한 명령 왜 이런 결과 나왔는지 궁금해",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-30940182",
+      "split": "final",
+      "text": "can you explain what just happened in the terminal",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e66e0c60",
+      "split": "final",
+      "text": "방금 그 grep 결과가 무슨 의미야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c86cc5e0",
+      "split": "final",
+      "text": "위에 나온 warning 메세지 설명해조",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-6caf3f18",
+      "split": "final",
+      "text": "방금 make 명령 실패한 이유 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-57842b4f",
+      "split": "final",
+      "text": "이전 출력 해석 좀 해줘 급함ㅠㅠ",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-461b4007",
+      "split": "final",
+      "text": "explain why the last command returned that",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:en",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-afbc0d7c",
+      "split": "final",
+      "text": "방금 curl 요청 결과 왜 저렇게 나왔는지",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-147869a3",
+      "split": "final",
+      "text": "바로 위 로그 줄들 뭔 뜻인지 하나씩 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-ff86368a",
+      "split": "final",
+      "text": "방금 명령어 성공한거야 실패한거야? 결과 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-d7f2cd13",
+      "split": "final",
+      "text": "이 command output 좀 해석해줘 뭔말인지 모르겠어",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-f175cea5",
+      "split": "final",
+      "text": "방금 systemctl status 결과에서 저 상태값이 뭘 뜻하는거야",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-dbeaddf2",
+      "split": "final",
+      "text": "last command explain 좀",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a2e6ecc9",
+      "split": "final",
+      "text": "방금 실행한 tar 명령 오류 설명해줘",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-62ddaa89",
+      "split": "final",
+      "text": "위에 뜬 이 메시지 무슨 뜻인지 설명해줘 ㅋㅋ",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-5cd11cca",
+      "split": "final",
+      "text": "방금 그 npm install 로그 왜 저런 경고 뜬건지 설명해",
+      "accepted": [
+        "explain_last"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-8fc02a52",
+      "split": "final",
+      "text": "지금 메모리 사용량 얼마나 되는지 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-733b3780",
+      "split": "final",
+      "text": "현재 열려있는 포트 목록 좀",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-2ae6cfad",
+      "split": "final",
+      "text": "ps aux 결과 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-90d62817",
+      "split": "final",
+      "text": "df -h 결과 확인하고 싶어",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-68bbd241",
+      "split": "final",
+      "text": "지금 CPU 사용률 몇 %야?",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-3db42a8d",
+      "split": "final",
+      "text": "docker ps 로 실행중인 컨테이너 목록 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-56ac4ba7",
+      "split": "final",
+      "text": "현재 systemd 서비스 상태 전체 목록",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-2a7c0a30",
+      "split": "final",
+      "text": "redis 메모리 사용량 지금 얼마나 쓰고있어?",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a56936fc",
+      "split": "final",
+      "text": "nginx worker process 몇 개 떠있는지 알려줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-fda5fd6d",
+      "split": "final",
+      "text": "지금 로드애버리지 값 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-c8af3448",
+      "split": "final",
+      "text": "postgres 커넥션 수 현재 몇 개인지",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-82208338",
+      "split": "final",
+      "text": "k8s 파드 목록 지금 상태로 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-cd010898",
+      "split": "final",
+      "text": "현재 디스크 남은 용량 확인",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-3c6fa9d2",
+      "split": "final",
+      "text": "지금 열려있는 tcp 세션 목록",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a089dfe4",
+      "split": "final",
+      "text": "netstat -tulnp 결과 보고싶어",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-aec0ef9d",
+      "split": "final",
+      "text": "지금 로그인 되어있는 사용자 목록",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-a05326c2",
+      "split": "final",
+      "text": "swap 얼마나 쓰고있는지 지금 수치",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1682dfa1",
+      "split": "final",
+      "text": "top 명령 결과 좀 보여줄래",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-248a4415",
+      "split": "final",
+      "text": "현재 uptime 얼마나 됐어?",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-f14cfeac",
+      "split": "final",
+      "text": "지금 실행중인 크론잡 목록 알려줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-048810fd",
+      "split": "final",
+      "text": "docker stats 결과 지금 상태로",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-922f75c9",
+      "split": "final",
+      "text": "현재 네트워크 인터페이스 상태 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-6baca916",
+      "split": "final",
+      "text": "지금 몇개의 프로세스가 돌고있어?",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-e1c74edb",
+      "split": "final",
+      "text": "kubectl get nodes 결과 좀",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-02dfd882",
+      "split": "final",
+      "text": "지금 systemctl status nginx 상태",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-3db31b90",
+      "split": "final",
+      "text": "현재 open file descriptor 개수 알려줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-3647678a",
+      "split": "final",
+      "text": "지금 방화벽 규칙 리스트 보여줘",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-1bb8af5f",
+      "split": "final",
+      "text": "elasticsearch 클러스터 상태 지금 어떤지",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-f7dccc0f",
+      "split": "final",
+      "text": "vmstat 결과 한번 보고싶은데",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    },
+    {
+      "id": "in-33eac3b6",
+      "split": "final",
+      "text": "지금 서버 몇시간째 켜져있는지",
+      "accepted": [
+        "local"
+      ],
+      "traits": [
+        "lang:ko",
+        "generated"
+      ],
+      "source": "generated:kiro/claude-sonnet-5"
+    }
+  ]
+}
