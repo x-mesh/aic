@@ -11233,7 +11233,7 @@ fn section_labels(lang: &str) -> (&'static str, &'static str, &'static str) {
 /// 분석 결과를 섹션 단위로 포맷해 출력한다.
 /// `▸ 원인` (cyan) → `▸ 다음 시도` (green + `$ cmd`) → `▸ 참고` (dim) 순서.
 /// <think> 블록이 있으면 먼저 흐린 회색으로 표시.
-/// 실패 출력에서 원인 계열을 고른다. 미설정·오류·시간 초과는 `None`이다.
+/// 실패 출력에서 원인 계열을 고른다. 미설정·오류·시간 초과·확신 부족은 `None`이다.
 ///
 /// 결과는 audit에 남긴다 — 어느 계열이 얼마나 나오는지는 호스트를 운영하며 쌓여야 알 수 있고,
 /// 분류를 설명 생성 앞에 둘지(비용 절감) 뒤에 둘지는 그 분포를 보고 정한다.
@@ -11251,24 +11251,26 @@ async fn classify_failure_cause(
         &criteria,
     )
     .await;
-    if let Some(c) = &picked {
-        debug_log!(
-            "cause    {} conf={:?} · {}ms",
-            c.value,
-            c.confidence,
-            started.elapsed().as_millis()
-        );
-        let _ = aic_client::audit::append(
-            "error_cause_classified",
-            serde_json::json!({
-                "category": c.value,
-                "confidence": c.confidence,
-                "exit_code": record.exit_code,
-                "elapsed_ms": started.elapsed().as_millis() as u64,
-            }),
-        );
-    }
-    picked
+    let picked = picked?;
+    let shown = ErrorAnalyzer::cause_is_confident(picked.confidence);
+    debug_log!(
+        "cause    {} conf={:?} shown={shown} · {}ms",
+        picked.value,
+        picked.confidence,
+        started.elapsed().as_millis()
+    );
+    // 가린 추정도 남긴다 — 임계값을 다시 정할 때 필요한 것은 가린 쪽의 분포다.
+    let _ = aic_client::audit::append(
+        "error_cause_classified",
+        serde_json::json!({
+            "category": picked.value,
+            "confidence": picked.confidence,
+            "shown": shown,
+            "exit_code": record.exit_code,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+    shown.then_some(picked)
 }
 
 /// 분류 결과 한 줄. **검증되지 않은 추정**임을 드러낸다 — 측정에서 열 번에 한 번은 틀렸다.

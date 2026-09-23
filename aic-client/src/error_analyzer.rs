@@ -203,6 +203,19 @@ impl ErrorAnalyzer {
         ("resource", "자원 한도에 걸렸다(파일 디스크립터, 메모리, 파일 크기, 디스크). 조치는 한도를 조정하거나 사용량을 줄이는 것이다."),
     ];
 
+    /// 이 confidence 미만의 추정은 사용자에게 보이지 않고 설명 프롬프트에도 싣지 않는다.
+    ///
+    /// 개발 분할에서 정했다: 오답 2건이 0.29·0.40, 정답의 최솟값이 0.56이어서 그 사이에 둔 값이다.
+    /// 최종 분할에서는 64건 중 1건(오답)만 가려 표시 정확도가 0.906에서 0.921로 올랐다. 개발
+    /// 분할의 오답이 두 건뿐이라 더 엄격한 값을 고를 근거가 없었다 — 최종 분할에서 0.95 이상이
+    /// 전부 맞았다는 관측은 있지만, 그 데이터로 값을 고르면 과적합이다.
+    pub const CAUSE_MIN_CONFIDENCE: f64 = 0.50;
+
+    /// 추정을 보여 줄 만한가. confidence를 주지 않은 응답은 믿을 근거가 없으므로 보이지 않는다.
+    pub fn cause_is_confident(confidence: Option<f64>) -> bool {
+        confidence.is_some_and(|c| c >= Self::CAUSE_MIN_CONFIDENCE)
+    }
+
     /// 분류 모델에 줄 질문. 측정에 쓴 문구 그대로다.
     pub const CAUSE_QUESTION: &'static str =
         "터미널에서 실행한 명령이 실패했다. 명령과 종료 코드와 \
@@ -1168,6 +1181,21 @@ mod tests {
     }
 
     // ── build_prompt ───────────────────────────────────────────
+
+    #[test]
+    fn a_low_confidence_cause_is_not_shown() {
+        // 최종 분할에서 confidence 0.70 미만 구간의 정확도는 0.20이었다. 그 라벨을 보이면
+        // 사용자는 틀린 방향부터 확인한다.
+        assert!(!ErrorAnalyzer::cause_is_confident(Some(0.49)));
+        assert!(ErrorAnalyzer::cause_is_confident(Some(0.50)));
+        assert!(ErrorAnalyzer::cause_is_confident(Some(0.99)));
+    }
+
+    #[test]
+    fn a_cause_without_confidence_is_not_shown() {
+        // confidence를 싣지 않은 응답은 믿을 근거가 없다.
+        assert!(!ErrorAnalyzer::cause_is_confident(None));
+    }
 
     #[test]
     fn the_cause_hint_is_a_hypothesis_not_a_fact() {
