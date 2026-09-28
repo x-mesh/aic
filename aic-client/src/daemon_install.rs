@@ -629,6 +629,33 @@ pub fn install_reclaiming(no_load: bool) -> Result<InstallReport> {
 ///
 /// 호출부가 명시하는 이유: root로 무언가를 설치하러 온 사람이 의도치 않게 전역 서비스를 만들면
 /// 안 된다. `aic daemon install --system`이 유일한 진입점이고, 기본값은 지금까지의 사용자 설치다.
+/// unit 파일을 둘 디렉토리를 만들고 실제로 파일을 쓸 수 있는지 확인한다. 읽기 전용 마운트
+/// (컨테이너·샌드박스의 `/etc`)는 권한 비트나 root 여부로 드러나지 않아 직접 써 본다.
+fn ensure_unit_dir_writable(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("unit 디렉토리 생성 실패: {}", dir.display()))?;
+    let probe = dir.join(format!(".aic-install-probe-{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Err(anyhow!(
+            "{}이(가) 읽기 전용 파일시스템에 있어 unit을 설치할 수 없습니다 — 컨테이너나 \
+             샌드박스 안이라면 호스트 셸에서 다시 실행하세요 ({e})",
+            dir.display()
+        )),
+        Err(e) => Err(anyhow!(
+            "{}에 unit 파일을 쓸 수 없습니다: {e}",
+            dir.display()
+        )),
+    }
+}
+
 pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<InstallReport> {
     let platform = detect_platform();
     if system && platform != Platform::Linux {
@@ -642,6 +669,41 @@ pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<In
             "--system 설치는 root 권한이 필요합니다 (sudo aic daemon install --system)"
         ));
     }
+    // 준비(경로 확인·디렉토리 생성·unit 쓰기 가능 여부)는 반대 스코프의 유닛을 정리하기 **전에**
+    // 끝낸다. 정리한 뒤에 실패하면 기존 서비스는 사라지고 새 서비스는 없는 상태로 끝난다.
+    if platform == Platform::Unsupported {
+        return Err(anyhow!(
+            "지원하지 않는 OS: {} (macOS / Linux만 지원)",
+            std::env::consts::OS
+        ));
+    }
+
+    let aicd = if system {
+        resolve_system_aicd_path()?
+    } else {
+        resolve_aicd_path()?
+    };
+    let logs = log_dir()?;
+    std::fs::create_dir_all(&logs)
+        .with_context(|| format!("로그 디렉토리 생성 실패: {}", logs.display()))?;
+    // 로그에는 실행한 명령과 경로가 들어간다. `/var/log` 아래는 기본 umask로 만들면 755가 되어
+    // 같은 호스트의 다른 사용자에게 읽힌다. aicd의 telemetry가 쓰는 권한과 같게 맞춘다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let unit_path = match platform {
+        Platform::Macos => macos_plist_path()?,
+        Platform::Linux if system => linux_system_unit_path(),
+        Platform::Linux => linux_unit_path()?,
+        Platform::Unsupported => unreachable!(),
+    };
+    if let Some(parent) = unit_path.parent() {
+        ensure_unit_dir_writable(parent)?;
+    }
+
     // system 유닛과 사용자 단위가 같이 떠 있으면 먼저 잡은 쪽이 lock을 쥐고 다른 쪽은
     // 영원히 실패한다. systemd가 재시작을 반복해 로그만 쌓이므로, 설치 단계에서 막는다.
     // 어느 쪽을 깔든 반대쪽을 본다 — 한 방향만 막으면 반대 순서로 같은 사고가 난다.
@@ -677,40 +739,6 @@ pub fn install_with_scope(no_load: bool, system: bool, force: bool) -> Result<In
             return Err(anyhow!("{}", remaining.remediation(action)));
         }
     }
-    if platform == Platform::Unsupported {
-        return Err(anyhow!(
-            "지원하지 않는 OS: {} (macOS / Linux만 지원)",
-            std::env::consts::OS
-        ));
-    }
-
-    let aicd = if system {
-        resolve_system_aicd_path()?
-    } else {
-        resolve_aicd_path()?
-    };
-    let logs = log_dir()?;
-    std::fs::create_dir_all(&logs)
-        .with_context(|| format!("로그 디렉토리 생성 실패: {}", logs.display()))?;
-    // 로그에는 실행한 명령과 경로가 들어간다. `/var/log` 아래는 기본 umask로 만들면 755가 되어
-    // 같은 호스트의 다른 사용자에게 읽힌다. aicd의 telemetry가 쓰는 권한과 같게 맞춘다.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(0o700));
-    }
-
-    let unit_path = match platform {
-        Platform::Macos => macos_plist_path()?,
-        Platform::Linux if system => linux_system_unit_path(),
-        Platform::Linux => linux_unit_path()?,
-        Platform::Unsupported => unreachable!(),
-    };
-    if let Some(parent) = unit_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("unit 디렉토리 생성 실패: {}", parent.display()))?;
-    }
-
     let body = match platform {
         Platform::Macos => render_macos_plist(&aicd, &logs),
         Platform::Linux => render_linux_service_for(&aicd, &logs, system),
@@ -1146,6 +1174,26 @@ mod tests {
     use std::path::Path;
 
     use crate::test_support::env_lock;
+
+    #[test]
+    fn unit_dir_preflight_accepts_a_writable_dir_and_leaves_no_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit_dir = dir.path().join("systemd/system");
+        ensure_unit_dir_writable(&unit_dir).unwrap();
+        assert_eq!(std::fs::read_dir(&unit_dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn unit_dir_preflight_fails_when_the_dir_cannot_be_created() {
+        // 정리 전에 이 실패가 나야 기존 유닛이 남는다.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("etc");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let err = ensure_unit_dir_writable(&blocker.join("systemd/system"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unit 디렉토리 생성 실패"), "{err}");
+    }
 
     /// 이 테스트가 지키는 것: 명시 런타임 디렉토리가 unit 파일로 넘어가는 것.
     /// 깨지면 systemd가 띄운 aicd와 셸의 `aic`가 서로 다른 디렉토리를 봐, 아무 에러 없이
