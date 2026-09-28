@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+## [0.50.1] - 2026-09-28
+
+### Fixed
+
+- `aic update`가 읽기 전용 파일시스템(컨테이너나 샌드박스의 `/usr` 등)에 설치된 binary를 교체하려 할 때 원인을 알려 준다. 이전에는 root여도 `sudo install`로 넘어가 같은 이유로 실패했고, `sudo install 실패`만 남았다. 이제 다운로드 전에 설치 위치에 쓸 수 있는지 확인하고, 읽기 전용이면 호스트 셸에서 다시 실행하라고 안내하며 멈춘다. root는 sudo를 쓰지 않는다.
+- `aic update`가 `aic`·`aic-session`·`aicd`를 교체하다 중간에 실패하면 이미 교체한 binary를 되돌린다. 이전에는 일부만 새 버전으로 남아 `aic`와 `aicd`의 버전이 어긋날 수 있었다. sudo로 설치할 때도 교체 전 백업(`.bak`)을 남긴다.
+- `aic workload discover`가 스레드를 별도 프로세스로 세지 않는다. 이전에는 멀티스레드 프로세스가 스레드마다 binding을 가져 스레드가 생기거나 끝날 때마다 후보의 fingerprint가 바뀌었고, discover 직후의 `aic workload enable`이 `workload candidate changed`로 거부될 수 있었다. `aic` 자신의 워커 스레드도 더 이상 후보로 나오지 않는다.
+
 ## [0.50.0] - 2026-09-23
 
 ### Added
