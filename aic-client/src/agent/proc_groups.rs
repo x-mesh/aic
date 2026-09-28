@@ -267,11 +267,29 @@ mod tests {
     /// 실제 시스템 호출 — 헤더가 있고 패닉 없이 돈다(값은 환경 의존이라 형식만 본다).
     ///
     /// **cpu가 전부 0이면 실패시킨다.** refresh 횟수가 모자라면 sysinfo는 오류 없이 조용히 0을
-    /// 돌려주므로(`render` doc의 실측 참고), 그 회귀를 잡을 방법은 이 확인뿐이다. 테스트 러너 자신이
-    /// cpu를 쓰고 있으므로 합계가 0일 수는 없다.
+    /// 돌려주므로(`render` doc의 실측 참고), 그 회귀를 잡을 방법은 이 확인뿐이다.
+    ///
+    /// `render`는 측정 구간 동안 sleep하므로 러너 자신은 cpu를 거의 쓰지 않고, 한가한 호스트에서는
+    /// 모든 그룹이 `0.0`으로 반올림된다(CI에서 실측). 측정 동안 cpu를 쓰는 스레드를 띄워 이
+    /// 프로세스가 반드시 잡히게 한다. refresh가 모자라면 부하와 무관하게 0이라 회귀 검출은 그대로다.
     #[test]
     fn render_produces_table_with_live_cpu() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinner = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            })
+        };
         let out = render();
+        stop.store(true, Ordering::Relaxed);
+        spinner.join().unwrap();
+
         assert!(out.starts_with("COUNT"), "헤더: {out}");
         let rows: Vec<&str> = out.lines().skip(1).collect();
         assert!(!rows.is_empty(), "행이 없다: {out}");
