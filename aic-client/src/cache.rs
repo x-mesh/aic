@@ -208,9 +208,11 @@ mod tests {
         // 이 필드는 나중에 생겼다. 기존 캐시가 역직렬화에서 깨지면 사용자는 이유 없이 모든
         // 분석을 다시 돌리게 된다.
         let dir = tempfile::tempdir().expect("tempdir");
+        // TTL 안의 시각이어야 한다. 고정 날짜는 다음 날부터 만료로 판정되어 호환성이 아니라
+        // TTL을 검사하게 된다.
         let legacy = serde_json::json!({
             "key": "k1",
-            "cached_at": "2026-09-23T00:00:00Z",
+            "cached_at": Utc::now().to_rfc3339(),
             "provider": "p",
             "model": "m",
             "result": {"explanation": "e", "suggested_command": null, "additional_info": null}

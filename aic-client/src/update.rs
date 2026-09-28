@@ -2,7 +2,8 @@
 //!
 //! - **Manual**(install.sh, /usr/local/bin, ~/.local/bin): GitHub release archive를
 //!   직접 받아 sha256 검증 후 세 binary(`aic`, `aic-session`, `aicd`)를 atomic
-//!   rename으로 교체. 디렉토리 권한이 없으면 `sudo install`로 fallback.
+//!   rename으로 교체. 디렉토리 권한이 없으면 `sudo install`로 fallback하고, 교체 중
+//!   하나라도 실패하면 이미 교체한 binary를 되돌린다.
 //! - **Brew**(`/opt/homebrew`, `/usr/local/Cellar`, `linuxbrew`): `brew upgrade
 //!   x-mesh/tap/aic`로 위임.
 //! - **Cargo**(`~/.cargo/bin`): 자동 교체 거부 — `cargo install` 재실행 안내.
@@ -352,65 +353,194 @@ fn extract_binaries(
 
 // ── atomic 교체 ───────────────────────────────────────────────
 
-/// staging 파일을 target 위치로 옮긴다. 디렉토리에 쓰기 권한이 없으면
-/// `sudo install`로 fallback. 같은 파일시스템이면 rename, cross-FS면
-/// `sudo install`이 copy로 처리한다.
-pub fn atomic_replace_with_sudo(staged: &Path, target: &Path) -> Result<()> {
-    let dir = target
-        .parent()
-        .ok_or_else(|| anyhow!("target에 부모 디렉토리 없음: {}", target.display()))?;
-    if writable(dir) {
-        return atomic_replace(staged, target);
+/// 설치 디렉토리에 binary를 쓰는 방법. 다운로드 **전에** 한 번 정한다 — 쓸 수 없는 위치라면
+/// 수십 MB를 받은 뒤가 아니라 시작하자마자 원인과 함께 멈춰야 한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAccess {
+    /// 현재 사용자로 직접 쓴다. staging도 설치 디렉토리에 두어 같은 FS에서 rename한다.
+    Direct,
+    /// 권한이 없어 `sudo`로 쓴다. staging은 시스템 tmpdir이고 `sudo install`이 copy한다.
+    Sudo,
+}
+
+fn install_dir_access(dir: &Path) -> Result<WriteAccess> {
+    match probe_write(dir) {
+        Ok(()) => Ok(WriteAccess::Direct),
+        Err(e) => access_after_probe_failure(
+            dir,
+            &e,
+            unsafe { libc::geteuid() } == 0,
+            which("sudo").is_some(),
+        ),
     }
-    if which("sudo").is_none() {
+}
+
+/// probe 실패의 **종류**로 다음 수단을 정한다. sudo는 권한 부족만 해결한다 — 읽기 전용
+/// 마운트(컨테이너·샌드박스의 `/usr` 등)나 root가 막힌 경우에 sudo로 넘기면 같은 이유로 다시
+/// 실패하고, 사용자에게는 원인과 무관한 "sudo install 실패"만 남는다.
+fn access_after_probe_failure(
+    dir: &Path,
+    err: &std::io::Error,
+    is_root: bool,
+    has_sudo: bool,
+) -> Result<WriteAccess> {
+    if err.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        bail!(
+            "{}이(가) 읽기 전용 파일시스템에 있어 binary를 교체할 수 없습니다 — 컨테이너나 \
+             샌드박스 안이라면 호스트 셸에서 다시 실행하세요 ({err})",
+            dir.display()
+        );
+    }
+    if err.kind() != std::io::ErrorKind::PermissionDenied || is_root {
+        bail!("{}에 쓸 수 없습니다: {err}", dir.display());
+    }
+    if !has_sudo {
         bail!(
             "{}에 쓰기 권한이 없고 sudo도 없음 — 권한 있는 사용자로 다시 실행하거나 \
              user-writable 위치로 binary를 옮기세요",
             dir.display()
         );
     }
-    let status = std::process::Command::new("sudo")
-        .arg("install")
-        .arg("-m")
-        .arg("0755")
-        .arg(staged)
-        .arg(target)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .status()
-        .context("sudo install 실행 실패")?;
-    if !status.success() {
-        bail!("sudo install 실패 (exit {:?})", status.code());
+    Ok(WriteAccess::Sudo)
+}
+
+/// 이번 실행에서 교체한 binary 하나. 되돌릴 때 이 기록만 쓴다 — 디렉토리의 `.bak`을 전부
+/// 믿으면 아직 교체하지 않은 binary까지 **이전 업데이트의** 백업으로 내려 버린다.
+struct Replaced {
+    target: PathBuf,
+    /// 교체 전 binary의 백업. 원래 없던 binary(첫 설치)면 `None` — 되돌릴 때 지운다.
+    backup: Option<PathBuf>,
+}
+
+/// staged binary들을 차례로 설치하고, 하나라도 실패하면 **이미 교체한 것을 모두** 되돌린다.
+/// 일부만 새 버전이 되면 `aic`와 `aicd`의 IPC 계약이 깨진다.
+fn install_all(access: WriteAccess, plan: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let mut done: Vec<Replaced> = Vec::new();
+    for (staged, target) in plan {
+        println!("  installing {} → {}", file_label(target), target.display());
+        match replace_binary(access, staged, target) {
+            Ok(replaced) => done.push(replaced),
+            Err(e) => {
+                for (staged, _) in plan {
+                    let _ = std::fs::remove_file(staged);
+                }
+                return Err(match roll_back(access, &done) {
+                    Ok(()) => e.context("설치를 중단하고 이미 교체한 binary를 되돌렸습니다"),
+                    Err(re) => e.context(format!(
+                        "되돌리기도 실패했습니다 — binary 버전이 섞였을 수 있으니 {}를 확인하세요: {re:#}",
+                        done.iter()
+                            .map(|r| r.target.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                });
+            }
+        }
     }
-    let _ = std::fs::remove_file(staged);
     Ok(())
 }
 
-fn atomic_replace(staged: &Path, target: &Path) -> Result<()> {
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn replace_binary(access: WriteAccess, staged: &Path, target: &Path) -> Result<Replaced> {
     if !staged.exists() {
         bail!("staged binary 없음: {}", staged.display());
     }
     let bak = target.with_extension("bak");
-    let _ = std::fs::remove_file(&bak);
-    if target.exists() {
-        std::fs::copy(target, &bak).with_context(|| format!("백업 실패: {}", bak.display()))?;
+    let backup = target.exists().then(|| bak.clone());
+    match access {
+        WriteAccess::Direct => {
+            let _ = std::fs::remove_file(&bak);
+            if backup.is_some() {
+                std::fs::copy(target, &bak)
+                    .with_context(|| format!("백업 실패: {}", bak.display()))?;
+            }
+            // chmod를 rename 뒤에 하면, 실패했을 때 이미 교체된 binary가 롤백 기록에서 빠진다.
+            // rename이 마지막 단계여야 실패 = 미교체가 성립한다.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o755);
+                std::fs::set_permissions(staged, perms)
+                    .with_context(|| format!("chmod 실패: {}", staged.display()))?;
+            }
+            std::fs::rename(staged, target)
+                .with_context(|| format!("rename 실패: {}", target.display()))?;
+        }
+        WriteAccess::Sudo => {
+            // Direct와 같은 `.bak`을 남겨야 교체 중 실패와 재시작 후 롤백(`restore_from_backup`)이
+            // 모두 가능하다.
+            if backup.is_some() {
+                run_sudo(&[
+                    "cp".as_ref(),
+                    "-p".as_ref(),
+                    target.as_os_str(),
+                    bak.as_os_str(),
+                ])
+                .with_context(|| format!("백업 실패: {}", bak.display()))?;
+            }
+            run_sudo(&[
+                "install".as_ref(),
+                "-m".as_ref(),
+                "0755".as_ref(),
+                staged.as_os_str(),
+                target.as_os_str(),
+            ])?;
+            let _ = std::fs::remove_file(staged);
+        }
     }
-    std::fs::rename(staged, target)
-        .with_context(|| format!("rename 실패: {}", target.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(target, perms)
-            .with_context(|| format!("chmod 실패: {}", target.display()))?;
+    Ok(Replaced {
+        target: target.to_path_buf(),
+        backup,
+    })
+}
+
+fn roll_back(access: WriteAccess, done: &[Replaced]) -> Result<()> {
+    for r in done.iter().rev() {
+        match (access, &r.backup) {
+            (WriteAccess::Direct, Some(bak)) => std::fs::rename(bak, &r.target)
+                .with_context(|| format!("복구 실패: {}", r.target.display()))?,
+            (WriteAccess::Direct, None) => std::fs::remove_file(&r.target)
+                .with_context(|| format!("삭제 실패: {}", r.target.display()))?,
+            (WriteAccess::Sudo, Some(bak)) => run_sudo(&[
+                "mv".as_ref(),
+                "-f".as_ref(),
+                bak.as_os_str(),
+                r.target.as_os_str(),
+            ])?,
+            (WriteAccess::Sudo, None) => {
+                run_sudo(&["rm".as_ref(), "-f".as_ref(), r.target.as_os_str()])?
+            }
+        }
     }
     Ok(())
 }
 
-/// `dir`에 임시 파일을 만들 수 있는지 probe한다. ACL/group으로 인해 mode bit
-/// 검사보다 정확하다.
-fn writable(dir: &Path) -> bool {
+fn run_sudo(args: &[&std::ffi::OsStr]) -> Result<()> {
+    let cmd = args
+        .first()
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let status = std::process::Command::new("sudo")
+        .args(args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .with_context(|| format!("sudo {cmd} 실행 실패"))?;
+    if !status.success() {
+        bail!("sudo {cmd} 실패 (exit {:?})", status.code());
+    }
+    Ok(())
+}
+
+/// `dir`에 임시 파일을 만들어 본다. ACL/group·마운트 옵션까지 반영되므로 mode bit 검사보다
+/// 정확하다. 실패 종류(권한/읽기 전용)는 호출부가 다음 수단을 고르는 데 쓴다.
+fn probe_write(dir: &Path) -> std::io::Result<()> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -420,18 +550,13 @@ fn writable(dir: &Path) -> bool {
         std::process::id(),
         nanos
     ));
-    match std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
-        .open(&probe)
-    {
-        Ok(f) => {
-            drop(f);
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
+        .open(&probe)?;
+    drop(f);
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -443,16 +568,6 @@ fn which(cmd: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// install 디렉토리에 쓸 수 있으면 거기에 stage(같은 FS에서 atomic rename),
-/// 아니면 시스템 tmpdir로 fallback(sudo install이 cross-FS copy를 처리).
-pub fn pick_staging_dir(install_dir: &Path) -> PathBuf {
-    if writable(install_dir) {
-        install_dir.to_path_buf()
-    } else {
-        std::env::temp_dir()
-    }
 }
 
 // ── 진입점 ────────────────────────────────────────────────────
@@ -579,14 +694,19 @@ fn print_cargo_hint() -> Result<()> {
 }
 
 async fn run_manual_upgrade(install: &Install, tag: &str) -> Result<()> {
+    let access = install_dir_access(&install.dir)?;
+    let staging = match access {
+        WriteAccess::Direct => install.dir.clone(),
+        WriteAccess::Sudo => std::env::temp_dir(),
+    };
     let asset = install.asset_name(tag);
-    let staging = pick_staging_dir(&install.dir);
     println!("downloading {asset} ({tag}) → {}", staging.display());
 
     let staged = download_verified(tag, &asset, &staging).await?;
 
     // aic / aic-session / aicd가 같은 디렉토리에 있다고 가정. 다른 위치에 있다면
     // 이 흐름은 aic의 위치만 갱신하고 나머지는 사용자 안내로 둔다.
+    let mut plan = Vec::new();
     for bin in BINARIES {
         let Some(src) = staged.get(*bin) else {
             eprintln!("⚠ archive에 {bin}이 없어 건너뜀");
@@ -602,9 +722,9 @@ async fn run_manual_upgrade(install: &Install, tag: &str) -> Result<()> {
             let _ = std::fs::remove_file(src);
             continue;
         }
-        println!("  installing {bin} → {}", target.display());
-        atomic_replace_with_sudo(src, &target)?;
+        plan.push((src.clone(), target));
     }
+    install_all(access, &plan)?;
 
     println!("updated to {tag}");
     // 재시작은 호출부가 Outcome::Replaced를 보고 자동으로 수행한다 — 안내만 하면
@@ -656,7 +776,7 @@ pub fn last_update_record() -> Option<UpdateRecord> {
         .find_map(|line| serde_json::from_str::<UpdateRecord>(line).ok())
 }
 
-/// `atomic_replace`가 남긴 `.bak`으로 세 binary를 되돌린다.
+/// `replace_binary`가 남긴 `.bak`으로 세 binary를 되돌린다.
 ///
 /// **세 개를 함께 되돌린다.** 일부만 되돌리면 `aic`와 `aicd`의 버전이 어긋나 IPC 계약이 깨진다.
 /// 하나라도 `.bak`이 없으면 되돌릴 수 없는 상태이므로 시도하지 않고 그 사실을 알린다.
@@ -891,6 +1011,111 @@ mod tests {
     #[test]
     fn writable_detects_user_dir() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(writable(dir.path()));
+        assert_eq!(install_dir_access(dir.path()).unwrap(), WriteAccess::Direct);
+    }
+
+    #[test]
+    fn read_only_filesystem_is_reported_instead_of_escalating_to_sudo() {
+        // sudo도 같은 EROFS로 실패한다. 예전에는 "sudo install 실패"만 남아 원인이 가려졌다.
+        let err = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        let msg = access_after_probe_failure(Path::new("/usr/local/bin"), &err, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("읽기 전용"), "{msg}");
+    }
+
+    #[test]
+    fn root_permission_denied_does_not_escalate_to_sudo() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(access_after_probe_failure(Path::new("/opt/aic"), &err, true, true).is_err());
+    }
+
+    #[test]
+    fn non_root_permission_denied_uses_sudo_only_when_available() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let dir = Path::new("/usr/local/bin");
+        assert_eq!(
+            access_after_probe_failure(dir, &err, false, true).unwrap(),
+            WriteAccess::Sudo
+        );
+        assert!(access_after_probe_failure(dir, &err, false, false).is_err());
+    }
+
+    fn stage_release(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+        BINARIES
+            .iter()
+            .map(|bin| {
+                let src = dir.join(format!("{bin}.new"));
+                std::fs::write(&src, b"new").unwrap();
+                (src, dir.join(bin))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn failed_replacement_rolls_back_binaries_already_replaced() {
+        // aic만 새 버전이 되고 aicd는 옛 버전으로 남으면 IPC 계약이 깨진다.
+        let dir = tempfile::tempdir().unwrap();
+        for bin in ["aic", "aic-session"] {
+            std::fs::write(dir.path().join(bin), b"old").unwrap();
+        }
+        // 마지막 대상(aicd)을 디렉토리로 만들어 백업 단계에서 실패시킨다.
+        std::fs::create_dir(dir.path().join("aicd")).unwrap();
+        std::fs::write(dir.path().join("aicd").join("keep"), b"x").unwrap();
+        let plan = stage_release(dir.path());
+
+        let msg = install_all(WriteAccess::Direct, &plan)
+            .unwrap_err()
+            .to_string();
+
+        assert!(msg.contains("되돌렸습니다"), "{msg}");
+        for bin in ["aic", "aic-session"] {
+            assert_eq!(
+                std::fs::read(dir.path().join(bin)).unwrap(),
+                b"old",
+                "{bin}"
+            );
+        }
+        for (src, _) in &plan {
+            assert!(!src.exists(), "staged 파일이 남음: {}", src.display());
+        }
+    }
+
+    #[test]
+    fn rollback_removes_a_binary_that_did_not_exist_before() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("aic-session"), b"old").unwrap();
+        std::fs::create_dir(dir.path().join("aicd")).unwrap();
+        std::fs::write(dir.path().join("aicd").join("keep"), b"x").unwrap();
+        let plan = stage_release(dir.path());
+
+        install_all(WriteAccess::Direct, &plan).unwrap_err();
+
+        assert!(!dir.path().join("aic").exists());
+        assert_eq!(
+            std::fs::read(dir.path().join("aic-session")).unwrap(),
+            b"old"
+        );
+    }
+
+    #[test]
+    fn successful_install_replaces_every_binary_and_keeps_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        for bin in BINARIES {
+            std::fs::write(dir.path().join(bin), b"old").unwrap();
+        }
+        let plan = stage_release(dir.path());
+
+        install_all(WriteAccess::Direct, &plan).unwrap();
+
+        for bin in BINARIES {
+            assert_eq!(
+                std::fs::read(dir.path().join(bin)).unwrap(),
+                b"new",
+                "{bin}"
+            );
+            let bak = dir.path().join(format!("{bin}.bak"));
+            assert_eq!(std::fs::read(bak).unwrap(), b"old", "{bin}");
+        }
     }
 }

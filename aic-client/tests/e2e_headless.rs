@@ -17,6 +17,22 @@ impl Drop for ChildGuard {
     }
 }
 
+/// 방금 쓴 실행 파일을 띄운다. 병렬 테스트의 다른 스레드가 그 사이 fork하면 쓰기 fd가 자식에
+/// 잠시 상속되어 exec가 `ETXTBSY`로 실패할 수 있다. 그 경우에만 짧게 다시 시도한다.
+fn spawn_retrying_text_busy(cmd: &mut Command) -> Child {
+    const ETXTBSY: i32 = 26;
+    const ATTEMPTS: u32 = 20;
+    for _ in 1..ATTEMPTS {
+        match cmd.spawn() {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            result => return result.unwrap(),
+        }
+    }
+    cmd.spawn().unwrap()
+}
+
 /// HOME/XDG를 임시로 격리한 aic 명령을 만든다(실제 홈 오염 방지 + keychain 우회).
 fn aic_cmd(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aic"));
@@ -786,21 +802,50 @@ fn workload_status_and_history_read_local_history() {
 #[test]
 fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let tmp = tempfile::tempdir().unwrap();
-    // 적격 후보가 없는 호스트를 대비해 하나 띄운다. 복사한 바이너리는 macOS 프로세스 목록에 잡히지 않는다.
-    let _workload = ChildGuard(Command::new("/bin/sleep").arg("60").spawn().unwrap());
+    // 적격 후보가 없는 호스트를 대비해 하나 띄운다. 후보는 실행 파일 경로로 묶이므로, 원본
+    // `/bin/sleep`은 다른 테스트가 띄운 짧은 sleep과 한 후보가 되어 discover와 enable 사이에
+    // fingerprint가 바뀐다. Linux에서는 고유 경로의 사본을 띄운다. 복사한 바이너리는 macOS 프로세스
+    // 목록에 잡히지 않아 거기서는 원본을 쓴다.
+    let sleep_bin = if cfg!(target_os = "linux") {
+        let dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("sleep");
+        std::fs::copy("/bin/sleep", &copy).unwrap();
+        copy
+    } else {
+        std::path::PathBuf::from("/bin/sleep")
+    };
+    let workload = spawn_retrying_text_busy(Command::new(&sleep_bin).arg("60"));
+    let sleep_pid = u64::from(workload.id());
+    let _workload = ChildGuard(workload);
     let discover = aic_cmd(tmp.path())
         .args(["workload", "discover", "--json"])
         .output()
         .unwrap();
     assert!(discover.status.success());
     let report: serde_json::Value = serde_json::from_slice(&discover.stdout).unwrap();
-    let candidate = report["report"]["candidates"]
-        .as_array()
+    let enableable = |candidate: &&serde_json::Value| {
+        !candidate["selector"].is_null()
+            && candidate["ambiguity"].as_array().is_some_and(Vec::is_empty)
+    };
+    let binds_sleep = |candidate: &&serde_json::Value| {
+        candidate["bindings"].as_array().is_some_and(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| binding["pid"].as_u64() == Some(sleep_pid))
+        })
+    };
+    // 호스트의 첫 후보는 실행 환경마다 다르고 그 사이에 바뀔 수 있다. 직접 띄운 sleep을 우선하고,
+    // sleep이 목록에 잡히지 않는 macOS에서만 첫 적격 후보로 물러난다.
+    let candidates = report["report"]["candidates"].as_array();
+    let candidate = candidates
         .and_then(|candidates| {
-            candidates.iter().find(|candidate| {
-                !candidate["selector"].is_null()
-                    && candidate["ambiguity"].as_array().is_some_and(Vec::is_empty)
-            })
+            let own = candidates.iter().filter(enableable).find(binds_sleep);
+            if cfg!(target_os = "linux") {
+                own
+            } else {
+                own.or_else(|| candidates.iter().find(enableable))
+            }
         })
         .expect("활성화 가능한 workload 후보가 있어야 함");
     let id = candidate["id"].as_str().unwrap();
