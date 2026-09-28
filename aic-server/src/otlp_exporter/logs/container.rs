@@ -45,13 +45,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use aic_common::redaction::redact;
-use aic_common::LogLine;
+use aic_common::{AicdLogsConfig, LogLine};
 
 use super::checkpoint::CheckpointStore;
-use super::file::{FileTail, LineParser};
-use super::DropCounters;
+use super::file::{FileTail, LineParser, PACE_INTERVAL};
 
 /// docker의 기본 컨테이너 로그 디렉토리. 컨테이너별 하위 디렉토리(`<id>/`) 안에
 /// `<id>-json.log`가 있다.
@@ -61,9 +61,6 @@ const DEFAULT_CONTAINERS_DIR: &str = "/var/lib/docker/containers";
 /// 많을 때 낭비라, tick보다 느슨한 별도 주기로 분리한다.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 이미 추적 중인 파일들을 읽는 주기. `file.rs::serve_files`의 1초 폴링과 동일한 관례.
-const TICK_INTERVAL: Duration = Duration::from_secs(1);
-
 /// container 수집기 실행 설정.
 #[derive(Debug, Clone)]
 pub struct ContainerCollectorConfig {
@@ -71,6 +68,9 @@ pub struct ContainerCollectorConfig {
     pub containers_dir: PathBuf,
     /// `record_id` 계산에 넘기는 host.
     pub host: String,
+    /// 컨테이너 로그 파일마다 채널로 넘기는 초당 라인 수. exporter의 `max_lines_per_sec`과 같아야
+    /// 밀린 줄이 exporter에서 버려지지 않는다.
+    pub max_lines_per_sec: u32,
 }
 
 impl Default for ContainerCollectorConfig {
@@ -78,6 +78,7 @@ impl Default for ContainerCollectorConfig {
         Self {
             containers_dir: PathBuf::from(DEFAULT_CONTAINERS_DIR),
             host: "unknown".to_string(),
+            max_lines_per_sec: AicdLogsConfig::default().max_lines_per_sec,
         }
     }
 }
@@ -302,6 +303,7 @@ fn add_tail(
     tails: &mut HashMap<PathBuf, FileTail>,
     log_path: PathBuf,
     host: &str,
+    max_lines_per_sec: u32,
     parse_counters: &Arc<ContainerParseCounters>,
 ) {
     if tails.contains_key(&log_path) {
@@ -327,7 +329,8 @@ fn add_tail(
     );
     // label은 체크포인트 키(`file/<label>`)로만 쓰인다 — service는 파서가 이미 결정했으므로
     // 여기서는 컨테이너 id를 그대로 label로 써서 유일성만 보장하면 된다.
-    let tail = FileTail::with_parser(log_path.clone(), container_id, host.to_string(), parser);
+    let tail = FileTail::with_parser(log_path.clone(), container_id, host.to_string(), parser)
+        .with_max_lines_per_sec(max_lines_per_sec);
     tails.insert(log_path, tail);
 }
 
@@ -340,7 +343,6 @@ pub async fn run_container_collector(
     cfg: ContainerCollectorConfig,
     tx: mpsc::Sender<LogLine>,
     checkpoint: Arc<CheckpointStore>,
-    drop_counters: Arc<DropCounters>,
     parse_counters: Arc<ContainerParseCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -381,10 +383,17 @@ pub async fn run_container_collector(
 
     let mut tails: HashMap<PathBuf, FileTail> = HashMap::new();
     for path in initial {
-        add_tail(&mut tails, path, &cfg.host, &parse_counters);
+        add_tail(
+            &mut tails,
+            path,
+            &cfg.host,
+            cfg.max_lines_per_sec,
+            &parse_counters,
+        );
     }
 
-    let mut tick_timer = tokio::time::interval(TICK_INTERVAL);
+    // 밀린 줄이 있는 tail만 매 PACE_INTERVAL마다, 나머지는 FileTail이 정한 폴링 간격마다 읽는다.
+    let mut tick_timer = tokio::time::interval(PACE_INTERVAL);
     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rescan_timer = tokio::time::interval(RESCAN_INTERVAL);
     rescan_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -395,8 +404,9 @@ pub async fn run_container_collector(
         }
         tokio::select! {
             _ = tick_timer.tick() => {
-                for tail in tails.values_mut() {
-                    if let Err(e) = tail.tick(&tx, &drop_counters, &checkpoint) {
+                let now = Instant::now();
+                for tail in tails.values_mut().filter(|t| t.is_due(now)) {
+                    if let Err(e) = tail.tick(&tx, &checkpoint) {
                         tracing::warn!(error = %e, "container tail tick 실패");
                     }
                 }
@@ -405,7 +415,13 @@ pub async fn run_container_collector(
                 match discover_container_logs(&cfg.containers_dir) {
                     Ok(found) => {
                         for path in found {
-                            add_tail(&mut tails, path, &cfg.host, &parse_counters);
+                            add_tail(
+            &mut tails,
+            path,
+            &cfg.host,
+            cfg.max_lines_per_sec,
+            &parse_counters,
+        );
                         }
                     }
                     Err(e) => {
@@ -429,6 +445,8 @@ pub async fn run_container_collector(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    const RATE: u32 = 1000;
 
     fn test_checkpoint() -> (tempfile::TempDir, Arc<CheckpointStore>) {
         let dir = tempfile::tempdir().unwrap();
@@ -568,11 +586,10 @@ mod tests {
 
         let parse_counters = Arc::new(ContainerParseCounters::new());
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
 
         let mut tails: HashMap<PathBuf, FileTail> = HashMap::new();
-        add_tail(&mut tails, path0.clone(), "host-a", &parse_counters);
-        add_tail(&mut tails, path1.clone(), "host-a", &parse_counters);
+        add_tail(&mut tails, path0.clone(), "host-a", RATE, &parse_counters);
+        add_tail(&mut tails, path1.clone(), "host-a", RATE, &parse_counters);
         assert_eq!(
             tails.len(),
             2,
@@ -580,7 +597,7 @@ mod tests {
         );
 
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         recv_all(&mut rx); // 최초 확립 — 백필 없음
 
@@ -594,7 +611,7 @@ mod tests {
         );
 
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         let got = recv_all(&mut rx);
         assert!(got.iter().any(|l| l.message == "gen0-line"));
@@ -653,18 +670,18 @@ mod tests {
 
         let (_cp_dir, checkpoint) = test_checkpoint();
         let (tx, _rx) = mpsc::channel(16);
-        let drop_counters = Arc::new(DropCounters::new());
         let parse_counters = Arc::new(ContainerParseCounters::new());
         let (_sd_tx, sd_rx) = watch::channel(false);
 
         let cfg = ContainerCollectorConfig {
             containers_dir: restricted.clone(),
             host: "test-host".to_string(),
+            ..Default::default()
         };
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run_container_collector(cfg, tx, checkpoint, drop_counters, parse_counters, sd_rx),
+            run_container_collector(cfg, tx, checkpoint, parse_counters, sd_rx),
         )
         .await;
 
@@ -812,11 +829,10 @@ mod tests {
 
         let parse_counters = Arc::new(ContainerParseCounters::new());
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tails: HashMap<PathBuf, FileTail> = HashMap::new();
-        add_tail(&mut tails, path.clone(), "host-a", &parse_counters);
+        add_tail(&mut tails, path.clone(), "host-a", RATE, &parse_counters);
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         recv_all(&mut rx);
 
@@ -828,7 +844,7 @@ mod tests {
         append(&path, &bad_line);
 
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         // panic만 안 나면 충분 — 내용 자체는 lossy 변환된 채로 스킵되거나 통과할 수 있다.
         let _ = recv_all(&mut rx);
@@ -926,7 +942,6 @@ mod tests {
         let (_cp_dir, checkpoint) = test_checkpoint();
         let parse_counters = Arc::new(ContainerParseCounters::new());
         let (tx, mut rx) = mpsc::channel(1 << 16);
-        let drop_counters = DropCounters::new();
 
         const N_CONTAINERS: usize = 200;
         const LINES_PER_CONTAINER: usize = 10;
@@ -943,13 +958,13 @@ mod tests {
         let discovered = discover_container_logs(base.path()).unwrap();
         assert_eq!(discovered.len(), N_CONTAINERS);
         for path in discovered {
-            add_tail(&mut tails, path, "host-a", &parse_counters);
+            add_tail(&mut tails, path, "host-a", RATE, &parse_counters);
         }
         assert_eq!(tails.len(), N_CONTAINERS);
 
         // 최초 확립(백필 없음).
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         recv_all(&mut rx);
 
@@ -976,18 +991,13 @@ mod tests {
         }
 
         for tail in tails.values_mut() {
-            tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+            tail.tick(&tx, &checkpoint).unwrap();
         }
         let got = recv_all(&mut rx);
         assert_eq!(
             got.len(),
             N_CONTAINERS * LINES_PER_CONTAINER,
             "모든 컨테이너의 모든 라인이 유실 없이 처리되어야 함"
-        );
-        assert_eq!(
-            drop_counters.by_channel_full.load(Ordering::Relaxed),
-            0,
-            "채널 용량을 넉넉히 뒀으므로 드롭이 없어야 함"
         );
 
         // 로테이션/재오픈 경로를 다 돈 뒤에도 tail당 열린 핸들은 여전히 1개뿐이어야 한다.
@@ -1020,19 +1030,18 @@ mod tests {
 
         let (_cp_dir, checkpoint) = test_checkpoint();
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = Arc::new(DropCounters::new());
         let parse_counters = Arc::new(ContainerParseCounters::new());
         let (sd_tx, sd_rx) = watch::channel(false);
 
         let cfg = ContainerCollectorConfig {
             containers_dir: dir.path().to_path_buf(),
             host: "host-a".to_string(),
+            ..Default::default()
         };
         let handle = tokio::spawn(run_container_collector(
             cfg,
             tx,
             checkpoint,
-            drop_counters,
             parse_counters.clone(),
             sd_rx,
         ));
@@ -1043,7 +1052,7 @@ mod tests {
             }
         }
         settle().await; // 최초 확립(백필 없음)
-        tokio::time::advance(TICK_INTERVAL).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         recv_all(&mut rx);
 
@@ -1055,7 +1064,7 @@ mod tests {
         buf.extend_from_slice(b"{\"log\":\"broken without close\n");
         append(&path, &buf);
 
-        tokio::time::advance(TICK_INTERVAL).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
 
         let got = recv_all(&mut rx);

@@ -610,16 +610,15 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
             let ct_shutdown = shutdown.subscribe();
             let ct_cfg = ContainerCollectorConfig {
                 host: log_host.clone(),
+                max_lines_per_sec: logs_section.max_lines_per_sec,
                 ..Default::default()
             };
-            let ct_drop = log_drop_counters.clone();
             let parse_counters = Arc::new(ContainerParseCounters::new());
             Some(tokio::spawn(async move {
                 if let Err(e) = aic_server::otlp_exporter::logs::container::run_container_collector(
                     ct_cfg,
                     tx,
                     cp,
-                    ct_drop,
                     parse_counters,
                     ct_shutdown,
                 )
@@ -643,19 +642,14 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
                         entry.label.clone(),
                         log_host.clone(),
                     )
+                    .with_max_lines_per_sec(logs_section.max_lines_per_sec)
                 })
                 .collect();
             let fl_shutdown = shutdown.subscribe();
-            let fl_drop = log_drop_counters.clone();
             Some(tokio::spawn(async move {
-                if let Err(e) = aic_server::otlp_exporter::logs::file::serve_files(
-                    tails,
-                    tx,
-                    cp,
-                    fl_drop,
-                    fl_shutdown,
-                )
-                .await
+                if let Err(e) =
+                    aic_server::otlp_exporter::logs::file::serve_files(tails, tx, cp, fl_shutdown)
+                        .await
                 {
                     tracing::warn!(error = %e, "파일 tail 수집기 종료(에러)");
                 }
@@ -895,8 +889,9 @@ fn read_logs_config() -> AicdLogsConfig {
 }
 
 /// logs 채널(`mpsc::channel::<LogLine>`) 용량. `max_lines_per_sec` 기본값(1000)의 몇 배를 버퍼로
-/// 두어, batch flush(`batch_max_ms` 기본 2000ms) 사이 순간 버스트를 흡수한다 — 채널이 가득 차면
-/// `DropCounters::by_channel_full`만 오르고 수집기는 막히지 않는다(모듈 doc 불변식).
+/// 두어, batch flush(`batch_max_ms` 기본 2000ms) 사이 순간 버스트를 흡수한다. 채널이 가득 차도
+/// 수집기는 막히지 않는다 — journald는 `DropCounters::by_channel_full`을 올리고 버리며, 파일·컨테이너
+/// tail은 버리지 않고 다음 tick으로 미룬다(#43).
 const LOGS_CHANNEL_CAPACITY: usize = 8192;
 
 /// `[aicd.exporter]`(enabled+logs_enabled+endpoint 유효)와 공유 spool/health, `[aicd.logs]`

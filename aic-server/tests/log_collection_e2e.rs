@@ -436,3 +436,124 @@ fn severity_drop_count(raw: &[u8]) -> Option<i64> {
     }
     None
 }
+
+// ── #43: 밀린 파일 줄은 버리지 않고 속도에 맞춰 전부 넘긴다 ─────────────────
+
+/// aicd가 멈췄다 뜨면 파일에는 그동안의 줄이 한꺼번에 밀려 있다. 이전에는 파일 tail이 EOF까지
+/// 한 번에 채널로 밀어 넣어 `channel_full`로 버리고, exporter의 서비스별 limiter(버스트 = 1초분)가
+/// 나머지를 `rate_limit`으로 버렸다(실측: 15,833줄 중 1,363줄만 도착).
+///
+/// 파일 tail이 exporter와 같은 초당 속도로 읽기를 늦추면, 파일 → 채널 → limiter → collector 전
+/// 구간에서 한 줄도 버려지지 않고 순서대로 도착해야 한다. 채널은 일부러 작게 둬 채널 쪽
+/// 역압도 함께 지나가게 한다.
+#[tokio::test]
+async fn file_backlog_is_paced_through_the_limiter_without_drops() {
+    use aic_common::AicdLogServiceOverride;
+    use aic_server::otlp_exporter::logs::checkpoint::CheckpointStore;
+    use aic_server::otlp_exporter::logs::file::{serve_files, FileTail};
+    use std::io::Write as _;
+
+    const RATE: u32 = 200;
+    const BACKLOG: usize = 600;
+
+    let (logs_body_tx, mut logs_body_rx) = mpsc::channel(1024);
+    let (metrics_body_tx, _metrics_body_rx) = mpsc::channel(64);
+    let endpoint = spawn_mock_collector(logs_body_tx, metrics_body_tx).await;
+
+    let mut logs_cfg = AicdLogsConfig {
+        max_lines_per_sec: RATE,
+        ..AicdLogsConfig::default()
+    };
+    // 파일 소스의 기본 기준은 WARN이다 — 실제 syslog 설정처럼 이 서비스만 INFO까지 받는다.
+    logs_cfg.services.insert(
+        "app".to_string(),
+        AicdLogServiceOverride {
+            min_severity: Some("INFO".to_string()),
+            ..Default::default()
+        },
+    );
+    let drop_counters = Arc::new(DropCounters::new());
+    let (_spool_dir, spool) = test_spool();
+    let mut cfg = logs_exporter_config(&endpoint, spool, logs_cfg, drop_counters.clone());
+    cfg.batch_max_lines = 100;
+    cfg.batch_max_ms = 200;
+
+    let (line_tx, line_rx) = mpsc::channel::<LogLine>(64);
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let exporter = tokio::spawn(serve_logs(cfg, line_rx, sd_rx.clone()));
+
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = Arc::new(CheckpointStore::open(dir.path().join("checkpoints")).unwrap());
+    let path = dir.path().join("app.log");
+    std::fs::write(
+        &path,
+        "padding-line-to-reach-fingerprint-threshold\n".repeat(32),
+    )
+    .unwrap();
+    let tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string())
+        .with_max_lines_per_sec(RATE);
+    let collector = tokio::spawn(serve_files(vec![tail], line_tx, checkpoint, sd_rx));
+
+    // 수집기는 파일을 처음 볼 때 현재 크기부터 읽는다(백필 없음). 확립 전에 밀어 넣은 줄은 설계대로
+    // 읽히지 않으므로, 고정 sleep 대신 표식 줄이 collector에 실제로 도착할 때까지 표식을 거듭 써서
+    // 확립과 전 구간 배선을 먼저 증명한다(느린 runner에서 300ms sleep이 모자라 0줄 도착한 적 있음).
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            writeln!(file, "ready-marker").unwrap();
+            let arrived = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let raw = logs_body_rx.recv().await.expect("collector 채널이 닫힘");
+                    if decode_log_bodies(&raw).iter().any(|b| b == "ready-marker") {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if arrived.is_ok() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("수집기가 파일을 확립하지 못함");
+    for i in 0..BACKLOG {
+        writeln!(file, "backlog-line-{i:04}").unwrap();
+    }
+    drop(file);
+
+    let expected: Vec<String> = (0..BACKLOG)
+        .map(|i| format!("backlog-line-{i:04}"))
+        .collect();
+    let mut got = Vec::new();
+    let deadline = Duration::from_secs(20);
+    tokio::time::timeout(deadline, async {
+        while got.len() < BACKLOG {
+            let raw = logs_body_rx.recv().await.expect("collector 채널이 닫힘");
+            got.extend(
+                decode_log_bodies(&raw)
+                    .into_iter()
+                    .filter(|b| b.starts_with("backlog-line-")),
+            );
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{BACKLOG}줄 중 {}줄만 도착", got.len()));
+
+    assert_eq!(got, expected, "밀린 줄이 빠짐없이 순서대로 도착해야 함");
+    use std::sync::atomic::Ordering;
+    assert_eq!(drop_counters.by_rate_limit.load(Ordering::Relaxed), 0);
+    assert_eq!(drop_counters.by_channel_full.load(Ordering::Relaxed), 0);
+
+    sd_tx.send(true).unwrap();
+    for handle in [exporter, collector] {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("shutdown 후 종료해야 함")
+            .unwrap()
+            .unwrap();
+    }
+}

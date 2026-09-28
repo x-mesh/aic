@@ -23,13 +23,19 @@
 //! 옛 파일에 미독 데이터가 남는다 — 그리고 그건 정확히 장애 직전 마지막 로그다. 유닉스에서는
 //! rename이 inode를 옮길 뿐 이미 열어 둔 fd는 계속 그 inode(옛 파일의 실제 데이터)를 가리키므로,
 //! 새 파일로 갈아타기 전에 **그 fd로 EOF까지 드레인**하면 이 꼬리를 잃지 않는다([`FileTail::tick`]의
-//! `Rotated` 분기, [`FileTail::drain_and_emit`]).
+//! `Rotated` 분기, `FileTail::drain_rotated`).
 //!
 //! **notify(inotify)는 쓰지 않는다.** inotify는 경로가 아니라 inode를 watch해서 mv+create 후
 //! 옛 inode를 계속 따라간다 — 새 파일의 새 로그를 놓친다. macOS FSEvents도 "남의 파일"을 잘 못
-//! 본다. 대신 1초 `tokio::time::interval` + `MissedTickBehavior::Skip`로 폴링한다
-//! ([`serve_files`] — `otlp_exporter/mod.rs`·`connections.rs`의 기존 exporter task 관례와 동일).
-//! `batch_max_ms = 2000`이라 1초 폴링의 지연은 배치 창에 흡수된다.
+//! 본다. 대신 `tokio::time::interval` + `MissedTickBehavior::Skip`로 폴링한다([`serve_files`] —
+//! `otlp_exporter/mod.rs`·`connections.rs`의 기존 exporter task 관례와 동일). 밀린 줄이 없으면
+//! 1초마다 변화를 확인하고, `batch_max_ms = 2000`이라 그 지연은 배치 창에 흡수된다.
+//!
+//! **밀린 줄은 버리지 않고 속도에 맞춰 넘긴다(#43).** aicd가 멈췄다 뜨면 체크포인트 이후의 줄이
+//! 한꺼번에 밀려 있다. 이걸 EOF까지 한 번에 채널로 밀어 넣으면 채널이 넘치고 exporter의 서비스별
+//! limiter가 초과분을 버리는데, 체크포인트는 이미 전진해 영구 유실된다(실측: 15,833줄 중 1,363줄
+//! 도착). 파일은 그 자체가 내구성 있는 버퍼이므로 `Pacer`로 exporter와 같은 초당 속도만큼만
+//! 읽어 넘기고, 넘긴 줄까지만 체크포인트를 전진시킨다. 밀린 동안에는 `PACE_INTERVAL`마다 읽는다.
 //!
 //! t10(`container.rs`)이 이 모듈을 그대로 재사용한다 — [`FileTail`]은 경로 하나·라벨 하나에
 //! 대해 일반화되어 있고, 라인 → [`LogLine`] 변환은 [`LineParser`] 클로저로 주입 가능하다(기본은
@@ -37,18 +43,19 @@
 //! 재사용하면 된다.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+// tokio 시계를 쓴다 — 테스트가 `tokio::time::pause`/`advance`로 폴링 간격을 진행시킬 수 있어야
+// 하고, 런타임 밖에서는 std 시계와 같게 동작한다.
+use tokio::time::Instant;
 
-use aic_common::LogLine;
+use aic_common::{AicdLogsConfig, LogLine};
 
 use super::checkpoint::{self, CheckpointStore};
-use super::DropCounters;
 
 /// fingerprint를 만드는 데 쓰는 선두 바이트 수. 이보다 짧은 파일은 fingerprint 충돌 위험이 커서
 /// 수집을 보류한다(Vector `known_small_files`와 동일한 이유).
@@ -226,6 +233,50 @@ struct TrackedHandle {
     offset: u64,
 }
 
+/// 밀린 줄이 있는 파일을 다시 읽는 간격이자, 한 번에 넘기는 양의 단위(초당 속도 × 이 간격).
+pub(super) const PACE_INTERVAL: Duration = Duration::from_millis(100);
+/// 밀린 줄이 없을 때 파일 변화를 확인하는 간격.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 파일 하나가 채널로 넘기는 속도의 예산(token bucket).
+///
+/// exporter는 서비스별로 초당 `max_lines_per_sec`을 넘는 줄을 **버린다**(`limiter.rs`). 파일은
+/// 그 자체가 내구성 있는 버퍼라 버릴 이유가 없으므로, 같은 속도로 **읽기를 늦춰** 그 상한 안에서만
+/// 넘긴다. 버스트는 [`PACE_INTERVAL`]분으로 작게 둔다 — exporter 버킷(버스트 = 1초분)에 여유가
+/// 남아, 두 쪽이 토큰을 채우는 시점이 조금 어긋나도 exporter에서 버려지지 않는다.
+struct Pacer {
+    rate_per_sec: f64,
+    burst: f64,
+    tokens: f64,
+    last_refill: Option<Instant>,
+}
+
+impl Pacer {
+    fn new(rate_per_sec: u32) -> Self {
+        let rate = f64::from(rate_per_sec.max(1));
+        let burst = (rate * PACE_INTERVAL.as_secs_f64()).max(1.0);
+        Self {
+            rate_per_sec: rate,
+            burst,
+            tokens: burst,
+            last_refill: None,
+        }
+    }
+
+    fn available(&mut self, now: Instant) -> usize {
+        if let Some(last) = self.last_refill {
+            let elapsed = now.saturating_duration_since(last).as_secs_f64();
+            self.tokens = (self.tokens + elapsed * self.rate_per_sec).min(self.burst);
+        }
+        self.last_refill = Some(now);
+        self.tokens.floor() as usize
+    }
+
+    fn consume(&mut self, lines: usize) {
+        self.tokens = (self.tokens - lines as f64).max(0.0);
+    }
+}
+
 /// 파일 하나를 폴링 tail한다. 경로/라벨별로 하나씩 만든다 — 여러 경로는 [`serve_files`]가
 /// `Vec<FileTail>`을 순회하며 굴린다.
 pub struct FileTail {
@@ -236,6 +287,13 @@ pub struct FileTail {
     host: String,
     parser: Arc<LineParser>,
     handle: Option<TrackedHandle>,
+    /// 로테이션으로 떼어 낸 옛 핸들. 예산 안에서 여러 tick에 걸쳐 EOF까지 읽은 뒤에야 닫는다 —
+    /// 그동안 새 파일은 읽지 않아 줄 순서가 유지된다.
+    draining: Option<TrackedHandle>,
+    pacer: Pacer,
+    /// 예산이나 채널 여유가 모자라 아직 넘기지 못한 완결 라인이 남았을 수 있는지.
+    backlog: bool,
+    next_poll: Option<Instant>,
     /// "임계 미만 — 수집 보류" 경고를 tick마다 반복 로깅하지 않기 위한 1회성 플래그.
     deferred_warned: bool,
 }
@@ -261,8 +319,25 @@ impl FileTail {
             host,
             parser,
             handle: None,
+            draining: None,
+            pacer: Pacer::new(AicdLogsConfig::default().max_lines_per_sec),
+            backlog: false,
+            next_poll: None,
             deferred_warned: false,
         }
+    }
+
+    /// 채널로 넘기는 초당 라인 수. exporter의 `max_lines_per_sec`과 같은 값을 줘야 exporter가
+    /// rate limit으로 버리지 않는다.
+    pub fn with_max_lines_per_sec(mut self, rate_per_sec: u32) -> Self {
+        self.pacer = Pacer::new(rate_per_sec);
+        self
+    }
+
+    /// 이번 순회에서 읽을 차례인지. 밀린 줄이 있으면 매 [`PACE_INTERVAL`]마다, 없으면
+    /// [`POLL_INTERVAL`]마다 읽는다.
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.backlog || self.next_poll.is_none_or(|at| now >= at)
     }
 
     /// 테스트/관측용 — 아직 identity가 확립되지 않아 수집이 보류 중인지.
@@ -275,17 +350,47 @@ impl FileTail {
         format!("file/{}", self.label)
     }
 
-    /// 한 번의 폴링 tick. 파일 상태를 재확인하고, 가능한 만큼 라인을 읽어 `tx`로 전달한다.
-    /// 파일이 순간적으로 없으면(rename 중간 등) 조용히 넘어간다 — 다음 tick에 재시도.
+    /// 한 번의 폴링 tick. 파일 상태를 재확인하고, 예산이 허락하는 만큼 라인을 읽어 `tx`로
+    /// 전달한다. 파일이 순간적으로 없으면(rename 중간 등) 조용히 넘어간다 — 다음 tick에 재시도.
     pub fn tick(
         &mut self,
         tx: &mpsc::Sender<LogLine>,
-        drop_counters: &DropCounters,
         checkpoint: &CheckpointStore,
     ) -> io::Result<()> {
+        self.tick_at(Instant::now(), tx, checkpoint)
+    }
+
+    fn tick_at(
+        &mut self,
+        now: Instant,
+        tx: &mpsc::Sender<LogLine>,
+        checkpoint: &CheckpointStore,
+    ) -> io::Result<()> {
+        self.next_poll = Some(now + POLL_INTERVAL);
+        let mut budget = self.pacer.available(now).min(tx.capacity());
+        let granted = budget;
+        let result = self.tick_with_budget(&mut budget, tx, checkpoint);
+        self.pacer.consume(granted - budget);
+        result
+    }
+
+    fn tick_with_budget(
+        &mut self,
+        budget: &mut usize,
+        tx: &mpsc::Sender<LogLine>,
+        checkpoint: &CheckpointStore,
+    ) -> io::Result<()> {
+        if !self.drain_rotated(budget, tx)? {
+            self.backlog = true;
+            return Ok(());
+        }
+
         let meta = match std::fs::metadata(&self.path) {
             Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.backlog = false;
+                return Ok(());
+            }
             Err(e) => return Err(e),
         };
         let size = meta.len();
@@ -297,6 +402,7 @@ impl FileTail {
             None => (None, 0, 0),
         };
 
+        self.backlog = false;
         match decide_change(
             old_fingerprint,
             new_fingerprint,
@@ -317,7 +423,7 @@ impl FileTail {
                 }
             }
             TailDecision::Continue => {
-                self.read_and_emit(tx, drop_counters, checkpoint)?;
+                self.read_and_emit(budget, tx, checkpoint)?;
             }
             TailDecision::Truncated => {
                 tracing::info!(path = %self.path.display(), "파일 truncate 감지 — offset 0부터 재시작");
@@ -327,42 +433,33 @@ impl FileTail {
                         h.fingerprint = fp;
                     }
                 }
-                self.read_and_emit(tx, drop_counters, checkpoint)?;
+                self.read_and_emit(budget, tx, checkpoint)?;
             }
             TailDecision::Rotated => {
-                self.handle_rotation(
-                    new_fingerprint,
-                    new_inode,
-                    size,
-                    tx,
-                    drop_counters,
-                    checkpoint,
-                )?;
+                self.handle_rotation(new_fingerprint, new_inode, size, budget, tx, checkpoint)?;
             }
         }
         Ok(())
     }
 
     /// 로테이션(또는 최초 확립) 처리. 옛 핸들이 있으면 **EOF까지 드레인**한 뒤에야 닫는다 —
-    /// 모듈 doc의 핵심 (2)번.
+    /// 모듈 doc의 핵심 (2)번. 예산이 모자라면 옛 핸들을 `draining`에 두고 다음 tick에 이어 읽는다.
     fn handle_rotation(
         &mut self,
         new_fingerprint: Option<u64>,
         new_inode: u64,
         size: u64,
+        budget: &mut usize,
         tx: &mpsc::Sender<LogLine>,
-        drop_counters: &DropCounters,
         checkpoint: &CheckpointStore,
     ) -> io::Result<()> {
         let had_prior_handle = self.handle.is_some();
 
-        if let Some(mut old) = self.handle.take() {
-            // 옛 fd는 rename되었거나 unlink되었어도 여전히 그 inode의 데이터를 가리킨다(유닉스
-            // 시맨틱) — logrotate가 mv 직후 아직 못 읽은 "장애 직전 마지막 로그"가 바로 여기서
-            // 나온다.
-            self.drain_and_emit(&mut old, tx, drop_counters)?;
-            // old.file은 여기서 drop되며 닫힌다.
-        }
+        // 옛 fd는 rename되었거나 unlink되었어도 여전히 그 inode의 데이터를 가리킨다(유닉스
+        // 시맨틱) — logrotate가 mv 직후 아직 못 읽은 "장애 직전 마지막 로그"가 바로 여기서
+        // 나온다.
+        self.draining = self.handle.take();
+        let drained = self.drain_rotated(budget, tx)?;
 
         self.deferred_warned = false;
 
@@ -370,6 +467,7 @@ impl FileTail {
             // 새 파일이 아직 fingerprint 임계 미만 — 지금은 핸들을 열지 않고 다음 tick에서
             // 재평가한다. old_fingerprint가 없는 상태로 다음 tick을 맞으므로 decide_change는
             // (None,None)→Deferred 아니면 (None,Some)→Rotated로만 갈 수 있어 안전하다.
+            self.backlog = !drained;
             return Ok(());
         };
 
@@ -398,17 +496,20 @@ impl FileTail {
             offset: start_offset,
         });
 
+        if !drained {
+            self.backlog = true;
+            return Ok(());
+        }
         // 체크포인트 재개 시 이미 그 이후로 더 쓰였을 수 있으니 곧바로 한 번 읽어 본다.
-        self.read_and_emit(tx, drop_counters, checkpoint)?;
-        Ok(())
+        self.read_and_emit(budget, tx, checkpoint)
     }
 
-    /// 현재 추적 중인 핸들(`self.handle`)에서 읽을 수 있는 만큼 읽어 emit하고, offset과
-    /// 체크포인트를 갱신한다.
+    /// 현재 추적 중인 핸들(`self.handle`)에서 예산만큼 읽어 emit하고, 넘긴 줄까지만 offset과
+    /// 체크포인트를 전진시킨다.
     fn read_and_emit(
         &mut self,
+        budget: &mut usize,
         tx: &mpsc::Sender<LogLine>,
-        drop_counters: &DropCounters,
         checkpoint: &CheckpointStore,
     ) -> io::Result<()> {
         // self.handle의 가변 borrow와 self.checkpoint_key()/self.parser의 불변 borrow가
@@ -420,21 +521,13 @@ impl FileTail {
         let Some(handle) = self.handle.as_mut() else {
             return Ok(());
         };
-        let (lines, new_offset) = drain_complete_lines(&mut handle.file, handle.offset)?;
-        if lines.is_empty() {
+        let before = handle.offset;
+        let more = emit_from_handle(parser.as_ref(), &host, handle, budget, tx)?;
+        self.backlog |= more;
+        if handle.offset == before {
             return Ok(());
         }
-        let fingerprint = handle.fingerprint;
-        emit_lines(
-            parser.as_ref(),
-            &host,
-            fingerprint,
-            lines,
-            tx,
-            drop_counters,
-        );
-        handle.offset = new_offset;
-        let checkpoint_value = format!("{fingerprint:x}:{}", handle.offset);
+        let checkpoint_value = format!("{:x}:{}", handle.fingerprint, handle.offset);
 
         // t9 범위: 배치가 durable해진 뒤(AckTracker::committed 반영) 저장하는 게 원칙(RFC-006
         // D9)이지만, 이 태스크는 "라인을 채널로 넘긴 시점"에 저장한다. t12에서 end-to-end ack를
@@ -451,110 +544,119 @@ impl FileTail {
         Ok(())
     }
 
-    /// 로테이션으로 곧 버려질 옛 핸들을 EOF까지 드레인한다. `self.handle`이 아니라 넘겨받은
-    /// `handle`을 직접 조작한다 — 호출 시점엔 이미 `self.handle`에서 떼어져 있다.
-    fn drain_and_emit(
-        &self,
-        handle: &mut TrackedHandle,
+    /// 로테이션으로 떼어 낸 옛 핸들을 예산만큼 이어 읽는다. EOF까지 다 읽었으면 핸들을 닫고
+    /// `true`, 아직 남았으면 핸들을 그대로 두고 `false`를 반환한다.
+    fn drain_rotated(
+        &mut self,
+        budget: &mut usize,
         tx: &mpsc::Sender<LogLine>,
-        drop_counters: &DropCounters,
-    ) -> io::Result<()> {
-        let (lines, new_offset) = drain_complete_lines(&mut handle.file, handle.offset)?;
-        if !lines.is_empty() {
-            emit_lines(
-                self.parser.as_ref(),
-                &self.host,
-                handle.fingerprint,
-                lines,
-                tx,
-                drop_counters,
-            );
+    ) -> io::Result<bool> {
+        let Some(mut old) = self.draining.take() else {
+            return Ok(true);
+        };
+        let more = emit_from_handle(self.parser.as_ref(), &self.host, &mut old, budget, tx)?;
+        if more {
+            self.draining = Some(old);
+            return Ok(false);
         }
-        handle.offset = new_offset;
-        Ok(())
+        // old.file은 여기서 drop되며 닫힌다.
+        Ok(true)
     }
 }
 
-/// `parser`로 라인을 변환하고 `record_id`를 채워 `tx.try_send`한다. 채널이 가득 차면
-/// `drop_counters.by_channel_full`만 올린다 — `send().await`로 블록하지 않는다(모듈 doc의
-/// 불변식, `logs/mod.rs`의 `DropCounters` 계약).
-fn emit_lines(
+/// `handle.offset`부터 완결 라인을 최대 `budget`개 읽어 채널로 넘기고, 넘긴(또는 파서가 거른)
+/// 줄까지만 `handle.offset`을 전진시킨다. 채널이 가득 차면 **버리지 않고** 멈춘다 — 남은 줄은
+/// 다음 tick에 같은 offset에서 다시 읽힌다. 반환값은 넘기지 못한 완결 라인이 남았을 수 있는지.
+fn emit_from_handle(
     parser: &LineParser,
     host: &str,
-    fingerprint: u64,
-    lines: Vec<(u64, String)>,
+    handle: &mut TrackedHandle,
+    budget: &mut usize,
     tx: &mpsc::Sender<LogLine>,
-    drop_counters: &DropCounters,
-) {
-    for (line_offset, text) in lines {
-        // 파서가 None을 주면 그 줄은 파이프라인에 닿지 않는다(깨진 라인 등). 버린 이유와
-        // 카운트는 파서 쪽 책임이다 — 여기서 채널 드롭 카운터를 올리면 의미가 섞인다.
-        let Some(mut line) = parser(&text) else {
-            continue;
-        };
-        line.record_id =
-            checkpoint::record_id(Some(&format!("{fingerprint:x}:{line_offset}")), host, &line);
-        if tx.try_send(line).is_err() {
-            drop_counters
-                .by_channel_full
-                .fetch_add(1, Ordering::Relaxed);
-        }
+) -> io::Result<bool> {
+    if *budget == 0 {
+        return Ok(true);
     }
+    let (lines, more) = read_complete_lines(&mut handle.file, handle.offset, *budget)?;
+    for CompleteLine { start, text, next } in lines {
+        *budget -= 1;
+        // 파서가 None을 주면 그 줄은 파이프라인에 닿지 않는다(깨진 라인 등). 버린 이유와
+        // 카운트는 파서 쪽 책임이다.
+        if let Some(mut line) = parser(&text) {
+            line.record_id = checkpoint::record_id(
+                Some(&format!("{:x}:{start}", handle.fingerprint)),
+                host,
+                &line,
+            );
+            if tx.try_send(line).is_err() {
+                *budget += 1;
+                return Ok(true);
+            }
+        }
+        handle.offset = next;
+    }
+    Ok(more)
 }
 
-/// `file`의 `start_offset`부터 지금 볼 수 있는 EOF까지 읽어, **마지막 개행까지만** 완결된
-/// 라인으로 취급한다. 개행 없이 끝나는 꼬리(부분 라인)는 절대 소비하지 않는다 — offset을 그
-/// 라인의 시작 지점 그대로 두어, 다음 tick에 이어 쓰인 나머지와 합쳐 온전히 다시 읽히게 한다
-/// (폴링 tail의 유일한 진짜 함정: 쓰는 쪽이 라인 중간까지만 flush한 순간에 stat이 걸리는 경우).
+/// 파일에서 읽은 완결 라인 하나.
+struct CompleteLine {
+    /// 라인이 시작하는 바이트 오프셋. 재시작 후 같은 위치에서 다시 읽어도 `record_id`가 동일하게
+    /// 재계산되어(§ `checkpoint::record_id`) 수신측 dedup이 자연스럽게 성립한다.
+    start: u64,
+    text: String,
+    /// 다음 라인의 오프셋 — 이 라인을 소비하면 여기까지 전진한다.
+    next: u64,
+}
+
+/// `file`의 `start_offset`부터 **완결된 라인**을 최대 `max_lines`개 읽는다. 개행 없이 끝나는
+/// 꼬리(부분 라인)는 절대 소비하지 않는다 — offset을 그 라인의 시작 지점 그대로 두어, 다음 tick에
+/// 이어 쓰인 나머지와 합쳐 온전히 다시 읽히게 한다(폴링 tail의 유일한 진짜 함정: 쓰는 쪽이 라인
+/// 중간까지만 flush한 순간에 stat이 걸리는 경우). 필요한 만큼만 읽으므로 밀린 양이 커도 한 tick의
+/// 메모리가 파일 크기에 비례해 커지지 않는다.
 ///
-/// 반환하는 `Vec<(u64, String)>`의 각 원소는 `(그 라인이 파일에서 시작하는 바이트 오프셋,
-/// 라인 텍스트)`다. 시작 오프셋 기준인 이유: 재시작 후 같은 위치에서 다시 읽어도 각 라인의
-/// `record_id`가 동일하게 재계산되어(§ `checkpoint::record_id`) 수신측 dedup이 자연스럽게
-/// 성립한다.
-fn drain_complete_lines(
+/// 두 번째 반환값은 `max_lines`에 걸려 멈췄는지(= 완결 라인이 더 남았을 수 있는지)다.
+fn read_complete_lines(
     file: &mut std::fs::File,
     start_offset: u64,
-) -> io::Result<(Vec<(u64, String)>, u64)> {
+    max_lines: usize,
+) -> io::Result<(Vec<CompleteLine>, bool)> {
     file.seek(SeekFrom::Start(start_offset))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-
-    let Some(last_newline) = buf.iter().rposition(|&b| b == b'\n') else {
-        // 개행이 하나도 없다 — 전부 미완결 꼬리. 아무것도 소비하지 않는다.
-        return Ok((Vec::new(), start_offset));
-    };
-
-    // buf[..=last_newline]만 완결된 라인들이다. '\n' 기준으로 자르면 이 슬라이스는 반드시
-    // '\n'로 끝나므로 split의 마지막 원소는 항상 빈 슬라이스(구분자 뒤 아티팩트)다 — 실제
-    // 라인이 아니므로 버린다. 중간의 진짜 빈 줄("\n\n")은 그대로 보존된다.
-    let mut parts: Vec<&[u8]> = buf[..=last_newline].split(|&b| b == b'\n').collect();
-    parts.pop();
-
-    let mut lines = Vec::with_capacity(parts.len());
+    let mut reader = io::BufReader::new(&mut *file);
+    let mut lines = Vec::new();
     let mut cursor = start_offset;
-    for raw in parts {
-        let advance = raw.len() as u64 + 1; // +1 = 소비한 '\n'
-        let text = String::from_utf8_lossy(raw)
+    let mut raw = Vec::new();
+    while lines.len() < max_lines {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || raw.last() != Some(&b'\n') {
+            return Ok((lines, false));
+        }
+        raw.pop();
+        let text = String::from_utf8_lossy(&raw)
             .trim_end_matches('\r')
             .to_string();
-        lines.push((cursor, text));
-        cursor += advance;
+        let next = cursor + read as u64;
+        lines.push(CompleteLine {
+            start: cursor,
+            text,
+            next,
+        });
+        cursor = next;
     }
-
-    Ok((lines, cursor))
+    Ok((lines, true))
 }
 
-/// 여러 파일을 1초 간격으로 폴링한다(모듈 doc — notify를 쓰지 않는 이유). `mod.rs:93-95`,
+/// 여러 파일을 폴링한다(모듈 doc — notify를 쓰지 않는 이유). 밀린 줄이 있는 파일만
+/// [`PACE_INTERVAL`]마다, 나머지는 [`POLL_INTERVAL`]마다 읽는다. `mod.rs:93-95`,
 /// `connections.rs:74-75`의 기존 exporter task 관례와 동일하게 `MissedTickBehavior::Skip` +
 /// 공유 shutdown watch를 쓴다.
 pub async fn serve_files(
     mut tails: Vec<FileTail>,
     tx: mpsc::Sender<LogLine>,
     checkpoint: Arc<CheckpointStore>,
-    drop_counters: Arc<DropCounters>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let mut ticker = tokio::time::interval(PACE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -563,8 +665,9 @@ pub async fn serve_files(
         }
         tokio::select! {
             _ = ticker.tick() => {
-                for tail in tails.iter_mut() {
-                    if let Err(e) = tail.tick(&tx, &drop_counters, &checkpoint) {
+                let now = Instant::now();
+                for tail in tails.iter_mut().filter(|t| t.is_due(now)) {
+                    if let Err(e) = tail.tick(&tx, &checkpoint) {
                         tracing::warn!(path = %tail.path.display(), error = %e, "file tail tick 실패");
                     }
                 }
@@ -694,11 +797,10 @@ mod tests {
         std::fs::write(&path, padded_lines(&[])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
 
         // 최초 tick: 체크포인트 없음 → 백필 없이 offset=size로 확립. 아무것도 emit 안 됨.
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert!(
             recv_all(&mut rx).is_empty(),
             "최초 확립은 백필 없이 시작해야 함"
@@ -712,7 +814,7 @@ mod tests {
         std::fs::rename(&path, &rotated).unwrap();
         std::fs::write(&path, padded_lines(&["FIRST-LINE-OF-NEW-GEN"])).unwrap();
 
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         let got = recv_all(&mut rx);
         assert!(
             got.iter().any(|m| m.contains("LAST-LINE-BEFORE-MV")),
@@ -733,26 +835,25 @@ mod tests {
         std::fs::write(&path, padded_lines(&[])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
 
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap(); // 확립, offset=size
+        tail.tick(&tx, &checkpoint).unwrap(); // 확립, offset=size
         recv_all(&mut rx);
 
         append(&path, b"pre-truncate-line\n");
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert_eq!(recv_all(&mut rx), vec!["pre-truncate-line".to_string()]);
 
         // `> file`과 동일 효과: 같은 경로를 O_TRUNC로 다시 씀(같은 inode, 크기 0).
         std::fs::write(&path, b"").unwrap();
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert!(
             recv_all(&mut rx).is_empty(),
             "truncate 직후엔 파일이 비어 있으니 아무것도 emit되면 안 됨"
         );
 
         std::fs::write(&path, b"post-truncate-line\n").unwrap();
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert_eq!(
             recv_all(&mut rx),
             vec!["post-truncate-line".to_string()],
@@ -771,15 +872,14 @@ mod tests {
         std::fs::write(&path, padded_lines(&["gen0-line"])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         recv_all(&mut rx);
 
         // 같은 경로에, 완전히 다른 내용으로 파일을 교체(재사용된 inode를 흉내). 같은 크기대에
         // 있어도(>= 이전 offset) 내용이 다르므로 fingerprint가 달라져야 한다.
         std::fs::write(&path, padded_lines(&["gen1-different-content"])).unwrap();
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         let got = recv_all(&mut rx);
         assert!(
             got.iter().any(|m| m.contains("gen1-different-content")),
@@ -796,13 +896,12 @@ mod tests {
         std::fs::write(&path, padded_lines(&[])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         recv_all(&mut rx);
 
         append(&path, b"complete-line\nPARTIAL-NO-NEWLINE-YET");
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert_eq!(
             recv_all(&mut rx),
             vec!["complete-line".to_string()],
@@ -810,7 +909,7 @@ mod tests {
         );
 
         append(&path, b"-NOW-DONE\n");
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert_eq!(
             recv_all(&mut rx),
             vec!["PARTIAL-NO-NEWLINE-YET-NOW-DONE".to_string()],
@@ -827,10 +926,9 @@ mod tests {
         std::fs::write(&path, b"tiny-line\n").unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "small".to_string(), "host-a".to_string());
 
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert!(
             recv_all(&mut rx).is_empty(),
             "임계 미만이면 아무것도 읽지 않아야 함"
@@ -842,7 +940,7 @@ mod tests {
 
         // 임계를 넘긴다.
         std::fs::write(&path, padded_lines(&["now-above-threshold"])).unwrap();
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert!(!tail.is_deferred(), "임계 도달 후엔 추적이 시작되어야 함");
     }
 
@@ -856,9 +954,8 @@ mod tests {
         std::fs::write(&path, padded_lines(&["gen0-line"])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         recv_all(&mut rx);
 
         // tick 사이에 두 세대가 지나간다 — gen1은 tail이 한 번도 못 본 채 사라진다.
@@ -867,7 +964,7 @@ mod tests {
         std::fs::rename(&path, dir.path().join("app.log.2")).unwrap();
         std::fs::write(&path, padded_lines(&["gen2-line-current"])).unwrap();
 
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         let got = recv_all(&mut rx);
         assert!(
             !got.iter().any(|m| m.contains("gen1-line-never-seen")),
@@ -889,17 +986,16 @@ mod tests {
         std::fs::write(&path, padded_lines(&["pre-existing-old-content"])).unwrap();
 
         let (tx, mut rx) = mpsc::channel(64);
-        let drop_counters = DropCounters::new();
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
 
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert!(
             recv_all(&mut rx).is_empty(),
             "체크포인트 없이 시작하면 기존 내용을 백필하면 안 됨"
         );
 
         append(&path, b"new-line-after-start\n");
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        tail.tick(&tx, &checkpoint).unwrap();
         assert_eq!(
             recv_all(&mut rx),
             vec!["new-line-after-start".to_string()],
@@ -907,28 +1003,111 @@ mod tests {
         );
     }
 
-    /// DoD 8: 채널이 가득 차면 try_send가 실패하고 by_channel_full만 오르며, 수집기는 막히지
-    /// 않는다.
+    /// 채널이 가득 차도 줄을 버리지 않는다. 넘기지 못한 줄은 offset을 전진시키지 않고 다음
+    /// tick에 이어 넘긴다(#43 — 이전에는 by_channel_full로 버리고 체크포인트는 전진시켜 영구 유실).
     #[test]
-    fn channel_full_drops_and_counts() {
+    fn full_channel_defers_lines_instead_of_dropping() {
         let dir = tempfile::tempdir().unwrap();
         let (_cp_dir, checkpoint) = test_checkpoint();
         let path = dir.path().join("app.log");
         std::fs::write(&path, padded_lines(&[])).unwrap();
 
-        // 용량 1 — 아무도 recv하지 않으므로 두 번째 try_send부터 실패한다.
-        let (tx, _rx) = mpsc::channel(1);
-        let drop_counters = DropCounters::new();
+        let (tx, mut rx) = mpsc::channel(2);
         let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string());
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap(); // 확립, offset=size, emit 없음
+        let t0 = Instant::now();
+        tail.tick_at(t0, &tx, &checkpoint).unwrap(); // 확립, offset=size
 
-        append(&path, b"line-a\nline-b\nline-c\n");
-        tail.tick(&tx, &drop_counters, &checkpoint).unwrap();
+        append(&path, b"line-a\nline-b\nline-c\nline-d\nline-e\n");
+        let mut got = Vec::new();
+        for step in 1..=10u32 {
+            tail.tick_at(t0 + PACE_INTERVAL * step, &tx, &checkpoint)
+                .unwrap();
+            got.extend(recv_all(&mut rx));
+        }
+        assert_eq!(got, ["line-a", "line-b", "line-c", "line-d", "line-e"]);
+        assert!(!tail.backlog, "다 넘긴 뒤에는 밀린 줄이 없어야 함");
+    }
 
+    /// 밀린 줄은 초당 속도 예산만큼씩 나눠 넘기고, 체크포인트는 넘긴 줄까지만 전진한다 — 중간에
+    /// 재시작해도 넘기지 못한 줄부터 이어 읽는다.
+    #[test]
+    fn backlog_is_paced_and_checkpoint_follows_sent_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cp_dir, checkpoint) = test_checkpoint();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, padded_lines(&[])).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        // 초당 100줄 → PACE_INTERVAL(100ms)당 10줄.
+        let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string())
+            .with_max_lines_per_sec(100);
+        let t0 = Instant::now();
+        tail.tick_at(t0, &tx, &checkpoint).unwrap();
+
+        let lines: Vec<String> = (0..25).map(|i| format!("line-{i:02}")).collect();
+        let mut bytes = Vec::new();
+        for line in &lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        append(&path, &bytes);
+
+        tail.tick_at(t0 + PACE_INTERVAL, &tx, &checkpoint).unwrap();
+        let first = recv_all(&mut rx);
+        assert_eq!(first, lines[..10], "첫 tick은 예산(10줄)만큼만");
+        assert!(tail.backlog);
         assert!(
-            drop_counters.by_channel_full.load(Ordering::Relaxed) >= 2,
-            "3줄 중 채널 용량(1)을 넘는 최소 2줄은 드롭 카운트되어야 함"
+            tail.is_due(t0 + PACE_INTERVAL),
+            "밀린 줄이 있으면 바로 다시 읽을 차례"
         );
+
+        // 재시작 — 새 FileTail은 체크포인트에서 이어 읽는다.
+        let mut restarted = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string())
+            .with_max_lines_per_sec(100);
+        let t1 = t0 + Duration::from_secs(5);
+        let mut rest = Vec::new();
+        for step in 0..5u32 {
+            restarted
+                .tick_at(t1 + PACE_INTERVAL * step, &tx, &checkpoint)
+                .unwrap();
+            rest.extend(recv_all(&mut rx));
+        }
+        assert_eq!(rest, lines[10..], "넘기지 못한 줄부터 빠짐없이, 중복 없이");
+    }
+
+    /// 로테이션된 옛 파일에 밀린 줄이 예산보다 많아도 여러 tick에 걸쳐 끝까지 읽은 뒤에 새 파일로
+    /// 넘어간다 — 옛 파일의 꼬리를 잃지 않고 순서도 지킨다.
+    #[test]
+    fn rotated_backlog_is_drained_across_ticks_before_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_cp_dir, checkpoint) = test_checkpoint();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, padded_lines(&["gen1-head"])).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut tail = FileTail::new(path.clone(), "app".to_string(), "host-a".to_string())
+            .with_max_lines_per_sec(100);
+        let t0 = Instant::now();
+        tail.tick_at(t0, &tx, &checkpoint).unwrap();
+
+        let old_lines: Vec<String> = (0..15).map(|i| format!("old-{i:02}")).collect();
+        let mut bytes = Vec::new();
+        for line in &old_lines {
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+        append(&path, &bytes);
+        std::fs::rename(&path, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&path, padded_lines(&["gen2-first"])).unwrap();
+
+        let mut got = Vec::new();
+        for step in 1..=10u32 {
+            tail.tick_at(t0 + PACE_INTERVAL * step, &tx, &checkpoint)
+                .unwrap();
+            got.extend(recv_all(&mut rx));
+        }
+        assert_eq!(got[..15], old_lines[..], "옛 파일의 밀린 줄이 먼저, 전부");
+        assert_eq!(got[15], "gen2-first", "그 다음에 새 파일");
     }
 
     /// DoD 9: severity는 라인 앞머리에서 파싱하고, message는 redact를 거친다.
