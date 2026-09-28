@@ -840,11 +840,12 @@ fn workload_enable_requires_current_fingerprint_and_persists_explicitly() {
     let candidates = report["report"]["candidates"].as_array();
     let candidate = candidates
         .and_then(|candidates| {
-            candidates
-                .iter()
-                .filter(enableable)
-                .find(binds_sleep)
-                .or_else(|| candidates.iter().find(enableable))
+            let own = candidates.iter().filter(enableable).find(binds_sleep);
+            if cfg!(target_os = "linux") {
+                own
+            } else {
+                own.or_else(|| candidates.iter().find(enableable))
+            }
         })
         .expect("활성화 가능한 workload 후보가 있어야 함");
     let id = candidate["id"].as_str().unwrap();
