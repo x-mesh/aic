@@ -254,13 +254,29 @@ boundary_strategy = { method = "prompt_marker" }
         );
     }
 
+    /// root는 system 서비스로 취급되어 XDG·`/tmp` 규약보다 `/run/aic`가 먼저다
+    /// (`aic_common::paths::session_dir_for_os`). 실행 uid에 따라 기대값을 나눠야 root로 돌린
+    /// 테스트도 규약 자체를 검사한다.
+    const SYSTEM_SOCKET_PATH: &str = "/run/aic/session.sock";
+
+    fn linux_expected(user_path: PathBuf) -> PathBuf {
+        if aic_common::is_system_service() {
+            PathBuf::from(SYSTEM_SOCKET_PATH)
+        } else {
+            user_path
+        }
+    }
+
     #[test]
     fn resolve_socket_path_linux_with_xdg_runtime() {
         let _guard = env_lock();
         let old = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = ConfigManager::resolve_socket_path("linux");
-        assert_eq!(path, PathBuf::from("/run/user/1000/aic/session.sock"));
+        assert_eq!(
+            path,
+            linux_expected(PathBuf::from("/run/user/1000/aic/session.sock"))
+        );
         if let Some(old) = old {
             std::env::set_var("XDG_RUNTIME_DIR", old);
         } else {
@@ -277,7 +293,7 @@ boundary_strategy = { method = "prompt_marker" }
         let uid = unsafe { libc::getuid() };
         assert_eq!(
             path,
-            PathBuf::from(format!("/tmp/aic-{}/session.sock", uid))
+            linux_expected(PathBuf::from(format!("/tmp/aic-{}/session.sock", uid)))
         );
         if let Some(old) = old {
             std::env::set_var("XDG_RUNTIME_DIR", old);
@@ -461,6 +477,9 @@ boundary_strategy = { method = "prompt_marker" }
             // 2) 플랫폼 관례 준수
             let path_str = path.to_string_lossy();
             match os {
+                "linux" if aic_common::is_system_service() => {
+                    prop_assert_eq!(path.as_path(), std::path::Path::new(SYSTEM_SOCKET_PATH));
+                }
                 "linux" => {
                     // Linux + XDG_RUNTIME_DIR → XDG_RUNTIME_DIR 하위
                     prop_assert!(
@@ -507,12 +526,16 @@ boundary_strategy = { method = "prompt_marker" }
             // 1) 절대 경로
             prop_assert!(path.is_absolute(), "경로가 절대 경로여야 합니다: {:?}", path);
 
-            // 2) XDG 미설정 시 Linux/macOS 모두 /tmp/aic- 하위
-            let path_str = path.to_string_lossy();
-            prop_assert!(
-                path_str.starts_with("/tmp/aic-"),
-                "XDG 미설정: 경로가 /tmp/aic- 하위여야 합니다: {:?}", path
-            );
+            // 2) XDG 미설정 시 Linux/macOS 모두 /tmp/aic- 하위 (Linux root는 system 경로)
+            if os == "linux" && aic_common::is_system_service() {
+                prop_assert_eq!(path.as_path(), std::path::Path::new(SYSTEM_SOCKET_PATH));
+            } else {
+                let path_str = path.to_string_lossy();
+                prop_assert!(
+                    path_str.starts_with("/tmp/aic-"),
+                    "XDG 미설정: 경로가 /tmp/aic- 하위여야 합니다: {:?}", path
+                );
+            }
 
             // 3) session.sock으로 종료
             prop_assert!(
