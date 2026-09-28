@@ -286,8 +286,18 @@ mod tests {
                 }
             })
         };
-        let out = render();
-        stop.store(true, Ordering::Relaxed);
+        // render가 패닉해도 스레드를 멈춘다. 남으면 바이너리가 끝날 때까지 한 코어를 태워 같은
+        // 바이너리의 시간 민감 테스트를 흔든다.
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let out = {
+            let _stop = StopOnDrop(stop);
+            render()
+        };
         spinner.join().unwrap();
 
         assert!(out.starts_with("COUNT"), "헤더: {out}");
