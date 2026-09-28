@@ -459,15 +459,17 @@ fn replace_binary(access: WriteAccess, staged: &Path, target: &Path) -> Result<R
                 std::fs::copy(target, &bak)
                     .with_context(|| format!("백업 실패: {}", bak.display()))?;
             }
-            std::fs::rename(staged, target)
-                .with_context(|| format!("rename 실패: {}", target.display()))?;
+            // chmod를 rename 뒤에 하면, 실패했을 때 이미 교체된 binary가 롤백 기록에서 빠진다.
+            // rename이 마지막 단계여야 실패 = 미교체가 성립한다.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let perms = std::fs::Permissions::from_mode(0o755);
-                std::fs::set_permissions(target, perms)
-                    .with_context(|| format!("chmod 실패: {}", target.display()))?;
+                std::fs::set_permissions(staged, perms)
+                    .with_context(|| format!("chmod 실패: {}", staged.display()))?;
             }
+            std::fs::rename(staged, target)
+                .with_context(|| format!("rename 실패: {}", target.display()))?;
         }
         WriteAccess::Sudo => {
             // Direct와 같은 `.bak`을 남겨야 교체 중 실패와 재시작 후 롤백(`restore_from_backup`)이
