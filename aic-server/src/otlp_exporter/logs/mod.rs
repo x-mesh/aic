@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - `by_severity`: [`filter::passes_severity`]에서 걸림.
 /// - `by_rate_limit`: [`Limiter::try_acquire`] 토큰 부족.
 /// - `by_channel_full`: 수집기가 `mpsc::Sender::try_send`에 실패했을 때 수집기 쪽에서 올린다
-///   (이 태스크 범위 밖 — 수집기 태스크가 아직 없다).
+///   (journald). 파일·컨테이너 tail은 버리지 않고 다음 tick으로 미루므로 올리지 않는다(#43).
 /// - `by_spool_quota`: spool `AppLogs` 쿼터 초과. `Spool`이 이미 `dropped_count`로 세고 있으므로
 ///   여기 별도 로직을 두지 않고, 메트릭을 만들 때 `Spool::dropped_count(SignalKind::AppLogs)`
 ///   값을 그대로 복사해 넣는다(스냅샷 시점에 read-through).
