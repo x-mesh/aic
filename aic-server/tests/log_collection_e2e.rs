@@ -494,12 +494,32 @@ async fn file_backlog_is_paced_through_the_limiter_without_drops() {
         .with_max_lines_per_sec(RATE);
     let collector = tokio::spawn(serve_files(vec![tail], line_tx, checkpoint, sd_rx));
 
-    // 수집기가 파일을 확립(현재 크기부터)할 때까지 기다린 뒤 한꺼번에 밀어 넣는다.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 수집기는 파일을 처음 볼 때 현재 크기부터 읽는다(백필 없음). 확립 전에 밀어 넣은 줄은 설계대로
+    // 읽히지 않으므로, 고정 sleep 대신 표식 줄이 collector에 실제로 도착할 때까지 표식을 거듭 써서
+    // 확립과 전 구간 배선을 먼저 증명한다(느린 runner에서 300ms sleep이 모자라 0줄 도착한 적 있음).
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            writeln!(file, "ready-marker").unwrap();
+            let arrived = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let raw = logs_body_rx.recv().await.expect("collector 채널이 닫힘");
+                    if decode_log_bodies(&raw).iter().any(|b| b == "ready-marker") {
+                        break;
+                    }
+                }
+            })
+            .await;
+            if arrived.is_ok() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("수집기가 파일을 확립하지 못함");
     for i in 0..BACKLOG {
         writeln!(file, "backlog-line-{i:04}").unwrap();
     }
