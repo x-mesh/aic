@@ -160,6 +160,9 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .processes()
         .iter()
         .filter(|(pid, _)| pid.as_u32() != scanner_pid)
+        // Linux의 `processes()`는 스레드도 돌려준다. 스레드가 binding이 되면 fingerprint가 스레드
+        // 생성·종료마다 바뀌고, 스캐너 자신의 워커 스레드까지 후보가 된다. 커널 스레드는 남긴다.
+        .filter(|(_, process)| crate::agent::proc_groups::is_countable(process))
         .map(|(pid, process)| {
             let pid = pid.as_u32();
             let mut ambiguity = Vec::new();
@@ -1503,6 +1506,44 @@ mod tests {
             key: key.to_string(),
         });
         row
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_does_not_bind_userland_threads() {
+        // 스레드마다 binding이 생기면 fingerprint가 스레드 생성·종료에 따라 바뀌어, discover 직후의
+        // enable이 "candidate changed"로 거부된다. 스캐너 자신의 워커 스레드도 후보로 올라온다.
+        use std::sync::mpsc;
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let stop_rx = std::sync::Arc::new(std::sync::Mutex::new(stop_rx));
+        let workers = (0..3)
+            .map(|_| {
+                let tid_tx = tid_tx.clone();
+                let stop_rx = stop_rx.clone();
+                std::thread::spawn(move || {
+                    tid_tx.send(unsafe { libc::gettid() } as u32).unwrap();
+                    let _ = stop_rx.lock().unwrap().recv();
+                })
+            })
+            .collect::<Vec<_>>();
+        let tids = (0..3)
+            .map(|_| tid_rx.recv().unwrap())
+            .collect::<BTreeSet<_>>();
+
+        let report = discover_with_driver_checks(false).unwrap();
+
+        drop(stop_tx);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let bound = report
+            .candidates
+            .iter()
+            .flat_map(|candidate| &candidate.bindings)
+            .filter(|binding| tids.contains(&binding.pid))
+            .count();
+        assert_eq!(bound, 0, "스레드 {tids:?}가 후보 binding에 들어감");
     }
 
     #[test]

@@ -26,7 +26,7 @@
 ///
 /// 반대 방향의 과교정도 실제로 있었다 — `thread_kind().is_none()`으로 걸렀다가 **커널 스레드까지
 /// 잘라내** 실제 173개 중 47개만 보고한 회귀(v0.31.0, 같은 날 핫픽스)다. 커널 스레드는 `Tgid == Pid`인
-/// 독립 항목이라 남겨야 한다. [`super::proc_fd`]가 같은 판정을 쓴다 — 바꾸려면 양쪽을 함께 봐야 한다.
+/// 독립 항목이라 남겨야 한다. [`super::proc_fd`]와 `crate::workload`의 discover가 같은 판정을 쓴다 — 바꾸려면 모두 함께 봐야 한다.
 pub(crate) fn is_countable(p: &sysinfo::Process) -> bool {
     !matches!(p.thread_kind(), Some(sysinfo::ThreadKind::Userland))
 }
