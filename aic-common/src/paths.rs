@@ -766,8 +766,9 @@ mod tests {
                 candidates.iter().any(|c| c.starts_with("/run/user/")),
                 "user 유닛 경로가 후보에서 빠졌다: {candidates:?}"
             );
+            // `Path::starts_with`는 요소 단위라 `aic-0`이 `aic-`로 시작하는지 보지 않는다.
             assert!(
-                candidates.iter().any(|c| c.starts_with("/tmp/aic-")),
+                candidates.contains(&tmp_session_dir()),
                 "옛 설치 경로가 후보에서 빠졌다: {candidates:?}"
             );
         } else {
@@ -1045,13 +1046,26 @@ mod tests {
     // 함수라, 값을 바꾸지 않아도 남이 바꾼 창에 관측하면 똑같이 깨진다.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// root는 system 서비스로 취급되어 XDG·`/tmp` 관례보다 `/run/aic`가 먼저다. 관례 경로를
+    /// 기대하는 테스트는 이 분기를 따로 기대해야 root로 돌려도 규약 자체를 검사한다.
+    fn expected_linux_dir(user_dir: PathBuf) -> PathBuf {
+        if is_system_service() {
+            PathBuf::from(SYSTEM_RUNTIME_DIR)
+        } else {
+            user_dir
+        }
+    }
+
     #[test]
     fn resolve_linux_with_xdg_runtime() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
         let path = resolve_socket_path("linux");
-        assert_eq!(path, PathBuf::from("/run/user/1000/aic/session.sock"));
+        assert_eq!(
+            path,
+            expected_linux_dir(PathBuf::from("/run/user/1000/aic")).join(LEGACY_SOCKET_FILE)
+        );
         match prev {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
@@ -1064,10 +1078,9 @@ mod tests {
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let path = resolve_socket_path("linux");
-        let uid = unsafe { libc::getuid() };
         assert_eq!(
             path,
-            PathBuf::from(format!("/tmp/aic-{}/session.sock", uid))
+            expected_linux_dir(tmp_session_dir()).join(LEGACY_SOCKET_FILE)
         );
         if let Some(v) = prev {
             std::env::set_var("XDG_RUNTIME_DIR", v);
@@ -1186,12 +1199,23 @@ mod tests {
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::remove_var("XDG_RUNTIME_DIR");
         let candidates = session_dir_candidates_for_os("linux");
-        assert_eq!(candidates[0], tmp_session_dir(), "0번은 정규 경로");
-        assert_eq!(
-            candidates[1],
-            run_user_session_dir(),
-            "systemd --user 쪽 대체"
-        );
+        if is_system_service() {
+            assert_eq!(
+                candidates,
+                vec![
+                    PathBuf::from(SYSTEM_RUNTIME_DIR),
+                    run_user_session_dir(),
+                    tmp_session_dir()
+                ]
+            );
+        } else {
+            assert_eq!(candidates[0], tmp_session_dir(), "0번은 정규 경로");
+            assert_eq!(
+                candidates[1],
+                run_user_session_dir(),
+                "systemd --user 쪽 대체"
+            );
+        }
         if let Some(v) = prev {
             std::env::set_var("XDG_RUNTIME_DIR", v);
         }
@@ -1205,9 +1229,16 @@ mod tests {
         let prev = std::env::var("XDG_RUNTIME_DIR").ok();
         std::env::set_var("XDG_RUNTIME_DIR", "/tmp/isolated-runtime");
         let candidates = session_dir_candidates_for_os("linux");
-        assert_eq!(candidates[0], PathBuf::from("/tmp/isolated-runtime/aic"));
-        assert_eq!(candidates[1], tmp_session_dir());
-        assert!(!candidates.contains(&run_user_session_dir()));
+        if is_system_service() {
+            // root는 user 유닛으로 뜬 aicd도 찾아야 해서 `/run/user/0`을 일부러 남긴다
+            // (`system_service_gets_its_own_runtime_dir`). XDG 경로는 system 경로 바로 뒤다.
+            assert_eq!(candidates[0], PathBuf::from(SYSTEM_RUNTIME_DIR));
+            assert_eq!(candidates[1], PathBuf::from("/tmp/isolated-runtime/aic"));
+        } else {
+            assert_eq!(candidates[0], PathBuf::from("/tmp/isolated-runtime/aic"));
+            assert_eq!(candidates[1], tmp_session_dir());
+            assert!(!candidates.contains(&run_user_session_dir()));
+        }
         match prev {
             Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
@@ -1244,14 +1275,14 @@ mod tests {
         std::env::set_var(RUNTIME_DIR_ENV, "");
         assert_eq!(
             session_dir_for_os("linux"),
-            PathBuf::from("/run/user/1000/aic")
+            expected_linux_dir(PathBuf::from("/run/user/1000/aic"))
         );
 
         // 상대 경로도 무시한다 — cwd에 따라 프로세스마다 다른 곳을 가리키면 계약이 아니다.
         std::env::set_var(RUNTIME_DIR_ENV, "runtime/aic");
         assert_eq!(
             session_dir_for_os("linux"),
-            PathBuf::from("/run/user/1000/aic"),
+            expected_linux_dir(PathBuf::from("/run/user/1000/aic")),
             "상대 경로는 관례 경로로 되돌아가야 한다"
         );
 

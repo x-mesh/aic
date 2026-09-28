@@ -136,9 +136,11 @@ proptest! {
 
         let path_str = path.to_string_lossy();
 
-        // /tmp/aic- prefix를 포함해야 함 (현재 /tmp/ac- → FAIL 예상)
+        // /tmp/aic- prefix를 포함해야 함 (현재 /tmp/ac- → FAIL 예상). Linux root는 system
+        // 서비스로 취급되어 `/run/aic`를 쓰며, 그 경로도 aic prefix다.
+        let system = os == "linux" && aic_common::is_system_service();
         prop_assert!(
-            path_str.contains("/tmp/aic-"),
+            path_str.contains("/tmp/aic-") || (system && path_str.starts_with("/run/aic/")),
             "소켓 경로가 '/tmp/aic-'를 포함해야 합니다. OS={}, 실제: {}",
             os, path_str
         );
