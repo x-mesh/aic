@@ -110,8 +110,10 @@ tar -xzf "$tmp/$asset" -C "$tmp" || err "압축 해제 실패"
 # 요구한다. aicd에는 TTY가 없어 그 sudo는 반드시 실패하므로, 자동 업데이트가 조용히 멈춘다.
 # root 설치(= Linux system 서비스 배포)만 공용 경로를 쓴다.
 if [ "$(id -u)" = "0" ]; then
+  is_root=true
   default_dir=/usr/local/bin
 else
+  is_root=false
   default_dir="$HOME/.local/bin"
 fi
 target_dir=${AIC_INSTALL_DIR:-$default_dir}
@@ -122,7 +124,7 @@ install_one() {
   bin=$(basename "$src")
   if [ -w "$dst_dir" ]; then
     install -m 0755 "$src" "$dst_dir/$bin"
-  elif command -v sudo >/dev/null 2>&1; then
+  elif [ "$is_root" = false ] && command -v sudo >/dev/null 2>&1; then
     sudo install -m 0755 "$src" "$dst_dir/$bin"
   else
     return 1
@@ -139,11 +141,18 @@ install_all_to() {
   done
 }
 
-if [ ! -w "$target_dir" ] && command -v sudo >/dev/null 2>&1; then
+# root가 쓸 수 없는 위치는 sudo로도 쓸 수 없다(읽기 전용 마운트 등). root 설치는 system 서비스
+# 배포라, 다른 위치로 옮겨 계속하면 뒤의 데몬 등록이 기존 유닛만 정리하고 새 서비스는 못 깐다.
+# 아무것도 바꾸기 전에 멈춘다. 없는 디렉토리는 `-w`가 거짓이라 먼저 만든다.
+mkdir -p "$target_dir" 2>/dev/null || true
+if [ "$is_root" = true ]; then
+  [ -w "$target_dir" ] || err "${target_dir}에 쓸 수 없습니다 — 읽기 전용 파일시스템(컨테이너·샌드박스)이면 호스트 셸에서 다시 실행하세요. 기존 설치와 aicd는 건드리지 않았습니다"
+elif [ ! -w "$target_dir" ] && command -v sudo >/dev/null 2>&1; then
   info "${target_dir}에 쓰기 권한 없음 — sudo로 설치"
 fi
 
 if ! install_all_to "$target_dir"; then
+  [ "$is_root" = true ] && err "${target_dir}에 설치 실패 — root 설치는 다른 위치로 옮기지 않습니다"
   fallback="$HOME/.local/bin"
   info "${target_dir}에 설치 실패 — ${fallback}로 fallback"
   install_all_to "$fallback" || err "설치 실패 (쓸 수 있는 위치 없음)"
