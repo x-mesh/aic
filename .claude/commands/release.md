@@ -22,22 +22,40 @@ protection이 없어 CI는 push 뒤에 돌기 때문에, tag를 먼저/같이 �
   호환 깨짐=major). 애매하면 사용자에게 묻는다.
 - 릴리스는 `develop`에서 한다. 현재 브랜치가 `develop`이 아니면 사용자에게 어떻게 올릴지 확인.
 
-## 2. 로컬 검증 (CI 매트릭스 누락 방지)
-`--lib`만으로는 CI의 phase × central_store 조합을 놓친다(과거 `central_store=1`에서만 깨진 env-race
-사례 있음). 최소 아래를 돌리고, 실패하면 **중단**한다.
+## 2. 사전 조건: 릴리스할 코드가 이미 CI를 통과했는가
+릴리스 커밋은 버전·lockfile·CHANGELOG만 바꾼다. 그 아래 코드는 develop에 머지될 때 이미 CI 전 matrix
+(14 job)를 통과했으므로, 로컬에서 그 일부를 다시 돌리지 않고 **그 통과 사실**을 확인한다. 로컬 재검사는
+CI의 부분집합이라 새 결함을 거의 잡지 못했고(과거 기록은 flaky·셸 차이 오판뿐) 릴리스마다 약 6분이 들었다.
+bump 커밋 자체는 5단계 게이트가 다시 전부 검사한다.
+
+bump 전에, 지금 develop HEAD의 develop CI가 green인지 본다.
 ```sh
-cargo clippy --workspace -- -D warnings   # CI(ci.yml)와 동일 명령 — 게이트는 CI와 일치시킨다
+git fetch origin
+[ "$(git rev-parse HEAD)" = "$(git rev-parse origin/develop)" ] || { echo "로컬 develop이 origin/develop과 다름" >&2; exit 1; }
+BASE=$(git rev-parse HEAD)
+STATE=$(gh run list --workflow=ci.yml --branch develop -L20 --json headSha,status,conclusion \
+        --jq ".[] | select(.headSha==\"$BASE\") | \"\(.status)/\(.conclusion)\"" | head -1)
+echo "base ${BASE:0:7}: ${STATE:-CI 실행 없음}"   # completed/success 여야 진행
+```
+- `completed/success`면 진행. `in_progress`/`queued`면 `gh run watch`로 끝까지 보고 green이면 진행.
+- 실패했거나 실행이 없으면(`[skip ci]`, 워크플로 비활성 등) **중단**하고 원인을 확인한다. 원인을 해결할 수 없어
+  CI 결과 없이 진행해야 한다면 사용자에게 확인한 뒤 아래 로컬 검증을 돌린다(실패하면 중단).
+```sh
+cargo clippy --workspace -- -D warnings
 cargo test --workspace --no-default-features --features phase-3_5
 AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
 ```
-> clippy는 CI(`ci.yml`)와 **똑같은** `--workspace -- -D warnings`를 쓴다. `--all-targets`를 붙이면 CI가
-> 검사하지 않는 test 타겟 경고까지 잡아, "CI는 통과할 릴리스"를 로컬에서 잘못 막는다(게이트가 CI보다
-> 엄격하면 안 된다). test 타겟 lint는 별도 백로그로 다룬다.
 
 ## 3. bump + CHANGELOG
 - `aic-common`/`aic-server`/`aic-client`의 `Cargo.toml` `version`을 동일하게 bump.
 - `cargo update -p aic-client -p aic-common -p aic-server --precise X.Y.Z`로 `Cargo.lock` 반영.
 - `CHANGELOG.md`의 `## [Unreleased]` → `## [X.Y.Z] - <오늘 날짜>` (그 위에 빈 `## [Unreleased]` 유지).
+- lockfile이 bump를 따라왔는지 확인한다. `make bump-version`은 동기화에 실패해도 경고만 내고 계속하므로,
+  CI(fuzz job은 `--locked`)에서 늦게 깨지기 전에 여기서 막는다. 실패하면 **중단**.
+```sh
+cargo metadata --locked --format-version 1 >/dev/null
+cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null   # ci.yml fuzz job과 동일
+```
 
 ## 4. commit + push develop (main·tag는 아직)
 - 기존 repo 패턴을 따른다: 기능/문서는 `feat(...)`/`docs(...)`, 버전 bump는 `chore(release): vX.Y.Z`
