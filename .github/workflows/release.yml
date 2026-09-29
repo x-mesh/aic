@@ -17,36 +17,40 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# 기본은 읽기만. 쓰기(GitHub Release 생성)는 publish job에만 준다 — build job은 외부 액션과 인터넷에서
+# 받은 도구(zig, cargo-zigbuild)를 실행하므로 저장소 쓰기 토큰을 들고 있을 이유가 없다.
 permissions:
-  contents: write   # GitHub Release 생성
+  contents: read
 
 jobs:
-  release:
-    # darwin native 빌드에 필수 — Apple SDK/ld가 있는 runner라야 프레임워크가 링크된다.
-    # linux 두 target은 같은 runner에서 cargo-zigbuild로 cross-compile한다.
+  # target 4개를 동시에 빌드한다. 한 runner에서 차례로 빌드하면 target마다 7~17분이 그대로 더해져
+  # 릴리스가 35~60분 걸렸다(v0.50.1~v0.50.4 실측). target끼리는 서로 독립이다.
+  #
+  # 모든 target을 macOS runner에서 빌드한다. darwin은 Apple SDK/ld가 있어야 프레임워크가 링크되고,
+  # linux는 검증된 zig(macOS용 tarball + sha256 pin) + cargo-zigbuild 경로를 그대로 쓴다 — linux
+  # runner로 옮기면 zig의 linux tarball pin과 새 빌드 경로를 따로 검증해야 한다.
+  #
+  # 예전의 `actions/cache`는 뺐다. 키가 `Cargo.lock` 해시라 버전 bump마다 빗나갔고, 대체 키로
+  # main의 debug CI 캐시(~900MB)를 받아 왔을 뿐 release 빌드는 매번 전부 다시 컴파일했다
+  # (v0.50.4: Compiling 1,355회). 복원·저장에 릴리스마다 1.5~2분만 들었다.
+  build:
     runs-on: macos-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { triple: x86_64-unknown-linux-gnu,  os: linux,  arch: amd64, tool: zig }
+          - { triple: aarch64-unknown-linux-gnu, os: linux,  arch: arm64, tool: zig }
+          - { triple: x86_64-apple-darwin,       os: darwin, arch: amd64, tool: native }
+          - { triple: aarch64-apple-darwin,      os: darwin, arch: arm64, tool: native }
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0   # tag 메타데이터 + 전체 git log
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,x86_64-apple-darwin,aarch64-apple-darwin
+          targets: ${{ matrix.triple }}
 
-      - name: Cache cargo registry & target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-
-
-      # zig + cargo-zigbuild — linux 두 target 전용(darwin은 native cargo).
+      # zig + cargo-zigbuild — linux target 전용(darwin은 native cargo).
       # 이 pin은 `dtolnay/rust-toolchain@stable`과 짝을 이룬다. rustc가 새 링커 인자를
       # 넘기기 시작하면 낡은 zig가 그것을 거부해 릴리스가 통째로 실패한다 — 실제로
       # rustc 1.98이 aarch64-linux에 `--fix-cortex-a53-843419`를 넘기면서 zig 0.13.0 +
@@ -60,6 +64,7 @@ jobs:
       # zig 버전을 올릴 때는 아래 두 sha256도 ziglang.org/download/index.json에서
       # 함께 갱신해야 한다 — 불일치면 이 step이 즉시 실패한다(조용한 오설치 방지).
       - name: Install zig
+        if: matrix.tool == 'zig'
         env:
           ZIG_VERSION: "0.16.0"
           ZIG_SHA256_AARCH64: "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
@@ -80,52 +85,80 @@ jobs:
           echo "${RUNNER_TEMP}/${name}" >> "$GITHUB_PATH"
 
       - name: Verify zig
+        if: matrix.tool == 'zig'
         run: zig version
 
       # 폴백 없이 핀만 쓴다. 예전의 `|| cargo install --locked cargo-zigbuild`는
       # 핀 설치가 깨졌을 때 미검증 최신 버전을 조용히 깔아, 위 주석이 경고하는
       # `unsupported linker arg` 류 실패를 릴리스 한복판으로 옮겨놓을 뿐이었다.
       - name: Install cargo-zigbuild
+        if: matrix.tool == 'zig'
         run: cargo install --locked cargo-zigbuild --version 0.23.0
 
-      # 4 triple × 3 binary 빌드 → (os,arch)별 tar.gz + checksums.
-      #   linux는 cargo zigbuild(zig cross), darwin은 cargo build(native, Apple ld=framework 링크).
-      #   feature/package 인자는 이전 .goreleaser.yaml의 flags와 동일(phase-3_4 릴리스 빌드).
-      - name: Build, archive, checksum
+      # 3 binary 빌드 → (os,arch) tar.gz. feature/package 인자는 이전 .goreleaser.yaml의 flags와
+      # 동일(phase-3_4 릴리스 빌드). 태그가 아닌 ref(브랜치에서 workflow_dispatch)는 빌드만 하는
+      # dry-run이라 버전에 `-dryrun`을 붙인다 — 브랜치 이름의 `/`가 파일명에 들어가지 않게 한다.
+      - name: Build and archive
         run: |
           set -euxo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          mkdir -p dist
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(grep -m1 '^version' aic-client/Cargo.toml | cut -d'"' -f2)-dryrun"
+          fi
+          triple="${{ matrix.triple }}"
+          if [ "${{ matrix.tool }}" = "zig" ]; then
+            cargo zigbuild --release --target "$triple" --no-default-features --features phase-3_4 \
+              -p aic-client --bin aic \
+              -p aic-server --bin aic-session --bin aicd
+          else
+            cargo build --release --target "$triple" --no-default-features --features phase-3_4 \
+              -p aic-client --bin aic \
+              -p aic-server --bin aic-session --bin aicd
+          fi
+          stage="stage/${{ matrix.os }}_${{ matrix.arch }}"
+          mkdir -p "$stage" dist
+          cp "target/${triple}/release/aic" \
+             "target/${triple}/release/aic-session" \
+             "target/${triple}/release/aicd" \
+             "$stage/"
+          cp LICENSE* README.md CHANGELOG.md "$stage/" 2>/dev/null || true
+          tar -C "$stage" -czf "dist/aic_${VERSION}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz" .
+          ls -la dist
 
-          build() {  # $1=triple  $2=os  $3=arch  $4=tool(zig|native)
-            local triple="$1" os="$2" arch="$3" tool="$4"
-            if [ "$tool" = "zig" ]; then
-              cargo zigbuild --release --target "$triple" --no-default-features --features phase-3_4 \
-                -p aic-client --bin aic \
-                -p aic-server --bin aic-session --bin aicd
-            else
-              cargo build --release --target "$triple" --no-default-features --features phase-3_4 \
-                -p aic-client --bin aic \
-                -p aic-server --bin aic-session --bin aicd
-            fi
-            local stage="stage/${os}_${arch}"
-            mkdir -p "$stage"
-            cp "target/${triple}/release/aic" \
-               "target/${triple}/release/aic-session" \
-               "target/${triple}/release/aicd" \
-               "$stage/"
-            cp LICENSE* README.md CHANGELOG.md "$stage/" 2>/dev/null || true
-            tar -C "$stage" -czf "dist/aic_${VERSION}_${os}_${arch}.tar.gz" .
-          }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: dist-${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
-          build x86_64-unknown-linux-gnu  linux  amd64  zig
-          build aarch64-unknown-linux-gnu linux  arm64  zig
-          build x86_64-apple-darwin       darwin amd64  native
-          build aarch64-apple-darwin      darwin arm64  native
+  # 네 target이 모두 성공해야만 게시한다(`needs` + fail-fast). 태그 push(또는 태그 ref로 수동
+  # 재실행)에서만 돈다 — 브랜치에서 workflow_dispatch하면 build까지만 도는 dry-run이 된다.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write   # GitHub Release 생성
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # tag 메타데이터 + 전체 git log
 
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          set -euxo pipefail
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          [ "$(ls dist/*.tar.gz | wc -l)" -eq 4 ]
           ( cd dist && shasum -a 256 *.tar.gz > checksums.txt )
           ls -la dist
+          cat dist/checksums.txt
 
       # GitHub Release — 이 repo에 직접 생성. mode:replace 멱등(재실행 시 asset 덮어쓰기).
       #   노트는 CHANGELOG의 해당 버전 섹션에서 뽑는다(tag 메시지보다 정보가 많다).
