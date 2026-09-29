@@ -31,17 +31,26 @@ jobs:
         with:
           toolchain: nightly-2026-09-01
 
-      - name: Cache fuzz tool and build
-        uses: actions/cache@v5
+      # test job과 같은 이유(릴리스 bump가 캐시 키를 바꾸지 않게). fuzz/Cargo.lock도 aic-common 버전을 담는다.
+      - name: Dependency hash
+        id: deps
+        shell: bash
+        run: |
+          hash=$({ sed '/^name = "aic-/,/^$/d' Cargo.lock; sed '/^name = "aic-/,/^$/d' fuzz/Cargo.lock; } | shasum -a 256 | cut -c1-16)
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+      - name: Restore fuzz tool and build
+        id: cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/cargo-fuzz
             fuzz/target
-          key: linux-fuzz-nightly-2026-09-01-cargo-fuzz-0.13.2-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.lock') }}
+          key: linux-fuzz-v2-nightly-2026-09-01-cargo-fuzz-0.13.2-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            linux-fuzz-nightly-2026-09-01-cargo-fuzz-0.13.2-
+            linux-fuzz-v2-nightly-2026-09-01-cargo-fuzz-0.13.2-
 
       - name: Install cargo-fuzz
         run: |
@@ -68,6 +77,18 @@ jobs:
             -timeout=1 \
             -rss_limit_mb=2048 \
             -artifact_prefix=fuzz/artifacts/jvm_perfdata/
+
+      # test job과 같은 이유로 develop push에서만 저장한다.
+      - name: Save fuzz tool and build
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin/cargo-fuzz
+            fuzz/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Upload fuzz failures
         if: failure()
@@ -107,19 +128,37 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v5
+      # test job과 같은 이유(릴리스 bump가 캐시 키를 바꾸지 않게). 예전 대체 키 `<os>-cargo-`는 test job의
+      # 캐시까지 집었으므로 clippy 캐시만 받도록 좁힌다.
+      - name: Dependency hash
+        id: deps
+        shell: bash
+        run: echo "hash=$(sed '/^name = "aic-/,/^$/d' Cargo.lock | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cargo cache
+        id: cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v2-clippy-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-v2-clippy-
 
       - name: Clippy lint
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Save cargo cache
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # Phase 3.3 / 3.4 의 test matrix. AIC_CENTRAL_STORE env 를 "0" / "1" 양쪽에서
   # 돌려 Central_Store_Flag on/off 회귀를 모두 커버한다 (R18.1, R18.2).
@@ -300,20 +339,36 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry & build
-        uses: actions/cache@v5
+      # clippy job과 같은 이유(릴리스 bump가 키를 바꾸지 않게, 다른 job 캐시를 집지 않게).
+      - name: Dependency hash
+        id: deps
+        shell: bash
+        run: echo "hash=$(sed '/^name = "aic-/,/^$/d' Cargo.lock | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cargo cache
+        id: cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-headless-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v2-headless-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            ${{ runner.os }}-cargo-headless-
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-v2-headless-
 
       - name: Headless e2e + integration (no TTY, no keychain)
         run: |
           cargo test -p aic-client --test e2e_headless
           cargo test -p aic-client --test obs_tools_integration
           cargo test -p aic-server --test webhook_integration
+
+      - name: Save cargo cache
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
