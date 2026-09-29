@@ -48,9 +48,13 @@ AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phas
 방금 push한 develop 커밋과 **같은 SHA**의 CI 실행을 찾아 끝까지 확인한다. `-L1`로 최신 실행을 집으면 다른
 커밋의 실행을 볼 수 있고, push 직후에는 실행이 아직 등록되지 않았을 수 있으므로 SHA로 찾을 때까지 기다린다.
 ```sh
-SHA=$(git rev-parse HEAD)
-until RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
-      --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1) && [ -n "$RID" ]; do sleep 5; done
+SHA=$(git rev-parse HEAD); RID=""
+for _ in $(seq 60); do   # 최대 5분 — [skip ci]·워크플로 비활성이면 실행이 영영 안 생긴다
+  RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
+        --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1)
+  [ -n "$RID" ] && break; sleep 5
+done
+[ -n "$RID" ] || { echo "develop CI 실행을 찾지 못함: $SHA" >&2; exit 1; }
 gh run watch "$RID" --exit-status
 ```
 - **green이 아니면 여기서 중단.** 실패 job의 로그(`gh run view --log-failed --job=<id>`)로 원인을 보고하고,

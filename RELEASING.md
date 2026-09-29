@@ -13,9 +13,13 @@
 git commit -am "chore(release): vX.Y.Z"
 git push origin develop
 # 5. 같은 SHA의 develop CI가 green인지 확인한 뒤에만 main FF + tag (ci.yml은 main에서 돌지 않는다)
-SHA=$(git rev-parse HEAD)
-until RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
-      --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1) && [ -n "$RID" ]; do sleep 5; done
+SHA=$(git rev-parse HEAD); RID=""
+for _ in $(seq 60); do   # 최대 5분 — [skip ci]·워크플로 비활성이면 실행이 영영 안 생긴다
+  RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
+        --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1)
+  [ -n "$RID" ] && break; sleep 5
+done
+[ -n "$RID" ] || { echo "develop CI 실행을 찾지 못함: $SHA" >&2; exit 1; }
 gh run watch "$RID" --exit-status
 git push origin develop:main   # main은 tag가 가리킬 커밋(FF)
 # 6. tag push → release.yml(커스텀 빌드 + GitHub Release + brew) 발화
