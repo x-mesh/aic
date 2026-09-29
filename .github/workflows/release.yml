@@ -16,6 +16,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+  # release 빌드 캐시를 main 범위에 채워 둔다(아래 build job 주석). schedule은 기본 브랜치(main)에서만
+  # 돌고, 태그 실행은 자기 ref와 main의 캐시만 읽을 수 있다. 3일 간격은 7일 미사용 캐시 삭제보다 짧게
+  # 잡은 것이다.
+  schedule:
+    - cron: '23 18 */3 * *'
 
 # 기본은 읽기만. 쓰기(GitHub Release 생성)는 publish job에만 준다 — build job은 외부 액션과 인터넷에서
 # 받은 도구(zig, cargo-zigbuild)를 실행하므로 저장소 쓰기 토큰을 들고 있을 이유가 없다.
@@ -30,11 +35,17 @@ jobs:
   # linux는 검증된 zig(macOS용 tarball + sha256 pin) + cargo-zigbuild 경로를 그대로 쓴다 — linux
   # runner로 옮기면 zig의 linux tarball pin과 새 빌드 경로를 따로 검증해야 한다.
   #
-  # 예전의 `actions/cache`는 뺐다. 키가 `Cargo.lock` 해시라 버전 bump마다 빗나갔고, 대체 키로
-  # main의 debug CI 캐시(~900MB)를 받아 왔을 뿐 release 빌드는 매번 전부 다시 컴파일했다
-  # (v0.50.4: Compiling 1,355회). 복원·저장에 릴리스마다 1.5~2분만 들었다.
+  # release 빌드 캐시: 캐시가 맞으면 target 빌드가 352~512s에서 93~173s로 준다(dry-run 36530997291
+  # 실측). 태그 실행이 저장한 캐시는 다음 태그가 읽지 못하므로 저장은 main에서만 한다(schedule, 또는
+  # main ref로 workflow_dispatch). 태그·브랜치 실행은 읽기만 한다. 키에서 워크스페이스(aic-*) 항목을
+  # 뺀 Cargo.lock 해시를 쓰는 이유는 ci.yml과 같다(버전 bump가 키를 바꾸지 않게). rustc와 zig/
+  # cargo-zigbuild 버전은 키에 넣는다 — cargo는 C 컴파일러(zig cc)가 바뀐 것을 모르므로 옛 C 오브젝트를
+  # 그대로 링크할 수 있다. 예전 `actions/cache`는 키가 Cargo.lock 전체 해시라 bump마다 빗나갔다.
   build:
     runs-on: macos-latest
+    env:
+      ZIG_VERSION: "0.16.0"
+      CARGO_ZIGBUILD_VERSION: "0.23.0"
     strategy:
       fail-fast: true
       matrix:
@@ -50,6 +61,49 @@ jobs:
         with:
           targets: ${{ matrix.triple }}
 
+      - name: Cache key
+        id: key
+        shell: bash
+        run: |
+          deps=$(sed '/^name = "aic-/,/^$/d' Cargo.lock | shasum -a 256 | cut -c1-16)
+          rustc_v=$(rustc -V | shasum -a 256 | cut -c1-8)
+          if [ "${{ matrix.tool }}" = "zig" ]; then
+            tool="zig${ZIG_VERSION}-zb${CARGO_ZIGBUILD_VERSION}"
+          else
+            tool="native"
+          fi
+          echo "prefix=release-${{ matrix.triple }}-${rustc_v}-${tool}-" >> "$GITHUB_OUTPUT"
+          echo "deps=${deps}" >> "$GITHUB_OUTPUT"
+
+      # cargo-zigbuild 바이너리와 cargo install 기록(.crates*.json/toml)도 넣어, 캐시가 맞으면 설치가
+      # "already installed"로 끝난다. darwin target에는 이 파일들이 없고 target 캐시만 담긴다.
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/bin/cargo-zigbuild
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
+          key: ${{ steps.key.outputs.prefix }}${{ steps.key.outputs.deps }}
+          restore-keys: |
+            ${{ steps.key.outputs.prefix }}
+
+      # schedule 실행은 캐시를 채우거나 사용 시각을 갱신하려는 것이다. 캐시가 이미 맞으면 복원만으로
+      # 목적을 이뤘으므로 빌드·업로드를 건너뛴다.
+      - name: Plan
+        id: plan
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # zig + cargo-zigbuild — linux target 전용(darwin은 native cargo).
       # 이 pin은 `dtolnay/rust-toolchain@stable`과 짝을 이룬다. rustc가 새 링커 인자를
       # 넘기기 시작하면 낡은 zig가 그것을 거부해 릴리스가 통째로 실패한다 — 실제로
@@ -64,9 +118,8 @@ jobs:
       # zig 버전을 올릴 때는 아래 두 sha256도 ziglang.org/download/index.json에서
       # 함께 갱신해야 한다 — 불일치면 이 step이 즉시 실패한다(조용한 오설치 방지).
       - name: Install zig
-        if: matrix.tool == 'zig'
+        if: matrix.tool == 'zig' && steps.plan.outputs.build == 'true'
         env:
-          ZIG_VERSION: "0.16.0"
           ZIG_SHA256_AARCH64: "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
           ZIG_SHA256_X86_64: "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
         run: |
@@ -85,20 +138,21 @@ jobs:
           echo "${RUNNER_TEMP}/${name}" >> "$GITHUB_PATH"
 
       - name: Verify zig
-        if: matrix.tool == 'zig'
+        if: matrix.tool == 'zig' && steps.plan.outputs.build == 'true'
         run: zig version
 
       # 폴백 없이 핀만 쓴다. 예전의 `|| cargo install --locked cargo-zigbuild`는
       # 핀 설치가 깨졌을 때 미검증 최신 버전을 조용히 깔아, 위 주석이 경고하는
       # `unsupported linker arg` 류 실패를 릴리스 한복판으로 옮겨놓을 뿐이었다.
       - name: Install cargo-zigbuild
-        if: matrix.tool == 'zig'
-        run: cargo install --locked cargo-zigbuild --version 0.23.0
+        if: matrix.tool == 'zig' && steps.plan.outputs.build == 'true'
+        run: cargo install --locked cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}"
 
       # 3 binary 빌드 → (os,arch) tar.gz. feature/package 인자는 이전 .goreleaser.yaml의 flags와
       # 동일(phase-3_4 릴리스 빌드). 태그가 아닌 ref(브랜치에서 workflow_dispatch)는 빌드만 하는
       # dry-run이라 버전에 `-dryrun`을 붙인다 — 브랜치 이름의 `/`가 파일명에 들어가지 않게 한다.
       - name: Build and archive
+        if: steps.plan.outputs.build == 'true'
         run: |
           set -euxo pipefail
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
@@ -127,10 +181,24 @@ jobs:
           ls -la dist
 
       - uses: actions/upload-artifact@v6
+        if: steps.plan.outputs.build == 'true'
         with:
           name: dist-${{ matrix.os }}_${{ matrix.arch }}
           path: dist/*.tar.gz
           if-no-files-found: error
+
+      - name: Save build cache
+        if: github.ref == 'refs/heads/main' && steps.plan.outputs.build == 'true' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/bin/cargo-zigbuild
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+            target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # 네 target이 모두 성공해야만 게시한다(`needs` + fail-fast). 태그 push(또는 태그 ref로 수동
   # 재실행)에서만 돈다 — 브랜치에서 workflow_dispatch하면 build까지만 도는 dry-run이 된다.
