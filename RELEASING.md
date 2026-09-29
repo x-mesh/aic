@@ -5,9 +5,10 @@
 ## TL;DR
 
 ```sh
+# 0. 사전 조건: 지금 develop HEAD의 develop CI가 green인지(아래 "정상 흐름" 1번)
 # 1. CHANGELOG의 [Unreleased] → [X.Y.Z] 로 정리
 # 2. Cargo.toml 버전 bump (aic-common/aic-server/aic-client) + Cargo.lock 반영
-# 3. 로컬 검증 (아래 "정상 흐름" 4번) — release.yml이 릴리스 게이트다
+# 3. lockfile 확인 — cargo metadata --locked (워크스페이스 + fuzz, "정상 흐름" 4번)
 # 4. bump 커밋에 [skip ci]를 넣지 말 것 — tag가 이 커밋을 가리키는데, [skip ci]는
 #    tag push로 트리거될 release.yml까지 스킵한다(v0.29.0에서 release가 안 떴다 → 아래 트러블슈팅).
 git commit -am "chore(release): vX.Y.Z"
@@ -30,7 +31,7 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 
 > **왜 main CI 게이트가 없는가**: release.yml **자체가 4 target을 릴리스 프로파일(phase-3_4)로 빌드**하므로,
 > 빌드가 깨지면 release가 실패하고 에셋이 안 나간다(`mode: replace` 멱등이라 재실행도 안전). 코드 회귀
-> 방지는 **로컬 사전 검증(4번)**과, tag 대상과 **같은 SHA의 develop push CI**로 잡는다. `ci.yml`은 main에서
+> 방지는 **릴리스할 코드가 이미 통과한 develop CI(1번)**와, tag 대상과 **같은 SHA의 develop push CI**로 잡는다. `ci.yml`은 main에서
 > 돌지 않는다 — main은 그 CI를 통과한 develop 커밋의 FF로만 갱신하므로 같은 커밋을 두 번 검사할 이유가
 > 없다(두 번 돌리면 macOS runner를 서로 기다려 태그 전 대기가 11~16분으로 늘었다). **main에 직접 커밋하지
 > 않는다.** **bump 커밋에 `[skip ci]`를 넣지 말 것.** 그 커밋이 곧 tag 대상이라, `[skip ci]`가 있으면
@@ -67,13 +68,30 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
 
 ## 정상 흐름
 
-1. 작업(develop)을 릴리스 가능한 상태로.
-2. CHANGELOG 정리 — `## [Unreleased]` → `## [X.Y.Z] - YYYY-MM-DD` (위에 빈 `## [Unreleased]` 유지).
-3. Cargo.toml 버전 bump (`aic-common`/`aic-server`/`aic-client` 동일) + `cargo update -p aic-client -p aic-common -p aic-server --precise X.Y.Z`로 Cargo.lock 반영.
-4. **로컬 사전 검증** (release.yml이 게이트라 main CI 대신 여기서 잡는다). CI(`ci.yml`)와 동일 형태로:
+1. 작업(develop)을 릴리스 가능한 상태로. **사전 조건**: 지금 develop HEAD의 develop CI가 `completed/success`여야 한다. 릴리스 커밋은 버전·lockfile·CHANGELOG만 바꾸므로, 그 아래 코드가 전 matrix를 이미 통과했는지를 확인하는 것으로 로컬 재검사를 대신한다(로컬 재검사는 CI의 부분집합이라 새 결함을 거의 잡지 못했고 약 6분이 들었다). 실패했거나 실행이 없으면 멈추고 원인을 확인한다.
 
    ```sh
-   cargo clippy --workspace --all-targets -- -D warnings   # ci.yml과 동일
+   git fetch origin
+   [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/develop)" ] || { echo "로컬 develop이 origin/develop과 다름" >&2; exit 1; }
+   BASE=$(git rev-parse HEAD)
+   STATE=$(gh run list --workflow=ci.yml --branch develop -L20 --json headSha,status,conclusion \
+           --jq ".[] | select(.headSha==\"$BASE\") | \"\(.status)/\(.conclusion)\"" | head -1)
+   echo "base ${BASE:0:7}: ${STATE:-CI 실행 없음}"   # completed/success 여야 진행
+   ```
+
+2. CHANGELOG 정리 — `## [Unreleased]` → `## [X.Y.Z] - YYYY-MM-DD` (위에 빈 `## [Unreleased]` 유지).
+3. Cargo.toml 버전 bump (`aic-common`/`aic-server`/`aic-client` 동일) + `cargo update -p aic-client -p aic-common -p aic-server --precise X.Y.Z`로 Cargo.lock 반영.
+4. **lockfile 확인**. `make bump-version`은 동기화에 실패해도 경고만 내므로, CI(fuzz job은 `--locked`)에서 늦게 깨지기 전에 확인한다:
+
+   ```sh
+   cargo metadata --locked --format-version 1 >/dev/null
+   cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null   # ci.yml fuzz job과 동일
+   ```
+
+   1번 사전 조건을 충족할 수 없어 CI 결과 없이 진행해야 한다면, 대신 로컬에서 CI 일부를 돌린다:
+
+   ```sh
+   cargo clippy --workspace -- -D warnings
    cargo test --workspace --no-default-features --features phase-3_5
    AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phase-3_3
    ```
