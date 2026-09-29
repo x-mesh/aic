@@ -17,8 +17,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# 기본은 읽기만. 쓰기(GitHub Release 생성)는 publish job에만 준다 — build job은 외부 액션과 인터넷에서
+# 받은 도구(zig, cargo-zigbuild)를 실행하므로 저장소 쓰기 토큰을 들고 있을 이유가 없다.
 permissions:
-  contents: write   # GitHub Release 생성
+  contents: read
 
 jobs:
   # target 4개를 동시에 빌드한다. 한 runner에서 차례로 빌드하면 target마다 7~17분이 그대로 더해져
@@ -136,6 +138,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
+    permissions:
+      contents: write   # GitHub Release 생성
     steps:
       - uses: actions/checkout@v6
         with:
