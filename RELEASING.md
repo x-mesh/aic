@@ -25,13 +25,13 @@ gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.
 > tag 대상이라, `[skip ci]`가 있으면 main CI뿐 아니라 **tag push로 떠야 할 release.yml까지 스킵된다**
 > (`[skip ci]`는 이벤트 종류를 안 가리고 그 커밋을 참조하는 모든 push 워크플로를 끈다).
 
-이 tag push가 다음을 자동으로 한다 (`.github/workflows/release.yml`, `macos-latest` runner 단일 job):
-- Rust toolchain(4 triple) + zig + cargo-zigbuild 설치
+이 tag push가 다음을 자동으로 한다 (`.github/workflows/release.yml`). `build` job이 target 4개를 `macos-latest` runner 4대에서 **동시에** 빌드하고, 넷 다 성공하면 `publish` job이 게시한다(하나라도 실패하면 게시하지 않는다). 순차 빌드일 때 33~62분이던 릴리스가 약 11분이다(v0.50.4 기준 dry-run 실측):
+- target마다 Rust toolchain 설치, linux target은 zig + cargo-zigbuild도 설치
 - 4 target triple로 binary 빌드:
   - **linux** `x86_64/aarch64-unknown-linux-gnu` → `cargo zigbuild` (zig cross-compile)
   - **darwin** `x86_64/aarch64-apple-darwin` → `cargo build` (**native, Apple ld** — 프레임워크 링크)
 - 각 (os, arch)별 `aic_<version>_<os>_<arch>.tar.gz`에 `aic`·`aic-session`·`aicd` + LICENSE/README/CHANGELOG 묶음
-- `checksums.txt` SHA256 생성
+- (`publish`) 네 tar.gz를 모아 `checksums.txt` SHA256 생성
 - GitHub Release 게시 (`gh release create`; 있으면 `upload --clobber`) — 노트는 CHANGELOG의 해당 버전 섹션에서 추출
 - `x-mesh/homebrew-tap/Formula/aic.rb` 재생성·push (4 OS/arch url + sha256 + bin.install 3개)
 
@@ -75,12 +75,11 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
 
 ## 수동 dry-run
 
-Actions → release → "Run workflow"(`workflow_dispatch`)로 발화 가능. 단 tag 없이 돌면 `GITHUB_REF_NAME`이 브랜치명이라 GitHub Release/tag가 어긋난다 — 실제 dry-run은 로컬에서 빌드 스텝만 재현하는 게 낫다:
+브랜치에서 `workflow_dispatch`하면 `build`만 도는 dry-run이다. `publish`는 `v*` 태그 ref에서만 돌므로 GitHub Release와 brew Formula는 건드리지 않는다. 산출물 이름의 버전에는 `-dryrun`이 붙는다(`aic_<Cargo.toml 버전>-dryrun_<os>_<arch>.tar.gz`). release.yml을 바꿨다면 태그 전에 이걸로 확인한다:
 
 ```sh
-# linux(zig) / darwin(native) 한 target씩 빌드가 통과하는지
-cargo build --release --target aarch64-apple-darwin --no-default-features --features phase-3_4 \
-  -p aic-client --bin aic -p aic-server --bin aic-session --bin aicd
+gh workflow run release.yml --ref <branch>
+gh run download <run-id> -D /tmp/aic-dryrun   # target별 tar.gz 확인
 ```
 
 ## 트러블슈팅
@@ -92,7 +91,7 @@ cargo build --release --target aarch64-apple-darwin --no-default-features --feat
 | **darwin 빌드 `undefined symbol: _SecKeychain*`/`_IOBSDNameMatching`** | zig 링커가 macOS 프레임워크(Security/CoreFoundation/IOKit)를 못 링크. **darwin은 반드시 native `cargo build`**(release.yml이 이미 그렇게 함). zigbuild로 darwin을 빌드하면 재발한다 — v0.27.0~v0.28.0에서 이걸로 5번 실패했다. |
 | **linux zigbuild `unsupported linker arg: --fix-cortex-a53-843419`** | rustc가 새 링커 인자를 넘기는데 pin된 zig가 그걸 모른다. release.yml은 `dtolnay/rust-toolchain@stable`(자동 최신)을 쓰면서 zig/cargo-zigbuild만 고정하므로, stable이 올라가면 이 짝이 어긋난다 — rustc 1.98 + zig 0.13.0/cargo-zigbuild 0.20.1에서 실측(v0.36.0). 해결: 두 pin을 함께 올린다(현재 zig 0.16.0 + cargo-zigbuild 0.23.0). 검증은 CI 왕복 대신 로컬에서 `cargo zigbuild --release --target aarch64-unknown-linux-gnu …`로 재현하는 게 빠르다. |
 | linux zigbuild 빌드 실패 (`linker not found` 등) | zig 버전 불일치. `mlugg/setup-zig` 버전과 `cargo-zigbuild --version`을 함께 bump. |
-| **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 ref_name이 브랜치라 어긋난다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
+| **tag를 push했는데 release.yml이 안 뜬다** | tag가 가리키는 커밋 메시지에 `[skip ci]`가 있다. `[skip ci]`는 branch push뿐 아니라 **그 커밋을 참조하는 tag push 워크플로까지** 스킵한다(v0.29.0 실측). 복구: 히스토리 재작성 없이 tag ref로 수동 dispatch — `gh workflow run release.yml --ref vX.Y.Z`. workflow_dispatch를 **tag ref**로 걸면 `GITHUB_REF_NAME=vX.Y.Z`라 VERSION/Release/brew가 모두 정상 산출된다(브랜치 ref로 걸면 `publish`가 돌지 않는 dry-run이 된다). 근본 예방: bump 커밋에 `[skip ci]`를 넣지 않는다(위 "정상 흐름" 5번). |
 | Release notes가 휑함 | notes는 CHANGELOG의 `## [X.Y.Z]` 섹션에서 추출된다. CHANGELOG에 해당 버전 섹션이 있는지 확인. |
 
 ## 왜 GoReleaser가 아닌가
