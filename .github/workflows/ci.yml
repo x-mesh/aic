@@ -205,7 +205,10 @@ jobs:
         run: echo "hash=$(sed '/^name = "aic-/,/^$/d' Cargo.lock | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       # 복원만 여기서 하고 저장은 아래에서 조건부로 한다. `v2`는 debuginfo 설정을 바꾸기 전의 큰 캐시를
-      # 받지 않기 위한 세대 표시다.
+      # 받지 않기 위한 세대 표시다. 캐시는 phase와 무관하게 OS별 하나다(test-phase-3_5 job도 같은 키).
+      # phase feature는 aic-common의 빈 플래그라 외부 의존성 빌드가 phase마다 같고, aic-* 크레이트는
+      # 새 checkout의 mtime 때문에 캐시가 있어도 매번 다시 빌드된다. phase별로 두면 같은 내용을 세 벌
+      # 저장해 10GB 한도를 ~4GB 더 썼다.
       - name: Restore cargo cache
         id: cache
         uses: actions/cache/restore@v5
@@ -214,9 +217,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-v2-${{ matrix.phase }}-${{ steps.deps.outputs.hash }}
+          key: ${{ runner.os }}-cargo-v2-test-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-${{ matrix.phase }}-
+            ${{ runner.os }}-cargo-v2-test-
 
       - name: Run tests
         run: cargo test --workspace --no-default-features --features ${{ matrix.phase }}
@@ -228,11 +231,12 @@ jobs:
           du -sh target ~/.cargo/registry 2>/dev/null || true
           df -h . | tail -1
 
-      # 저장은 develop push에서, 같은 키를 쓰는 central_store 0/1 중 한 job만 한다. 두 job이 같은 키를
-      # 동시에 저장하려 하면 한쪽은 "Unable to reserve cache"로 실패하면서도 압축에 1분 넘게 썼다. PR에서
-      # 저장한 캐시는 그 PR에서만 읽혀 한도만 잠식하므로 저장하지 않는다(PR은 develop 캐시를 읽는다).
+      # 저장은 develop push에서, 같은 키를 쓰는 job 중 OS마다 하나(phase-3_4, central_store=0)만 한다.
+      # 여러 job이 같은 키를 동시에 저장하려 하면 한쪽은 "Unable to reserve cache"로 실패하면서도 압축에
+      # 1분 넘게 썼다. PR에서 저장한 캐시는 그 PR에서만 읽혀 한도만 잠식하므로 저장하지 않는다(PR은
+      # develop 캐시를 읽는다).
       - name: Save cargo cache
-        if: github.event_name == 'push' && matrix.central_store == '0' && steps.cache.outputs.cache-hit != 'true'
+        if: github.event_name == 'push' && matrix.phase == 'phase-3_4' && matrix.central_store == '0' && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
         with:
           path: |
@@ -270,7 +274,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # test job과 같은 이유(릴리스 bump가 캐시 키를 바꾸지 않게).
+      # test job과 같은 키를 읽기만 한다. 저장은 test job(phase-3_4, central_store=0)이 한다.
       - name: Dependency hash
         id: deps
         shell: bash
@@ -284,9 +288,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-v2-phase-3_5-${{ steps.deps.outputs.hash }}
+          key: ${{ runner.os }}-cargo-v2-test-${{ steps.deps.outputs.hash }}
           restore-keys: |
-            ${{ runner.os }}-cargo-v2-phase-3_5-
+            ${{ runner.os }}-cargo-v2-test-
 
       - name: Run tests
         run: cargo test --workspace --no-default-features --features phase-3_5
@@ -297,17 +301,6 @@ jobs:
         run: |
           du -sh target ~/.cargo/registry 2>/dev/null || true
           df -h . | tail -1
-
-      # test job과 같은 이유로 develop push에서만 저장한다(이 job은 central_store 변형이 하나다).
-      - name: Save cargo cache
-        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # SRE R6: headless(비대화·TTY 없음) 안전성 게이트. aic는 서버(cron/systemd/webhook
   # spawn)에서 TTY·키체인 없이 돈다. ubuntu-latest 러너 자체가 headless이며, 여기에
