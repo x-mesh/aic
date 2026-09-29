@@ -1,8 +1,11 @@
 name: CI
 
+# main에서는 돌지 않는다. main은 CI를 통과한 develop 커밋의 fast-forward로만 갱신되고(RELEASING.md),
+# 릴리스는 같은 커밋의 develop CI를 태그 게이트로 쓴다. main까지 돌리면 같은 SHA에 14개 job이 두 벌
+# 뜨고 macOS runner를 서로 기다려 태그 전 대기가 11~16분으로 늘었다(v0.50.3~v0.50.5 실측).
 on:
   push:
-    branches: [main, develop]
+    branches: [develop]
   pull_request:
 
 env:
