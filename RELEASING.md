@@ -11,19 +11,31 @@
 # 4. bump 커밋에 [skip ci]를 넣지 말 것 — tag가 이 커밋을 가리키는데, [skip ci]는
 #    tag push로 트리거될 release.yml까지 스킵한다(v0.29.0에서 release가 안 떴다 → 아래 트러블슈팅).
 git commit -am "chore(release): vX.Y.Z"
-git push origin develop && git push origin develop:main   # main은 tag가 가리킬 커밋(FF)
-# 5. tag push → release.yml(커스텀 빌드 + GitHub Release + brew) 발화
+git push origin develop
+# 5. 같은 SHA의 develop CI가 green인지 확인한 뒤에만 main FF + tag (ci.yml은 main에서 돌지 않는다)
+SHA=$(git rev-parse HEAD); RID=""
+for _ in $(seq 60); do   # 최대 5분 — [skip ci]·워크플로 비활성이면 실행이 영영 안 생긴다
+  RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
+        --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1)
+  [ -n "$RID" ] && break; sleep 5
+done
+[ -n "$RID" ] || { echo "develop CI 실행을 찾지 못함: $SHA" >&2; exit 1; }
+gh run watch "$RID" --exit-status
+git push origin develop:main   # main은 tag가 가리킬 커밋(FF)
+# 6. tag push → release.yml(커스텀 빌드 + GitHub Release + brew) 발화
 git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
-# 6. release run 확인
+# 7. release run 확인
 gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status
 ```
 
 > **왜 main CI 게이트가 없는가**: release.yml **자체가 4 target을 릴리스 프로파일(phase-3_4)로 빌드**하므로,
-> 빌드가 깨지면 release가 실패하고 에셋이 안 나간다(`mode: replace` 멱등이라 재실행도 안전). 즉 release
-> run이 곧 게이트다. 코드 회귀 방지는 **로컬 사전 검증(4번)**과 개발 중 PR CI로 잡는다. main FF push로
-> ci.yml이 한 번 도는 건 무해하니 그대로 둔다 — **bump 커밋에 `[skip ci]`를 넣지 말 것.** 그 커밋이 곧
-> tag 대상이라, `[skip ci]`가 있으면 main CI뿐 아니라 **tag push로 떠야 할 release.yml까지 스킵된다**
-> (`[skip ci]`는 이벤트 종류를 안 가리고 그 커밋을 참조하는 모든 push 워크플로를 끈다).
+> 빌드가 깨지면 release가 실패하고 에셋이 안 나간다(`mode: replace` 멱등이라 재실행도 안전). 코드 회귀
+> 방지는 **로컬 사전 검증(4번)**과, tag 대상과 **같은 SHA의 develop push CI**로 잡는다. `ci.yml`은 main에서
+> 돌지 않는다 — main은 그 CI를 통과한 develop 커밋의 FF로만 갱신하므로 같은 커밋을 두 번 검사할 이유가
+> 없다(두 번 돌리면 macOS runner를 서로 기다려 태그 전 대기가 11~16분으로 늘었다). **main에 직접 커밋하지
+> 않는다.** **bump 커밋에 `[skip ci]`를 넣지 말 것.** 그 커밋이 곧 tag 대상이라, `[skip ci]`가 있으면
+> develop CI뿐 아니라 **tag push로 떠야 할 release.yml까지 스킵된다**(`[skip ci]`는 이벤트 종류를 안
+> 가리고 그 커밋을 참조하는 모든 push 워크플로를 끈다).
 
 이 tag push가 다음을 자동으로 한다 (`.github/workflows/release.yml`). `build` job이 target 4개를 `macos-latest` runner 4대에서 **동시에** 빌드하고, 넷 다 성공하면 `publish` job이 게시한다(하나라도 실패하면 게시하지 않는다). 순차 빌드일 때 33~62분이던 릴리스가 약 11분이다(v0.50.4 기준 dry-run 실측):
 - target마다 Rust toolchain 설치, linux target은 zig + cargo-zigbuild도 설치
@@ -67,7 +79,7 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
    ```
 
 5. `git commit -am "chore(release): vX.Y.Z"` — **`[skip ci]`를 넣지 말 것.** 이 커밋이 곧 tag 대상이라, `[skip ci]`가 있으면 tag push로 떠야 할 release.yml까지 스킵된다(v0.29.0 실측).
-6. `git push origin develop` 후 `git push origin develop:main` — main은 tag가 가리킬 커밋(FF). main push로 ci.yml이 한 번 도는 건 무해하니 그대로 둔다.
+6. `git push origin develop` → 같은 SHA의 develop CI가 green인지 확인(위 TL;DR의 `gh run watch`) → `git push origin develop:main`. main은 tag가 가리킬 커밋(FF)이고, `ci.yml`은 main에서 돌지 않는다. CI가 green이 아니면 main FF와 tag를 하지 않는다.
 7. `git tag vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` — release.yml 발화.
 8. `gh run watch "$(gh run list --workflow=release.yml -L1 --json databaseId --jq '.[0].databaseId')" --exit-status` — 그린이면 끝. `gh release view vX.Y.Z`로 에셋 5개, `brew update && brew info x-mesh/tap/aic`로 새 버전 노출 확인.
 
