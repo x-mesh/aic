@@ -112,6 +112,21 @@ gh workflow run release.yml --ref <branch>
 gh run download <run-id> -D /tmp/aic-dryrun   # target별 tar.gz 확인
 ```
 
+## release 빌드 캐시
+
+`build` job은 target별 release 빌드 캐시를 복원한다. 캐시가 맞으면 target 빌드가 352~512s에서 93~173s로 준다(dry-run 실측). 캐시가 없거나 빗나가면 전체를 다시 빌드할 뿐 실패하지 않는다.
+
+- **저장은 main에서만 한다.** 태그 실행이 저장한 캐시는 다음 태그가 읽지 못한다(GitHub 캐시는 자기 ref와 기본 브랜치 것만 읽힌다). 그래서 `schedule`(3일마다, main)과 main ref `workflow_dispatch`만 저장하고, 태그·브랜치 실행은 읽기만 한다.
+- **키**: `release-<triple>-<rustc -V 해시>-<zig·cargo-zigbuild 버전 또는 native>-<aic-* 뺀 Cargo.lock 해시>`. 버전 bump는 키를 바꾸지 않는다. 의존성만 바뀌면 같은 접두사의 이전 캐시를 받아 바뀐 크레이트만 다시 빌드한다. rustc·zig가 바뀌면 캐시 없이 빌드한다.
+- **schedule 실행**은 캐시가 이미 맞으면 복원만 하고 빌드·업로드를 건너뛴다. 복원이 캐시의 사용 시각을 갱신해 7일 미사용 삭제를 막는다.
+
+의존성이나 툴체인을 바꾼 릴리스 직후, 다음 릴리스 전에 캐시를 채우려면 main에서 수동으로 돌린다:
+
+```sh
+gh workflow run release.yml --ref main
+gh cache list --key release- --json key,ref,sizeInBytes   # ref가 refs/heads/main인 release-* 4개
+```
+
 ## 트러블슈팅
 
 | 증상 | 원인 / 해결 |
