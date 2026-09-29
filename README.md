@@ -3,7 +3,7 @@
 > A Rust terminal assistant for shell-error analysis and bounded SRE diagnostics.
 > It supports OpenAI-compatible, Groq, Anthropic, and CLI backends.
 
-[![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
+[![CI](https://github.com/x-mesh/aic/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/x-mesh/aic/actions/workflows/ci.yml)
 
 **Languages:** English · [한국어](./README.ko.md)
 

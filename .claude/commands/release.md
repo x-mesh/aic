@@ -1,14 +1,17 @@
 ---
-description: aic 전체 릴리스 — bump+commit+push(main) → CI green 게이트 → tag push → GitHub Release + brew 배포 검증
+description: aic 전체 릴리스 — bump+commit+push(develop) → 같은 커밋의 develop CI green 게이트 → main FF → tag push → GitHub Release + brew 배포 검증
 argument-hint: [patch|minor|major]
 ---
 
 aic를 릴리스한다. `$ARGUMENTS` = bump 종류(`patch`|`minor`|`major`). 생략하면 변경 내용으로 판단한다.
 
 이 커맨드는 `/xm:ship`의 핵심(squash·bump·commit·push)에 **CI green 게이트 → tag → 배포 검증**을 묶은
-aic 전용 릴리스 파이프라인이다. **철칙: tag는 반드시 CI green 확인(5단계) 뒤에 push한다.** main에
-branch protection이 없어 직접 push의 CI는 post-merge로 돌기 때문에, tag를 먼저/같이 올리면 CI가 실패해도
-릴리스(GitHub Release + brew)가 그대로 나간다. 각 단계가 실패하면 즉시 중단하고 사용자에게 보고한다.
+aic 전용 릴리스 파이프라인이다. **철칙: tag는 반드시 CI green 확인(5단계) 뒤에 push한다.** branch
+protection이 없어 CI는 push 뒤에 돌기 때문에, tag를 먼저/같이 올리면 CI가 실패해도 릴리스(GitHub Release
++ brew)가 그대로 나간다. 각 단계가 실패하면 즉시 중단하고 사용자에게 보고한다.
+
+**게이트는 tag 대상 커밋과 같은 SHA의 develop push CI다.** `ci.yml`은 main에서 돌지 않는다 — main은 CI를
+통과한 develop 커밋의 fast-forward로만 갱신한다. main에 직접 커밋하지 않는다.
 
 근거·배경: `RELEASING.md`, memory `project-aic-release-workflow`.
 
@@ -17,7 +20,7 @@ branch protection이 없어 직접 push의 CI는 post-merge로 돌기 때문에,
 - 현재 버전: `grep -m1 '^version' aic-client/Cargo.toml`.
 - bump 종류 결정: `$ARGUMENTS`가 있으면 그것. 없으면 변경으로 판단(새 기능=minor, 버그/내부=patch,
   호환 깨짐=major). 애매하면 사용자에게 묻는다.
-- 현재 브랜치가 `main`이 아니면 사용자에게 어떻게 올릴지 확인.
+- 릴리스는 `develop`에서 한다. 현재 브랜치가 `develop`이 아니면 사용자에게 어떻게 올릴지 확인.
 
 ## 2. 로컬 검증 (CI 매트릭스 누락 방지)
 `--lib`만으로는 CI의 phase × central_store 조합을 놓친다(과거 `central_store=1`에서만 깨진 env-race
@@ -36,25 +39,30 @@ AIC_CENTRAL_STORE=1 cargo test --workspace --no-default-features --features phas
 - `cargo update -p aic-client -p aic-common -p aic-server --precise X.Y.Z`로 `Cargo.lock` 반영.
 - `CHANGELOG.md`의 `## [Unreleased]` → `## [X.Y.Z] - <오늘 날짜>` (그 위에 빈 `## [Unreleased]` 유지).
 
-## 4. commit + push main (tag 없이)
+## 4. commit + push develop (main·tag는 아직)
 - 기존 repo 패턴을 따른다: 기능/문서는 `feat(...)`/`docs(...)`, 버전 bump는 `chore(release): vX.Y.Z`
-  커밋으로 분리. scope 밖 파일은 별도 커밋하거나 사용자에게 확인.
-- `git push origin main` — **tag는 아직 만들지 않는다.**
+  커밋으로 분리. scope 밖 파일은 별도 커밋하거나 사용자에게 확인. bump 커밋에 `[skip ci]`를 넣지 않는다.
+- `git push origin develop` — **main FF와 tag는 아직 하지 않는다.**
 
 ## 5. CI green 게이트 (필수)
-방금 push한 main 커밋의 CI를 끝까지 확인한다.
+방금 push한 develop 커밋과 **같은 SHA**의 CI 실행을 찾아 끝까지 확인한다. `-L1`로 최신 실행을 집으면 다른
+커밋의 실행을 볼 수 있고, push 직후에는 실행이 아직 등록되지 않았을 수 있으므로 SHA로 찾을 때까지 기다린다.
 ```sh
-gh run watch "$(gh run list --workflow=ci.yml --branch main -L1 --json databaseId --jq '.[0].databaseId')" --exit-status
+SHA=$(git rev-parse HEAD)
+until RID=$(gh run list --workflow=ci.yml --branch develop -L10 --json databaseId,headSha \
+      --jq ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1) && [ -n "$RID" ]; do sleep 5; done
+gh run watch "$RID" --exit-status
 ```
 - **green이 아니면 여기서 중단.** 실패 job의 로그(`gh run view --log-failed --job=<id>`)로 원인을 보고하고,
-  고친 뒤 4단계부터 다시. **절대 tag를 만들지 않는다.**
+  고친 뒤 4단계부터 다시. **절대 main FF나 tag를 하지 않는다.**
+- green이면 main을 같은 커밋으로 FF한다: `git push origin develop:main` (FF가 아니면 거부된다 — 강제하지 않는다).
 
 ## 6. tag push → 배포 트리거
 ```sh
 VER=$(grep -m1 '^version' aic-client/Cargo.toml | cut -d'"' -f2)
 git tag "v$VER" -m "v$VER" && git push origin "v$VER"
 ```
-이 tag push가 `release.yml`(GoReleaser)을 발화 → 4 OS/arch 빌드 + GitHub Release + `x-mesh/homebrew-tap`
+이 tag push가 `release.yml`을 발화 → 4 OS/arch 병렬 빌드 + GitHub Release + `x-mesh/homebrew-tap`
 Formula 자동 갱신(brew는 여기서 자동, 수동 작업 없음).
 
 ## 7. 배포 검증
