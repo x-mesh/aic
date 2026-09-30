@@ -341,6 +341,9 @@ spool 디스크가 먼저 터진다.**
   INFO 가시성이 필요하다.
 - 우선순위: **서비스별 override > 명시적 전역값 > 소스별 안전 기본.**
   (`[aicd.logs].min_severity`를 사용자가 명시적으로 바꾸면 소스 기본을 이긴다.)
+- 외부 소스의 안전 기본은 `[aicd.logs].external_min_severity`(기본 `WARN`)로 바꾼다.
+  `min_severity = "INFO"`는 기본값과 같아 외부 소스를 INFO로 열지 못한다. 서비스별 override는
+  맵 항목이라 등록 설치 설정으로 만들 수 없다. 이 키는 스칼라라 설치 설정 한 줄로 넣을 수 있다.
 
 ### 6.2 rate limit — **토큰버킷, 기본 1000/s** (초안의 `100/s` 폐기)
 
@@ -511,6 +514,7 @@ logs_enabled = false         # 기본 false — opt-in. 다른 하위 플래그(
 
 [aicd.logs]
 min_severity = "WARN"        # 외부 소스 기본. aic self는 INFO(§6.1이 소스별로 처리)
+external_min_severity = "WARN"  # min_severity가 기본값일 때 외부 소스에 적용(§6.1)
 max_lines_per_sec = 1000     # 서비스당 토큰버킷
 batch_max_lines = 500
 batch_max_bytes = 4194304    # 4 MiB — 수신 측 상한(8 MiB)의 절반(§6.4)

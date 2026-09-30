@@ -995,6 +995,14 @@ pub struct AicdLogsConfig {
     /// 이 severity 미만은 버린다. `"ERROR"` | `"WARN"` | `"INFO"` | `"DEBUG"`. 기본 `"INFO"`.
     #[serde(default = "default_log_min_severity")]
     pub min_severity: String,
+    /// 외부 소스(journald/container/file)에 적용하는 기본 severity. 기본 `"WARN"`.
+    ///
+    /// `min_severity`가 기본값 그대로면 외부 소스에는 이 값이 적용된다. 그 판정 때문에
+    /// `min_severity = "INFO"`로는 외부 소스를 INFO로 열 수 없고, 서비스별 override는 맵 항목이라
+    /// 등록 설치 설정(`aic config set`과 같은 경로)으로 만들 수 없다. 이 값은 스칼라라 설치 설정
+    /// 한 줄로 바꿀 수 있다.
+    #[serde(default = "default_log_external_min_severity")]
+    pub external_min_severity: String,
     /// 초당 최대 라인 수(token-bucket, 전체 소스 합산). 초과분은 drop + 카운터. 기본 1000.
     #[serde(default = "default_log_max_lines_per_sec")]
     pub max_lines_per_sec: u32,
@@ -1040,6 +1048,7 @@ impl Default for AicdLogsConfig {
     fn default() -> Self {
         Self {
             min_severity: default_log_min_severity(),
+            external_min_severity: default_log_external_min_severity(),
             max_lines_per_sec: default_log_max_lines_per_sec(),
             batch_max_lines: default_log_batch_max_lines(),
             batch_max_bytes: default_log_batch_max_bytes(),
@@ -1056,6 +1065,10 @@ impl Default for AicdLogsConfig {
 
 fn default_log_min_severity() -> String {
     "INFO".to_string()
+}
+
+fn default_log_external_min_severity() -> String {
+    "WARN".to_string()
 }
 
 fn default_log_max_lines_per_sec() -> u32 {
@@ -1517,6 +1530,7 @@ method = "prompt_marker"
         assert!(cfg.aicd.logs.files.is_empty());
         assert!(!cfg.aicd.logs.self_.enabled);
         assert_eq!(cfg.aicd.logs.min_severity, "INFO");
+        assert_eq!(cfg.aicd.logs.external_min_severity, "WARN");
         assert_eq!(cfg.aicd.logs.max_lines_per_sec, 1000);
         assert_eq!(cfg.aicd.logs.batch_max_lines, 500);
         assert_eq!(cfg.aicd.logs.batch_max_ms, 2000);
@@ -1543,6 +1557,7 @@ logs_enabled = true
 
 [aicd.logs]
 min_severity = "WARN"
+external_min_severity = "INFO"
 max_lines_per_sec = 1000
 batch_max_lines = 500
 batch_max_ms = 2000
@@ -1568,6 +1583,7 @@ min_severity = "INFO"
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.aicd.exporter.logs_enabled);
         assert_eq!(cfg.aicd.logs.min_severity, "WARN");
+        assert_eq!(cfg.aicd.logs.external_min_severity, "INFO");
         assert_eq!(cfg.aicd.logs.max_services, 50);
         assert!(!cfg.aicd.logs.journald.enabled);
         assert!(!cfg.aicd.logs.container.enabled);
