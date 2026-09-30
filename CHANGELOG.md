@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.50.11] - 2026-09-30
+
+### Added
+
+- `[aicd.logs] external_min_severity`로 journald·파일·컨테이너 로그의 기본 수집 수준을 정한다(기본 `WARN`). 값 하나짜리 설정이라 rca-web 등록 키의 설치 설정에 `aicd.logs.external_min_severity = INFO`를 넣으면 설치할 때 INFO 로그까지 수집한다. 이전에는 `min_severity = "INFO"`가 기본값과 같아 외부 소스에 적용되지 않았고, 서비스별 설정은 설치 설정으로 넣을 수 없어 호스트마다 config.toml을 고쳐야 했다.
+
 ## [0.50.10] - 2026-09-30
 
 ### Fixed
