@@ -18,9 +18,10 @@ on:
   workflow_dispatch:
   # release 빌드 캐시를 main 범위에 채워 둔다(아래 build job 주석). schedule은 기본 브랜치(main)에서만
   # 돌고, 태그 실행은 자기 ref와 main의 캐시만 읽을 수 있다. 3일 간격은 7일 미사용 캐시 삭제보다 짧게
-  # 잡은 것이다.
+  # 잡은 것이다. cron의 날짜 칸(`*/3`)은 매달 1일부터 다시 세어 간격이 1~3일로 흔들리므로, 매일 돌리고
+  # build job의 Schedule gate가 UTC 에포크 일수가 3의 배수인 날에만 진행한다.
   schedule:
-    - cron: '23 18 */3 * *'
+    - cron: '23 18 * * *'
 
 # 기본은 읽기만. 쓰기(GitHub Release 생성)는 publish job에만 준다 — build job은 외부 액션과 인터넷에서
 # 받은 도구(zig, cargo-zigbuild)를 실행하므로 저장소 쓰기 토큰을 들고 있을 이유가 없다.
@@ -57,12 +58,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Schedule gate
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ $(( $(date -u +%s) / 86400 % 3 )) -ne 0 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.run == 'true'
         with:
           targets: ${{ matrix.triple }}
 
       - name: Cache key
         id: key
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           deps=$(sed '/^name = "aic-/,/^$/d' Cargo.lock | shasum -a 256 | cut -c1-16)
@@ -79,6 +92,7 @@ jobs:
       # "already installed"로 끝난다. darwin target에는 이 파일들이 없고 target 캐시만 담긴다.
       - name: Restore build cache
         id: cache
+        if: steps.gate.outputs.run == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -98,7 +112,9 @@ jobs:
         id: plan
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ steps.gate.outputs.run }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
