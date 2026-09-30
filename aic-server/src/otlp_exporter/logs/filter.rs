@@ -9,6 +9,8 @@
 //! `"INFO"`다. 여기서는 그 값이 **손대지 않은 기본값과 동일할 때만** 소스별 안전 기본을
 //! 얹는다 — 사용자가 전역값을 명시적으로 다른 값으로 바꾸면(예: `"ERROR"`) 소스와 무관하게
 //! 그 값이 이긴다. 서비스별 `[aicd.logs.services.<name>]` override는 항상 최우선이다.
+//!
+//! 외부 소스의 안전 기본은 `external_min_severity`(기본 `"WARN"`)로 바꿀 수 있다.
 
 use aic_common::{AicdLogsConfig, LogLine};
 
@@ -27,12 +29,12 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
-/// 소스별 안전 기본값. `line.source == "aic"`만 INFO, 나머지 전부 WARN.
-fn source_default_min_severity(source: &str) -> &'static str {
+/// 소스별 안전 기본값. `line.source == "aic"`만 INFO, 나머지는 `external_min_severity`.
+fn source_default_min_severity<'a>(source: &str, cfg: &'a AicdLogsConfig) -> &'a str {
     if source == "aic" {
         "INFO"
     } else {
-        "WARN"
+        cfg.external_min_severity.as_str()
     }
 }
 
@@ -49,7 +51,7 @@ fn effective_min_severity<'a>(line: &LogLine, cfg: &'a AicdLogsConfig) -> &'a st
     if cfg.min_severity != GLOBAL_DEFAULT_SENTINEL {
         return cfg.min_severity.as_str();
     }
-    source_default_min_severity(&line.source)
+    source_default_min_severity(&line.source, cfg)
 }
 
 /// `line.severity`가 유효 min_severity 이상이면 `true`(통과), 미만이면 `false`(드롭 대상 —
@@ -135,5 +137,57 @@ mod tests {
         assert!(!passes_severity(&line("journald", "nginx", "WARN"), &cfg));
         assert!(passes_severity(&line("journald", "nginx", "ERROR"), &cfg));
         assert!(!passes_severity(&line("aic", "aicd", "WARN"), &cfg));
+    }
+
+    #[test]
+    fn external_min_severity_opens_external_sources_only() {
+        // 등록 설치 설정은 스칼라만 쓸 수 있다 — `min_severity = "INFO"`는 기본값과 같아 외부
+        // 소스를 열지 못하므로, 이 값이 INFO 수집을 켜는 유일한 스칼라다.
+        let cfg = AicdLogsConfig {
+            external_min_severity: "INFO".to_string(),
+            ..Default::default()
+        };
+
+        assert!(passes_severity(
+            &line("journald", "cron.service", "INFO"),
+            &cfg
+        ));
+        assert!(passes_severity(&line("file", "syslog", "INFO"), &cfg));
+        assert!(passes_severity(&line("container", "web", "INFO"), &cfg));
+        assert!(!passes_severity(
+            &line("journald", "cron.service", "DEBUG"),
+            &cfg
+        ));
+        // aic self는 자기 기본(INFO)을 그대로 쓴다.
+        assert!(!passes_severity(&line("aic", "aicd", "DEBUG"), &cfg));
+    }
+
+    #[test]
+    fn service_override_and_explicit_global_still_beat_external_min_severity() {
+        let mut cfg = AicdLogsConfig {
+            external_min_severity: "INFO".to_string(),
+            ..Default::default()
+        };
+        cfg.services.insert(
+            "noisy.service".to_string(),
+            AicdLogServiceOverride {
+                min_severity: Some("ERROR".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!passes_severity(
+            &line("journald", "noisy.service", "WARN"),
+            &cfg
+        ));
+        assert!(passes_severity(
+            &line("journald", "other.service", "INFO"),
+            &cfg
+        ));
+
+        cfg.min_severity = "ERROR".to_string();
+        assert!(!passes_severity(
+            &line("journald", "other.service", "WARN"),
+            &cfg
+        ));
     }
 }
