@@ -11,10 +11,20 @@
 //! 권한 없을 때의 fallback, 교체 후 aicd 재시작이 이미 거기 있다. 데몬이 같은
 //! 일을 한 벌 더 구현하면 두 경로가 갈라진다.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
+
+/// `aic update`의 출력을 남기는 파일(`log_dir()` 아래). 매 실행마다 새로 쓴다.
+const UPDATE_LOG_FILE: &str = "self-update.log";
+
+/// 실패를 알리는 경고에 싣는 출력 끝부분의 상한.
+const UPDATE_LOG_TAIL_BYTES: usize = 2048;
+
+/// 설치기가 까는 유닛 이름(`aic-client`의 `daemon_install::SYSTEMD_UNIT`)과 같아야 한다.
+const SYSTEMD_UNIT_LEAF: &str = "/aicd.service";
 
 /// 중앙이 주는 것은 이것뿐이다. 필드를 늘리기 전에 모듈 주석을 읽을 것.
 #[derive(Debug, Deserialize)]
@@ -269,6 +279,10 @@ async fn tick(
 /// `sudo install`로 넘어가는데, 데몬에는 TTY가 없다. 열어 두면 비밀번호를
 /// 기다리며 멈출 수 있다. 막아 두면 즉시 실패하고 로그가 남는다 — 권한이
 /// 없는 호스트는 조용히 안 되는 것보다 안 됐다고 말하는 편이 낫다.
+///
+/// 출력을 파이프가 아니라 파일로 받는 이유: `aic update`는 aicd를 재시작한 뒤에도 응답 확인과
+/// 이력 기록을 이어 가는데, 그때는 이 프로세스가 이미 사라져 파이프의 읽는 쪽이 없다. 다음
+/// `println!`이 EPIPE로 panic하면 재시작 뒤의 단계가 통째로 빠진다.
 async fn run_update(tag: &str) {
     let exe = match which_aic() {
         Some(p) => p,
@@ -277,29 +291,110 @@ async fn run_update(tag: &str) {
             return;
         }
     };
-    let out = tokio::process::Command::new(&exe)
-        .args(["update", "--to", tag])
+    let log_path = aic_common::paths::log_dir().join(UPDATE_LOG_FILE);
+    let (stdout, stderr) = match open_update_log(&log_path) {
+        Ok(pair) => pair,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %log_path.display(),
+                "셀프업데이트 출력 파일을 열지 못해 건너뜀"
+            );
+            return;
+        }
+    };
+    let status = update_command(&exe, tag, current_service_scope())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stdout(stdout)
+        .stderr(stderr)
+        .status()
         .await;
-    match out {
-        Ok(o) if o.status.success() => {
-            // `aic update`가 교체 후 aicd를 재시작하므로, 성공했다면 이 프로세스는
-            // 곧 사라진다. 그 전에 한 줄 남긴다.
+    match status {
+        Ok(s) if s.success() => {
+            // 재시작이 이 프로세스를 먼저 끝내면 여기까지 오지 않는다. 그때의 결과는 `aic update`가
+            // 이력 파일에 남기고 `aic status`가 보여 준다.
             tracing::info!(%tag, "셀프업데이트 완료 — aicd가 재시작된다");
         }
-        Ok(o) => {
+        Ok(s) => {
             tracing::warn!(
                 %tag,
-                status = ?o.status.code(),
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                status = ?s.code(),
+                log = %log_path.display(),
+                output = %log_tail(&log_path),
                 "셀프업데이트 실패 — 현재 버전을 유지한다"
             );
         }
         Err(err) => tracing::warn!(error = %err, "`aic update` 실행 실패"),
     }
+}
+
+/// `aic update`를 띄운 서비스 매니저의 스코프.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceScope {
+    System,
+    User,
+}
+
+/// `/proc/<pid>/cgroup` 본문에서 aicd 유닛의 스코프를 읽는다.
+///
+/// 유닛이 leaf일 때만 인정한다. ssh 세션에서 손으로 띄운 aicd도 `user.slice` 아래에 있지만,
+/// 그때는 cgroup째 죽이는 매니저가 없어 감쌀 이유가 없고, user manager가 없는 호스트에서는
+/// `systemd-run --user`가 실패해 지금 되는 업데이트까지 막는다.
+fn service_scope_from_cgroup(cgroup: &str) -> Option<ServiceScope> {
+    cgroup
+        .lines()
+        .map(str::trim_end)
+        .find(|line| line.ends_with(SYSTEMD_UNIT_LEAF))
+        .map(|line| {
+            if line.contains("/user@") {
+                ServiceScope::User
+            } else {
+                ServiceScope::System
+            }
+        })
+}
+
+fn current_service_scope() -> Option<ServiceScope> {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|raw| service_scope_from_cgroup(&raw))
+}
+
+/// systemd 유닛으로 돌 때는 `systemd-run --scope`로 감싼다. `aic update`는 교체 후
+/// `systemctl restart aicd`를 부르는데, 유닛의 기본 `KillMode=control-group`이 aicd의 cgroup에
+/// 있는 프로세스를 모두 죽인다. 자식으로 그대로 두면 재시작 뒤의 응답 확인·이력 기록·롤백이
+/// 실행되지 못한다(jwserver68에서 그렇게 됐다). scope는 `systemd-run`이 자신을 새 cgroup으로
+/// 옮긴 뒤 exec하므로, 여전히 이 프로세스의 자식이고 환경도 그대로 물려받는다.
+fn update_command(aic: &Path, tag: &str, scope: Option<ServiceScope>) -> tokio::process::Command {
+    let mut cmd = match scope {
+        None => tokio::process::Command::new(aic),
+        Some(scope) => {
+            let mut cmd = tokio::process::Command::new("systemd-run");
+            if scope == ServiceScope::User {
+                cmd.arg("--user");
+            }
+            cmd.args(["--scope", "--quiet", "--collect", "--"]).arg(aic);
+            cmd
+        }
+    };
+    cmd.args(["update", "--to", tag]);
+    cmd
+}
+
+fn open_update_log(path: &Path) -> std::io::Result<(Stdio, Stdio)> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::File::create(path)?;
+    Ok((Stdio::from(file.try_clone()?), Stdio::from(file)))
+}
+
+fn log_tail(path: &Path) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let start = bytes.len().saturating_sub(UPDATE_LOG_TAIL_BYTES);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
 /// 나란히 설치된 `aic`. aicd와 같은 디렉토리에 있다(release archive가 셋을 함께
@@ -402,14 +497,23 @@ pub fn spawn(
                 continue;
             }
             let request_token = crate::live_config::effective_token(live.as_ref(), &token);
-            tick(
-                &client,
-                &endpoint,
-                request_token.as_deref(),
-                &current,
-                &health,
-            )
-            .await;
+            // 확인하는 동안에도 종료 신호를 받는다. `aic update`가 거는 재시작은 aicd가 끝나기를
+            // 기다리고, aicd는 이 task를 join한다 — 여기서 `tick`을 끝까지 기다리면 재시작이
+            // `TimeoutStopSec`의 SIGKILL까지 멈춘다. future를 버려도 `aic update`는 계속 돈다
+            // (tokio `Command`의 기본값은 `kill_on_drop(false)`).
+            tokio::select! {
+                _ = tick(
+                    &client,
+                    &endpoint,
+                    request_token.as_deref(),
+                    &current,
+                    &health,
+                ) => {}
+                _ = shutdown.changed() => {
+                    tracing::debug!("셀프업데이트 종료");
+                    return;
+                }
+            }
             anchor = tokio::time::Instant::now();
         }
     })
@@ -417,7 +521,11 @@ pub fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{config_url, decide, Decision, SelfUpdateHealth};
+    use super::{
+        config_url, decide, service_scope_from_cgroup, update_command, Decision, SelfUpdateHealth,
+        ServiceScope,
+    };
+    use std::path::Path;
     use std::time::Duration;
 
     #[test]
@@ -539,6 +647,91 @@ mod tests {
         assert_eq!(
             config_url("https://rca.example/"),
             "https://rca.example/v1/agent/config"
+        );
+    }
+
+    #[test]
+    fn the_scope_comes_from_the_aicd_unit_cgroup() {
+        assert_eq!(
+            service_scope_from_cgroup("0::/system.slice/aicd.service\n"),
+            Some(ServiceScope::System)
+        );
+        assert_eq!(
+            service_scope_from_cgroup(
+                "0::/user.slice/user-0.slice/user@0.service/app.slice/aicd.service\n"
+            ),
+            Some(ServiceScope::User)
+        );
+        // cgroup v1은 컨트롤러마다 줄이 있다.
+        assert_eq!(
+            service_scope_from_cgroup(
+                "12:pids:/system.slice/aicd.service\n1:name=systemd:/system.slice/aicd.service\n"
+            ),
+            Some(ServiceScope::System)
+        );
+    }
+
+    #[test]
+    fn an_aicd_outside_its_unit_is_not_wrapped() {
+        // ssh 세션에서 손으로 띄운 aicd. user.slice 아래지만 유닛이 아니다 — 감싸면 user manager가
+        // 없는 호스트에서 업데이트 자체가 실패한다.
+        assert_eq!(
+            service_scope_from_cgroup("0::/user.slice/user-0.slice/session-12.scope\n"),
+            None
+        );
+        assert_eq!(service_scope_from_cgroup("0::/\n"), None);
+        assert_eq!(service_scope_from_cgroup(""), None);
+    }
+
+    fn argv(scope: Option<ServiceScope>) -> Vec<String> {
+        let cmd = update_command(Path::new("/usr/local/bin/aic"), "v0.50.2", scope);
+        let std = cmd.as_std();
+        std::iter::once(std.get_program())
+            .chain(std.get_args())
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_unit_managed_update_runs_outside_the_aicd_cgroup() {
+        // 유닛의 cgroup 안에 두면 `systemctl restart aicd`가 `aic update`까지 죽여, 재시작 뒤의
+        // 응답 확인·이력 기록·롤백이 빠진다.
+        assert_eq!(
+            argv(Some(ServiceScope::System)),
+            [
+                "systemd-run",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--",
+                "/usr/local/bin/aic",
+                "update",
+                "--to",
+                "v0.50.2"
+            ]
+        );
+        assert_eq!(
+            argv(Some(ServiceScope::User)),
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                "--",
+                "/usr/local/bin/aic",
+                "update",
+                "--to",
+                "v0.50.2"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_update_without_a_unit_runs_aic_directly() {
+        assert_eq!(
+            argv(None),
+            ["/usr/local/bin/aic", "update", "--to", "v0.50.2"]
         );
     }
 }
