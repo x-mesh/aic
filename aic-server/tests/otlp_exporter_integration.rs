@@ -17,6 +17,65 @@ use axum::routing::post;
 use axum::Router;
 use tokio::sync::{mpsc, watch};
 
+#[tokio::test]
+async fn directory_snapshot_worker_returns_bounded_fixture_usage() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("logs");
+    std::fs::create_dir_all(directory.join("nested/deep")).unwrap();
+    let file = directory.join("nested/deep/data");
+    std::fs::write(&file, vec![1; 8192]).unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_aicd"))
+            .arg("--directory-snapshot-worker")
+            .arg(root.path())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let last = output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .rfind(|line| !line.is_empty())
+        .unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(last).unwrap();
+    assert_eq!(snapshot["truncated"], false);
+    assert_eq!(snapshot["version"], 1);
+    let entries = snapshot["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let usage = entries.iter().find(|entry| entry["depth"] == 1).unwrap()["bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(usage >= std::fs::metadata(file).unwrap().blocks() * 512);
+
+    let excluded = root.path().join("secrets");
+    std::fs::create_dir(&excluded).unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_aicd"))
+            .arg("--directory-snapshot-worker")
+            .arg(&excluded)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(output.status.success());
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot["truncated"], true);
+    assert_eq!(snapshot["reasons"][0], "excluded_path");
+    assert!(snapshot["entries"].as_array().unwrap().is_empty());
+}
+
 /// 테스트 전용 임시 spool. `TempDir`을 반환값에 같이 묶어 두지 않으면 drop 시 디렉토리가
 /// 삭제되어 spool이 파일을 못 쓴다 — 호출부가 `_dir`을 테스트 스코프 끝까지 들고 있어야 한다.
 fn test_spool() -> (tempfile::TempDir, Arc<Spool>) {
@@ -90,6 +149,8 @@ async fn exporter_pushes_valid_otlp_to_collector() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
@@ -162,6 +223,8 @@ async fn exporter_without_token_sends_no_auth_header() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
@@ -220,6 +283,8 @@ async fn process_inventory_ring_records_real_change_and_skips_keyframe() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         // OTLP 인벤토리 전송은 꺼 둔다 — 링은 이 플래그와 무관하게 동작해야 한다.
         process_inventory_enabled: false,
@@ -305,6 +370,8 @@ async fn a_rotated_token_reaches_the_collector_without_a_restart() {
         token: Some("first-token".to_string()),
         // 라이브 스냅샷의 하한이 1초다 — `ExporterConfig::interval`은 첫 tick 전에 이 값으로 덮인다.
         interval_secs: 1,
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         ..aic_common::AicdExporterConfig::default()
@@ -326,6 +393,8 @@ async fn a_rotated_token_reaches_the_collector_without_a_restart() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
@@ -390,6 +459,8 @@ async fn raising_the_interval_stops_the_pushes() {
         endpoint: endpoint.clone(),
         token: None,
         interval_secs: 1,
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         ..aic_common::AicdExporterConfig::default()
@@ -411,6 +482,8 @@ async fn raising_the_interval_stops_the_pushes() {
         spool_max_age: None,
         health,
         drop_counters: Arc::new(DropCounters::new()),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,

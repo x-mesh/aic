@@ -818,6 +818,10 @@ pub struct AicdExporterConfig {
     /// 때까지 opt-in으로 둔다(dns_enabled와 동일 관례).
     #[serde(default)]
     pub process_inventory_enabled: bool,
+    #[serde(default)]
+    pub directory_snapshot_enabled: bool,
+    #[serde(default)]
+    pub process_io_diagnostics_enabled: bool,
     /// 이 호스트를 RCA에 연결한 enrollment의 id. `aic enroll`이 교환 성공 시 기록한다.
     ///
     /// 동작에는 쓰이지 않고 **출처 추적용**이다 — 나중에 "이 호스트가 어떤 등록으로 붙었나",
@@ -888,6 +892,8 @@ impl Default for AicdExporterConfig {
             kernel_window_secs: default_kernel_window(),
             process_enabled: true,
             process_inventory_enabled: false,
+            directory_snapshot_enabled: false,
+            process_io_diagnostics_enabled: false,
             // 손으로 설정한 config는 enrollment을 거치지 않았다는 뜻이라 None이 기본이다.
             enrollment_id: None,
         }
@@ -1465,6 +1471,8 @@ method = "prompt_marker"
 "#;
         let cfg: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!cfg.aicd.exporter.enabled);
+        assert!(!cfg.aicd.exporter.directory_snapshot_enabled);
+        assert!(!cfg.aicd.exporter.process_io_diagnostics_enabled);
         assert_eq!(cfg.aicd.exporter.interval_secs, 60);
         assert!(cfg.aicd.exporter.endpoint.is_empty());
         assert!(cfg.aicd.exporter.token.is_none());

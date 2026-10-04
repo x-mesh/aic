@@ -363,6 +363,8 @@ async fn dropped_lines_appear_in_metrics_as_aic_log_dropped() {
         spool_max_age: None,
         health,
         drop_counters: Arc::clone(&drop_counters),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
         process_enabled: false,
         process_inventory_enabled: false,
         process_inventory_store: None,
