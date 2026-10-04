@@ -154,6 +154,7 @@ pub struct ProcessEntry<'a> {
     pub disk_read_bytes: u64,
     /// 직전 tick 이후 이 프로세스가 **쓴** 디스크 바이트(delta).
     pub disk_write_bytes: u64,
+    pub io_status: Option<&'a str>,
     /// 프로세스 시작 시각(unix epoch 초). `(pid, start_time)`이 안정 식별자 — PID는 재사용되므로
     /// pid만으로는 짧게 죽고 재사용된 프로세스가 한 시계열에 섞인다. 0이면 attr 생략(rest 버킷 등).
     pub start_time: u64,
@@ -418,14 +419,21 @@ pub fn encode_process_samples(
                 attr_int("process.pid", p.pid),
                 attr_double("process.cpu_utilization", p.cpu_pct),
                 attr_int("process.memory_rss_bytes", saturating_i64(p.rss_bytes)),
-                // disk IO는 창(window) delta라 0도 "이번 창엔 IO 없음"이라는 실제 값이다
-                // (connection bytes와 동일 취지) — 그래서 부재가 아니라 항상 싣는다.
-                attr_int("process.disk.read_bytes", saturating_i64(p.disk_read_bytes)),
-                attr_int(
+            ];
+            if p.io_status.is_none_or(|status| status == "measured") {
+                attributes.push(attr_int(
+                    "process.disk.read_bytes",
+                    saturating_i64(p.disk_read_bytes),
+                ));
+                attributes.push(attr_int(
                     "process.disk.write_bytes",
                     saturating_i64(p.disk_write_bytes),
-                ),
-            ];
+                ));
+            }
+            if let Some(status) = p.io_status {
+                attributes.push(attr_str("process.disk.io.status", status));
+            }
+
             // 아래 네 개는 "모르면 생략"(빈 값 금지, connections/dns 규약). start_time은 0(rest
             // 버킷·미측정)이면 생략, uid/container/fd는 None이면 생략한다.
             if p.start_time > 0 {
@@ -1294,6 +1302,7 @@ mod tests {
                 rss_bytes: 128 * 1024 * 1024,
                 disk_read_bytes: 4096,
                 disk_write_bytes: 8192,
+                io_status: None,
                 start_time: 1_700_000_000,
                 uid: Some(1000),
                 container_id: Some(
@@ -1307,6 +1316,7 @@ mod tests {
                 cpu_pct: 210.0, // 멀티코어 합산이라 100% 초과 정상
                 rss_bytes: 4 * 1024 * 1024 * 1024,
                 disk_read_bytes: 512 * 1024 * 1024,
+                io_status: None,
                 disk_write_bytes: 0, // 이번 창엔 쓰기 없음 — 0도 실제 값
                 start_time: 0,       // 미측정 → attr 생략돼야 한다
                 uid: None,           // 생략
@@ -1400,6 +1410,69 @@ mod tests {
         assert!(!attrs2
             .iter()
             .any(|kv| kv.key == "process.file_descriptor.count"));
+    }
+
+    #[test]
+    fn process_io_status_preserves_zero_and_omits_unmeasured_bytes() {
+        for status in [
+            "measured",
+            "baseline",
+            "permission_denied",
+            "unavailable",
+            "unsupported",
+            "partial",
+        ] {
+            let sample = ProcessEntry {
+                name: "test",
+                pid: 7,
+                cpu_pct: 0.0,
+                rss_bytes: 0,
+                disk_read_bytes: 0,
+                disk_write_bytes: 0,
+                io_status: Some(status),
+                start_time: 1,
+                uid: None,
+                container_id: None,
+                fd_count: None,
+            };
+            let bytes = encode_process_samples(&[sample], &resource(None), "test", 1);
+            let decoded = ExportLogsServiceRequest::decode(bytes.as_slice()).unwrap();
+            let attrs = &decoded.resource_logs[0].scope_logs[0].log_records[0].attributes;
+            let keys: Vec<_> = attrs.iter().map(|attr| attr.key.as_str()).collect();
+            assert!(keys.contains(&"process.disk.io.status"));
+            assert_eq!(
+                keys.contains(&"process.disk.write_bytes"),
+                status == "measured"
+            );
+            assert_eq!(
+                keys.contains(&"process.disk.read_bytes"),
+                status == "measured"
+            );
+            let value = attrs
+                .iter()
+                .find(|attr| attr.key == "process.disk.io.status")
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap();
+            assert_eq!(value, &AnyValueOneof::StringValue(status.to_string()));
+            if status == "measured" {
+                let value = attrs
+                    .iter()
+                    .find(|attr| attr.key == "process.disk.write_bytes")
+                    .unwrap()
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .value
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(value, &AnyValueOneof::IntValue(0));
+            }
+        }
     }
 
     #[test]

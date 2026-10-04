@@ -50,6 +50,12 @@ struct Cli {
     foreground: bool,
 
     #[arg(long, hide = true)]
+    directory_snapshot_worker: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    directory_snapshot_mounts_worker: bool,
+
+    #[arg(long, hide = true)]
     jvm_perfdata_worker: bool,
 
     #[arg(long, hide = true, default_value = "normal")]
@@ -61,6 +67,12 @@ struct Cli {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.directory_snapshot_mounts_worker {
+        return aic_server::otlp_exporter::directory_snapshot::mounts_worker_main();
+    }
+    if let Some(ref mount) = cli.directory_snapshot_worker {
+        return aic_server::otlp_exporter::directory_snapshot::worker_main(mount);
+    }
     if cli.jvm_perfdata_fd_setup_test {
         #[cfg(target_os = "linux")]
         std::process::exit(aic_server::jvm_perfdata_worker::fd_setup_test_main());
@@ -1005,6 +1017,8 @@ fn load_exporter_config(
         // 프로세스별 top-N(scope=aic.process)은 host metrics tick에 편승한다 — 별도 task가 아니라
         // 이 config의 플래그로 on/off한다(기본 true).
         process_enabled: ex.process_enabled,
+        directory_snapshot_enabled: ex.directory_snapshot_enabled,
+        process_io_diagnostics_enabled: ex.process_io_diagnostics_enabled,
         // 전체 프로세스 인벤토리 CDC(scope=aic.process.inventory)도 같은 tick에 편승한다(기본
         // false, opt-in — 수신측 rca decoder 준비 전엔 partial_success 폐기 노이즈를 막는다).
         process_inventory_enabled: ex.process_inventory_enabled,

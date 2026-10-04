@@ -41,11 +41,13 @@ mod docker;
 // `encode`/`logs_proto`는 OTLP wire 스키마(protobuf message subset) 정의다. 통합 테스트
 // (`tests/`)가 mock collector가 받은 본문을 **디코딩해서** 검증하려면 이 스키마가 필요하다 —
 // 바이트 substring 매칭만으로는 "aic.log.dropped가 0보다 크다" 같은 값 단언을 할 수 없다.
+pub mod directory_snapshot;
 pub mod encode;
 mod events;
 mod health;
 mod host_extra;
 mod host_metrics;
+mod process_io;
 // PRD Lane C: rca-agent 커널 카운터 delta 릴레이(aic.kernel.*).
 mod kernel;
 pub mod logs;
@@ -103,6 +105,8 @@ pub struct ExporterConfig {
     /// config `[aicd.exporter].process_enabled`. host metrics가 이미 refresh한 프로세스 목록을
     /// 재사용하므로 추가 열거 비용이 없다 — 그래서 별도 task가 아니라 이 tick에 얹는다.
     pub process_enabled: bool,
+    pub directory_snapshot_enabled: bool,
+    pub process_io_diagnostics_enabled: bool,
     /// 전체 프로세스 인벤토리 CDC(scope=`aic.process.inventory`)를 host metrics tick에 편승해
     /// 보낼지. config `[aicd.exporter].process_inventory_enabled`(기본 false, opt-in). `serve`가
     /// 이전 tick과 diff해 add/remove/change만 보낸다 — top-N 메트릭(`process_enabled`)과 독립이다.
@@ -180,6 +184,17 @@ pub async fn serve(
     );
 
     let mut sampler = host_metrics::HostSampler::new();
+    sampler.enable_process_io_diagnostics(cfg.process_io_diagnostics_enabled);
+    let mut snapshot_tasks = tokio::task::JoinSet::new();
+    if cfg.directory_snapshot_enabled {
+        let snapshot_cfg = cfg.clone();
+        let snapshot_shutdown = shutdown.clone();
+        snapshot_tasks.spawn(async move {
+            if let Err(error) = directory_snapshot::serve(snapshot_cfg, snapshot_shutdown).await {
+                tracing::error!(%error, "directory snapshot exporter stopped");
+            }
+        });
+    }
     let mut ticker = tokio::time::interval(cfg.interval);
     // 밀린 tick이 몰아치지 않게(느린 push 후 따라잡기 폭주 방지). 첫 tick은 즉시 완료된다.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -247,6 +262,26 @@ pub async fn serve(
                     Err(_) => break, // sampler panic — task 종료.
                 };
                 sampler = returned;
+                if let Some(count) = sampler.take_permission_diagnostic() {
+                    let now = unix_nanos_now();
+                    let event = aic_common::AgentEvent {
+                        kind: "process.io.permission_denied".to_string(),
+                        summary: format!("Linux process I/O measurement denied for {count} processes; check daemon UID and procfs access policy"),
+                        severity: "WARN".to_string(),
+                        attrs: [("denied_count".to_string(), count.to_string())].into(),
+                        ts: chrono::Utc::now(),
+                    };
+                    let resource = logs_proto::ResourceAttrs {
+                        host_name: &sample.resource.host_name,
+                        host_id: &sample.resource.host_id,
+                        os_type: &sample.resource.os_type,
+                        host_ip: None,
+                    };
+                    let diagnostic = logs_proto::encode_agent_event(&event, &resource, &cfg.service_version, now, now);
+                    if let Err(error) = cfg.spool.append(SignalKind::Logs, &diagnostic) {
+                        tracing::error!(%error, "process I/O permission diagnostic lost: spool append failed");
+                    }
+                }
 
                 // by_spool_quota는 Spool이 이미 세고 있다(AppLogs 쿼터 초과 drop) — 여기서 다시
                 // 세지 않고, 매 tick마다 최신 값을 read-through로 복사해 넣는다.
@@ -279,6 +314,7 @@ pub async fn serve(
                             rss_bytes: p.rss_bytes,
                             disk_read_bytes: p.disk_read_bytes,
                             disk_write_bytes: p.disk_write_bytes,
+                            io_status: p.io_status.map(|status| status.as_str()),
                             start_time: p.start_time,
                             uid: p.uid,
                             container_id: p.container_id.as_deref(),

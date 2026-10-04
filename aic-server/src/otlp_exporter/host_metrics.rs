@@ -40,6 +40,7 @@ use std::time::Instant;
 // 프로세스에 다른 숫자를 보고하게 되고, 그러면 어느 쪽이 맞는지 판단할 근거가 사라진다.
 use aic_common::proc::process_fd_count;
 
+use super::process_io::{IoStatus, ProcessIoTracker};
 use aic_common::disk_io::{canonical_device_identity, DiskIoTracker};
 use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -82,6 +83,7 @@ pub struct ProcessSample {
     /// 직전 tick 이후 읽은/쓴 디스크 바이트(delta). 미지원 플랫폼/첫 tick은 0.
     pub disk_read_bytes: u64,
     pub disk_write_bytes: u64,
+    pub io_status: Option<IoStatus>,
     /// 프로세스 시작 시각(unix epoch 초). `(pid, start_time)` 안정 식별자. rest 버킷은 0.
     pub start_time: u64,
     /// 소유자 실제 uid. top-N만 `/proc/<pid>/status`에서 채운다(Linux). 그 외/미측정은 `None`.
@@ -144,6 +146,7 @@ pub struct HostSampler {
     disks: Disks,
     disk_io: DiskIoTracker<std::ffi::OsString>,
     networks: Networks,
+    process_io: Option<ProcessIoTracker>,
     last: Instant,
     host_name: String,
     host_id: String,
@@ -174,6 +177,7 @@ impl HostSampler {
             disks: Disks::new_with_refreshed_list(),
             disk_io: DiskIoTracker::new(),
             networks: Networks::new_with_refreshed_list(),
+            process_io: None,
             last: Instant::now(),
             host_id: host_id(&host_name),
             os_type: std::env::consts::OS.to_string(),
@@ -182,6 +186,14 @@ impl HostSampler {
             host_name,
             extra: super::host_extra::HostExtraState::new(),
         }
+    }
+
+    pub fn enable_process_io_diagnostics(&mut self, enabled: bool) {
+        self.process_io = enabled.then(ProcessIoTracker::default);
+    }
+
+    pub fn take_permission_diagnostic(&mut self) -> Option<usize> {
+        self.process_io.as_mut()?.take_permission_diagnostic()
     }
 
     /// 현재 host metrics를 수집한다. disk/net i/o는 직전 sample 이후 delta를 경과시간으로 나눠 bytes/s.
@@ -269,7 +281,8 @@ impl HostSampler {
         let top_rss = top_process_rss(real_processes(&self.sys).map(|p| p.memory()));
         // 프로세스별 top-N(CPU/메모리 상위 소비자). 이미 refresh한 목록을 재사용하므로 추가 열거
         // 비용이 없다. host_metrics의 무차원 Gauge와 달리 이름/PID를 담아 OTLP Logs로 나간다.
-        let top_processes = collect_top_processes(&self.sys, TOP_PROCESS_COUNT);
+        let top_processes =
+            collect_top_processes(&self.sys, TOP_PROCESS_COUNT, self.process_io.as_mut());
         // 전체 프로세스 인벤토리(전수, 경량). 같은 refresh 목록을 재사용하며 무비용 필드만 읽으므로
         // top-N 수집과 별개의 추가 열거·syscall이 없다(uid/container는 CDC 추적기가 add에만 붙인다).
         let process_inventory = collect_process_inventory(&self.sys);
@@ -493,11 +506,26 @@ fn top_process_rss(memories: impl IntoIterator<Item = u64>) -> Option<u64> {
 ///   그래서 top-N이 **same-uid 프로세스로 편향**된다. 또한 uid/container 귀속은 `/proc`에 의존하는
 ///   Linux 전용이라 macOS에선 항상 `None`이다([`enrich_process_owner`]). aicd의 실제 배포 대상은
 ///   Linux 서버라 이 편향은 로컬 macOS 개발 관측에만 영향을 준다.
-/// - **Linux**: `/proc/<pid>/*`가 world-readable이라 비루트도 전량 읽힌다(uid/container 포함).
-fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
+/// - **Linux**: `/proc/<pid>/io`는 권한에 따라 읽지 못할 수 있다. 진단 모드는 실패 상태를 보존한다.
+fn collect_top_processes(
+    sys: &System,
+    n: usize,
+    mut tracker: Option<&mut ProcessIoTracker>,
+) -> Vec<ProcessSample> {
+    if let Some(tracker) = tracker.as_deref_mut() {
+        tracker.begin();
+    }
     let all: Vec<ProcessSample> = real_processes(sys)
         .map(|p| {
             let io = p.disk_usage();
+            let (read_bytes, write_bytes, io_status) = match tracker.as_deref_mut() {
+                Some(tracker) => {
+                    let (read, write, status) =
+                        tracker.sample(i64::from(p.pid().as_u32()), p.start_time());
+                    (read, write, Some(status))
+                }
+                None => (io.read_bytes, io.written_bytes, None),
+            };
             ProcessSample {
                 name: p.name().to_string_lossy().into_owned(),
                 pid: i64::from(p.pid().as_u32()),
@@ -505,8 +533,9 @@ fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
                 rss_bytes: p.memory(),
                 // read_bytes/written_bytes는 직전 refresh 이후 delta(total_*가 누적) — "이 창에서
                 // 누가 디스크를 때렸나"라 delta가 맞다.
-                disk_read_bytes: io.read_bytes,
-                disk_write_bytes: io.written_bytes,
+                disk_read_bytes: read_bytes,
+                disk_write_bytes: write_bytes,
+                io_status,
                 // start_time은 sysinfo가 이미 준다(무비용, 전 플랫폼). uid/container는 비싸므로
                 // (프로세스당 /proc 파일 읽기) 여기서 채우지 않고 select 후 top-N만 enrich한다.
                 start_time: p.start_time(),
@@ -523,6 +552,9 @@ fn collect_top_processes(sys: &System, n: usize) -> Vec<ProcessSample> {
             }
         })
         .collect();
+    if let Some(tracker) = tracker {
+        tracker.finish();
+    }
     let mut top = select_top_processes(all, n);
     // uid/container는 top-N(+rest)에만 필요하니 여기서만 /proc 파일을 읽는다 — fd와 달리 랭킹
     // 축이 아니라 귀속 정보일 뿐이라 전수로 읽을 이유가 없다. rest 버킷(pid=0)은 건너뛴다.
@@ -697,6 +729,7 @@ fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample>
     // 어느 하나도 단독으로는 상위에 못 드는 경우)를 드러낸다. 단 읽기 실패(`None`)는 합계에서
     // 빠지므로 rest fd는 **읽을 수 있었던 것들의 합**이고, 하나도 못 읽었으면 `None`이 유지된다
     // (0으로 접으면 "아무도 안 열었다"는 거짓 신호가 된다).
+    let diagnostic_mode = all.iter().any(|p| p.io_status.is_some());
     let mut result = Vec::with_capacity(keep.len() + 1);
     let mut rest = ProcessSample {
         name: REST_BUCKET_NAME.to_string(),
@@ -705,6 +738,7 @@ fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample>
         rss_bytes: 0,
         disk_read_bytes: 0,
         disk_write_bytes: 0,
+        io_status: diagnostic_mode.then_some(IoStatus::Measured),
         start_time: 0,
         uid: None,
         container_id: None,
@@ -714,6 +748,11 @@ fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample>
         if keep.contains(&i) {
             result.push(p);
         } else {
+            if p.io_status
+                .is_some_and(|status| status != IoStatus::Measured)
+            {
+                rest.io_status = Some(IoStatus::Partial);
+            }
             rest.cpu_pct += p.cpu_pct;
             rest.rss_bytes = rest.rss_bytes.saturating_add(p.rss_bytes);
             rest.disk_read_bytes = rest.disk_read_bytes.saturating_add(p.disk_read_bytes);
@@ -734,7 +773,12 @@ fn select_top_processes(all: Vec<ProcessSample>, n: usize) -> Vec<ProcessSample>
     //
     // fd를 이 조건에 넣는 게 중요하다: cpu·rss·disk가 전부 0인데 fd만 쥐고 있는 idle 워커 떼가
     // 정확히 fd 누수 탐지의 대상인데, fd를 빼면 그 rest 버킷이 통째로 버려진다.
-    if rest.cpu_pct > 0.0 || rest.rss_bytes > 0 || disk_io(&rest) > 0 || fd_of(&rest) > 0 {
+    if rest.cpu_pct > 0.0
+        || rest.rss_bytes > 0
+        || disk_io(&rest) > 0
+        || fd_of(&rest) > 0
+        || rest.io_status == Some(IoStatus::Partial)
+    {
         result.push(rest);
     }
     result
@@ -966,6 +1010,7 @@ mod tests {
             rss_bytes,
             disk_read_bytes: 0,
             disk_write_bytes: 0,
+            io_status: None,
             start_time: 0,
             uid: None,
             container_id: None,
@@ -982,6 +1027,7 @@ mod tests {
             rss_bytes: 0,
             disk_read_bytes: 0,
             disk_write_bytes: 0,
+            io_status: None,
             start_time: 0,
             uid: None,
             container_id: None,
@@ -997,6 +1043,7 @@ mod tests {
             rss_bytes: 0,
             disk_read_bytes,
             disk_write_bytes,
+            io_status: None,
             start_time: 0,
             uid: None,
             container_id: None,
@@ -1145,6 +1192,21 @@ mod tests {
             "디스크 전용 소비자가 top-N에 없다: {pids:?}"
         );
         assert_eq!(top.len(), 3);
+    }
+
+    #[test]
+    fn rest_bucket_marks_unmeasured_io_instead_of_claiming_zero() {
+        let mut unknown = proc("unknown", 1, 0.0, 0);
+        unknown.io_status = Some(IoStatus::PermissionDenied);
+        let mut measured = proc_io("writer", 2, 0, 100);
+        measured.io_status = Some(IoStatus::Measured);
+        let top = select_top_processes(vec![unknown, measured], 1);
+        let rest = top.iter().find(|p| p.pid == 0).unwrap();
+        assert_eq!(rest.io_status, Some(IoStatus::Partial));
+        assert_eq!(
+            top.iter().find(|p| p.pid == 2).unwrap().io_status,
+            Some(IoStatus::Measured)
+        );
     }
 
     #[test]
