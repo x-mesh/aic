@@ -95,7 +95,7 @@ graph LR
 
 ### 사전 요구 사항
 
-- Rust 1.89+ (2021 edition)
+- Rust 1.95+ (2021 edition)
 - macOS 또는 Linux
 - LLM API key (OpenAI, Anthropic, Groq 등) 또는 CLI Backend (kiro-cli, claude-cli)
 

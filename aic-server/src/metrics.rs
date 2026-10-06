@@ -80,10 +80,10 @@ impl AicdMetrics {
 
     /// Attach_UDS 연결 1건 종료 — gauge 감소. 0 underflow는 방지.
     pub fn dec_attach_connection(&self) {
-        // fetch_update으로 saturating 감소. attach_connections는 gauge라 음수가 의미 없음.
+        // try_update으로 saturating 감소. attach_connections는 gauge라 음수가 의미 없음.
         let _ = self
             .attach_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             });
     }

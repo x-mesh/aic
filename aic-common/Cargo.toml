@@ -2,7 +2,7 @@
 name = "aic-common"
 version = "0.50.11"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "MIT"
 build = "build.rs"
 
