@@ -109,7 +109,7 @@ graph LR
 
 ### Prerequisites
 
-- Rust 1.89+ (2021 edition)
+- Rust 1.95+ (2021 edition)
 - macOS or Linux
 - An LLM API key (OpenAI, Anthropic, Groq, etc.) or a CLI Backend (kiro-cli, claude-cli)
 
