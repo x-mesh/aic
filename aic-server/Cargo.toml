@@ -1,6 +1,6 @@
 [package]
 name = "aic-server"
-version = "0.50.11"
+version = "0.50.12"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
