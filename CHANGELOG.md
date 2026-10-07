@@ -4,6 +4,27 @@
 
 ## [Unreleased]
 
+## [0.50.14] - 2026-10-07
+
+### Added
+
+- docker·containerd·podman·lxc 컨테이너 안의 서비스(PostgreSQL, Redis, nginx 등)를 workload로 등록해 감시할 수 있다. 후보에 컨테이너 이름과 이미지가 보이고, docker 후보 id는 컨테이너 이름으로 만들어 Compose가 컨테이너를 다시 만들어도 유지된다. 컨테이너 후보는 연결 주소를 지정해야 등록된다.
+- `aic workload enable`을 인자 없이 터미널에서 실행하면 서비스를 검색해 고르고, 제안된 연결(docker는 공개 포트, 사용자·DB는 컨테이너 환경 변수)을 Enter로 확인한 뒤 비밀번호를 입력해 등록한다. 저장 전에 한 번 점검하고, 실패하면 다시 입력하거나 그래도 저장하거나 취소한다.
+- 비밀 참조 `file:NAME`을 추가했다. 대화형 등록은 비밀번호를 `~/.config/aic/secrets/`에 소유자만 읽을 수 있게 저장한다. systemd로 뜬 aicd도 읽을 수 있다.
+- `[aicd.exporter] workload_enabled`를 켜면 수집한 workload 지표를 `aic.workload.<종류>.<항목>`으로 rca-web에 보낸다. 누적 값은 1분 사이 증가분으로, 수집 성공 여부는 `aic.workload.up`으로 보낸다. 연결 주소와 계정은 보내지 않는다. 기본 꺼짐이며 켠 뒤 aicd를 재시작해야 한다.
+- 같은 종류의 서비스를 여러 개 등록해 각각 수집할 수 있다(예: 호스트 PostgreSQL과 컨테이너 PostgreSQL). 각 정의에 연결 주소가 있어야 한다.
+- `aic workload inspect`·`monitor`·`history`에 컨테이너 이름 같은 짧은 이름을 쓸 수 있다.
+
+### Changed
+
+- `aic workload discover`의 기본 출력은 서비스로 판정된 후보만 보이고 일반 프로세스 수를 알린다(`--all`로 전체). 커널 스레드는 후보에서 빠졌다. `inspect`는 읽기 쉬운 줄로 보이고 제안은 셸에서 실행할 `aic workload …` 명령으로 보인다. `--json` 출력은 그대로다.
+- 같은 id로 다시 `enable`하면 연결 정보를 새 값으로 바꾼다. 이전에는 새 값을 무시했다.
+- chat의 `/discover` 다중 선택은 연결 정보가 필요한 서비스를 목록에서 빼고 `aic workload enable`로 안내한다. 이전에는 골라도 저장이 실패했다.
+
+### Fixed
+
+- 패키지 업그레이드로 실행 파일이 바뀐 프로세스의 후보 id에 ` (deleted)`가 붙어 재시작 전후로 id가 달라지던 문제를 고쳤다.
+
 ## [0.50.13] - 2026-10-07
 
 ### Added

@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "aic-common"
-version = "0.50.13"
+version = "0.50.14"
 dependencies = [
  "anyhow",
  "bytes",
