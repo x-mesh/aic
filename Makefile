@@ -324,7 +324,8 @@ ci-quick: lint test
 #   awk로 [package] section 안의 첫 `version =` 줄만 교체 — [dependencies]
 #   block의 version은 건드리지 않는다. cargo build로 Cargo.lock도 동기화하고,
 #   fuzz 하위 워크스페이스의 Cargo.lock까지 같이 맞춘다 — CI의 fuzz job이
-#   --locked로 검증해서, 어긋나면 릴리스 커밋이 CI를 깨뜨린다.
+#   --locked로 검증해서, 어긋나면 릴리스 커밋이 CI를 깨뜨린다. eval/도 같은
+#   이유로 맞춘다 — CI가 검사하지 않아 손으로만 맞추다 보니 매번 낡았다.
 #
 # tag VERSION=0.3.0
 #   bump-version 후 git commit + annotated tag까지 한 번에. push는 따로.
@@ -350,13 +351,14 @@ bump-version:
 	@grep -E "^version" aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml
 	@cargo build --workspace --quiet >/dev/null 2>&1 && echo "✓ Cargo.lock 동기화" || echo "⚠ cargo build 실패 — Cargo.lock 미동기화"
 	@cargo metadata --manifest-path fuzz/Cargo.toml --format-version 1 >/dev/null 2>&1 && echo "✓ fuzz/Cargo.lock 동기화" || echo "⚠ fuzz metadata 실패 — fuzz/Cargo.lock 미동기화"
+	@cargo metadata --manifest-path eval/Cargo.toml --format-version 1 >/dev/null 2>&1 && echo "✓ eval/Cargo.lock 동기화" || echo "⚠ eval metadata 실패 — eval/Cargo.lock 미동기화"
 
 .PHONY: tag
 tag: bump-version
-	@if git diff --quiet --exit-code aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock fuzz/Cargo.lock; then \
+	@if git diff --quiet --exit-code aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock fuzz/Cargo.lock eval/Cargo.lock; then \
 		echo "⚠ 버전 변경이 없습니다 (이미 v$(VERSION)?). tag만 생성합니다."; \
 	else \
-		git add aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock fuzz/Cargo.lock && \
+		git add aic-common/Cargo.toml aic-server/Cargo.toml aic-client/Cargo.toml Cargo.lock fuzz/Cargo.lock eval/Cargo.lock && \
 		git commit -m "release: v$(VERSION)"; \
 	fi
 	@git tag v$(VERSION) -m "v$(VERSION)"
