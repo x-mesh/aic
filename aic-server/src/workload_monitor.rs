@@ -340,7 +340,17 @@ fn trim_to_max(path: &Path, max: usize) -> Result<()> {
     Ok(())
 }
 
-pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+pub async fn serve(cfg: WorkloadMonitorConfig, shutdown: watch::Receiver<bool>) -> Result<()> {
+    serve_with_export(cfg, shutdown, None).await
+}
+
+/// [`serve`]와 같고, 기록한 sample을 `export`로도 넘긴다(rca-web 전송 task). 채널이 가득 차면
+/// 그 sample은 전송에서만 빠지고 로컬 기록은 남는다 — 수집이 전송을 기다리지 않게 한다.
+pub async fn serve_with_export(
+    cfg: WorkloadMonitorConfig,
+    mut shutdown: watch::Receiver<bool>,
+    export: Option<tokio::sync::mpsc::Sender<WorkloadSample>>,
+) -> Result<()> {
     let mut interval = tokio::time::interval(cfg.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous = Vec::new();
@@ -400,7 +410,14 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                             }
                         };
                         match wait_for_collection(result, &mut shutdown).await {
-                            Some(Ok(Ok(_))) => {},
+                            Some(Ok(Ok(TickOutcome::Appended(sample)))) => {
+                                if let Some(export) = &export {
+                                    if export.try_send(sample).is_err() {
+                                        tracing::debug!(?adapter, "workload export channel full or closed — sample not exported");
+                                    }
+                                }
+                            }
+                            Some(Ok(Ok(TickOutcome::Skipped(_)))) => {},
                             Some(Ok(Err(error))) => tracing::warn!(?adapter, error = %error, "workload sample append failed"),
                             Some(Err(error)) => tracing::warn!(?adapter, error = %error, "workload collector thread ended without a result"),
                             None => return Ok(()),

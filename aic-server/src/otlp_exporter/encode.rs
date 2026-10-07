@@ -48,18 +48,7 @@ pub fn encode_metrics(
     now_unix_nano: u64,
     drop_counters: Option<&DropCounters>,
 ) -> Vec<u8> {
-    let resource_attrs = vec![
-        attr("host.name", &sample.resource.host_name),
-        attr("host.id", &sample.resource.host_id),
-        attr("os.type", &sample.resource.os_type),
-        // OTel resource semconv. 코어 수/총 메모리는 여기 없다 — 그건 resource가
-        // 아니라 메트릭(system.cpu.logical.count / system.memory.limit)의 자리라
-        // 이미 그렇게 보내고 있고, 수신측이 거기서 인벤토리를 채운다.
-        attr("host.arch", &sample.resource.arch),
-        attr("os.description", &sample.resource.os_desc),
-        attr("service.name", SERVICE_NAME),
-        attr("service.version", service_version),
-    ];
+    let resource_attrs = resource_attributes(&sample.resource, service_version);
 
     let data_points = sample
         .points
@@ -116,6 +105,88 @@ pub fn encode_metrics(
         });
     }
 
+    metrics_request(resource_attrs, service_version, metrics)
+}
+
+fn resource_attributes(
+    resource: &super::host_metrics::ResourceAttrs,
+    service_version: &str,
+) -> Vec<KeyValue> {
+    vec![
+        attr("host.name", &resource.host_name),
+        attr("host.id", &resource.host_id),
+        attr("os.type", &resource.os_type),
+        // OTel resource semconv. 코어 수/총 메모리는 여기 없다 — 그건 resource가
+        // 아니라 메트릭(system.cpu.logical.count / system.memory.limit)의 자리라
+        // 이미 그렇게 보내고 있고, 수신측이 거기서 인벤토리를 채운다.
+        attr("host.arch", &resource.arch),
+        attr("os.description", &resource.os_desc),
+        attr("service.name", SERVICE_NAME),
+        attr("service.version", service_version),
+    ]
+}
+
+/// data point마다 속성을 붙이는 gauge 하나. 이름이 런타임에 정해지는 지표(workload 등)용이다.
+pub struct AttributedPoint {
+    pub name: String,
+    pub unit: &'static str,
+    pub value: MetricValue,
+    pub attributes: Vec<(&'static str, String)>,
+}
+
+/// 속성이 붙은 gauge들을 인코딩한다. 같은 이름의 점은 metric 하나의 data point들로 묶는다 —
+/// 수신측은 이름별로 저장하고 data point 속성을 `attrs`에 보존한다(리소스 속성은 host 식별 외에는
+/// 버린다). 그래서 대상 구분(예: workload id)은 반드시 data point 속성으로 실어야 남는다.
+pub fn encode_attributed_metrics(
+    resource: &super::host_metrics::ResourceAttrs,
+    service_version: &str,
+    now_unix_nano: u64,
+    points: &[AttributedPoint],
+) -> Vec<u8> {
+    let mut metrics: Vec<Metric> = Vec::new();
+    for point in points {
+        let data_point = NumberDataPoint {
+            attributes: point
+                .attributes
+                .iter()
+                .map(|(key, value)| attr(key, value))
+                .collect(),
+            start_time_unix_nano: 0,
+            time_unix_nano: now_unix_nano,
+            value: Some(match point.value {
+                MetricValue::Double(v) => NumberValue::AsDouble(v),
+                MetricValue::Int(v) => NumberValue::AsInt(v),
+            }),
+            flags: 0,
+        };
+        let name = redact_str(&point.name);
+        match metrics.iter_mut().find(|metric| metric.name == name) {
+            Some(Metric {
+                data: Some(MetricData::Gauge(gauge)),
+                ..
+            }) => gauge.data_points.push(data_point),
+            _ => metrics.push(Metric {
+                name,
+                description: String::new(),
+                unit: redact_str(point.unit),
+                data: Some(MetricData::Gauge(Gauge {
+                    data_points: vec![data_point],
+                })),
+            }),
+        }
+    }
+    metrics_request(
+        resource_attributes(resource, service_version),
+        service_version,
+        metrics,
+    )
+}
+
+fn metrics_request(
+    resource_attrs: Vec<KeyValue>,
+    service_version: &str,
+    metrics: Vec<Metric>,
+) -> Vec<u8> {
     let request = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
             resource: Some(Resource {
