@@ -876,6 +876,21 @@ pub struct WorkloadStore {
     pub workloads: Vec<WorkloadDefinition>,
 }
 
+/// Returns true when the definitions of one adapter cannot be collected side by side.
+///
+/// One definition never conflicts. Several definitions conflict when two share an ID, because
+/// their samples would mix in history. They also conflict when one has no explicit connection,
+/// because it would probe the fixed local default that another definition can also reach.
+pub fn adapter_definitions_conflict(definitions: &[&WorkloadDefinition]) -> bool {
+    if definitions.len() < 2 {
+        return false;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    definitions
+        .iter()
+        .any(|definition| definition.connection.is_none() || !ids.insert(definition.id.as_str()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkloadSample {
     pub schema_version: u32,

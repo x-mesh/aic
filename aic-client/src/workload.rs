@@ -1,7 +1,7 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    load_workload_history, monitor_clickhouse_with_connection,
+    adapter_definitions_conflict, load_workload_history, monitor_clickhouse_with_connection,
     monitor_elasticsearch_with_connection, monitor_etcd_with_connection,
     monitor_haproxy_with_connection, monitor_memcached_with_connection,
     monitor_mongodb_with_connection, monitor_mysql_with_connection, monitor_nginx_with_connection,
@@ -430,11 +430,11 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
 
 pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
     let report = discover_for_monitor()?;
-    let candidate = select_monitor_candidate(&report, candidate_id)?;
     let connection = list_configured()?
         .into_iter()
-        .find(|definition| definition.id == candidate.id)
+        .find(|definition| definition.id == candidate_id)
         .and_then(|definition| definition.connection);
+    let candidate = select_monitor_candidate(&report, candidate_id, connection.is_some())?;
     let report = match candidate.adapter {
         WorkloadAdapter::HaProxy => {
             let connection = connection.as_ref().ok_or_else(|| {
@@ -599,6 +599,7 @@ fn safe_monitor_error(adapter: WorkloadAdapter, error: WorkloadProbeError) -> an
 fn select_monitor_candidate<'a>(
     report: &'a DiscoveryReport,
     candidate_id: &str,
+    has_saved_connection: bool,
 ) -> Result<&'a WorkloadCandidate> {
     let candidate = report
         .candidates
@@ -610,6 +611,11 @@ fn select_monitor_candidate<'a>(
     }
     if !candidate.ambiguity.is_empty() {
         bail!("workload monitor candidate is ambiguous");
+    }
+    // 저장된 연결이 없으면 고정 기본 주소로 조회한다. 같은 어댑터의 후보가 여럿이면 그 주소가
+    // 어느 후보의 것인지 알 수 없다.
+    if has_saved_connection {
+        return Ok(candidate);
     }
     let count = report
         .candidates
@@ -1289,12 +1295,11 @@ pub fn derive_status(
                     .num_seconds()
                     .max(0) as u64
             });
-            let state = if definitions
+            let same_adapter = definitions
                 .iter()
                 .filter(|other| other.adapter == definition.adapter)
-                .count()
-                > 1
-            {
+                .collect::<Vec<_>>();
+            let state = if adapter_definitions_conflict(&same_adapter) {
                 CollectionState::AmbiguousDefinitions
             } else if let Some(age_secs) = age_secs {
                 if Duration::from_secs(age_secs) > STALE_AFTER {
@@ -2562,8 +2567,27 @@ mod tests {
     #[test]
     fn monitor_selects_the_single_matching_unambiguous_candidate() {
         let report = redis_report(vec![redis_candidate("redis-a", &[])]);
-        let selected = select_monitor_candidate(&report, "redis-a").unwrap();
+        let selected = select_monitor_candidate(&report, "redis-a", false).unwrap();
         assert_eq!(selected.id, "redis-a");
+    }
+
+    /// 이 테스트가 지키는 것: 연결이 저장된 후보는 같은 어댑터의 다른 후보와 함께 있어도
+    /// 점검할 수 있는 것. 호스트와 컨테이너에 같은 서비스가 함께 있는 경우다.
+    #[test]
+    fn a_candidate_with_a_saved_connection_is_monitored_among_others() {
+        let report = redis_report(vec![
+            redis_candidate("redis-a", &[]),
+            redis_candidate("redis-b", &[]),
+        ]);
+        assert!(select_monitor_candidate(&report, "redis-a", false).is_err());
+        let selected = select_monitor_candidate(&report, "redis-a", true).unwrap();
+        assert_eq!(selected.id, "redis-a");
+        assert!(select_monitor_candidate(&report, "redis-c", true).is_err());
+        let ambiguous = redis_report(vec![redis_candidate(
+            "redis-a",
+            &["executable_unavailable"],
+        )]);
+        assert!(select_monitor_candidate(&ambiguous, "redis-a", true).is_err());
     }
 
     #[test]
@@ -2590,7 +2614,7 @@ mod tests {
             ),
         ];
         for (report, candidate_id) in cases {
-            assert!(select_monitor_candidate(&report, candidate_id).is_err());
+            assert!(select_monitor_candidate(&report, candidate_id, false).is_err());
         }
     }
 
@@ -2737,6 +2761,30 @@ mod tests {
         );
         assert_eq!(states[0].state, CollectionState::AmbiguousDefinitions);
         assert_eq!(states[2].state, CollectionState::Fresh);
+
+        let connected = |id: &str, endpoint: &str| WorkloadDefinition {
+            connection: Some(WorkloadConnectionConfig {
+                endpoint: endpoint.to_string(),
+                username: None,
+                secret_ref: None,
+                database: None,
+                auth_source: None,
+            }),
+            ..redis_definition(id)
+        };
+        let states = derive_status(
+            &[
+                connected("redis", "tcp://127.0.0.1:6379"),
+                connected(
+                    "container:docker:cache:exe:/usr/local/bin/redis-server",
+                    "tcp://127.0.0.1:16379",
+                ),
+            ],
+            &[sample("redis", now)],
+            now,
+        );
+        assert_eq!(states[0].state, CollectionState::Fresh);
+        assert_eq!(states[1].state, CollectionState::NoSamples);
     }
 
     #[cfg(unix)]

@@ -44,7 +44,7 @@ A successful one-time probe returns `monitor_ready: true`. It does not update th
 
 The one-time probe does not write history. It uses a saved connection when one exists.
 
-Run the one-time probe only for a current, unique, unambiguous candidate of that adapter.
+Run the one-time probe only for a current, unambiguous candidate. If the candidate has a saved connection, other candidates of the same adapter can exist. If it has no saved connection, it must be the only candidate of that adapter, because the probe uses the fixed local default.
 
 ```sh
 aic workload discover --json
@@ -166,7 +166,9 @@ Each cycle checks every monitor adapter. A saved definition becomes eligible wit
 
 The next cycle sees a new definition. Allow up to 60 seconds after the first immediate cycle.
 
-Each adapter permits exactly one saved definition. Multiple definitions block only that adapter.
+An adapter can have more than one saved definition. Each definition must have a different ID and an explicit connection. The daemon then collects each definition in each cycle.
+
+If two definitions of one adapter share an ID, or one of them has no connection, the definitions conflict. A conflict blocks only that adapter.
 
 An invalid connection blocks only its adapter. Other adapters continue their collection cycles.
 
@@ -192,7 +194,7 @@ aic workload status --json
 | `fresh` | A sample exists, and its age is 180 seconds or less. |
 | `stale` | The last sample age is more than 180 seconds. |
 | `no_samples` | A monitor definition exists, but no sample exists for its ID and adapter. |
-| `ambiguous_definitions` | More than one definition uses the same monitor adapter. |
+| `ambiguous_definitions` | Definitions of the same monitor adapter conflict. They share an ID, or one of them has no connection. |
 | `not_collected` | The definition uses JVM, Kafka, Consul, or another non-monitor adapter. |
 
 The `fresh` state describes sample age. Check `last_sample.outcome` to distinguish collection success from failure.
