@@ -110,6 +110,23 @@ pub struct WorkloadCandidate {
     pub bindings: Vec<RuntimeBinding>,
     #[serde(default)]
     pub ambiguity: Vec<String>,
+    /// The container that runs this workload. `None` means a host process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<WorkloadContainer>,
+}
+
+/// Container identity from cgroup evidence and, for Docker, the container metadata file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadContainer {
+    /// `docker`, `containerd`, `podman`, or `lxc`.
+    pub runtime: String,
+    /// The runtime container ID, or the LXC container name.
+    pub id: String,
+    /// The Docker container name. It stays the same when Compose recreates the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

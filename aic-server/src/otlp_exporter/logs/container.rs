@@ -55,7 +55,7 @@ use super::file::{FileTail, LineParser, PACE_INTERVAL};
 
 /// docker의 기본 컨테이너 로그 디렉토리. 컨테이너별 하위 디렉토리(`<id>/`) 안에
 /// `<id>-json.log`가 있다.
-const DEFAULT_CONTAINERS_DIR: &str = "/var/lib/docker/containers";
+const DEFAULT_CONTAINERS_DIR: &str = aic_common::docker::DOCKER_CONTAINERS_DIR;
 
 /// 새 컨테이너를 잡아내는 재스캔 주기. 매 tick(1초)마다 전체 디렉토리를 훑는 건 컨테이너 수가
 /// 많을 때 낭비라, tick보다 느슨한 별도 주기로 분리한다.
@@ -267,32 +267,13 @@ pub struct ContainerMeta {
 /// 없거나, 유효한 JSON이 아니거나, `Name` 필드가 비어 있으면 짧은 id로 폴백한다 — 절대 panic하지
 /// 않는다.
 pub fn resolve_container_meta(container_dir: &Path, container_id: &str) -> ContainerMeta {
-    let fallback_service = short_container_id(container_id);
-    let Ok(content) = std::fs::read_to_string(container_dir.join("config.v2.json")) else {
-        return ContainerMeta {
-            service: fallback_service,
-            image: None,
-        };
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return ContainerMeta {
-            service: fallback_service,
-            image: None,
-        };
-    };
-    let service = value
-        .get("Name")
-        .and_then(|n| n.as_str())
-        .map(|s| s.trim_start_matches('/').to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(fallback_service);
-    let image = value
-        .get("Config")
-        .and_then(|c| c.get("Image"))
-        .and_then(|i| i.as_str())
-        .or_else(|| value.get("Image").and_then(|i| i.as_str()))
-        .map(|s| s.to_string());
-    ContainerMeta { service, image }
+    let meta = aic_common::docker::read_docker_container_meta(container_dir);
+    ContainerMeta {
+        service: meta
+            .name
+            .unwrap_or_else(|| short_container_id(container_id)),
+        image: meta.image,
+    }
 }
 
 // ── 수집기 드라이버 ──────────────────────────────────────────────────────

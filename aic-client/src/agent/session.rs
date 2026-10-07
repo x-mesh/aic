@@ -4685,6 +4685,7 @@ mod tests {
     fn workload_explain_prompt_is_bounded_and_uses_opaque_references() {
         let candidates = (0..100)
             .map(|index| aic_common::WorkloadCandidate {
+                container: None,
                 id: format!("exe:/secret/path/{index}"),
                 fingerprint: format!("fingerprint-{index}"),
                 selector: Some(aic_common::WorkloadSelector::Executable {
@@ -4737,6 +4738,7 @@ mod tests {
     fn workload_discovery_display_is_bounded_and_reports_omissions() {
         let candidates = (0..100)
             .map(|index| aic_common::WorkloadCandidate {
+                container: None,
                 id: format!("exe:/very/long/path/{index}/{}", "x".repeat(1024)),
                 fingerprint: format!("fingerprint-{index}"),
                 selector: Some(aic_common::WorkloadSelector::Executable {
@@ -4771,6 +4773,7 @@ mod tests {
             evidence_coverage: "test".to_string(),
             candidates: vec![
                 aic_common::WorkloadCandidate {
+                    container: None,
                     id: "nginx".to_string(),
                     fingerprint: "n".to_string(),
                     selector: None,
@@ -4780,6 +4783,7 @@ mod tests {
                     ambiguity: Vec::new(),
                 },
                 aic_common::WorkloadCandidate {
+                    container: None,
                     id: "helper".to_string(),
                     fingerprint: "g".to_string(),
                     selector: None,
