@@ -18,6 +18,8 @@ Discovery is a one-time process scan. It does not save definitions or start coll
 
 Discovery does not watch new processes. Run discovery again after a service starts, stops, or changes identity.
 
+Discovery skips kernel threads. The text output shows only candidates with a service adapter. To show generic processes too, add `--all`. The `--json` output always contains every candidate.
+
 The shell command `aic workload enable` is an explicit write. It saves the definition without another confirmation prompt.
 
 The TTY `/discover` flow shows selected definitions and requests confirmation before it saves them.
@@ -63,6 +65,31 @@ AIC accepts argv[0] only when the value is an absolute path to an existing file.
 If no executable path resolves, the candidate gets the `executable_unavailable` ambiguity. AIC refuses to enable an ambiguous candidate.
 
 To collect the strongest evidence, run discovery as root or as the owner of the service process.
+
+### Container workloads
+
+Discovery reads the container runtime and container ID from the process cgroup. It supports Docker, containerd, Podman, and LXC.
+
+A container candidate has a `container` object with `runtime`, `id`, `name`, and `image`.
+
+For Docker, AIC reads the name and the image from `/var/lib/docker/containers/<id>/config.v2.json`. Only root can read this file.
+
+If AIC reads the Docker name, the candidate ID uses the name: `container:docker:<name>:exe:<path>`. Compose keeps the name when it recreates a container, so the ID stays the same.
+
+If AIC cannot read the name, the candidate ID uses the container ID. A recreated container then gets a new candidate ID.
+
+A process in a different PID or mount namespace without a runtime cgroup marker gets the `containerized_workload` ambiguity. AIC cannot identify that isolation, so it refuses to enable the candidate.
+
+A container candidate requires `--endpoint`. The fixed local defaults point to host services, not to services inside a container.
+
+Use the published port or the container address as the endpoint:
+
+```sh
+aic workload enable "container:docker:db:exe:/usr/local/bin/postgres" \
+  --fingerprint "$FINGERPRINT" \
+  --endpoint tcp://127.0.0.1:5432 \
+  --username monitor --database postgres --auth-env PGPASSWORD
+```
 
 ## Adapter contract
 

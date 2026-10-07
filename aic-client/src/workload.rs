@@ -16,8 +16,8 @@ use aic_common::workload::{
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
-    WorkloadCandidate, WorkloadConnectionConfig, WorkloadDefinition, WorkloadDriverMode,
-    WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
+    WorkloadCandidate, WorkloadConnectionConfig, WorkloadContainer, WorkloadDefinition,
+    WorkloadDriverMode, WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -65,6 +65,9 @@ struct ProcessRow {
     cmd: Vec<String>,
     systemd_unit: Option<String>,
     container: Option<ContainerEvidence>,
+    /// Docker `config.v2.json`에서 읽은 이름과 이미지. 다른 런타임이거나 읽지 못하면 `None`.
+    container_name: Option<String>,
+    container_image: Option<String>,
     ambiguity: Vec<String>,
 }
 
@@ -74,6 +77,7 @@ type CandidateGroup = (
     WorkloadAdapter,
     Vec<RuntimeBinding>,
     Vec<String>,
+    Option<WorkloadContainer>,
 );
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -111,6 +115,15 @@ impl ContainerRuntime {
             Self::RootFs => "rootfs",
             Self::Isolated => "isolated",
         }
+    }
+
+    /// 런타임이 붙인 컨테이너 id나 이름이 있어 같은 컨테이너를 다시 찾을 수 있는가. 네임스페이스나
+    /// 루트 파일시스템 차이로만 추정한 격리(snap, 샌드박스 등)는 무엇인지 모른다.
+    fn identifies_container(self) -> bool {
+        matches!(
+            self,
+            Self::Docker | Self::Containerd | Self::Podman | Self::Lxc
+        )
     }
 }
 
@@ -202,10 +215,16 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
                 cmd,
                 systemd_unit,
                 container,
+                container_name: None,
+                container_image: None,
                 ambiguity,
             }
         })
         .collect::<Vec<_>>();
+    attach_docker_meta(
+        &mut rows,
+        Path::new(aic_common::docker::DOCKER_CONTAINERS_DIR),
+    );
     rows.sort_by(|a, b| {
         a.exe
             .cmp(&b.exe)
@@ -237,12 +256,21 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
             .as_ref()
             .map(WorkloadSelector::stable_id)
             .unwrap_or_else(|| format!("generic:{}", row.pid));
-        let (key, id) = if let Some(container) = &row.container {
-            ambiguity.push(CONTAINERIZED_WORKLOAD_AMBIGUITY.to_string());
+        let container = row.container.as_ref().map(|container| WorkloadContainer {
+            runtime: container.runtime.label().to_string(),
+            id: container.key.clone(),
+            name: row.container_name.clone(),
+            image: row.container_image.clone(),
+        });
+        let (key, id) = if let Some(evidence) = &row.container {
+            if !evidence.runtime.identifies_container() {
+                ambiguity.push(CONTAINERIZED_WORKLOAD_AMBIGUITY.to_string());
+            }
+            // Compose는 컨테이너를 다시 만들 때 id를 바꾸고 이름은 유지한다.
+            let label = row.container_name.as_deref().unwrap_or(&evidence.key);
             let prefix = format!(
-                "{CONTAINER_ID_PREFIX}:{}:{}:",
-                container.runtime.label(),
-                container.key
+                "{CONTAINER_ID_PREFIX}:{}:{label}:",
+                evidence.runtime.label(),
             );
             (
                 format!("{prefix}{group_base}"),
@@ -253,9 +281,16 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
         };
         ambiguity.sort();
         ambiguity.dedup();
-        let entry = groups
-            .entry(key)
-            .or_insert_with(|| (id, selector.clone(), adapter, Vec::new(), ambiguity.clone()));
+        let entry = groups.entry(key).or_insert_with(|| {
+            (
+                id,
+                selector.clone(),
+                adapter,
+                Vec::new(),
+                ambiguity.clone(),
+                container,
+            )
+        });
         entry.3.push(RuntimeBinding {
             pid: row.pid,
             start_time: row.start_time,
@@ -267,19 +302,22 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
 
     let mut candidates = groups
         .into_values()
-        .map(|(id, selector, adapter, mut bindings, ambiguity)| {
-            bindings.sort_by_key(|binding| (binding.pid, binding.start_time));
-            let fingerprint = fingerprint(&id, &bindings);
-            WorkloadCandidate {
-                id,
-                fingerprint,
-                selector,
-                adapter,
-                driver_mode: driver_mode(adapter),
-                bindings,
-                ambiguity,
-            }
-        })
+        .map(
+            |(id, selector, adapter, mut bindings, ambiguity, container)| {
+                bindings.sort_by_key(|binding| (binding.pid, binding.start_time));
+                let fingerprint = fingerprint(&id, &bindings);
+                WorkloadCandidate {
+                    id,
+                    fingerprint,
+                    selector,
+                    adapter,
+                    driver_mode: driver_mode(adapter),
+                    bindings,
+                    ambiguity,
+                    container,
+                }
+            },
+        )
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| {
         adapter_priority(a.adapter)
@@ -290,6 +328,7 @@ fn discover_rows(rows: Vec<ProcessRow>) -> DiscoveryReport {
                     .cmp(&b.ambiguity.is_empty())
                     .reverse()
             })
+            .then_with(|| a.container.is_some().cmp(&b.container.is_some()))
             .then_with(|| a.id.cmp(&b.id))
     });
     candidates.truncate(MAX_CANDIDATES);
@@ -957,6 +996,31 @@ fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
     None
 }
 
+/// Docker 컨테이너의 이름과 이미지를 붙인다. 메타데이터 파일은 root만 읽을 수 있어, 비root
+/// 탐색에서는 이름 없이 id로 남는다.
+fn attach_docker_meta(rows: &mut [ProcessRow], containers_dir: &Path) {
+    let mut cache: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for row in rows {
+        let Some(evidence) = &row.container else {
+            continue;
+        };
+        if evidence.runtime != ContainerRuntime::Docker {
+            continue;
+        }
+        let (name, image) = cache
+            .entry(evidence.key.clone())
+            .or_insert_with(|| {
+                let meta = aic_common::docker::read_docker_container_meta(
+                    &containers_dir.join(&evidence.key),
+                );
+                (meta.name, meta.image)
+            })
+            .clone();
+        row.container_name = name;
+        row.container_image = image;
+    }
+}
+
 fn is_container_hex_id(id: &str) -> bool {
     (CONTAINER_ID_MIN_HEX..=CONTAINER_ID_MAX_HEX).contains(&id.len())
         && id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -1291,6 +1355,11 @@ pub fn enable_with_connection(
     if !candidate.ambiguity.is_empty() || candidate.selector.is_none() {
         bail!("ambiguous workload candidates cannot be enabled");
     }
+    // 고정 기본 주소(127.0.0.1의 표준 포트)는 호스트의 서비스를 가리킨다. 컨테이너 안의 서비스는
+    // 공개한 포트나 컨테이너 주소로만 닿는다.
+    if candidate.container.is_some() && connection.is_none() {
+        bail!("container workload monitoring requires an explicit --endpoint");
+    }
     validate_enable_connection(candidate.adapter, connection.as_ref())?;
     let definition = WorkloadDefinition {
         id: candidate.id,
@@ -1495,6 +1564,17 @@ fn snake_label(value: &impl serde::Serialize) -> String {
         .unwrap_or_default()
 }
 
+fn container_label(container: &WorkloadContainer) -> String {
+    let short_id = container.id.chars().take(12).collect::<String>();
+    format!(
+        "container={} runtime={} id={} image={}",
+        container.name.as_deref().unwrap_or("-"),
+        container.runtime,
+        short_id,
+        container.image.as_deref().unwrap_or("-"),
+    )
+}
+
 fn list_or_dash(values: &[String]) -> String {
     if values.is_empty() {
         "-".to_string()
@@ -1527,7 +1607,7 @@ pub fn shell_command(proposal: &WorkloadProposal, candidate: &WorkloadCandidate)
                 "aic workload enable {id} --fingerprint {}",
                 candidate.fingerprint
             );
-            if requires_explicit_connection(candidate.adapter) {
+            if requires_explicit_connection(candidate.adapter) || candidate.container.is_some() {
                 command.push_str(" --endpoint <tcp://HOST:PORT>");
             }
             Some(command)
@@ -1561,6 +1641,9 @@ pub fn render_discover(report: &DiscoveryReport, all: bool) -> String {
             candidate.fingerprint,
             list_or_dash(&candidate.ambiguity),
         ));
+        if let Some(container) = &candidate.container {
+            out.push_str(&format!("              {}\n", container_label(container)));
+        }
     }
     if shown
         .iter()
@@ -1593,6 +1676,9 @@ pub fn render_inspect(
         list_or_dash(&candidate.ambiguity),
         list_or_dash(&pids),
     );
+    if let Some(container) = &candidate.container {
+        out.push_str(&format!("{}\n", container_label(container)));
+    }
     if proposals.is_empty() {
         return out;
     }
@@ -1622,6 +1708,8 @@ mod tests {
             cmd: cmd.iter().map(|s| s.to_string()).collect(),
             systemd_unit: None,
             container: None,
+            container_name: None,
+            container_image: None,
             ambiguity: Vec::new(),
         }
     }
@@ -2167,17 +2255,113 @@ mod tests {
                     .starts_with("container:docker:0123456789abcdef0123456789abcdef:")
             })
             .unwrap();
-        assert!(container
+        assert!(container.ambiguity.is_empty(), "{:?}", container.ambiguity);
+        assert_eq!(
+            container.container.as_ref().map(|c| c.runtime.as_str()),
+            Some("docker")
+        );
+        assert_eq!(container.driver_mode, Some(WorkloadDriverMode::DetectOnly));
+        let all = proposals(&report);
+        let enabled = all
+            .iter()
+            .filter(|proposal| proposal.kind == ProposalKind::Enable)
+            .map(|proposal| proposal.candidate_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, vec![host_id, container.id.clone()]);
+        let enable = all
+            .iter()
+            .find(|p| p.kind == ProposalKind::Enable && p.candidate_id == container.id)
+            .unwrap();
+        assert!(shell_command(enable, container)
+            .unwrap()
+            .ends_with(" --endpoint <tcp://HOST:PORT>"));
+    }
+
+    /// 이 테스트가 지키는 것: 네임스페이스 차이로만 추정한 격리는 무엇인지 모르므로 등록을
+    /// 막는 것. snap(multipass 등)도 마운트 네임스페이스가 달라 이 경로로 잡힌다.
+    #[test]
+    fn an_unidentified_isolation_stays_ambiguous() {
+        let report = discover_rows(vec![container_row(
+            2,
+            1,
+            "postgres",
+            Some("/usr/lib/postgresql/16/bin/postgres"),
+            &[],
+            ContainerRuntime::PidNamespace,
+            "4026532001",
+        )]);
+        let candidate = &report.candidates[0];
+        assert!(candidate
             .ambiguity
             .iter()
             .any(|ambiguity| ambiguity == CONTAINERIZED_WORKLOAD_AMBIGUITY));
-        assert_eq!(container.driver_mode, Some(WorkloadDriverMode::DetectOnly));
-        let enabled = proposals(&report)
-            .into_iter()
-            .filter(|proposal| proposal.kind == ProposalKind::Enable)
-            .map(|proposal| proposal.candidate_id)
+        assert!(proposals(&report)
+            .iter()
+            .all(|proposal| proposal.kind != ProposalKind::Enable));
+    }
+
+    /// 이 테스트가 지키는 것: docker 후보 id가 컨테이너 이름을 쓰는 것. Compose가 컨테이너를
+    /// 다시 만들면 id는 바뀌고 이름은 남는다. 메타데이터를 못 읽으면 id로 남는다.
+    #[test]
+    fn a_docker_candidate_is_named_after_its_container() {
+        let named = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let unreadable = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(named)).unwrap();
+        std::fs::write(
+            dir.path().join(named).join("config.v2.json"),
+            r#"{"Name":"/dnx-postgres-1","Config":{"Image":"postgres:17.6-alpine"}}"#,
+        )
+        .unwrap();
+        let executable = "/usr/local/bin/postgres";
+        let mut rows = vec![
+            container_row(
+                2,
+                1,
+                "postgres",
+                Some(executable),
+                &[],
+                ContainerRuntime::Docker,
+                named,
+            ),
+            container_row(
+                3,
+                1,
+                "postgres",
+                Some(executable),
+                &[],
+                ContainerRuntime::Docker,
+                unreadable,
+            ),
+        ];
+        attach_docker_meta(&mut rows, dir.path());
+        let report = discover_rows(rows);
+        let ids = report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(enabled, vec![host_id]);
+        assert!(
+            ids.contains(&"container:docker:dnx-postgres-1:exe:/usr/local/bin/postgres"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(
+                &format!("container:docker:{unreadable}:exe:/usr/local/bin/postgres").as_str()
+            ),
+            "{ids:?}"
+        );
+        let named_candidate = report
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id.contains("dnx-postgres-1"))
+            .unwrap();
+        let container = named_candidate.container.as_ref().unwrap();
+        assert_eq!(container.id, named);
+        assert_eq!(container.image.as_deref(), Some("postgres:17.6-alpine"));
+        assert!(render_discover(&report, false).contains(
+            "container=dnx-postgres-1 runtime=docker id=aaaaaaaaaaaa image=postgres:17.6-alpine"
+        ));
     }
 
     #[test]
@@ -2309,6 +2493,7 @@ mod tests {
     #[test]
     fn unsupported_driver_stays_detect_only() {
         let candidate = WorkloadCandidate {
+            container: None,
             id: "exe:/usr/bin/java".into(),
             fingerprint: "test".into(),
             selector: Some(WorkloadSelector::Executable {
@@ -2334,6 +2519,7 @@ mod tests {
             schema_version: WORKLOAD_SCHEMA_VERSION,
             evidence_coverage: "test".into(),
             candidates: vec![WorkloadCandidate {
+                container: None,
                 id: "exe:/usr/bin/redis-server".into(),
                 fingerprint: "test".into(),
                 selector: Some(WorkloadSelector::Executable {
@@ -2352,6 +2538,7 @@ mod tests {
 
     fn redis_candidate(id: &str, ambiguity: &[&str]) -> WorkloadCandidate {
         WorkloadCandidate {
+            container: None,
             id: id.into(),
             fingerprint: format!("fingerprint:{id}"),
             selector: Some(WorkloadSelector::Executable {

@@ -4,6 +4,7 @@ pub mod attach;
 pub mod bounded_byte_channel;
 pub mod central_store_flag;
 pub mod disk_io;
+pub mod docker;
 pub mod error;
 pub mod ipc;
 #[doc(hidden)]
@@ -54,8 +55,9 @@ pub use workload::{
     NginxMetrics, NginxMonitorReport, OpenSearchMetrics, OpenSearchMonitorReport,
     PostgreSqlMetrics, PostgreSqlMonitorReport, PrometheusMetrics, PrometheusMonitorReport,
     ProposalEffects, ProposalKind, RabbitMqMetrics, RabbitMqMonitorReport, RuntimeBinding,
-    WorkloadAdapter, WorkloadCandidate, WorkloadConnectionConfig, WorkloadDefinition,
-    WorkloadDriverMode, WorkloadProposal, WorkloadSelector, WORKLOAD_SCHEMA_VERSION,
+    WorkloadAdapter, WorkloadCandidate, WorkloadConnectionConfig, WorkloadContainer,
+    WorkloadDefinition, WorkloadDriverMode, WorkloadProposal, WorkloadSelector,
+    WORKLOAD_SCHEMA_VERSION,
 };
 
 // CaptureMode/CaptureQuality/OutputMetadata는 같은 모듈 내 정의이므로 별도 re-export 불필요.
