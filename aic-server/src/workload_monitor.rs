@@ -1,6 +1,6 @@
 use aic_common::workload::{
-    workload_history_path, workloads_file_path, WorkloadAdapter, WorkloadDefinition,
-    WorkloadMetrics, WorkloadProbeError, WorkloadSample, WorkloadSampleFailure,
+    adapter_definitions_conflict, workload_history_path, workloads_file_path, WorkloadAdapter,
+    WorkloadDefinition, WorkloadMetrics, WorkloadProbeError, WorkloadSample, WorkloadSampleFailure,
     WorkloadSampleOutcome, WorkloadStore, MAX_WORKLOAD_HISTORY_SAMPLES, WORKLOAD_SAMPLE_INTERVAL,
     WORKLOAD_SAMPLE_SCHEMA_VERSION,
 };
@@ -37,6 +37,8 @@ pub enum DefinitionsState {
     Idle,
     Ambiguous(usize),
     One(WorkloadDefinition),
+    /// Several definitions with distinct IDs and explicit connections. Each one is collected.
+    Many(Vec<WorkloadDefinition>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,16 +154,15 @@ pub fn load_adapter_definition(path: &Path, adapter: WorkloadAdapter) -> Definit
     let mut definitions = store
         .workloads
         .into_iter()
-        .filter(|definition| definition.adapter == adapter);
-    let first = match definitions.next() {
-        Some(definition) => definition,
-        None => return DefinitionsState::Idle,
-    };
-    let count = 1 + definitions.count();
-    if count == 1 {
-        DefinitionsState::One(first)
-    } else {
-        DefinitionsState::Ambiguous(count)
+        .filter(|definition| definition.adapter == adapter)
+        .collect::<Vec<_>>();
+    if adapter_definitions_conflict(&definitions.iter().collect::<Vec<_>>()) {
+        return DefinitionsState::Ambiguous(definitions.len());
+    }
+    match definitions.len() {
+        0 => DefinitionsState::Idle,
+        1 => DefinitionsState::One(definitions.remove(0)),
+        _ => DefinitionsState::Many(definitions),
     }
 }
 
@@ -385,7 +386,12 @@ pub async fn serve(cfg: WorkloadMonitorConfig, mut shutdown: watch::Receiver<boo
                             _ => tracing::info!(?adapter, state = tag, "workload definition state changed"),
                         }
                     }
-                    if let DefinitionsState::One(definition) = state {
+                    let definitions = match state {
+                        DefinitionsState::One(definition) => vec![definition],
+                        DefinitionsState::Many(definitions) => definitions,
+                        _ => Vec::new(),
+                    };
+                    for definition in definitions {
                         let result = match start_collection_thread(cfg.clone(), definition) {
                             Ok(result) => result,
                             Err(error) => {
@@ -417,6 +423,7 @@ fn state_tag(state: &DefinitionsState) -> &'static str {
         DefinitionsState::Idle => "idle",
         DefinitionsState::Ambiguous(_) => "ambiguous",
         DefinitionsState::One(_) => "one",
+        DefinitionsState::Many(_) => "many",
     }
 }
 
@@ -2179,6 +2186,57 @@ mod tests {
             sample.adapter == WorkloadAdapter::Memcached
                 && matches!(sample.outcome, WorkloadSampleOutcome::Collected { .. })
         }));
+    }
+
+    /// 이 테스트가 지키는 것: 같은 어댑터의 정의가 여럿이어도 각각 수집되는 것. 호스트의
+    /// PostgreSQL과 컨테이너의 PostgreSQL을 함께 감시하는 경우다.
+    #[tokio::test]
+    async fn serve_collects_every_definition_of_one_adapter() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("history.jsonl"),
+            interval: Duration::from_secs(3600),
+        };
+        let closed_port = |id: &str| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let mut definition = postgresql_definition();
+            definition.id = id.to_string();
+            definition.connection.as_mut().unwrap().endpoint = format!("tcp://127.0.0.1:{port}");
+            definition
+        };
+        let host = closed_port("exe:/usr/bin/postgres");
+        let container = closed_port("container:docker:db:exe:/usr/local/bin/postgres");
+        let store = WorkloadStore {
+            workloads: vec![host.clone(), container.clone()],
+        };
+        fs::write(&cfg.workloads_path, toml::to_string(&store).unwrap()).unwrap();
+        assert_eq!(
+            load_postgresql_definition(&cfg.workloads_path),
+            DefinitionsState::Many(vec![host.clone(), container.clone()])
+        );
+
+        let (shutdown, receiver) = watch::channel(false);
+        let handle = tokio::spawn(serve(cfg.clone(), receiver));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let samples = loop {
+            let samples =
+                aic_common::workload::load_workload_history(&cfg.history_path).unwrap_or_default();
+            if samples.len() >= 2 || tokio::time::Instant::now() > deadline {
+                break samples;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        shutdown.send(true).unwrap();
+        handle.await.unwrap().unwrap();
+        let mut ids = samples
+            .iter()
+            .map(|sample| sample.workload_id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec![container.id.as_str(), host.id.as_str()]);
     }
 
     #[tokio::test]

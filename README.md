@@ -428,7 +428,7 @@ The following status values describe collection state:
 - `fresh`: A sample exists from the last 180 seconds.
 - `stale`: The newest sample is older than 180 seconds.
 - `no_samples`: A definition exists, but no sample exists.
-- `ambiguous_definitions`: Multiple definitions prevent collection for that adapter.
+- `ambiguous_definitions`: Definitions of one adapter conflict. They share an ID, or one of them has no connection. The conflict prevents collection for that adapter.
 - `not_collected`: The adapter supports discovery only.
 
 Thirteen adapters support monitoring. JVM, Kafka, and Consul support discovery only.
