@@ -386,7 +386,7 @@ Tab 순환, Enter 선택, Esc 닫기).
 
 1. `aic workload discover --json`으로 후보를 찾습니다.
 2. `aic workload inspect <id> --json`으로 후보 하나를 점검합니다.
-3. `aic workload enable <id> --fingerprint <value> ...`로 정의를 저장합니다.
+3. 터미널에서 `aic workload enable`(인자 없음)을 실행해 후보를 고르고 연결 정보를 넣으면, 한 번 점검한 뒤 정의를 저장합니다. 스크립트에서는 `aic workload enable <id> --fingerprint <value> ...`를 씁니다.
 4. `aic workload list --json`으로 저장된 정의를 확인합니다.
 5. `aic workload monitor <id> --json`으로 단발 프로브를 시험합니다.
 6. `aic daemon start`로 60초 주기 수집을 시작합니다.

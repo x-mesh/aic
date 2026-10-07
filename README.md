@@ -407,7 +407,7 @@ Use this lifecycle:
 
 1. Run `aic workload discover --json` to find candidates.
 2. Run `aic workload inspect <id> --json` to check one candidate.
-3. Run `aic workload enable <id> --fingerprint <value> ...` to save a definition.
+3. Run `aic workload enable` in a terminal to select a candidate, enter its connection, and probe it before AIC saves it. In a script, run `aic workload enable <id> --fingerprint <value> ...`.
 4. Run `aic workload list --json` to verify saved definitions.
 5. Run `aic workload monitor <id> --json` to test one probe.
 6. Run `aic daemon start` to collect samples every 60 seconds.

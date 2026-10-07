@@ -4,7 +4,31 @@ This document defines the current workload discovery, configuration, collection,
 
 ## Lifecycle
 
-Use this sequence for each workload:
+### Interactive enable
+
+In a terminal, run `aic workload enable` without arguments:
+
+```sh
+aic workload enable
+```
+
+The command runs discovery and lists the candidates that AIC can monitor. Type to filter the list.
+
+After you select a candidate, the command asks for the connection. It suggests an endpoint:
+
+- For a host process, it suggests the standard port on `127.0.0.1`.
+- For a Docker container, it suggests the published port. If the container does not publish the port, it suggests the container address.
+- For other container runtimes, it does not suggest an endpoint.
+
+The command asks only for the fields that the adapter uses. For a password, it offers three sources: a file secret, an environment variable, or no password. The file secret is the default.
+
+Before it saves the definition, the command runs one probe with the connection. If the probe fails, you can enter the values again, save anyway, or cancel.
+
+The interactive flow does not ask for a fingerprint. You select the candidate from the discovery that the flow just ran.
+
+### Scripted enable
+
+Use this sequence in a script:
 
 1. Run `aic workload discover --json`.
 2. Record the candidate `id` and `fingerprint`.
@@ -20,9 +44,11 @@ Discovery does not watch new processes. Run discovery again after a service star
 
 Discovery skips kernel threads. The text output shows only candidates with a service adapter. To show generic processes too, add `--all`. The `--json` output always contains every candidate.
 
-The shell command `aic workload enable` is an explicit write. It saves the definition without another confirmation prompt.
+The shell command `aic workload enable <id> --fingerprint <value>` is an explicit write. It saves the definition without another confirmation prompt.
 
-The TTY `/discover` flow shows selected definitions and requests confirmation before it saves them.
+If a definition with the same ID exists, enable replaces it. Use this to correct an endpoint or a credential.
+
+The TTY `/discover` flow shows selected definitions and requests confirmation before it saves them. It cannot ask for a connection. It lists candidates that need a connection separately and refers you to the interactive enable.
 
 The TTY `/workload enable <id> <fingerprint>` flow also requests confirmation before it saves one definition.
 
@@ -32,7 +58,15 @@ Definitions use `$XDG_CONFIG_HOME/aic/workloads.toml`. The default path is `~/.c
 
 On Unix, AIC writes `workloads.toml` with mode `0600`. Definitions contain secret references, not secret values.
 
-Use `env:NAME` or `keychain:ACCOUNT` references. AIC resolves each secret only for a probe.
+Use `file:NAME`, `env:NAME`, or `keychain:ACCOUNT` references. AIC resolves each secret only for a probe.
+
+A `file:NAME` reference reads `secrets/NAME` in the same directory as `workloads.toml`. The default path is `~/.config/aic/secrets/NAME`.
+
+The interactive enable writes the file with mode `0600` in a directory with mode `0700`. AIC refuses to read a file secret that the group or other users can read.
+
+On Linux, use `file:NAME` when `aicd` runs as a systemd service. The service does not get the environment of your login shell. The kernel keyring of your login session is also not available to the service.
+
+`file:NAME` needs a version of `aicd` that supports it. An older `aicd` cannot parse `workloads.toml` with this reference and stops all workload collection. Update `aic` and `aicd` together.
 
 ## Discovery and driver modes
 

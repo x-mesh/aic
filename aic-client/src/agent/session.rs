@@ -2162,6 +2162,9 @@ impl AgentSession {
         if !self.allow_run_command || !self.out.is_tui() {
             return;
         }
+        // 다중 선택은 연결 정보를 묻지 못한다. 연결이 필요한 후보를 넣으면 고른 뒤에 저장이
+        // 실패하므로, 연결을 묻는 대화형 등록으로 보낸다.
+        let mut needs_connection = Vec::new();
         let items = proposals
             .iter()
             .filter(|proposal| {
@@ -2173,6 +2176,10 @@ impl AgentSession {
                     .candidates
                     .iter()
                     .find(|candidate| candidate.id == proposal.candidate_id)?;
+                if crate::workload::needs_connection(candidate) {
+                    needs_connection.push(candidate.id.clone());
+                    return None;
+                }
                 Some(super::chat_tui::MultiSelectItem {
                     id: candidate.id.clone(),
                     label: format!(
@@ -2185,6 +2192,15 @@ impl AgentSession {
                 })
             })
             .collect::<Vec<_>>();
+        if !needs_connection.is_empty() {
+            self.out
+                .note(&format!(
+                    "연결 정보가 필요한 서비스 {}개는 터미널에서 `aic workload enable`(인자 없음)로 등록하세요: {}",
+                    needs_connection.len(),
+                    needs_connection.join(", ")
+                ))
+                .await;
+        }
         if items.is_empty() {
             self.out.note("적용 가능한 workload 정의가 없습니다.").await;
             return;

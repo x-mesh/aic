@@ -20,6 +20,7 @@ use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 mod config_picker;
+mod workload_picker;
 
 // ── ANSI 색상 상수 ─────────────────────────────────────────────
 const COL_RESET: &str = "\x1b[0m";
@@ -666,10 +667,12 @@ enum WorkloadOp {
         json: bool,
     },
     /// 현재 후보 fingerprint가 일치할 때만 정의를 저장한다.
+    ///
+    /// 인자 없이 터미널에서 실행하면 후보를 골라 연결 정보를 입력하고 점검한 뒤 저장한다.
     Enable {
-        candidate_id: String,
-        #[arg(long)]
-        fingerprint: String,
+        candidate_id: Option<String>,
+        #[arg(long, requires = "candidate_id")]
+        fingerprint: Option<String>,
         /// Explicit unix://, tcp://, or tls:// workload endpoint.
         #[arg(long)]
         endpoint: Option<String>,
@@ -1518,7 +1521,11 @@ fn handle_workload(op: WorkloadOp) {
             }
         }),
         WorkloadOp::Enable {
-            candidate_id,
+            candidate_id: None,
+            ..
+        } => workload_picker::run_enable_picker().map(|()| String::new()),
+        WorkloadOp::Enable {
+            candidate_id: Some(candidate_id),
             fingerprint,
             endpoint,
             username,
@@ -1550,7 +1557,14 @@ fn handle_workload(op: WorkloadOp) {
                 }
                 None => Ok(None),
             };
-            connection.and_then(|connection| workload::enable_with_connection(&candidate_id, &fingerprint, connection)).map(|definition| {
+            connection
+                .and_then(|connection| {
+                    let fingerprint = fingerprint.ok_or_else(|| {
+                        anyhow::anyhow!("--fingerprint is required with a candidate id; run `aic workload enable` without arguments to pick one interactively")
+                    })?;
+                    workload::enable_with_connection(&candidate_id, &fingerprint, connection)
+                })
+                .map(|definition| {
             if json {
                 serde_json::json!({ "configured": definition }).to_string()
             } else {
@@ -1560,6 +1574,7 @@ fn handle_workload(op: WorkloadOp) {
         }
     };
     match result {
+        Ok(output) if output.is_empty() => {}
         Ok(output) => println!("{output}"),
         Err(error) => {
             eprintln!("workload error: {error}");
