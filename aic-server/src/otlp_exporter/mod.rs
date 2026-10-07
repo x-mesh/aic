@@ -56,6 +56,7 @@ mod ntp;
 mod proc;
 mod process_inventory;
 mod spool;
+mod workload;
 
 pub use agent::{serve_agent, AgentConfig};
 pub use changes::{serve_changes, ChangesConfig};
@@ -67,6 +68,7 @@ pub use health::ExporterHealth;
 pub use kernel::{ensure_loopback, serve_kernel, KernelConfig};
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
 pub use spool::{DropReason, SignalKind, Spool};
+pub use workload::{serve_workload, WorkloadExportConfig};
 
 use crate::live_config::{self, LiveExporterConfig};
 use std::sync::Arc;

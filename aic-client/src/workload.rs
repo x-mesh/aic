@@ -1516,17 +1516,9 @@ fn suggest_connection_in(
     }
 }
 
-/// 사람이 부르는 짧은 이름. 컨테이너는 컨테이너 이름, 실행 파일은 파일 이름이다.
+/// 사람이 부르는 짧은 이름. aicd가 rca-web에 보내는 `workload.name`과 같은 규칙이다.
 pub fn short_name(id: &str) -> &str {
-    if let Some(rest) = id.strip_prefix("container:") {
-        if let Some(name) = rest.split(':').nth(1) {
-            return name;
-        }
-    }
-    if let Some(unit) = id.strip_prefix("systemd:") {
-        return unit;
-    }
-    id.rsplit('/').next().unwrap_or(id)
+    aic_common::workload::workload_short_name(id)
 }
 
 /// 사용자가 준 이름을 전체 id로 바꾼다. 정확한 id, 짧은 이름, id의 일부 순서로 찾는다. 여럿이

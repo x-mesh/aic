@@ -516,3 +516,141 @@ async fn raising_the_interval_stops_the_pushes() {
     sd_tx.send(true).unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
+
+/// 이 테스트가 지키는 것: workload sample이 rca-web이 저장하는 형태로 도착하는 것. 지표마다
+/// workload 속성이 data point에 실리고, 누적 카운터는 두 번째 sample부터 증가분으로 오며, 연결
+/// 주소는 실리지 않는다.
+#[tokio::test]
+async fn workload_samples_arrive_as_attributed_increments() {
+    use aic_common::workload::{
+        PostgreSqlMetrics, WorkloadAdapter, WorkloadMetrics, WorkloadSample, WorkloadSampleOutcome,
+        WORKLOAD_SAMPLE_SCHEMA_VERSION,
+    };
+    use aic_server::otlp_exporter::encode::{
+        AnyValueOneof, ExportMetricsServiceRequest, MetricData, NumberValue,
+    };
+    use aic_server::otlp_exporter::{serve_workload, WorkloadExportConfig};
+    use prost::Message as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<Captured>(8);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
+    let cfg = WorkloadExportConfig {
+        endpoint: format!("http://{addr}"),
+        token: Some("test-token".to_string()),
+        service_version: "9.9.9".to_string(),
+        spool,
+        health,
+        live: None,
+    };
+    let (sample_tx, sample_rx) = mpsc::channel(4);
+    let handle = tokio::spawn(serve_workload(cfg, sample_rx, sd_rx));
+
+    let id = "container:docker:dnx-postgres-1:exe:/usr/local/bin/postgres";
+    let sample = |xact_commit: u64| WorkloadSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: id.into(),
+        captured_at: chrono::Utc::now(),
+        adapter: WorkloadAdapter::PostgreSql,
+        outcome: WorkloadSampleOutcome::Collected {
+            endpoint: "tcp://10.1.2.3:5432".into(),
+            metrics: WorkloadMetrics::PostgreSql(PostgreSqlMetrics {
+                numbackends: 2,
+                xact_commit,
+                xact_rollback: 0,
+                blks_read: 0,
+                blks_hit: 0,
+                tup_returned: 0,
+                tup_fetched: 0,
+                tup_inserted: 0,
+                tup_updated: 0,
+                tup_deleted: 0,
+                conflicts: 0,
+                temp_files: 0,
+                temp_bytes: 0,
+                deadlocks: 0,
+            }),
+        },
+    };
+    sample_tx.send(sample(1000)).await.unwrap();
+    sample_tx.send(sample(1060)).await.unwrap();
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("collector가 5초 내 요청을 받지 못함")
+            .expect("채널이 닫힘");
+        assert_eq!(captured.authorization.as_deref(), Some("Bearer test-token"));
+        assert!(!contains(&captured.body, b"10.1.2.3"), "연결 주소가 실림");
+        bodies.push(captured.body);
+    }
+
+    let decode = |body: &[u8]| {
+        let request = ExportMetricsServiceRequest::decode(body).unwrap();
+        let mut out = Vec::new();
+        for rm in request.resource_metrics {
+            for sm in rm.scope_metrics {
+                for metric in sm.metrics {
+                    let Some(MetricData::Gauge(gauge)) = metric.data else {
+                        panic!("gauge만 보낸다");
+                    };
+                    for dp in gauge.data_points {
+                        let attrs = dp
+                            .attributes
+                            .iter()
+                            .map(|kv| {
+                                let value = match kv.value.as_ref().and_then(|v| v.value.clone()) {
+                                    Some(AnyValueOneof::StringValue(s)) => s,
+                                    other => panic!("문자열 속성만 보낸다: {other:?}"),
+                                };
+                                (kv.key.clone(), value)
+                            })
+                            .collect::<Vec<_>>();
+                        let value = match dp.value {
+                            Some(NumberValue::AsInt(v)) => v,
+                            other => panic!("정수 값: {other:?}"),
+                        };
+                        out.push((metric.name.clone(), value, attrs));
+                    }
+                }
+            }
+        }
+        out
+    };
+    let first = decode(&bodies[0]);
+    assert!(first
+        .iter()
+        .all(|(name, _, _)| name != "aic.workload.postgresql.xact_commit"));
+    let second = decode(&bodies[1]);
+    let (_, commits, attrs) = second
+        .iter()
+        .find(|(name, _, _)| name == "aic.workload.postgresql.xact_commit")
+        .expect("두 번째 sample에 증가분이 있어야 한다");
+    assert_eq!(*commits, 60);
+    assert!(attrs.contains(&("workload.id".to_string(), id.to_string())));
+    assert!(attrs.contains(&("workload.name".to_string(), "dnx-postgres-1".to_string())));
+    assert!(attrs.contains(&("workload.adapter".to_string(), "postgresql".to_string())));
+    let (_, up, up_attrs) = second
+        .iter()
+        .find(|(name, _, _)| name == "aic.workload.up")
+        .unwrap();
+    assert_eq!(*up, 1);
+    assert!(up_attrs.contains(&("status".to_string(), "collected".to_string())));
+
+    sd_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("exporter가 3초 내 종료하지 못함")
+        .unwrap()
+        .unwrap();
+}

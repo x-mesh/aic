@@ -670,6 +670,29 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         _ => None,
     };
 
+    // OTLP workload exporter (opt-in, [aicd.exporter] enabled=true + workload_enabled=true).
+    // workload 수집기가 기록한 sample을 채널로 받아 `aic.workload.*` metric으로 push한다.
+    let (workload_export_tx, workload_export_handle) = match load_workload_export_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+        live_exporter.clone(),
+    ) {
+        Some(cfg) => {
+            let (tx, rx) = tokio::sync::mpsc::channel(WORKLOAD_EXPORT_CHANNEL_CAPACITY);
+            let we_shutdown = shutdown.subscribe();
+            let handle = tokio::spawn(async move {
+                if let Err(e) =
+                    aic_server::otlp_exporter::serve_workload(cfg, rx, we_shutdown).await
+                {
+                    tracing::warn!(error = %e, "OTLP workload exporter 종료(에러)");
+                }
+            });
+            (Some(tx), Some(handle))
+        }
+        None => (None, None),
+    };
+
     let workload_cfg = aic_server::workload_monitor::default_config();
     tracing::info!(
         workloads_path = %workload_cfg.workloads_path.display(),
@@ -679,7 +702,13 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     );
     let workload_shutdown = shutdown.subscribe();
     let workload_handle = tokio::spawn(async move {
-        if let Err(e) = aic_server::workload_monitor::serve(workload_cfg, workload_shutdown).await {
+        if let Err(e) = aic_server::workload_monitor::serve_with_export(
+            workload_cfg,
+            workload_shutdown,
+            workload_export_tx,
+        )
+        .await
+        {
             tracing::warn!(error = %e, "workload collector stopped with error");
         }
     });
@@ -739,6 +768,9 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
         let _ = h.await;
     }
     let _ = workload_handle.await;
+    if let Some(h) = workload_export_handle {
+        let _ = h.await;
+    }
 
     reconcile_handle.abort();
     if let Some(h) = config_reload_handle {
@@ -905,6 +937,10 @@ fn read_logs_config() -> AicdLogsConfig {
 /// 수집기는 막히지 않는다 — journald는 `DropCounters::by_channel_full`을 올리고 버리며, 파일·컨테이너
 /// tail은 버리지 않고 다음 tick으로 미룬다(#43).
 const LOGS_CHANNEL_CAPACITY: usize = 8192;
+
+/// workload 수집기 → exporter 채널. 정의마다 60초에 sample 하나라, 전송이 잠시 막혀도 이만큼이면
+/// 수집 주기 여러 번을 담는다. 가득 차면 수집기는 그 sample을 전송에서만 뺀다.
+const WORKLOAD_EXPORT_CHANNEL_CAPACITY: usize = 256;
 
 /// `[aicd.exporter]`(enabled+logs_enabled+endpoint 유효)와 공유 spool/health, `[aicd.logs]`
 /// 설정으로부터 logs exporter 설정을 만든다. 다른 `load_*_config` 헬퍼와 동일한 게이트 패턴.
@@ -1266,6 +1302,35 @@ fn load_kernel_config(
     })
 }
 
+/// workload exporter 설정 로더. 부모 `enabled` + `workload_enabled` + endpoint + spool/health가
+/// 모두 있어야 task가 뜬다(kernel 로더와 같은 게이트).
+fn load_workload_export_config(
+    ex: Option<aic_common::AicdExporterConfig>,
+    spool: Option<Arc<OtlpSpool>>,
+    health: Option<Arc<aic_server::otlp_exporter::ExporterHealth>>,
+    live: Option<Arc<aic_server::live_config::LiveExporterConfig>>,
+) -> Option<aic_server::otlp_exporter::WorkloadExportConfig> {
+    let ex = ex?;
+    if !ex.enabled || !ex.workload_enabled {
+        return None;
+    }
+    if ex.endpoint.trim().is_empty() {
+        tracing::warn!("exporter enabled이지만 endpoint 미설정 — workload exporter 비활성");
+        return None;
+    }
+    let spool = spool?;
+    let health = health?;
+    let token = std::env::var("AIC_EXPORTER_TOKEN").ok().or(ex.token);
+    Some(aic_server::otlp_exporter::WorkloadExportConfig {
+        endpoint: ex.endpoint,
+        token,
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        spool,
+        health,
+        live,
+    })
+}
+
 fn load_docker_config(
     ex: Option<aic_common::AicdExporterConfig>,
     spool: Option<Arc<OtlpSpool>>,
@@ -1524,6 +1589,44 @@ method = "prompt_marker"
             cfg.is_none(),
             "enabled=false면 endpoint가 있어도 비활성이어야 한다"
         );
+    }
+
+    /// 이 테스트가 지키는 것: workload 지표는 명시적으로 켠 경우에만 호스트 밖으로 나가는 것.
+    #[test]
+    fn load_workload_export_config_requires_both_gates() {
+        let (_dir, spool) = test_spool();
+        let health = test_health(spool.clone());
+        let base = AicdExporterConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:4318".to_string(),
+            ..AicdExporterConfig::default()
+        };
+        assert!(load_workload_export_config(
+            Some(base.clone()),
+            Some(spool.clone()),
+            Some(health.clone()),
+            None
+        )
+        .is_none());
+        let child_only = AicdExporterConfig {
+            enabled: false,
+            workload_enabled: true,
+            ..base.clone()
+        };
+        assert!(load_workload_export_config(
+            Some(child_only),
+            Some(spool.clone()),
+            Some(health.clone()),
+            None
+        )
+        .is_none());
+        let both = AicdExporterConfig {
+            workload_enabled: true,
+            ..base
+        };
+        let cfg = load_workload_export_config(Some(both), Some(spool), Some(health), None)
+            .expect("두 게이트를 통과하면 config가 만들어져야 한다");
+        assert_eq!(cfg.endpoint, "http://127.0.0.1:4318");
     }
 
     /// kernel exporter는 부모 게이트 + 자기 플래그를 모두 통과해야 뜬다(기본 off).

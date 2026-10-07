@@ -253,7 +253,23 @@ aic workload history "$WORKLOAD_ID" --limit 20
 aic workload history "$WORKLOAD_ID" --limit 20 --json
 ```
 
-AIC does not send workload history to a remote destination.
+By default, AIC does not send workload samples to a remote destination.
+
+To send samples to the central collector, set `aicd.exporter.workload_enabled = true` and restart `aicd`. The exporter must also be enabled with an endpoint.
+
+```sh
+aic config set aicd.exporter.workload_enabled true
+aic daemon restart
+```
+
+The daemon then sends each sample as OTLP metrics to the exporter endpoint:
+
+- Each numeric field becomes `aic.workload.<adapter>.<field>`, for example `aic.workload.postgresql.numbackends`.
+- A counter field, such as `xact_commit`, is sent as the increase since the previous sample. The first sample of a workload only sets the baseline. If a counter decreases because the service restarted, that sample does not send the counter.
+- `aic.workload.up` is `1` for a collected sample and `0` for a failed sample. Its `status` attribute is `collected`, `unreachable`, `rejected`, or `malformed`.
+- Every data point has the attributes `workload.id`, `workload.name`, and `workload.adapter`.
+
+The exporter does not send the endpoint, the username, or any secret.
 
 ## Security and protocol limits
 

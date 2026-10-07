@@ -794,6 +794,11 @@ pub struct AicdExporterConfig {
     /// correlation_hint는 호스트 밖으로 내보내지 않는다(전송 표면 최소화).
     #[serde(default)]
     pub kernel_enabled: bool,
+    /// 등록한 workload(PostgreSQL, Redis 등)의 수집 결과를 `aic.workload.*` metric으로 push할지.
+    /// **기본 false**(opt-in) — 서비스 지표를 호스트 밖으로 보내는 일이라 명시적으로 켠다.
+    /// 수집 주기를 따르므로(60초) 별도 주기 설정은 없다. 연결 주소(endpoint)와 계정은 보내지 않는다.
+    #[serde(default)]
+    pub workload_enabled: bool,
     /// rca-agent control API base URL(loopback 전용). 기본 `http://127.0.0.1:9090`.
     #[serde(default = "default_rca_agent_url")]
     pub kernel_url: String,
@@ -889,6 +894,7 @@ impl Default for AicdExporterConfig {
             docker_bin: None,
             dns_enabled: false,
             kernel_enabled: false,
+            workload_enabled: false,
             kernel_url: default_rca_agent_url(),
             kernel_interval_secs: default_kernel_interval(),
             kernel_window_secs: default_kernel_window(),
@@ -1249,6 +1255,7 @@ mod tests {
             "aicd.exporter.endpoint",
             "aicd.exporter.logs_enabled",
             "aicd.exporter.kernel_enabled",
+            "aicd.exporter.workload_enabled",
             "aicd.exporter.kernel_url",
             "aicd.exporter.spool_max_bytes",
             "aicd.exporter.enrollment_id",

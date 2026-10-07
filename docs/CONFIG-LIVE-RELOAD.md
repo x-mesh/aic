@@ -142,7 +142,7 @@ aic config get aicd.exporter.self_update_enabled
 | 설정 | 이유 |
 |---|---|
 | `enabled` | exporter task 전체를 띄울지 결정한다 |
-| `events_enabled`, `connections_enabled`, `agent_enabled`, `changes_enabled`, `logs_enabled`, `docker_enabled`, `dns_enabled`, `kernel_enabled` | 각 task를 띄울지 결정한다 |
+| `events_enabled`, `connections_enabled`, `agent_enabled`, `changes_enabled`, `logs_enabled`, `docker_enabled`, `dns_enabled`, `kernel_enabled`, `workload_enabled` | 각 task를 띄울지 결정한다 |
 | `endpoint` | 전송 URL을 기동 시 조립한다. 도중에 바꾸면 spool에 쌓인 배치의 목적지가 갈린다 |
 | `kernel_url` | 같은 이유. loopback 검증도 기동 시 한 번 한다 |
 | `spool_max_bytes` | spool을 열 때 쿼터가 정해진다 |

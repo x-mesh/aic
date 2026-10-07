@@ -703,6 +703,151 @@ pub enum WorkloadMetrics {
     HaProxy(HaProxyMetrics),
 }
 
+/// Fields that count up from service start. An exporter reports the increase between two samples
+/// for these fields, because the central store has no rate function. Other fields are current
+/// values (connections, memory, sizes) and an exporter reports them as they are.
+pub const WORKLOAD_COUNTER_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "redis",
+        &[
+            "total_commands_processed",
+            "keyspace_hits",
+            "keyspace_misses",
+        ],
+    ),
+    (
+        "memcached",
+        &["cmd_get", "cmd_set", "get_hits", "get_misses", "evictions"],
+    ),
+    (
+        "postgresql",
+        &[
+            "xact_commit",
+            "xact_rollback",
+            "blks_read",
+            "blks_hit",
+            "tup_returned",
+            "tup_fetched",
+            "tup_inserted",
+            "tup_updated",
+            "tup_deleted",
+            "conflicts",
+            "temp_files",
+            "temp_bytes",
+            "deadlocks",
+        ],
+    ),
+    (
+        "mysql",
+        &[
+            "connections",
+            "aborted_connects",
+            "questions",
+            "slow_queries",
+            "bytes_received",
+            "bytes_sent",
+        ],
+    ),
+    (
+        "mongodb",
+        &[
+            "connections_total_created",
+            "opcounters_query",
+            "opcounters_get_more",
+            "opcounters_command",
+            "network_bytes_in",
+            "network_bytes_out",
+            "network_num_requests",
+        ],
+    ),
+    ("prometheus", &["tsdb_head_samples_appended_total"]),
+    (
+        "etcd",
+        &[
+            "leader_changes_seen_total",
+            "proposals_applied_total",
+            "proposals_committed_total",
+            "proposals_failed_total",
+        ],
+    ),
+    (
+        "rabbitmq",
+        &[
+            "message_stats_publish_total",
+            "message_stats_deliver_get_total",
+        ],
+    ),
+    (
+        "nginx",
+        &["accepts_total", "handled_total", "requests_total"],
+    ),
+    (
+        "haproxy",
+        &[
+            "sessions_total",
+            "bytes_in_total",
+            "bytes_out_total",
+            "denied_requests_total",
+            "denied_responses_total",
+            "failed_connections_total",
+            "retry_warnings_total",
+        ],
+    ),
+];
+
+/// The lowercase adapter name that metric names and the counter table use.
+pub fn workload_adapter_name(adapter: WorkloadAdapter) -> String {
+    format!("{adapter:?}").to_lowercase()
+}
+
+/// The short name that people use for a workload: the container name for a container, the unit
+/// for a systemd service, and the executable file name otherwise.
+pub fn workload_short_name(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix("container:") {
+        if let Some(name) = rest.split(':').nth(1) {
+            return name;
+        }
+    }
+    if let Some(unit) = id.strip_prefix("systemd:") {
+        return unit;
+    }
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// One numeric field of a workload sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadMetricField {
+    pub field: String,
+    pub value: u64,
+    pub counter: bool,
+}
+
+/// Lists the numeric fields of one sample in name order, marked as counter or current value.
+pub fn workload_metric_fields(
+    adapter: WorkloadAdapter,
+    metrics: &WorkloadMetrics,
+) -> Vec<WorkloadMetricField> {
+    let name = workload_adapter_name(adapter);
+    let counters = WORKLOAD_COUNTER_FIELDS
+        .iter()
+        .find(|(adapter, _)| *adapter == name)
+        .map(|(_, fields)| *fields)
+        .unwrap_or_default();
+    let Ok(serde_json::Value::Object(map)) = serde_json::to_value(metrics) else {
+        return Vec::new();
+    };
+    map.into_iter()
+        .filter_map(|(field, value)| {
+            let value = value.as_u64()?;
+            Some(WorkloadMetricField {
+                counter: counters.contains(&field.as_str()),
+                field,
+                value,
+            })
+        })
+        .collect()
+}
+
 /// Backward-compatible result of a one-shot Redis monitor probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedisMonitorReport {
@@ -3577,6 +3722,84 @@ fn monitor_memcached_tcp(
 
 #[cfg(test)]
 mod tests {
+
+    /// 구조체의 필드 이름을 모은다. 빈 객체부터 역직렬화하며 "missing field"가 가리키는 필드를
+    /// 하나씩 채운다 — 지표 구조체에는 `Default`가 없다.
+    fn field_names<T: serde::de::DeserializeOwned>() -> Vec<String> {
+        let mut object = serde_json::Map::new();
+        loop {
+            match serde_json::from_value::<T>(serde_json::Value::Object(object.clone())) {
+                Ok(_) => return object.keys().cloned().collect(),
+                Err(error) => {
+                    let message = error.to_string();
+                    let field = message
+                        .split('`')
+                        .nth(1)
+                        .unwrap_or_else(|| panic!("unexpected error: {message}"))
+                        .to_string();
+                    assert!(!object.contains_key(&field), "{message}");
+                    object.insert(field, serde_json::json!(0));
+                }
+            }
+        }
+    }
+
+    /// 이 테스트가 지키는 것: 카운터 표의 어댑터와 필드가 실제 지표 구조체와 같은 것. 오타가
+    /// 있으면 그 필드는 누적 값인데도 그대로 전송되어 rca-web 차트가 계속 오르기만 한다.
+    #[test]
+    fn every_counter_field_names_a_real_metric_field() {
+        let fields = [
+            ("redis", field_names::<RedisMetrics>()),
+            ("memcached", field_names::<MemcachedMetrics>()),
+            ("postgresql", field_names::<PostgreSqlMetrics>()),
+            ("mysql", field_names::<MySqlMetrics>()),
+            ("mongodb", field_names::<MongoDbMetrics>()),
+            ("prometheus", field_names::<PrometheusMetrics>()),
+            ("etcd", field_names::<EtcdMetrics>()),
+            ("rabbitmq", field_names::<RabbitMqMetrics>()),
+            ("nginx", field_names::<NginxMetrics>()),
+            ("haproxy", field_names::<HaProxyMetrics>()),
+        ];
+        for (adapter, counters) in WORKLOAD_COUNTER_FIELDS {
+            let (_, real) = fields
+                .iter()
+                .find(|(name, _)| name == adapter)
+                .unwrap_or_else(|| panic!("unknown adapter {adapter}"));
+            for counter in *counters {
+                assert!(real.iter().any(|f| f == counter), "{adapter}.{counter}");
+            }
+        }
+        for adapter in [
+            WorkloadAdapter::Redis,
+            WorkloadAdapter::PostgreSql,
+            WorkloadAdapter::HaProxy,
+            WorkloadAdapter::RabbitMq,
+        ] {
+            assert!(WORKLOAD_COUNTER_FIELDS
+                .iter()
+                .any(|(name, _)| *name == workload_adapter_name(adapter)));
+        }
+    }
+
+    #[test]
+    fn metric_fields_mark_counters_and_keep_current_values() {
+        let metrics: PostgreSqlMetrics = serde_json::from_value(serde_json::Value::Object(
+            field_names::<PostgreSqlMetrics>()
+                .into_iter()
+                .map(|f| (f, serde_json::json!(7)))
+                .collect(),
+        ))
+        .unwrap();
+        let fields = workload_metric_fields(
+            WorkloadAdapter::PostgreSql,
+            &WorkloadMetrics::PostgreSql(metrics),
+        );
+        let find = |name: &str| fields.iter().find(|f| f.field == name).unwrap();
+        assert!(!find("numbackends").counter);
+        assert!(find("xact_commit").counter);
+        assert_eq!(find("xact_commit").value, 7);
+        assert_eq!(fields.len(), 14);
+    }
     use super::*;
     use std::io::{Cursor, Result as IoResult};
 
