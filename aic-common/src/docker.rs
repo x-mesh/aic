@@ -4,6 +4,18 @@
 
 use std::path::Path;
 
+/// 컨테이너 환경 변수 중 읽는 키. 서비스 이미지가 계정과 DB 이름을 받는 변수다. 비밀번호 변수는
+/// 넣지 않는다 — aic가 다른 프로그램의 비밀을 스스로 꺼내 복사하지 않는다.
+pub const IDENTITY_ENV_KEYS: &[&str] = &[
+    "POSTGRES_USER",
+    "POSTGRES_DB",
+    "MYSQL_USER",
+    "MYSQL_DATABASE",
+    "MARIADB_USER",
+    "MARIADB_DATABASE",
+    "MONGO_INITDB_ROOT_USERNAME",
+];
+
 /// docker의 기본 컨테이너 디렉토리. 컨테이너마다 `<id>/` 하위 디렉토리가 있다.
 pub const DOCKER_CONTAINERS_DIR: &str = "/var/lib/docker/containers";
 
@@ -17,6 +29,17 @@ pub struct DockerContainerMeta {
     pub published_tcp: Vec<PublishedPort>,
     /// `NetworkSettings.Networks.*.IPAddress`. host 네트워크면 비어 있다.
     pub network_ips: Vec<String>,
+    /// `Config.Env` 중 [`IDENTITY_ENV_KEYS`]에 있는 것만.
+    pub identity_env: Vec<(String, String)>,
+}
+
+impl DockerContainerMeta {
+    pub fn env(&self, key: &str) -> Option<&str> {
+        self.identity_env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,11 +105,25 @@ pub fn read_docker_container_meta(container_dir: &Path) -> DockerContainerMeta {
                 .collect()
         })
         .unwrap_or_default();
+    let identity_env = value
+        .get("Config")
+        .and_then(|c| c.get("Env"))
+        .and_then(|e| e.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str()?.split_once('='))
+                .filter(|(key, value)| IDENTITY_ENV_KEYS.contains(key) && !value.is_empty())
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
     DockerContainerMeta {
         name,
         image,
         published_tcp,
         network_ips,
+        identity_env,
     }
 }
 
@@ -107,7 +144,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("config.v2.json"),
-            r#"{"Name":"/db","Config":{"Image":"postgres:17","Env":["POSTGRES_PASSWORD=x"]},
+            r#"{"Name":"/db","Config":{"Image":"postgres:17","Env":["POSTGRES_PASSWORD=x","POSTGRES_USER=dnx","PATH=/usr/bin"]},
                "NetworkSettings":{
                  "Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"15432"}],
                           "8080/tcp":null,"53/udp":[{"HostIp":"","HostPort":"53"}]},
@@ -126,5 +163,10 @@ mod tests {
             }]
         );
         assert_eq!(meta.network_ips, vec!["172.19.0.2".to_string()]);
+        assert_eq!(
+            meta.identity_env,
+            vec![("POSTGRES_USER".to_string(), "dnx".to_string())]
+        );
+        assert_eq!(meta.env("POSTGRES_PASSWORD"), None);
     }
 }

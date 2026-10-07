@@ -40,20 +40,46 @@ fn credentials(adapter: WorkloadAdapter) -> Credentials {
     }
 }
 
+/// 이미지 digest(`@sha256:…`)는 사람이 구분하는 데 쓰이지 않고 줄만 길게 만든다.
+fn image_without_digest(image: &str) -> &str {
+    image.split('@').next().unwrap_or(image)
+}
+
 fn candidate_label(candidate: &WorkloadCandidate) -> String {
     let adapter = workload::adapter_display_name(candidate.adapter);
     match &candidate.container {
         Some(container) => format!(
-            "[{adapter}] {} ({}) · {}",
-            container.name.as_deref().unwrap_or(&container.id),
-            container.image.as_deref().unwrap_or(&container.runtime),
-            candidate.id
+            "[{adapter}] {} ({})",
+            workload::short_name(&candidate.id),
+            container
+                .image
+                .as_deref()
+                .map(image_without_digest)
+                .unwrap_or(&container.runtime),
         ),
-        None => format!("[{adapter}] {}", candidate.id),
+        None => format!("[{adapter}] {}", workload::short_name(&candidate.id)),
     }
 }
 
-/// `file:` 비밀 이름. 사람이 알아볼 수 있게 어댑터와 컨테이너 이름(없으면 실행 파일 이름)으로 만든다.
+/// 짧은 라벨이 겹치면 그 후보들에만 전체 id를 붙인다.
+fn candidate_labels(candidates: &[&WorkloadCandidate]) -> Vec<String> {
+    let short = candidates
+        .iter()
+        .map(|candidate| candidate_label(candidate))
+        .collect::<Vec<_>>();
+    short
+        .iter()
+        .zip(candidates)
+        .map(|(label, candidate)| {
+            if short.iter().filter(|other| *other == label).count() > 1 {
+                format!("{label} · {}", candidate.id)
+            } else {
+                label.clone()
+            }
+        })
+        .collect()
+}
+
 fn secret_name(candidate: &WorkloadCandidate) -> String {
     let subject = candidate
         .container
@@ -103,131 +129,161 @@ fn optional(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn ask_secret_ref(
+fn input_with_default(
     theme: &ColorfulTheme,
-    candidate: &WorkloadCandidate,
-    pending: &mut Option<String>,
+    prompt: &str,
+    default: Option<&str>,
+    allow_empty: bool,
 ) -> anyhow::Result<Option<String>> {
-    let choice = Select::with_theme(theme)
-        .with_prompt("비밀번호")
-        .items([
-            "여기서 입력해 aic 비밀 파일에 저장 (권장)",
-            "aicd 환경 변수 이름 지정 (env:NAME)",
-            "비밀번호 없음",
-        ])
-        .default(0)
-        .interact()?;
-    match choice {
-        0 => {
-            let secret = Password::with_theme(theme)
-                .with_prompt("비밀번호 (화면에 표시하지 않음)")
-                .interact()?;
-            let name = format!("{}{PENDING_SUFFIX}", secret_name(candidate));
-            aic_common::secret::store_file_secret(&name, &secret).map_err(anyhow::Error::msg)?;
-            *pending = Some(name.clone());
-            Ok(Some(aic_common::secret::make_file_reference(&name)))
-        }
-        1 => {
-            let name: String = Input::with_theme(theme)
-                .with_prompt("환경 변수 이름 (aicd 실행 환경에 있어야 함)")
-                .interact_text()?;
-            Ok(Some(format!("env:{}", name.trim())))
-        }
-        _ => Ok(None),
+    let mut input = Input::<String>::with_theme(theme)
+        .with_prompt(prompt)
+        .allow_empty(allow_empty);
+    if let Some(default) = default {
+        input = input.default(default.to_string());
     }
+    Ok(optional(input.interact_text()?))
+}
+
+/// 어댑터가 쓰는 연결 값만 남긴다. TLS에서만 인증을 허용하는 어댑터는 TLS가 아니면 계정을 뺀다.
+fn applicable(
+    adapter: WorkloadAdapter,
+    endpoint: &str,
+    defaults: &workload::ConnectionDefaults,
+) -> workload::ConnectionDefaults {
+    let mut values = defaults.clone();
+    match credentials(adapter) {
+        Credentials::None => {
+            values.username = None;
+            values.database = None;
+        }
+        Credentials::UserRequired => {}
+        Credentials::PasswordOptionalUser | Credentials::UserAndPassword => {
+            values.database = None;
+        }
+        Credentials::UserAndPasswordOverTls => {
+            values.database = None;
+            if !endpoint.starts_with("tls://") {
+                values.username = None;
+            }
+        }
+    }
+    values
+}
+
+fn summary(adapter: WorkloadAdapter, values: &workload::ConnectionDefaults) -> String {
+    let mut parts = vec![values.endpoint.clone().unwrap_or_default()];
+    if let Some(user) = &values.username {
+        parts.push(format!("사용자 {user}"));
+    }
+    if let Some(database) = &values.database {
+        parts.push(format!("DB {database}"));
+    }
+    if credentials(adapter) == Credentials::UserRequired && values.username.is_none() {
+        parts.push("사용자 미정".to_string());
+    }
+    parts.join(" · ")
+}
+
+/// 연결 값을 정한다. 제안이 모두 있으면 한 줄로 보여 주고 확인만 받는다. 틀렸다고 하거나
+/// 다시 입력할 때만 항목별로 묻는다.
+fn ask_connection_values(
+    theme: &ColorfulTheme,
+    adapter: WorkloadAdapter,
+    defaults: &workload::ConnectionDefaults,
+    edit: bool,
+) -> anyhow::Result<workload::ConnectionDefaults> {
+    let endpoint = defaults.endpoint.clone().unwrap_or_default();
+    let proposed = applicable(adapter, &endpoint, defaults);
+    let complete = proposed.endpoint.is_some()
+        && (credentials(adapter) != Credentials::UserRequired || proposed.username.is_some())
+        && (adapter != WorkloadAdapter::PostgreSql || proposed.database.is_some());
+    if !edit
+        && complete
+        && Confirm::with_theme(theme)
+            .with_prompt(format!("연결 {}", summary(adapter, &proposed)))
+            .default(true)
+            .interact()?
+    {
+        return Ok(proposed);
+    }
+    let endpoint =
+        input_with_default(theme, "주소", defaults.endpoint.as_deref(), false)?.unwrap_or_default();
+    let mut values = workload::ConnectionDefaults {
+        endpoint: Some(endpoint.clone()),
+        ..Default::default()
+    };
+    match credentials(adapter) {
+        Credentials::None => {}
+        Credentials::UserRequired => {
+            values.username =
+                input_with_default(theme, "사용자", defaults.username.as_deref(), false)?;
+            let required = adapter == WorkloadAdapter::PostgreSql;
+            let prompt = if required {
+                "DB"
+            } else {
+                "DB (비우면 지정 안 함)"
+            };
+            values.database =
+                input_with_default(theme, prompt, defaults.database.as_deref(), !required)?;
+        }
+        Credentials::PasswordOptionalUser => {
+            values.username = input_with_default(
+                theme,
+                "사용자 (ACL을 쓰지 않으면 비움)",
+                defaults.username.as_deref(),
+                true,
+            )?;
+        }
+        Credentials::UserAndPassword | Credentials::UserAndPasswordOverTls => {
+            if credentials(adapter) == Credentials::UserAndPassword
+                || endpoint.starts_with("tls://")
+            {
+                values.username = input_with_default(
+                    theme,
+                    "사용자 (인증하지 않으면 비움)",
+                    defaults.username.as_deref(),
+                    true,
+                )?;
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn ask_draft(
     theme: &ColorfulTheme,
     candidate: &WorkloadCandidate,
-    previous: Option<&WorkloadConnectionConfig>,
+    defaults: &workload::ConnectionDefaults,
+    edit: bool,
 ) -> anyhow::Result<Draft> {
-    let suggested = previous
-        .map(|connection| connection.endpoint.clone())
-        .or_else(|| workload::suggest_endpoint(candidate));
-    let mut endpoint = Input::<String>::with_theme(theme)
-        .with_prompt("연결 주소 (tcp://HOST:PORT, tls://HOST:PORT, unix:///PATH)");
-    if let Some(suggested) = suggested {
-        endpoint = endpoint.default(suggested);
-    }
-    let endpoint = endpoint.interact_text()?.trim().to_string();
+    let values = ask_connection_values(theme, candidate.adapter, defaults, edit)?;
     let mut draft = Draft {
         connection: WorkloadConnectionConfig {
-            endpoint,
-            username: None,
+            endpoint: values.endpoint.unwrap_or_default(),
+            username: values.username,
             secret_ref: None,
-            database: None,
+            database: values.database,
             auth_source: None,
         },
         pending_secret: None,
     };
-    let previous_user = previous.and_then(|connection| connection.username.clone());
-    let ask_user = |prompt: &str, default: Option<String>| -> anyhow::Result<String> {
-        let mut input = Input::<String>::with_theme(theme).with_prompt(prompt);
-        if let Some(default) = default {
-            input = input.default(default);
-        }
-        Ok(input.interact_text()?.trim().to_string())
-    };
-    match credentials(candidate.adapter) {
-        Credentials::None => {}
-        Credentials::UserRequired => {
-            let default_user = previous_user.or_else(|| {
-                (candidate.adapter == WorkloadAdapter::PostgreSql).then(|| "postgres".to_string())
-            });
-            draft.connection.username = optional(ask_user("사용자", default_user)?);
-            let database_default = previous
-                .and_then(|connection| connection.database.clone())
-                .or_else(|| {
-                    (candidate.adapter == WorkloadAdapter::PostgreSql)
-                        .then(|| "postgres".to_string())
-                });
-            let database_prompt = if candidate.adapter == WorkloadAdapter::PostgreSql {
-                "데이터베이스"
-            } else {
-                "데이터베이스 (비우면 지정 안 함)"
-            };
-            let mut database = Input::<String>::with_theme(theme)
-                .with_prompt(database_prompt)
-                .allow_empty(candidate.adapter != WorkloadAdapter::PostgreSql);
-            if let Some(default) = database_default {
-                database = database.default(default);
-            }
-            draft.connection.database = optional(database.interact_text()?);
-            draft.connection.secret_ref =
-                ask_secret_ref(theme, candidate, &mut draft.pending_secret)?;
-        }
-        Credentials::PasswordOptionalUser => {
-            draft.connection.secret_ref =
-                ask_secret_ref(theme, candidate, &mut draft.pending_secret)?;
-            if draft.connection.secret_ref.is_some() {
-                let user = Input::<String>::with_theme(theme)
-                    .with_prompt("사용자 (ACL을 쓰지 않으면 비움)")
-                    .allow_empty(true)
-                    .interact_text()?;
-                draft.connection.username = optional(user);
-            }
-        }
+    let wants_password = match credentials(candidate.adapter) {
+        Credentials::None => false,
+        Credentials::UserRequired | Credentials::PasswordOptionalUser => true,
         Credentials::UserAndPassword | Credentials::UserAndPasswordOverTls => {
-            let tls_only = credentials(candidate.adapter) == Credentials::UserAndPasswordOverTls;
-            let allowed = !tls_only || draft.connection.endpoint.starts_with("tls://");
-            if allowed
-                && Confirm::with_theme(theme)
-                    .with_prompt("사용자와 비밀번호로 인증하나요?")
-                    .default(previous_user.is_some())
-                    .interact()?
-            {
-                draft.connection.username = optional(ask_user("사용자", previous_user)?);
-                draft.connection.secret_ref =
-                    ask_secret_ref(theme, candidate, &mut draft.pending_secret)?;
-                if candidate.adapter == WorkloadAdapter::MongoDb {
-                    let source = Input::<String>::with_theme(theme)
-                        .with_prompt("인증 데이터베이스 (비우면 admin)")
-                        .allow_empty(true)
-                        .interact_text()?;
-                    draft.connection.auth_source = optional(source);
-                }
-            }
+            draft.connection.username.is_some()
+        }
+    };
+    if wants_password {
+        let secret = Password::with_theme(theme)
+            .with_prompt("비밀번호 (비우면 없음)")
+            .allow_empty_password(true)
+            .interact()?;
+        if !secret.is_empty() {
+            let name = format!("{}{PENDING_SUFFIX}", secret_name(candidate));
+            aic_common::secret::store_file_secret(&name, &secret).map_err(anyhow::Error::msg)?;
+            draft.connection.secret_ref = Some(aic_common::secret::make_file_reference(&name));
+            draft.pending_secret = Some(name);
         }
     }
     Ok(draft)
@@ -280,12 +336,9 @@ pub(crate) fn run_enable_picker() -> anyhow::Result<()> {
         println!("등록할 수 있는 서비스가 없습니다. `aic workload discover`로 후보를 확인하세요.");
         return Ok(());
     }
-    let labels = candidates
-        .iter()
-        .map(|candidate| candidate_label(candidate))
-        .collect::<Vec<_>>();
+    let labels = candidate_labels(&candidates);
     let Some(index) = FuzzySelect::with_theme(&theme)
-        .with_prompt("감시할 서비스 (입력해 검색 · Esc 취소)")
+        .with_prompt("서비스 (입력해 검색 · Esc 취소)")
         .items(&labels)
         .default(0)
         .max_length(15)
@@ -294,59 +347,88 @@ pub(crate) fn run_enable_picker() -> anyhow::Result<()> {
         return Ok(());
     };
     let candidate = candidates[index];
+    let name = workload::short_name(&candidate.id);
     let existing = workload::list_configured()?
         .into_iter()
-        .find(|definition| definition.id == candidate.id);
-    if existing.is_some() {
-        println!("이미 등록된 서비스입니다. 저장하면 연결 정보를 새 값으로 바꿉니다.");
-    }
-    let mut previous = existing.and_then(|definition| definition.connection);
+        .find(|definition| definition.id == candidate.id)
+        .and_then(|definition| definition.connection);
+    let mut defaults = match &existing {
+        Some(connection) => {
+            println!("이미 등록된 서비스입니다. 저장하면 연결 정보를 바꿉니다.");
+            workload::ConnectionDefaults {
+                endpoint: Some(connection.endpoint.clone()),
+                username: connection.username.clone(),
+                database: connection.database.clone(),
+            }
+        }
+        None => workload::suggest_connection(candidate),
+    };
+    let mut edit = false;
 
     loop {
-        let draft = ask_draft(&theme, candidate, previous.as_ref())?;
+        let draft = ask_draft(&theme, candidate, &defaults, edit)?;
+        defaults = workload::ConnectionDefaults {
+            endpoint: Some(draft.connection.endpoint.clone()),
+            username: draft.connection.username.clone(),
+            database: draft.connection.database.clone(),
+        };
+        edit = true;
         if let Err(error) = draft.connection.validate_for(candidate.adapter) {
             discard_pending(&draft);
             println!("입력값 오류: {error}");
-            previous = Some(draft.connection);
             continue;
         }
-        println!("점검 중: {}", draft.connection.endpoint);
         let probe = workload::probe_with_connection(candidate, Some(&draft.connection));
-        let options: &[&str] = match &probe {
+        let save = match &probe {
             Ok(report) => {
                 println!("점검 성공: {}", metrics_summary(report));
-                &["저장", "다시 입력", "취소"]
+                if Confirm::with_theme(&theme)
+                    .with_prompt("저장할까요?")
+                    .default(true)
+                    .interact()?
+                {
+                    true
+                } else {
+                    let choice = Select::with_theme(&theme)
+                        .items(["다시 입력", "취소"])
+                        .default(0)
+                        .interact()?;
+                    if choice == 1 {
+                        discard_pending(&draft);
+                        println!("취소했습니다. 저장한 것이 없습니다.");
+                        return Ok(());
+                    }
+                    false
+                }
             }
             Err(error) => {
                 println!("점검 실패: {error}");
-                &["다시 입력", "그래도 저장", "취소"]
+                match Select::with_theme(&theme)
+                    .items(["다시 입력", "그래도 저장", "취소"])
+                    .default(0)
+                    .interact()?
+                {
+                    1 => true,
+                    2 => {
+                        discard_pending(&draft);
+                        println!("취소했습니다. 저장한 것이 없습니다.");
+                        return Ok(());
+                    }
+                    _ => false,
+                }
             }
         };
-        let choice = Select::with_theme(&theme)
-            .items(options)
-            .default(0)
-            .interact()?;
-        match options[choice] {
-            "저장" | "그래도 저장" => {
-                let connection = commit_secret(candidate, draft)?;
-                let definition = workload::enable_candidate(candidate, Some(connection))?;
-                println!("등록: {}", definition.id);
-                println!(
-                    "aicd가 1분 안에 수집을 시작합니다. 확인: aic workload status · aic workload history {}",
-                    definition.id
-                );
-                return Ok(());
-            }
-            "다시 입력" => {
-                discard_pending(&draft);
-                previous = Some(draft.connection);
-            }
-            _ => {
-                discard_pending(&draft);
-                println!("취소했습니다. 저장한 것이 없습니다.");
-                return Ok(());
-            }
+        if !save {
+            discard_pending(&draft);
+            continue;
         }
+        let connection = commit_secret(candidate, draft)?;
+        workload::enable_candidate(candidate, Some(connection))?;
+        println!(
+            "등록: {name} ({}) · 1분 뒤 확인: aic workload status · aic workload history {name}",
+            workload::adapter_display_name(candidate.adapter)
+        );
+        return Ok(());
     }
 }
 
@@ -412,9 +494,48 @@ mod tests {
             WorkloadAdapter::PostgreSql,
             Some("db"),
         );
-        assert_eq!(
-            candidate_label(&c),
-            "[postgresql] db (postgres:17) · container:docker:db:exe:/usr/local/bin/postgres"
+        assert_eq!(candidate_label(&c), "[postgresql] db (postgres:17)");
+    }
+
+    #[test]
+    fn labels_drop_the_image_digest_and_add_the_id_only_on_a_clash() {
+        let mut digest = candidate(
+            "container:docker:db:exe:/usr/local/bin/postgres",
+            WorkloadAdapter::PostgreSql,
+            Some("db"),
         );
+        digest.container.as_mut().unwrap().image =
+            Some("postgres:17.6-alpine@sha256:ef257d85f76e48da".into());
+        assert_eq!(
+            candidate_label(&digest),
+            "[postgresql] db (postgres:17.6-alpine)"
+        );
+
+        let host = candidate("exe:/usr/sbin/nginx", WorkloadAdapter::Nginx, None);
+        let other = candidate("exe:/opt/nginx/sbin/nginx", WorkloadAdapter::Nginx, None);
+        let labels = candidate_labels(&[&digest, &host, &other]);
+        assert_eq!(labels[0], "[postgresql] db (postgres:17.6-alpine)");
+        assert_eq!(labels[1], "[nginx] nginx · exe:/usr/sbin/nginx");
+        assert_eq!(labels[2], "[nginx] nginx · exe:/opt/nginx/sbin/nginx");
+    }
+
+    #[test]
+    fn tls_only_credentials_are_dropped_over_plain_tcp() {
+        let defaults = workload::ConnectionDefaults {
+            endpoint: Some("tcp://127.0.0.1:80".into()),
+            username: Some("admin".into()),
+            database: Some("x".into()),
+        };
+        let plain = applicable(WorkloadAdapter::Nginx, "tcp://127.0.0.1:80", &defaults);
+        assert_eq!(plain.username, None);
+        assert_eq!(plain.database, None);
+        let tls = applicable(WorkloadAdapter::Nginx, "tls://web:443", &defaults);
+        assert_eq!(tls.username.as_deref(), Some("admin"));
+        let postgres = applicable(
+            WorkloadAdapter::PostgreSql,
+            "tcp://127.0.0.1:5432",
+            &defaults,
+        );
+        assert_eq!(postgres.database.as_deref(), Some("x"));
     }
 }

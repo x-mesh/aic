@@ -12,19 +12,24 @@ In a terminal, run `aic workload enable` without arguments:
 aic workload enable
 ```
 
-The command runs discovery and lists the candidates that AIC can monitor. Type to filter the list.
+The command runs discovery and lists the candidates that AIC can monitor. A container candidate shows its container name and image. Type to filter the list.
 
-After you select a candidate, the command asks for the connection. It suggests an endpoint:
+After you select a candidate, the command proposes a connection on one line. Press Enter to accept it:
 
-- For a host process, it suggests the standard port on `127.0.0.1`.
-- For a Docker container, it suggests the published port. If the container does not publish the port, it suggests the container address.
-- For other container runtimes, it does not suggest an endpoint.
+- For a host process, it proposes the standard port on `127.0.0.1`.
+- For a Docker container, it proposes the published port. If the container does not publish the port, it proposes the container address.
+- For a Docker container, it reads the user and the database from `POSTGRES_USER`, `POSTGRES_DB`, `MYSQL_USER`, `MYSQL_DATABASE`, `MARIADB_USER`, `MARIADB_DATABASE`, and `MONGO_INITDB_ROOT_USERNAME`. It does not read password variables.
+- For other container runtimes, it does not propose an endpoint.
 
-The command asks only for the fields that the adapter uses. For a password, it offers three sources: a file secret, an environment variable, or no password. The file secret is the default.
+If you reject the proposal, the command asks for each field that the adapter uses.
+
+Then the command asks for the password. To use no password, leave it empty. The command stores the password as a file secret. To use an `env:NAME` reference, use the scripted enable.
 
 Before it saves the definition, the command runs one probe with the connection. If the probe fails, you can enter the values again, save anyway, or cancel.
 
 The interactive flow does not ask for a fingerprint. You select the candidate from the discovery that the flow just ran.
+
+The `inspect`, `monitor`, and `history` commands accept a short name, such as the container name, in place of the full ID. If the name matches more than one workload, the command lists the matches and stops.
 
 ### Scripted enable
 

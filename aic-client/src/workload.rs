@@ -430,9 +430,17 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
 
 pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
     let report = discover_for_monitor()?;
-    let connection = list_configured()?
+    let configured = list_configured()?;
+    let candidate_id = &resolve_workload_ref(
+        candidate_id,
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str()),
+    )?;
+    let connection = configured
         .into_iter()
-        .find(|definition| definition.id == candidate_id)
+        .find(|definition| definition.id == *candidate_id)
         .and_then(|definition| definition.connection);
     let candidate = select_monitor_candidate(&report, candidate_id, connection.is_some())?;
     probe_with_connection(candidate, connection.as_ref())
@@ -1042,10 +1050,17 @@ fn is_container_hex_id(id: &str) -> bool {
 
 pub fn inspect(candidate_id: &str) -> Result<(DiscoveryReport, WorkloadCandidate)> {
     let report = discover()?;
+    let candidate_id = &resolve_workload_ref(
+        candidate_id,
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str()),
+    )?;
     let candidate = report
         .candidates
         .iter()
-        .find(|candidate| candidate.id == candidate_id)
+        .find(|candidate| candidate.id == *candidate_id)
         .cloned()
         .context("workload candidate was not found")?;
     Ok((report, candidate))
@@ -1337,15 +1352,20 @@ pub fn status() -> Result<Vec<WorkloadStatusEntry>> {
 }
 
 pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
-    if !list_configured()?
+    let configured = list_configured()?;
+    let workload_id = &resolve_workload_ref(
+        workload_id,
+        configured.iter().map(|definition| definition.id.as_str()),
+    )?;
+    if !configured
         .iter()
-        .any(|definition| definition.id == workload_id)
+        .any(|definition| definition.id == *workload_id)
     {
         bail!("workload is not configured");
     }
     let mut samples = load_workload_history(&workload_history_path())?
         .into_iter()
-        .filter(|sample| sample.workload_id == workload_id)
+        .filter(|sample| sample.workload_id == *workload_id)
         .collect::<Vec<_>>();
     samples.sort_by_key(|sample| sample.captured_at);
     let skip = samples.len().saturating_sub(limit);
@@ -1415,41 +1435,129 @@ pub fn default_tcp_port(adapter: WorkloadAdapter) -> Option<u16> {
     })
 }
 
-/// 후보에 닿을 endpoint를 제안한다. 호스트 프로세스는 loopback의 기본 포트, docker 컨테이너는
-/// 공개한 포트, 공개하지 않았으면 컨테이너 IP를 쓴다. 다른 런타임은 알 수 없어 `None`이다.
-pub fn suggest_endpoint(candidate: &WorkloadCandidate) -> Option<String> {
-    suggest_endpoint_in(
+/// 대화형 등록이 미리 채우는 연결 값.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionDefaults {
+    pub endpoint: Option<String>,
+    pub username: Option<String>,
+    pub database: Option<String>,
+}
+
+/// 후보에 닿을 연결 값을 제안한다. 주소는 호스트 프로세스면 loopback의 기본 포트, docker
+/// 컨테이너면 공개한 포트, 공개하지 않았으면 컨테이너 IP다. 사용자와 DB는 docker 컨테이너의
+/// 환경 변수(`POSTGRES_USER` 등)에서, 없으면 이미지의 기본값에서 온다. 비밀번호는 제안하지 않는다.
+pub fn suggest_connection(candidate: &WorkloadCandidate) -> ConnectionDefaults {
+    suggest_connection_in(
         candidate,
         Path::new(aic_common::docker::DOCKER_CONTAINERS_DIR),
     )
 }
 
-fn suggest_endpoint_in(candidate: &WorkloadCandidate, containers_dir: &Path) -> Option<String> {
-    let port = default_tcp_port(candidate.adapter)?;
-    let Some(container) = &candidate.container else {
-        return Some(format!("tcp://127.0.0.1:{port}"));
+fn suggest_connection_in(
+    candidate: &WorkloadCandidate,
+    containers_dir: &Path,
+) -> ConnectionDefaults {
+    let meta = candidate
+        .container
+        .as_ref()
+        .filter(|container| container.runtime == "docker")
+        .map(|container| {
+            aic_common::docker::read_docker_container_meta(&containers_dir.join(&container.id))
+        });
+    let endpoint = default_tcp_port(candidate.adapter).and_then(|port| {
+        if candidate.container.is_none() {
+            return Some(format!("tcp://127.0.0.1:{port}"));
+        }
+        // docker가 아닌 런타임은 공개 포트를 알 수 없다.
+        let meta = meta.as_ref()?;
+        if let Some(published) = meta
+            .published_tcp
+            .iter()
+            .find(|published| published.container_port == port)
+        {
+            let host = match published.host_ip.as_str() {
+                "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+                ip if ip.contains(':') => format!("[{ip}]"),
+                ip => ip.to_string(),
+            };
+            return Some(format!("tcp://{host}:{}", published.host_port));
+        }
+        match meta.network_ips.first() {
+            Some(ip) => Some(format!("tcp://{ip}:{port}")),
+            // host 네트워크 컨테이너는 호스트의 포트를 그대로 쓴다.
+            None => Some(format!("tcp://127.0.0.1:{port}")),
+        }
+    });
+    let env = |key: &str| {
+        meta.as_ref()
+            .and_then(|meta| meta.env(key))
+            .map(str::to_string)
     };
-    if container.runtime != "docker" {
-        return None;
+    let (username, database) = match candidate.adapter {
+        // 공식 postgres 이미지는 POSTGRES_DB가 없으면 사용자 이름의 DB를 만든다.
+        WorkloadAdapter::PostgreSql => {
+            let user = env("POSTGRES_USER").unwrap_or_else(|| "postgres".to_string());
+            let database = env("POSTGRES_DB").unwrap_or_else(|| user.clone());
+            (Some(user), Some(database))
+        }
+        WorkloadAdapter::MySql => (
+            env("MYSQL_USER")
+                .or_else(|| env("MARIADB_USER"))
+                .or_else(|| Some("root".to_string())),
+            env("MYSQL_DATABASE").or_else(|| env("MARIADB_DATABASE")),
+        ),
+        WorkloadAdapter::MongoDb => (env("MONGO_INITDB_ROOT_USERNAME"), None),
+        _ => (None, None),
+    };
+    ConnectionDefaults {
+        endpoint,
+        username,
+        database,
     }
-    let meta = aic_common::docker::read_docker_container_meta(&containers_dir.join(&container.id));
-    if let Some(published) = meta
-        .published_tcp
-        .iter()
-        .find(|published| published.container_port == port)
-    {
-        let host = match published.host_ip.as_str() {
-            "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
-            ip if ip.contains(':') => format!("[{ip}]"),
-            ip => ip.to_string(),
-        };
-        return Some(format!("tcp://{host}:{}", published.host_port));
+}
+
+/// 사람이 부르는 짧은 이름. 컨테이너는 컨테이너 이름, 실행 파일은 파일 이름이다.
+pub fn short_name(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix("container:") {
+        if let Some(name) = rest.split(':').nth(1) {
+            return name;
+        }
     }
-    match meta.network_ips.first() {
-        Some(ip) => Some(format!("tcp://{ip}:{port}")),
-        // host 네트워크 컨테이너는 호스트의 포트를 그대로 쓴다.
-        None => Some(format!("tcp://127.0.0.1:{port}")),
+    if let Some(unit) = id.strip_prefix("systemd:") {
+        return unit;
     }
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// 사용자가 준 이름을 전체 id로 바꾼다. 정확한 id, 짧은 이름, id의 일부 순서로 찾는다. 여럿이
+/// 맞으면 고르지 않고 후보를 보여 준다. 하나도 맞지 않으면 입력을 그대로 돌려 호출자가 "없음"을
+/// 알리게 한다.
+pub fn resolve_workload_ref<'a>(
+    input: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<String> {
+    let ids = ids.into_iter().collect::<BTreeSet<_>>();
+    if ids.contains(input) {
+        return Ok(input.to_string());
+    }
+    for matches in [
+        ids.iter()
+            .filter(|id| short_name(id) == input)
+            .collect::<Vec<_>>(),
+        ids.iter()
+            .filter(|id| id.contains(input))
+            .collect::<Vec<_>>(),
+    ] {
+        match matches.as_slice() {
+            [] => continue,
+            [one] => return Ok((**one).to_string()),
+            many => bail!(
+                "'{input}' matches several workloads; use the full id: {}",
+                many.iter().map(|id| **id).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+    Ok(input.to_string())
 }
 
 pub fn is_enableable_monitor_candidate(candidate: &WorkloadCandidate) -> bool {
@@ -1951,7 +2059,7 @@ mod tests {
                 image: None,
             }),
         };
-        let suggest = |id: Option<&str>| suggest_endpoint_in(&candidate(id), dir.path());
+        let suggest = |id: Option<&str>| suggest_connection_in(&candidate(id), dir.path()).endpoint;
         assert_eq!(suggest(None).as_deref(), Some("tcp://127.0.0.1:5432"));
         assert_eq!(
             suggest(Some(&published)).as_deref(),
@@ -1971,7 +2079,74 @@ mod tests {
         );
         let mut podman = candidate(Some(&published));
         podman.container.as_mut().unwrap().runtime = "podman".into();
-        assert_eq!(suggest_endpoint_in(&podman, dir.path()), None);
+        assert_eq!(suggest_connection_in(&podman, dir.path()).endpoint, None);
+    }
+
+    #[test]
+    fn short_names_and_references_resolve_to_one_workload() {
+        let pg = "container:docker:dnx-postgres-1:exe:/usr/local/bin/postgres";
+        let nginx = "exe:/usr/sbin/nginx";
+        let nginx_container = "container:docker:web:exe:/usr/sbin/nginx";
+        assert_eq!(short_name(pg), "dnx-postgres-1");
+        assert_eq!(short_name(nginx), "nginx");
+        assert_eq!(short_name("systemd:redis.service"), "redis.service");
+        let ids = [pg, nginx, nginx_container];
+        assert_eq!(resolve_workload_ref(pg, ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("dnx-postgres-1", ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("postgres-1", ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("web", ids).unwrap(), nginx_container);
+        assert_eq!(resolve_workload_ref("nginx", ids).unwrap(), nginx);
+        let two_hosts = [nginx, "exe:/opt/nginx/sbin/nginx"];
+        let error = resolve_workload_ref("nginx", two_hosts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("several"), "{error}");
+        assert_eq!(resolve_workload_ref("missing", ids).unwrap(), "missing");
+    }
+
+    /// 이 테스트가 지키는 것: 사용자와 DB 기본값이 컨테이너 설정에서 오고, 비밀번호는 오지 않는 것.
+    #[test]
+    fn connection_defaults_come_from_the_container_without_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "e".repeat(64);
+        std::fs::create_dir_all(dir.path().join(&id)).unwrap();
+        std::fs::write(
+            dir.path().join(&id).join("config.v2.json"),
+            r#"{"Config":{"Env":["POSTGRES_USER=dnx","POSTGRES_PASSWORD=secret"]},
+               "NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5432"}]}}}"#,
+        )
+        .unwrap();
+        let mut candidate = WorkloadCandidate {
+            id: "container:docker:dnx:exe:/usr/local/bin/postgres".into(),
+            fingerprint: "f".into(),
+            selector: Some(WorkloadSelector::Executable {
+                path: "/usr/local/bin/postgres".into(),
+            }),
+            adapter: WorkloadAdapter::PostgreSql,
+            driver_mode: None,
+            bindings: Vec::new(),
+            ambiguity: Vec::new(),
+            container: Some(WorkloadContainer {
+                runtime: "docker".into(),
+                id,
+                name: Some("dnx".into()),
+                image: None,
+            }),
+        };
+        let defaults = suggest_connection_in(&candidate, dir.path());
+        assert_eq!(
+            defaults,
+            ConnectionDefaults {
+                endpoint: Some("tcp://127.0.0.1:5432".into()),
+                username: Some("dnx".into()),
+                database: Some("dnx".into()),
+            }
+        );
+        assert!(!format!("{defaults:?}").contains("secret"));
+        candidate.container = None;
+        let host = suggest_connection_in(&candidate, dir.path());
+        assert_eq!(host.username.as_deref(), Some("postgres"));
+        assert_eq!(host.database.as_deref(), Some("postgres"));
     }
 
     #[test]
