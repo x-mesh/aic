@@ -45,7 +45,7 @@ clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 libc = "0.2"
 dirs = "5"
-dialoguer = "0.12.0"
+dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
 terminal_size = "0.4"
 unicode-width = "0.2"
 # TTY 대화형 입력 line editor — Claude 스타일 slash 후보 패널(ColumnarMenu, ↑↓/Tab/Enter/Esc)

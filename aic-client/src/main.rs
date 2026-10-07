@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
+mod config_picker;
+
 // ── ANSI 색상 상수 ─────────────────────────────────────────────
 const COL_RESET: &str = "\x1b[0m";
 const COL_BOLD: &str = "\x1b[1m";
@@ -209,7 +211,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// 설정 파일 경로 및 현재 설정 표시/편집
+    /// 설정 — 인자 없이 실행하면 작업별 마법사(LLM 연결, 언어, 캡처 모드). 경로 하나를 찾아
+    /// 바꾸려면 `aic config set`(인자 없이 실행하면 검색해 고르는 화면), 목록은 `aic config list`
     Config {
         #[command(subcommand)]
         op: Option<ConfigOp>,
@@ -1336,12 +1339,22 @@ enum ConfigOp {
         /// dot으로 구분된 path (예: `llm.default_provider`, `server.max_buffer_lines`)
         path: String,
     },
-    /// dotted path 값을 설정 (예: `aic config set aicd.exporter.self_update_enabled true`)
+    /// dotted path 값을 설정 (예: `aic config set aicd.exporter.self_update_enabled true`).
+    /// 인자 없이 터미널에서 실행하면 경로를 검색해 고르고 값을 입력하는 화면이 뜬다.
     Set {
         /// dot으로 구분된 path. `aic config get`이 읽는 경로를 그대로 쓴다.
-        path: String,
+        path: Option<String>,
         /// 설정할 값. `-`면 stdin에서 읽고, `unset`은 값을 비운다.
-        value: String,
+        value: Option<String>,
+    },
+    /// `aic config set`이 받는 경로와 현재 값을 나열한다. [즉시]는 aicd가 재시작 없이 다시 읽는 값
+    List {
+        /// 재시작 없이 반영되는 경로만
+        #[arg(long)]
+        live: bool,
+        /// JSON 형식으로 출력
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1620,7 +1633,21 @@ async fn main() {
             None => handle_config(),
             Some(ConfigOp::Show { json, show_secrets }) => handle_config_show(json, show_secrets),
             Some(ConfigOp::Get { path }) => handle_config_get(&path),
-            Some(ConfigOp::Set { path, value }) => handle_config_set(&path, &value),
+            Some(ConfigOp::Set {
+                path: Some(path),
+                value: Some(value),
+            }) => handle_config_set(&path, &value),
+            Some(ConfigOp::Set {
+                path: None,
+                value: None,
+            }) => handle_config_set_interactive(),
+            Some(ConfigOp::Set { .. }) => {
+                eprintln!(
+                    "{COL_RED}✗{COL_RESET} 경로와 값을 함께 주세요 — 둘 다 빼면 설정을 검색해 고르는 화면이 뜹니다"
+                );
+                std::process::exit(2);
+            }
+            Some(ConfigOp::List { live, json }) => handle_config_list(live, json),
         },
         Some(Commands::Doctor {
             json,
@@ -2388,9 +2415,36 @@ fn handle_config_set(path: &str, value: &str) {
         std::process::exit(1);
     }
 
+    report_config_set(&config, path, &value);
+}
+
+/// `aic config set`을 인자 없이 실행했을 때의 진입점.
+fn handle_config_set_interactive() {
+    if let Err(e) = config_picker::run_set_picker() {
+        eprintln!("{COL_RED}✗{COL_RESET} {e}");
+        std::process::exit(2);
+    }
+}
+
+fn handle_config_list(live_only: bool, json: bool) {
+    let config = match ConfigManager::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{COL_YELLOW}⚠{COL_RESET} 설정 로드 실패: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = config_picker::print_list(&config, live_only, json) {
+        eprintln!("{COL_RED}✗{COL_RESET} {e}");
+        std::process::exit(2);
+    }
+}
+
+/// 값을 저장한 뒤의 안내. 경로를 인자로 받은 set과 고르는 화면이 같은 말을 하게 한 곳에 둔다.
+fn report_config_set(config: &AppConfig, path: &str, value: &str) {
     println!(
         "{COL_GREEN}✔{COL_RESET} {path} = {}",
-        set_value_for_display(path, &value)
+        set_value_for_display(path, value)
     );
 
     // capture_mode를 **건드렸을 때만** 셸 hook 안내를 낸다. 범용 set이 열리기 전에는 이
@@ -2404,7 +2458,7 @@ fn handle_config_set(path: &str, value: &str) {
     {
         print_hook_capture_setup_hint(config.session.capture_mode);
     }
-    print_config_set_followup(&config, path);
+    print_config_set_followup(config, path);
 }
 
 /// 값 자리의 `-`는 stdin에서 읽는다.
@@ -6767,6 +6821,7 @@ fn handle_config() {
         "LLM Provider 설정",
         "응답 언어 설정",
         "세션 캡처 모드 설정",
+        "모든 설정 검색·변경 (aic config set)",
         "설정 파일 직접 편집 (예제 포함)",
         "종료",
     ];
@@ -6777,14 +6832,19 @@ fn handle_config() {
             .items(options)
             .default(0)
             .interact()
-            .unwrap_or(5);
+            .unwrap_or(options.len() - 1);
 
         match selection {
             0 => show_current_config(),
             1 => configure_llm_provider(),
             2 => configure_lang(),
             3 => configure_session_capture_mode(),
-            4 => show_config_example(),
+            4 => {
+                if let Err(e) = config_picker::run_set_picker() {
+                    eprintln!("{COL_RED}✗{COL_RESET} {e}");
+                }
+            }
+            5 => show_config_example(),
             _ => break,
         }
         println!();
