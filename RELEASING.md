@@ -8,7 +8,7 @@
 # 0. 사전 조건: 지금 develop HEAD의 develop CI가 green인지(아래 "정상 흐름" 1번)
 # 1. CHANGELOG의 [Unreleased] → [X.Y.Z] 로 정리
 # 2. Cargo.toml 버전 bump (aic-common/aic-server/aic-client) + Cargo.lock 반영
-# 3. lockfile 확인 — cargo metadata --locked (워크스페이스 + fuzz, "정상 흐름" 4번)
+# 3. lockfile 확인 — cargo metadata --locked (워크스페이스 + fuzz + eval, "정상 흐름" 4번)
 # 4. bump 커밋에 [skip ci]를 넣지 말 것 — tag가 이 커밋을 가리키는데, [skip ci]는
 #    tag push로 트리거될 release.yml까지 스킵한다(v0.29.0에서 release가 안 떴다 → 아래 트러블슈팅).
 git commit -am "chore(release): vX.Y.Z"
@@ -86,6 +86,7 @@ release.yml이 첫 release에서 `Formula/aic.rb`를 통째로 생성한다. pla
    ```sh
    cargo metadata --locked --format-version 1 >/dev/null
    cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 >/dev/null   # ci.yml fuzz job과 동일
+   cargo metadata --manifest-path eval/Cargo.toml --locked --format-version 1 >/dev/null   # CI는 보지 않는다 — 여기서만 확인
    ```
 
    1번 사전 조건을 충족할 수 없어 CI 결과 없이 진행해야 한다면, 대신 로컬에서 CI 일부를 돌린다:
