@@ -430,14 +430,30 @@ fn probe_postgres_tcp(endpoint: SocketAddr) -> Result<(), String> {
 
 pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
     let report = discover_for_monitor()?;
-    let connection = list_configured()?
+    let configured = list_configured()?;
+    let candidate_id = &resolve_workload_ref(
+        candidate_id,
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str()),
+    )?;
+    let connection = configured
         .into_iter()
-        .find(|definition| definition.id == candidate_id)
+        .find(|definition| definition.id == *candidate_id)
         .and_then(|definition| definition.connection);
     let candidate = select_monitor_candidate(&report, candidate_id, connection.is_some())?;
+    probe_with_connection(candidate, connection.as_ref())
+}
+
+/// 후보 하나를 주어진 연결로 한 번 점검한다. 연결이 없으면 어댑터의 고정 기본 주소를 쓴다.
+pub fn probe_with_connection(
+    candidate: &WorkloadCandidate,
+    connection: Option<&WorkloadConnectionConfig>,
+) -> Result<WorkloadMonitorReport> {
     let report = match candidate.adapter {
         WorkloadAdapter::HaProxy => {
-            let connection = connection.as_ref().ok_or_else(|| {
+            let connection = connection.ok_or_else(|| {
                 anyhow::anyhow!("HAProxy monitor requires an explicit connection")
             })?;
             WorkloadMonitorReport::HaProxy(HaProxyMonitorReport {
@@ -465,7 +481,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
         WorkloadAdapter::Redis => WorkloadMonitorReport::Redis(RedisMonitorReport {
             candidate_id: candidate.id.clone(),
             monitor_ready: true,
-            metrics: monitor_redis_with_connection(connection.as_ref())
+            metrics: monitor_redis_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Redis, error))?,
         }),
@@ -473,12 +489,12 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::Memcached,
             monitor_ready: true,
-            metrics: monitor_memcached_with_connection(connection.as_ref())
+            metrics: monitor_memcached_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Memcached, error))?,
         }),
         WorkloadAdapter::PostgreSql => {
-            let connection = connection.as_ref().ok_or_else(|| {
+            let connection = connection.ok_or_else(|| {
                 anyhow::anyhow!("PostgreSQL monitor requires an explicit connection")
             })?;
             WorkloadMonitorReport::PostgreSql(PostgreSqlMonitorReport {
@@ -504,7 +520,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             })
         }
         WorkloadAdapter::MongoDb => {
-            let connection = connection.as_ref().ok_or_else(|| {
+            let connection = connection.ok_or_else(|| {
                 anyhow::anyhow!("MongoDB monitor requires an explicit connection")
             })?;
             WorkloadMonitorReport::MongoDb(MongoDbMonitorReport {
@@ -520,7 +536,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::Prometheus,
             monitor_ready: true,
-            metrics: monitor_prometheus_with_connection(connection.as_ref())
+            metrics: monitor_prometheus_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Prometheus, error))?,
         }),
@@ -528,7 +544,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::ClickHouse,
             monitor_ready: true,
-            metrics: monitor_clickhouse_with_connection(connection.as_ref())
+            metrics: monitor_clickhouse_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::ClickHouse, error))?,
         }),
@@ -536,7 +552,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::Etcd,
             monitor_ready: true,
-            metrics: monitor_etcd_with_connection(connection.as_ref())
+            metrics: monitor_etcd_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::Etcd, error))?,
         }),
@@ -545,7 +561,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
                 candidate_id: candidate.id.clone(),
                 adapter: WorkloadAdapter::Elasticsearch,
                 monitor_ready: true,
-                metrics: monitor_elasticsearch_with_connection(connection.as_ref())
+                metrics: monitor_elasticsearch_with_connection(connection)
                     .map(|(_, metrics)| metrics)
                     .map_err(|error| safe_monitor_error(WorkloadAdapter::Elasticsearch, error))?,
             })
@@ -554,7 +570,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::OpenSearch,
             monitor_ready: true,
-            metrics: monitor_opensearch_with_connection(connection.as_ref())
+            metrics: monitor_opensearch_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::OpenSearch, error))?,
         }),
@@ -562,7 +578,7 @@ pub fn monitor_candidate(candidate_id: &str) -> Result<WorkloadMonitorReport> {
             candidate_id: candidate.id.clone(),
             adapter: WorkloadAdapter::RabbitMq,
             monitor_ready: true,
-            metrics: monitor_rabbitmq_with_connection(connection.as_ref())
+            metrics: monitor_rabbitmq_with_connection(connection)
                 .map(|(_, metrics)| metrics)
                 .map_err(|error| safe_monitor_error(WorkloadAdapter::RabbitMq, error))?,
         }),
@@ -1034,10 +1050,17 @@ fn is_container_hex_id(id: &str) -> bool {
 
 pub fn inspect(candidate_id: &str) -> Result<(DiscoveryReport, WorkloadCandidate)> {
     let report = discover()?;
+    let candidate_id = &resolve_workload_ref(
+        candidate_id,
+        report
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str()),
+    )?;
     let candidate = report
         .candidates
         .iter()
-        .find(|candidate| candidate.id == candidate_id)
+        .find(|candidate| candidate.id == *candidate_id)
         .cloned()
         .context("workload candidate was not found")?;
     Ok((report, candidate))
@@ -1329,15 +1352,20 @@ pub fn status() -> Result<Vec<WorkloadStatusEntry>> {
 }
 
 pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
-    if !list_configured()?
+    let configured = list_configured()?;
+    let workload_id = &resolve_workload_ref(
+        workload_id,
+        configured.iter().map(|definition| definition.id.as_str()),
+    )?;
+    if !configured
         .iter()
-        .any(|definition| definition.id == workload_id)
+        .any(|definition| definition.id == *workload_id)
     {
         bail!("workload is not configured");
     }
     let mut samples = load_workload_history(&workload_history_path())?
         .into_iter()
-        .filter(|sample| sample.workload_id == workload_id)
+        .filter(|sample| sample.workload_id == *workload_id)
         .collect::<Vec<_>>();
     samples.sort_by_key(|sample| sample.captured_at);
     let skip = samples.len().saturating_sub(limit);
@@ -1357,6 +1385,18 @@ pub fn enable_with_connection(
     if candidate.fingerprint != expected_fingerprint {
         bail!("workload candidate changed; discover again before enabling");
     }
+    enable_candidate(&candidate, connection)
+}
+
+/// 방금 탐색한 후보를 저장한다. 같은 id의 정의가 있으면 새 연결로 바꾼다.
+///
+/// fingerprint를 다시 확인하지 않는다. 대화형 등록에서는 사용자가 이 탐색 결과에서 후보를 직접
+/// 골랐고, PostgreSQL처럼 접속마다 자식 프로세스를 띄우는 서비스는 몇 초 사이에도 fingerprint가
+/// 바뀐다.
+pub fn enable_candidate(
+    candidate: &WorkloadCandidate,
+    connection: Option<WorkloadConnectionConfig>,
+) -> Result<WorkloadDefinition> {
     if !candidate.ambiguity.is_empty() || candidate.selector.is_none() {
         bail!("ambiguous workload candidates cannot be enabled");
     }
@@ -1367,14 +1407,173 @@ pub fn enable_with_connection(
     }
     validate_enable_connection(candidate.adapter, connection.as_ref())?;
     let definition = WorkloadDefinition {
-        id: candidate.id,
-        selector: candidate.selector.unwrap(),
+        id: candidate.id.clone(),
+        selector: candidate.selector.clone().expect("checked above"),
         adapter: candidate.adapter,
         driver_mode: candidate.driver_mode.unwrap_or_default(),
         connection,
     };
     save_definition(&definition)?;
     Ok(definition)
+}
+
+/// 어댑터가 보통 듣는 TCP 포트. HAProxy는 Unix 소켓이라 없다.
+pub fn default_tcp_port(adapter: WorkloadAdapter) -> Option<u16> {
+    Some(match adapter {
+        WorkloadAdapter::PostgreSql => 5432,
+        WorkloadAdapter::MySql => 3306,
+        WorkloadAdapter::MongoDb => 27017,
+        WorkloadAdapter::Redis => 6379,
+        WorkloadAdapter::Memcached => 11211,
+        WorkloadAdapter::Prometheus => 9090,
+        WorkloadAdapter::ClickHouse => 8123,
+        WorkloadAdapter::Etcd => 2379,
+        WorkloadAdapter::Elasticsearch | WorkloadAdapter::OpenSearch => 9200,
+        WorkloadAdapter::RabbitMq => 15672,
+        WorkloadAdapter::Nginx => 80,
+        _ => return None,
+    })
+}
+
+/// 대화형 등록이 미리 채우는 연결 값.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionDefaults {
+    pub endpoint: Option<String>,
+    pub username: Option<String>,
+    pub database: Option<String>,
+}
+
+/// 후보에 닿을 연결 값을 제안한다. 주소는 호스트 프로세스면 loopback의 기본 포트, docker
+/// 컨테이너면 공개한 포트, 공개하지 않았으면 컨테이너 IP다. 사용자와 DB는 docker 컨테이너의
+/// 환경 변수(`POSTGRES_USER` 등)에서, 없으면 이미지의 기본값에서 온다. 비밀번호는 제안하지 않는다.
+pub fn suggest_connection(candidate: &WorkloadCandidate) -> ConnectionDefaults {
+    suggest_connection_in(
+        candidate,
+        Path::new(aic_common::docker::DOCKER_CONTAINERS_DIR),
+    )
+}
+
+fn suggest_connection_in(
+    candidate: &WorkloadCandidate,
+    containers_dir: &Path,
+) -> ConnectionDefaults {
+    let meta = candidate
+        .container
+        .as_ref()
+        .filter(|container| container.runtime == "docker")
+        .map(|container| {
+            aic_common::docker::read_docker_container_meta(&containers_dir.join(&container.id))
+        });
+    let endpoint = default_tcp_port(candidate.adapter).and_then(|port| {
+        if candidate.container.is_none() {
+            return Some(format!("tcp://127.0.0.1:{port}"));
+        }
+        // docker가 아닌 런타임은 공개 포트를 알 수 없다.
+        let meta = meta.as_ref()?;
+        if let Some(published) = meta
+            .published_tcp
+            .iter()
+            .find(|published| published.container_port == port)
+        {
+            let host = match published.host_ip.as_str() {
+                "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+                ip if ip.contains(':') => format!("[{ip}]"),
+                ip => ip.to_string(),
+            };
+            return Some(format!("tcp://{host}:{}", published.host_port));
+        }
+        match meta.network_ips.first() {
+            Some(ip) => Some(format!("tcp://{ip}:{port}")),
+            // host 네트워크 컨테이너는 호스트의 포트를 그대로 쓴다.
+            None => Some(format!("tcp://127.0.0.1:{port}")),
+        }
+    });
+    let env = |key: &str| {
+        meta.as_ref()
+            .and_then(|meta| meta.env(key))
+            .map(str::to_string)
+    };
+    let (username, database) = match candidate.adapter {
+        // 공식 postgres 이미지는 POSTGRES_DB가 없으면 사용자 이름의 DB를 만든다.
+        WorkloadAdapter::PostgreSql => {
+            let user = env("POSTGRES_USER").unwrap_or_else(|| "postgres".to_string());
+            let database = env("POSTGRES_DB").unwrap_or_else(|| user.clone());
+            (Some(user), Some(database))
+        }
+        WorkloadAdapter::MySql => (
+            env("MYSQL_USER")
+                .or_else(|| env("MARIADB_USER"))
+                .or_else(|| Some("root".to_string())),
+            env("MYSQL_DATABASE").or_else(|| env("MARIADB_DATABASE")),
+        ),
+        WorkloadAdapter::MongoDb => (env("MONGO_INITDB_ROOT_USERNAME"), None),
+        _ => (None, None),
+    };
+    ConnectionDefaults {
+        endpoint,
+        username,
+        database,
+    }
+}
+
+/// 사람이 부르는 짧은 이름. 컨테이너는 컨테이너 이름, 실행 파일은 파일 이름이다.
+pub fn short_name(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix("container:") {
+        if let Some(name) = rest.split(':').nth(1) {
+            return name;
+        }
+    }
+    if let Some(unit) = id.strip_prefix("systemd:") {
+        return unit;
+    }
+    id.rsplit('/').next().unwrap_or(id)
+}
+
+/// 사용자가 준 이름을 전체 id로 바꾼다. 정확한 id, 짧은 이름, id의 일부 순서로 찾는다. 여럿이
+/// 맞으면 고르지 않고 후보를 보여 준다. 하나도 맞지 않으면 입력을 그대로 돌려 호출자가 "없음"을
+/// 알리게 한다.
+pub fn resolve_workload_ref<'a>(
+    input: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<String> {
+    let ids = ids.into_iter().collect::<BTreeSet<_>>();
+    if ids.contains(input) {
+        return Ok(input.to_string());
+    }
+    for matches in [
+        ids.iter()
+            .filter(|id| short_name(id) == input)
+            .collect::<Vec<_>>(),
+        ids.iter()
+            .filter(|id| id.contains(input))
+            .collect::<Vec<_>>(),
+    ] {
+        match matches.as_slice() {
+            [] => continue,
+            [one] => return Ok((**one).to_string()),
+            many => bail!(
+                "'{input}' matches several workloads; use the full id: {}",
+                many.iter().map(|id| **id).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+    Ok(input.to_string())
+}
+
+pub fn is_enableable_monitor_candidate(candidate: &WorkloadCandidate) -> bool {
+    is_monitor_adapter(candidate.adapter)
+        && candidate.selector.is_some()
+        && candidate.ambiguity.is_empty()
+}
+
+/// `enable`에 연결 정보를 반드시 넣어야 하는가. TTY 대화의 `/discover` 다중 선택은 연결을 묻지
+/// 못하므로 이런 후보를 대화형 등록으로 보낸다.
+pub fn needs_connection(candidate: &WorkloadCandidate) -> bool {
+    requires_explicit_connection(candidate.adapter) || candidate.container.is_some()
+}
+
+pub fn adapter_display_name(adapter: WorkloadAdapter) -> String {
+    adapter_label(adapter)
 }
 
 fn requires_explicit_connection(adapter: WorkloadAdapter) -> bool {
@@ -1497,13 +1696,12 @@ fn save_definition(definition: &WorkloadDefinition) -> Result<()> {
     } else {
         WorkloadStore::default()
     };
-    if !store
+    // 같은 id를 다시 enable하면 연결을 고친다는 뜻이다. 예전에는 기존 정의를 남기고 새 값을
+    // 조용히 버려서, 잘못 넣은 endpoint를 고칠 방법이 정의 파일 수정뿐이었다.
+    store
         .workloads
-        .iter()
-        .any(|existing| existing.id == definition.id)
-    {
-        store.workloads.push(definition.clone());
-    }
+        .retain(|existing| existing.id != definition.id);
+    store.workloads.push(definition.clone());
     store.workloads.sort_by(|a, b| a.id.cmp(&b.id));
     let text = toml::to_string_pretty(&store).context("serialize workloads.toml")?;
     let temporary = path.with_extension("toml.tmp");
@@ -1612,7 +1810,7 @@ pub fn shell_command(proposal: &WorkloadProposal, candidate: &WorkloadCandidate)
                 "aic workload enable {id} --fingerprint {}",
                 candidate.fingerprint
             );
-            if requires_explicit_connection(candidate.adapter) || candidate.container.is_some() {
+            if needs_connection(candidate) {
                 command.push_str(" --endpoint <tcp://HOST:PORT>");
             }
             Some(command)
@@ -1813,6 +2011,142 @@ mod tests {
         let all = render_discover(&report, true);
         assert!(all.starts_with("workload candidates: 3\n"));
         assert!(all.contains("/usr/bin/bash"));
+    }
+
+    /// 이 테스트가 지키는 것: 대화형 등록이 제안하는 기본 주소가 실제로 닿는 곳인 것. 호스트는
+    /// loopback의 표준 포트, docker는 공개 포트, 공개하지 않았으면 컨테이너 IP다.
+    #[test]
+    fn endpoint_suggestions_follow_where_the_service_listens() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |id: &str, body: &str| {
+            std::fs::create_dir_all(dir.path().join(id)).unwrap();
+            std::fs::write(dir.path().join(id).join("config.v2.json"), body).unwrap();
+        };
+        let published = "a".repeat(64);
+        let wildcard = "b".repeat(64);
+        let private = "c".repeat(64);
+        let host_net = "d".repeat(64);
+        write(
+            &published,
+            r#"{"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"15432"}]},"Networks":{"n":{"IPAddress":"172.19.0.2"}}}}"#,
+        );
+        write(
+            &wildcard,
+            r#"{"NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"0.0.0.0","HostPort":"5433"}]}}}"#,
+        );
+        write(
+            &private,
+            r#"{"NetworkSettings":{"Ports":{"5432/tcp":null},"Networks":{"n":{"IPAddress":"172.19.0.3"}}}}"#,
+        );
+        write(
+            &host_net,
+            r#"{"NetworkSettings":{"Ports":{},"Networks":{"host":{"IPAddress":""}}}}"#,
+        );
+        let candidate = |container: Option<&str>| WorkloadCandidate {
+            id: "x".into(),
+            fingerprint: "f".into(),
+            selector: Some(WorkloadSelector::Executable {
+                path: "/usr/local/bin/postgres".into(),
+            }),
+            adapter: WorkloadAdapter::PostgreSql,
+            driver_mode: None,
+            bindings: Vec::new(),
+            ambiguity: Vec::new(),
+            container: container.map(|id| WorkloadContainer {
+                runtime: "docker".into(),
+                id: id.to_string(),
+                name: None,
+                image: None,
+            }),
+        };
+        let suggest = |id: Option<&str>| suggest_connection_in(&candidate(id), dir.path()).endpoint;
+        assert_eq!(suggest(None).as_deref(), Some("tcp://127.0.0.1:5432"));
+        assert_eq!(
+            suggest(Some(&published)).as_deref(),
+            Some("tcp://127.0.0.1:15432")
+        );
+        assert_eq!(
+            suggest(Some(&wildcard)).as_deref(),
+            Some("tcp://127.0.0.1:5433")
+        );
+        assert_eq!(
+            suggest(Some(&private)).as_deref(),
+            Some("tcp://172.19.0.3:5432")
+        );
+        assert_eq!(
+            suggest(Some(&host_net)).as_deref(),
+            Some("tcp://127.0.0.1:5432")
+        );
+        let mut podman = candidate(Some(&published));
+        podman.container.as_mut().unwrap().runtime = "podman".into();
+        assert_eq!(suggest_connection_in(&podman, dir.path()).endpoint, None);
+    }
+
+    #[test]
+    fn short_names_and_references_resolve_to_one_workload() {
+        let pg = "container:docker:dnx-postgres-1:exe:/usr/local/bin/postgres";
+        let nginx = "exe:/usr/sbin/nginx";
+        let nginx_container = "container:docker:web:exe:/usr/sbin/nginx";
+        assert_eq!(short_name(pg), "dnx-postgres-1");
+        assert_eq!(short_name(nginx), "nginx");
+        assert_eq!(short_name("systemd:redis.service"), "redis.service");
+        let ids = [pg, nginx, nginx_container];
+        assert_eq!(resolve_workload_ref(pg, ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("dnx-postgres-1", ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("postgres-1", ids).unwrap(), pg);
+        assert_eq!(resolve_workload_ref("web", ids).unwrap(), nginx_container);
+        assert_eq!(resolve_workload_ref("nginx", ids).unwrap(), nginx);
+        let two_hosts = [nginx, "exe:/opt/nginx/sbin/nginx"];
+        let error = resolve_workload_ref("nginx", two_hosts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("several"), "{error}");
+        assert_eq!(resolve_workload_ref("missing", ids).unwrap(), "missing");
+    }
+
+    /// 이 테스트가 지키는 것: 사용자와 DB 기본값이 컨테이너 설정에서 오고, 비밀번호는 오지 않는 것.
+    #[test]
+    fn connection_defaults_come_from_the_container_without_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "e".repeat(64);
+        std::fs::create_dir_all(dir.path().join(&id)).unwrap();
+        std::fs::write(
+            dir.path().join(&id).join("config.v2.json"),
+            r#"{"Config":{"Env":["POSTGRES_USER=dnx","POSTGRES_PASSWORD=secret"]},
+               "NetworkSettings":{"Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"5432"}]}}}"#,
+        )
+        .unwrap();
+        let mut candidate = WorkloadCandidate {
+            id: "container:docker:dnx:exe:/usr/local/bin/postgres".into(),
+            fingerprint: "f".into(),
+            selector: Some(WorkloadSelector::Executable {
+                path: "/usr/local/bin/postgres".into(),
+            }),
+            adapter: WorkloadAdapter::PostgreSql,
+            driver_mode: None,
+            bindings: Vec::new(),
+            ambiguity: Vec::new(),
+            container: Some(WorkloadContainer {
+                runtime: "docker".into(),
+                id,
+                name: Some("dnx".into()),
+                image: None,
+            }),
+        };
+        let defaults = suggest_connection_in(&candidate, dir.path());
+        assert_eq!(
+            defaults,
+            ConnectionDefaults {
+                endpoint: Some("tcp://127.0.0.1:5432".into()),
+                username: Some("dnx".into()),
+                database: Some("dnx".into()),
+            }
+        );
+        assert!(!format!("{defaults:?}").contains("secret"));
+        candidate.container = None;
+        let host = suggest_connection_in(&candidate, dir.path());
+        assert_eq!(host.username.as_deref(), Some("postgres"));
+        assert_eq!(host.database.as_deref(), Some("postgres"));
     }
 
     #[test]

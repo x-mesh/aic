@@ -4,6 +4,18 @@
 
 use std::path::Path;
 
+/// 컨테이너 환경 변수 중 읽는 키. 서비스 이미지가 계정과 DB 이름을 받는 변수다. 비밀번호 변수는
+/// 넣지 않는다 — aic가 다른 프로그램의 비밀을 스스로 꺼내 복사하지 않는다.
+pub const IDENTITY_ENV_KEYS: &[&str] = &[
+    "POSTGRES_USER",
+    "POSTGRES_DB",
+    "MYSQL_USER",
+    "MYSQL_DATABASE",
+    "MARIADB_USER",
+    "MARIADB_DATABASE",
+    "MONGO_INITDB_ROOT_USERNAME",
+];
+
 /// docker의 기본 컨테이너 디렉토리. 컨테이너마다 `<id>/` 하위 디렉토리가 있다.
 pub const DOCKER_CONTAINERS_DIR: &str = "/var/lib/docker/containers";
 
@@ -13,6 +25,29 @@ pub struct DockerContainerMeta {
     pub name: Option<String>,
     /// `Config.Image`, 없으면 top-level `Image`.
     pub image: Option<String>,
+    /// `NetworkSettings.Ports`에서 호스트에 공개한 TCP 포트.
+    pub published_tcp: Vec<PublishedPort>,
+    /// `NetworkSettings.Networks.*.IPAddress`. host 네트워크면 비어 있다.
+    pub network_ips: Vec<String>,
+    /// `Config.Env` 중 [`IDENTITY_ENV_KEYS`]에 있는 것만.
+    pub identity_env: Vec<(String, String)>,
+}
+
+impl DockerContainerMeta {
+    pub fn env(&self, key: &str) -> Option<&str> {
+        self.identity_env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPort {
+    pub container_port: u16,
+    /// 빈 값이면 모든 주소에 공개했다는 뜻이다.
+    pub host_ip: String,
+    pub host_port: u16,
 }
 
 /// `<container_dir>/config.v2.json`을 읽는다. 파일이 없거나 읽을 수 없거나 JSON이 아니면 두 값
@@ -35,5 +70,103 @@ pub fn read_docker_container_meta(container_dir: &Path) -> DockerContainerMeta {
         .and_then(|i| i.as_str())
         .or_else(|| value.get("Image").and_then(|i| i.as_str()))
         .map(|s| s.to_string());
-    DockerContainerMeta { name, image }
+    let network = value.get("NetworkSettings");
+    let published_tcp = network
+        .and_then(|n| n.get("Ports"))
+        .and_then(|p| p.as_object())
+        .map(|ports| {
+            ports
+                .iter()
+                .filter_map(|(key, bindings)| {
+                    let container_port = key.strip_suffix("/tcp")?.parse().ok()?;
+                    Some((container_port, bindings.as_array()?))
+                })
+                .flat_map(|(container_port, bindings)| {
+                    bindings.iter().filter_map(move |binding| {
+                        Some(PublishedPort {
+                            container_port,
+                            host_ip: binding.get("HostIp")?.as_str()?.to_string(),
+                            host_port: binding.get("HostPort")?.as_str()?.parse().ok()?,
+                        })
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let network_ips = network
+        .and_then(|n| n.get("Networks"))
+        .and_then(|n| n.as_object())
+        .map(|networks| {
+            networks
+                .values()
+                .filter_map(|network| network.get("IPAddress")?.as_str())
+                .filter(|ip| !ip.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let identity_env = value
+        .get("Config")
+        .and_then(|c| c.get("Env"))
+        .and_then(|e| e.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_str()?.split_once('='))
+                .filter(|(key, value)| IDENTITY_ENV_KEYS.contains(key) && !value.is_empty())
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    DockerContainerMeta {
+        name,
+        image,
+        published_tcp,
+        network_ips,
+        identity_env,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_published_ports_and_network_addresses() {
+        let dir = std::env::temp_dir().join(format!(
+            "aic-docker-meta-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.v2.json"),
+            r#"{"Name":"/db","Config":{"Image":"postgres:17","Env":["POSTGRES_PASSWORD=x","POSTGRES_USER=dnx","PATH=/usr/bin"]},
+               "NetworkSettings":{
+                 "Ports":{"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"15432"}],
+                          "8080/tcp":null,"53/udp":[{"HostIp":"","HostPort":"53"}]},
+                 "Networks":{"app":{"IPAddress":"172.19.0.2"},"none":{"IPAddress":""}}}}"#,
+        )
+        .unwrap();
+        let meta = read_docker_container_meta(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(meta.name.as_deref(), Some("db"));
+        assert_eq!(
+            meta.published_tcp,
+            vec![PublishedPort {
+                container_port: 5432,
+                host_ip: "127.0.0.1".into(),
+                host_port: 15432,
+            }]
+        );
+        assert_eq!(meta.network_ips, vec!["172.19.0.2".to_string()]);
+        assert_eq!(
+            meta.identity_env,
+            vec![("POSTGRES_USER".to_string(), "dnx".to_string())]
+        );
+        assert_eq!(meta.env("POSTGRES_PASSWORD"), None);
+    }
 }
