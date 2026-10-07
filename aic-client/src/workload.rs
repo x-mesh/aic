@@ -161,8 +161,9 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
         .iter()
         .filter(|(pid, _)| pid.as_u32() != scanner_pid)
         // Linux의 `processes()`는 스레드도 돌려준다. 스레드가 binding이 되면 fingerprint가 스레드
-        // 생성·종료마다 바뀌고, 스캐너 자신의 워커 스레드까지 후보가 된다. 커널 스레드는 남긴다.
-        .filter(|(_, process)| crate::agent::proc_groups::is_countable(process))
+        // 생성·종료마다 바뀌고, 스캐너 자신의 워커 스레드까지 후보가 된다. 커널 스레드는 감시할
+        // 서비스가 아닌데 실행 파일이 없어 pid마다 후보가 되어 `MAX_CANDIDATES`를 채웠다.
+        .filter(|(_, process)| process.thread_kind().is_none())
         .map(|(pid, process)| {
             let pid = pid.as_u32();
             let mut ambiguity = Vec::new();
@@ -180,7 +181,7 @@ fn discover_with_driver_checks(check_drivers: bool) -> Result<DiscoveryReport> {
             }
             let exe = process
                 .exe()
-                .map(|p| p.to_string_lossy().to_string())
+                .map(|p| without_deleted_suffix(&p.to_string_lossy()).to_string())
                 .or_else(|| executable_from_argv0(&cmd));
             if exe.is_none() {
                 ambiguity.push("executable_unavailable".to_string());
@@ -805,6 +806,12 @@ fn executable_from_argv0(cmd: &[String]) -> Option<String> {
     (path.is_absolute() && path.is_file()).then(|| argv0.clone())
 }
 
+/// 패키지 업그레이드로 실행 파일이 바뀌면 커널은 `/proc/<pid>/exe` 끝에 ` (deleted)`를 붙인다.
+/// 그대로 두면 재시작 전후로 같은 서비스의 후보 id가 달라진다.
+fn without_deleted_suffix(path: &str) -> &str {
+    path.strip_suffix(" (deleted)").unwrap_or(path)
+}
+
 fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let unit = line.rsplit('/').next()?.trim();
@@ -1296,19 +1303,22 @@ pub fn enable_with_connection(
     Ok(definition)
 }
 
-fn validate_enable_connection(
-    adapter: WorkloadAdapter,
-    connection: Option<&WorkloadConnectionConfig>,
-) -> Result<()> {
-    if matches!(
+fn requires_explicit_connection(adapter: WorkloadAdapter) -> bool {
+    matches!(
         adapter,
         WorkloadAdapter::PostgreSql
             | WorkloadAdapter::MySql
             | WorkloadAdapter::MongoDb
             | WorkloadAdapter::Nginx
             | WorkloadAdapter::HaProxy
-    ) && connection.is_none()
-    {
+    )
+}
+
+fn validate_enable_connection(
+    adapter: WorkloadAdapter,
+    connection: Option<&WorkloadConnectionConfig>,
+) -> Result<()> {
+    if requires_explicit_connection(adapter) && connection.is_none() {
         bail!("database workload monitoring requires an explicit connection");
     }
     if let Some(connection) = connection {
@@ -1474,6 +1484,131 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
+fn adapter_label(adapter: WorkloadAdapter) -> String {
+    format!("{adapter:?}").to_lowercase()
+}
+
+fn snake_label(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn list_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | ':' | '-' | '@'));
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+/// 제안을 셸에서 실행할 `aic workload …` 명령으로 바꾼다. `WorkloadProposal::command`는 TTY
+/// 대화의 `/workload …` 문법이라 셸에 그대로 붙이면 동작하지 않는다.
+pub fn shell_command(proposal: &WorkloadProposal, candidate: &WorkloadCandidate) -> Option<String> {
+    proposal.command.as_ref()?;
+    let id = shell_quote(&candidate.id);
+    match proposal.kind {
+        ProposalKind::Inspect => Some(format!("aic workload inspect {id}")),
+        ProposalKind::Enable => {
+            let mut command = format!(
+                "aic workload enable {id} --fingerprint {}",
+                candidate.fingerprint
+            );
+            if requires_explicit_connection(candidate.adapter) {
+                command.push_str(" --endpoint <tcp://HOST:PORT>");
+            }
+            Some(command)
+        }
+        _ => None,
+    }
+}
+
+/// `aic workload discover`의 사람용 출력. 기본은 어댑터가 붙은 후보만 보인다 — 일반
+/// 프로세스는 감시할 방법이 없는데 수백 줄을 차지한다.
+pub fn render_discover(report: &DiscoveryReport, all: bool) -> String {
+    let shown = report
+        .candidates
+        .iter()
+        .filter(|candidate| all || candidate.adapter != WorkloadAdapter::Generic)
+        .collect::<Vec<_>>();
+    let hidden = report.candidates.len() - shown.len();
+    let mut out = format!("workload candidates: {}", shown.len());
+    if hidden > 0 {
+        out.push_str(&format!(
+            " ({hidden} generic processes hidden; --all shows them)"
+        ));
+    }
+    out.push('\n');
+    for candidate in &shown {
+        out.push_str(&format!(
+            "{:<13} {}\n              pids={} fingerprint={} ambiguity={}\n",
+            adapter_label(candidate.adapter),
+            candidate.id,
+            candidate.bindings.len(),
+            candidate.fingerprint,
+            list_or_dash(&candidate.ambiguity),
+        ));
+    }
+    if shown
+        .iter()
+        .any(|candidate| candidate.adapter != WorkloadAdapter::Generic)
+    {
+        out.push_str("next: aic workload inspect <id>\n");
+    }
+    out
+}
+
+/// `aic workload inspect`의 사람용 출력.
+pub fn render_inspect(
+    candidate: &WorkloadCandidate,
+    driver: &DriverInspection,
+    proposals: &[WorkloadProposal],
+) -> String {
+    let pids = candidate
+        .bindings
+        .iter()
+        .map(|binding| binding.pid.to_string())
+        .collect::<Vec<_>>();
+    let mut out = format!(
+        "{}\nadapter={}\nfingerprint={}\ndriver_mode={}\ndriver_evidence={}\ndriver_pending_checks={}\nambiguity={}\npids={}\n",
+        candidate.id,
+        adapter_label(candidate.adapter),
+        candidate.fingerprint,
+        snake_label(&driver.mode),
+        list_or_dash(&driver.evidence),
+        list_or_dash(&driver.pending_checks),
+        list_or_dash(&candidate.ambiguity),
+        list_or_dash(&pids),
+    );
+    if proposals.is_empty() {
+        return out;
+    }
+    out.push_str("proposals:\n");
+    for proposal in proposals {
+        let action = shell_command(proposal, candidate).unwrap_or_else(|| proposal.reason.clone());
+        out.push_str(&format!(
+            "  [{}] {}: {}\n",
+            snake_label(&proposal.readiness),
+            snake_label(&proposal.kind),
+            action
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,6 +1679,80 @@ mod tests {
             .filter(|binding| tids.contains(&binding.pid))
             .count();
         assert_eq!(bound, 0, "스레드 {tids:?}가 후보 binding에 들어감");
+    }
+
+    /// 이 테스트가 지키는 것: 커널 스레드가 후보 상한을 채우지 않는 것. pid 2는 리눅스에서
+    /// 커널 스레드를 만드는 `kthreadd`다.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovery_skips_kernel_threads() {
+        let report = discover_with_driver_checks(false).unwrap();
+        let kthreadd = report
+            .candidates
+            .iter()
+            .flat_map(|candidate| &candidate.bindings)
+            .any(|binding| binding.pid == 2);
+        assert!(!kthreadd, "kthreadd가 후보 binding에 들어감");
+    }
+
+    #[test]
+    fn a_replaced_executable_keeps_its_candidate_id() {
+        assert_eq!(
+            without_deleted_suffix("/usr/sbin/nginx (deleted)"),
+            "/usr/sbin/nginx"
+        );
+        assert_eq!(without_deleted_suffix("/usr/sbin/nginx"), "/usr/sbin/nginx");
+    }
+
+    #[test]
+    fn discover_output_hides_generic_processes_unless_all() {
+        let report = discover_rows(vec![
+            row(10, 1, "nginx", Some("/usr/sbin/nginx"), &[]),
+            row(11, 1, "bash", Some("/usr/bin/bash"), &[]),
+            row(12, 1, "cron", Some("/usr/sbin/cron"), &[]),
+        ]);
+        let short = render_discover(&report, false);
+        assert!(short.starts_with("workload candidates: 1 (2 generic processes hidden"));
+        assert!(short.contains("exe:/usr/sbin/nginx"));
+        assert!(!short.contains("/usr/bin/bash"));
+        assert!(short.contains("next: aic workload inspect <id>"));
+
+        let all = render_discover(&report, true);
+        assert!(all.starts_with("workload candidates: 3\n"));
+        assert!(all.contains("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn proposals_render_as_shell_commands() {
+        let report = discover_rows(vec![
+            row(10, 1, "nginx", Some("/opt/my nginx/sbin/nginx"), &[]),
+            row(20, 1, "redis-server", Some("/usr/bin/redis-server"), &[]),
+        ]);
+        let all = proposals(&report);
+        let command = |id: &str, kind: ProposalKind| {
+            let candidate = report.candidates.iter().find(|c| c.id == id).unwrap();
+            let proposal = all
+                .iter()
+                .find(|p| p.candidate_id == id && p.kind == kind)
+                .unwrap();
+            shell_command(proposal, candidate)
+        };
+        let nginx = "exe:/opt/my nginx/sbin/nginx";
+        assert_eq!(
+            command(nginx, ProposalKind::Inspect).unwrap(),
+            "aic workload inspect 'exe:/opt/my nginx/sbin/nginx'"
+        );
+        let enable = command(nginx, ProposalKind::Enable).unwrap();
+        assert!(
+            enable.starts_with("aic workload enable 'exe:/opt/my nginx/sbin/nginx' --fingerprint ")
+        );
+        assert!(
+            enable.ends_with(" --endpoint <tcp://HOST:PORT>"),
+            "{enable}"
+        );
+        let redis = command("exe:/usr/bin/redis-server", ProposalKind::Enable).unwrap();
+        assert!(!redis.contains("--endpoint"), "{redis}");
+        assert_eq!(command(nginx, ProposalKind::DriverInspect), None);
     }
 
     #[test]

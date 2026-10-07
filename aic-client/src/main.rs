@@ -631,6 +631,9 @@ enum WorkloadOp {
     Discover {
         #[arg(long)]
         json: bool,
+        /// 어댑터가 없는 일반 프로세스까지 표시한다. `--json`은 항상 전체를 낸다.
+        #[arg(long)]
+        all: bool,
     },
     /// 후보 한 개와 제안을 표시한다.
     Inspect {
@@ -1361,27 +1364,12 @@ enum ConfigOp {
 fn handle_workload(op: WorkloadOp) {
     use aic_client::workload;
     let result = match op {
-        WorkloadOp::Discover { json } => workload::discover().map(|report| {
-            let proposals = workload::proposals(&report);
+        WorkloadOp::Discover { json, all } => workload::discover().map(|report| {
             if json {
+                let proposals = workload::proposals(&report);
                 serde_json::json!({ "report": report, "proposals": proposals }).to_string()
             } else {
-                format!(
-                    "schema={} coverage={}\n{}",
-                    report.schema_version,
-                    report.evidence_coverage,
-                    report
-                        .candidates
-                        .iter()
-                        .map(|candidate| format!(
-                            "{} {} {} {:?}\n",
-                            candidate.id,
-                            candidate.fingerprint,
-                            format!("{:?}", candidate.adapter).to_lowercase(),
-                            candidate.ambiguity
-                        ))
-                        .collect::<String>()
-                )
+                workload::render_discover(&report, all)
             }
         }),
         WorkloadOp::Inspect { candidate_id, json } => {
@@ -1395,17 +1383,7 @@ fn handle_workload(op: WorkloadOp) {
                     serde_json::json!({ "candidate": candidate, "proposals": proposals })
                         .to_string()
                 } else {
-                    format!(
-                        "{}\nfingerprint={}\nadapter={:?}\ndriver_mode={:?}\ndriver_evidence={:?}\ndriver_pending_checks={:?}\nambiguity={:?}\nproposals={:?}",
-                        candidate.id,
-                        candidate.fingerprint,
-                        candidate.adapter,
-                        driver.mode,
-                        driver.evidence,
-                        driver.pending_checks,
-                        candidate.ambiguity,
-                        proposals
-                    )
+                    workload::render_inspect(&candidate, &driver, &proposals)
                 }
             })
         }
