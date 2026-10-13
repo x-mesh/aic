@@ -111,11 +111,36 @@ const KERNEL_COUNTERS: &[(&str, &str)] = &[
     ("/syscall/futex/total", "aic.kernel.syscalls.futex"),
 ];
 
+/// `observations.end` 안의 latency histogram 경로, 임계치(µs), metric 이름.
+///
+/// 임계치를 넘은 버킷 count의 합을 보낸다. 버킷 count가 누적값이라 이 합도 누적값이고, 증가분과
+/// 재시작 처리는 다른 카운터와 같다. 버킷 경계는 `rca.manifest.v1` 계약 밖이어서 테스트가 실측
+/// 샘플(`tests/fixtures/rca-agent/collectz-end.json`)과 대조한다. block_io 경계에는 10ms가 없어
+/// `over_10ms`는 10240µs를 쓴다. syscall·file_io 꼬리는 유휴 대기(futex, 파이프·소켓 read)가 섞여
+/// 지연 신호가 되지 않으므로 넣지 않는다.
+const KERNEL_LATENCY_TAILS: &[(&str, u64, &str)] = &[
+    ("/scheduler", 1_000, "aic.kernel.runqueue_events.over_1ms"),
+    ("/scheduler", 10_000, "aic.kernel.runqueue_events.over_10ms"),
+    ("/block_io", 10_240, "aic.kernel.block_ios.over_10ms"),
+    ("/block_io", 50_000, "aic.kernel.block_ios.over_50ms"),
+];
+
+/// 임계치를 넘은 버킷 count의 합. 버킷 `i`는 `(bounds[i-1], bounds[i]]`이고 마지막 count는 마지막
+/// 경계를 넘은 값이라, 임계치와 같은 경계의 다음 버킷부터 더한다. 임계치가 경계에 없으면 `None`.
+fn latency_tail(histogram: &Value, threshold_us: u64) -> Option<i64> {
+    let bounds = histogram.get("bucket_upper_bounds")?.as_array()?;
+    let idx = bounds
+        .iter()
+        .position(|b| b.as_u64() == Some(threshold_us))?;
+    let counts = histogram.get("counts")?.as_array()?;
+    counts.get(idx + 1..)?.iter().map(Value::as_i64).sum()
+}
+
 /// `rca.evidence.v1` 번들의 누적 카운터 → `aic.kernel.*` 이름별 값. **순수 함수.**
 ///
-/// `observations.end`에서 [`KERNEL_COUNTERS`]의 경로만 읽는다. 숫자가 아닌 값이나 예상 밖 구조는
-/// 조용히 건너뛴다(파싱 실패 = 빈 목록). metric 이름은 OTLP 인코더가 `&'static str`을 요구하므로
-/// 알려진 경로만 상수로 매핑하고, 모르는 신호는 버린다.
+/// `observations.end`에서 [`KERNEL_COUNTERS`]와 [`KERNEL_LATENCY_TAILS`]의 경로만 읽는다.
+/// 숫자가 아닌 값이나 예상 밖 구조는 조용히 건너뛴다(파싱 실패 = 빈 목록). metric 이름은 OTLP
+/// 인코더가 `&'static str`을 요구하므로 알려진 경로만 상수로 매핑하고, 모르는 신호는 버린다.
 pub fn read_counters(bundle_json: &str) -> BTreeMap<&'static str, i64> {
     let mut out = BTreeMap::new();
     let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
@@ -126,6 +151,14 @@ pub fn read_counters(bundle_json: &str) -> BTreeMap<&'static str, i64> {
     };
     for &(pointer, name) in KERNEL_COUNTERS {
         if let Some(n) = end.pointer(pointer).and_then(Value::as_i64) {
+            out.insert(name, n);
+        }
+    }
+    for &(pointer, threshold_us, name) in KERNEL_LATENCY_TAILS {
+        if let Some(n) = end
+            .pointer(pointer)
+            .and_then(|h| latency_tail(h, threshold_us))
+        {
             out.insert(name, n);
         }
     }
@@ -911,5 +944,45 @@ mod tests {
                 "{name}: {pointer}가 manifest 카운터 선언과 맞지 않는다: {counters}"
             );
         }
+    }
+
+    /// 실제 rca-agent 응답의 `observations.end`. 버킷 경계는 manifest 계약에 없어 이 샘플이 근거다.
+    /// 출처: RCA-eBPF main `bef779e04` 빌드를 2026-10-13 이 호스트에서 세 번(신호 cardinality 상한
+    /// 때문에 나눠서) 띄워 받은 `/collectz?duration=0` 응답. `top` 등 entity가 든 필드는 뺐다.
+    fn golden_collect() -> String {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rca-agent/collectz-end.json"
+        ))
+        .to_string()
+    }
+
+    #[test]
+    fn read_counters_reads_latency_tails_from_golden_sample() {
+        let c = read_counters(&golden_collect());
+        // scheduler 버킷 (1000, 2500]에 32, (2500, 5000]에 7 — 그 위는 0.
+        assert_eq!(c.get("aic.kernel.runqueue_events.over_1ms"), Some(&39));
+        assert_eq!(c.get("aic.kernel.runqueue_events.over_10ms"), Some(&0));
+        assert_eq!(c.get("aic.kernel.block_ios.over_10ms"), Some(&0));
+        assert_eq!(c.get("aic.kernel.block_ios.over_50ms"), Some(&0));
+        // 실제 응답에서도 기존 누적 카운터가 모두 읽혀야 한다.
+        for &(pointer, name) in KERNEL_COUNTERS {
+            assert!(
+                c.contains_key(name),
+                "{name}: 실측 샘플에서 {pointer}를 못 읽음"
+            );
+        }
+    }
+
+    #[test]
+    fn latency_tail_sums_buckets_above_threshold() {
+        let h = serde_json::json!({"bucket_upper_bounds": [10, 100, 1000], "counts": [5, 4, 3, 2]});
+        assert_eq!(latency_tail(&h, 10), Some(4 + 3 + 2));
+        // 마지막 경계를 임계치로 쓰면 그 경계를 넘은 마지막 버킷만 남는다.
+        assert_eq!(latency_tail(&h, 1000), Some(2));
+        // 경계에 없는 임계치는 근사하지 않는다 — 이름과 다른 기준의 값을 보내지 않는다.
+        assert_eq!(latency_tail(&h, 500), None);
+        let broken = serde_json::json!({"bucket_upper_bounds": [10], "counts": [1, "x"]});
+        assert_eq!(latency_tail(&broken, 10), None);
     }
 }
