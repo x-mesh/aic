@@ -200,6 +200,69 @@ pub fn diff_counters(
     points
 }
 
+/// 이번 tick의 카운터 증가분. 인스턴스 ID로 재시작을 확인했으면 새 인스턴스는 직전 폴 뒤에
+/// 떴으므로 누적값 전체가 이번 구간의 증가분이다. 그 밖에는 [`diff_counters`]가 후퇴를
+/// 재시작으로 추정한다.
+fn counter_points(
+    prev: Option<&BTreeMap<&'static str, i64>>,
+    cur: &BTreeMap<&'static str, i64>,
+    agent_restarted: bool,
+) -> Vec<MetricPoint> {
+    if agent_restarted {
+        let zero: BTreeMap<&'static str, i64> = cur.keys().map(|&name| (name, 0)).collect();
+        return diff_counters(Some(&zero), cur);
+    }
+    diff_counters(prev, cur)
+}
+
+/// collect 앞뒤에서 읽은 `agent_instance_id`로 내린 이번 tick의 판정.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentInstance {
+    /// collect 앞뒤의 ID가 다르다 — 수집 도중 재시작했다. 이번 tick을 버리고 상태를 둔다.
+    Changing,
+    /// ID를 모른다(`/manifestz` 이전 에이전트이거나 조회 실패). 카운터 후퇴와 OOM seq 후퇴로
+    /// 재시작을 추정한다.
+    Unknown,
+    /// 직전 tick과 같은 인스턴스이거나, ID를 처음 알게 된 tick.
+    Same,
+    /// 직전 tick 뒤에 새로 뜬 인스턴스.
+    Restarted,
+}
+
+fn agent_instance(known: Option<&str>, before: Option<&str>, after: Option<&str>) -> AgentInstance {
+    match (before, after) {
+        (Some(b), Some(a)) if b != a => AgentInstance::Changing,
+        (Some(id), Some(_)) => match known {
+            Some(k) if k != id => AgentInstance::Restarted,
+            _ => AgentInstance::Same,
+        },
+        _ => AgentInstance::Unknown,
+    }
+}
+
+/// `/manifestz` 응답의 `agent_instance_id`. 없거나 비어 있으면 `None`.
+fn parse_instance_id(body: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.get("agent_instance_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+/// `GET /manifestz`로 rca-agent 인스턴스 ID를 읽는다. 404(manifest 이전 버전)와 조회 실패는
+/// `None`이고, 호출자는 [`AgentInstance::Unknown`]으로 처리해 그 사실을 로그로 남긴다.
+async fn fetch_instance_id(client: &reqwest::Client, url: &str) -> Option<String> {
+    let resp = client.get(url).timeout(POLL_TIMEOUT).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.len() > MAX_BUNDLE_BYTES {
+        return None;
+    }
+    parse_instance_id(&bytes)
+}
+
 /// OOM kill 이산 이벤트 하나 — ring buffer의 개별 사건.
 ///
 /// 카운터(metric)와 달리 "누가 죽었나"가 핵심이라 comm을 싣는다. **이것이 이 경로에서 유일하게
@@ -279,10 +342,20 @@ pub fn oom_ring_restarted(last_seq: u64, observed_max: u64) -> bool {
 ///
 /// - `delivered == false`: 배치가 push도 spool도 못 됐다 = 어디에도 남지 않았다. 커서를
 ///   붙잡아 다음 폴에서 다시 시도한다(중복은 `record_id`가 흡수한다).
+/// - `agent_restarted`(인스턴스 ID로 확인한 재시작): ring은 새 인스턴스의 것이라 옛 커서는
+///   의미가 없다. 보냈으면 관측값, 못 보냈으면 0으로 두어 다음 폴에서 ring 전체를 다시 시도한다.
 /// - ring 리셋: 관측값을 그대로 새 기준선으로 삼는다. `max`로 올리면 옛 커서가 남아 재시작
 ///   이후의 사건이 영구히 걸러진다.
 /// - 그 외: 단조 증가.
-pub fn next_oom_cursor(last_seq: u64, observed_max: u64, delivered: bool) -> u64 {
+pub fn next_oom_cursor(
+    last_seq: u64,
+    observed_max: u64,
+    delivered: bool,
+    agent_restarted: bool,
+) -> u64 {
+    if agent_restarted {
+        return if delivered { observed_max } else { 0 };
+    }
     if !delivered {
         return last_seq;
     }
@@ -329,6 +402,7 @@ async fn serve_kernel_with(
     let logs_url = super::logs_url(&cfg.endpoint);
     // duration=0 — 대기 없이 스냅샷만 받는다(모듈 doc 참고).
     let collect_url = format!("{}/collectz?profile=incident&duration=0", cfg.agent_url);
+    let manifest_url = format!("{}/manifestz", cfg.agent_url);
     tracing::info!(
         url = %url,
         agent = %cfg.agent_url,
@@ -357,6 +431,10 @@ async fn serve_kernel_with(
     let mut last_oom_seq: u64 = 0;
     // 첫 tick을 지났는지. OOM 기준선 판정에 쓴다(카운터는 prev_counters로 같은 판정을 한다).
     let mut first_seen = false;
+    // prev_counters·last_oom_seq를 만든 rca-agent 인스턴스. 모르면 None.
+    let mut agent_id: Option<String> = None;
+    // 인스턴스 ID를 쓸 수 있는지의 직전 상태. 바뀔 때만 로그를 남긴다.
+    let mut instance_id_available: Option<bool> = None;
 
     // 재적용 알림 구독. 주기가 길면 다음 tick까지 기다렸다 바뀌는 것이 설정을 고친 사람에게는
     // "반영 안 됨"과 같아 보이므로, 변경이 들어오면 즉시 깨어나 주기를 다시 잡는다.
@@ -379,6 +457,9 @@ async fn serve_kernel_with(
 
         tokio::select! {
             _ = ticker.tick() => {
+                // collect 앞뒤에서 인스턴스 ID를 읽어야 수집 도중의 재시작을 가를 수 있다.
+                // 한 번만 읽으면 옛 인스턴스의 누적값을 새 인스턴스의 증가분으로 보낼 수 있다.
+                let id_before = fetch_instance_id(client, &manifest_url).await;
                 let bundle = match collect_once(client, &collect_url).await {
                     Ok(b) => {
                         if collect_failing {
@@ -399,6 +480,38 @@ async fn serve_kernel_with(
                         continue;
                     }
                 };
+                let id_after = fetch_instance_id(client, &manifest_url).await;
+                let instance =
+                    agent_instance(agent_id.as_deref(), id_before.as_deref(), id_after.as_deref());
+                if instance == AgentInstance::Changing {
+                    tracing::info!(
+                        before = ?id_before,
+                        after = ?id_after,
+                        "수집 도중 rca-agent 재시작 — 이번 tick을 건너뛴다"
+                    );
+                    continue;
+                }
+                let available = instance != AgentInstance::Unknown;
+                if instance_id_available != Some(available) {
+                    if available {
+                        tracing::info!("rca-agent agent_instance_id로 재시작을 판정한다");
+                    } else {
+                        tracing::info!(
+                            "rca-agent agent_instance_id를 읽지 못함(/manifestz 이전 버전 또는 조회 실패) — 카운터·OOM seq 후퇴로 재시작을 추정한다"
+                        );
+                    }
+                    instance_id_available = Some(available);
+                }
+                let agent_restarted = instance == AgentInstance::Restarted;
+                if agent_restarted {
+                    tracing::info!(
+                        previous = ?agent_id,
+                        current = ?id_after,
+                        "rca-agent 재시작 확인 — 새 인스턴스의 누적값 전체를 이번 구간 증가분으로 보낸다"
+                    );
+                }
+                // ID를 모르는 tick 뒤에는 이어서 비교할 근거가 없으므로 잊는다.
+                agent_id = if available { id_after } else { None };
 
                 // 이산 이벤트(OOM)는 카운터와 독립적으로 내보낸다 — 한쪽이 비어도 다른 쪽은 보낸다.
                 //
@@ -418,13 +531,15 @@ async fn serve_kernel_with(
                 // 관측 최대 seq가 커서보다 작으면 ring이 리셋된 것이다. 이때 ring에 남은 사건은
                 // 재시작 **이후**의 새 사건이므로(옛 ring은 에이전트와 함께 사라졌다) 커서를
                 // 무시하고 전부 새로 잡는다 — aicd 첫 폴의 기준선 규칙과 달리 여기서는 옛 사건이
-                // 되살아날 여지가 없다.
-                let ring_restarted = oom_ring_restarted(last_oom_seq, max_seq);
+                // 되살아날 여지가 없다. seq 후퇴만으로는 새 인스턴스의 seq가 옛 커서를 넘어선
+                // 재시작을 놓치므로, 인스턴스 ID로 확인한 재시작도 같은 경로로 보낸다.
+                let ring_restarted = agent_restarted || oom_ring_restarted(last_oom_seq, max_seq);
                 if ring_restarted {
                     tracing::info!(
                         max_seq,
                         last_oom_seq,
-                        "OOM ring seq 후퇴 — rca-agent 재시작으로 보고 커서를 재설정한다"
+                        agent_restarted,
+                        "rca-agent 재시작 — OOM ring 커서를 재설정한다"
                     );
                     let (fresh, _) = build_oom_events(&bundle, 0);
                     oom_events = fresh;
@@ -456,10 +571,10 @@ async fn serve_kernel_with(
                         "OOM 배치가 전송·spool 모두 실패 — seq 커서를 전진시키지 않는다"
                     );
                 }
-                last_oom_seq = next_oom_cursor(last_oom_seq, max_seq, delivered);
+                last_oom_seq = next_oom_cursor(last_oom_seq, max_seq, delivered, agent_restarted);
 
                 let cur = read_counters(&bundle);
-                let points = diff_counters(prev_counters.as_ref(), &cur);
+                let points = counter_points(prev_counters.as_ref(), &cur, agent_restarted);
                 let first_poll = prev_counters.is_none();
                 prev_counters = Some(cur);
                 first_seen = true;
@@ -753,20 +868,20 @@ mod tests {
     #[test]
     fn next_oom_cursor_covers_every_transition() {
         // 정상 전진.
-        assert_eq!(next_oom_cursor(5, 9, true), 9);
+        assert_eq!(next_oom_cursor(5, 9, true, false), 9);
         // 사건 없음(관측 0) — 커서 유지. 여기서 0으로 밀리면 보낸 사건이 전부 재발행된다.
-        assert_eq!(next_oom_cursor(5, 0, true), 5);
+        assert_eq!(next_oom_cursor(5, 0, true, false), 5);
         // 같은 ring 재관측 — 제자리.
-        assert_eq!(next_oom_cursor(5, 5, true), 5);
+        assert_eq!(next_oom_cursor(5, 5, true, false), 5);
         // ring 리셋(rca-agent 재시작): 관측값이 새 기준선. `max`였다면 5로 남아 재시작 이후의
         // 사건(seq 1..2)이 영구 누락된다.
-        assert_eq!(next_oom_cursor(5, 2, true), 2);
+        assert_eq!(next_oom_cursor(5, 2, true, false), 2);
         // 전송·spool 모두 실패 — 어디에도 안 남았으니 커서를 붙잡는다.
-        assert_eq!(next_oom_cursor(5, 9, false), 5);
+        assert_eq!(next_oom_cursor(5, 9, false, false), 5);
         // 실패 + ring 리셋: 커서를 유지해 다음 폴에서 리셋을 다시 감지하고 재시도한다.
-        assert_eq!(next_oom_cursor(5, 2, false), 5);
+        assert_eq!(next_oom_cursor(5, 2, false, false), 5);
         // 첫 폴(기준선) — 0에서 시작해 관측값을 그대로 잡는다.
-        assert_eq!(next_oom_cursor(0, 7, true), 7);
+        assert_eq!(next_oom_cursor(0, 7, true, false), 7);
     }
 
     #[test]
@@ -984,5 +1099,62 @@ mod tests {
         assert_eq!(latency_tail(&h, 500), None);
         let broken = serde_json::json!({"bucket_upper_bounds": [10], "counts": [1, "x"]});
         assert_eq!(latency_tail(&broken, 10), None);
+    }
+
+    #[test]
+    fn oom_seq_heuristic_misses_restart_when_new_seq_passes_cursor() {
+        // 옛 인스턴스가 OOM 2건을 보낸 뒤 재시작했고, 다음 폴 전에 새 인스턴스가 3건을 냈다.
+        // seq 후퇴만 보면 재시작으로 보이지 않아 새 사건 seq 1, 2를 보낸 것으로 친다.
+        assert!(!oom_ring_restarted(2, 3));
+        // 인스턴스 ID로 재시작을 확인하면 커서를 새 ring 기준으로 다시 잡는다.
+        assert_eq!(next_oom_cursor(2, 3, true, true), 3);
+        // 사건이 없는 새 인스턴스 — 옛 커서 2가 남으면 이후 seq 1, 2가 걸러진다.
+        assert_eq!(next_oom_cursor(2, 0, true, true), 0);
+        // 재시작 tick의 배치가 어디에도 남지 않았으면 다음 폴에서 ring 전체를 다시 시도한다.
+        assert_eq!(next_oom_cursor(2, 3, false, true), 0);
+    }
+
+    #[test]
+    fn agent_instance_covers_every_case() {
+        use AgentInstance::*;
+        // ID를 처음 알게 된 tick은 비교 대상이 없어 같은 인스턴스로 본다.
+        assert_eq!(agent_instance(None, Some("a"), Some("a")), Same);
+        assert_eq!(agent_instance(Some("a"), Some("a"), Some("a")), Same);
+        assert_eq!(agent_instance(Some("a"), Some("b"), Some("b")), Restarted);
+        // collect 도중 재시작 — 어느 인스턴스의 값인지 모른다.
+        assert_eq!(agent_instance(Some("a"), Some("a"), Some("b")), Changing);
+        assert_eq!(agent_instance(None, Some("a"), Some("b")), Changing);
+        // 한쪽이라도 못 읽으면 추정으로 물러난다.
+        assert_eq!(agent_instance(Some("a"), None, Some("a")), Unknown);
+        assert_eq!(agent_instance(Some("a"), Some("a"), None), Unknown);
+        assert_eq!(agent_instance(None, None, None), Unknown);
+    }
+
+    #[test]
+    fn counter_points_reports_full_cumulative_after_confirmed_restart() {
+        let prev = counters(&[("aic.kernel.forks", 500)]);
+        let cur = counters(&[("aic.kernel.forks", 700)]);
+        let value = |pts: Vec<MetricPoint>| match pts.as_slice() {
+            [p] => match p.value {
+                MetricValue::Int(v) => v,
+                MetricValue::Double(_) => panic!("커널 카운터는 Int여야 한다"),
+            },
+            other => panic!("점 하나를 기대했다: {}", other.len()),
+        };
+        // 새 인스턴스는 직전 폴 뒤에 떴다 — 700 전부가 이번 구간의 사건이다.
+        assert_eq!(value(counter_points(Some(&prev), &cur, true)), 700);
+        // 같은 인스턴스라면 차분.
+        assert_eq!(value(counter_points(Some(&prev), &cur, false)), 200);
+    }
+
+    #[test]
+    fn parse_instance_id_reads_manifestz_envelope() {
+        assert_eq!(
+            parse_instance_id(br#"{"manifest_schema_version":"rca.manifest.v1","agent_instance_id":"3756406f-25a9-4e55-88e3-93a085725aa7"}"#),
+            Some("3756406f-25a9-4e55-88e3-93a085725aa7".to_string())
+        );
+        assert_eq!(parse_instance_id(br#"{"agent_instance_id":""}"#), None);
+        assert_eq!(parse_instance_id(br#"{"signals":[]}"#), None);
+        assert_eq!(parse_instance_id(b"404 page not found"), None);
     }
 }
