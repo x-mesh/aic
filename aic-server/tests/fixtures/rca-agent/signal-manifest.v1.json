@@ -1,0 +1,654 @@
+{
+  "manifest_schema_version": "rca.manifest.v1",
+  "signals": [
+    {
+      "id": "capability_check",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 2,
+      "hooks": [
+        {
+          "role": "capable",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "lsm",
+              "target": "capable",
+              "requires": [
+                "lsm",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "kretprobe",
+              "target": "security_capable",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "u64_cumulative",
+          "keys": [
+            "capability_failures"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "process_lifecycle",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 4,
+      "hooks": [
+        {
+          "role": "fork",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "sched/sched_process_fork",
+              "requires": []
+            }
+          ]
+        },
+        {
+          "role": "exit",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "sched/sched_process_exit",
+              "requires": []
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "u64_cumulative",
+          "keys": [
+            "fork",
+            "exit"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "userspace",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 6,
+      "hooks": [
+        {
+          "role": "malloc",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "uprobe",
+              "target": "libc.so.6:malloc",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "free",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "uprobe",
+              "target": "libc.so.6:free",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "usdt_memory_malloc_retry",
+          "required": false,
+          "candidates": [
+            {
+              "flavor": "uprobe",
+              "target": "libc:memory_malloc_retry",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "u64_cumulative",
+          "keys": [
+            "malloc",
+            "free",
+            "usdt_memory_malloc_retry"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "scheduler",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 3,
+      "hooks": [
+        {
+          "role": "wakeup",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tp_btf",
+              "target": "sched_wakeup",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "raw_tracepoint",
+              "target": "sched_wakeup",
+              "requires": [
+                "raw_tracepoint"
+              ]
+            },
+            {
+              "flavor": "tracepoint",
+              "target": "sched/sched_wakeup",
+              "requires": []
+            }
+          ]
+        },
+        {
+          "role": "switch",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tp_btf",
+              "target": "sched_switch",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "raw_tracepoint",
+              "target": "sched_switch",
+              "requires": [
+                "raw_tracepoint"
+              ]
+            },
+            {
+              "flavor": "tracepoint",
+              "target": "sched/sched_switch",
+              "requires": []
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "latency_histogram",
+          "keys": [
+            "unit",
+            "bucket_upper_bounds",
+            "counts",
+            "total"
+          ]
+        },
+        "top": {
+          "key": "scheduler",
+          "stable_fields": [
+            "items",
+            "by_comm",
+            "by_cgroup"
+          ]
+        }
+      }
+    },
+    {
+      "id": "oom",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 2,
+      "hooks": [
+        {
+          "role": "counter",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "oom/mark_victim",
+              "requires": []
+            }
+          ]
+        },
+        {
+          "role": "event",
+          "required": false,
+          "candidates": [
+            {
+              "flavor": "fentry",
+              "target": "oom_kill_process",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "tracepoint",
+              "target": "oom/mark_victim",
+              "requires": []
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "u64_cumulative",
+          "keys": [
+            "kills"
+          ]
+        },
+        "top": {
+          "key": "oom",
+          "stable_fields": [
+            "by_comm",
+            "by_cgroup"
+          ]
+        }
+      }
+    },
+    {
+      "id": "block_io",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 3,
+      "hooks": [
+        {
+          "role": "latency",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tp_btf",
+              "target": "block_rq_issue+block_rq_complete",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "fentry",
+              "target": "blk_account_io_done",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "latency_histogram",
+          "keys": [
+            "unit",
+            "bucket_upper_bounds",
+            "counts",
+            "total"
+          ]
+        },
+        "top": {
+          "key": "block_io",
+          "stable_fields": [
+            "items",
+            "by_comm",
+            "by_cgroup"
+          ]
+        }
+      }
+    },
+    {
+      "id": "network",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 0,
+      "hooks": [
+        {
+          "role": "traffic",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fexit",
+              "target": "tcp_sendmsg+tcp_recvmsg",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "retransmit",
+          "required": false,
+          "candidates": [
+            {
+              "flavor": "fentry",
+              "target": "tcp_retransmit_skb",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": null,
+        "top": {
+          "key": "network",
+          "stable_fields": []
+        }
+      }
+    },
+    {
+      "id": "tcp_servicemap",
+      "stability": "experimental",
+      "delivers": true,
+      "cardinality_max": 3,
+      "hooks": [
+        {
+          "role": "active",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fentry",
+              "target": "tcp_connect",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "kprobe",
+              "target": "tcp_connect",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "passive",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fexit",
+              "target": "inet_csk_accept",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            },
+            {
+              "flavor": "kretprobe",
+              "target": "inet_csk_accept",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "state",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "sock/inet_sock_set_state",
+              "requires": []
+            }
+          ]
+        },
+        {
+          "role": "early_passive_v4",
+          "required": false,
+          "candidates": [
+            {
+              "flavor": "kretprobe",
+              "target": "tcp_v4_syn_recv_sock",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "early_passive_v6",
+          "required": false,
+          "candidates": [
+            {
+              "flavor": "kretprobe",
+              "target": "tcp_v6_syn_recv_sock",
+              "requires": [
+                "kprobe"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": null,
+        "top": {
+          "key": "network",
+          "field": "servicemap",
+          "stable_fields": []
+        }
+      }
+    },
+    {
+      "id": "syscall",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 12,
+      "hooks": [
+        {
+          "role": "enter",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "raw_syscalls/sys_enter",
+              "requires": []
+            }
+          ]
+        },
+        {
+          "role": "exit",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "raw_syscalls/sys_exit",
+              "requires": []
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "per_name_latency_histogram",
+          "keys": [
+            "unit",
+            "bucket_upper_bounds",
+            "counts",
+            "total"
+          ],
+          "names": [
+            "read",
+            "write",
+            "openat",
+            "futex"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "file_io",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 4,
+      "hooks": [
+        {
+          "role": "vfs_read_enter",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fentry",
+              "target": "vfs_read",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "vfs_read_exit",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fexit",
+              "target": "vfs_read",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "vfs_write_enter",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fentry",
+              "target": "vfs_write",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        },
+        {
+          "role": "vfs_write_exit",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "fexit",
+              "target": "vfs_write",
+              "requires": [
+                "tracing",
+                "btf"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "latency_histogram",
+          "keys": [
+            "unit",
+            "bucket_upper_bounds",
+            "counts",
+            "total"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "context_switch",
+      "stability": "stable",
+      "delivers": true,
+      "cardinality_max": 2,
+      "hooks": [
+        {
+          "role": "switch",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "tracepoint",
+              "target": "sched/sched_switch",
+              "requires": []
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": {
+          "shape": "u64_cumulative",
+          "keys": [
+            "switches"
+          ]
+        },
+        "top": null
+      }
+    },
+    {
+      "id": "profiling",
+      "stability": "experimental",
+      "delivers": false,
+      "cardinality_max": 0,
+      "hooks": [
+        {
+          "role": "cpu_sample",
+          "required": true,
+          "candidates": [
+            {
+              "flavor": "perf_event",
+              "target": "software:cpu-clock",
+              "requires": [
+                "perf_event"
+              ]
+            }
+          ]
+        }
+      ],
+      "observations": {
+        "counters": null,
+        "top": null
+      }
+    }
+  ],
+  "collect": {
+    "endpoint": "/collectz",
+    "method": "POST",
+    "profiles": [
+      "incident"
+    ],
+    "default_profile": "incident",
+    "duration": {
+      "format": "go_duration",
+      "default": "30s",
+      "min": "0s",
+      "max": "5m0s",
+      "zero": "start_end_back_to_back",
+      "out_of_range_status": 400
+    },
+    "observations_unit": "cumulative_counts_with_window_delta"
+  }
+}

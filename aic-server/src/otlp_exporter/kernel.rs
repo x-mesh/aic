@@ -17,8 +17,9 @@
 //! 미관측). 그 사이 fork storm이 나면 통째로 안 보인다. 폴링은 두 폴 사이 전 구간을 담고,
 //! 블로킹이 없어 동시 collect 경합도 사라진다.
 //!
-//! **감수 사항**: `duration=0` 동작은 실측으로 확인했지만 rca-agent의 문서화된 계약은 아직
-//! 아니다(그쪽 PRD Q3). 계약이 확정되기 전까지는 이 전제가 바뀔 수 있다.
+//! `duration=0` 동작과 카운터 키는 rca-agent 계약 `rca.manifest.v1`(RCA-eBPF ADR-0054,
+//! `docs/architecture/evidence-v1-schema.md`)이다. 이 계약에서 키 삭제·이름 변경은 새
+//! `manifest_schema_version`을 요구한다.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -85,36 +86,46 @@ pub fn ensure_loopback(raw: &str) -> anyhow::Result<String> {
     Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
-/// `rca.evidence.v1` 번들 → `aic.kernel.*` metric points. **순수 함수.**
+/// `observations.end` 안의 JSON pointer → metric 이름.
 ///
-/// `observations.delta`는 `{signal: {metric: count}}` 모양이라 이름을
-/// `aic.kernel.<signal>.<metric>`으로 평탄화한다. 값이 0인 항목도 보낸다 — "이 window에 아무 일도
-/// 없었다"는 사실 자체가 시계열의 정보이고, 빠지면 소비자가 결측과 0을 구분할 수 없다.
+/// 경로는 rca-agent 계약 `rca.manifest.v1`의 `observations.counters`를 따르며, 테스트가
+/// `tests/fixtures/rca-agent/signal-manifest.v1.json`과 대조한다. latency histogram 신호는 분포를
+/// 보내지 않고 `total`(모든 버킷 count의 합 = 관측한 이벤트 수)만 보낸다 — 분포는 rca-web으로
+/// 직행할 수 없어 로컬 조회 몫이다(PRD-RCA-AGENT-INTEGRATION §1.3). `file_io`는 생산자가
+/// `vfs_read`와 `vfs_write`를 한 histogram에 합쳐 읽기·쓰기를 나눌 수 없다.
+const KERNEL_COUNTERS: &[(&str, &str)] = &[
+    ("/context_switch/switches", "aic.kernel.context_switches"),
+    ("/process_lifecycle/fork", "aic.kernel.forks"),
+    ("/process_lifecycle/exit", "aic.kernel.exits"),
+    ("/oom/kills", "aic.kernel.oom_kills"),
+    (
+        "/capability_check/capability_failures",
+        "aic.kernel.capability_failures",
+    ),
+    ("/scheduler/total", "aic.kernel.runqueue_events"),
+    ("/block_io/total", "aic.kernel.block_ios"),
+    ("/file_io/total", "aic.kernel.file_ios"),
+    ("/syscall/read/total", "aic.kernel.syscalls.read"),
+    ("/syscall/write/total", "aic.kernel.syscalls.write"),
+    ("/syscall/openat/total", "aic.kernel.syscalls.openat"),
+    ("/syscall/futex/total", "aic.kernel.syscalls.futex"),
+];
+
+/// `rca.evidence.v1` 번들의 누적 카운터 → `aic.kernel.*` 이름별 값. **순수 함수.**
 ///
-/// 숫자가 아닌 값이나 예상 밖 구조는 조용히 건너뛴다(파싱 실패 = 빈 목록). metric 이름은 OTLP
-/// 인코더가 `&'static str`을 요구하므로 알려진 신호·메트릭 조합만 상수로 매핑한다 — 모르는
-/// 조합은 버린다(rca-agent가 신호를 추가하면 여기 한 줄이 늘어난다).
+/// `observations.end`에서 [`KERNEL_COUNTERS`]의 경로만 읽는다. 숫자가 아닌 값이나 예상 밖 구조는
+/// 조용히 건너뛴다(파싱 실패 = 빈 목록). metric 이름은 OTLP 인코더가 `&'static str`을 요구하므로
+/// 알려진 경로만 상수로 매핑하고, 모르는 신호는 버린다.
 pub fn read_counters(bundle_json: &str) -> BTreeMap<&'static str, i64> {
     let mut out = BTreeMap::new();
     let Ok(v) = serde_json::from_str::<Value>(bundle_json) else {
         return out;
     };
-    let Some(end) = v
-        .get("observations")
-        .and_then(|o| o.get("end"))
-        .and_then(Value::as_object)
-    else {
+    let Some(end) = v.get("observations").and_then(|o| o.get("end")) else {
         return out;
     };
-    for (signal, metrics) in end {
-        let Some(metrics) = metrics.as_object() else {
-            continue;
-        };
-        for (metric, value) in metrics {
-            let Some(name) = metric_name(signal, metric) else {
-                continue;
-            };
-            let Some(n) = value.as_i64() else { continue };
+    for &(pointer, name) in KERNEL_COUNTERS {
+        if let Some(n) = end.pointer(pointer).and_then(Value::as_i64) {
             out.insert(name, n);
         }
     }
@@ -154,23 +165,6 @@ pub fn diff_counters(
     // BTreeMap 순회라 이미 이름순이지만, 인코딩 결정성을 명시적으로 고정한다.
     points.sort_by_key(|p| p.name);
     points
-}
-
-/// (signal, metric) → metric 이름. 알려진 조합만 통과시킨다(allowlist).
-fn metric_name(signal: &str, metric: &str) -> Option<&'static str> {
-    Some(match (signal, metric) {
-        ("context_switch", "switches") => "aic.kernel.context_switches",
-        ("process_lifecycle", "fork") => "aic.kernel.forks",
-        ("process_lifecycle", "exit") => "aic.kernel.exits",
-        ("oom", "kills") => "aic.kernel.oom_kills",
-        ("capability_check", "failures") => "aic.kernel.capability_failures",
-        ("block_io", "ios") => "aic.kernel.block_ios",
-        ("file_io", "reads") => "aic.kernel.file_reads",
-        ("file_io", "writes") => "aic.kernel.file_writes",
-        ("syscall", "calls") => "aic.kernel.syscalls",
-        ("scheduler", "runqueue_events") => "aic.kernel.runqueue_events",
-        _ => return None,
-    })
 }
 
 /// OOM kill 이산 이벤트 하나 — ring buffer의 개별 사건.
@@ -809,5 +803,113 @@ mod tests {
             ensure_loopback("http://127.0.0.1:9090/").unwrap(),
             "http://127.0.0.1:9090"
         );
+    }
+
+    /// rca-agent 생산자 계약 `rca.manifest.v1`의 사본.
+    /// 출처: parametacorp/RCA-eBPF `docs/architecture/signal-manifest.v1.json` (main `bef779e04`,
+    /// ADR-0054 1단계 PR #91 산출물과 동일). 손으로 쓴 픽스처는 생산자 키가 바뀌어도 통과하므로
+    /// 카운터 모양은 이 파일에서만 만든다.
+    fn signal_manifest() -> Value {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/rca-agent/signal-manifest.v1.json"
+        )))
+        .expect("signal-manifest.v1.json 파싱")
+    }
+
+    const HISTOGRAM_TOTAL: i64 = 7;
+
+    /// manifest의 `observations.counters` 선언대로 `observations.end`를 합성한다. 누적 카운터는 1,
+    /// 히스토그램은 `total`만 `HISTOGRAM_TOTAL`이라 어느 키를 읽었는지 값으로 구분된다.
+    fn bundle_from_manifest(manifest: &Value) -> String {
+        let histogram = serde_json::json!({
+            "unit": "microseconds",
+            "bucket_upper_bounds": [10.0],
+            "counts": [3, 4],
+            "total": HISTOGRAM_TOTAL,
+        });
+        let mut end = serde_json::Map::new();
+        for signal in manifest["signals"].as_array().expect("signals 목록") {
+            let id = signal["id"].as_str().expect("signal id");
+            let counters = &signal["observations"]["counters"];
+            let names = |field: &str| -> Vec<String> {
+                counters[field]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|k| k.as_str().map(str::to_string))
+                    .collect()
+            };
+            let observed: serde_json::Map<String, Value> = match counters["shape"].as_str() {
+                Some("u64_cumulative") => names("keys")
+                    .into_iter()
+                    .map(|k| (k, Value::from(1)))
+                    .collect(),
+                Some("latency_histogram") => histogram.as_object().expect("histogram").clone(),
+                Some("per_name_latency_histogram") => names("names")
+                    .into_iter()
+                    .map(|n| (n, histogram.clone()))
+                    .collect(),
+                // 카운터 없는 신호, 또는 생산자가 추가한 새 모양 — 추가는 계약 위반이 아니다.
+                _ => continue,
+            };
+            end.insert(id.to_string(), Value::Object(observed));
+        }
+        serde_json::json!({"observations": {"end": end}}).to_string()
+    }
+
+    #[test]
+    fn read_counters_reads_every_manifest_counter_shape() {
+        let c = read_counters(&bundle_from_manifest(&signal_manifest()));
+        let expected = [
+            ("aic.kernel.context_switches", 1),
+            ("aic.kernel.forks", 1),
+            ("aic.kernel.exits", 1),
+            ("aic.kernel.oom_kills", 1),
+            ("aic.kernel.capability_failures", 1),
+            ("aic.kernel.runqueue_events", HISTOGRAM_TOTAL),
+            ("aic.kernel.block_ios", HISTOGRAM_TOTAL),
+            ("aic.kernel.file_ios", HISTOGRAM_TOTAL),
+            ("aic.kernel.syscalls.read", HISTOGRAM_TOTAL),
+            ("aic.kernel.syscalls.write", HISTOGRAM_TOTAL),
+            ("aic.kernel.syscalls.openat", HISTOGRAM_TOTAL),
+            ("aic.kernel.syscalls.futex", HISTOGRAM_TOTAL),
+        ];
+        let expected: BTreeMap<&str, i64> = expected.into_iter().collect();
+        let got: BTreeMap<&str, i64> = c.into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn kernel_counters_match_signal_manifest() {
+        let manifest = signal_manifest();
+        // 키 삭제·이름 변경은 schema version을 올린다(ADR-0054 §6). 버전이 바뀌면 표를 다시 대조한다.
+        assert_eq!(manifest["manifest_schema_version"], "rca.manifest.v1");
+        let signals = manifest["signals"].as_array().expect("signals 목록");
+        let contains = |list: &Value, key: &str| {
+            list.as_array()
+                .is_some_and(|a| a.iter().any(|k| k.as_str() == Some(key)))
+        };
+        for &(pointer, name) in KERNEL_COUNTERS {
+            let path: Vec<&str> = pointer.trim_start_matches('/').split('/').collect();
+            let signal = signals
+                .iter()
+                .find(|s| s["id"] == path[0])
+                .unwrap_or_else(|| panic!("{name}: manifest에 신호 {} 없음", path[0]));
+            let counters = &signal["observations"]["counters"];
+            let declared = match (counters["shape"].as_str(), path.as_slice()) {
+                (Some("u64_cumulative"), [_, key]) => contains(&counters["keys"], key),
+                // histogram은 스칼라 `total`만 읽는다. `counts`는 배열이라 as_i64가 걸러 낸다.
+                (Some("latency_histogram"), [_, "total"]) => contains(&counters["keys"], "total"),
+                (Some("per_name_latency_histogram"), [_, syscall, "total"]) => {
+                    contains(&counters["names"], syscall) && contains(&counters["keys"], "total")
+                }
+                _ => false,
+            };
+            assert!(
+                declared,
+                "{name}: {pointer}가 manifest 카운터 선언과 맞지 않는다: {counters}"
+            );
+        }
     }
 }
