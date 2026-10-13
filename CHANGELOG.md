@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [0.50.15] - 2026-10-13
+
+### Added
+
+- rca-agent의 scheduler·block_io 지연 히스토그램에서 임계치를 넘은 건수를 `aic.kernel.runqueue_events.over_1ms`·`over_10ms`, `aic.kernel.block_ios.over_10ms`(경계 10.24ms)·`over_50ms`로 보낸다. 지연 분포 자체는 보내지 않는다. 값이 오려면 rca-agent에서 해당 신호를 켜야 한다.
+
+### Fixed
+
+- `aic.kernel.*` 10개 중 6개가 rca-agent가 내지 않는 키를 찾고 있어 한 번도 송신되지 않던 문제를 고쳤다. 이제 `capability_failures`, `block_ios`, `runqueue_events`가 송신된다. `file_reads`·`file_writes`는 `aic.kernel.file_ios` 하나로, `syscalls`는 `aic.kernel.syscalls.read`·`write`·`openat`·`futex`로 바뀌었다.
+- rca-agent가 재시작한 직후의 OOM 사건 일부를 보낸 것으로 착각해 버릴 수 있던 문제를 고쳤다. rca-agent의 `/manifestz`로 재시작을 확인하면 새 인스턴스의 OOM 사건과 카운터 증가분을 모두 보낸다. `/manifestz`가 없는 rca-agent(v0.8.0 등)에서는 이전처럼 동작한다.
+
 ## [0.50.14] - 2026-10-07
 
 ### Added
