@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.50.17] - 2026-10-14
+
+### Added
+
+- `aic workload enable`에 `--auth-file NAME`을 추가했다. systemd로 도는 aicd가 읽을 수 있는 `file:NAME` 비밀(`~/.config/aic/secrets/NAME`)을 명령줄 등록에서 바로 지정한다. 파일이 있으면 소유자만 읽을 수 있는지 확인한 뒤 재사용하고, 없으면 터미널 프롬프트나 `--password-stdin`으로 비밀번호를 받아 0600으로 저장한다. 이미 있는 파일은 덮어쓰지 않는다. 이제 `--query-digest`와 함께 명령 하나로 등록할 수 있다.
+
 ## [0.50.16] - 2026-10-14
 
 ### Added
