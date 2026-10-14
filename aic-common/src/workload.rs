@@ -1410,7 +1410,7 @@ impl QueryDigestTracker {
         }
         self.previous_now_us = Some(snapshot.server_now_us);
         self.evict();
-        changed.sort_by(|left, right| right.2.timer_wait_ps.cmp(&left.2.timer_wait_ps));
+        changed.sort_by_key(|(_, _, delta)| std::cmp::Reverse(delta.timer_wait_ps));
         changed.truncate(MYSQL_QUERY_DIGEST_TOP);
         QueryDigestReport {
             baseline: window_start.is_none(),
