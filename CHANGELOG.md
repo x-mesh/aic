@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.50.16] - 2026-10-14
+
+### Added
+
+- MySQL workload의 문장 통계를 볼 수 있다. `aic workload enable ... --query-digest`로 켜면 aicd가 60초마다 `performance_schema.events_statements_summary_by_digest`를 읽어, 그 구간에 시간을 가장 많이 쓴 정규화 문장 10개(호출 수, 총·평균 시간, 검사한 행 수, 인덱스 미사용 횟수, 오류 수)를 `workload-query-digests.jsonl`에 남기고 `aic workload status`에 보여 준다. 모니터 계정에 `performance_schema` 조회 권한이 필요하다. 읽지 못하면 `permission_denied`, `consumer_disabled` 같은 이유를 남기며, 기존 상태값 수집에는 영향이 없다. 리터럴 값이 든 `QUERY_SAMPLE_TEXT`와 `SQL_TEXT`는 읽지 않는다.
+- `aicd.exporter.workload_enabled`가 켜져 있으면 위 문장 통계를 OTLP logs(scope `aic.workload.query`)로 rca-web에 보낸다. MySQL이 리터럴을 `?`로 바꾼 문장 텍스트가 호스트 밖으로 나가며, 테이블·컬럼 이름은 남는다. 두 옵션을 이미 켜 둔 호스트는 업그레이드 후 바로 보내기 시작한다.
+
 ## [0.50.15] - 2026-10-13
 
 ### Added
