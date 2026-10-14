@@ -8,6 +8,10 @@
 //! 보존하고 리소스 속성은 host 식별 외에는 버리기 때문이다. 연결 주소(endpoint)와 계정은 보내지
 //! 않는다. 수집 성공 여부는 `aic.workload.up`(1/0)과 `status` 속성으로 보낸다.
 //!
+//! **문장 통계**: `query_digest`를 켠 MySQL workload의 poll 기록은 지표가 아니라 OTLP logs
+//! (`aic.workload.query` scope)로 보낸다. 문장마다 digest와 텍스트가 붙어 지표 속성으로 보내면
+//! rca-web의 1분 롤업에서 문장 구분이 사라지기 때문이다.
+//!
 //! **누적 카운터**: rca-web에는 rate 함수가 없으므로 누적 필드는 두 sample 사이 증가분을 보낸다
 //! (`kernel` exporter와 같은 규칙). workload의 첫 sample은 기준선만 잡는다. 값이 줄면 서비스가
 //! 재시작된 것으로 보고 그 필드는 이번에 보내지 않고 기준선만 새로 잡는다.
@@ -16,8 +20,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aic_common::workload::{
-    workload_adapter_name, workload_metric_fields, workload_short_name, WorkloadSample,
-    WorkloadSampleFailure, WorkloadSampleOutcome,
+    workload_adapter_name, workload_metric_fields, workload_short_name, QueryDigestSample,
+    WorkloadSample, WorkloadSampleFailure, WorkloadSampleOutcome,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -26,10 +30,18 @@ use crate::live_config::{self, LiveExporterConfig};
 use super::backoff::Backoff;
 use super::encode::{self, AttributedPoint};
 use super::host_metrics::{MetricValue, ResourceAttrs};
+use super::logs_proto;
 use super::spool::{SignalKind, Spool};
 
 const UP_METRIC: &str = "aic.workload.up";
 const METRIC_PREFIX: &str = "aic.workload";
+
+/// 수집기가 송신기로 넘기는 기록. 지표 sample과 문장 통계 poll은 보내는 경로가 다르다.
+#[derive(Debug, Clone)]
+pub enum WorkloadExport {
+    Sample(WorkloadSample),
+    QueryDigest(QueryDigestSample),
+}
 
 /// workload exporter 설정. 다른 exporter task와 spool·health를 공유한다.
 pub struct WorkloadExportConfig {
@@ -119,7 +131,7 @@ fn sample_points(sample: &WorkloadSample, baseline: &mut CounterBaseline) -> Vec
 /// 맡는다).
 pub async fn serve_workload(
     cfg: WorkloadExportConfig,
-    mut samples: mpsc::Receiver<WorkloadSample>,
+    mut samples: mpsc::Receiver<WorkloadExport>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
@@ -127,6 +139,7 @@ pub async fn serve_workload(
         .connect_timeout(std::time::Duration::from_secs(3))
         .build()?;
     let url = super::metrics_url(&cfg.endpoint);
+    let logs_url = super::logs_url(&cfg.endpoint);
     tracing::info!(url = %url, "OTLP workload exporter 시작");
 
     // host_metrics와 같은 방식으로 얻어야 같은 host.id로 다른 signal과 상관관계를 지을 수 있다.
@@ -145,15 +158,32 @@ pub async fn serve_workload(
         if *shutdown.borrow() {
             break;
         }
-        let sample = tokio::select! {
-            sample = samples.recv() => match sample {
-                Some(sample) => sample,
+        let export = tokio::select! {
+            export = samples.recv() => match export {
+                Some(export) => export,
                 None => break,
             },
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
+                continue;
+            }
+        };
+        let sample = match export {
+            WorkloadExport::Sample(sample) => sample,
+            WorkloadExport::QueryDigest(digest) => {
+                let body = logs_proto::encode_query_digests(
+                    &digest,
+                    &logs_proto::ResourceAttrs {
+                        host_name: &resource.host_name,
+                        host_id: &resource.host_id,
+                        os_type: &resource.os_type,
+                        host_ip: None,
+                    },
+                    &cfg.service_version,
+                );
+                push_query_digest(&cfg, &client, &logs_url, body, &mut backoff).await;
                 continue;
             }
         };
@@ -188,6 +218,37 @@ pub async fn serve_workload(
     }
     tracing::info!("OTLP workload exporter 종료");
     Ok(())
+}
+
+/// 문장 통계 logs를 보낸다. 실패하면 지표와 같은 spool의 logs 칸에 쌓아 재전송에 맡긴다.
+async fn push_query_digest(
+    cfg: &WorkloadExportConfig,
+    client: &reqwest::Client,
+    url: &str,
+    body: Vec<u8>,
+    backoff: &mut Backoff,
+) {
+    if !backoff.ready() {
+        if let Err(e) = cfg.spool.append(SignalKind::Logs, &body) {
+            tracing::warn!(error = %e, "OTLP query digest spool append 실패 — 이 poll 유실");
+        }
+        return;
+    }
+    let token = live_config::effective_token(cfg.live.as_ref(), &cfg.token);
+    match super::push_logs(client, url, token.as_deref(), body.clone()).await {
+        Ok(_) => {
+            backoff.on_success();
+            cfg.health.record_ok();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "OTLP query digest push 실패 — spool에 적재");
+            if let Err(e2) = cfg.spool.append(SignalKind::Logs, &body) {
+                tracing::warn!(error = %e2, "OTLP query digest spool append 실패 — 이 poll 유실");
+            }
+            backoff.on_failure();
+            cfg.health.record_fail(url, &e);
+        }
+    }
 }
 
 #[cfg(test)]

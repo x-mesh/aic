@@ -1020,6 +1020,7 @@ const QUERY_DIGEST_EVICT_AFTER_POLLS: u64 = 10;
 /// one interval, so the poll only sets a new baseline.
 const QUERY_DIGEST_STALE_AFTER_US: u64 = 3 * WORKLOAD_SAMPLE_INTERVAL.as_secs() * MICROS_PER_SEC;
 const MICROS_PER_SEC: u64 = 1_000_000;
+const MICROS_PER_MILLI: u64 = 1_000;
 /// `performance_schema` timers count picoseconds.
 const PICOS_PER_MICRO: u64 = 1_000_000;
 /// ER_DBACCESS_DENIED_ERROR, ER_TABLEACCESS_DENIED_ERROR, ER_COLUMNACCESS_DENIED_ERROR.
@@ -1252,6 +1253,16 @@ pub struct QueryDigestReport {
     pub unattributed_calls: u64,
     /// The poll read the row limit. Statements with less total time can be missing.
     pub row_limit_reached: bool,
+    /// Length of the interval that the differences cover, by the MySQL server clock. `0` when
+    /// the poll only set the baseline. Records written before this field default to `0`.
+    #[serde(default)]
+    pub interval_ms: u64,
+    /// Calls and time of every row read in this poll, the overflow row included, so that a reader
+    /// can tell what share of the interval the top statements hold.
+    #[serde(default)]
+    pub observed_calls: u64,
+    #[serde(default)]
+    pub observed_time_us: u64,
 }
 
 pub type QueryDigestPoll = std::result::Result<QueryDigestReport, QueryDigestUnavailable>;
@@ -1382,6 +1393,7 @@ impl QueryDigestTracker {
         self.polls += 1;
         let mut changed = Vec::new();
         let mut unattributed_calls = 0;
+        let mut observed = DigestCounters::default();
         for row in &snapshot.rows {
             let key = (row.schema.clone(), row.digest.clone());
             let delta = window_start.and_then(|start| match self.baselines.get(&key) {
@@ -1400,6 +1412,10 @@ impl QueryDigestTracker {
                     last_poll: self.polls,
                 },
             );
+            if let Some(delta) = delta {
+                observed.calls += delta.calls;
+                observed.timer_wait_ps = observed.timer_wait_ps.saturating_add(delta.timer_wait_ps);
+            }
             match (delta, &row.digest) {
                 (Some(delta), None) => unattributed_calls += delta.calls,
                 (Some(delta), Some(digest)) if delta.calls > 0 => {
@@ -1431,6 +1447,11 @@ impl QueryDigestTracker {
                 .collect(),
             unattributed_calls,
             row_limit_reached: snapshot.rows.len() >= MYSQL_QUERY_DIGEST_ROW_LIMIT,
+            interval_ms: window_start.map_or(0, |start| {
+                snapshot.server_now_us.saturating_sub(start) / MICROS_PER_MILLI
+            }),
+            observed_calls: observed.calls,
+            observed_time_us: observed.timer_wait_ps / PICOS_PER_MICRO,
         }
     }
 
@@ -6087,6 +6108,12 @@ path = "/usr/bin/redis-server"
         );
         assert!(!second.baseline);
         assert_eq!(top_calls(&second), [("b", 20), ("a", 5)]);
+        assert_eq!(second.interval_ms, MINUTE_US / MICROS_PER_MILLI);
+        assert_eq!(
+            (second.observed_calls, second.observed_time_us),
+            (25, 9_000)
+        );
+        assert_eq!((first.interval_ms, first.observed_calls), (0, 0));
         let b = &second.top[0];
         assert_eq!(b.total_time_us, 8_000);
         assert_eq!(b.lock_time_us, 20);
@@ -6166,6 +6193,8 @@ path = "/usr/bin/redis-server"
         );
         assert_eq!(report.unattributed_calls, 30);
         assert_eq!(top_calls(&report), [("a", 2)]);
+        // The overflow row counts toward the observed total, so the top share stays honest.
+        assert_eq!(report.observed_calls, 32);
         assert!(!report.row_limit_reached);
 
         let full = poll(
@@ -6256,6 +6285,9 @@ path = "/usr/bin/redis-server"
                 .collect(),
             unattributed_calls: 0,
             row_limit_reached: false,
+            interval_ms: 0,
+            observed_calls: 0,
+            observed_time_us: 0,
         };
         tracker.remember_text("b".to_string(), "SELECT 1");
         assert_eq!(tracker.missing_texts(&report), ["a"]);
@@ -6405,6 +6437,9 @@ path = "/usr/bin/redis-server"
                 top: Vec::new(),
                 unattributed_calls: 2,
                 row_limit_reached: false,
+                interval_ms: 0,
+                observed_calls: 0,
+                observed_time_us: 0,
             }),
         };
         let unavailable = QueryDigestSample {
@@ -6425,6 +6460,25 @@ path = "/usr/bin/redis-server"
         let metric_line = r#"{"schema_version":1,"workload_id":"exe:/usr/sbin/mysqld","captured_at":"2026-10-14T00:00:00Z","adapter":"my_sql","outcome":"failed","reason":"rejected","detail":"x"}"#;
         assert!(serde_json::from_str::<WorkloadSample>(metric_line).is_ok());
         assert!(serde_json::from_str::<QueryDigestSample>(metric_line).is_err());
+    }
+
+    #[test]
+    fn query_digest_records_from_before_the_totals_still_parse() {
+        let line = r#"{"schema_version":1,"workload_id":"mysql","captured_at":"2026-10-14T00:00:00Z","outcome":"collected","baseline":false,"top":[],"unattributed_calls":0,"row_limit_reached":false}"#;
+        let QueryDigestOutcome::Collected(report) = serde_json::from_str::<QueryDigestSample>(line)
+            .unwrap()
+            .outcome
+        else {
+            panic!("expected a collected record");
+        };
+        assert_eq!(
+            (
+                report.interval_ms,
+                report.observed_calls,
+                report.observed_time_us
+            ),
+            (0, 0, 0)
+        );
     }
 
     #[test]
