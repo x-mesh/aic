@@ -215,6 +215,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Redis,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: None,
+        query_digest: false,
     };
     let nginx_definition = WorkloadDefinition {
         id: "nginx-test".into(),
@@ -230,6 +231,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let memcached_definition = WorkloadDefinition {
         id: "memcached-test".into(),
@@ -239,6 +241,7 @@ fn workload_status_and_history_read_local_history() {
         adapter: WorkloadAdapter::Memcached,
         driver_mode: WorkloadDriverMode::MonitorReady,
         connection: None,
+        query_digest: false,
     };
     let postgresql_definition = WorkloadDefinition {
         id: "postgresql-test".into(),
@@ -254,6 +257,7 @@ fn workload_status_and_history_read_local_history() {
             database: Some("postgres".into()),
             auth_source: None,
         }),
+        query_digest: false,
     };
     let mysql_definition = WorkloadDefinition {
         id: "mysql-test".into(),
@@ -269,6 +273,7 @@ fn workload_status_and_history_read_local_history() {
             database: Some("metrics".into()),
             auth_source: None,
         }),
+        query_digest: false,
     };
     let mongodb_definition = WorkloadDefinition {
         id: "mongodb-test".into(),
@@ -284,6 +289,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: Some("admin".into()),
         }),
+        query_digest: false,
     };
     let prometheus_definition = WorkloadDefinition {
         id: "prometheus-test".into(),
@@ -299,6 +305,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let clickhouse_definition = WorkloadDefinition {
         id: "clickhouse-test".into(),
@@ -314,6 +321,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let etcd_definition = WorkloadDefinition {
         id: "etcd-test".into(),
@@ -329,6 +337,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let elasticsearch_definition = WorkloadDefinition {
         id: "elasticsearch-test".into(),
@@ -344,6 +353,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let opensearch_definition = WorkloadDefinition {
         id: "opensearch-test".into(),
@@ -359,6 +369,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     let rabbitmq_definition = WorkloadDefinition {
         id: "rabbitmq-test".into(),
@@ -374,6 +385,7 @@ fn workload_status_and_history_read_local_history() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     std::fs::write(
         config_dir.join("workloads.toml"),
@@ -1035,6 +1047,7 @@ fn haproxy_history_hides_the_socket_path_and_reads_persisted_config() {
             database: None,
             auth_source: None,
         }),
+        query_digest: false,
     };
     std::fs::write(
         config_dir.join("workloads.toml"),

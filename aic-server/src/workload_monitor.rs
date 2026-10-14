@@ -1,16 +1,22 @@
 use aic_common::workload::{
-    adapter_definitions_conflict, workload_history_path, workloads_file_path, WorkloadAdapter,
-    WorkloadDefinition, WorkloadMetrics, WorkloadProbeError, WorkloadSample, WorkloadSampleFailure,
-    WorkloadSampleOutcome, WorkloadStore, MAX_WORKLOAD_HISTORY_SAMPLES, WORKLOAD_SAMPLE_INTERVAL,
+    adapter_definitions_conflict, workload_history_path, workloads_file_path, QueryDigestSample,
+    QueryDigestTracker, WorkloadAdapter, WorkloadConnectionConfig, WorkloadDefinition,
+    WorkloadMetrics, WorkloadProbeError, WorkloadSample, WorkloadSampleFailure,
+    WorkloadSampleOutcome, WorkloadStore, MAX_QUERY_DIGEST_HISTORY_SAMPLES,
+    MAX_WORKLOAD_HISTORY_SAMPLES, QUERY_DIGEST_HISTORY_FILE, WORKLOAD_SAMPLE_INTERVAL,
     WORKLOAD_SAMPLE_SCHEMA_VERSION,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio::time::MissedTickBehavior;
@@ -46,6 +52,9 @@ pub enum TickOutcome {
     Skipped(DefinitionsState),
     Appended(WorkloadSample),
 }
+
+/// workload id별 문장 기준선. 수집 스레드는 tick마다 새로 뜨므로 기준선은 루프가 들고 있다.
+type QueryDigestTrackers = Arc<Mutex<HashMap<String, QueryDigestTracker>>>;
 
 pub fn load_redis_definition(path: &Path) -> DefinitionsState {
     load_adapter_definition(path, WorkloadAdapter::Redis)
@@ -206,6 +215,48 @@ pub fn collect_once(
     Ok(TickOutcome::Appended(sample))
 }
 
+/// MySQL 상태값과 함께 문장 통계를 읽는다. 문장 기록 실패는 지표 sample을 막지 않는다.
+fn collect_mysql_with_query_digest(
+    cfg: &WorkloadMonitorConfig,
+    definition: &WorkloadDefinition,
+    connection: &WorkloadConnectionConfig,
+    trackers: &QueryDigestTrackers,
+    now: DateTime<Utc>,
+) -> Result<TickOutcome> {
+    let mut trackers = trackers.lock().unwrap_or_else(PoisonError::into_inner);
+    let tracker = trackers.entry(definition.id.clone()).or_default();
+    let mut poll = None;
+    let outcome = collect_once(
+        cfg,
+        definition,
+        || {
+            aic_common::workload::monitor_mysql_with_query_digest(connection, tracker).map(
+                |(endpoint, metrics, digest)| {
+                    poll = Some(digest);
+                    (endpoint, WorkloadMetrics::MySql(metrics))
+                },
+            )
+        },
+        now,
+    );
+    if let Some(poll) = poll {
+        let sample = QueryDigestSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: definition.id.clone(),
+            captured_at: now,
+            outcome: poll.into(),
+        };
+        if let Err(error) = append_sample_with_limit(
+            &query_digest_history_path(cfg),
+            &sample,
+            MAX_QUERY_DIGEST_HISTORY_SAMPLES,
+        ) {
+            tracing::warn!(workload = %definition.id, error = %error, "MySQL 문장 통계 기록 실패");
+        }
+    }
+    outcome
+}
+
 fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
     match adapter {
         WorkloadAdapter::Redis => "Redis endpoint is unavailable",
@@ -267,9 +318,14 @@ pub fn append_sample(path: &Path, sample: &WorkloadSample) -> Result<()> {
     append_sample_with_limit(path, sample, MAX_WORKLOAD_HISTORY_SAMPLES)
 }
 
-fn append_sample_with_limit(
+/// 문장 기록은 지표 기록 옆 별도 파일에 둔다. 지표 기록만 읽는 쪽이 문장 텍스트를 보지 않게 하려는 것이다.
+fn query_digest_history_path(cfg: &WorkloadMonitorConfig) -> PathBuf {
+    cfg.history_path.with_file_name(QUERY_DIGEST_HISTORY_FILE)
+}
+
+fn append_sample_with_limit<T: Serialize + DeserializeOwned>(
     path: &Path,
-    sample: &WorkloadSample,
+    sample: &T,
     max_samples: usize,
 ) -> Result<()> {
     let parent = path
@@ -305,15 +361,15 @@ fn append_sample_with_limit(
     }
     writeln!(file, "{}", serde_json::to_string(sample)?)?;
     file.sync_data()?;
-    trim_to_max(path, max_samples)
+    trim_to_max::<T>(path, max_samples)
 }
 
-fn trim_to_max(path: &Path, max: usize) -> Result<()> {
+fn trim_to_max<T: Serialize + DeserializeOwned>(path: &Path, max: usize) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let valid = content
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<WorkloadSample>(line).ok())
+        .filter_map(|line| serde_json::from_str::<T>(line).ok())
         .collect::<Vec<_>>();
     let non_blank = content
         .lines()
@@ -354,6 +410,7 @@ pub async fn serve_with_export(
     let mut interval = tokio::time::interval(cfg.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous = Vec::new();
+    let trackers = QueryDigestTrackers::default();
     loop {
         if *shutdown.borrow() {
             break;
@@ -402,7 +459,7 @@ pub async fn serve_with_export(
                         _ => Vec::new(),
                     };
                     for definition in definitions {
-                        let result = match start_collection_thread(cfg.clone(), definition) {
+                        let result = match start_collection_thread(cfg.clone(), definition, trackers.clone()) {
                             Ok(result) => result,
                             Err(error) => {
                                 tracing::warn!(?adapter, error = %error, "workload collector thread failed to start");
@@ -447,6 +504,7 @@ fn state_tag(state: &DefinitionsState) -> &'static str {
 fn start_collection_thread(
     cfg: WorkloadMonitorConfig,
     definition: WorkloadDefinition,
+    trackers: QueryDigestTrackers,
 ) -> std::io::Result<oneshot::Receiver<Result<TickOutcome>>> {
     let (sender, receiver) = oneshot::channel();
     std::thread::Builder::new()
@@ -499,6 +557,13 @@ fn start_collection_thread(
                     ),
                 },
                 WorkloadAdapter::MySql => match definition.connection.as_ref() {
+                    Some(connection) if definition.query_digest => collect_mysql_with_query_digest(
+                        &cfg,
+                        &definition,
+                        connection,
+                        &trackers,
+                        Utc::now(),
+                    ),
                     Some(connection) => collect_once(
                         &cfg,
                         &definition,
@@ -715,6 +780,7 @@ mod tests {
             adapter: WorkloadAdapter::Redis,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -727,6 +793,7 @@ mod tests {
             adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -745,6 +812,7 @@ mod tests {
                 database: Some("postgres".into()),
                 auth_source: None,
             }),
+            query_digest: false,
         }
     }
 
@@ -763,6 +831,7 @@ mod tests {
                 database: None,
                 auth_source: None,
             }),
+            query_digest: false,
         }
     }
 
@@ -794,6 +863,7 @@ mod tests {
                 database: None,
                 auth_source: None,
             }),
+            query_digest: false,
         }
     }
 
@@ -821,6 +891,7 @@ mod tests {
             adapter: WorkloadAdapter::Prometheus,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -846,6 +917,7 @@ mod tests {
             adapter: WorkloadAdapter::ClickHouse,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -873,6 +945,7 @@ mod tests {
             adapter: WorkloadAdapter::Etcd,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -903,6 +976,7 @@ mod tests {
             adapter,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -943,6 +1017,7 @@ mod tests {
             adapter: WorkloadAdapter::RabbitMq,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -976,6 +1051,7 @@ mod tests {
                 database: None,
                 auth_source: None,
             }),
+            query_digest: false,
         }
     }
 
@@ -1006,6 +1082,7 @@ mod tests {
                 database: None,
                 auth_source: None,
             }),
+            query_digest: false,
         }
     }
 
@@ -2286,5 +2363,77 @@ mod tests {
         .await
         .unwrap();
         assert!(result.is_none());
+    }
+
+    fn query_digest_config(temp: &tempfile::TempDir) -> WorkloadMonitorConfig {
+        WorkloadMonitorConfig {
+            workloads_path: temp.path().join("workloads.toml"),
+            history_path: temp.path().join("state/aic/workload-history.jsonl"),
+            interval: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn query_digest_history_is_a_separate_bounded_file() {
+        use aic_common::workload::{
+            load_query_digest_history, QueryDigestOutcome, QueryDigestUnavailable,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = query_digest_config(&temp);
+        let path = query_digest_history_path(&cfg);
+        assert_eq!(
+            path,
+            temp.path()
+                .join("state/aic")
+                .join(QUERY_DIGEST_HISTORY_FILE)
+        );
+        let start = DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for minute in 0..5 {
+            let sample = QueryDigestSample {
+                schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+                workload_id: "mysql".into(),
+                captured_at: start + chrono::Duration::minutes(minute),
+                outcome: QueryDigestOutcome::Unavailable {
+                    reason: QueryDigestUnavailable::Timeout,
+                },
+            };
+            append_sample_with_limit(&path, &sample, 3).unwrap();
+        }
+        let kept = load_query_digest_history(&path).unwrap();
+        assert_eq!(kept.len(), 3);
+        assert_eq!(kept[0].captured_at, start + chrono::Duration::minutes(2));
+        assert!(!cfg.history_path.exists());
+    }
+
+    #[test]
+    fn unreachable_mysql_records_only_the_metric_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = query_digest_config(&temp);
+        let mut definition = mysql_definition();
+        definition.query_digest = true;
+        // Port 1 refuses the connection, so the status probe fails before any statement poll.
+        let connection = WorkloadConnectionConfig {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            ..definition.connection.clone().unwrap()
+        };
+        let trackers = QueryDigestTrackers::default();
+        let outcome =
+            collect_mysql_with_query_digest(&cfg, &definition, &connection, &trackers, Utc::now())
+                .unwrap();
+        let TickOutcome::Appended(sample) = outcome else {
+            panic!("expected an appended sample");
+        };
+        assert!(matches!(
+            sample.outcome,
+            WorkloadSampleOutcome::Failed {
+                reason: WorkloadSampleFailure::Unreachable,
+                ..
+            }
+        ));
+        assert!(cfg.history_path.exists());
+        assert!(!query_digest_history_path(&cfg).exists());
+        assert!(trackers.lock().unwrap().contains_key("mysql"));
     }
 }

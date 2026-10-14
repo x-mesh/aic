@@ -423,7 +423,7 @@ pub(crate) fn run_enable_picker() -> anyhow::Result<()> {
             continue;
         }
         let connection = commit_secret(candidate, draft)?;
-        workload::enable_candidate(candidate, Some(connection))?;
+        workload::enable_candidate(candidate, Some(connection), false)?;
         println!(
             "등록: {name} ({}) · 1분 뒤 확인: aic workload status · aic workload history {name}",
             workload::adapter_display_name(candidate.adapter)

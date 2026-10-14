@@ -1,18 +1,20 @@
 //! Deterministic local workload discovery and explicit definition storage.
 
 use aic_common::workload::{
-    adapter_definitions_conflict, load_workload_history, monitor_clickhouse_with_connection,
-    monitor_elasticsearch_with_connection, monitor_etcd_with_connection,
-    monitor_haproxy_with_connection, monitor_memcached_with_connection,
-    monitor_mongodb_with_connection, monitor_mysql_with_connection, monitor_nginx_with_connection,
+    adapter_definitions_conflict, load_query_digest_history, load_workload_history,
+    monitor_clickhouse_with_connection, monitor_elasticsearch_with_connection,
+    monitor_etcd_with_connection, monitor_haproxy_with_connection,
+    monitor_memcached_with_connection, monitor_mongodb_with_connection,
+    monitor_mysql_with_connection, monitor_nginx_with_connection,
     monitor_opensearch_with_connection, monitor_postgresql_with_connection,
     monitor_prometheus_with_connection, monitor_rabbitmq_with_connection,
-    monitor_redis_with_connection, workload_history_path, workloads_file_path,
-    ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport, HaProxyMonitorReport,
-    MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport, NginxMonitorReport,
-    OpenSearchMonitorReport, PostgreSqlMonitorReport, PrometheusMonitorReport, ProposalCost,
-    ProposalReadiness, RabbitMqMonitorReport, RedisMonitorReport, WorkloadMonitorReport,
-    WorkloadProbeError, WorkloadSample, WorkloadStore, WORKLOAD_SAMPLE_INTERVAL,
+    monitor_redis_with_connection, query_digest_history_path, workload_history_path,
+    workloads_file_path, ClickHouseMonitorReport, ElasticsearchMonitorReport, EtcdMonitorReport,
+    HaProxyMonitorReport, MemcachedMonitorReport, MongoDbMonitorReport, MySqlMonitorReport,
+    NginxMonitorReport, OpenSearchMonitorReport, PostgreSqlMonitorReport, PrometheusMonitorReport,
+    ProposalCost, ProposalReadiness, QueryDigestOutcome, QueryDigestSample, RabbitMqMonitorReport,
+    RedisMonitorReport, WorkloadMonitorReport, WorkloadProbeError, WorkloadSample, WorkloadStore,
+    WORKLOAD_SAMPLE_INTERVAL,
 };
 use aic_common::{
     DiscoveryReport, ProposalEffects, ProposalKind, RuntimeBinding, WorkloadAdapter,
@@ -1286,6 +1288,9 @@ pub struct WorkloadStatusEntry {
     pub state: CollectionState,
     pub last_sample: Option<WorkloadSample>,
     pub age_secs: Option<u64>,
+    /// The latest statement poll of a MySQL workload with `query_digest` enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_digest: Option<QueryDigestSample>,
 }
 
 pub fn derive_status(
@@ -1304,6 +1309,7 @@ pub fn derive_status(
                     state: CollectionState::NotCollected,
                     last_sample: None,
                     age_secs: None,
+                    query_digest: None,
                 };
             }
             let last_sample = samples
@@ -1340,6 +1346,7 @@ pub fn derive_status(
                 state,
                 last_sample,
                 age_secs,
+                query_digest: None,
             }
         })
         .collect()
@@ -1348,7 +1355,72 @@ pub fn derive_status(
 pub fn status() -> Result<Vec<WorkloadStatusEntry>> {
     let definitions = list_configured()?;
     let samples = load_workload_history(&workload_history_path())?;
-    Ok(derive_status(&definitions, &samples, Utc::now()))
+    let mut entries = derive_status(&definitions, &samples, Utc::now());
+    if definitions.iter().any(|definition| definition.query_digest) {
+        let digests = load_query_digest_history(&query_digest_history_path())?;
+        attach_query_digests(&mut entries, &definitions, &digests);
+    }
+    Ok(entries)
+}
+
+/// Attaches the latest statement poll to each MySQL workload that has `query_digest` enabled.
+pub fn attach_query_digests(
+    entries: &mut [WorkloadStatusEntry],
+    definitions: &[WorkloadDefinition],
+    digests: &[QueryDigestSample],
+) {
+    for entry in entries {
+        let enabled = definitions.iter().any(|definition| {
+            definition.id == entry.workload_id
+                && definition.adapter == WorkloadAdapter::MySql
+                && definition.query_digest
+        });
+        if enabled {
+            entry.query_digest = digests
+                .iter()
+                .filter(|digest| digest.workload_id == entry.workload_id)
+                .max_by_key(|digest| digest.captured_at)
+                .cloned();
+        }
+    }
+}
+
+const MICROS_PER_MILLI: f64 = 1_000.0;
+
+/// Text lines for one statement poll, one statement per line, indented under the workload line.
+pub fn render_query_digest(sample: &QueryDigestSample) -> String {
+    let report = match &sample.outcome {
+        QueryDigestOutcome::Unavailable { reason } => {
+            return format!(
+                "  query_digest captured_at={} unavailable={}\n",
+                sample.captured_at.to_rfc3339(),
+                reason.as_str()
+            );
+        }
+        QueryDigestOutcome::Collected(report) => report,
+    };
+    let mut text = format!(
+        "  query_digest captured_at={} baseline={} statements={} unattributed_calls={} row_limit_reached={}\n",
+        sample.captured_at.to_rfc3339(),
+        report.baseline,
+        report.top.len(),
+        report.unattributed_calls,
+        report.row_limit_reached
+    );
+    for entry in &report.top {
+        text.push_str(&format!(
+            "    total_ms={:.1} calls={} avg_ms={:.2} rows_examined={} no_index_used={} errors={} schema={} {}\n",
+            entry.total_time_us as f64 / MICROS_PER_MILLI,
+            entry.calls,
+            entry.total_time_us as f64 / entry.calls.max(1) as f64 / MICROS_PER_MILLI,
+            entry.rows_examined,
+            entry.no_index_used,
+            entry.errors,
+            entry.schema.as_deref().unwrap_or("-"),
+            entry.text.as_deref().unwrap_or("(text unavailable)")
+        ));
+    }
+    text
 }
 
 pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
@@ -1373,19 +1445,20 @@ pub fn history(workload_id: &str, limit: usize) -> Result<Vec<WorkloadSample>> {
 }
 
 pub fn enable(candidate_id: &str, expected_fingerprint: &str) -> Result<WorkloadDefinition> {
-    enable_with_connection(candidate_id, expected_fingerprint, None)
+    enable_with_connection(candidate_id, expected_fingerprint, None, false)
 }
 
 pub fn enable_with_connection(
     candidate_id: &str,
     expected_fingerprint: &str,
     connection: Option<WorkloadConnectionConfig>,
+    query_digest: bool,
 ) -> Result<WorkloadDefinition> {
     let (_, candidate) = inspect(candidate_id)?;
     if candidate.fingerprint != expected_fingerprint {
         bail!("workload candidate changed; discover again before enabling");
     }
-    enable_candidate(&candidate, connection)
+    enable_candidate(&candidate, connection, query_digest)
 }
 
 /// 방금 탐색한 후보를 저장한다. 같은 id의 정의가 있으면 새 연결로 바꾼다.
@@ -1396,9 +1469,13 @@ pub fn enable_with_connection(
 pub fn enable_candidate(
     candidate: &WorkloadCandidate,
     connection: Option<WorkloadConnectionConfig>,
+    query_digest: bool,
 ) -> Result<WorkloadDefinition> {
     if !candidate.ambiguity.is_empty() || candidate.selector.is_none() {
         bail!("ambiguous workload candidates cannot be enabled");
+    }
+    if query_digest && candidate.adapter != WorkloadAdapter::MySql {
+        bail!("--query-digest is supported only for MySQL workloads");
     }
     // 고정 기본 주소(127.0.0.1의 표준 포트)는 호스트의 서비스를 가리킨다. 컨테이너 안의 서비스는
     // 공개한 포트나 컨테이너 주소로만 닿는다.
@@ -1412,6 +1489,7 @@ pub fn enable_candidate(
         adapter: candidate.adapter,
         driver_mode: candidate.driver_mode.unwrap_or_default(),
         connection,
+        query_digest,
     };
     save_definition(&definition)?;
     Ok(definition)
@@ -2960,6 +3038,7 @@ mod tests {
                 adapter,
                 driver_mode: WorkloadDriverMode::DetectOnly,
                 connection: None,
+                query_digest: false,
             };
             assert_eq!(
                 derive_status(&[definition], &[], Utc::now())[0].state,
@@ -2986,6 +3065,121 @@ mod tests {
         assert!(validate_enable_connection(WorkloadAdapter::MySql, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::MongoDb, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::Redis, None).is_ok());
+    }
+
+    #[test]
+    fn query_digest_can_only_be_enabled_for_mysql() {
+        let error = enable_candidate(&redis_candidate("redis", &[]), None, true).unwrap_err();
+        assert!(error.to_string().contains("--query-digest"), "{error}");
+    }
+
+    fn digest_sample(
+        workload_id: &str,
+        captured_at: DateTime<Utc>,
+        outcome: QueryDigestOutcome,
+    ) -> QueryDigestSample {
+        QueryDigestSample {
+            schema_version: aic_common::workload::WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: workload_id.into(),
+            captured_at,
+            outcome,
+        }
+    }
+
+    fn digest_entry(text: Option<&str>) -> aic_common::workload::QueryDigestEntry {
+        aic_common::workload::QueryDigestEntry {
+            schema: Some("app".into()),
+            digest: "ab12".into(),
+            text: text.map(str::to_string),
+            calls: 5,
+            total_time_us: 12_500,
+            lock_time_us: 0,
+            errors: 1,
+            rows_examined: 500,
+            rows_sent: 5,
+            no_index_used: 5,
+        }
+    }
+
+    #[test]
+    fn status_attaches_the_latest_statement_poll_to_enabled_mysql_workloads() {
+        let now = Utc::now();
+        let mysql = WorkloadDefinition {
+            adapter: WorkloadAdapter::MySql,
+            query_digest: true,
+            ..redis_definition("mysql")
+        };
+        let quiet = WorkloadDefinition {
+            id: "quiet".into(),
+            query_digest: false,
+            ..mysql.clone()
+        };
+        let definitions = [mysql, quiet, redis_definition("redis")];
+        let unavailable = QueryDigestOutcome::Unavailable {
+            reason: aic_common::workload::QueryDigestUnavailable::Timeout,
+        };
+        let latest = digest_sample("mysql", now, unavailable.clone());
+        let digests = [
+            digest_sample(
+                "mysql",
+                now - chrono::Duration::minutes(1),
+                unavailable.clone(),
+            ),
+            latest.clone(),
+            digest_sample("quiet", now, unavailable),
+        ];
+        let mut entries = derive_status(&definitions, &[], now);
+        attach_query_digests(&mut entries, &definitions, &digests);
+        assert_eq!(entries[0].query_digest.as_ref(), Some(&latest));
+        assert!(entries[1].query_digest.is_none());
+        assert!(entries[2].query_digest.is_none());
+        let json = serde_json::to_value(&entries[1]).unwrap();
+        assert!(json.get("query_digest").is_none());
+    }
+
+    #[test]
+    fn statement_polls_render_one_line_per_statement() {
+        let captured_at = DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let report = aic_common::workload::QueryDigestReport {
+            baseline: false,
+            top: vec![
+                digest_entry(Some("SELECT * FROM `orders` WHERE `id` = ?")),
+                digest_entry(None),
+            ],
+            unattributed_calls: 3,
+            row_limit_reached: false,
+        };
+        let text = render_query_digest(&digest_sample(
+            "mysql",
+            captured_at,
+            QueryDigestOutcome::Collected(report),
+        ));
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].contains("statements=2 unattributed_calls=3"),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains("total_ms=12.5 calls=5 avg_ms=2.50 rows_examined=500"),
+            "{text}"
+        );
+        assert!(lines[1].ends_with("schema=app SELECT * FROM `orders` WHERE `id` = ?"));
+        assert!(lines[2].ends_with("(text unavailable)"));
+
+        let unavailable = render_query_digest(&digest_sample(
+            "mysql",
+            captured_at,
+            QueryDigestOutcome::Unavailable {
+                reason: aic_common::workload::QueryDigestUnavailable::PermissionDenied,
+            },
+        ));
+        assert!(
+            unavailable.contains("unavailable=permission_denied"),
+            "{unavailable}"
+        );
     }
 
     fn sample(workload_id: &str, captured_at: DateTime<Utc>) -> WorkloadSample {
@@ -3018,6 +3212,7 @@ mod tests {
             adapter: WorkloadAdapter::Redis,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 
@@ -3030,6 +3225,7 @@ mod tests {
             adapter: WorkloadAdapter::Memcached,
             driver_mode: WorkloadDriverMode::MonitorReady,
             connection: None,
+            query_digest: false,
         }
     }
 

@@ -139,7 +139,7 @@ Thirteen adapters support metric collection. Five adapters require an explicit c
 | Redis or Valkey | Known local sockets, then `127.0.0.1:6379` | Optional `unix`, `tcp`, or `tls` endpoint | Optional username and secret | Native host roots | `INFO` |
 | Memcached | `127.0.0.1:11211` | Optional `unix`, `tcp`, or `tls` endpoint | Not supported | Native host roots | `stats` |
 | PostgreSQL | None | Explicit `tcp` or `tls`, with a username and database | Optional password secret | Native host roots | One `pg_stat_database` row |
-| MySQL or MariaDB | None | Explicit `tcp` or `tls`, with a username and optional database | Optional password secret | Native host roots | Fixed `SHOW GLOBAL STATUS` |
+| MySQL or MariaDB | None | Explicit `tcp` or `tls`, with a username and optional database | Optional password secret | Native host roots | Fixed `SHOW GLOBAL STATUS`, and the optional statement poll |
 | MongoDB | None | Explicit `tcp` or `tls`, without URI, SRV, or Unix support | Optional username and secret pair, with optional `auth_source` | OpenSSL file system CA paths | `serverStatus` |
 | Prometheus | `127.0.0.1:9090` | Optional `tcp` or `tls` endpoint | Not supported | Native host roots | `GET /metrics` |
 | ClickHouse | `127.0.0.1:8123` | Optional HTTP `tcp` or `tls` endpoint | Optional Basic authentication on TLS | Native host roots | One fixed system table query |
@@ -197,6 +197,71 @@ aic workload enable "$WORKLOAD_ID" \
   --endpoint unix:///run/haproxy/admin.sock
 ```
 
+### MySQL statement statistics
+
+`--query-digest` adds per-statement statistics to a MySQL workload. The option is off by default.
+
+The daemon reads `performance_schema.events_statements_summary_by_digest` on the same connection, after the status query.
+
+Prepare MySQL before you enable the option:
+
+1. Set `performance_schema = ON` in the server configuration. A change to this setting requires a MySQL restart.
+2. Make sure that the `statements_digest` consumer is enabled.
+3. Grant `SELECT` on `performance_schema` to the monitor account.
+
+```sql
+SELECT @@performance_schema;
+SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'statements_digest';
+GRANT SELECT ON performance_schema.* TO 'aic_monitor'@'%';
+```
+
+MariaDB disables `performance_schema` by default. You can enable it only at server start.
+
+Enable MySQL with statement statistics:
+
+```sh
+export AIC_MYSQL_MONITOR_PASSWORD='replace-me'
+aic workload enable "$WORKLOAD_ID" \
+  --fingerprint "$FINGERPRINT" \
+  --endpoint tcp://127.0.0.1:3306 \
+  --username aic_monitor \
+  --auth-env AIC_MYSQL_MONITOR_PASSWORD \
+  --query-digest
+```
+
+The interactive enable flow does not set this option. If you enable the workload again without `--query-digest`, AIC saves the definition with the option off.
+
+Each cycle does these steps:
+
+1. It reads at most 200 digest rows that ran in the last 90 seconds. Rows with the most total time come first.
+2. It compares each row with the previous cycle. It keeps the 10 statements with the most time in this interval.
+3. It reads `DIGEST_TEXT` only for statements without cached text.
+
+The statement poll has a separate two-second limit. If the poll fails, the status metrics of the cycle stay.
+
+The first cycle only sets the baseline. A cycle also sets only the baseline when the previous poll is more than 180 seconds old.
+
+A MySQL restart or a `TRUNCATE` recreates digest rows. A row that MySQL recreated after the previous poll counts in full.
+
+If the poll fails, the record has one of these reasons:
+
+| Reason | Meaning |
+| --- | --- |
+| `performance_schema_off` | `@@performance_schema` is `0`. |
+| `consumer_disabled` | The `statements_digest` consumer is not enabled. |
+| `permission_denied` | The monitor account cannot read `performance_schema`. |
+| `timeout` | The statement poll took more than two seconds. |
+| `query_failed` | MySQL rejected a statement query for a different reason. |
+| `malformed` | A result row has an unexpected shape. |
+
+`DIGEST_TEXT` replaces literal values with `?` and removes comments. Table names and column names stay in the text.
+
+AIC does not read `QUERY_SAMPLE_TEXT` or `SQL_TEXT`. These columns contain literal values.
+
+MySQL adds a statement to the digest table when the statement completes. A statement in progress does not appear until it completes.
+
+If more than 200 digest rows ran in the window, statements with less total time can be absent. The record then has `row_limit_reached` set to `true`.
+
 ## Daemon collection
 
 `aicd` reads saved definitions. It starts the first collection cycle immediately, then starts a cycle every 60 seconds.
@@ -253,6 +318,14 @@ aic workload history "$WORKLOAD_ID" --limit 20
 aic workload history "$WORKLOAD_ID" --limit 20 --json
 ```
 
+MySQL statement statistics use a separate file, `$XDG_STATE_HOME/aic/workload-query-digests.jsonl`. Metric history readers do not see statement text.
+
+The statement file retains 360 polls across all workloads. That is six hours for one workload.
+
+`aic workload status` shows the latest statement poll under its workload line. The JSON output puts it in `query_digest`.
+
+The exporter does not send statement statistics.
+
 By default, AIC does not send workload samples to a remote destination.
 
 To send samples to the central collector, set `aicd.exporter.workload_enabled = true` and restart `aicd`. The exporter must also be enabled with an endpoint.
@@ -288,5 +361,7 @@ Most response limits are 64 KiB. Nginx uses 16 KiB, HAProxy uses 256 KiB, and Pr
 MongoDB applies its 64 KiB limit after BSON decode. The driver can receive a larger response before this check.
 
 PostgreSQL and MySQL libraries do not expose response byte limits. Their fixed queries bound the expected result shape.
+
+The MySQL statement poll reads at most 200 rows and the text of at most 10 statements in one cycle. AIC stores at most 4,096 bytes of each statement text.
 
 Use least-privilege monitor accounts. Do not grant write, administration, or configuration permissions for these probes.
