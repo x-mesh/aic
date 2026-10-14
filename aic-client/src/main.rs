@@ -688,6 +688,9 @@ enum WorkloadOp {
         auth_env: Option<String>,
         #[arg(long, conflicts_with = "auth_env")]
         auth_keychain: Option<String>,
+        /// Also read per-statement statistics from MySQL performance_schema.
+        #[arg(long, requires = "candidate_id", requires = "endpoint")]
+        query_digest: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1472,12 +1475,18 @@ fn handle_workload(op: WorkloadOp) {
                                 }
                             ),
                         );
+                        let query_digest = entry
+                            .query_digest
+                            .as_ref()
+                            .map(workload::render_query_digest)
+                            .unwrap_or_default();
                         format!(
-                            "{} state={} age_secs={} {}\n",
+                            "{} state={} age_secs={} {}\n{}",
                             entry.workload_id,
                             entry.state.as_str(),
                             entry.age_secs.map_or_else(|| "-".to_string(), |age| age.to_string()),
-                            sample
+                            sample,
+                            query_digest
                         )
                     })
                     .collect()
@@ -1533,6 +1542,7 @@ fn handle_workload(op: WorkloadOp) {
             auth_source,
             auth_env,
             auth_keychain,
+            query_digest,
             json,
         } => {
             let connection = match endpoint {
@@ -1562,7 +1572,7 @@ fn handle_workload(op: WorkloadOp) {
                     let fingerprint = fingerprint.ok_or_else(|| {
                         anyhow::anyhow!("--fingerprint is required with a candidate id; run `aic workload enable` without arguments to pick one interactively")
                     })?;
-                    workload::enable_with_connection(&candidate_id, &fingerprint, connection)
+                    workload::enable_with_connection(&candidate_id, &fingerprint, connection, query_digest)
                 })
                 .map(|definition| {
             if json {
@@ -11653,6 +11663,43 @@ mod tests {
         assert!(validate_bind("localhost").is_err());
         assert!(validate_bind("127.0.0.1:").is_err());
         assert!(validate_bind("127.0.0.1:99999").is_err());
+    }
+
+    #[test]
+    fn query_digest_flag_needs_a_candidate_and_an_endpoint() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "aic",
+            "workload",
+            "enable",
+            "exe:/usr/sbin/mysqld",
+            "--fingerprint",
+            "f",
+            "--endpoint",
+            "tcp://127.0.0.1:3306",
+            "--username",
+            "aic_monitor",
+            "--query-digest",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Workload {
+                op: super::WorkloadOp::Enable {
+                    query_digest: true,
+                    ..
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["aic", "workload", "enable", "--query-digest"]).is_err());
+        assert!(Cli::try_parse_from([
+            "aic",
+            "workload",
+            "enable",
+            "exe:/usr/sbin/mysqld",
+            "--query-digest",
+        ])
+        .is_err());
     }
 
     #[test]

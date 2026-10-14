@@ -140,6 +140,10 @@ pub struct WorkloadDefinition {
     /// Missing records keep the fixed local endpoint defaults.
     #[serde(default)]
     pub connection: Option<WorkloadConnectionConfig>,
+    /// Reads per-statement statistics from MySQL `performance_schema`. It is opt-in because the
+    /// monitor account needs `SELECT` on `performance_schema` and the result holds statement text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub query_digest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -993,6 +997,34 @@ pub const WORKLOAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 pub const REDIS_SAMPLE_INTERVAL: Duration = WORKLOAD_SAMPLE_INTERVAL;
 pub const MAX_WORKLOAD_HISTORY_SAMPLES: usize = 1440;
 pub const WORKLOAD_HISTORY_FILE: &str = "workload-history.jsonl";
+/// Statement rows read per poll. The limit bounds the response, because `mysql_async` has no
+/// response byte limit.
+pub const MYSQL_QUERY_DIGEST_ROW_LIMIT: usize = 200;
+/// Statements kept per poll, the most total time first.
+pub const MYSQL_QUERY_DIGEST_TOP: usize = 10;
+/// The statement poll has its own budget after the status query, so a slow
+/// `performance_schema` read cannot drop the status metrics.
+pub const MYSQL_QUERY_DIGEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// Rows that ran in this window are read. It is longer than the sample interval, so a late tick
+/// does not skip a statement.
+const MYSQL_QUERY_DIGEST_WINDOW_SECS: u64 = WORKLOAD_SAMPLE_INTERVAL.as_secs() + 30;
+/// Per-statement history holds whole statement text, so it keeps fewer lines than the metric
+/// history: six hours at one poll per minute.
+pub const MAX_QUERY_DIGEST_HISTORY_SAMPLES: usize = 360;
+pub const QUERY_DIGEST_HISTORY_FILE: &str = "workload-query-digests.jsonl";
+/// `max_digest_length` can be raised above the 1024-byte default. This bounds the stored text.
+const QUERY_DIGEST_TEXT_BYTES: usize = 4096;
+const QUERY_DIGEST_BASELINE_CAP: usize = 2000;
+const QUERY_DIGEST_EVICT_AFTER_POLLS: u64 = 10;
+/// A baseline older than this spans several intervals. Its difference would credit all of them to
+/// one interval, so the poll only sets a new baseline.
+const QUERY_DIGEST_STALE_AFTER_US: u64 = 3 * WORKLOAD_SAMPLE_INTERVAL.as_secs() * MICROS_PER_SEC;
+const MICROS_PER_SEC: u64 = 1_000_000;
+/// `performance_schema` timers count picoseconds.
+const PICOS_PER_MICRO: u64 = 1_000_000;
+/// ER_DBACCESS_DENIED_ERROR, ER_TABLEACCESS_DENIED_ERROR, ER_COLUMNACCESS_DENIED_ERROR.
+const MYSQL_ACCESS_DENIED_CODES: [u16; 3] = [1044, 1142, 1143];
+const MYSQL_QUERY_DIGEST_PREREQUISITES: &str = "SELECT @@performance_schema, (SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'statements_digest'), CAST(UNIX_TIMESTAMP(NOW(6)) * 1000000 AS UNSIGNED)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkloadProbeError {
@@ -1166,6 +1198,430 @@ pub fn load_workload_history(path: &Path) -> Result<Vec<WorkloadSample>> {
         .collect::<Vec<WorkloadSample>>();
     samples.sort_by_key(|sample| sample.captured_at);
     Ok(samples)
+}
+
+/// Why a MySQL statement poll returned no statements. The status metrics of the same tick are
+/// still collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryDigestUnavailable {
+    PerformanceSchemaOff,
+    ConsumerDisabled,
+    PermissionDenied,
+    Timeout,
+    QueryFailed,
+    Malformed,
+}
+
+impl QueryDigestUnavailable {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PerformanceSchemaOff => "performance_schema_off",
+            Self::ConsumerDisabled => "consumer_disabled",
+            Self::PermissionDenied => "permission_denied",
+            Self::Timeout => "timeout",
+            Self::QueryFailed => "query_failed",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// What one normalized statement did during one interval. Times are microseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryDigestEntry {
+    pub schema: Option<String>,
+    pub digest: String,
+    /// `DIGEST_TEXT`: MySQL replaces literals with `?` and removes comments. `None` when the text
+    /// lookup failed.
+    pub text: Option<String>,
+    pub calls: u64,
+    pub total_time_us: u64,
+    pub lock_time_us: u64,
+    pub errors: u64,
+    pub rows_examined: u64,
+    pub rows_sent: u64,
+    pub no_index_used: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryDigestReport {
+    /// The poll only set the baseline: it is the first poll, or the previous poll is too old.
+    pub baseline: bool,
+    pub top: Vec<QueryDigestEntry>,
+    /// Calls that MySQL put in its overflow row because the digest table was full.
+    pub unattributed_calls: u64,
+    /// The poll read the row limit. Statements with less total time can be missing.
+    pub row_limit_reached: bool,
+}
+
+pub type QueryDigestPoll = std::result::Result<QueryDigestReport, QueryDigestUnavailable>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum QueryDigestOutcome {
+    Collected(QueryDigestReport),
+    Unavailable { reason: QueryDigestUnavailable },
+}
+
+impl From<QueryDigestPoll> for QueryDigestOutcome {
+    fn from(poll: QueryDigestPoll) -> Self {
+        match poll {
+            Ok(report) => Self::Collected(report),
+            Err(reason) => Self::Unavailable { reason },
+        }
+    }
+}
+
+/// One statement poll in the per-statement history. It is kept apart from [`WorkloadSample`] so
+/// that metric history readers never see statement text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryDigestSample {
+    pub schema_version: u32,
+    pub workload_id: String,
+    pub captured_at: DateTime<Utc>,
+    #[serde(flatten)]
+    pub outcome: QueryDigestOutcome,
+}
+
+pub fn query_digest_history_path() -> PathBuf {
+    paths::state_dir().join(QUERY_DIGEST_HISTORY_FILE)
+}
+
+pub fn load_query_digest_history(path: &Path) -> Result<Vec<QueryDigestSample>> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut samples = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect::<Vec<QueryDigestSample>>();
+    samples.sort_by_key(|sample| sample.captured_at);
+    Ok(samples)
+}
+
+/// Raw counters of one `events_statements_summary_by_digest` row. They accumulate until MySQL
+/// restarts or someone truncates the table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DigestCounters {
+    calls: u64,
+    timer_wait_ps: u64,
+    lock_time_ps: u64,
+    errors: u64,
+    rows_examined: u64,
+    rows_sent: u64,
+    no_index_used: u64,
+}
+
+impl DigestCounters {
+    /// `None` when the row counts fewer calls than before, which a live row never does.
+    fn since(self, previous: Self) -> Option<Self> {
+        (self.calls >= previous.calls).then(|| Self {
+            calls: self.calls - previous.calls,
+            timer_wait_ps: self.timer_wait_ps.saturating_sub(previous.timer_wait_ps),
+            lock_time_ps: self.lock_time_ps.saturating_sub(previous.lock_time_ps),
+            errors: self.errors.saturating_sub(previous.errors),
+            rows_examined: self.rows_examined.saturating_sub(previous.rows_examined),
+            rows_sent: self.rows_sent.saturating_sub(previous.rows_sent),
+            no_index_used: self.no_index_used.saturating_sub(previous.no_index_used),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DigestRow {
+    schema: Option<String>,
+    /// `None` for the overflow row.
+    digest: Option<String>,
+    counters: DigestCounters,
+    first_seen_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DigestSnapshot {
+    server_now_us: u64,
+    rows: Vec<DigestRow>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DigestBaseline {
+    counters: DigestCounters,
+    first_seen_us: u64,
+    last_poll: u64,
+}
+
+/// Per-workload state that turns cumulative digest rows into per-interval differences.
+///
+/// The monitor keeps one tracker for each workload across ticks. A row is matched with its
+/// baseline by schema and digest. `FIRST_SEEN` tells a recreated row (after a restart or a
+/// `TRUNCATE`) from a live one.
+#[derive(Debug, Default)]
+pub struct QueryDigestTracker {
+    previous_now_us: Option<u64>,
+    polls: u64,
+    baselines: BTreeMap<(Option<String>, Option<String>), DigestBaseline>,
+    texts: BTreeMap<String, String>,
+}
+
+impl QueryDigestTracker {
+    fn observe(&mut self, snapshot: &DigestSnapshot) -> QueryDigestReport {
+        let window_start = match self.previous_now_us {
+            Some(previous)
+                if snapshot.server_now_us.saturating_sub(previous)
+                    <= QUERY_DIGEST_STALE_AFTER_US =>
+            {
+                Some(previous)
+            }
+            _ => {
+                self.baselines.clear();
+                None
+            }
+        };
+        self.polls += 1;
+        let mut changed = Vec::new();
+        let mut unattributed_calls = 0;
+        for row in &snapshot.rows {
+            let key = (row.schema.clone(), row.digest.clone());
+            let delta = window_start.and_then(|start| match self.baselines.get(&key) {
+                Some(previous) if previous.first_seen_us == row.first_seen_us => {
+                    row.counters.since(previous.counters)
+                }
+                // A row created after the previous poll counted only this interval.
+                _ if row.first_seen_us >= start => Some(row.counters),
+                _ => None,
+            });
+            self.baselines.insert(
+                key,
+                DigestBaseline {
+                    counters: row.counters,
+                    first_seen_us: row.first_seen_us,
+                    last_poll: self.polls,
+                },
+            );
+            match (delta, &row.digest) {
+                (Some(delta), None) => unattributed_calls += delta.calls,
+                (Some(delta), Some(digest)) if delta.calls > 0 => {
+                    changed.push((row.schema.clone(), digest.clone(), delta));
+                }
+                _ => {}
+            }
+        }
+        self.previous_now_us = Some(snapshot.server_now_us);
+        self.evict();
+        changed.sort_by_key(|(_, _, delta)| std::cmp::Reverse(delta.timer_wait_ps));
+        changed.truncate(MYSQL_QUERY_DIGEST_TOP);
+        QueryDigestReport {
+            baseline: window_start.is_none(),
+            top: changed
+                .into_iter()
+                .map(|(schema, digest, delta)| QueryDigestEntry {
+                    schema,
+                    digest,
+                    text: None,
+                    calls: delta.calls,
+                    total_time_us: delta.timer_wait_ps / PICOS_PER_MICRO,
+                    lock_time_us: delta.lock_time_ps / PICOS_PER_MICRO,
+                    errors: delta.errors,
+                    rows_examined: delta.rows_examined,
+                    rows_sent: delta.rows_sent,
+                    no_index_used: delta.no_index_used,
+                })
+                .collect(),
+            unattributed_calls,
+            row_limit_reached: snapshot.rows.len() >= MYSQL_QUERY_DIGEST_ROW_LIMIT,
+        }
+    }
+
+    fn evict(&mut self) {
+        let polls = self.polls;
+        self.baselines
+            .retain(|_, baseline| polls - baseline.last_poll < QUERY_DIGEST_EVICT_AFTER_POLLS);
+        if self.baselines.len() > QUERY_DIGEST_BASELINE_CAP {
+            let mut ages = self
+                .baselines
+                .values()
+                .map(|baseline| baseline.last_poll)
+                .collect::<Vec<_>>();
+            ages.sort_unstable();
+            let cutoff = ages[self.baselines.len() - QUERY_DIGEST_BASELINE_CAP];
+            self.baselines
+                .retain(|_, baseline| baseline.last_poll >= cutoff);
+        }
+        if self.texts.len() > QUERY_DIGEST_BASELINE_CAP {
+            let live = self
+                .baselines
+                .keys()
+                .filter_map(|(_, digest)| digest.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            self.texts.retain(|digest, _| live.contains(digest));
+        }
+    }
+
+    /// Digests in `report` whose text is not cached yet, without duplicates.
+    fn missing_texts(&self, report: &QueryDigestReport) -> Vec<String> {
+        let mut missing = report
+            .top
+            .iter()
+            .map(|entry| entry.digest.clone())
+            .filter(|digest| !self.texts.contains_key(digest))
+            .collect::<Vec<_>>();
+        missing.sort();
+        missing.dedup();
+        missing
+    }
+
+    fn remember_text(&mut self, digest: String, text: &str) {
+        self.texts.insert(
+            digest,
+            truncate_at_char_boundary(text, QUERY_DIGEST_TEXT_BYTES),
+        );
+    }
+
+    fn fill_texts(&self, report: &mut QueryDigestReport) {
+        for entry in &mut report.top {
+            entry.text = self.texts.get(&entry.digest).cloned();
+        }
+    }
+}
+
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn mysql_query_digest_rows_query() -> String {
+    format!(
+        "SELECT SCHEMA_NAME, DIGEST, COUNT_STAR, SUM_TIMER_WAIT, SUM_LOCK_TIME, SUM_ERRORS, \
+         SUM_ROWS_EXAMINED, SUM_ROWS_SENT, SUM_NO_INDEX_USED, \
+         CAST(UNIX_TIMESTAMP(FIRST_SEEN) * 1000000 AS UNSIGNED) \
+         FROM performance_schema.events_statements_summary_by_digest \
+         WHERE LAST_SEEN >= NOW(6) - INTERVAL {MYSQL_QUERY_DIGEST_WINDOW_SECS} SECOND \
+         ORDER BY SUM_TIMER_WAIT DESC LIMIT {MYSQL_QUERY_DIGEST_ROW_LIMIT}"
+    )
+}
+
+fn mysql_query_digest_text_query(digests: usize) -> String {
+    format!(
+        "SELECT DIGEST, DIGEST_TEXT FROM performance_schema.events_statements_summary_by_digest \
+         WHERE DIGEST IN ({})",
+        vec!["?"; digests].join(", ")
+    )
+}
+
+fn query_digest_error(error: mysql_async::Error) -> QueryDigestUnavailable {
+    match error {
+        mysql_async::Error::Server(server) if MYSQL_ACCESS_DENIED_CODES.contains(&server.code) => {
+            QueryDigestUnavailable::PermissionDenied
+        }
+        _ => QueryDigestUnavailable::QueryFailed,
+    }
+}
+
+/// Converts the next column of a fixed-shape result row.
+fn next_value<T: mysql_async::prelude::FromValue>(
+    values: &mut impl Iterator<Item = mysql_async::Value>,
+) -> std::result::Result<T, QueryDigestUnavailable> {
+    values
+        .next()
+        .and_then(|value| mysql_async::from_value_opt(value).ok())
+        .ok_or(QueryDigestUnavailable::Malformed)
+}
+
+/// Returns the server clock when the digest consumer is ready.
+fn query_digest_server_now(
+    rows: Vec<Vec<mysql_async::Value>>,
+) -> std::result::Result<u64, QueryDigestUnavailable> {
+    let Ok([row]) = <[_; 1]>::try_from(rows) else {
+        return Err(QueryDigestUnavailable::Malformed);
+    };
+    let mut values = row.into_iter();
+    let performance_schema: u64 = next_value(&mut values)?;
+    let consumer: Option<String> = next_value(&mut values)?;
+    let now_us: u64 = next_value(&mut values)?;
+    if performance_schema == 0 {
+        return Err(QueryDigestUnavailable::PerformanceSchemaOff);
+    }
+    if consumer.as_deref() != Some("YES") {
+        return Err(QueryDigestUnavailable::ConsumerDisabled);
+    }
+    Ok(now_us)
+}
+
+fn query_digest_row(
+    values: Vec<mysql_async::Value>,
+) -> std::result::Result<DigestRow, QueryDigestUnavailable> {
+    let mut values = values.into_iter();
+    Ok(DigestRow {
+        schema: next_value(&mut values)?,
+        digest: next_value(&mut values)?,
+        counters: DigestCounters {
+            calls: next_value(&mut values)?,
+            timer_wait_ps: next_value(&mut values)?,
+            lock_time_ps: next_value(&mut values)?,
+            errors: next_value(&mut values)?,
+            rows_examined: next_value(&mut values)?,
+            rows_sent: next_value(&mut values)?,
+            no_index_used: next_value(&mut values)?,
+        },
+        first_seen_us: next_value(&mut values)?,
+    })
+}
+
+async fn poll_query_digest(
+    connection: &mut MySqlConnection,
+    tracker: &mut QueryDigestTracker,
+) -> QueryDigestPoll {
+    let prerequisites = connection
+        .query::<mysql_async::Row, _>(MYSQL_QUERY_DIGEST_PREREQUISITES)
+        .await
+        .map_err(query_digest_error)?;
+    let server_now_us = query_digest_server_now(
+        prerequisites
+            .into_iter()
+            .map(mysql_async::Row::unwrap)
+            .collect(),
+    )?;
+    let rows = connection
+        .query::<mysql_async::Row, _>(mysql_query_digest_rows_query())
+        .await
+        .map_err(query_digest_error)?
+        .into_iter()
+        .map(|row| query_digest_row(row.unwrap()))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut report = tracker.observe(&DigestSnapshot {
+        server_now_us,
+        rows,
+    });
+    let missing = tracker.missing_texts(&report);
+    if !missing.is_empty() {
+        // A failed text lookup keeps the numbers. The entries show the text as unavailable.
+        match connection
+            .exec::<mysql_async::Row, _, _>(mysql_query_digest_text_query(missing.len()), missing)
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let mut values = row.unwrap().into_iter();
+                    let digest: std::result::Result<String, _> = next_value(&mut values);
+                    let text: std::result::Result<Vec<u8>, _> = next_value(&mut values);
+                    if let (Ok(digest), Ok(text)) = (digest, text) {
+                        tracker.remember_text(digest, &String::from_utf8_lossy(&text));
+                    }
+                }
+            }
+            Err(error) => tracing::debug!(error = %error, "MySQL digest text lookup failed"),
+        }
+    }
+    tracker.fill_texts(&mut report);
+    Ok(report)
 }
 
 pub fn monitor_redis() -> std::result::Result<(String, RedisMetrics), RedisProbeError> {
@@ -1449,71 +1905,130 @@ fn map_postgresql_connect_error(error: tokio_postgres::Error) -> WorkloadProbeEr
 pub fn monitor_mysql_with_connection(
     connection: &WorkloadConnectionConfig,
 ) -> std::result::Result<(String, MySqlMetrics), WorkloadProbeError> {
-    connection
-        .validate_for(WorkloadAdapter::MySql)
-        .map_err(|_| {
-            WorkloadProbeError::Malformed("MySQL connection configuration is invalid".into())
-        })?;
-    let endpoint = connection
-        .endpoint()
-        .map_err(|_| WorkloadProbeError::Malformed("MySQL endpoint is invalid".into()))?;
-    let secret = resolve_connection_secret(connection).map_err(|_| {
-        WorkloadProbeError::Rejected("MySQL authentication secret is unavailable".into())
-    })?;
-    let username = connection
-        .username
-        .as_deref()
-        .ok_or_else(|| WorkloadProbeError::Malformed("MySQL username is missing".into()))?;
-    let (host, port, use_tls) = match endpoint {
-        WorkloadEndpoint::Tcp { host, port } => (host, port, false),
-        WorkloadEndpoint::Tls { host, port } => (host, port, true),
-        WorkloadEndpoint::Unix(_) => {
-            return Err(WorkloadProbeError::Malformed(
-                "MySQL endpoint must use TCP or TLS".into(),
-            ));
-        }
-    };
-
-    let username = username.to_owned();
-    let database = connection.database.clone();
-    let endpoint_text = connection.endpoint.clone();
-    let metrics = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| {
-                WorkloadProbeError::Unreachable("MySQL probe runtime is unavailable".into())
-            })?;
-        runtime.block_on(async {
-            tokio::time::timeout(
-                MYSQL_PROBE_TIMEOUT,
-                monitor_mysql_async(
-                    &host,
-                    port,
-                    use_tls,
-                    &username,
-                    secret.as_deref(),
-                    database.as_deref(),
-                ),
-            )
-            .await
-            .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
+    let target = MySqlTarget::from_connection(connection)?;
+    let metrics = run_mysql_probe(async {
+        tokio::time::timeout(MYSQL_PROBE_TIMEOUT, async {
+            let (connection, metrics) = mysql_status(&target).await?;
+            let _ = connection.disconnect().await;
+            Ok(metrics)
         })
-    })
-    .join()
-    .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe runtime failed".into()))??;
-    Ok((endpoint_text, metrics))
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
+    })?;
+    Ok((target.endpoint_text, metrics))
 }
 
-async fn monitor_mysql_async(
-    host: &str,
+/// Collect the status metrics and then, on the same connection, the statements that took the most
+/// time since the previous poll. A failed statement poll keeps the status metrics.
+pub fn monitor_mysql_with_query_digest(
+    connection: &WorkloadConnectionConfig,
+    tracker: &mut QueryDigestTracker,
+) -> std::result::Result<(String, MySqlMetrics, QueryDigestPoll), WorkloadProbeError> {
+    let target = MySqlTarget::from_connection(connection)?;
+    let (metrics, poll) = run_mysql_probe(async {
+        let (mut connection, metrics) = mysql_status_with_timeout(&target).await?;
+        let poll = tokio::time::timeout(
+            MYSQL_QUERY_DIGEST_TIMEOUT,
+            poll_query_digest(&mut connection, tracker),
+        )
+        .await
+        .unwrap_or(Err(QueryDigestUnavailable::Timeout));
+        let _ = tokio::time::timeout(MYSQL_QUERY_DIGEST_TIMEOUT, connection.disconnect()).await;
+        Ok((metrics, poll))
+    })?;
+    Ok((target.endpoint_text, metrics, poll))
+}
+
+struct MySqlTarget {
+    host: String,
     port: u16,
     use_tls: bool,
-    username: &str,
-    password: Option<&str>,
-    database: Option<&str>,
-) -> std::result::Result<MySqlMetrics, WorkloadProbeError> {
-    let options = mysql_connection_options(host, port, use_tls, username, password, database)?;
+    username: String,
+    password: Option<String>,
+    database: Option<String>,
+    endpoint_text: String,
+}
+
+impl MySqlTarget {
+    fn from_connection(
+        connection: &WorkloadConnectionConfig,
+    ) -> std::result::Result<Self, WorkloadProbeError> {
+        connection
+            .validate_for(WorkloadAdapter::MySql)
+            .map_err(|_| {
+                WorkloadProbeError::Malformed("MySQL connection configuration is invalid".into())
+            })?;
+        let endpoint = connection
+            .endpoint()
+            .map_err(|_| WorkloadProbeError::Malformed("MySQL endpoint is invalid".into()))?;
+        let password = resolve_connection_secret(connection).map_err(|_| {
+            WorkloadProbeError::Rejected("MySQL authentication secret is unavailable".into())
+        })?;
+        let username = connection
+            .username
+            .clone()
+            .ok_or_else(|| WorkloadProbeError::Malformed("MySQL username is missing".into()))?;
+        let (host, port, use_tls) = match endpoint {
+            WorkloadEndpoint::Tcp { host, port } => (host, port, false),
+            WorkloadEndpoint::Tls { host, port } => (host, port, true),
+            WorkloadEndpoint::Unix(_) => {
+                return Err(WorkloadProbeError::Malformed(
+                    "MySQL endpoint must use TCP or TLS".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            host,
+            port,
+            use_tls,
+            username,
+            password,
+            database: connection.database.clone(),
+            endpoint_text: connection.endpoint.clone(),
+        })
+    }
+}
+
+/// Runs a MySQL probe on its own current-thread runtime, because callers can already be inside a
+/// Tokio runtime. The scoped thread lets the probe borrow a statement tracker.
+fn run_mysql_probe<T: Send>(
+    probe: impl std::future::Future<Output = std::result::Result<T, WorkloadProbeError>> + Send,
+) -> std::result::Result<T, WorkloadProbeError> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| {
+                        WorkloadProbeError::Unreachable("MySQL probe runtime is unavailable".into())
+                    })?;
+                runtime.block_on(probe)
+            })
+            .join()
+            .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe runtime failed".into()))?
+    })
+}
+
+async fn mysql_status_with_timeout(
+    target: &MySqlTarget,
+) -> std::result::Result<(MySqlConnection, MySqlMetrics), WorkloadProbeError> {
+    tokio::time::timeout(MYSQL_PROBE_TIMEOUT, mysql_status(target))
+        .await
+        .map_err(|_| WorkloadProbeError::Unreachable("MySQL probe timed out".into()))?
+}
+
+async fn mysql_status(
+    target: &MySqlTarget,
+) -> std::result::Result<(MySqlConnection, MySqlMetrics), WorkloadProbeError> {
+    let options = mysql_connection_options(
+        &target.host,
+        target.port,
+        target.use_tls,
+        &target.username,
+        target.password.as_deref(),
+        target.database.as_deref(),
+    )?;
     let mut connection = MySqlConnection::new(options)
         .await
         .map_err(map_mysql_connect_error)?;
@@ -1521,9 +2036,13 @@ async fn monitor_mysql_async(
         .query(MYSQL_METRICS_QUERY)
         .await
         .map_err(|_| WorkloadProbeError::Rejected("MySQL rejected metrics query".into()))?;
-    let metrics = mysql_metrics_from_rows(&rows);
-    let _ = connection.disconnect().await;
-    metrics
+    match mysql_metrics_from_rows(&rows) {
+        Ok(metrics) => Ok((connection, metrics)),
+        Err(error) => {
+            let _ = connection.disconnect().await;
+            Err(error)
+        }
+    }
 }
 
 fn mysql_connection_options(
@@ -3862,6 +4381,7 @@ mod tests {
             adapter: WorkloadAdapter::Jvm,
             driver_mode: WorkloadDriverMode::DetectOnly,
             connection: None,
+            query_digest: false,
         };
         let json = serde_json::to_string(&definition).unwrap();
         assert_eq!(
@@ -5497,5 +6017,500 @@ path = "/usr/bin/redis-server"
             let mut stream = TestStream::response(invalid);
             assert!(monitor_memcached_stream(&mut stream).is_err());
         }
+    }
+
+    const MINUTE_US: u64 = 60 * MICROS_PER_SEC;
+    const T0: u64 = 1_000 * MINUTE_US;
+
+    fn digest_row(
+        digest: Option<&str>,
+        calls: u64,
+        timer_wait_ps: u64,
+        first_seen_us: u64,
+    ) -> DigestRow {
+        DigestRow {
+            schema: Some("app".to_string()),
+            digest: digest.map(str::to_string),
+            counters: DigestCounters {
+                calls,
+                timer_wait_ps,
+                lock_time_ps: calls * 1_000_000,
+                errors: 0,
+                rows_examined: calls * 10,
+                rows_sent: calls,
+                no_index_used: calls / 2,
+            },
+            first_seen_us,
+        }
+    }
+
+    fn poll(
+        tracker: &mut QueryDigestTracker,
+        server_now_us: u64,
+        rows: Vec<DigestRow>,
+    ) -> QueryDigestReport {
+        tracker.observe(&DigestSnapshot {
+            server_now_us,
+            rows,
+        })
+    }
+
+    fn top_calls(report: &QueryDigestReport) -> Vec<(&str, u64)> {
+        report
+            .top
+            .iter()
+            .map(|entry| (entry.digest.as_str(), entry.calls))
+            .collect()
+    }
+
+    #[test]
+    fn query_digest_reports_interval_differences_most_time_first() {
+        let mut tracker = QueryDigestTracker::default();
+        let first = poll(
+            &mut tracker,
+            T0,
+            vec![
+                digest_row(Some("a"), 10, 5_000_000_000, 0),
+                digest_row(Some("b"), 5, 1_000_000_000, 0),
+            ],
+        );
+        assert!(first.baseline);
+        assert!(first.top.is_empty());
+
+        let second = poll(
+            &mut tracker,
+            T0 + MINUTE_US,
+            vec![
+                digest_row(Some("a"), 15, 6_000_000_000, 0),
+                digest_row(Some("b"), 25, 9_000_000_000, 0),
+            ],
+        );
+        assert!(!second.baseline);
+        assert_eq!(top_calls(&second), [("b", 20), ("a", 5)]);
+        let b = &second.top[0];
+        assert_eq!(b.total_time_us, 8_000);
+        assert_eq!(b.lock_time_us, 20);
+        assert_eq!(b.rows_examined, 200);
+        assert_eq!(b.no_index_used, 10);
+        assert_eq!(b.schema.as_deref(), Some("app"));
+        assert_eq!(b.text, None);
+    }
+
+    #[test]
+    fn query_digest_counts_rows_created_after_the_previous_poll_in_full() {
+        let mut tracker = QueryDigestTracker::default();
+        poll(
+            &mut tracker,
+            T0,
+            vec![digest_row(Some("restarted"), 100, 100, 0)],
+        );
+        let report = poll(
+            &mut tracker,
+            T0 + MINUTE_US,
+            vec![
+                // TRUNCATE or a restart recreated the row after the previous poll.
+                digest_row(Some("restarted"), 3, 30, T0 + 30 * MICROS_PER_SEC),
+                digest_row(Some("new"), 7, 70, T0 + 10 * MICROS_PER_SEC),
+                // Older than the previous poll: its calls cannot be split by interval.
+                digest_row(Some("unknown_age"), 50, 500, T0 - MINUTE_US),
+            ],
+        );
+        assert_eq!(top_calls(&report), [("new", 7), ("restarted", 3)]);
+
+        let next = poll(
+            &mut tracker,
+            T0 + 2 * MINUTE_US,
+            vec![digest_row(Some("unknown_age"), 55, 550, T0 - MINUTE_US)],
+        );
+        assert_eq!(top_calls(&next), [("unknown_age", 5)]);
+    }
+
+    #[test]
+    fn query_digest_skips_rows_that_lost_calls_and_resets_after_a_gap() {
+        let mut tracker = QueryDigestTracker::default();
+        poll(&mut tracker, T0, vec![digest_row(Some("a"), 10, 100, 0)]);
+        let shrunk = poll(
+            &mut tracker,
+            T0 + MINUTE_US,
+            vec![digest_row(Some("a"), 4, 40, 0)],
+        );
+        assert!(shrunk.top.is_empty());
+
+        // Four minutes without a poll: the difference would span several intervals.
+        let after_gap = poll(
+            &mut tracker,
+            T0 + 5 * MINUTE_US,
+            vec![digest_row(Some("a"), 400, 4_000, 0)],
+        );
+        assert!(after_gap.baseline);
+        assert!(after_gap.top.is_empty());
+        let resumed = poll(
+            &mut tracker,
+            T0 + 6 * MINUTE_US,
+            vec![digest_row(Some("a"), 401, 4_010, 0)],
+        );
+        assert_eq!(top_calls(&resumed), [("a", 1)]);
+    }
+
+    #[test]
+    fn query_digest_reports_the_overflow_row_apart_and_flags_the_row_limit() {
+        let mut tracker = QueryDigestTracker::default();
+        poll(&mut tracker, T0, vec![digest_row(None, 100, 100, 0)]);
+        let report = poll(
+            &mut tracker,
+            T0 + MINUTE_US,
+            vec![
+                digest_row(None, 130, 130, 0),
+                digest_row(Some("a"), 2, 20, T0 + MICROS_PER_SEC),
+            ],
+        );
+        assert_eq!(report.unattributed_calls, 30);
+        assert_eq!(top_calls(&report), [("a", 2)]);
+        assert!(!report.row_limit_reached);
+
+        let full = poll(
+            &mut tracker,
+            T0 + 2 * MINUTE_US,
+            (0..MYSQL_QUERY_DIGEST_ROW_LIMIT)
+                .map(|index| digest_row(Some(&format!("d{index}")), 1, 1, 0))
+                .collect(),
+        );
+        assert!(full.row_limit_reached);
+    }
+
+    #[test]
+    fn query_digest_keeps_only_the_top_statements() {
+        let mut tracker = QueryDigestTracker::default();
+        let names = (0..12)
+            .map(|index| format!("d{index:02}"))
+            .collect::<Vec<_>>();
+        poll(
+            &mut tracker,
+            T0,
+            names
+                .iter()
+                .map(|name| digest_row(Some(name), 0, 0, 0))
+                .collect(),
+        );
+        let report = poll(
+            &mut tracker,
+            T0 + MINUTE_US,
+            names
+                .iter()
+                .zip(1..)
+                .map(|(name, weight)| digest_row(Some(name), 1, weight * 1_000_000, 0))
+                .collect(),
+        );
+        assert_eq!(report.top.len(), MYSQL_QUERY_DIGEST_TOP);
+        assert_eq!(report.top[0].digest, "d11");
+        assert_eq!(report.top[MYSQL_QUERY_DIGEST_TOP - 1].digest, "d02");
+    }
+
+    #[test]
+    fn query_digest_forgets_rows_unseen_for_ten_polls() {
+        let mut tracker = QueryDigestTracker::default();
+        poll(
+            &mut tracker,
+            T0,
+            vec![
+                digest_row(Some("rare"), 10, 100, 0),
+                digest_row(Some("busy"), 1, 1, 0),
+            ],
+        );
+        for minute in 1..=QUERY_DIGEST_EVICT_AFTER_POLLS {
+            poll(
+                &mut tracker,
+                T0 + minute * MINUTE_US,
+                vec![digest_row(Some("busy"), 1 + minute, 1 + minute, 0)],
+            );
+        }
+        // The old baseline is gone, and the row is older than the previous poll, so its
+        // ten-minute total is not credited to one interval.
+        let report = poll(
+            &mut tracker,
+            T0 + (QUERY_DIGEST_EVICT_AFTER_POLLS + 1) * MINUTE_US,
+            vec![digest_row(Some("rare"), 100, 1_000, 0)],
+        );
+        assert!(report.top.is_empty());
+    }
+
+    #[test]
+    fn query_digest_text_is_cached_deduplicated_and_truncated() {
+        let mut tracker = QueryDigestTracker::default();
+        let mut report = QueryDigestReport {
+            baseline: false,
+            top: ["a", "b", "a"]
+                .into_iter()
+                .map(|digest| QueryDigestEntry {
+                    schema: None,
+                    digest: digest.to_string(),
+                    text: None,
+                    calls: 1,
+                    total_time_us: 1,
+                    lock_time_us: 0,
+                    errors: 0,
+                    rows_examined: 0,
+                    rows_sent: 0,
+                    no_index_used: 0,
+                })
+                .collect(),
+            unattributed_calls: 0,
+            row_limit_reached: false,
+        };
+        tracker.remember_text("b".to_string(), "SELECT 1");
+        assert_eq!(tracker.missing_texts(&report), ["a"]);
+
+        let long = format!("SELECT '{}'", "가".repeat(QUERY_DIGEST_TEXT_BYTES));
+        tracker.remember_text("a".to_string(), &long);
+        tracker.fill_texts(&mut report);
+        let text = report.top[0].text.as_deref().unwrap();
+        assert!(text.len() <= QUERY_DIGEST_TEXT_BYTES);
+        assert!(long.starts_with(text));
+        assert_eq!(report.top[1].text.as_deref(), Some("SELECT 1"));
+    }
+
+    fn bytes(value: &str) -> mysql_async::Value {
+        mysql_async::Value::Bytes(value.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn query_digest_prerequisites_report_why_statements_are_unavailable() {
+        let row = |performance_schema, consumer: Option<&str>| {
+            vec![vec![
+                bytes(performance_schema),
+                consumer.map_or(mysql_async::Value::NULL, bytes),
+                bytes("1700000000123456"),
+            ]]
+        };
+        assert_eq!(
+            query_digest_server_now(row("1", Some("YES"))),
+            Ok(1_700_000_000_123_456)
+        );
+        assert_eq!(
+            query_digest_server_now(row("0", Some("YES"))),
+            Err(QueryDigestUnavailable::PerformanceSchemaOff)
+        );
+        assert_eq!(
+            query_digest_server_now(row("1", Some("NO"))),
+            Err(QueryDigestUnavailable::ConsumerDisabled)
+        );
+        assert_eq!(
+            query_digest_server_now(row("1", None)),
+            Err(QueryDigestUnavailable::ConsumerDisabled)
+        );
+        assert_eq!(
+            query_digest_server_now(Vec::new()),
+            Err(QueryDigestUnavailable::Malformed)
+        );
+    }
+
+    #[test]
+    fn query_digest_rows_parse_text_protocol_values() {
+        let values = |schema: mysql_async::Value, digest: mysql_async::Value, calls: &str| {
+            vec![
+                schema,
+                digest,
+                bytes(calls),
+                bytes("2500000000"),
+                bytes("1000000"),
+                bytes("1"),
+                bytes("40"),
+                bytes("4"),
+                bytes("4"),
+                bytes("1700000000000000"),
+            ]
+        };
+        let row = query_digest_row(values(bytes("app"), bytes("ab12"), "4")).unwrap();
+        assert_eq!(row.schema.as_deref(), Some("app"));
+        assert_eq!(row.digest.as_deref(), Some("ab12"));
+        assert_eq!(row.counters.timer_wait_ps, 2_500_000_000);
+        assert_eq!(row.first_seen_us, 1_700_000_000_000_000);
+
+        let overflow = query_digest_row(values(
+            mysql_async::Value::NULL,
+            mysql_async::Value::NULL,
+            "4",
+        ))
+        .unwrap();
+        assert_eq!((overflow.schema, overflow.digest), (None, None));
+
+        assert_eq!(
+            query_digest_row(values(bytes("app"), bytes("ab12"), "four")),
+            Err(QueryDigestUnavailable::Malformed)
+        );
+        let mut short = values(bytes("app"), bytes("ab12"), "4");
+        short.pop();
+        assert_eq!(
+            query_digest_row(short),
+            Err(QueryDigestUnavailable::Malformed)
+        );
+    }
+
+    #[test]
+    fn query_digest_access_errors_map_to_permission_denied() {
+        let server = |code| {
+            mysql_async::Error::Server(mysql_async::ServerError {
+                code,
+                message: "denied".to_string(),
+                state: "42000".to_string(),
+            })
+        };
+        for code in MYSQL_ACCESS_DENIED_CODES {
+            assert_eq!(
+                query_digest_error(server(code)),
+                QueryDigestUnavailable::PermissionDenied
+            );
+        }
+        // ER_NO_SUCH_TABLE: an old server without the digest table.
+        assert_eq!(
+            query_digest_error(server(1146)),
+            QueryDigestUnavailable::QueryFailed
+        );
+    }
+
+    #[test]
+    fn query_digest_queries_are_bounded_and_never_read_raw_statements() {
+        let rows = mysql_query_digest_rows_query();
+        assert!(rows.contains(&format!("LIMIT {MYSQL_QUERY_DIGEST_ROW_LIMIT}")));
+        assert!(rows.contains(&format!("INTERVAL {MYSQL_QUERY_DIGEST_WINDOW_SECS} SECOND")));
+        assert!(rows.contains("ORDER BY SUM_TIMER_WAIT DESC"));
+        let text = mysql_query_digest_text_query(3);
+        assert!(text.ends_with("IN (?, ?, ?)"));
+        for query in [
+            rows.as_str(),
+            text.as_str(),
+            MYSQL_QUERY_DIGEST_PREREQUISITES,
+        ] {
+            assert!(!query.contains("QUERY_SAMPLE_TEXT"));
+            assert!(!query.contains("SQL_TEXT"));
+        }
+    }
+
+    #[test]
+    fn digest_text_identifiers_survive_redaction() {
+        let text = "SELECT `email` , `ip_address` , `phone` FROM `users` WHERE `id` = ? AND `created_at` > ?";
+        assert_eq!(crate::redaction::redact(text).0, text);
+    }
+
+    #[test]
+    fn query_digest_history_lines_never_parse_as_metric_samples() {
+        let collected = QueryDigestSample {
+            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+            workload_id: "exe:/usr/sbin/mysqld".to_string(),
+            captured_at: DateTime::parse_from_rfc3339("2026-10-14T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            outcome: QueryDigestOutcome::Collected(QueryDigestReport {
+                baseline: false,
+                top: Vec::new(),
+                unattributed_calls: 2,
+                row_limit_reached: false,
+            }),
+        };
+        let unavailable = QueryDigestSample {
+            outcome: Err(QueryDigestUnavailable::PermissionDenied).into(),
+            ..collected.clone()
+        };
+        for sample in [collected, unavailable] {
+            let line = serde_json::to_string(&sample).unwrap();
+            assert_eq!(
+                serde_json::from_str::<QueryDigestSample>(&line).unwrap(),
+                sample
+            );
+            assert!(
+                serde_json::from_str::<WorkloadSample>(&line).is_err(),
+                "{line}"
+            );
+        }
+        let metric_line = r#"{"schema_version":1,"workload_id":"exe:/usr/sbin/mysqld","captured_at":"2026-10-14T00:00:00Z","adapter":"my_sql","outcome":"failed","reason":"rejected","detail":"x"}"#;
+        assert!(serde_json::from_str::<WorkloadSample>(metric_line).is_ok());
+        assert!(serde_json::from_str::<QueryDigestSample>(metric_line).is_err());
+    }
+
+    #[test]
+    fn query_digest_definition_flag_defaults_off_and_round_trips() {
+        let toml_without = r#"
+            id = "exe:/usr/sbin/mysqld"
+            adapter = "my_sql"
+            [selector.executable]
+            path = "/usr/sbin/mysqld"
+        "#;
+        let definition = toml::from_str::<WorkloadDefinition>(toml_without).unwrap();
+        assert!(!definition.query_digest);
+        assert!(!toml::to_string(&definition)
+            .unwrap()
+            .contains("query_digest"));
+
+        let enabled = WorkloadDefinition {
+            query_digest: true,
+            ..definition
+        };
+        let text = toml::to_string(&enabled).unwrap();
+        assert!(text.contains("query_digest = true"));
+        assert_eq!(
+            toml::from_str::<WorkloadDefinition>(&text).unwrap(),
+            enabled
+        );
+    }
+
+    /// Runs against a live MySQL, for example a disposable container. Set
+    /// `AIC_TEST_MYSQL_ENDPOINT`, `AIC_TEST_MYSQL_USER`, and `AIC_TEST_MYSQL_PASSWORD`. Set
+    /// `AIC_TEST_MYSQL_EXPECT` to an unavailable reason, such as `permission_denied`, to check
+    /// that path instead.
+    #[test]
+    #[ignore = "needs a live MySQL; see the doc comment"]
+    fn live_mysql_query_digest() {
+        let (Ok(endpoint), Ok(username)) = (
+            std::env::var("AIC_TEST_MYSQL_ENDPOINT"),
+            std::env::var("AIC_TEST_MYSQL_USER"),
+        ) else {
+            return;
+        };
+        let connection = WorkloadConnectionConfig {
+            endpoint,
+            username: Some(username),
+            secret_ref: Some("env:AIC_TEST_MYSQL_PASSWORD".to_string()),
+            database: None,
+            auth_source: None,
+        };
+        let mut tracker = QueryDigestTracker::default();
+        let (_, _, first) = monitor_mysql_with_query_digest(&connection, &mut tracker).unwrap();
+        if let Ok(expected) = std::env::var("AIC_TEST_MYSQL_EXPECT") {
+            assert_eq!(first.unwrap_err().as_str(), expected);
+            return;
+        }
+        assert!(first.unwrap().baseline);
+
+        let target = MySqlTarget::from_connection(&connection).unwrap();
+        run_mysql_probe(async {
+            let (mut session, _) = mysql_status(&target).await?;
+            for value in 0..20 {
+                session
+                    .query_drop(format!("SELECT {value} + 41 AS aic_digest_probe"))
+                    .await
+                    .unwrap();
+            }
+            let _ = session.disconnect().await;
+            Ok(())
+        })
+        .unwrap();
+
+        let (_, _, second) = monitor_mysql_with_query_digest(&connection, &mut tracker).unwrap();
+        let report = second.unwrap();
+        assert!(!report.baseline);
+        let probe = report
+            .top
+            .iter()
+            .find(|entry| {
+                entry
+                    .text
+                    .as_deref()
+                    .is_some_and(|text| text.contains("aic_digest_probe"))
+            })
+            .unwrap_or_else(|| panic!("probe statement missing: {report:#?}"));
+        assert_eq!(probe.calls, 20, "{probe:#?}");
+        let text = probe.text.as_deref().unwrap();
+        assert!(!text.contains("41"), "{text}");
+        eprintln!("{report:#?}");
     }
 }
