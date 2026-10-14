@@ -69,6 +69,25 @@ A `file:NAME` reference reads `secrets/NAME` in the same directory as `workloads
 
 The interactive enable writes the file with mode `0600` in a directory with mode `0700`. AIC refuses to read a file secret that the group or other users can read.
 
+A scripted enable sets a `file:NAME` reference with `--auth-file NAME`:
+
+- If `secrets/NAME` exists, enable uses that file. Enable checks the file mode and the content first.
+- If the file does not exist, enable asks for the password on a terminal. In a script, add `--password-stdin` and write the password to standard input.
+- Enable does not replace a file that exists. With `--password-stdin` and a file that exists, enable stops with an error.
+- If enable fails after it writes a new file, it removes that file.
+- Enable removes line breaks at the end of the password. An empty password stops enable.
+
+The file contains only the password as text. AIC ignores line breaks at the end of the file.
+
+```sh
+printf '%s\n' "$MONITOR_PASSWORD" | aic workload enable "$WORKLOAD_ID" \
+  --fingerprint "$FINGERPRINT" \
+  --endpoint tcp://127.0.0.1:3306 \
+  --username aic_monitor \
+  --auth-file mysql-monitor \
+  --password-stdin
+```
+
 On Linux, use `file:NAME` when `aicd` runs as a systemd service. The service does not get the environment of your login shell. The kernel keyring of your login session is also not available to the service.
 
 `file:NAME` needs a version of `aicd` that supports it. An older `aicd` cannot parse `workloads.toml` with this reference and stops all workload collection. Update `aic` and `aicd` together.
@@ -220,12 +239,12 @@ MariaDB disables `performance_schema` by default. You can enable it only at serv
 Enable MySQL with statement statistics:
 
 ```sh
-export AIC_MYSQL_MONITOR_PASSWORD='replace-me'
-aic workload enable "$WORKLOAD_ID" \
+printf '%s\n' "$MONITOR_PASSWORD" | aic workload enable "$WORKLOAD_ID" \
   --fingerprint "$FINGERPRINT" \
   --endpoint tcp://127.0.0.1:3306 \
   --username aic_monitor \
-  --auth-env AIC_MYSQL_MONITOR_PASSWORD \
+  --auth-file mysql-monitor \
+  --password-stdin \
   --query-digest
 ```
 
