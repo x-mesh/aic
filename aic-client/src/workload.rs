@@ -27,7 +27,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -1493,6 +1493,97 @@ pub fn enable_candidate(
     };
     save_definition(&definition)?;
     Ok(definition)
+}
+
+/// A `file:NAME` secret ready for a workload definition.
+pub struct PreparedFileSecret {
+    pub reference: String,
+    /// Set when this call wrote the file, so that a failed enable removes only what it made.
+    created: Option<String>,
+}
+
+impl PreparedFileSecret {
+    pub fn discard(&self) {
+        if let Some(name) = &self.created {
+            let _ = aic_common::secret::delete_file_secret(name);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FileSecretSource {
+    Existing,
+    Stdin,
+    Prompt,
+}
+
+fn file_secret_source(
+    exists: bool,
+    password_stdin: bool,
+    stdin_is_terminal: bool,
+) -> Result<FileSecretSource> {
+    match (exists, password_stdin, stdin_is_terminal) {
+        (true, false, _) => Ok(FileSecretSource::Existing),
+        // Another workload can use the same file. Replacing it would change that password too.
+        (true, true, _) => bail!(
+            "file secret already exists; --password-stdin does not overwrite it. Remove the file or choose another name"
+        ),
+        (false, true, _) => Ok(FileSecretSource::Stdin),
+        (false, false, true) => Ok(FileSecretSource::Prompt),
+        // Reading stdin without the flag could swallow input meant for something else.
+        (false, false, false) => bail!(
+            "file secret does not exist and stdin is not a terminal; pass the password with --password-stdin"
+        ),
+    }
+}
+
+fn secret_from_input(raw: &str) -> Result<String> {
+    let secret = raw.trim_end_matches(['\n', '\r']);
+    if secret.is_empty() {
+        bail!("the password is empty; omit --auth-file for an account without a password");
+    }
+    Ok(secret.to_string())
+}
+
+/// Prepares the `file:NAME` secret of `aic workload enable --auth-file NAME`.
+///
+/// An existing file is reused after the checks that aicd applies when it reads the file. Otherwise
+/// the password comes from a hidden prompt or, with `password_stdin`, from standard input, and is
+/// stored with owner-only permissions.
+pub fn prepare_file_secret(name: &str, password_stdin: bool) -> Result<PreparedFileSecret> {
+    let reference = aic_common::secret::make_file_reference(name);
+    aic_common::secret::parse_secret_reference(&reference).map_err(anyhow::Error::msg)?;
+    let exists = aic_common::secret::file_secret_dir().join(name).exists();
+    let secret = match file_secret_source(exists, password_stdin, std::io::stdin().is_terminal())? {
+        FileSecretSource::Existing => {
+            let existing = aic_common::secret::resolve_secret_reference(&reference)
+                .map_err(anyhow::Error::msg)?;
+            if existing.is_empty() {
+                bail!("file secret is empty: {name}");
+            }
+            return Ok(PreparedFileSecret {
+                reference,
+                created: None,
+            });
+        }
+        FileSecretSource::Stdin => {
+            let mut raw = String::new();
+            std::io::stdin()
+                .read_to_string(&mut raw)
+                .context("read the password from stdin")?;
+            secret_from_input(&raw)?
+        }
+        FileSecretSource::Prompt => secret_from_input(
+            &dialoguer::Password::new()
+                .with_prompt(format!("{name} password"))
+                .interact()?,
+        )?,
+    };
+    aic_common::secret::store_file_secret(name, &secret).map_err(anyhow::Error::msg)?;
+    Ok(PreparedFileSecret {
+        reference,
+        created: Some(name.to_string()),
+    })
 }
 
 /// 어댑터가 보통 듣는 TCP 포트. HAProxy는 Unix 소켓이라 없다.
@@ -3065,6 +3156,27 @@ mod tests {
         assert!(validate_enable_connection(WorkloadAdapter::MySql, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::MongoDb, None).is_err());
         assert!(validate_enable_connection(WorkloadAdapter::Redis, None).is_ok());
+    }
+
+    #[test]
+    fn auth_file_reuses_an_existing_file_and_never_overwrites_it() {
+        use FileSecretSource::*;
+        assert_eq!(file_secret_source(true, false, true).unwrap(), Existing);
+        assert_eq!(file_secret_source(true, false, false).unwrap(), Existing);
+        assert!(file_secret_source(true, true, false).is_err());
+        assert_eq!(file_secret_source(false, true, false).unwrap(), Stdin);
+        assert_eq!(file_secret_source(false, true, true).unwrap(), Stdin);
+        assert_eq!(file_secret_source(false, false, true).unwrap(), Prompt);
+        let error = file_secret_source(false, false, false).unwrap_err();
+        assert!(error.to_string().contains("--password-stdin"), "{error}");
+    }
+
+    #[test]
+    fn auth_file_input_drops_trailing_newlines_and_rejects_empty() {
+        assert_eq!(secret_from_input("S3cret!pw\r\n").unwrap(), "S3cret!pw");
+        assert_eq!(secret_from_input(" spaced pw \n").unwrap(), " spaced pw ");
+        assert!(secret_from_input("\n").is_err());
+        assert!(secret_from_input("").is_err());
     }
 
     #[test]

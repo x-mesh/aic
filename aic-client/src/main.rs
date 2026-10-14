@@ -684,10 +684,17 @@ enum WorkloadOp {
         /// MongoDB authentication database. Defaults to admin.
         #[arg(long)]
         auth_source: Option<String>,
-        #[arg(long, conflicts_with = "auth_keychain")]
+        #[arg(long, conflicts_with_all = ["auth_keychain", "auth_file"])]
         auth_env: Option<String>,
-        #[arg(long, conflicts_with = "auth_env")]
+        #[arg(long, conflicts_with_all = ["auth_env", "auth_file"])]
         auth_keychain: Option<String>,
+        /// Password file NAME under the aic secrets directory (`file:NAME`). An existing file is
+        /// reused; otherwise the password is asked for, or read with --password-stdin.
+        #[arg(long, conflicts_with_all = ["auth_env", "auth_keychain"])]
+        auth_file: Option<String>,
+        /// Read the --auth-file password from standard input instead of a prompt.
+        #[arg(long, requires = "auth_file")]
+        password_stdin: bool,
         /// Also read per-statement statistics from MySQL performance_schema.
         #[arg(long, requires = "candidate_id", requires = "endpoint")]
         query_digest: bool,
@@ -1542,6 +1549,8 @@ fn handle_workload(op: WorkloadOp) {
             auth_source,
             auth_env,
             auth_keychain,
+            auth_file,
+            password_stdin,
             query_digest,
             json,
         } => {
@@ -1559,10 +1568,11 @@ fn handle_workload(op: WorkloadOp) {
                         || database.is_some()
                         || auth_source.is_some()
                         || auth_env.is_some()
-                        || auth_keychain.is_some() =>
+                        || auth_keychain.is_some()
+                        || auth_file.is_some() =>
                 {
                     Err(anyhow::anyhow!(
-                        "--username, --database, --auth-source, --auth-env, and --auth-keychain require --endpoint"
+                        "--username, --database, --auth-source, --auth-env, --auth-keychain, and --auth-file require --endpoint"
                     ))
                 }
                 None => Ok(None),
@@ -1572,7 +1582,16 @@ fn handle_workload(op: WorkloadOp) {
                     let fingerprint = fingerprint.ok_or_else(|| {
                         anyhow::anyhow!("--fingerprint is required with a candidate id; run `aic workload enable` without arguments to pick one interactively")
                     })?;
-                    workload::enable_with_connection(&candidate_id, &fingerprint, connection, query_digest)
+                    // The file secret is written last, after every flag check, and removed again
+                    // when the enable fails, so a rejected command leaves no password behind.
+                    let (Some(mut connection), Some(name)) = (connection.clone(), auth_file.as_deref())
+                    else {
+                        return workload::enable_with_connection(&candidate_id, &fingerprint, connection, query_digest);
+                    };
+                    let secret = workload::prepare_file_secret(name, password_stdin)?;
+                    connection.secret_ref = Some(secret.reference.clone());
+                    workload::enable_with_connection(&candidate_id, &fingerprint, Some(connection), query_digest)
+                        .inspect_err(|_| secret.discard())
                 })
                 .map(|definition| {
             if json {
@@ -11663,6 +11682,39 @@ mod tests {
         assert!(validate_bind("localhost").is_err());
         assert!(validate_bind("127.0.0.1:").is_err());
         assert!(validate_bind("127.0.0.1:99999").is_err());
+    }
+
+    #[test]
+    fn auth_file_flags_parse_and_exclude_other_secret_sources() {
+        use clap::Parser;
+        let base = [
+            "aic",
+            "workload",
+            "enable",
+            "exe:/usr/sbin/mysqld",
+            "--fingerprint",
+            "f",
+            "--endpoint",
+            "tcp://127.0.0.1:3306",
+            "--username",
+            "aic_monitor",
+        ];
+        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()));
+        let parsed = parse(&["--auth-file", "mysql-dev", "--password-stdin"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Workload {
+                op: super::WorkloadOp::Enable {
+                    auth_file: Some(ref name),
+                    password_stdin: true,
+                    ..
+                }
+            }) if name == "mysql-dev"
+        ));
+        assert!(parse(&["--auth-file", "mysql-dev"]).is_ok());
+        assert!(parse(&["--password-stdin"]).is_err());
+        assert!(parse(&["--auth-file", "a", "--auth-env", "B"]).is_err());
+        assert!(parse(&["--auth-file", "a", "--auth-keychain", "b"]).is_err());
     }
 
     #[test]
