@@ -2087,9 +2087,10 @@ mod tests {
         assert!(body.is_char_boundary(body.len()));
     }
 
-    fn query_records(
-        outcome: aic_common::workload::QueryDigestOutcome,
-    ) -> Vec<(i32, Vec<(String, Option<AnyValueOneof>)>)> {
+    /// (severity_number, attributes) of one encoded log record.
+    type DecodedRecord = (i32, Vec<(String, Option<AnyValueOneof>)>);
+
+    fn query_records(outcome: aic_common::workload::QueryDigestOutcome) -> Vec<DecodedRecord> {
         let sample = aic_common::workload::QueryDigestSample {
             schema_version: 1,
             workload_id: "systemd:mysql.service".to_string(),
