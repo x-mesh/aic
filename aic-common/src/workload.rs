@@ -969,7 +969,10 @@ pub const PROMETHEUS_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9090";
 pub const PROMETHEUS_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const CLICKHOUSE_LOOPBACK_ENDPOINT: &str = "127.0.0.1:8123";
 pub const CLICKHOUSE_RESPONSE_BYTES: usize = 64 * 1024;
-pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, value FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
+/// `system.asynchronous_metrics.value` is Float64, and `Uptime` carries a fraction. `toInt64`
+/// matches the Int64 column of `system.metrics`: `toUInt64` leaves the UNION ALL without a
+/// common type unless the server enables `use_variant_as_common_type`.
+pub const CLICKHOUSE_METRICS_QUERY: &str = "SELECT metric, value FROM system.metrics WHERE metric IN ('Query','Merge','PartMutation','ReplicatedFetch','ReplicatedSend','TCPConnection','HTTPConnection','MemoryTracking') UNION ALL SELECT metric, toInt64(value) FROM system.asynchronous_metrics WHERE metric IN ('Uptime','MemoryResident') ORDER BY metric FORMAT TabSeparatedRaw";
 pub const ETCD_LOOPBACK_ENDPOINT: &str = "127.0.0.1:2379";
 pub const ETCD_RESPONSE_BYTES: usize = 64 * 1024;
 pub const SEARCH_LOOPBACK_ENDPOINT: &str = "127.0.0.1:9200";
@@ -6566,5 +6569,29 @@ path = "/usr/bin/redis-server"
         let text = probe.text.as_deref().unwrap();
         assert!(!text.contains("41"), "{text}");
         eprintln!("{report:#?}");
+    }
+
+    /// Runs against a live ClickHouse, for example a disposable container. Set
+    /// `AIC_TEST_CLICKHOUSE_ENDPOINT` to its HTTP endpoint, such as `tcp://127.0.0.1:8123`.
+    #[test]
+    #[ignore = "needs a live ClickHouse; see the doc comment"]
+    fn live_clickhouse_metrics() {
+        let Ok(endpoint) = std::env::var("AIC_TEST_CLICKHOUSE_ENDPOINT") else {
+            return;
+        };
+        let connection = WorkloadConnectionConfig {
+            endpoint,
+            username: None,
+            secret_ref: None,
+            database: None,
+            auth_source: None,
+        };
+        let (_, metrics) = monitor_clickhouse_with_connection(Some(&connection)).unwrap();
+        assert!(
+            metrics.queries >= 1,
+            "the probe query counts itself: {metrics:#?}"
+        );
+        assert!(metrics.memory_resident_bytes > 0, "{metrics:#?}");
+        eprintln!("{metrics:#?}");
     }
 }

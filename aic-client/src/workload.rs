@@ -786,6 +786,9 @@ fn classify(row: &ProcessRow) -> (Option<WorkloadSelector>, WorkloadAdapter, Vec
     if let Some(result) = named_service(&["clickhouse-server"], WorkloadAdapter::ClickHouse) {
         return result;
     }
+    if is_clickhouse_server(&row.cmd, executable) {
+        return (service_selector(), WorkloadAdapter::ClickHouse, ambiguity);
+    }
     if let Some(result) = named_service(&["etcd"], WorkloadAdapter::Etcd) {
         return result;
     }
@@ -859,6 +862,17 @@ fn read_cgroup_text(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
         let _ = (pid, ambiguity);
         None
     }
+}
+
+/// 공식 패키지와 이미지는 하나의 `/usr/bin/clickhouse`가 argv로 server·keeper·client 모드를 고른다.
+/// 그래서 `/proc/<pid>/exe`는 `clickhouse`, 15바이트로 잘린 comm은 `clickhouse-serv`가 되고,
+/// 서버인지는 argv로만 알 수 있다.
+fn is_clickhouse_server(cmd: &[String], executable: &str) -> bool {
+    let argv0 = cmd
+        .first()
+        .map(|argv0| argv0.rsplit('/').next().unwrap_or(argv0));
+    argv0 == Some("clickhouse-server")
+        || (executable == "clickhouse" && cmd.get(1).map(String::as_str) == Some("server"))
 }
 
 /// 비루트는 다른 사용자 프로세스의 `/proc/<pid>/exe`를 읽지 못한다. argv[0]은 프로세스가
@@ -2389,9 +2403,12 @@ mod tests {
             row(
                 7,
                 1,
-                "clickhouse-server",
-                Some("/usr/bin/clickhouse-server"),
-                &[],
+                "clickhouse-serv",
+                Some("/usr/bin/clickhouse"),
+                &[
+                    "/usr/bin/clickhouse-server",
+                    "--config-file=/etc/clickhouse-server/config.xml",
+                ],
             ),
             row(8, 1, "etcd", Some("/usr/local/bin/etcd"), &[]),
             row(9, 1, "consul", Some("/usr/bin/consul"), &[]),
@@ -2416,6 +2433,24 @@ mod tests {
         ] {
             assert!(adapters.contains(&adapter), "missing {adapter:?}");
         }
+    }
+
+    #[test]
+    fn discovery_classifies_clickhouse_only_in_server_mode() {
+        let adapter_of = |row| discover_rows(vec![row]).candidates[0].adapter;
+        let exe = Some("/usr/bin/clickhouse");
+        assert_eq!(
+            adapter_of(row(1, 1, "clickhouse", exe, &["clickhouse", "server"])),
+            WorkloadAdapter::ClickHouse
+        );
+        assert_eq!(
+            adapter_of(row(2, 1, "clickhouse-keep", exe, &["clickhouse-keeper"])),
+            WorkloadAdapter::Generic
+        );
+        assert_eq!(
+            adapter_of(row(3, 1, "clickhouse", exe, &["clickhouse", "client"])),
+            WorkloadAdapter::Generic
+        );
     }
 
     #[test]
