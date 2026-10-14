@@ -864,8 +864,6 @@ fn read_cgroup_text(pid: u32, ambiguity: &mut Vec<String>) -> Option<String> {
     }
 }
 
-/// 비루트는 다른 사용자 프로세스의 `/proc/<pid>/exe`를 읽지 못한다. argv[0]은 프로세스가
-/// 바꿀 수 있으므로, 절대 경로이면서 실재하는 파일일 때만 대체 증거로 받는다.
 /// 공식 패키지와 이미지는 하나의 `/usr/bin/clickhouse`가 argv로 server·keeper·client 모드를 고른다.
 /// 그래서 `/proc/<pid>/exe`는 `clickhouse`, 15바이트로 잘린 comm은 `clickhouse-serv`가 되고,
 /// 서버인지는 argv로만 알 수 있다.
@@ -877,6 +875,8 @@ fn is_clickhouse_server(cmd: &[String], executable: &str) -> bool {
         || (executable == "clickhouse" && cmd.get(1).map(String::as_str) == Some("server"))
 }
 
+/// 비루트는 다른 사용자 프로세스의 `/proc/<pid>/exe`를 읽지 못한다. argv[0]은 프로세스가
+/// 바꿀 수 있으므로, 절대 경로이면서 실재하는 파일일 때만 대체 증거로 받는다.
 fn executable_from_argv0(cmd: &[String]) -> Option<String> {
     let argv0 = cmd.first()?;
     let path = std::path::Path::new(argv0);
