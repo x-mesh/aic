@@ -1,3 +1,4 @@
+use crate::otlp_exporter::WorkloadExport;
 use aic_common::workload::{
     adapter_definitions_conflict, workload_history_path, workloads_file_path, QueryDigestSample,
     QueryDigestTracker, WorkloadAdapter, WorkloadConnectionConfig, WorkloadDefinition,
@@ -51,6 +52,8 @@ pub enum DefinitionsState {
 pub enum TickOutcome {
     Skipped(DefinitionsState),
     Appended(WorkloadSample),
+    /// MySQL `query_digest` workload: the metric sample plus the statement poll of the same tick.
+    AppendedWithQueryDigest(WorkloadSample, QueryDigestSample),
 }
 
 /// workload id별 문장 기준선. 수집 스레드는 tick마다 새로 뜨므로 기준선은 루프가 들고 있다.
@@ -239,22 +242,27 @@ fn collect_mysql_with_query_digest(
         },
         now,
     );
-    if let Some(poll) = poll {
-        let sample = QueryDigestSample {
-            schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
-            workload_id: definition.id.clone(),
-            captured_at: now,
-            outcome: poll.into(),
-        };
-        if let Err(error) = append_sample_with_limit(
-            &query_digest_history_path(cfg),
-            &sample,
-            MAX_QUERY_DIGEST_HISTORY_SAMPLES,
-        ) {
-            tracing::warn!(workload = %definition.id, error = %error, "MySQL 문장 통계 기록 실패");
-        }
+    let Some(poll) = poll else {
+        return outcome;
+    };
+    let digest = QueryDigestSample {
+        schema_version: WORKLOAD_SAMPLE_SCHEMA_VERSION,
+        workload_id: definition.id.clone(),
+        captured_at: now,
+        outcome: poll.into(),
+    };
+    if let Err(error) = append_sample_with_limit(
+        &query_digest_history_path(cfg),
+        &digest,
+        MAX_QUERY_DIGEST_HISTORY_SAMPLES,
+    ) {
+        tracing::warn!(workload = %definition.id, error = %error, "MySQL 문장 통계 기록 실패");
     }
-    outcome
+    // 로컬 기록이 실패해도 송신은 한다 — 두 경로는 서로 독립이다.
+    match outcome? {
+        TickOutcome::Appended(sample) => Ok(TickOutcome::AppendedWithQueryDigest(sample, digest)),
+        other => Ok(other),
+    }
 }
 
 fn unavailable_detail(adapter: WorkloadAdapter) -> &'static str {
@@ -400,12 +408,12 @@ pub async fn serve(cfg: WorkloadMonitorConfig, shutdown: watch::Receiver<bool>) 
     serve_with_export(cfg, shutdown, None).await
 }
 
-/// [`serve`]와 같고, 기록한 sample을 `export`로도 넘긴다(rca-web 전송 task). 채널이 가득 차면
+/// [`serve`]와 같고, 기록한 sample과 문장 통계 poll을 `export`로도 넘긴다(rca-web 전송 task). 채널이 가득 차면
 /// 그 sample은 전송에서만 빠지고 로컬 기록은 남는다 — 수집이 전송을 기다리지 않게 한다.
 pub async fn serve_with_export(
     cfg: WorkloadMonitorConfig,
     mut shutdown: watch::Receiver<bool>,
-    export: Option<tokio::sync::mpsc::Sender<WorkloadSample>>,
+    export: Option<tokio::sync::mpsc::Sender<WorkloadExport>>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(cfg.interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -468,11 +476,11 @@ pub async fn serve_with_export(
                         };
                         match wait_for_collection(result, &mut shutdown).await {
                             Some(Ok(Ok(TickOutcome::Appended(sample)))) => {
-                                if let Some(export) = &export {
-                                    if export.try_send(sample).is_err() {
-                                        tracing::debug!(?adapter, "workload export channel full or closed — sample not exported");
-                                    }
-                                }
+                                send_export(export.as_ref(), adapter, WorkloadExport::Sample(sample));
+                            }
+                            Some(Ok(Ok(TickOutcome::AppendedWithQueryDigest(sample, digest)))) => {
+                                send_export(export.as_ref(), adapter, WorkloadExport::Sample(sample));
+                                send_export(export.as_ref(), adapter, WorkloadExport::QueryDigest(digest));
                             }
                             Some(Ok(Ok(TickOutcome::Skipped(_)))) => {},
                             Some(Ok(Err(error))) => tracing::warn!(?adapter, error = %error, "workload sample append failed"),
@@ -488,6 +496,22 @@ pub async fn serve_with_export(
         }
     }
     Ok(())
+}
+
+/// 채널이 가득 차면 그 기록은 전송에서만 빠지고 로컬 기록은 남는다.
+fn send_export(
+    export: Option<&tokio::sync::mpsc::Sender<WorkloadExport>>,
+    adapter: WorkloadAdapter,
+    record: WorkloadExport,
+) {
+    if let Some(export) = export {
+        if export.try_send(record).is_err() {
+            tracing::debug!(
+                ?adapter,
+                "workload export channel full or closed — record not exported"
+            );
+        }
+    }
 }
 
 fn state_tag(state: &DefinitionsState) -> &'static str {

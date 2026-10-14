@@ -611,6 +611,150 @@ pub fn encode_changes(
     build_request(resource, "aic.changes", service_version, log_records)
 }
 
+/// MySQL 문장 통계 poll 하나를 `aic.workload.query` scope로 인코딩한다(rca-web 수신 계약).
+///
+/// poll마다 `aic.query.kind=poll` 레코드 하나와, 그 poll의 상위 문장마다 `kind=statement` 레코드를
+/// 보낸다. 수신측은 (host, workload.id, ts, schema, digest)로 중복을 합치므로 한 poll 안에서
+/// (schema, digest)는 한 번씩만 나온다(tracker가 그 쌍으로 키를 잡는다). 문장 본문은
+/// `DIGEST_TEXT`라 리터럴이 이미 `?`로 바뀌어 있고, 여기서도 [`redact_str`]를 거친다.
+pub fn encode_query_digests(
+    sample: &aic_common::workload::QueryDigestSample,
+    resource: &ResourceAttrs<'_>,
+    service_version: &str,
+) -> Vec<u8> {
+    use aic_common::workload::{
+        workload_adapter_name, workload_short_name, QueryDigestOutcome, WorkloadAdapter,
+    };
+    let time_unix_nano = unix_nanos(sample.captured_at);
+    let adapter = workload_adapter_name(WorkloadAdapter::MySql);
+    let identity = |kind: &str| {
+        vec![
+            attr_str("aic.query.kind", kind),
+            attr_str("workload.id", &sample.workload_id),
+            attr_str("workload.name", workload_short_name(&sample.workload_id)),
+            attr_str("workload.adapter", &adapter),
+        ]
+    };
+    let record = |severity_number: i32, body: Option<&str>, attributes: Vec<KeyValue>| LogRecord {
+        time_unix_nano,
+        observed_time_unix_nano: time_unix_nano,
+        severity_number,
+        severity_text: redact_str(if severity_number == SEVERITY_WARN {
+            "WARN"
+        } else {
+            "INFO"
+        }),
+        body: body.map(string_value),
+        attributes,
+        dropped_attributes_count: 0,
+        flags: 0,
+    };
+
+    let mut poll = identity("poll");
+    poll.push(attr_str(
+        "aic.query.record_id",
+        &query_record_id(
+            resource.host_name,
+            &sample.workload_id,
+            time_unix_nano,
+            None,
+        ),
+    ));
+    let report = match &sample.outcome {
+        QueryDigestOutcome::Unavailable { reason } => {
+            poll.push(attr_str("aic.query.status", reason.as_str()));
+            let records = vec![record(SEVERITY_WARN, None, poll)];
+            return build_request(resource, "aic.workload.query", service_version, records);
+        }
+        QueryDigestOutcome::Collected(report) => report,
+    };
+    let status = if report.baseline {
+        "baseline"
+    } else {
+        "collected"
+    };
+    poll.extend([
+        attr_str("aic.query.status", status),
+        attr_int(
+            "aic.query.statements",
+            saturating_i64(report.top.len() as u64),
+        ),
+        attr_int(
+            "aic.query.unattributed_calls",
+            saturating_i64(report.unattributed_calls),
+        ),
+        attr_bool("aic.query.row_limit_reached", report.row_limit_reached),
+        attr_int(
+            "aic.query.observed_calls",
+            saturating_i64(report.observed_calls),
+        ),
+        attr_int(
+            "aic.query.observed_time_us",
+            saturating_i64(report.observed_time_us),
+        ),
+        attr_int("aic.query.interval_ms", saturating_i64(report.interval_ms)),
+    ]);
+    let mut records = vec![record(SEVERITY_INFO, None, poll)];
+    for (rank, entry) in (1..).zip(&report.top) {
+        let mut attributes = identity("statement");
+        attributes.extend([
+            attr_str("db.system.name", &adapter),
+            attr_str("aic.query.digest", &entry.digest),
+            attr_int("aic.query.rank", rank),
+            attr_int("aic.query.calls", saturating_i64(entry.calls)),
+            attr_int(
+                "aic.query.total_time_us",
+                saturating_i64(entry.total_time_us),
+            ),
+            attr_int("aic.query.lock_time_us", saturating_i64(entry.lock_time_us)),
+            attr_int("aic.query.errors", saturating_i64(entry.errors)),
+            attr_int(
+                "aic.query.rows_examined",
+                saturating_i64(entry.rows_examined),
+            ),
+            attr_int("aic.query.rows_sent", saturating_i64(entry.rows_sent)),
+            attr_int(
+                "aic.query.no_index_used",
+                saturating_i64(entry.no_index_used),
+            ),
+            attr_int("aic.query.interval_ms", saturating_i64(report.interval_ms)),
+            attr_str(
+                "aic.query.record_id",
+                &query_record_id(
+                    resource.host_name,
+                    &sample.workload_id,
+                    time_unix_nano,
+                    Some((entry.schema.as_deref(), &entry.digest)),
+                ),
+            ),
+        ]);
+        // 모르는 schema는 attr을 생략한다 — 수신측이 빈 문자열로 저장한다.
+        if let Some(schema) = entry.schema.as_deref().filter(|schema| !schema.is_empty()) {
+            attributes.push(attr_str("db.namespace", schema));
+        }
+        records.push(record(SEVERITY_INFO, entry.text.as_deref(), attributes));
+    }
+    build_request(resource, "aic.workload.query", service_version, records)
+}
+
+/// spool 재전송 중복을 수신측 ReplacingMergeTree가 흡수하도록 하는 idempotency 키.
+/// statement는 (schema, digest)까지 넣어 같은 poll의 다른 문장과 구분한다.
+fn query_record_id(
+    host: &str,
+    workload_id: &str,
+    time_unix_nano: u64,
+    statement: Option<(Option<&str>, &str)>,
+) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    host.hash(&mut h);
+    workload_id.hash(&mut h);
+    time_unix_nano.hash(&mut h);
+    statement.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// `lines`를 한 번의 `ExportLogsServiceRequest`(scope=`aic.logs`)로 배치 인코딩한다(SRE R2:
 /// journald/container/file/aic self 4종 로그 소스 공용 인코더).
 ///
@@ -739,6 +883,15 @@ fn attr_int(key: &str, value: i64) -> KeyValue {
         key: redact_str(key),
         value: Some(AnyValue {
             value: Some(AnyValueOneof::IntValue(value)),
+        }),
+    }
+}
+
+fn attr_bool(key: &str, value: bool) -> KeyValue {
+    KeyValue {
+        key: redact_str(key),
+        value: Some(AnyValue {
+            value: Some(AnyValueOneof::BoolValue(value)),
         }),
     }
 }
@@ -1932,5 +2085,98 @@ mod tests {
         };
         assert!(body.len() <= MAX_LOG_LINE_BYTES);
         assert!(body.is_char_boundary(body.len()));
+    }
+
+    fn query_records(
+        outcome: aic_common::workload::QueryDigestOutcome,
+    ) -> Vec<(i32, Vec<(String, Option<AnyValueOneof>)>)> {
+        let sample = aic_common::workload::QueryDigestSample {
+            schema_version: 1,
+            workload_id: "systemd:mysql.service".to_string(),
+            captured_at: Utc.with_ymd_and_hms(2026, 10, 14, 0, 0, 0).unwrap(),
+            outcome,
+        };
+        let body = encode_query_digests(&sample, &resource(None), "9.9.9");
+        let request = ExportLogsServiceRequest::decode(body.as_slice()).unwrap();
+        request.resource_logs[0].scope_logs[0]
+            .log_records
+            .iter()
+            .map(|record| {
+                let attrs = record
+                    .attributes
+                    .iter()
+                    .map(|kv| {
+                        (
+                            kv.key.clone(),
+                            kv.value.as_ref().and_then(|v| v.value.clone()),
+                        )
+                    })
+                    .collect();
+                (record.severity_number, attrs)
+            })
+            .collect()
+    }
+
+    fn attr<'a>(
+        attrs: &'a [(String, Option<AnyValueOneof>)],
+        key: &str,
+    ) -> Option<&'a AnyValueOneof> {
+        attrs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.as_ref())
+    }
+
+    #[test]
+    fn unavailable_query_poll_sends_one_warn_record_with_the_reason() {
+        let records = query_records(aic_common::workload::QueryDigestOutcome::Unavailable {
+            reason: aic_common::workload::QueryDigestUnavailable::PermissionDenied,
+        });
+        assert_eq!(records.len(), 1);
+        let (severity, attrs) = &records[0];
+        assert_eq!(*severity, SEVERITY_WARN);
+        assert_eq!(
+            attr(attrs, "aic.query.status"),
+            Some(&AnyValueOneof::StringValue("permission_denied".into()))
+        );
+        assert_eq!(
+            attr(attrs, "workload.name"),
+            Some(&AnyValueOneof::StringValue("mysql.service".into()))
+        );
+        assert!(attr(attrs, "aic.query.statements").is_none());
+    }
+
+    #[test]
+    fn baseline_query_poll_sends_no_statements_and_a_stable_record_id() {
+        let outcome = || {
+            aic_common::workload::QueryDigestOutcome::Collected(
+                aic_common::workload::QueryDigestReport {
+                    baseline: true,
+                    top: Vec::new(),
+                    unattributed_calls: 0,
+                    row_limit_reached: false,
+                    interval_ms: 0,
+                    observed_calls: 0,
+                    observed_time_us: 0,
+                },
+            )
+        };
+        let records = query_records(outcome());
+        assert_eq!(records.len(), 1);
+        let (severity, attrs) = &records[0];
+        assert_eq!(*severity, SEVERITY_INFO);
+        assert_eq!(
+            attr(attrs, "aic.query.status"),
+            Some(&AnyValueOneof::StringValue("baseline".into()))
+        );
+        assert_eq!(
+            attr(attrs, "aic.query.statements"),
+            Some(&AnyValueOneof::IntValue(0))
+        );
+        assert_eq!(
+            attr(attrs, "aic.query.record_id"),
+            attr(&query_records(outcome())[0].1, "aic.query.record_id"),
+            "같은 poll을 다시 인코딩해도 record_id는 같아야 한다"
+        );
     }
 }

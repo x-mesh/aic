@@ -3150,6 +3150,9 @@ mod tests {
             ],
             unattributed_calls: 3,
             row_limit_reached: false,
+            interval_ms: 0,
+            observed_calls: 0,
+            observed_time_us: 0,
         };
         let text = render_query_digest(&digest_sample(
             "mysql",

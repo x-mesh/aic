@@ -68,7 +68,7 @@ pub use health::ExporterHealth;
 pub use kernel::{ensure_loopback, serve_kernel, KernelConfig};
 pub use logs::{serve_logs, DropCounters, LogsExporterConfig};
 pub use spool::{DropReason, SignalKind, Spool};
-pub use workload::{serve_workload, WorkloadExportConfig};
+pub use workload::{serve_workload, WorkloadExport, WorkloadExportConfig};
 
 use crate::live_config::{self, LiveExporterConfig};
 use std::sync::Arc;

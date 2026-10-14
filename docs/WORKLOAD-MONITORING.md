@@ -324,7 +324,22 @@ The statement file retains 360 polls across all workloads. That is six hours for
 
 `aic workload status` shows the latest statement poll under its workload line. The JSON output puts it in `query_digest`.
 
-The exporter does not send statement statistics.
+The workload exporter also sends statement polls when `aicd.exporter.workload_enabled = true`. Both settings must be on: the exporter flag and `--query-digest` on the workload.
+
+Statement polls go to `/v1/logs` with the scope `aic.workload.query`, not to `/v1/metrics`. The rca-web metric rollup drops attributes. Per-statement metric points then lose the digest.
+
+Each poll sends these records:
+
+- One `poll` record. It has `aic.query.status`, the statement count, `unattributed_calls`, `row_limit_reached`, the observed totals, and `interval_ms`.
+- One `statement` record for each top statement. The body is `DIGEST_TEXT`. The attributes carry the digest, the rank, the schema as `db.namespace`, and the interval differences.
+
+Every record has `workload.id`, `workload.name`, `workload.adapter`, and `aic.query.record_id`. The receiver uses the record ID to merge a resent poll.
+
+A poll that only sets the baseline sends the `poll` record with the status `baseline` and no `statement` records. A failed poll sends one `poll` record with the failure reason.
+
+Statement text leaves the host when you enable both settings. MySQL removes literal values from the text, and the exporter applies the same redaction as other signals. Table names and column names stay in the text.
+
+If the collector does not accept the `aic.workload.query` scope, it rejects the records, and `aicd` logs a partial-success warning.
 
 By default, AIC does not send workload samples to a remote destination.
 
