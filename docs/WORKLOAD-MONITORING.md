@@ -161,7 +161,7 @@ Thirteen adapters support metric collection. Five adapters require an explicit c
 | MySQL or MariaDB | None | Explicit `tcp` or `tls`, with a username and optional database | Optional password secret | Native host roots | Fixed `SHOW GLOBAL STATUS`, and the optional statement poll |
 | MongoDB | None | Explicit `tcp` or `tls`, without URI, SRV, or Unix support | Optional username and secret pair, with optional `auth_source` | OpenSSL file system CA paths | `serverStatus` |
 | Prometheus | `127.0.0.1:9090` | Optional `tcp` or `tls` endpoint | Not supported | Native host roots | `GET /metrics` |
-| ClickHouse | `127.0.0.1:8123` | Optional HTTP `tcp` or `tls` endpoint | Optional Basic authentication on TLS | Native host roots | One fixed system table query |
+| ClickHouse | `127.0.0.1:8123` | Optional HTTP `tcp` or `tls` endpoint | Optional Basic authentication on TLS or loopback TCP | Native host roots | One fixed system table query |
 | etcd | `127.0.0.1:2379` | Optional `tcp` or `tls` endpoint | Not supported | Native host roots | `GET /metrics` |
 | Elasticsearch | `127.0.0.1:9200` | Optional HTTP `tcp` or `tls` endpoint | Optional Basic authentication on TLS | Native host roots | `GET /_cluster/stats?timeout=2s` |
 | OpenSearch | `127.0.0.1:9200` | Optional HTTP `tcp` or `tls` endpoint | Optional Basic authentication on TLS | Native host roots | `GET /_cluster/stats?timeout=2s` |
@@ -383,6 +383,8 @@ The exporter does not send the endpoint, the username, or any secret.
 All probes use fixed read-only commands, queries, or paths. AIC does not accept user SQL or custom HTTP paths.
 
 HTTP probes disable system proxies and redirects. Basic authentication requires TLS for supported HTTP adapters.
+
+ClickHouse also accepts Basic authentication on a `tcp` endpoint with a loopback IP address, such as `127.0.0.1` or `::1`. The password then stays on the host. AIC rejects a host name in this case, because a resolver can point the name to another host.
 
 TLS verifies the endpoint host. Most adapters use native host roots. MongoDB uses OpenSSL file system CA paths.
 
