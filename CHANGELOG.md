@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [0.50.18] - 2026-10-15
+
 ### Fixed
 
 - 공식 패키지나 Docker 이미지로 띄운 ClickHouse가 workload 후보에서 `generic`으로 분류되어 등록할 수 없던 문제를 고쳤다. 이 배포본은 하나의 `/usr/bin/clickhouse`가 명령줄로 서버 모드를 고르므로, 이제 명령줄이 `clickhouse-server`나 `clickhouse server`일 때 ClickHouse로 인식한다. 같은 바이너리로 뜬 keeper와 client는 ClickHouse 후보가 되지 않는다.
