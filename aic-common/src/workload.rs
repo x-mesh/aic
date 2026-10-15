@@ -166,6 +166,19 @@ pub enum WorkloadEndpoint {
     Tls { host: String, port: u16 },
 }
 
+/// HTTP Basic credentials travel in clear text without TLS. A loopback address keeps them on the
+/// host, which covers a database container that publishes its port on the same machine. Host
+/// names stay excluded because a resolver can point them elsewhere.
+fn keeps_basic_auth_on_host(endpoint: &WorkloadEndpoint) -> bool {
+    match endpoint {
+        WorkloadEndpoint::Tls { .. } => true,
+        WorkloadEndpoint::Tcp { host, .. } => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback()),
+        WorkloadEndpoint::Unix(_) => false,
+    }
+}
+
 impl WorkloadConnectionConfig {
     pub fn validate_for(&self, adapter: WorkloadAdapter) -> Result<()> {
         self.endpoint()?;
@@ -243,8 +256,10 @@ impl WorkloadConnectionConfig {
                 if self.database.is_some() || self.auth_source.is_some() {
                     anyhow::bail!("ClickHouse workload connections do not support database fields");
                 }
-                if self.secret_ref.is_some() && !matches!(endpoint, WorkloadEndpoint::Tls { .. }) {
-                    anyhow::bail!("ClickHouse authentication requires a TLS endpoint");
+                if self.secret_ref.is_some() && !keeps_basic_auth_on_host(&endpoint) {
+                    anyhow::bail!(
+                        "ClickHouse authentication requires a TLS endpoint or a loopback TCP endpoint"
+                    );
                 }
             }
             WorkloadAdapter::Etcd => {
@@ -4968,6 +4983,22 @@ path = "/usr/bin/redis-server"
             clickhouse_http_url(&authenticated).unwrap(),
             "https://[::1]:8443/"
         );
+        for loopback in ["tcp://127.0.0.1:8123", "tcp://[::1]:8123"] {
+            WorkloadConnectionConfig {
+                endpoint: loopback.into(),
+                ..authenticated.clone()
+            }
+            .validate_for(WorkloadAdapter::ClickHouse)
+            .unwrap();
+        }
+        for exposed in ["tcp://10.0.0.5:8123", "tcp://localhost:8123"] {
+            assert!(WorkloadConnectionConfig {
+                endpoint: exposed.into(),
+                ..authenticated.clone()
+            }
+            .validate_for(WorkloadAdapter::ClickHouse)
+            .is_err());
+        }
         for invalid in [
             WorkloadConnectionConfig {
                 secret_ref: None,
@@ -6572,17 +6603,21 @@ path = "/usr/bin/redis-server"
     }
 
     /// Runs against a live ClickHouse, for example a disposable container. Set
-    /// `AIC_TEST_CLICKHOUSE_ENDPOINT` to its HTTP endpoint, such as `tcp://127.0.0.1:8123`.
+    /// `AIC_TEST_CLICKHOUSE_ENDPOINT` to its HTTP endpoint, such as `tcp://127.0.0.1:8123`. For a
+    /// password account, also set `AIC_TEST_CLICKHOUSE_USER` and `AIC_TEST_CLICKHOUSE_PASSWORD`.
     #[test]
     #[ignore = "needs a live ClickHouse; see the doc comment"]
     fn live_clickhouse_metrics() {
         let Ok(endpoint) = std::env::var("AIC_TEST_CLICKHOUSE_ENDPOINT") else {
             return;
         };
+        let username = std::env::var("AIC_TEST_CLICKHOUSE_USER").ok();
         let connection = WorkloadConnectionConfig {
             endpoint,
-            username: None,
-            secret_ref: None,
+            secret_ref: username
+                .as_ref()
+                .map(|_| "env:AIC_TEST_CLICKHOUSE_PASSWORD".to_string()),
+            username,
             database: None,
             auth_source: None,
         };
