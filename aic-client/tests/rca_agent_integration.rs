@@ -109,3 +109,85 @@ async fn agent_error_status_is_surfaced() {
     assert!(err.message.contains("409"));
     assert!(err.message.contains("already in progress"));
 }
+
+/// process_tree를 켠 호스트 크기의 번들. 노드 하나가 600B 남짓이라 `nodes`만으로 수백 KB가 된다.
+fn bundle_with_process_tree(nodes: usize) -> serde_json::Value {
+    let nodes: Vec<_> = (0..nodes)
+        .map(|i| {
+            json!({
+                "pid": 10_000 + i, "ppid": 1730, "fork_ppid": 1730,
+                "start_boottime_ns": 863_987_800_000_000u64 + i as u64, "start_precision": "ns",
+                "start_age_seconds": 12.4, "comm": "java", "exe": "/usr/lib/jvm/java-21/bin/java",
+                "exe_source": "proc_exe", "cgroup_id": 9123,
+                "cgroup_path": "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-3f9c.scope",
+                "ns_pid": 7, "ns_level": 1, "state": "live", "source": "event",
+                "in_window": {"forked": true, "execed": true, "exited": false},
+                "window": {"cpu_ns": 9_800_000_000u64, "runq_wait_us": 1_830_000, "runq_count": 5120,
+                           "block_io_bytes": 73_400_320, "block_io_count": 812}
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": "rca.evidence.v1",
+        "observations": {
+            "findings": [{"signal": "oom", "metric": "kills", "severity": "warning", "value": 1}],
+            "delta": {"process_tree": {"forks": 31, "ringbuf_drops_fork": 0}},
+            "top": {
+                "oom": {"available": true, "events": [{"seq": 1, "pid": 48190, "comm": "java"}]},
+                "process_tree": {
+                    "available": true, "schema": "process_tree.v1", "loss_in_window": false,
+                    "nodes_total": nodes.len(), "nodes": nodes, "exited": []
+                }
+            }
+        }
+    })
+}
+
+/// 공용 읽기 상한(512KB)과 LLM 출력 상한(64KB)을 모두 넘는 번들도 유효한 JSON으로 와야 한다.
+/// 바이트 단위로 자르면 `kernel_findings`가 파싱에 실패해 finding이 조용히 사라진다.
+#[tokio::test]
+async fn oversized_bundle_stays_valid_json_and_keeps_findings() {
+    let bundle = bundle_with_process_tree(1024);
+    assert!(
+        bundle.to_string().len() > 512 * 1024,
+        "재현 조건: 512KB 초과"
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/collectz"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle))
+        .mount(&server)
+        .await;
+
+    let client = RcaAgentClient::new(&cfg(&server.uri())).unwrap().unwrap();
+    let out = client.collect(5).await.expect("collect should succeed");
+    assert!(out.len() <= 64 * 1024, "len={}", out.len());
+
+    let v: serde_json::Value = serde_json::from_str(&out).expect("출력이 유효한 JSON이어야 한다");
+    let obs = &v["observations"];
+    assert_eq!(obs["findings"][0]["signal"], "oom");
+    assert_eq!(obs["delta"]["process_tree"]["forks"], 31);
+    let tree = &obs["top"]["process_tree"];
+    assert_eq!(tree["available"], true, "스칼라 플래그는 남아야 한다");
+    assert!(tree["nodes"]["aic_omitted_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        obs["top"]["oom"]["events"][0]["seq"], 1,
+        "작은 항목은 그대로"
+    );
+}
+
+/// 번들 읽기 상한을 넘으면 깨진 JSON을 넘기지 않고 크기를 알리는 오류로 실패한다.
+#[tokio::test]
+async fn bundle_over_read_cap_is_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/collectz"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(bundle_with_process_tree(5000)))
+        .mount(&server)
+        .await;
+
+    let client = RcaAgentClient::new(&cfg(&server.uri())).unwrap().unwrap();
+    let err = client.collect(5).await.unwrap_err();
+    assert!(err.message.contains("bytes"), "{}", err.message);
+}

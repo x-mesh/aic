@@ -28,9 +28,9 @@ use aic_common::{BackendConfig, BackendType, ObservabilityConfig};
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// 네트워크 레벨 응답 본문 fetch 상한.
-const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 /// LLM/출력에 넘기는 최종 문자열 상한.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Loki/ES 기본 결과 행 수.
 const DEFAULT_LIMIT: u64 = 100;
 /// 결과 행 수 하드 상한.
@@ -380,21 +380,31 @@ fn is_safe_index(index: &str) -> bool {
 
 /// 응답을 MAX_RESPONSE_BYTES까지만 스트리밍으로 읽는다(거대 응답 OOM 방지).
 pub(crate) async fn read_bounded(resp: reqwest::Response) -> Result<Vec<u8>, ToolError> {
+    read_capped(resp, MAX_RESPONSE_BYTES)
+        .await
+        .map(|(buf, _)| buf)
+}
+
+/// 응답을 `max_bytes`까지만 스트리밍으로 읽고, 상한에 걸려 잘렸는지 함께 돌려준다.
+pub(crate) async fn read_capped(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), ToolError> {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ToolError::new(format!("응답 읽기 실패: {e}")))?;
-        if buf.len() >= MAX_RESPONSE_BYTES {
-            break;
+        if buf.len() >= max_bytes {
+            return Ok((buf, true));
         }
-        let remaining = MAX_RESPONSE_BYTES - buf.len();
+        let remaining = max_bytes - buf.len();
         if chunk.len() > remaining {
             buf.extend_from_slice(&chunk[..remaining]);
-            break;
+            return Ok((buf, true));
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf)
+    Ok((buf, false))
 }
 
 /// LLM/출력 전 최종 처리: redaction 적용 + 출력 길이 cap.
