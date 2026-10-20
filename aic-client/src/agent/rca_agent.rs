@@ -192,17 +192,35 @@ impl RcaAgentClient {
 ///
 /// 바이트 단위로 자르면 JSON이 깨져 `kernel_findings` 같은 파싱 소비자가 조용히 빈 결과를
 /// 낸다. 그래서 `observations.top`에서 큰 값부터 표식으로 바꿔 유효한 JSON을 유지한다.
-/// findings·delta·start/end는 작고 판정의 정본이라 건드리지 않는다. redaction은 자리표시자
-/// 때문에 길이를 늘릴 수 있어 먼저 적용하고, 그 결과의 직렬화 길이로 판정한다.
+/// findings·delta·start/end는 작고 판정의 정본이라 건드리지 않는다.
 /// JSON이 아니면 공용 `finalize`로 물러난다.
 pub(crate) fn finalize_bundle(body: &str) -> String {
-    let (redacted, _report) = crate::redaction::redact(body);
-    let Ok(mut bundle) = serde_json::from_str::<Value>(&redacted) else {
+    let Ok(mut bundle) = serde_json::from_str::<Value>(body) else {
         return finalize(body);
     };
+    redact_strings(&mut bundle);
     shrink_top(&mut bundle, MAX_OUTPUT_BYTES);
-    // 파싱이 \u 이스케이프를 풀어 새 평문이 생길 수 있으므로 직렬화 뒤 한 번 더 적용한다.
-    finalize(&bundle.to_string())
+    // 직렬화한 텍스트에 redaction을 다시 돌리면 숫자가 가려져 JSON이 깨지므로 자르기만 한다.
+    truncate(&bundle.to_string(), MAX_OUTPUT_BYTES)
+}
+
+/// 문자열 값과 키에만 redaction을 적용한다. 원문 텍스트에 돌리면 `kr_rrn`이 따옴표 없는
+/// 13자리 숫자를 가리고 `conn_string`이 닫는 따옴표 너머까지 삼켜 JSON이 깨진다.
+fn redact_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = crate::redaction::redact(s).0,
+        Value::Array(items) => items.iter_mut().for_each(redact_strings),
+        Value::Object(fields) => {
+            *fields = std::mem::take(fields)
+                .into_iter()
+                .map(|(key, mut v)| {
+                    redact_strings(&mut v);
+                    (crate::redaction::redact(&key).0, v)
+                })
+                .collect();
+        }
+        _ => {}
+    }
 }
 
 /// 직렬화 길이가 `max_bytes` 이하가 될 때까지 `observations.top`의 가장 큰 값을 표식으로 바꾼다.
@@ -390,6 +408,22 @@ mod tests {
         let body = include_str!("../../../aic-server/tests/fixtures/rca-agent/collectz-end.json");
         let out: Value = serde_json::from_str(&finalize_bundle(body)).unwrap();
         assert!(out.get("observations").is_some());
+    }
+
+    #[test]
+    fn redaction_keeps_bundle_json_valid() {
+        let body = bundle(json!({"process_tree": {
+            "nodes": [{"pid": 1, "start_boottime_ns": 1_234_561_234_567u64}],
+            "note": "redis://user:pass@cache:6379",
+            "after": 1
+        }}));
+        let out = finalize_bundle(&body);
+        assert_eq!(crate::agent::diagnose::kernel_findings(&out).len(), 1);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let tree = &v["observations"]["top"]["process_tree"];
+        assert_eq!(tree["nodes"][0]["start_boottime_ns"], 1_234_561_234_567u64);
+        assert_eq!(tree["note"], "[REDACTED:conn_string]");
+        assert_eq!(tree["after"], 1);
     }
 
     #[test]
