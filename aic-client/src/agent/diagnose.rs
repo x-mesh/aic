@@ -3201,4 +3201,30 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         // signal 없는 항목은 건너뛴다.
         assert!(kernel_findings(r#"{"observations":{"findings":[{"metric":"x"}]}}"#).is_empty());
     }
+
+    /// PR #77 L1: `process_tree.aic_findings`는 에이전트 finding과 같은 급으로 옮긴다.
+    /// warning만 Warn이고 Crit으로 올리지 않으며, 형식이 맞지 않는 항목은 건너뛴다.
+    #[test]
+    fn process_tree_findings_map_without_promotion() {
+        let bundle = r#"{"observations":{"top":{"process_tree":{"aic_findings":[
+            {"kind":"crash_loop","severity":"warning","message":"java 3번"},
+            {"kind":"signal_exit","severity":"info","message":"SIGKILL"},
+            {"kind":"d_state","severity":"critical","message":"D 9개"},
+            {"severity":"warning","message":"kind 없음"},
+            {"kind":"loss","severity":"warning"}
+        ]}}}}"#;
+        let f = kernel_findings(bundle);
+        assert_eq!(f.len(), 3, "kind·message가 없는 항목은 건너뛴다");
+        assert!(f.iter().all(|x| x.source == SourceQuality::External));
+        assert!(f.iter().all(|x| x.confidence == Confidence::Medium));
+        assert!(f.iter().all(|x| x.probe_id == KERNEL_SECTION));
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert_eq!(f[0].message, "kernel/process_tree.crash_loop: java 3번");
+        assert_eq!(f[1].severity, Severity::Normal);
+        assert_eq!(
+            f[2].severity,
+            Severity::Normal,
+            "모르는 severity는 올리지 않는다"
+        );
+    }
 }

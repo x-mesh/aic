@@ -183,17 +183,30 @@ fn exits_in_window(exited: &[Value]) -> Value {
 }
 
 /// reconcile 종료는 종료 시각·상태가 없다. 개수와, 실제 종료가 들어 있는 age 범위만 싣는다.
+/// 레코드는 최근에 없어진 것부터 `MAX_RECONCILE_EXITS`개 남기고, age 범위는 모든 reconcile
+/// 종료로 계산한다(남기지 못한 레코드의 범위도 잃지 않게).
 fn reconcile_exits(exited: &[Value]) -> Value {
-    let records: Vec<&Value> = exited
+    const MISSING: &str = "first_missing_age_seconds";
+    const ALIVE: &str = "last_seen_alive_age_seconds";
+    let mut records: Vec<&Value> = exited
         .iter()
         .filter(|e| e.get("closed_by").and_then(Value::as_str) == Some("reconcile"))
         .collect();
+    records.sort_by(|a, b| age(a, MISSING).total_cmp(&age(b, MISSING)));
     let kept: Vec<Value> = records
         .iter()
         .take(MAX_RECONCILE_EXITS)
         .map(|e| pick(e, RECONCILE_FIELDS))
         .collect();
-    json!({
+    let ages = |key: &str| -> Vec<f64> {
+        records
+            .iter()
+            .filter_map(|e| e.get(key).and_then(Value::as_f64))
+            .collect()
+    };
+    let newest = ages(MISSING).into_iter().reduce(f64::min);
+    let oldest = ages(ALIVE).into_iter().reduce(f64::max);
+    let mut out = json!({
         "total": records.len(),
         "in_window": records
             .iter()
@@ -201,9 +214,19 @@ fn reconcile_exits(exited: &[Value]) -> Value {
             .count(),
         "kept": kept.len(),
         "records": kept,
-        "note": "종료 시각과 원인을 모름. 실제 종료는 first_missing_age_seconds 전과 \
-                 last_seen_alive_age_seconds 전 사이",
-    })
+        "note": "종료 시각과 원인을 모름. 각 종료는 first_missing_age_seconds 초 전과 \
+                 last_seen_alive_age_seconds 초 전 사이에 일어남",
+    });
+    if let (Some(newest), Some(oldest)) = (newest, oldest) {
+        // age 두 값이 모두 있는 reconcile 종료가 들어 있는 경과 시간 범위. 시각이 아니라 창 끝 기준 초다.
+        let without = records
+            .iter()
+            .filter(|e| e.get(MISSING).is_none() || e.get(ALIVE).is_none())
+            .count();
+        out["age_range_seconds"] =
+            json!({ "min": newest, "max": oldest, "records_without_age": without });
+    }
+    out
 }
 
 /// pid → 노드. `ppid`는 pid만 가리키므로, 같은 pid가 둘이면(live와 창 이전 종료) live를 고른다.
@@ -447,11 +470,15 @@ fn abnormal(exit: &Value) -> bool {
             .is_some_and(|s| s != 0)
 }
 
-fn process_name(exit: &Value) -> &str {
+/// 실행 파일 경로, 없으면 comm. 둘 다 없으면 `None`.
+fn known_name(exit: &Value) -> Option<&str> {
     exit.get("exe")
         .and_then(Value::as_str)
         .or_else(|| exit.get("comm").and_then(Value::as_str))
-        .unwrap_or("?")
+}
+
+fn process_name(exit: &Value) -> &str {
+    known_name(exit).unwrap_or("?")
 }
 
 fn outcome(exit: &Value) -> String {
@@ -466,15 +493,18 @@ fn outcome(exit: &Value) -> String {
 }
 
 /// 같은 부모(`fork_ppid`)가 띄운 같은 실행 파일이 창 안에서 `CRASH_LOOP_MIN_EXITS`번 이상
-/// 비정상 종료했으면 크래시 루프다.
+/// 비정상 종료했으면 크래시 루프다. `fork_ppid`나 이름이 없는 종료는 묶지 않는다: 값이 없다는
+/// 것은 "같은 부모·같은 프로그램"의 근거가 아니라, 서로 무관한 종료가 한 그룹으로 합쳐질 뿐이다.
 fn crash_loops(exits: &[&Value]) -> Vec<Value> {
     let mut groups: HashMap<(u64, &str), Vec<&Value>> = HashMap::new();
     for exit in exits.iter().copied().filter(|e| abnormal(e)) {
-        let ppid = exit.get("fork_ppid").and_then(Value::as_u64).unwrap_or(0);
-        groups
-            .entry((ppid, process_name(exit)))
-            .or_default()
-            .push(exit);
+        let (Some(ppid), Some(name)) = (
+            exit.get("fork_ppid").and_then(Value::as_u64),
+            known_name(exit),
+        ) else {
+            continue;
+        };
+        groups.entry((ppid, name)).or_default().push(exit);
     }
     let mut loops: Vec<((u64, &str), Vec<&Value>)> = groups
         .into_iter()
@@ -502,10 +532,23 @@ fn crash_loops(exits: &[&Value]) -> Vec<Value> {
 }
 
 /// fault 시그널·코어 덤프·SIGKILL로 끝난 개별 종료. fault와 코어 덤프는 warning, SIGKILL은
-/// 원인을 단정할 수 없어 info로 싣는다.
+/// 원인을 단정할 수 없어 info로 싣는다. 상한이 있으므로 warning을 먼저, 그 안에서는 최근 종료를
+/// 먼저 고른다(입력 순서대로 자르면 오래된 SIGKILL이 최근 SIGSEGV를 밀어낼 수 있다).
 fn signal_exits(exits: &[&Value]) -> Vec<Value> {
+    let is_warning = |e: &Value| {
+        e.get("core_dumped").and_then(Value::as_bool) == Some(true)
+            || e.get("signal")
+                .and_then(Value::as_u64)
+                .is_some_and(|sig| FAULT_SIGNALS.iter().any(|(n, _)| *n == sig))
+    };
+    let mut ordered: Vec<&Value> = exits.to_vec();
+    ordered.sort_by(|a, b| {
+        is_warning(b)
+            .cmp(&is_warning(a))
+            .then(age(a, "exit_age_seconds").total_cmp(&age(b, "exit_age_seconds")))
+    });
     let mut out = Vec::new();
-    for exit in exits {
+    for exit in ordered {
         let Some(sig) = exit.get("signal").and_then(Value::as_u64) else {
             continue;
         };
@@ -783,6 +826,72 @@ mod tests {
         let msg = fs[0]["message"].as_str().unwrap();
         assert!(msg.contains("3번"), "{msg}");
         assert!(msg.contains("exit 1") && msg.contains("SIGTERM"), "{msg}");
+    }
+
+    /// PR #77 L2·L6: 부모나 이름이 없는 종료는 같은 그룹의 근거가 아니다.
+    #[test]
+    fn exits_without_parent_or_name_are_not_grouped() {
+        let no_parent = |pid| {
+            json!({"pid": pid, "exe": "/usr/bin/java", "in_window": true,
+                                     "closed_by": "exit_event", "exit_status": 1})
+        };
+        let no_name = |pid| {
+            json!({"pid": pid, "fork_ppid": 100, "in_window": true,
+                                   "closed_by": "exit_event", "exit_status": 1})
+        };
+        let tree = json!({"exited": [
+            no_parent(1), no_parent(2), no_parent(3),
+            no_name(4), no_name(5), no_name(6),
+        ]});
+        assert!(findings(&tree).is_empty());
+    }
+
+    /// PR #77 L3: 오래된 SIGKILL이 앞에 많아도 최근 fault 종료가 상한 안에 남는다.
+    #[test]
+    fn fault_exits_outrank_older_sigkills_under_the_cap() {
+        let mut exited: Vec<Value> = (0..MAX_FINDINGS_PER_KIND as u64 + 2)
+            .map(|i| {
+                exit(
+                    i,
+                    1000 + i,
+                    json!({"signal": 9, "exit_age_seconds": 100.0 + i as f64}),
+                )
+            })
+            .collect();
+        exited.push(exit(
+            99,
+            2000,
+            json!({"signal": 11, "exit_age_seconds": 1.0}),
+        ));
+        let fs = findings(&json!({ "exited": exited }));
+        assert_eq!(fs.len(), MAX_FINDINGS_PER_KIND);
+        assert_eq!(fs[0]["severity"], "warning");
+        assert!(fs[0]["message"].as_str().unwrap().contains("SIGSEGV"));
+        // 나머지 SIGKILL은 최근 순이다.
+        assert!(fs[1]["message"].as_str().unwrap().contains("(0)"));
+    }
+
+    /// PR #77 L4: 레코드를 다 싣지 못해도 age 범위는 모든 reconcile 종료로 계산한다.
+    #[test]
+    fn reconcile_age_range_covers_all_records() {
+        let exited: Vec<Value> = (0..MAX_RECONCILE_EXITS as u64 + 4)
+            .map(|i| {
+                json!({"pid": i, "closed_by": "reconcile", "in_window": true,
+                       "first_missing_age_seconds": 2.0 + i as f64,
+                       "last_seen_alive_age_seconds": 10.0 + i as f64})
+            })
+            .chain(std::iter::once(
+                json!({"pid": 999, "closed_by": "reconcile"}),
+            ))
+            .collect();
+        let s = summarize(&json!({ "exited": exited })).unwrap();
+        let r = &s["reconcile_exits"];
+        assert_eq!(r["kept"], MAX_RECONCILE_EXITS);
+        assert_eq!(r["records"][0]["first_missing_age_seconds"], 2.0);
+        let range = &r["age_range_seconds"];
+        assert_eq!(range["min"], 2.0);
+        assert_eq!(range["max"], 10.0 + (MAX_RECONCILE_EXITS + 3) as f64);
+        assert_eq!(range["records_without_age"], 1);
     }
 
     #[test]
