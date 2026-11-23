@@ -266,21 +266,7 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
     // 안 뜨면 아무도 채우지 않으므로 ControlContext에는 `None`을 넘겨 "수집 안 함"을 표현한다.
     let process_inventory_store =
         Arc::new(aic_server::process_inventory_store::ProcessInventoryStore::new());
-    let exporter_cfg = load_exporter_config(
-        exporter_section.clone(),
-        exporter_spool.clone(),
-        exporter_health.clone(),
-        log_drop_counters.clone(),
-        Some(process_inventory_store.clone()),
-        live_exporter.clone(),
-    );
-    let (flush_tx, flush_rx) = if exporter_cfg.is_some() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(4);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
+    // exporter가 매 tick 이 상태를 resource 속성으로 싣기 때문에 exporter config보다 먼저 만든다.
     let self_update_health = std::sync::Arc::new(aic_server::self_update::SelfUpdateHealth::new());
     if let Some(ex) = exporter_section.as_ref() {
         self_update_health.set_configured(
@@ -288,6 +274,25 @@ async fn daemon_main(cli: Cli) -> anyhow::Result<()> {
             std::time::Duration::from_secs(ex.self_update_interval_secs),
         );
     }
+    let exporter_cfg = load_exporter_config(
+        exporter_section.clone(),
+        exporter_spool.clone(),
+        exporter_health.clone(),
+        log_drop_counters.clone(),
+        Some(process_inventory_store.clone()),
+        live_exporter.clone(),
+    )
+    .map(|mut cfg| {
+        cfg.self_update = Some(self_update_health.clone());
+        cfg
+    });
+    let (flush_tx, flush_rx) = if exporter_cfg.is_some() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(4);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let control_ctx = ControlContext {
         shutdown: shutdown.clone(),
         registry: registry.clone(),
@@ -1050,6 +1055,8 @@ fn load_exporter_config(
         // t12: 호출부(main)가 logs exporter(`serve_logs`)와 공유하는 동일 `Arc`를 넘긴다 — 두
         // task의 카운터가 합쳐져야 `aic.log.dropped` 게이지가 실제 드롭을 반영한다.
         drop_counters,
+        // 호출부(main)가 control server와 공유하는 상태를 채운다.
+        self_update: None,
         // 프로세스별 top-N(scope=aic.process)은 host metrics tick에 편승한다 — 별도 task가 아니라
         // 이 config의 플래그로 on/off한다(기본 true).
         process_enabled: ex.process_enabled,

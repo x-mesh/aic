@@ -103,6 +103,9 @@ pub struct ExporterConfig {
     /// aicd_main에 배선되지 않은 동안은 항상 0이다 — 그게 배선되면 **동일 `Arc`**를
     /// `LogsExporterConfig::drop_counters`에도 넘겨야 두 task의 카운터가 하나로 합쳐진다.
     pub drop_counters: Arc<DropCounters>,
+    /// 자체 업데이트 상태. `Some`이면 매 tick 스냅샷을 host metrics resource의
+    /// `aic.self_update.*` 속성으로 싣는다(`encode::encode_metrics` 참고). `None`이면 싣지 않는다.
+    pub self_update: Option<Arc<crate::self_update::SelfUpdateHealth>>,
     /// 프로세스별 리소스 top-N(scope=`aic.process`)을 host metrics tick에 편승해 보낼지.
     /// config `[aicd.exporter].process_enabled`. host metrics가 이미 refresh한 프로세스 목록을
     /// 재사용하므로 추가 열거 비용이 없다 — 그래서 별도 task가 아니라 이 tick에 얹는다.
@@ -291,6 +294,7 @@ pub async fn serve(
                     .by_spool_quota
                     .store(cfg.spool.dropped_count(SignalKind::AppLogs), std::sync::atomic::Ordering::Relaxed);
 
+                let self_update = cfg.self_update.as_ref().map(|h| h.snapshot());
                 let body = encode::encode_metrics(
                     &sample,
                     &cfg.service_version,
@@ -298,6 +302,7 @@ pub async fn serve(
                     // 로그 드롭 게이지는 이 task만 싣는다 — docker exporter도 metrics를 내보내지만
                     // 카운터를 모르므로 None을 넘긴다(같은 메트릭의 중복 발행 방지).
                     Some(&cfg.drop_counters),
+                    self_update.as_ref(),
                 );
 
                 // 프로세스별 top-N(scope=aic.process)을 같은 tick에 얹는다 — sample이 이미
