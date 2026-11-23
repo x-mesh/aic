@@ -6330,9 +6330,14 @@ async fn print_log_drop_status() {
 }
 
 /// 외부 소스에 소스별 기본값(`external_min_severity`)이 적용되고, 그 값이 기본 WARN 그대로인가.
+///
+/// 서비스별 `min_severity` override가 하나라도 있으면 false다. 드롭 수는 소스·서비스 구분 없이
+/// 합산되므로, 그 드롭이 override 때문인지 알 수 없고 `external_min_severity`를 바꿔도 override된
+/// 서비스에는 효과가 없다.
 fn uses_default_external_severity(logs: &aic_common::AicdLogsConfig) -> bool {
     logs.min_severity == aic_common::DEFAULT_LOG_MIN_SEVERITY
         && logs.external_min_severity == aic_common::AicdLogsConfig::default().external_min_severity
+        && logs.services.values().all(|o| o.min_severity.is_none())
 }
 
 /// `aic status`의 로그 드롭 절. 외부 소스가 기본 WARN을 따르는 상태에서 severity 드롭이 있으면
@@ -12149,6 +12154,27 @@ mod tests {
             ..Default::default()
         };
         assert!(!uses_default_external_severity(&explicit_global));
+
+        // 서비스 override가 드롭 원인일 수 있으면 external_min_severity 안내는 틀린 조언이다.
+        let mut with_override = aic_common::AicdLogsConfig::default();
+        with_override.services.insert(
+            "nginx".to_string(),
+            aic_common::AicdLogServiceOverride {
+                min_severity: Some("ERROR".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!uses_default_external_severity(&with_override));
+
+        let mut enabled_only = aic_common::AicdLogsConfig::default();
+        enabled_only.services.insert(
+            "nginx".to_string(),
+            aic_common::AicdLogServiceOverride {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(uses_default_external_severity(&enabled_only));
     }
 
     /// 파일에 쓰지 않아도 `aic config get/set`은 이 경로를 계속 다룬다.
