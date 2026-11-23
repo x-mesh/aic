@@ -191,7 +191,9 @@ fn sum_maps(frames: &[Value], key: &str, limit: usize) -> Value {
 ///
 /// 1. [`SHRINK_ORDER`] 순서로 하위 값을 생략 표식으로 바꾼다.
 /// 2. 그래도 넘으면 트리거를 뒤에서부터 줄인다(`cause` 등이 비정상적으로 클 때).
-/// 3. 그래도 넘으면 id·state·원래 크기만 남긴 최소 객체로 바꾼다.
+/// 3. 그래도 넘으면 id·state·원래 크기만 남긴 최소 객체로 바꾸고, 그 객체도 넘으면 note·id·state
+///    순으로 뺀다. 마지막에는 `{"aic_omitted_bytes": N}`만 남는다. 이보다 작은 상한은 표현할 수
+///    없으므로 이 객체를 그대로 돌려준다(상한은 64 KiB라 실제로는 생기지 않는다).
 fn shrink(summary: &mut Value, max_bytes: usize) {
     let fits = |v: &Value| v.to_string().len() <= max_bytes;
     for pointer in SHRINK_ORDER {
@@ -211,15 +213,25 @@ fn shrink(summary: &mut Value, max_bytes: usize) {
             break;
         }
     }
-    if !fits(summary) {
-        let size = summary.to_string().len();
-        *summary = json!({
-            "id": summary.get("id").cloned().unwrap_or(Value::Null),
-            "state": summary.get("state").cloned().unwrap_or(Value::Null),
-            SUMMARY_KEY: summary.get(SUMMARY_KEY).cloned().unwrap_or(Value::Null),
-            OMITTED_KEY: size,
-            "note": "요약도 출력 상한을 넘어 생략했다. rca-agent의 GET /blackboxz/<id>를 직접 확인할 것",
-        });
+    if fits(summary) {
+        return;
+    }
+    let size = summary.to_string().len();
+    *summary = json!({
+        "id": summary.get("id").cloned().unwrap_or(Value::Null),
+        "state": summary.get("state").cloned().unwrap_or(Value::Null),
+        SUMMARY_KEY: summary.get(SUMMARY_KEY).cloned().unwrap_or(Value::Null),
+        OMITTED_KEY: size,
+        "note": "요약도 출력 상한을 넘어 생략했다. rca-agent의 GET /blackboxz/<id>를 직접 확인할 것",
+    });
+    // id·state는 서버가 준 값이라 크기를 믿을 수 없다. 덜 중요한 것부터 뺀다.
+    for key in ["note", SUMMARY_KEY, "state", "id"] {
+        if fits(summary) {
+            return;
+        }
+        if let Some(fields) = summary.as_object_mut() {
+            fields.remove(key);
+        }
     }
 }
 
@@ -368,6 +380,21 @@ mod tests {
             !s["triggers"].as_array().unwrap().is_empty(),
             "트리거는 줄이되 남긴다"
         );
+    }
+
+    /// PR #79 L5: 서버가 준 id·state가 크면 최소 객체도 상한을 넘는다. 그 필드를 빼서라도 맞춘다.
+    #[test]
+    fn minimal_object_drops_oversized_server_fields() {
+        let mut c = capture();
+        c["id"] = json!("i".repeat(4096));
+        c["state"] = json!("s".repeat(4096));
+        let limit = 256;
+        let s = summarize(&c, limit).unwrap();
+        let text = s.to_string();
+        assert!(text.len() <= limit, "len={}", text.len());
+        serde_json::from_str::<Value>(&text).expect("유효한 JSON");
+        assert!(s[OMITTED_KEY].as_u64().unwrap() > 0);
+        assert!(s.get("id").is_none() && s.get("state").is_none());
     }
 
     #[test]
