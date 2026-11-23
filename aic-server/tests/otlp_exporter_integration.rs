@@ -198,6 +198,75 @@ async fn exporter_pushes_valid_otlp_to_collector() {
     assert!(joined.is_ok(), "serve()가 Ok로 끝나야 함: {joined:?}");
 }
 
+/// #29 R5: exporter에 넘긴 자체 업데이트 상태가 실제 `/v1/metrics` 본문의 resource 속성으로 나간다.
+#[tokio::test]
+async fn exporter_pushes_self_update_status_attributes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut rx) = mpsc::channel::<Captured>(8);
+    let app = Router::new()
+        .route("/v1/metrics", post(collect))
+        .with_state(tx);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let self_update = Arc::new(aic_server::self_update::SelfUpdateHealth::new());
+    self_update.set_configured(true, Duration::from_secs(3600));
+    self_update.set_live(true);
+    self_update.record_check(Some("9.9.9".to_string()), "already-at-target");
+
+    let (sd_tx, sd_rx) = watch::channel(false);
+    let (_spool_dir, spool) = test_spool();
+    let health = Arc::new(ExporterHealth::new(format!("http://{addr}"), spool.clone()));
+    let cfg = ExporterConfig {
+        endpoint: format!("http://{addr}"),
+        token: None,
+        interval: Duration::from_millis(50),
+        service_version: "9.9.9".to_string(),
+        spool,
+        drain_batch_limit: 20,
+        spool_max_age: None,
+        health,
+        drop_counters: Arc::new(DropCounters::new()),
+        self_update: Some(self_update),
+        directory_snapshot_enabled: false,
+        process_io_diagnostics_enabled: false,
+        process_enabled: false,
+        process_inventory_enabled: false,
+        process_inventory_store: None,
+        live: None,
+    };
+    let handle = tokio::spawn(async move {
+        let (_ftx, frx) = tokio::sync::mpsc::channel::<aic_server::otlp_exporter::FlushRequest>(1);
+        serve(cfg, sd_rx, frx).await
+    });
+
+    let captured = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("collector가 5초 내 요청을 받지 못함")
+        .expect("채널이 닫힘");
+    for needle in [
+        b"aic.self_update.enabled".as_slice(),
+        b"aic.self_update.last_outcome",
+        b"already-at-target",
+        b"aic.self_update.last_check_secs_ago",
+    ] {
+        assert!(
+            contains(&captured.body, needle),
+            "본문에 {} 누락",
+            String::from_utf8_lossy(needle)
+        );
+    }
+
+    sd_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("exporter가 3초 내 종료하지 못함")
+        .expect("task join 실패")
+        .expect("serve()가 Ok로 끝나야 함");
+}
+
 /// token 미설정 시 Authorization 헤더 없이 전송되는지(localhost collector 경로).
 #[tokio::test]
 async fn exporter_without_token_sends_no_auth_header() {
