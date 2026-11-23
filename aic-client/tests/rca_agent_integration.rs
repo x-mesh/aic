@@ -170,7 +170,10 @@ async fn oversized_bundle_stays_valid_json_and_keeps_findings() {
     assert_eq!(obs["delta"]["process_tree"]["forks"], 31);
     let tree = &obs["top"]["process_tree"];
     assert_eq!(tree["available"], true, "스칼라 플래그는 남아야 한다");
-    assert!(tree["nodes"]["aic_omitted_bytes"].as_u64().unwrap() > 0);
+    // #74: 트리 원문은 생략 표식이 아니라 요약으로 바뀐다.
+    assert!(tree["aic_summary_of_bytes"].as_u64().unwrap() > 0);
+    assert!(tree.get("nodes").is_none());
+    assert!(tree["top_nodes"].is_object());
     assert_eq!(
         obs["top"]["oom"]["events"][0]["seq"], 1,
         "작은 항목은 그대로"

@@ -185,13 +185,12 @@ pub(crate) fn kernel_findings(bundle_json: &str) -> Vec<Finding> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(bundle_json) else {
         return Vec::new();
     };
-    let Some(items) = v
+    let items: &[serde_json::Value] = v
         .get("observations")
         .and_then(|o| o.get("findings"))
         .and_then(serde_json::Value::as_array)
-    else {
-        return Vec::new();
-    };
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
     let mut out = Vec::new();
     for it in items {
@@ -237,7 +236,42 @@ pub(crate) fn kernel_findings(bundle_json: &str) -> Vec<Finding> {
             suggested_followup: None,
         });
     }
+    out.extend(process_tree_findings(&v));
     out
+}
+
+/// `finalize_bundle`이 트리 원문에서 만들어 둔 `process_tree.aic_findings`를 finding으로 옮긴다.
+///
+/// 판정은 aic가 했지만 근거는 외부 에이전트가 넘긴 값이고 귀속을 증명하지 않으므로,
+/// 에이전트 finding과 같이 `External`·`Medium`으로 둔다. `warning`만 Warn이고 Crit으로는
+/// 올리지 않는다.
+fn process_tree_findings(bundle: &serde_json::Value) -> Vec<Finding> {
+    let Some(items) = bundle
+        .pointer("/observations/top/process_tree")
+        .and_then(|t| t.get(super::rca_process_tree::FINDINGS_KEY))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let kind = it.get("kind").and_then(serde_json::Value::as_str)?;
+            let message = it.get("message").and_then(serde_json::Value::as_str)?;
+            let severity = match it.get("severity").and_then(serde_json::Value::as_str) {
+                Some("warning") => Severity::Warn,
+                _ => Severity::Normal,
+            };
+            Some(Finding {
+                severity,
+                confidence: Confidence::Medium,
+                source: SourceQuality::External,
+                probe_id: KERNEL_SECTION.to_string(),
+                message: format!("kernel/process_tree.{kind}: {message}"),
+                suggested_followup: None,
+            })
+        })
+        .collect()
 }
 
 /// 커널 evidence가 들어가는 섹션 이름 — finding의 `probe_id`이자 evidence 헤더다.
@@ -3166,5 +3200,31 @@ tcp LISTEN 0 128 0.0.0.0:49484 0.0.0.0:*\n--- stderr ---\n\n\
         assert!(kernel_findings(r#"{"observations":{"findings":"nope"}}"#).is_empty());
         // signal 없는 항목은 건너뛴다.
         assert!(kernel_findings(r#"{"observations":{"findings":[{"metric":"x"}]}}"#).is_empty());
+    }
+
+    /// PR #77 L1: `process_tree.aic_findings`는 에이전트 finding과 같은 급으로 옮긴다.
+    /// warning만 Warn이고 Crit으로 올리지 않으며, 형식이 맞지 않는 항목은 건너뛴다.
+    #[test]
+    fn process_tree_findings_map_without_promotion() {
+        let bundle = r#"{"observations":{"top":{"process_tree":{"aic_findings":[
+            {"kind":"crash_loop","severity":"warning","message":"java 3번"},
+            {"kind":"signal_exit","severity":"info","message":"SIGKILL"},
+            {"kind":"d_state","severity":"critical","message":"D 9개"},
+            {"severity":"warning","message":"kind 없음"},
+            {"kind":"loss","severity":"warning"}
+        ]}}}}"#;
+        let f = kernel_findings(bundle);
+        assert_eq!(f.len(), 3, "kind·message가 없는 항목은 건너뛴다");
+        assert!(f.iter().all(|x| x.source == SourceQuality::External));
+        assert!(f.iter().all(|x| x.confidence == Confidence::Medium));
+        assert!(f.iter().all(|x| x.probe_id == KERNEL_SECTION));
+        assert_eq!(f[0].severity, Severity::Warn);
+        assert_eq!(f[0].message, "kernel/process_tree.crash_loop: java 3번");
+        assert_eq!(f[1].severity, Severity::Normal);
+        assert_eq!(
+            f[2].severity,
+            Severity::Normal,
+            "모르는 severity는 올리지 않는다"
+        );
     }
 }
