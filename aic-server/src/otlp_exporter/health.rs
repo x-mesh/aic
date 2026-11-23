@@ -200,6 +200,13 @@ impl ExporterHealth {
                     message: f.message.clone(),
                 })
             }),
+            // 배선 전이면 None — 0건으로 단정하지 않는다.
+            log_dropped: self.drop_counters.get().map(|c| aic_common::LogDropCounts {
+                severity: c.by_severity.load(Ordering::Relaxed),
+                rate_limit: c.by_rate_limit.load(Ordering::Relaxed),
+                channel_full: c.by_channel_full.load(Ordering::Relaxed),
+                rejected: c.by_rejected.load(Ordering::Relaxed),
+            }),
         }
     }
 }
@@ -445,6 +452,30 @@ mod tests {
             .fetch_add(7, Ordering::Relaxed);
         h.attach_drop_counters(counters);
         assert_eq!(h.snapshot().collector_dropped, 7);
+    }
+
+    /// #30: severity 필터 드롭이 중앙 게이지에만 있으면 호스트에서는 "로그가 왜 안 가나"를 알 수 없다.
+    #[test]
+    fn log_drop_counts_are_reported_once_counters_are_attached() {
+        let h = health();
+        assert_eq!(h.snapshot().log_dropped, None, "배선 전에는 모른다");
+
+        let counters = Arc::new(DropCounters::new());
+        counters.by_severity.fetch_add(263, Ordering::Relaxed);
+        counters.by_rate_limit.fetch_add(4, Ordering::Relaxed);
+        counters.by_channel_full.fetch_add(3, Ordering::Relaxed);
+        counters.by_rejected.fetch_add(2, Ordering::Relaxed);
+        h.attach_drop_counters(counters);
+
+        assert_eq!(
+            h.snapshot().log_dropped,
+            Some(aic_common::LogDropCounts {
+                severity: 263,
+                rate_limit: 4,
+                channel_full: 3,
+                rejected: 2,
+            })
+        );
     }
 
     #[test]

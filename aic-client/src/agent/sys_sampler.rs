@@ -387,7 +387,7 @@ impl SysSampler {
     ) -> ExporterState {
         use crate::agent_event::ExporterProbe;
         match probe {
-            ExporterProbe::Status(s) => ExporterState::from_exporter_status(s),
+            ExporterProbe::Status(s) => ExporterState::from_exporter_status(*s),
             ExporterProbe::Down => ExporterState::DaemonDown,
             ExporterProbe::Unknown => last,
         }
@@ -1993,7 +1993,10 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            SysSampler::next_exporter_state(ExporterProbe::Status(s), ExporterState::DaemonDown),
+            SysSampler::next_exporter_state(
+                ExporterProbe::Status(Box::new(s)),
+                ExporterState::DaemonDown
+            ),
             ExporterState::Backlogged(7)
         );
     }

@@ -643,7 +643,7 @@ pub async fn flush_spool_async() -> Result<aic_common::SpoolFlushResult, String>
 /// 우리가 이 프로젝트 내내 잡은 "모르는 걸 안다고 단언"하는 거짓말이다(aicd는 떠 있는데 꺼졌다고 보고).
 pub enum ExporterProbe {
     /// 응답을 받았다 — 이 값으로 상태를 접는다.
-    Status(aic_common::ExporterStatus),
+    Status(Box<aic_common::ExporterStatus>),
     /// connect/write가 실패했다(`SendFailed`) = 소켓에 **못 닿았다**. "aicd off"가 정직한 유일한 경우.
     Down,
     /// 요청은 나갔는데 응답을 못 받았다(`NoReply` — read timeout 등), 또는 이 요청을 모르는 구버전이
@@ -663,7 +663,7 @@ pub fn exporter_status_probe() -> ExporterProbe {
 fn to_exporter_probe(rt: Roundtrip) -> ExporterProbe {
     match rt {
         Roundtrip::Replied(resp) => match *resp {
-            IpcResponse::ExporterStatus(s) => ExporterProbe::Status(s),
+            IpcResponse::ExporterStatus(s) => ExporterProbe::Status(Box::new(s)),
             // 이 요청에 올 수 없는 응답(구버전 graceful Error 포함) — 상태를 알 수 없지만 aicd는 답했다.
             _ => ExporterProbe::Unknown,
         },

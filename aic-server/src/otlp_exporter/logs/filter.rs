@@ -14,9 +14,8 @@
 
 use aic_common::{AicdLogsConfig, LogLine};
 
-/// `aic-common::default_log_min_severity()`와 동일한 리터럴(그 함수는 private이라 재노출되지
-/// 않는다) — 전역 `min_severity`가 이 값 그대로면 "사용자가 안 건드린 기본값"으로 취급한다.
-const GLOBAL_DEFAULT_SENTINEL: &str = "INFO";
+/// 전역 `min_severity`가 이 값 그대로면 "사용자가 안 건드린 기본값"으로 취급한다.
+const GLOBAL_DEFAULT_SENTINEL: &str = aic_common::DEFAULT_LOG_MIN_SEVERITY;
 
 /// severity 순서: DEBUG < INFO < WARN < ERROR. 알 수 없는 값은 INFO로 취급한다(너무 낙관적으로
 /// 버리지도, 너무 보수적으로 다 통과시키지도 않는 중간값).

@@ -513,8 +513,10 @@ logs_enabled = false         # 기본 false — opt-in. 다른 하위 플래그(
 # spool_app_logs_max_bytes = ...
 
 [aicd.logs]
-min_severity = "WARN"        # 외부 소스 기본. aic self는 INFO(§6.1이 소스별로 처리)
-external_min_severity = "WARN"  # min_severity가 기본값일 때 외부 소스에 적용(§6.1)
+# min_severity = "ERROR"     # 생략하면 소스별 기본(aic self INFO, 외부 external_min_severity).
+                             # 명시하면 aic self를 포함한 모든 소스에 적용(§6.1). "INFO"는
+                             # 기본값과 같아 생략한 것으로 처리하고, aic는 이 값을 파일에 쓰지 않는다.
+external_min_severity = "WARN"  # 외부 소스 기본. INFO까지 보내려면 "INFO"(§6.1)
 max_lines_per_sec = 1000     # 서비스당 토큰버킷
 batch_max_lines = 500
 batch_max_bytes = 4194304    # 4 MiB — 수신 측 상한(8 MiB)의 절반(§6.4)

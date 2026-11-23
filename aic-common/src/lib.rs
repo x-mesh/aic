@@ -29,7 +29,7 @@ pub mod workload;
 pub use error::AicError;
 pub use ipc::{
     decode_frame, encode_frame, AgentEvent, DaemonVersion, ExporterFailure, ExporterStatus,
-    IpcRequest, IpcResponse, MetricsSnapshot, SelfUpdateStatus, SpoolFlushResult,
+    IpcRequest, IpcResponse, LogDropCounts, MetricsSnapshot, SelfUpdateStatus, SpoolFlushResult,
     AGENT_KIND_FINDING_CREATED, AGENT_KIND_RISK_DENIED, AGENT_KIND_SNAPSHOT_RECORDED,
     AGENT_KIND_TOOL_RUN_COMMAND,
 };
@@ -1077,8 +1077,12 @@ impl Default for AicdLogsConfig {
     }
 }
 
+/// `[aicd.logs] min_severity`의 기본값. 전역 값이 이 값과 같으면 aicd는 "설정하지 않음"으로 보고
+/// 소스별 기본값을 적용한다. 그래서 설정 파일에 이 값을 기록하면 적힌 값과 실제 동작이 달라진다.
+pub const DEFAULT_LOG_MIN_SEVERITY: &str = "INFO";
+
 fn default_log_min_severity() -> String {
-    "INFO".to_string()
+    DEFAULT_LOG_MIN_SEVERITY.to_string()
 }
 
 fn default_log_external_min_severity() -> String {
