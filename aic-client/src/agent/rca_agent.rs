@@ -44,6 +44,20 @@ const MAX_WINDOW_SECS: u64 = 300;
 const MAX_BUNDLE_BYTES: usize = 2 * 1024 * 1024;
 /// 출력 상한 때문에 생략한 `observations.top` 하위 값을 대신하는 표식 키(값은 원래 크기).
 const OMITTED_KEY: &str = "aic_omitted_bytes";
+/// 블랙박스 고정본 읽기 상한. rca-agent 설정 상한이 16 MiB이고, 줄일 대상이 바닥나면 그보다
+/// 커질 수 있다(형식 문서 §8).
+const MAX_BLACKBOX_BYTES: usize = 32 * 1024 * 1024;
+/// 준비된 고정본은 완성된 JSON을 그대로 내주므로 짧게 둔다. 큰 고정본 전송 시간만 감안한다.
+const BLACKBOX_TIMEOUT_SECS: u64 = 30;
+/// 블랙박스 id 길이(16자리 소문자 hex).
+const BLACKBOX_ID_LEN: usize = 16;
+
+fn is_blackbox_id(id: &str) -> bool {
+    id.len() == BLACKBOX_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// 로컬 rca-agent control API에 대한 read-only pull 클라이언트.
 #[derive(Debug)]
@@ -99,7 +113,8 @@ impl RcaAgentClient {
                      kill_sender.pid는 시그널을 생성한 실행 문맥이지 죽이기로 결정한 주체가 아니다. \
                      process_tree.aic_findings는 aic가 트리 원문에서 만든 판정이다(loss, \
                      crash_loop, signal_exit, d_state). SIGKILL 종료는 OOM이라고 단정하지 않으므로 \
-                     oom 신호와 맞춰 본다.",
+                     oom 신호와 맞춰 본다. process_tree.blackbox_refs에 state가 ready인 id가 있으면 \
+                     rca_agent_blackbox로 장애 앞뒤 구간의 고정본을 볼 수 있다.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -117,6 +132,29 @@ impl RcaAgentClient {
                      kernel capability(btf/tracing/ringbuf 등)를 조회한다. read-only, 즉시 반환.",
                 parameters: json!({ "type": "object", "properties": {} }),
             },
+            ToolSpec {
+                name: "rca_agent_blackbox",
+                description:
+                    "rca-agent 프로세스 트리 블랙박스 고정본(process_tree_blackbox.v1)을 id로 \
+                     조회해 요약을 반환한다. id는 rca_agent_collect 결과의 \
+                     process_tree.blackbox_refs[].id(16자리 hex)다. read-only, 즉시 반환. 요약: \
+                     triggers(crash_loop·fatal_signal·oom_kill·fork_storm·d_state·pressure·manual, \
+                     cause 포함), range(트리거 전후 구간), loss(0이 아니면 그 구간의 프레임·종료가 \
+                     빠짐), frames(1초 프레임의 live 노드 수 범위, procs_blocked·load1·PSI 최댓값과 \
+                     시각, 카운터 합, 종료 그룹 합), exits(최근 종료), exited_summary, \
+                     snapshots.at_trigger·at_end(트리거 시점과 끝 시점의 process_tree 요약). \
+                     아직 캡처 중이면 오류로 알린다.",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "blackbox_refs[].id (16자리 소문자 hex)"
+                        }
+                    },
+                    "required": ["id"]
+                }),
+            },
         ]
     }
 
@@ -131,6 +169,10 @@ impl RcaAgentClient {
                 self.collect(secs).await
             }
             "rca_agent_features" => self.features().await,
+            "rca_agent_blackbox" => {
+                let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+                self.blackbox(id).await
+            }
             other => Err(ToolError::new(format!("미지원 rca-agent 도구: {other}"))),
         }
     }
@@ -168,6 +210,54 @@ impl RcaAgentClient {
         self.send(req).await
     }
 
+    /// `GET /blackboxz/<id>` — 블랙박스 고정본을 받아 요약한다.
+    ///
+    /// id는 경로에 그대로 들어가므로 형식(16자리 소문자 hex)을 먼저 검사한다. 캡처 중이면 409,
+    /// 블랙박스가 꺼져 있거나 id가 없으면 404가 온다(형식 문서 §8).
+    pub async fn blackbox(&self, id: &str) -> Result<String, ToolError> {
+        if !is_blackbox_id(id) {
+            return Err(ToolError::new(format!(
+                "블랙박스 id 형식이 아닙니다: '{}'. rca_agent_collect 결과의 \
+                 process_tree.blackbox_refs[].id(16자리 소문자 hex)를 쓰세요.",
+                truncate(id, 64)
+            )));
+        }
+        let url = format!("{}/blackboxz/{id}", self.base);
+        let req = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(BLACKBOX_TIMEOUT_SECS));
+        let (status, text, truncated) = self.fetch_any_status(req, MAX_BLACKBOX_BYTES).await?;
+        match status {
+            reqwest::StatusCode::CONFLICT => {
+                return Err(ToolError::new(format!(
+                "블랙박스 {id}는 아직 캡처 중입니다(state capturing). 트리거 뒤 구간(기본 30초)이 \
+                     끝난 뒤 다시 조회하세요."
+            )))
+            }
+            reqwest::StatusCode::NOT_FOUND => {
+                return Err(ToolError::new(format!(
+                    "블랙박스 {id}를 찾지 못했습니다. 블랙박스가 꺼져 있거나(signals.process_tree.\
+                     blackbox) 고정본이 보관 한도로 지워졌을 수 있습니다. ({})",
+                    truncate(&text, 500)
+                )))
+            }
+            s if !s.is_success() => return Err(status_error(s, &text)),
+            _ => {}
+        }
+        if truncated {
+            return Err(ToolError::new(format!(
+                "블랙박스 고정본이 {MAX_BLACKBOX_BYTES} bytes를 넘어 읽기를 중단했습니다."
+            )));
+        }
+        let Ok(mut capture) = serde_json::from_str::<Value>(&text) else {
+            return Ok(finalize(&text));
+        };
+        redact_strings(&mut capture);
+        let summary = super::rca_blackbox::summarize(&capture, MAX_OUTPUT_BYTES).unwrap_or(capture);
+        Ok(truncate(&summary.to_string(), MAX_OUTPUT_BYTES))
+    }
+
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<String, ToolError> {
         let (text, _) = self.fetch(req, MAX_RESPONSE_BYTES).await?;
         Ok(finalize(&text))
@@ -179,6 +269,19 @@ impl RcaAgentClient {
         req: reqwest::RequestBuilder,
         max_bytes: usize,
     ) -> Result<(String, bool), ToolError> {
+        let (status, text, truncated) = self.fetch_any_status(req, max_bytes).await?;
+        if !status.is_success() {
+            return Err(status_error(status, &text));
+        }
+        Ok((text, truncated))
+    }
+
+    /// 요청을 보내 상태 코드와 함께 `max_bytes`까지 읽는다. 상태별로 안내를 바꾸는 호출부용이다.
+    async fn fetch_any_status(
+        &self,
+        req: reqwest::RequestBuilder,
+        max_bytes: usize,
+    ) -> Result<(reqwest::StatusCode, String, bool), ToolError> {
         let resp = req.send().await.map_err(|e| {
             ToolError::new(format!(
                 "rca-agent 요청 실패: {e}. rca-agent가 실행 중인지 확인하세요 \
@@ -187,15 +290,16 @@ impl RcaAgentClient {
         })?;
         let status = resp.status();
         let (bytes, truncated) = read_capped(resp, max_bytes).await?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if !status.is_success() {
-            return Err(ToolError::new(format!(
-                "rca-agent 오류 {status}: {}",
-                truncate(&text, 2000)
-            )));
-        }
-        Ok((text, truncated))
+        Ok((
+            status,
+            String::from_utf8_lossy(&bytes).into_owned(),
+            truncated,
+        ))
     }
+}
+
+fn status_error(status: reqwest::StatusCode, body: &str) -> ToolError {
+    ToolError::new(format!("rca-agent 오류 {status}: {}", truncate(body, 2000)))
 }
 
 /// `/collectz` 번들을 redaction하고 LLM 출력 상한에 맞춘다.
@@ -404,12 +508,34 @@ mod tests {
     }
 
     #[test]
-    fn specs_expose_two_readonly_tools() {
+    fn specs_expose_readonly_tools() {
         let client = RcaAgentClient::new(&cfg(true, "http://127.0.0.1:9090"))
             .unwrap()
             .unwrap();
         let names: Vec<&str> = client.specs().iter().map(|s| s.name).collect();
-        assert_eq!(names, vec!["rca_agent_collect", "rca_agent_features"]);
+        assert_eq!(
+            names,
+            vec![
+                "rca_agent_collect",
+                "rca_agent_features",
+                "rca_agent_blackbox"
+            ]
+        );
+    }
+
+    /// id는 URL 경로에 들어가므로 형식이 아닌 값은 요청 전에 거부한다.
+    #[test]
+    fn blackbox_id_must_be_16_lowercase_hex() {
+        assert!(is_blackbox_id("0123456789abcdef"));
+        for bad in [
+            "",
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "../../healthz00",
+            "0123456789abcdefa",
+        ] {
+            assert!(!is_blackbox_id(bad), "{bad}");
+        }
     }
 
     fn bundle(top: Value) -> String {

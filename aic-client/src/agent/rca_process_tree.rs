@@ -192,9 +192,18 @@ fn age(record: &Value, key: &str) -> f64 {
 
 /// 창 안에 커널 종료 이벤트로 닫힌 종료를 최근 순으로 `MAX_EXITS`개 남긴다.
 fn exits_in_window(exited: &[Value]) -> Value {
-    let mut events: Vec<&Value> = exited
-        .iter()
-        .filter(|e| e.get("in_window").and_then(Value::as_bool) == Some(true))
+    recent_exits(
+        exited
+            .iter()
+            .filter(|e| e.get("in_window").and_then(Value::as_bool) == Some(true))
+            .collect(),
+    )
+}
+
+/// reconcile을 뺀 종료를 최근 순으로 `MAX_EXITS`개 남긴다. 블랙박스 고정본의 종료 이력도 이 모양으로 싣는다.
+pub(crate) fn recent_exits(candidates: Vec<&Value>) -> Value {
+    let mut events: Vec<&Value> = candidates
+        .into_iter()
         .filter(|e| e.get("closed_by").and_then(Value::as_str) != Some("reconcile"))
         .collect();
     let total = events.len();
