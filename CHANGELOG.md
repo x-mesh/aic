@@ -17,6 +17,7 @@
 ### Fixed
 
 - `aic config set`, `aic enroll` 등으로 설정을 저장해도 `[aicd.logs]`에 `min_severity = "INFO"`가 새로 기록되지 않는다. 이 값은 기본값과 같아 aicd가 "설정하지 않음"으로 처리하고 외부 소스에는 WARN을 적용하는데, 파일에는 INFO로 적혀 실제 동작과 달라 보였다. 동작은 바뀌지 않는다. 이미 파일에 있는 줄은 다음 저장 때 사라진다.
+- 파일 로그(`[[aicd.logs.files]]`)의 severity 판정이 `WARNING`, `ERR`, `FATAL`, `CRIT(ICAL)` 같은 표기와 색상 코드가 붙은 레벨을 알아본다. 지금까지는 대문자 `ERROR`·`WARN`·`INFO`·`DEBUG`만 찾아서, 실제 경고와 오류가 INFO로 판정돼 외부 소스 기본값(WARN)에서 버려졌다. 소문자 레벨은 레벨 표기라는 근거가 있을 때만 인정한다(`[warn]`, `<error>`, `Error:`, `level=warn`). 본문의 "no error found" 같은 일반 단어는 그대로 INFO다. `TRACE`는 DEBUG로, `NOTICE`는 INFO로 본다. 그동안 버려지던 경고·오류 줄이 전송되므로 파일 로그 전송량이 늘 수 있다.
 
 ## [0.50.19] - 2026-10-15
 

@@ -68,14 +68,83 @@ const FINGERPRINT_MIN_BYTES: u64 = 1024;
 /// 버린 사실은 파서가 자기 카운터에 기록한다(여기서는 알 바 아니다).
 pub type LineParser = dyn Fn(&str) -> Option<LogLine> + Send + Sync;
 
-/// 라인 앞머리에서 `ERROR|WARN|INFO|DEBUG`를 토큰 단위로 찾는다(부분 문자열 매치가 아니다 —
-/// 예: `MIRROR`가 `ERROR`로 오인되지 않는다). 앞의 최대 8개 공백 구분 토큰만 본다(타임스탬프
-/// 등 앞머리를 넘어가면 검사하지 않음). 못 찾으면 `"INFO"`.
+/// severity 토큰을 찾는 앞머리 단어 수. 타임스탬프·호스트·프로세스 이름 뒤까지만 본다.
+const SEVERITY_PREFIX_WORDS: usize = 8;
+/// `level=warn` 형식에서 레벨로 읽는 키(대소문자 무시).
+const LEVEL_KEYS: [&str; 4] = ["level", "lvl", "severity", "loglevel"];
+
+/// 레벨 이름(대문자)을 필터가 쓰는 네 단계로 바꾼다. syslog 레벨 이름을 포함한다.
+fn level_alias(upper: &str) -> Option<&'static str> {
+    match upper {
+        "FATAL" | "CRIT" | "CRITICAL" | "EMERG" | "EMERGENCY" | "ALERT" | "ERROR" | "ERR" => {
+            Some("ERROR")
+        }
+        "WARN" | "WARNING" => Some("WARN"),
+        "INFO" | "NOTICE" => Some("INFO"),
+        "DEBUG" | "TRACE" => Some("DEBUG"),
+        _ => None,
+    }
+}
+
+/// ANSI 이스케이프 시퀀스(`ESC [ … 문자`)를 뺀다. 색을 입힌 레벨(`\x1b[31mERROR\x1b[0m`)을
+/// 읽기 위해서이며 판정에만 쓴다(전송하는 message는 원문 그대로다).
+fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            // CSI 시퀀스는 0x40..=0x7E 범위의 문자로 끝난다.
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// 라인 앞머리에서 severity 토큰을 찾는다. 못 찾으면 `"INFO"`.
+///
+/// 토큰 단위로만 비교한다(부분 문자열 매치가 아니다 — 예: `MIRROR`가 `ERROR`로 오인되지 않는다).
+/// 앞의 최대 [`SEVERITY_PREFIX_WORDS`]개 단어만 본다.
+///
+/// 대문자 단어(`ERROR`, `WARNING`, `ERR`, `FATAL` …)는 어디서나 인정한다. 소문자·첫 글자만
+/// 대문자인 단어는 레벨 표기라는 근거가 있을 때만 인정한다: 괄호로 감쌌거나(`[warn]`, `<error>`),
+/// 콜론으로 끝나거나(`Error:`, `warning:`), `level=warn` 형식일 때다. 본문의 "no error found"
+/// 같은 일반 단어를 ERROR로 올려 볼륨을 늘리지 않기 위해서다.
 pub fn parse_severity_prefix(line: &str) -> &'static str {
-    const LEVELS: [&str; 4] = ["ERROR", "WARN", "INFO", "DEBUG"];
-    for word in line.split_whitespace().take(8) {
+    let line = strip_ansi(line);
+    for word in line.split_whitespace().take(SEVERITY_PREFIX_WORDS) {
+        if let Some((key, value)) = word.split_once('=') {
+            let key = key.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            if LEVEL_KEYS.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+                let value = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                if let Some(level) = level_alias(&value.to_ascii_uppercase()) {
+                    return level;
+                }
+            }
+            continue;
+        }
         let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        if let Some(level) = LEVELS.iter().find(|&&l| l == trimmed) {
+        if trimmed.is_empty() {
+            continue;
+        }
+        let explicit = word.starts_with(['[', '<', '(']) || word.ends_with(':');
+        let candidate = if trimmed.bytes().all(|b| b.is_ascii_uppercase()) {
+            level_alias(trimmed)
+        } else if explicit {
+            level_alias(&trimmed.to_ascii_uppercase())
+        } else {
+            None
+        };
+        if let Some(level) = candidate {
             return level;
         }
     }
@@ -1129,6 +1198,48 @@ mod tests {
             "INFO",
             "부분 문자열(MIRROR가 ERROR를 포함하지 않음에도)로 오인하면 안 됨"
         );
+    }
+
+    /// #30: 표준 형식의 경고·오류가 INFO로 떨어져 기본 WARN 필터에서 버려지던 경우들.
+    #[test]
+    fn severity_recognizes_common_level_spellings() {
+        let cases = [
+            ("WARNING: deprecated flag", "WARN"),
+            ("2026-11-23 10:00:00 ERR failed", "ERROR"),
+            ("FATAL out of memory", "ERROR"),
+            ("Nov 23 10:00:00 host app[12]: CRITICAL db down", "ERROR"),
+            ("[warn] upstream timed out", "WARN"),
+            (
+                "2026/11/23 10:00:00 [error] 12#12: connect() failed",
+                "ERROR",
+            ),
+            ("<error> bad request", "ERROR"),
+            ("Error: connection refused", "ERROR"),
+            ("main.c:3: warning: unused variable", "WARN"),
+            ("ts=2026-11-23 level=warn msg=slow", "WARN"),
+            ("time=x severity=\"ERROR\" msg=y", "ERROR"),
+            ("\x1b[31mERROR\x1b[0m boom", "ERROR"),
+            ("\x1b[33mwarn\x1b[0m: low disk", "WARN"),
+            ("TRACE entering loop", "DEBUG"),
+            ("NOTICE service started", "INFO"),
+        ];
+        for (line, want) in cases {
+            assert_eq!(parse_severity_prefix(line), want, "{line:?}");
+        }
+    }
+
+    /// 근거 없는 소문자 단어는 레벨로 보지 않는다(볼륨을 늘리는 오탐 방지).
+    #[test]
+    fn severity_ignores_bare_lowercase_words() {
+        for line in [
+            "no error found in config",
+            "request completed without warning",
+            "user error rate 0.1",
+            "debug mode disabled",
+            "verbose=1 retries=3 error_count=0",
+        ] {
+            assert_eq!(parse_severity_prefix(line), "INFO", "{line:?}");
+        }
     }
 
     #[test]
