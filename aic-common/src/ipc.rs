@@ -377,6 +377,10 @@ pub struct SelfUpdateStatus {
     /// 첫 주기가 오지 않았다는 뜻이라, "방금 확인함"과 뭉개지 않는다.
     #[serde(default)]
     pub last_check_secs_ago: Option<u64>,
+    /// 마지막 확인 시각(Unix 초). `last_check_secs_ago`와 달리 다음 확인 전까지 값이 바뀌지 않아,
+    /// OTLP resource 속성처럼 값이 시계열 식별에 쓰이는 자리에는 이 값을 싣는다.
+    #[serde(default)]
+    pub last_check_unix_secs: Option<u64>,
     /// 중앙이 마지막 확인에서 선언한 목표 버전. `None`이면 선언하지 않았거나 응답을 받지 못했다.
     #[serde(default)]
     pub desired_version: Option<String>,
@@ -561,6 +565,7 @@ mod tests {
             live: true,
             interval_secs: 3600,
             last_check_secs_ago: Some(42),
+            last_check_unix_secs: Some(1_790_000_000),
             desired_version: Some("0.42.0".to_string()),
             last_outcome: Some("목표가 현재보다 낮음".to_string()),
             current_version: "0.41.6".to_string(),

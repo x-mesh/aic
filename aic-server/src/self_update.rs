@@ -93,6 +93,7 @@ impl SelfUpdateHealth {
             last_check_secs_ago: last
                 .as_ref()
                 .map(|l| unix_now_secs().saturating_sub(l.unix_secs)),
+            last_check_unix_secs: last.as_ref().map(|l| l.unix_secs),
             desired_version: last.as_ref().and_then(|l| l.desired_version.clone()),
             last_outcome: last.map(|l| l.outcome),
             current_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -536,6 +537,7 @@ mod tests {
         assert!(!s.configured);
         assert!(!s.live);
         assert_eq!(s.last_check_secs_ago, None);
+        assert_eq!(s.last_check_unix_secs, None);
         assert_eq!(s.current_version, env!("CARGO_PKG_VERSION"));
     }
 
@@ -563,6 +565,9 @@ mod tests {
         assert_eq!(s.desired_version.as_deref(), Some("0.42.0"));
         assert_eq!(s.last_outcome.as_deref(), Some("목표가 현재보다 낮음"));
         assert!(s.last_check_secs_ago.is_some_and(|secs| secs <= 1));
+        assert!(s.last_check_unix_secs.is_some_and(|t| t > 0));
+        // 확인 시각은 다음 확인 전까지 고정이다. OTLP resource 속성이 이 값을 쓴다.
+        assert_eq!(h.snapshot().last_check_unix_secs, s.last_check_unix_secs);
     }
 
     #[test]

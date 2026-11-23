@@ -250,7 +250,7 @@ async fn exporter_pushes_self_update_status_attributes() {
         b"aic.self_update.enabled".as_slice(),
         b"aic.self_update.last_outcome",
         b"already-at-target",
-        b"aic.self_update.last_check_secs_ago",
+        b"aic.self_update.last_check_unix_secs",
     ] {
         assert!(
             contains(&captured.body, needle),

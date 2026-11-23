@@ -139,6 +139,9 @@ fn resource_attributes(
 ///
 /// `enabled`는 꺼져 있어도 항상 싣는다. 나머지 둘은 값이 없으면 생략한다: 아직 확인하지 않은
 /// 상태를 `0`(방금 확인함)이나 빈 문자열로 보내면 수신측이 구분할 수 없다.
+///
+/// 확인 시점은 경과 초가 아니라 절대 시각으로 싣는다. resource 속성은 수집기에서 시계열
+/// 식별자로 쓰이므로, tick마다 바뀌는 값을 넣으면 같은 호스트의 시계열이 tick마다 새로 생긴다.
 fn self_update_attributes(status: &SelfUpdateStatus) -> Vec<KeyValue> {
     let mut attrs = vec![typed_attr(
         "aic.self_update.enabled",
@@ -147,9 +150,9 @@ fn self_update_attributes(status: &SelfUpdateStatus) -> Vec<KeyValue> {
     if let Some(outcome) = &status.last_outcome {
         attrs.push(attr("aic.self_update.last_outcome", outcome));
     }
-    if let Some(secs) = status.last_check_secs_ago {
+    if let Some(secs) = status.last_check_unix_secs {
         attrs.push(typed_attr(
-            "aic.self_update.last_check_secs_ago",
+            "aic.self_update.last_check_unix_secs",
             AnyValueOneof::IntValue(i64::try_from(secs).unwrap_or(i64::MAX)),
         ));
     }
@@ -672,6 +675,7 @@ mod tests {
             live: true,
             interval_secs: 3600,
             last_check_secs_ago: Some(120),
+            last_check_unix_secs: Some(1_790_000_000),
             desired_version: Some("0.50.20".to_string()),
             last_outcome: Some("이미 목표 버전".to_string()),
             current_version: "0.50.20".to_string(),
@@ -688,8 +692,13 @@ mod tests {
             Some(&AnyValueOneof::StringValue("이미 목표 버전".to_string()))
         );
         assert_eq!(
+            find_attr(&attrs, "aic.self_update.last_check_unix_secs"),
+            Some(&AnyValueOneof::IntValue(1_790_000_000))
+        );
+        // 경과 초는 tick마다 바뀌어 resource 식별자를 흔들므로 싣지 않는다.
+        assert_eq!(
             find_attr(&attrs, "aic.self_update.last_check_secs_ago"),
-            Some(&AnyValueOneof::IntValue(120))
+            None
         );
     }
 
@@ -712,7 +721,7 @@ mod tests {
         );
         assert_eq!(find_attr(&attrs, "aic.self_update.last_outcome"), None);
         assert_eq!(
-            find_attr(&attrs, "aic.self_update.last_check_secs_ago"),
+            find_attr(&attrs, "aic.self_update.last_check_unix_secs"),
             None
         );
     }

@@ -6,7 +6,7 @@
 
 ### Added
 
-- 중앙 서버가 호스트마다 자체 업데이트가 켜져 있는지 알 수 있다. host metrics를 보낼 때 resource 속성 `aic.self_update.enabled`(설정이 켜져 있고 확인 task가 살아 있으면 true), `aic.self_update.last_outcome`(마지막 확인 결과 한 줄), `aic.self_update.last_check_secs_ago`(마지막 확인 후 경과 초)를 함께 싣는다. 지금까지는 버전이 바뀌는지만 보였기 때문에, 자체 업데이트를 켜지 않은 호스트와 켰는데 업데이트에 실패하는 호스트를 중앙에서 구분할 수 없었다. 아직 확인하지 않았으면 뒤의 두 속성은 생략한다.
+- 중앙 서버가 호스트마다 자체 업데이트가 켜져 있는지 알 수 있다. host metrics를 보낼 때 resource 속성 `aic.self_update.enabled`(설정이 켜져 있고 확인 task가 살아 있으면 true), `aic.self_update.last_outcome`(마지막 확인 결과 한 줄), `aic.self_update.last_check_unix_secs`(마지막 확인 시각, Unix 초)를 함께 싣는다. 확인 시점을 경과 초로 보내면 값이 전송마다 바뀌어, resource 속성으로 시계열을 구분하는 수집기에서 같은 호스트의 시계열이 계속 새로 생기므로 절대 시각을 쓴다. 지금까지는 버전이 바뀌는지만 보였기 때문에, 자체 업데이트를 켜지 않은 호스트와 켰는데 업데이트에 실패하는 호스트를 중앙에서 구분할 수 없었다. 아직 확인하지 않았으면 뒤의 두 속성은 생략한다.
 
 ## [0.50.19] - 2026-10-15
 
