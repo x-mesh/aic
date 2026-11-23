@@ -735,6 +735,8 @@ async fn serve_docker_with(
                             super::unix_nanos_now(),
                             // docker task는 로그 드롭을 모른다 — 게이지를 싣지 않는다(중복 발행 방지).
                             None,
+                            // 자체 업데이트 상태도 host metrics task만 싣는다.
+                            None,
                         );
 
                         if !backoff.ready() {

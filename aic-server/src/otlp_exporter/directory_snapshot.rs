@@ -812,6 +812,7 @@ mod tests {
                     spool.clone(),
                 )),
                 drop_counters: Arc::new(super::super::DropCounters::new()),
+                self_update: None,
                 process_enabled: false,
                 directory_snapshot_enabled: true,
                 process_io_diagnostics_enabled: false,

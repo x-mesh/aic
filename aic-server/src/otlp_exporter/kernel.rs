@@ -604,6 +604,7 @@ async fn serve_kernel_with(
                     &cfg.service_version,
                     super::unix_nanos_now(),
                     None,
+                    None,
                 );
 
                 if !backoff.ready() {

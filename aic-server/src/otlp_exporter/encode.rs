@@ -14,6 +14,7 @@ use prost::Message as _;
 
 use super::host_metrics::{HostSample, MetricValue};
 use super::logs::DropCounters;
+use aic_common::SelfUpdateStatus;
 
 /// InstrumentationScope name — 이 metric을 낸 주체. resource `service.name`과 동일하게 aicd.
 const SCOPE_NAME: &str = "aicd";
@@ -42,13 +43,20 @@ fn redact_str(s: &str) -> String {
 /// 둘(host metrics `serve`, docker exporter)인데 둘 다 이 게이지를 실으면 **같은 메트릭이
 /// 서로 다른 값으로 중복 발행**된다 — docker task는 로그 드롭을 알지 못하므로 0을 보내고,
 /// 수신 측에서는 어느 쪽이 진실인지 알 수 없다. 로그 드롭은 **host metrics task만** 보고한다.
+///
+/// `self_update`도 같은 이유로 host metrics task만 `Some`을 넘긴다. `Some`이면 resource에
+/// `aic.self_update.*` 속성을 붙인다([`self_update_attributes`]).
 pub fn encode_metrics(
     sample: &HostSample,
     service_version: &str,
     now_unix_nano: u64,
     drop_counters: Option<&DropCounters>,
+    self_update: Option<&SelfUpdateStatus>,
 ) -> Vec<u8> {
-    let resource_attrs = resource_attributes(&sample.resource, service_version);
+    let mut resource_attrs = resource_attributes(&sample.resource, service_version);
+    if let Some(status) = self_update {
+        resource_attrs.extend(self_update_attributes(status));
+    }
 
     let data_points = sample
         .points
@@ -124,6 +132,28 @@ fn resource_attributes(
         attr("service.name", SERVICE_NAME),
         attr("service.version", service_version),
     ]
+}
+
+/// 자체 업데이트 상태 resource 속성(#29 R5). 중앙은 버전이 바뀌는지만 보고는 "켜지 않음"과
+/// "켰는데 실패 중"을 구분하지 못하므로, `aic status`가 보는 값을 함께 싣는다.
+///
+/// `enabled`는 꺼져 있어도 항상 싣는다. 나머지 둘은 값이 없으면 생략한다: 아직 확인하지 않은
+/// 상태를 `0`(방금 확인함)이나 빈 문자열로 보내면 수신측이 구분할 수 없다.
+fn self_update_attributes(status: &SelfUpdateStatus) -> Vec<KeyValue> {
+    let mut attrs = vec![typed_attr(
+        "aic.self_update.enabled",
+        AnyValueOneof::BoolValue(status.configured && status.live),
+    )];
+    if let Some(outcome) = &status.last_outcome {
+        attrs.push(attr("aic.self_update.last_outcome", outcome));
+    }
+    if let Some(secs) = status.last_check_secs_ago {
+        attrs.push(typed_attr(
+            "aic.self_update.last_check_secs_ago",
+            AnyValueOneof::IntValue(i64::try_from(secs).unwrap_or(i64::MAX)),
+        ));
+    }
+    attrs
 }
 
 /// data point마다 속성을 붙이는 gauge 하나. 이름이 런타임에 정해지는 지표(workload 등)용이다.
@@ -217,6 +247,14 @@ fn attr(key: &str, value: &str) -> KeyValue {
         value: Some(AnyValue {
             value: Some(AnyValueOneof::StringValue(redact_str(value))),
         }),
+    }
+}
+
+/// 문자열이 아닌 값의 `KeyValue`. 키는 [`attr`]와 같이 redact한다. 문자열 값은 [`attr`]를 쓴다.
+fn typed_attr(key: &str, value: AnyValueOneof) -> KeyValue {
+    KeyValue {
+        key: redact_str(key),
+        value: Some(AnyValue { value: Some(value) }),
     }
 }
 
@@ -501,6 +539,7 @@ mod tests {
             "0.24.0",
             1_700_000_000_000_000_000,
             Some(&DropCounters::default()),
+            None,
         );
 
         // 원문 secret은 wire에 절대 남지 않는다.
@@ -528,7 +567,7 @@ mod tests {
         ];
         for secret in cases {
             let sample = sample_with_resource(secret, "id", "linux");
-            let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
+            let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()), None);
             assert!(
                 !contains(&bytes, secret.as_bytes()),
                 "'{secret}' 종류가 redact되지 않고 유출됨"
@@ -540,7 +579,7 @@ mod tests {
     #[test]
     fn encodes_valid_otlp_request_roundtrip() {
         let sample = sample_with_resource("web-1", "id-abc", "linux");
-        let bytes = encode_metrics(&sample, "9.9.9", 42, Some(&DropCounters::default()));
+        let bytes = encode_metrics(&sample, "9.9.9", 42, Some(&DropCounters::default()), None);
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("valid protobuf");
 
         assert_eq!(req.resource_metrics.len(), 1);
@@ -588,7 +627,7 @@ mod tests {
     #[test]
     fn resource_attr_value_is_redacted_and_readable() {
         let sample = sample_with_resource("clean-host", "AKIAIOSFODNN7EXAMPLE", "linux");
-        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()), None);
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let attrs = &req.resource_metrics[0]
             .resource
@@ -605,6 +644,102 @@ mod tests {
         );
     }
 
+    fn resource_attr_values(bytes: &[u8]) -> Vec<(String, AnyValueOneof)> {
+        let req = ExportMetricsServiceRequest::decode(bytes).unwrap();
+        req.resource_metrics[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes
+            .iter()
+            .map(|kv| {
+                let value = kv.value.as_ref().unwrap().value.clone().unwrap();
+                (kv.key.clone(), value)
+            })
+            .collect()
+    }
+
+    fn find_attr<'a>(attrs: &'a [(String, AnyValueOneof)], key: &str) -> Option<&'a AnyValueOneof> {
+        attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// #29 R5: 중앙이 "켜지 않음"과 "켰는데 실패 중"을 구분하도록 자체 업데이트 상태를 타입대로 싣는다.
+    #[test]
+    fn self_update_status_is_attached_with_typed_values() {
+        let sample = sample_with_resource("web-1", "id-abc", "linux");
+        let status = SelfUpdateStatus {
+            configured: true,
+            live: true,
+            interval_secs: 3600,
+            last_check_secs_ago: Some(120),
+            desired_version: Some("0.50.20".to_string()),
+            last_outcome: Some("이미 목표 버전".to_string()),
+            current_version: "0.50.20".to_string(),
+        };
+        let bytes = encode_metrics(&sample, "0.50.20", 1, None, Some(&status));
+        let attrs = resource_attr_values(&bytes);
+
+        assert_eq!(
+            find_attr(&attrs, "aic.self_update.enabled"),
+            Some(&AnyValueOneof::BoolValue(true))
+        );
+        assert_eq!(
+            find_attr(&attrs, "aic.self_update.last_outcome"),
+            Some(&AnyValueOneof::StringValue("이미 목표 버전".to_string()))
+        );
+        assert_eq!(
+            find_attr(&attrs, "aic.self_update.last_check_secs_ago"),
+            Some(&AnyValueOneof::IntValue(120))
+        );
+    }
+
+    /// 켰지만 확인 task가 죽었으면 enabled는 false다. 아직 확인하지 않은 값은 0이나 빈 문자열로
+    /// 채우지 않고 생략한다.
+    #[test]
+    fn self_update_disabled_is_sent_and_unknown_fields_are_omitted() {
+        let sample = sample_with_resource("web-1", "id-abc", "linux");
+        let status = SelfUpdateStatus {
+            configured: true,
+            live: false,
+            ..SelfUpdateStatus::default()
+        };
+        let bytes = encode_metrics(&sample, "0.50.20", 1, None, Some(&status));
+        let attrs = resource_attr_values(&bytes);
+
+        assert_eq!(
+            find_attr(&attrs, "aic.self_update.enabled"),
+            Some(&AnyValueOneof::BoolValue(false))
+        );
+        assert_eq!(find_attr(&attrs, "aic.self_update.last_outcome"), None);
+        assert_eq!(
+            find_attr(&attrs, "aic.self_update.last_check_secs_ago"),
+            None
+        );
+    }
+
+    /// 상태를 넘기지 않는 task(docker, kernel)는 `aic.self_update.*`를 싣지 않는다.
+    #[test]
+    fn self_update_attrs_absent_without_status() {
+        let sample = sample_with_resource("web-1", "id-abc", "linux");
+        let bytes = encode_metrics(&sample, "0.50.20", 1, None, None);
+        let attrs = resource_attr_values(&bytes);
+        assert!(attrs
+            .iter()
+            .all(|(k, _)| !k.starts_with("aic.self_update.")));
+    }
+
+    /// `last_outcome`은 사람이 읽는 문자열이라 다른 문자열 속성과 같이 redact된다.
+    #[test]
+    fn self_update_last_outcome_is_redacted() {
+        let sample = sample_with_resource("web-1", "id-abc", "linux");
+        let status = SelfUpdateStatus {
+            last_outcome: Some("확인 실패: admin@corp.internal".to_string()),
+            ..SelfUpdateStatus::default()
+        };
+        let bytes = encode_metrics(&sample, "0.50.20", 1, None, Some(&status));
+        assert!(!contains(&bytes, b"admin@corp.internal"));
+    }
+
     /// rca의 `hosts` 인벤토리(호스트 상세 화면의 OS/아키텍처)가 이 두 attr에서 나온다.
     /// 빠지면 화면에 "—"가 뜬다.
     ///
@@ -614,7 +749,7 @@ mod tests {
     #[test]
     fn resource_carries_arch_and_os_description_for_the_host_inventory() {
         let sample = sample_with_resource("web-1", "id-1", "macos");
-        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()));
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&DropCounters::default()), None);
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let attrs = &req.resource_metrics[0]
             .resource
@@ -659,7 +794,7 @@ mod tests {
             .by_collector_dropped
             .fetch_add(66, Ordering::Relaxed);
 
-        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&counters));
+        let bytes = encode_metrics(&sample, "0.24.0", 1, Some(&counters), None);
         let req = ExportMetricsServiceRequest::decode(bytes.as_slice()).unwrap();
         let sm = &req.resource_metrics[0].scope_metrics[0];
 
