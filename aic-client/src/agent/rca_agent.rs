@@ -89,7 +89,12 @@ impl RcaAgentClient {
                      delta이고 correlation_hint는 rule 기반 참고 힌트다 — root cause 판정이 아니며 \
                      baseline.available은 저장 이력 유무일 뿐이다. 출력 상한 때문에 \
                      observations.top 하위 값이 {\"aic_omitted_bytes\": N}으로 바뀌어 있으면 \
-                     N bytes가 생략된 것이지 데이터가 없다는 뜻이 아니다.",
+                     N bytes가 생략된 것이지 데이터가 없다는 뜻이 아니다. process_tree에 \
+                     aic_summary_of_bytes가 있으면 원문 대신 요약이다: exits_in_window(창 안 \
+                     종료, kill_sender 원문 포함), reconcile_exits(시각·원인 미상, 개수와 age \
+                     범위만), top_nodes(지표별 상위 노드와 조상 사슬, 지표 키가 없으면 측정 안 \
+                     함), d_state. 각 목록의 total과 kept가 다르면 일부만 실린 것이다. \
+                     kill_sender.pid는 시그널을 생성한 실행 문맥이지 죽이기로 결정한 주체가 아니다.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -199,9 +204,25 @@ pub(crate) fn finalize_bundle(body: &str) -> String {
         return finalize(body);
     };
     redact_strings(&mut bundle);
+    // 요약은 redaction을 거친 값으로만 만든다(exe·argv_path·cgroup_path가 원문으로 나가지 않게).
+    if bundle.to_string().len() > MAX_OUTPUT_BYTES {
+        summarize_process_tree(&mut bundle);
+    }
     shrink_top(&mut bundle, MAX_OUTPUT_BYTES);
     // 직렬화한 텍스트에 redaction을 다시 돌리면 숫자가 가려져 JSON이 깨지므로 자르기만 한다.
     truncate(&bundle.to_string(), MAX_OUTPUT_BYTES)
+}
+
+/// 출력 상한을 넘는 번들에서 `observations.top.process_tree` 원문을 판정용 요약으로 바꾼다.
+/// 원문은 노드 1024개까지 와서 가장 큰 항목이 되고, 그대로 두면 `shrink_top`이 통째로
+/// 생략 표식으로 바꿔 트리를 하나도 볼 수 없게 된다.
+fn summarize_process_tree(bundle: &mut Value) {
+    let Some(tree) = bundle.pointer_mut("/observations/top/process_tree") else {
+        return;
+    };
+    if let Some(summary) = super::rca_process_tree::summarize(tree) {
+        *tree = summary;
+    }
 }
 
 /// 문자열 값과 키에만 redaction을 적용한다. 원문 텍스트에 돌리면 `kr_rrn`이 따옴표 없는
@@ -388,6 +409,94 @@ mod tests {
         let out = finalize_bundle(&body);
         assert!(out.len() <= MAX_OUTPUT_BYTES);
         assert_eq!(crate::agent::diagnose::kernel_findings(&out).len(), 1);
+    }
+
+    /// #74: 노드 1024개·종료 이력 256개(렌더 상한)인 트리는 생략 표식이 아니라 요약으로 남는다.
+    #[test]
+    fn full_process_tree_is_summarized_within_output_limit() {
+        let nodes: Vec<Value> = (1..=1024u64)
+            .map(|pid| {
+                json!({
+                    "pid": pid, "ppid": pid - 1, "fork_ppid": pid - 1,
+                    "start_boottime_ns": 1_000_000_000u64 * pid, "start_precision": "ns",
+                    "start_age_seconds": 100.0, "comm": "worker",
+                    "exe": "/usr/lib/jvm/java-21/bin/java", "exe_source": "proc_exe",
+                    "cgroup_id": 9123,
+                    "cgroup_path": "/kubepods.slice/kubepods-burstable.slice/cri-containerd-3f9c.scope",
+                    "state": "live", "source": "event", "proc_state": "S", "rss_bytes": pid * 4096,
+                    "in_window": {"forked": false, "execed": false, "exited": false},
+                    "window": {"cpu_ns": pid * 1000, "runq_wait_us": pid, "block_io_bytes": 0}
+                })
+            })
+            .collect();
+        let exited: Vec<Value> = (0..256u64)
+            .map(|i| {
+                json!({
+                    "seq": i, "pid": 5000 + i, "ppid": 1, "fork_ppid": 1,
+                    "start_boottime_ns": 7_000_000_000u64 + i, "comm": "sh", "exe": "/bin/sh",
+                    "cgroup_path": "/system.slice/cron.service", "in_window": true,
+                    "closed_by": "exit_event", "exit_age_seconds": i as f64, "lifetime_ms": 3,
+                    "exit_status": 1, "cpu_total_ns": 0, "total": {"runq_wait_us": 1}
+                })
+            })
+            .collect();
+        let body = bundle(json!({"process_tree": {
+            "available": true, "schema": "process_tree.v1", "loss_in_window": true,
+            "loss_keys": ["exited_overwritten"], "nodes_truncated": true,
+            "nodes": nodes, "exited": exited
+        }}));
+        assert!(body.len() > MAX_OUTPUT_BYTES);
+
+        let out = finalize_bundle(&body);
+        assert!(out.len() <= MAX_OUTPUT_BYTES, "{}", out.len());
+        assert_eq!(crate::agent::diagnose::kernel_findings(&out).len(), 1);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let tree = &v["observations"]["top"]["process_tree"];
+        assert!(tree.get(OMITTED_KEY).is_none(), "요약이 생략되면 안 된다");
+        assert!(
+            tree[crate::agent::rca_process_tree::SUMMARY_KEY]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert_eq!(tree["loss_in_window"], true);
+        assert_eq!(tree["exits_in_window"]["total"], 256);
+        assert_eq!(tree["top_nodes"]["cpu_ns"]["top"][0]["pid"], 1024);
+    }
+
+    /// 요약은 redaction을 거친 값으로 만든다.
+    #[test]
+    fn summary_is_built_from_redacted_values() {
+        let nodes: Vec<Value> = (1..=1024u64)
+            .map(|pid| {
+                json!({"pid": pid, "ppid": 0, "comm": "app",
+                       "exe": "/usr/lib/jvm/java-21/bin/java", "window": {"cpu_ns": pid}})
+            })
+            .collect();
+        let exited = vec![json!({
+            "pid": 9, "comm": "client", "in_window": true, "closed_by": "exit_event",
+            "argv_path": "redis://user:pass@cache:6379", "exit_status": 1
+        })];
+        let body = bundle(json!({"process_tree": {"nodes": nodes, "exited": exited}}));
+        assert!(body.len() > MAX_OUTPUT_BYTES, "요약 경로를 타야 한다");
+        let out = finalize_bundle(&body);
+        assert!(!out.contains("user:pass"), "원문 비밀값이 요약에 남았다");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["observations"]["top"]["process_tree"]["exits_in_window"]["records"][0]["argv_path"],
+            "[REDACTED:conn_string]"
+        );
+    }
+
+    /// 상한 안의 번들은 process_tree 원문을 그대로 둔다.
+    #[test]
+    fn small_process_tree_is_not_summarized() {
+        let body = bundle(json!({"process_tree": {"nodes": [{"pid": 1, "comm": "systemd"}]}}));
+        let v: Value = serde_json::from_str(&finalize_bundle(&body)).unwrap();
+        assert_eq!(
+            v["observations"]["top"]["process_tree"]["nodes"][0]["pid"],
+            1
+        );
     }
 
     #[test]
