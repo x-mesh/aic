@@ -254,8 +254,11 @@ impl RcaAgentClient {
             return Ok(finalize(&text));
         };
         redact_strings(&mut capture);
-        let summary = super::rca_blackbox::summarize(&capture, MAX_OUTPUT_BYTES).unwrap_or(capture);
-        Ok(truncate(&summary.to_string(), MAX_OUTPUT_BYTES))
+        // 요약은 상한 안의 유효한 JSON을 보장하므로 문자열을 자르지 않는다(자르면 JSON이 깨진다).
+        match super::rca_blackbox::summarize(&capture, MAX_OUTPUT_BYTES) {
+            Some(summary) => Ok(summary.to_string()),
+            None => Ok(finalize(&text)),
+        }
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<String, ToolError> {

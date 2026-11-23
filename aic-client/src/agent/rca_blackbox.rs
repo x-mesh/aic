@@ -165,39 +165,61 @@ fn frames(frames: &[Value]) -> Value {
 
 /// 프레임마다 있는 `{키: 수}` 객체를 키별로 더해, 0이 아닌 키를 큰 순으로 `limit`개 남긴다.
 fn sum_maps(frames: &[Value], key: &str, limit: usize) -> Value {
-    let mut totals: Map<String, Value> = Map::new();
-    let mut sums: Vec<(String, u64)> = Vec::new();
+    // fork storm에서는 종료 그룹 키가 많으므로 키마다 선형 탐색하지 않는다.
+    let mut sums: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
     for frame in frames {
         let Some(map) = frame.get(key).and_then(Value::as_object) else {
             continue;
         };
         for (k, v) in map {
-            let n = v.as_u64().unwrap_or(0);
-            match sums.iter_mut().find(|(name, _)| name == k) {
-                Some((_, total)) => *total += n,
-                None => sums.push((k.clone(), n)),
-            }
+            *sums.entry(k.as_str()).or_default() += v.as_u64().unwrap_or(0);
         }
     }
     let groups = sums.len();
-    sums.retain(|(_, n)| *n > 0);
-    sums.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    for (k, n) in sums.into_iter().take(limit) {
-        totals.insert(k, json!(n));
-    }
+    let mut ranked: Vec<(&str, u64)> = sums.into_iter().filter(|(_, n)| *n > 0).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let totals: Map<String, Value> = ranked
+        .into_iter()
+        .take(limit)
+        .map(|(k, n)| (k.to_string(), json!(n)))
+        .collect();
     json!({ "distinct": groups, "top": totals })
 }
 
-/// 직렬화 길이가 `max_bytes` 이하가 될 때까지 [`SHRINK_ORDER`] 순서로 생략 표식을 넣는다.
+/// 직렬화 길이가 `max_bytes` 이하가 되게 줄인다. 결과는 항상 유효한 JSON이다(호출부가 문자열을
+/// 자르지 않아도 된다).
+///
+/// 1. [`SHRINK_ORDER`] 순서로 하위 값을 생략 표식으로 바꾼다.
+/// 2. 그래도 넘으면 트리거를 뒤에서부터 줄인다(`cause` 등이 비정상적으로 클 때).
+/// 3. 그래도 넘으면 id·state·원래 크기만 남긴 최소 객체로 바꾼다.
 fn shrink(summary: &mut Value, max_bytes: usize) {
+    let fits = |v: &Value| v.to_string().len() <= max_bytes;
     for pointer in SHRINK_ORDER {
-        if summary.to_string().len() <= max_bytes {
+        if fits(summary) {
             return;
         }
         if let Some(target) = summary.pointer_mut(pointer) {
             let size = target.to_string().len();
             *target = json!({ OMITTED_KEY: size });
         }
+    }
+    while !fits(summary) {
+        let Some(triggers) = summary.get_mut("triggers").and_then(Value::as_array_mut) else {
+            break;
+        };
+        if triggers.pop().is_none() {
+            break;
+        }
+    }
+    if !fits(summary) {
+        let size = summary.to_string().len();
+        *summary = json!({
+            "id": summary.get("id").cloned().unwrap_or(Value::Null),
+            "state": summary.get("state").cloned().unwrap_or(Value::Null),
+            SUMMARY_KEY: summary.get(SUMMARY_KEY).cloned().unwrap_or(Value::Null),
+            OMITTED_KEY: size,
+            "note": "요약도 출력 상한을 넘어 생략했다. rca-agent의 GET /blackboxz/<id>를 직접 확인할 것",
+        });
     }
 }
 
@@ -319,6 +341,33 @@ mod tests {
         );
         assert_eq!(s["triggers"], c["triggers"]);
         assert_eq!(s["loss"], c["loss"]);
+    }
+
+    /// PR #79 L1·L3: 생략 순서를 다 써도 넘치면(트리거 cause가 비정상적으로 큰 경우) 트리거를
+    /// 줄이고, 그래도 넘치면 최소 객체로 바꾼다. 어느 단계에서도 결과는 상한 안의 유효한 JSON이다.
+    #[test]
+    fn oversized_triggers_still_yield_valid_json_within_limit() {
+        let mut c = capture();
+        let big = "x".repeat(4096);
+        c["triggers"] = Value::Array(
+            (0..40)
+                .map(|i| json!({"id": "crash_loop", "at": format!("t{i}"), "cause": {"comm": big}}))
+                .collect(),
+        );
+        for limit in [LIMIT, 8 * 1024, 512] {
+            let s = summarize(&c, limit).unwrap();
+            let text = s.to_string();
+            assert!(text.len() <= limit, "limit={limit} len={}", text.len());
+            serde_json::from_str::<Value>(&text).expect("유효한 JSON");
+            assert_eq!(s["id"], c["id"], "id는 끝까지 남는다");
+        }
+        let s = summarize(&c, 512).unwrap();
+        assert!(s[OMITTED_KEY].as_u64().unwrap() > 0, "최소 객체로 바뀐다");
+        let s = summarize(&c, 8 * 1024).unwrap();
+        assert!(
+            !s["triggers"].as_array().unwrap().is_empty(),
+            "트리거는 줄이되 남긴다"
+        );
     }
 
     #[test]

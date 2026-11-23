@@ -616,11 +616,13 @@ fn crash_loops<'a>(exits: &[&'a Value], summary: &'a [Value]) -> Vec<Value> {
             let group = records.get(&key).map(Vec::as_slice).unwrap_or_default();
             // 컨테이너는 그룹의 모든 종료가 같은 컨테이너일 때만 적는다. 재시작된 컨테이너는 id가
             // 바뀌므로, 섞여 있으면 하나를 골라 적지 않는다. 비교는 전체 id로 한다(짧은 id는 겹칠 수 있다).
+            // 요약이 기록보다 많이 셌으면 기록에 없는 종료의 컨테이너를 모르므로 적지 않는다.
             let mut containers = group.iter().map(|e| container(e));
             let first = containers.next().flatten();
             let place = match first {
                 Some((runtime, id))
-                    if containers.all(|c| c.as_ref() == Some(&(runtime, id.clone()))) =>
+                    if group.len() == count
+                        && containers.all(|c| c.as_ref() == Some(&(runtime, id.clone()))) =>
                 {
                     format!(", {runtime} 컨테이너 {}", short_id(&id))
                 }
@@ -1107,10 +1109,30 @@ mod tests {
             msg.contains("exit 1 ×30") && msg.contains("SIGKILL ×5"),
             "{msg}"
         );
+        // PR #79 L4: 기록 2건으로 35건 전체의 컨테이너를 단정하지 않는다.
         assert!(
-            msg.contains("docker 컨테이너"),
-            "컨테이너는 기록에서 찾는다: {msg}"
+            !msg.contains("컨테이너"),
+            "기록에 없는 종료의 컨테이너는 모른다: {msg}"
         );
+    }
+
+    /// 요약 수와 기록 수가 같으면(모든 종료가 기록에 있으면) 기록의 컨테이너를 적는다.
+    #[test]
+    fn exited_summary_keeps_container_when_records_cover_all_exits() {
+        let path = format!("/system.slice/docker-{HEX64}.scope");
+        let tree = json!({
+            "exited": [
+                exit(1, 100, json!({"exit_status": 1, "cgroup_path": path})),
+                exit(2, 100, json!({"exit_status": 1, "cgroup_path": path})),
+                exit(3, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            ],
+            "exited_summary": {"groups": [
+                {"fork_ppid": 100, "exe": "/usr/bin/java", "count": 3,
+                 "exit_status": {"1": 3}, "signal": {}, "reconcile": 0}
+            ]}
+        });
+        let msg = findings(&tree)[0]["message"].as_str().unwrap().to_string();
+        assert!(msg.contains("docker 컨테이너"), "{msg}");
     }
 
     /// 요약 그룹에도 부모·이름 규칙을 그대로 적용하고, 정상 종료(`codes_other` 포함)는 세지 않는다.
