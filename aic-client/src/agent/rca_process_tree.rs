@@ -479,7 +479,7 @@ pub(crate) fn findings(tree: &Value) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default();
-    out.extend(crash_loops(&exits));
+    out.extend(crash_loops(&exits, summary_groups(tree)));
     out.extend(signal_exits(&exits));
     if let Some(f) = d_state_finding(tree) {
         out.push(f);
@@ -517,11 +517,54 @@ fn outcome(exit: &Value) -> String {
     }
 }
 
+/// `exited_summary.groups`(창 안 모든 종료의 `(fork_ppid, exe|comm)` 집계). rca-agent는 창 안
+/// 종료가 `exited[]`에 실린 것보다 많을 때만 이 요약을 낸다. 모양:
+/// `{fork_ppid, exe?, comm?, count, exit_status: {"코드": 수}, signal: {"번호": 수}, reconcile,
+/// codes_other?}`이며, `exit_status`에는 0보다 큰 코드만 있다.
+fn summary_groups(tree: &Value) -> &[Value] {
+    tree.pointer("/exited_summary/groups")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// 크래시 루프 그룹 키: `(fork_ppid, exe 또는 comm)`.
+type GroupKey<'a> = (u64, &'a str);
+
+/// 요약 그룹의 비정상 종료 수와 결과 목록. `codes_other`는 정상 종료가 섞였을 수 있어 세지 않는다.
+fn summary_abnormal(group: &Value) -> (usize, Vec<String>) {
+    let mut count = 0usize;
+    let mut outcomes = Vec::new();
+    let codes = |key: &str| -> Vec<(u64, u64)> {
+        group
+            .get(key)
+            .and_then(Value::as_object)
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(code, n)| Some((code.parse().ok()?, n.as_u64()?)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (sig, n) in codes("signal") {
+        count += n as usize;
+        outcomes.push(format!("{} ×{n}", signal_name(sig)));
+    }
+    for (status, n) in codes("exit_status").into_iter().filter(|(s, _)| *s != 0) {
+        count += n as usize;
+        outcomes.push(format!("exit {status} ×{n}"));
+    }
+    (count, outcomes)
+}
+
 /// 같은 부모(`fork_ppid`)가 띄운 같은 실행 파일이 창 안에서 `CRASH_LOOP_MIN_EXITS`번 이상
 /// 비정상 종료했으면 크래시 루프다. `fork_ppid`나 이름이 없는 종료는 묶지 않는다: 값이 없다는
 /// 것은 "같은 부모·같은 프로그램"의 근거가 아니라, 서로 무관한 종료가 한 그룹으로 합쳐질 뿐이다.
-fn crash_loops(exits: &[&Value]) -> Vec<Value> {
-    let mut groups: HashMap<(u64, &str), Vec<&Value>> = HashMap::new();
+///
+/// `exited_summary`가 있으면 그 그룹의 횟수와 결과를 쓴다. `exited[]`는 최대 256건이라 그 밖의
+/// 종료를 놓치지만 요약은 창 안 종료를 모두 센다. 컨테이너는 같은 키의 종료 기록에서 찾는다.
+fn crash_loops<'a>(exits: &[&'a Value], summary: &'a [Value]) -> Vec<Value> {
+    let mut records: HashMap<GroupKey<'a>, Vec<&'a Value>> = HashMap::new();
     for exit in exits.iter().copied().filter(|e| abnormal(e)) {
         let (Some(ppid), Some(name)) = (
             exit.get("fork_ppid").and_then(Value::as_u64),
@@ -529,20 +572,39 @@ fn crash_loops(exits: &[&Value]) -> Vec<Value> {
         ) else {
             continue;
         };
-        groups.entry((ppid, name)).or_default().push(exit);
+        records.entry((ppid, name)).or_default().push(exit);
     }
-    let mut loops: Vec<((u64, &str), Vec<&Value>)> = groups
-        .into_iter()
-        .filter(|(_, v)| v.len() >= CRASH_LOOP_MIN_EXITS)
-        .collect();
-    loops.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
-    loops
-        .into_iter()
-        .take(MAX_FINDINGS_PER_KIND)
-        .map(|((ppid, name), group)| {
+    // 키 → (비정상 종료 수, 결과 목록). 요약이 있으면 요약 값이 기록 값을 대신한다.
+    let mut groups: HashMap<GroupKey<'a>, (usize, Vec<String>)> = records
+        .iter()
+        .map(|(key, group)| {
             let mut outcomes: Vec<String> = group.iter().map(|e| outcome(e)).collect();
             outcomes.sort();
             outcomes.dedup();
+            (*key, (group.len(), outcomes))
+        })
+        .collect();
+    for g in summary {
+        let (Some(ppid), Some(name)) = (g.get("fork_ppid").and_then(Value::as_u64), known_name(g))
+        else {
+            continue;
+        };
+        let (count, outcomes) = summary_abnormal(g);
+        if count > 0 {
+            groups.insert((ppid, name), (count, outcomes));
+        }
+    }
+    let mut loops: Vec<(GroupKey<'a>, (usize, Vec<String>))> = groups
+        .into_iter()
+        .filter(|(_, (count, _))| *count >= CRASH_LOOP_MIN_EXITS)
+        .collect();
+    loops.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(&b.0)));
+    loops
+        .into_iter()
+        .take(MAX_FINDINGS_PER_KIND)
+        .map(|(key, (count, outcomes))| {
+            let (ppid, name) = key;
+            let group = records.get(&key).map(Vec::as_slice).unwrap_or_default();
             // 컨테이너는 그룹의 모든 종료가 같은 컨테이너일 때만 적는다. 재시작된 컨테이너는 id가
             // 바뀌므로, 섞여 있으면 하나를 골라 적지 않는다. 비교는 전체 id로 한다(짧은 id는 겹칠 수 있다).
             let mut containers = group.iter().map(|e| container(e));
@@ -559,8 +621,7 @@ fn crash_loops(exits: &[&Value]) -> Vec<Value> {
                 "crash_loop",
                 true,
                 format!(
-                    "크래시 루프 의심: {name}(부모 pid {ppid}{place})가 창 안에서 {}번 비정상 종료({})",
-                    group.len(),
+                    "크래시 루프 의심: {name}(부모 pid {ppid}{place})가 창 안에서 {count}번 비정상 종료({})",
                     outcomes.join(", ")
                 ),
             )
@@ -1013,6 +1074,45 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!msg.contains("컨테이너"), "{msg}");
+    }
+
+    /// `exited[]`에는 2건뿐이어도 `exited_summary`가 창 안 전체를 세면 크래시 루프다.
+    #[test]
+    fn exited_summary_counts_exits_beyond_the_rendered_history() {
+        let path = format!("/system.slice/docker-{HEX64}.scope");
+        let tree = json!({
+            "exited": [
+                exit(1, 100, json!({"exit_status": 1, "cgroup_path": path})),
+                exit(2, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            ],
+            "exited_summary": {"basis": "all_exits_in_window", "exits_in_window": 40, "groups": [
+                {"fork_ppid": 100, "exe": "/usr/bin/java", "comm": "java", "count": 40,
+                 "exit_status": {"1": 30}, "signal": {"9": 5}, "reconcile": 5}
+            ]}
+        });
+        let fs = findings(&tree);
+        let msg = fs[0]["message"].as_str().unwrap();
+        assert_eq!(fs[0]["kind"], "crash_loop");
+        assert!(msg.contains("35번"), "reconcile은 세지 않는다: {msg}");
+        assert!(
+            msg.contains("exit 1 ×30") && msg.contains("SIGKILL ×5"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("docker 컨테이너"),
+            "컨테이너는 기록에서 찾는다: {msg}"
+        );
+    }
+
+    /// 요약 그룹에도 부모·이름 규칙을 그대로 적용하고, 정상 종료(`codes_other` 포함)는 세지 않는다.
+    #[test]
+    fn exited_summary_group_rules_match_records() {
+        let tree = json!({"exited_summary": {"groups": [
+            {"fork_ppid": 100, "count": 9, "exit_status": {"1": 9}, "signal": {}},
+            {"fork_ppid": 200, "exe": "/bin/ok", "count": 9, "exit_status": {}, "signal": {}, "codes_other": 9},
+            {"fork_ppid": 300, "exe": "/bin/two", "count": 2, "exit_status": {"2": 2}, "signal": {}}
+        ]}});
+        assert!(findings(&tree).is_empty());
     }
 
     #[test]
