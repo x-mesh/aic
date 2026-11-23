@@ -974,6 +974,14 @@ fn container_evidence(
         })
 }
 
+/// cgroup v2 경로(예: rca-agent process_tree의 `cgroup_path`)에서 컨테이너 런타임 이름과 id를
+/// 찾는다. workload 탐색과 같은 규칙을 쓰며, 런타임이 붙인 id나 이름이 있는 경우만 돌려준다.
+pub(crate) fn container_from_cgroup_path(path: &str) -> Option<(&'static str, String)> {
+    container_marker_from_cgroup(path)
+        .filter(|e| e.runtime.identifies_container())
+        .map(|e| (e.runtime.label(), e.key))
+}
+
 fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
     for line in text.lines() {
         let components = line.split('/').map(str::trim).collect::<Vec<_>>();

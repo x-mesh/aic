@@ -94,6 +94,8 @@ impl RcaAgentClient {
                      종료, kill_sender 원문 포함), reconcile_exits(시각·원인 미상, 개수와 age \
                      범위만), top_nodes(지표별 상위 노드와 조상 사슬, 지표 키가 없으면 측정 안 \
                      함), d_state. 각 목록의 total과 kept가 다르면 일부만 실린 것이다. \
+                     container는 cgroup_path에서 aic가 찾은 런타임과 짧은 id(12자)이며, 없으면 \
+                     컨테이너 밖이거나 런타임을 알아보지 못한 것이다. \
                      kill_sender.pid는 시그널을 생성한 실행 문맥이지 죽이기로 결정한 주체가 아니다. \
                      process_tree.aic_findings는 aic가 트리 원문에서 만든 판정이다(loss, \
                      crash_loop, signal_exit, d_state). SIGKILL 종료는 OOM이라고 단정하지 않으므로 \
@@ -494,6 +496,27 @@ mod tests {
         assert_eq!(tree["loss_in_window"], true);
         assert_eq!(tree["exits_in_window"]["total"], 256);
         assert_eq!(tree["top_nodes"]["cpu_ns"]["top"][0]["pid"], 1024);
+    }
+
+    /// 컨테이너 id(64자리 hex)는 redaction을 거친 뒤에도 요약에 남아야 한다.
+    #[test]
+    fn container_id_survives_redaction_into_summary() {
+        let hex = "3f9c0a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789ab";
+        let path = format!("/kubepods.slice/kubepods-burstable.slice/cri-containerd-{hex}.scope");
+        let nodes: Vec<Value> = (1..=1024u64)
+            .map(|pid| {
+                json!({"pid": pid, "ppid": 0, "comm": "app", "cgroup_path": path,
+                       "exe": "/usr/lib/jvm/java-21/bin/java", "window": {"cpu_ns": pid}})
+            })
+            .collect();
+        let body = bundle(json!({"process_tree": {"nodes": nodes}}));
+        assert!(body.len() > MAX_OUTPUT_BYTES, "요약 경로를 타야 한다");
+        let v: Value = serde_json::from_str(&finalize_bundle(&body)).unwrap();
+        let top = &v["observations"]["top"]["process_tree"]["top_nodes"]["cpu_ns"]["top"][0];
+        assert_eq!(
+            top["container"],
+            json!({"runtime": "containerd", "id": &hex[..12]})
+        );
     }
 
     /// 요약은 redaction을 거친 값으로 만든다.
