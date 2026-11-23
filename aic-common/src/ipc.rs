@@ -357,6 +357,29 @@ pub struct ExporterStatus {
     /// `None`이면 실패한 적이 없거나 이 필드를 모르는 구버전 aicd다.
     #[serde(default)]
     pub last_failure: Option<ExporterFailure>,
+    /// 로그 수집에서 버린 줄 수(aicd 기동 후 누적). 지금까지는 `aic.log.dropped` 게이지로 중앙에만
+    /// 보내서, severity 필터가 줄을 전부 버려도 호스트에서는 보이지 않았다(#30).
+    /// `None`이면 이 필드를 모르는 구버전 aicd다.
+    #[serde(default)]
+    pub log_dropped: Option<LogDropCounts>,
+}
+
+/// 로그 수집 단계에서 버린 줄 수의 사유별 내역. 단위는 줄이다(spool 유실은 배치 단위라
+/// [`ExporterStatus::spool_dropped`]에 따로 있다).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LogDropCounts {
+    /// `min_severity` 필터에 걸린 줄.
+    #[serde(default)]
+    pub severity: u64,
+    /// 초당 줄 수 상한(`max_lines_per_sec`)을 넘은 줄.
+    #[serde(default)]
+    pub rate_limit: u64,
+    /// 수집기 채널이 가득 차 버린 줄(journald).
+    #[serde(default)]
+    pub channel_full: u64,
+    /// collector가 배치를 영구 거부(4xx)해 버린 줄.
+    #[serde(default)]
+    pub rejected: u64,
 }
 
 /// 셀프업데이트 상태.
@@ -589,6 +612,24 @@ mod tests {
         assert_eq!(s.spool_dropped_age, 0);
         assert_eq!(s.spool_dropped_rejected, 0);
         assert_eq!(s.collector_dropped, 0);
+        assert_eq!(s.log_dropped, None, "구버전은 로그 드롭 내역을 모른다");
+    }
+
+    #[test]
+    fn exporter_status_roundtrips_log_drop_counts() {
+        let s = ExporterStatus {
+            enabled: true,
+            log_dropped: Some(LogDropCounts {
+                severity: 263,
+                rate_limit: 5,
+                channel_full: 1,
+                rejected: 2,
+            }),
+            ..Default::default()
+        };
+        let back: ExporterStatus =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

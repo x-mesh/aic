@@ -7,6 +7,11 @@
 ### Added
 
 - 중앙 서버가 호스트마다 자체 업데이트가 켜져 있는지 알 수 있다. host metrics를 보낼 때 resource 속성 `aic.self_update.enabled`(설정이 켜져 있고 확인 task가 살아 있으면 true), `aic.self_update.last_outcome`(마지막 확인 결과 한 줄), `aic.self_update.last_check_unix_secs`(마지막 확인 시각, Unix 초)를 함께 싣는다. 확인 시점을 경과 초로 보내면 값이 전송마다 바뀌어, resource 속성으로 시계열을 구분하는 수집기에서 같은 호스트의 시계열이 계속 새로 생기므로 절대 시각을 쓴다. 지금까지는 버전이 바뀌는지만 보였기 때문에, 자체 업데이트를 켜지 않은 호스트와 켰는데 업데이트에 실패하는 호스트를 중앙에서 구분할 수 없었다. 아직 확인하지 않았으면 뒤의 두 속성은 생략한다.
+- `aic status`에 로그 수집에서 버린 줄 수가 사유별로 나온다(severity 필터, 초당 상한, 채널 포화, 수신 거부). 지금까지는 `aic.log.dropped` 게이지로 중앙에만 보내서, 파일 로그가 severity 필터에 전부 걸려도 호스트에서는 알 수 없었다. 외부 소스가 기본 WARN을 따르는 상태에서 severity 드롭이 있으면 `aic config set aicd.logs.external_min_severity INFO`를 안내한다. `aic status --json`에는 exporter 상태 전체가 `exporter` 키로 들어간다.
+
+### Fixed
+
+- `aic config set`, `aic enroll` 등으로 설정을 저장해도 `[aicd.logs]`에 `min_severity = "INFO"`가 새로 기록되지 않는다. 이 값은 기본값과 같아 aicd가 "설정하지 않음"으로 처리하고 외부 소스에는 WARN을 적용하는데, 파일에는 INFO로 적혀 실제 동작과 달라 보였다. 동작은 바뀌지 않는다. 이미 파일에 있는 줄은 다음 저장 때 사라진다.
 
 ## [0.50.19] - 2026-10-15
 

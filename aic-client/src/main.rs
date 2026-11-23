@@ -6082,6 +6082,12 @@ async fn print_status_json(session: Option<&str>) {
             serde_json::to_value(&su).unwrap_or(serde_json::Value::Null),
         );
     }
+    if let Some(ex) = aic_client::agent_event::exporter_status_for_diagnosis().await {
+        obj.insert(
+            "exporter".into(),
+            serde_json::to_value(&ex).unwrap_or(serde_json::Value::Null),
+        );
+    }
     if let Some(rec) = aic_client::update::last_update_record() {
         obj.insert(
             "last_update".into(),
@@ -6299,6 +6305,57 @@ async fn print_status_once(session: Option<&str>) {
 
     print_unit_conflict_warning().await;
     print_self_update_status().await;
+    print_log_drop_status().await;
+}
+
+/// exporter의 로그 드롭 내역을 출력한다. exporter가 꺼져 있거나 aicd가 구버전이면 출력하지 않는다.
+async fn print_log_drop_status() {
+    let Some(status) = aic_client::agent_event::exporter_status_for_diagnosis().await else {
+        return;
+    };
+    if !status.enabled {
+        return;
+    }
+    let Some(counts) = status.log_dropped else {
+        return;
+    };
+    // 설정을 읽지 못하면 안내만 생략한다. 드롭 수는 aicd가 준 값이라 그대로 보여 준다.
+    let external_at_default = ConfigManager::load()
+        .map(|cfg| uses_default_external_severity(&cfg.aicd.logs))
+        .unwrap_or(false);
+    println!();
+    for line in log_drop_lines(&counts, external_at_default) {
+        println!("{line}");
+    }
+}
+
+/// 외부 소스에 소스별 기본값(`external_min_severity`)이 적용되고, 그 값이 기본 WARN 그대로인가.
+fn uses_default_external_severity(logs: &aic_common::AicdLogsConfig) -> bool {
+    logs.min_severity == aic_common::DEFAULT_LOG_MIN_SEVERITY
+        && logs.external_min_severity == aic_common::AicdLogsConfig::default().external_min_severity
+}
+
+/// `aic status`의 로그 드롭 절. 외부 소스가 기본 WARN을 따르는 상태에서 severity 드롭이 있으면
+/// 수준을 바꾸는 명령을 안내한다: 외부 소스는 `min_severity`가 아니라 `external_min_severity`를
+/// 따르므로(#30), `min_severity = "INFO"`를 써도 줄이 계속 버려진다.
+fn log_drop_lines(c: &aic_common::LogDropCounts, external_at_default: bool) -> Vec<String> {
+    let mut lines = vec!["  로그 수집 드롭 (aicd 기동 후 누적, 단위: 줄):".to_string()];
+    let total = c.severity + c.rate_limit + c.channel_full + c.rejected;
+    if total == 0 {
+        lines.push(format!("    {COL_DIM}없음{COL_RESET}"));
+        return lines;
+    }
+    lines.push(format!(
+        "    severity 필터 {} · 초당 상한 {} · 채널 포화 {} · 수신 거부 {}",
+        c.severity, c.rate_limit, c.channel_full, c.rejected
+    ));
+    if c.severity > 0 && external_at_default {
+        lines.push(format!(
+            "    {COL_DIM}journald·파일·컨테이너 로그는 external_min_severity(기본 WARN) 미만을 버립니다. \
+             INFO까지 보내려면: aic config set aicd.logs.external_min_severity INFO{COL_RESET}"
+        ));
+    }
+    lines
 }
 
 /// 셀프업데이트 상태를 aicd에 물어 출력한다.
@@ -7833,6 +7890,44 @@ fn default_config() -> AppConfig {
     }
 }
 
+const LOGS_TABLE_HEADER: &str = "[aicd.logs]";
+
+/// 설정 파일에 쓸 TOML을 만든다. `[aicd.logs] min_severity`가 기본값이면 그 줄을 쓰지 않는다.
+///
+/// aicd는 전역 값이 기본값(`INFO`)이면 "설정하지 않음"으로 보고, 외부 소스에는
+/// `external_min_severity`(기본 `WARN`)를 적용한다(#30). 그 줄이 파일에 있으면 사용자는 외부 소스도
+/// INFO로 수집된다고 읽는다. 키를 지워도 역직렬화하면 같은 기본값이 되므로 동작은 바뀌지 않는다.
+/// `skip_serializing_if`를 쓰지 않는 이유: `aic config get/set`이 직렬화한 값에서 경로를 찾으므로,
+/// 직렬화에서 빠지면 `aicd.logs.min_severity`를 읽고 쓸 수 없게 된다.
+fn render_config_toml(config: &AppConfig) -> anyhow::Result<String> {
+    let rendered = toml::to_string_pretty(config)?;
+    if config.aicd.logs.min_severity != aic_common::DEFAULT_LOG_MIN_SEVERITY {
+        return Ok(rendered);
+    }
+    let default_line = format!(
+        "min_severity = \"{}\"",
+        aic_common::DEFAULT_LOG_MIN_SEVERITY
+    );
+    let mut in_logs_table = false;
+    let mut out = String::with_capacity(rendered.len());
+    for line in rendered.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_logs_table = trimmed == LOGS_TABLE_HEADER;
+        } else if in_logs_table && trimmed == default_line {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // 줄 단위 제거라, 여러 줄 문자열 값 안의 줄이 헤더나 키처럼 보이면 값이 바뀔 수 있다. 다시 읽어
+    // 원래 설정과 다르면 제거하지 않은 원문을 쓴다(기본값 한 줄이 남을 뿐 설정은 보존된다).
+    match toml::from_str::<AppConfig>(&out) {
+        Ok(reparsed) if reparsed == *config => Ok(out),
+        _ => Ok(rendered),
+    }
+}
+
 fn save_config(config: &AppConfig) -> anyhow::Result<()> {
     let path = ConfigManager::config_path();
 
@@ -7841,7 +7936,7 @@ fn save_config(config: &AppConfig) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let toml_str = toml::to_string_pretty(config)?;
+    let toml_str = render_config_toml(config)?;
     let parent = path.parent().expect("config path has parent");
     let tmp = parent.join(format!(".config.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, toml_str)?;
@@ -11610,9 +11705,10 @@ fn print_command_block(title: &str, cmd: &str) {
 mod tests {
     use super::{
         apply_config_set, apply_provider_override, chat_run_command_enabled, hooks_to_regenerate,
-        is_destructive_command, list_sessions_from, parse_duration_arg, parse_session_capture_mode,
-        resolve_init_modes, resolve_provider, validate_bind, validate_config_toml, Cli, Commands,
-        ATTACH_SNIPPET, RESTART_HINT_AFTER_MS, UNIT_RESTART_WAIT_MS,
+        is_destructive_command, list_sessions_from, log_drop_lines, parse_duration_arg,
+        parse_session_capture_mode, render_config_toml, resolve_init_modes, resolve_provider,
+        uses_default_external_severity, validate_bind, validate_config_toml, Cli, Commands,
+        ATTACH_SNIPPET, LOGS_TABLE_HEADER, RESTART_HINT_AFTER_MS, UNIT_RESTART_WAIT_MS,
     };
     use aic_client::llm_dispatcher::LlmDispatcher;
     use aic_common::{
@@ -11940,6 +12036,127 @@ mod tests {
         // 여기서 지키는 것은 **오타 경로가 여전히 거부되는 것**이다.
         let err = apply_config_set(&mut cfg, "server.max_bufer_lines", "1000").unwrap_err();
         assert!(err.to_string().contains("없는 설정 경로"), "{err}");
+    }
+
+    fn logs_table_lines(rendered: &str) -> Vec<String> {
+        rendered
+            .lines()
+            .skip_while(|l| l.trim() != LOGS_TABLE_HEADER)
+            .skip(1)
+            .take_while(|l| !l.trim().starts_with('['))
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// #30: 기본값 `min_severity = "INFO"`를 파일에 쓰면, 외부 소스에는 WARN이 적용되는데도 파일만
+    /// 보면 INFO로 수집된다고 읽힌다.
+    #[test]
+    fn saved_config_omits_default_global_min_severity() {
+        let cfg = config_with_providers("openai", &["openai"]);
+        let rendered = render_config_toml(&cfg).unwrap();
+
+        let logs = logs_table_lines(&rendered);
+        assert!(!logs.is_empty(), "[aicd.logs] 테이블은 남는다:\n{rendered}");
+        assert!(
+            !logs.iter().any(|l| l.starts_with("min_severity")),
+            "{logs:?}"
+        );
+        assert!(logs.contains(&"external_min_severity = \"WARN\"".to_string()));
+        assert_eq!(toml::from_str::<AppConfig>(&rendered).unwrap(), cfg);
+    }
+
+    #[test]
+    fn saved_config_keeps_explicit_global_min_severity() {
+        let mut cfg = config_with_providers("openai", &["openai"]);
+        apply_config_set(&mut cfg, "aicd.logs.min_severity", "WARN").unwrap();
+        let rendered = render_config_toml(&cfg).unwrap();
+
+        assert!(logs_table_lines(&rendered).contains(&"min_severity = \"WARN\"".to_string()));
+        assert_eq!(toml::from_str::<AppConfig>(&rendered).unwrap(), cfg);
+    }
+
+    /// 서비스별 `min_severity = "INFO"`는 외부 소스를 INFO로 여는 우회 설정이라 지우면 안 된다.
+    #[test]
+    fn saved_config_keeps_service_override_min_severity() {
+        let mut cfg = config_with_providers("openai", &["openai"]);
+        cfg.aicd.logs.services.insert(
+            "syslog".to_string(),
+            aic_common::AicdLogServiceOverride {
+                min_severity: Some("INFO".to_string()),
+                ..Default::default()
+            },
+        );
+        let rendered = render_config_toml(&cfg).unwrap();
+
+        assert!(
+            rendered.contains("[aicd.logs.services.syslog]"),
+            "{rendered}"
+        );
+        let reparsed: AppConfig = toml::from_str(&rendered).unwrap();
+        assert_eq!(
+            reparsed.aicd.logs.services["syslog"]
+                .min_severity
+                .as_deref(),
+            Some("INFO")
+        );
+        assert_eq!(reparsed, cfg);
+    }
+
+    #[test]
+    fn log_drop_lines_show_counts_and_hint_external_severity() {
+        let counts = aic_common::LogDropCounts {
+            severity: 263,
+            rate_limit: 1,
+            ..Default::default()
+        };
+        let text = log_drop_lines(&counts, true).join("\n");
+        assert!(text.contains("severity 필터 263"), "{text}");
+        assert!(text.contains("초당 상한 1"), "{text}");
+        assert!(
+            text.contains("aic config set aicd.logs.external_min_severity INFO"),
+            "{text}"
+        );
+
+        let without_hint = log_drop_lines(&counts, false).join("\n");
+        assert!(
+            !without_hint.contains("external_min_severity"),
+            "{without_hint}"
+        );
+    }
+
+    #[test]
+    fn log_drop_lines_say_none_when_nothing_dropped() {
+        let text = log_drop_lines(&aic_common::LogDropCounts::default(), true).join("\n");
+        assert!(text.contains("없음"), "{text}");
+        assert!(!text.contains("severity 필터"), "{text}");
+    }
+
+    /// 안내는 외부 소스가 실제로 기본 WARN을 따를 때만 맞다.
+    #[test]
+    fn external_severity_hint_applies_only_with_default_levels() {
+        assert!(uses_default_external_severity(
+            &aic_common::AicdLogsConfig::default()
+        ));
+
+        let external_info = aic_common::AicdLogsConfig {
+            external_min_severity: "INFO".to_string(),
+            ..Default::default()
+        };
+        assert!(!uses_default_external_severity(&external_info));
+
+        let explicit_global = aic_common::AicdLogsConfig {
+            min_severity: "ERROR".to_string(),
+            ..Default::default()
+        };
+        assert!(!uses_default_external_severity(&explicit_global));
+    }
+
+    /// 파일에 쓰지 않아도 `aic config get/set`은 이 경로를 계속 다룬다.
+    #[test]
+    fn default_global_min_severity_is_still_addressable_by_config_set() {
+        let mut cfg = config_with_providers("openai", &["openai"]);
+        apply_config_set(&mut cfg, "aicd.logs.min_severity", "ERROR").unwrap();
+        assert_eq!(cfg.aicd.logs.min_severity, "ERROR");
     }
 
     #[test]
