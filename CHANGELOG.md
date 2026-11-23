@@ -11,6 +11,8 @@
 - rca-agent에서 `process_tree`를 켠 호스트에서도 `rca_agent_collect`와 `aic rca collect`가 프로세스 트리 정보를 보여 준다. 트리 원문은 수백 KB라 출력 상한(64 KiB)을 넘으면 통째로 생략됐는데, 이제 그 경우 원문 대신 요약을 싣는다. 요약에는 창 안 종료(종료 코드·시그널·`kill_sender`), 종료 시각을 모르는 reconcile 종료의 개수와 경과 시간(age) 범위, CPU·runqueue 대기·block I/O·RSS·네트워크별 상위 프로세스와 조상 사슬, D state 프로세스가 들어간다. `loss_in_window`·`tree_basis` 같은 신뢰도 표시는 원문 그대로 둔다. 상한 안에 들어가는 번들은 지금처럼 원문을 싣는다.
 - `aic diagnose --kernel`과 chat 진단이 rca-agent 프로세스 트리에서 판정을 낸다. 같은 부모가 띄운 같은 실행 파일이 창 안에서 3번 이상 비정상 종료하면 크래시 루프로, SIGSEGV·SIGABRT 같은 fault 시그널이나 코어 덤프로 끝난 프로세스는 warning으로, D state 프로세스가 5개 이상이면 warning으로 알린다. SIGKILL 종료는 OOM이라고 단정하지 않고 시그널 송신 문맥(`kill_sender`)만 적으며, 종료 시각을 모르는 reconcile 종료는 근거로 쓰지 않는다. 이벤트 손실(`loss_in_window`)이 있는 창은 그 사실을 먼저 알린다. 지금까지는 에이전트가 넘긴 카운터 변화만 finding이 됐다.
 - 프로세스 트리 요약의 종료 기록과 상위 프로세스에 컨테이너(`container: {runtime, id}`)가 붙는다. rca-agent는 `cgroup_path` 원문만 주므로, aic가 workload 탐색과 같은 규칙으로 docker·containerd(kubepods)·podman·lxc 경로에서 런타임과 짧은 id(12자)를 찾는다. 크래시 루프 판정은 그룹의 종료가 모두 같은 컨테이너일 때 그 컨테이너를 메시지에 적는다. CRI-O(`crio-<id>.scope`)는 아직 알아보지 못한다.
+- chat 도구 `rca_agent_blackbox(id)`가 rca-agent 프로세스 트리 블랙박스 고정본(`GET /blackboxz/<id>`)을 요약해 보여 준다. id는 `rca_agent_collect` 결과의 `process_tree.blackbox_refs[].id`다. 고정본은 장애 앞뒤 구간(기본 트리거 전 60초, 뒤 30초)을 담아 기본 4 MiB까지 커지므로, 트리거와 원인·구간·손실은 원문 그대로 두고 1초 프레임은 지표별 최댓값과 시각·카운터 합·종료 그룹 합으로, 트리거 시점과 끝 시점의 트리는 process_tree 요약으로 줄인다. 캡처 중(409)이거나 고정본이 없으면(404) 그 사실을 알린다.
+- 크래시 루프 판정이 `exited_summary`를 쓴다. 종료 이력은 최대 256건이라 fork storm처럼 종료가 많은 창에서는 같은 그룹의 종료 일부만 셌는데, rca-agent가 창 안 모든 종료를 묶어 낸 요약이 있으면 그 수로 판정한다.
 
 ### Fixed
 

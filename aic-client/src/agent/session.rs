@@ -1854,7 +1854,7 @@ impl AgentSession {
             }
         } else if matches!(
             call.name.as_str(),
-            "rca_agent_collect" | "rca_agent_features"
+            "rca_agent_collect" | "rca_agent_features" | "rca_agent_blackbox"
         ) {
             // rca-agent 커널 evidence pull: loopback 전용 read-only HTTP.
             match &self.rca_agent {

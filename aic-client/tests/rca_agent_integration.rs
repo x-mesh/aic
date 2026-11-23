@@ -194,3 +194,68 @@ async fn bundle_over_read_cap_is_an_error() {
     let err = client.collect(5).await.unwrap_err();
     assert!(err.message.contains("bytes"), "{}", err.message);
 }
+
+const BLACKBOX_ID: &str = "0123456789abcdef";
+
+/// 준비된 고정본은 요약으로 돌아오고, 문자열은 redaction을 거친다.
+#[tokio::test]
+async fn blackbox_ready_capture_is_summarized() {
+    let frames: Vec<serde_json::Value> = (0..90)
+        .map(|s| {
+            json!({"at": format!("t{s}"), "counters": {"exits": 1}, "live_nodes": 10,
+                         "system": {"procs_blocked": s % 7}})
+        })
+        .collect();
+    let capture = json!({
+        "schema": "process_tree_blackbox.v1", "id": BLACKBOX_ID, "state": "ready",
+        "triggers": [{"id": "fatal_signal", "at": "t60",
+                      "cause": {"comm": "app", "exe": "/srv/app", "signal": 11}}],
+        "range": {"start": "t0", "end": "t89", "pre": 60_000_000_000u64, "post": 30_000_000_000u64, "merged": false},
+        "frames": frames,
+        "exited": [{"pid": 7, "comm": "app", "closed_by": "exit_event", "exit_age_seconds": 1.0,
+                    "signal": 11, "argv_path": "redis://user:pass@cache:6379"}],
+        "snapshots": {"at_trigger": {"nodes": []}, "at_end": {"nodes": []}},
+        "loss": {"frames_missed": 0, "exited_overwritten_in_range": 0, "triggers_dropped": 0}
+    });
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/blackboxz/{BLACKBOX_ID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(capture))
+        .mount(&server)
+        .await;
+
+    let client = RcaAgentClient::new(&cfg(&server.uri())).unwrap().unwrap();
+    let out = client
+        .blackbox(BLACKBOX_ID)
+        .await
+        .expect("blackbox should succeed");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("유효한 JSON");
+    assert_eq!(v["triggers"][0]["id"], "fatal_signal");
+    assert_eq!(v["frames"]["count"], 90);
+    assert_eq!(v["frames"]["system_peaks"]["procs_blocked"]["max"], 6.0);
+    assert!(v.get("aic_summary_of_bytes").is_some());
+    assert!(!out.contains("user:pass"), "비밀값이 남았다");
+}
+
+#[tokio::test]
+async fn blackbox_capturing_and_missing_have_clear_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/blackboxz/{BLACKBOX_ID}")))
+        .respond_with(ResponseTemplate::new(409).set_body_string("capturing"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/blackboxz/fedcba9876543210"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+        .mount(&server)
+        .await;
+
+    let client = RcaAgentClient::new(&cfg(&server.uri())).unwrap().unwrap();
+    let err = client.blackbox(BLACKBOX_ID).await.unwrap_err();
+    assert!(err.message.contains("캡처 중"), "{}", err.message);
+    let err = client.blackbox("fedcba9876543210").await.unwrap_err();
+    assert!(err.message.contains("찾지 못했습니다"), "{}", err.message);
+    let err = client.blackbox("../healthz").await.unwrap_err();
+    assert!(err.message.contains("형식"), "{}", err.message);
+}
