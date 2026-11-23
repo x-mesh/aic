@@ -161,6 +161,31 @@ fn pick(record: &Value, fields: &[&str]) -> Value {
     Value::Object(picked)
 }
 
+/// 요약에 싣는 컨테이너 id 길이. docker CLI가 보여 주는 짧은 id와 같은 길이다.
+const SHORT_CONTAINER_ID: usize = 12;
+
+/// `cgroup_path`에서 찾은 컨테이너(전체 id). rca-agent는 경로 원문만 주고 해석은 aic가 맡는다(#74).
+/// 같은 컨테이너인지는 전체 id로 비교하고, 표시할 때만 [`short_id`]로 줄인다.
+fn container(record: &Value) -> Option<(&'static str, String)> {
+    let path = record.get("cgroup_path").and_then(Value::as_str)?;
+    crate::workload::container_from_cgroup_path(path)
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(SHORT_CONTAINER_ID).collect()
+}
+
+/// `pick`한 레코드에 `container: {runtime, id}`를 붙인다. 찾지 못하면 키를 넣지 않는다.
+fn with_container(mut picked: Value, record: &Value) -> Value {
+    if let (Value::Object(fields), Some((runtime, id))) = (&mut picked, container(record)) {
+        fields.insert(
+            "container".into(),
+            json!({ "runtime": runtime, "id": short_id(&id) }),
+        );
+    }
+    picked
+}
+
 fn age(record: &Value, key: &str) -> f64 {
     record.get(key).and_then(Value::as_f64).unwrap_or(f64::MAX)
 }
@@ -177,7 +202,7 @@ fn exits_in_window(exited: &[Value]) -> Value {
     let kept: Vec<Value> = events
         .into_iter()
         .take(MAX_EXITS)
-        .map(|e| pick(e, EXIT_FIELDS))
+        .map(|e| with_container(pick(e, EXIT_FIELDS), e))
         .collect();
     json!({ "total": total, "kept": kept.len(), "records": kept })
 }
@@ -296,7 +321,7 @@ fn label(node: &Value) -> String {
 }
 
 fn node_summary(node: &Value, index: &NodeIndex) -> Value {
-    let mut v = pick(node, NODE_ID_FIELDS);
+    let mut v = with_container(pick(node, NODE_ID_FIELDS), node);
     if let Value::Object(fields) = &mut v {
         fields.insert("chain".into(), json!(index.chain(node)));
     }
@@ -518,11 +543,23 @@ fn crash_loops(exits: &[&Value]) -> Vec<Value> {
             let mut outcomes: Vec<String> = group.iter().map(|e| outcome(e)).collect();
             outcomes.sort();
             outcomes.dedup();
+            // 컨테이너는 그룹의 모든 종료가 같은 컨테이너일 때만 적는다. 재시작된 컨테이너는 id가
+            // 바뀌므로, 섞여 있으면 하나를 골라 적지 않는다. 비교는 전체 id로 한다(짧은 id는 겹칠 수 있다).
+            let mut containers = group.iter().map(|e| container(e));
+            let first = containers.next().flatten();
+            let place = match first {
+                Some((runtime, id))
+                    if containers.all(|c| c.as_ref() == Some(&(runtime, id.clone()))) =>
+                {
+                    format!(", {runtime} 컨테이너 {}", short_id(&id))
+                }
+                _ => String::new(),
+            };
             finding(
                 "crash_loop",
                 true,
                 format!(
-                    "크래시 루프 의심: {name}(부모 pid {ppid})가 창 안에서 {}번 비정상 종료({})",
+                    "크래시 루프 의심: {name}(부모 pid {ppid}{place})가 창 안에서 {}번 비정상 종료({})",
                     group.len(),
                     outcomes.join(", ")
                 ),
@@ -892,6 +929,90 @@ mod tests {
         assert_eq!(range["min"], 2.0);
         assert_eq!(range["max"], 10.0 + (MAX_RECONCILE_EXITS + 3) as f64);
         assert_eq!(range["records_without_age"], 1);
+    }
+
+    const HEX64: &str = "3f9c0a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcdef0123456789ab";
+
+    #[test]
+    fn container_is_parsed_from_cgroup_path() {
+        let cases = [
+            (format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{HEX64}.scope"), Some("containerd")),
+            (format!("/system.slice/docker-{HEX64}.scope"), Some("docker")),
+            (format!("/machine.slice/libpod-{HEX64}.scope"), Some("podman")),
+            ("/system.slice/nginx.service".to_string(), None),
+            ("/init.scope".to_string(), None),
+        ];
+        for (path, runtime) in cases {
+            let got = container(&json!({ "cgroup_path": path }));
+            assert_eq!(got.as_ref().map(|(r, _)| *r), runtime, "{path}");
+            if let Some((_, id)) = got {
+                assert_eq!(id, HEX64, "비교용으로는 전체 id를 돌려준다");
+            }
+        }
+        assert!(
+            container(&json!({})).is_none(),
+            "cgroup_path가 없으면 찾지 않는다"
+        );
+    }
+
+    #[test]
+    fn exits_and_top_nodes_carry_container() {
+        let path = format!("/system.slice/docker-{HEX64}.scope");
+        let tree = json!({
+            "nodes": [{"pid": 5, "ppid": 0, "comm": "app", "cgroup_path": path, "window": {"cpu_ns": 10}},
+                      {"pid": 6, "ppid": 0, "comm": "host", "cgroup_path": "/system.slice/sshd.service", "window": {"cpu_ns": 5}}],
+            "exited": [exit(7, 1, json!({"cgroup_path": path, "exit_status": 1}))]
+        });
+        let s = summarize(&tree).unwrap();
+        let expect = json!({"runtime": "docker", "id": &HEX64[..SHORT_CONTAINER_ID]});
+        assert_eq!(s["exits_in_window"]["records"][0]["container"], expect);
+        let top = &s["top_nodes"]["cpu_ns"]["top"];
+        assert_eq!(top[0]["container"], expect);
+        assert!(
+            top[1].get("container").is_none(),
+            "컨테이너가 아니면 키를 넣지 않는다"
+        );
+    }
+
+    #[test]
+    fn crash_loop_names_the_container_only_when_shared() {
+        let path = format!("/system.slice/docker-{HEX64}.scope");
+        let same = json!({"exited": [
+            exit(1, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            exit(2, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            exit(3, 100, json!({"exit_status": 1, "cgroup_path": path})),
+        ]});
+        let msg = findings(&same)[0]["message"].as_str().unwrap().to_string();
+        assert!(
+            msg.contains(&format!("docker 컨테이너 {}", &HEX64[..SHORT_CONTAINER_ID])),
+            "{msg}"
+        );
+
+        let other = format!("/system.slice/docker-{}.scope", "a".repeat(64));
+        let mixed = json!({"exited": [
+            exit(1, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            exit(2, 100, json!({"exit_status": 1, "cgroup_path": other})),
+            exit(3, 100, json!({"exit_status": 1})),
+        ]});
+        let msg = findings(&mixed)[0]["message"].as_str().unwrap().to_string();
+        assert!(!msg.contains("컨테이너"), "{msg}");
+
+        // PR #78 L1: 짧은 id(12자)가 같아도 전체 id가 다르면 다른 컨테이너다.
+        let same_prefix = format!(
+            "/system.slice/docker-{}{}.scope",
+            &HEX64[..SHORT_CONTAINER_ID],
+            "b".repeat(64 - SHORT_CONTAINER_ID)
+        );
+        let prefix_clash = json!({"exited": [
+            exit(1, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            exit(2, 100, json!({"exit_status": 1, "cgroup_path": path})),
+            exit(3, 100, json!({"exit_status": 1, "cgroup_path": same_prefix})),
+        ]});
+        let msg = findings(&prefix_clash)[0]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!msg.contains("컨테이너"), "{msg}");
     }
 
     #[test]
