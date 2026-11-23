@@ -9,6 +9,7 @@
 - 중앙 서버가 호스트마다 자체 업데이트가 켜져 있는지 알 수 있다. host metrics를 보낼 때 resource 속성 `aic.self_update.enabled`(설정이 켜져 있고 확인 task가 살아 있으면 true), `aic.self_update.last_outcome`(마지막 확인 결과 한 줄), `aic.self_update.last_check_unix_secs`(마지막 확인 시각, Unix 초)를 함께 싣는다. 확인 시점을 경과 초로 보내면 값이 전송마다 바뀌어, resource 속성으로 시계열을 구분하는 수집기에서 같은 호스트의 시계열이 계속 새로 생기므로 절대 시각을 쓴다. 지금까지는 버전이 바뀌는지만 보였기 때문에, 자체 업데이트를 켜지 않은 호스트와 켰는데 업데이트에 실패하는 호스트를 중앙에서 구분할 수 없었다. 아직 확인하지 않았으면 뒤의 두 속성은 생략한다.
 - `aic status`에 로그 수집에서 버린 줄 수가 사유별로 나온다(severity 필터, 초당 상한, 채널 포화, 수신 거부). 지금까지는 `aic.log.dropped` 게이지로 중앙에만 보내서, 파일 로그가 severity 필터에 전부 걸려도 호스트에서는 알 수 없었다. 외부 소스가 기본 WARN을 따르는 상태에서 severity 드롭이 있으면 `aic config set aicd.logs.external_min_severity INFO`를 안내한다. `aic status --json`에는 exporter 상태 전체가 `exporter` 키로 들어간다.
 - rca-agent에서 `process_tree`를 켠 호스트에서도 `rca_agent_collect`와 `aic rca collect`가 프로세스 트리 정보를 보여 준다. 트리 원문은 수백 KB라 출력 상한(64 KiB)을 넘으면 통째로 생략됐는데, 이제 그 경우 원문 대신 요약을 싣는다. 요약에는 창 안 종료(종료 코드·시그널·`kill_sender`), 종료 시각을 모르는 reconcile 종료의 개수와 시각 범위, CPU·runqueue 대기·block I/O·RSS·네트워크별 상위 프로세스와 조상 사슬, D state 프로세스가 들어간다. `loss_in_window`·`tree_basis` 같은 신뢰도 표시는 원문 그대로 둔다. 상한 안에 들어가는 번들은 지금처럼 원문을 싣는다.
+- `aic diagnose --kernel`과 chat 진단이 rca-agent 프로세스 트리에서 판정을 낸다. 같은 부모가 띄운 같은 실행 파일이 창 안에서 3번 이상 비정상 종료하면 크래시 루프로, SIGSEGV·SIGABRT 같은 fault 시그널이나 코어 덤프로 끝난 프로세스는 warning으로, D state 프로세스가 5개 이상이면 warning으로 알린다. SIGKILL 종료는 OOM이라고 단정하지 않고 시그널 송신 문맥(`kill_sender`)만 적으며, 종료 시각을 모르는 reconcile 종료는 근거로 쓰지 않는다. 이벤트 손실(`loss_in_window`)이 있는 창은 그 사실을 먼저 알린다. 지금까지는 에이전트가 넘긴 카운터 변화만 finding이 됐다.
 
 ### Fixed
 

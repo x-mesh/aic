@@ -185,13 +185,12 @@ pub(crate) fn kernel_findings(bundle_json: &str) -> Vec<Finding> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(bundle_json) else {
         return Vec::new();
     };
-    let Some(items) = v
+    let items: &[serde_json::Value] = v
         .get("observations")
         .and_then(|o| o.get("findings"))
         .and_then(serde_json::Value::as_array)
-    else {
-        return Vec::new();
-    };
+        .map(Vec::as_slice)
+        .unwrap_or_default();
 
     let mut out = Vec::new();
     for it in items {
@@ -237,7 +236,42 @@ pub(crate) fn kernel_findings(bundle_json: &str) -> Vec<Finding> {
             suggested_followup: None,
         });
     }
+    out.extend(process_tree_findings(&v));
     out
+}
+
+/// `finalize_bundle`이 트리 원문에서 만들어 둔 `process_tree.aic_findings`를 finding으로 옮긴다.
+///
+/// 판정은 aic가 했지만 근거는 외부 에이전트가 넘긴 값이고 귀속을 증명하지 않으므로,
+/// 에이전트 finding과 같이 `External`·`Medium`으로 둔다. `warning`만 Warn이고 Crit으로는
+/// 올리지 않는다.
+fn process_tree_findings(bundle: &serde_json::Value) -> Vec<Finding> {
+    let Some(items) = bundle
+        .pointer("/observations/top/process_tree")
+        .and_then(|t| t.get(super::rca_process_tree::FINDINGS_KEY))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|it| {
+            let kind = it.get("kind").and_then(serde_json::Value::as_str)?;
+            let message = it.get("message").and_then(serde_json::Value::as_str)?;
+            let severity = match it.get("severity").and_then(serde_json::Value::as_str) {
+                Some("warning") => Severity::Warn,
+                _ => Severity::Normal,
+            };
+            Some(Finding {
+                severity,
+                confidence: Confidence::Medium,
+                source: SourceQuality::External,
+                probe_id: KERNEL_SECTION.to_string(),
+                message: format!("kernel/process_tree.{kind}: {message}"),
+                suggested_followup: None,
+            })
+        })
+        .collect()
 }
 
 /// 커널 evidence가 들어가는 섹션 이름 — finding의 `probe_id`이자 evidence 헤더다.

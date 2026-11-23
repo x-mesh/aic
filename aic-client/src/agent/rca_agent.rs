@@ -94,7 +94,10 @@ impl RcaAgentClient {
                      종료, kill_sender 원문 포함), reconcile_exits(시각·원인 미상, 개수와 age \
                      범위만), top_nodes(지표별 상위 노드와 조상 사슬, 지표 키가 없으면 측정 안 \
                      함), d_state. 각 목록의 total과 kept가 다르면 일부만 실린 것이다. \
-                     kill_sender.pid는 시그널을 생성한 실행 문맥이지 죽이기로 결정한 주체가 아니다.",
+                     kill_sender.pid는 시그널을 생성한 실행 문맥이지 죽이기로 결정한 주체가 아니다. \
+                     process_tree.aic_findings는 aic가 트리 원문에서 만든 판정이다(loss, \
+                     crash_loop, signal_exit, d_state). SIGKILL 종료는 OOM이라고 단정하지 않으므로 \
+                     oom 신호와 맞춰 본다.",
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -204,13 +207,33 @@ pub(crate) fn finalize_bundle(body: &str) -> String {
         return finalize(body);
     };
     redact_strings(&mut bundle);
-    // 요약은 redaction을 거친 값으로만 만든다(exe·argv_path·cgroup_path가 원문으로 나가지 않게).
+    // 판정과 요약은 redaction을 거친 값으로만 만든다(exe·argv_path·cgroup_path가 원문으로 나가지 않게).
+    // 판정은 트리 원문이 필요하므로 요약보다 먼저 만든다.
+    attach_process_tree_findings(&mut bundle);
     if bundle.to_string().len() > MAX_OUTPUT_BYTES {
         summarize_process_tree(&mut bundle);
     }
     shrink_top(&mut bundle, MAX_OUTPUT_BYTES);
     // 직렬화한 텍스트에 redaction을 다시 돌리면 숫자가 가려져 JSON이 깨지므로 자르기만 한다.
     truncate(&bundle.to_string(), MAX_OUTPUT_BYTES)
+}
+
+/// 트리 원문에서 만든 판정을 `process_tree.aic_findings`에 싣는다. 판정이 없으면 키를 넣지 않는다.
+fn attach_process_tree_findings(bundle: &mut Value) {
+    const TREE: &str = "/observations/top/process_tree";
+    let findings = match bundle.pointer(TREE) {
+        Some(tree) => super::rca_process_tree::findings(tree),
+        None => return,
+    };
+    if findings.is_empty() {
+        return;
+    }
+    if let Some(tree) = bundle.pointer_mut(TREE).and_then(Value::as_object_mut) {
+        tree.insert(
+            super::rca_process_tree::FINDINGS_KEY.into(),
+            Value::Array(findings),
+        );
+    }
 }
 
 /// 출력 상한을 넘는 번들에서 `observations.top.process_tree` 원문을 판정용 요약으로 바꾼다.
@@ -449,7 +472,16 @@ mod tests {
 
         let out = finalize_bundle(&body);
         assert!(out.len() <= MAX_OUTPUT_BYTES, "{}", out.len());
-        assert_eq!(crate::agent::diagnose::kernel_findings(&out).len(), 1);
+        // 에이전트 finding(oom) 1건에, 원문 트리에서 만든 손실·크래시 루프 판정이 요약을 거쳐 남는다.
+        let messages: Vec<String> = crate::agent::diagnose::kernel_findings(&out)
+            .into_iter()
+            .map(|f| f.message)
+            .collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(messages[0].starts_with("kernel/oom"));
+        assert!(messages[1].starts_with("kernel/process_tree.loss"));
+        assert!(messages[2].starts_with("kernel/process_tree.crash_loop"));
+        assert!(messages[2].contains("256번"), "{}", messages[2]);
         let v: Value = serde_json::from_str(&out).unwrap();
         let tree = &v["observations"]["top"]["process_tree"];
         assert!(tree.get(OMITTED_KEY).is_none(), "요약이 생략되면 안 된다");

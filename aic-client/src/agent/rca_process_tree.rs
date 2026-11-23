@@ -51,6 +51,7 @@ const PASSTHROUGH_FIELDS: &[&str] = &[
     "render_scope",
     "exited_summary",
     "blackbox_refs",
+    FINDINGS_KEY,
 ];
 
 /// 종료 레코드에서 남기는 필드. `kill_sender`·`total`처럼 객체인 값도 그대로 둔다.
@@ -352,6 +353,233 @@ fn d_state(nodes: &[Value], index: &NodeIndex) -> Value {
     json!({ "total": matched.len(), "kept": kept.len(), "nodes": kept })
 }
 
+// ── 판정(finding) ─────────────────────────────────────────────
+
+/// 트리 원문에서 만든 판정을 싣는 키. 요약으로 바뀌어도 그대로 남는다.
+pub(crate) const FINDINGS_KEY: &str = "aic_findings";
+/// 같은 부모·실행 파일이 창 안에서 이 횟수 이상 비정상 종료하면 크래시 루프로 본다.
+/// rca-agent 블랙박스의 crash_loop 느린 경로(10분 안 3회)와 같은 횟수다.
+const CRASH_LOOP_MIN_EXITS: usize = 3;
+/// D state 노드가 이 수 이상이면 warning으로 올린다. 그보다 적으면 참고로만 싣는다.
+const D_STATE_WARN_NODES: usize = 5;
+/// 종류마다 싣는 판정 수 상한.
+const MAX_FINDINGS_PER_KIND: usize = 5;
+/// 판정 메시지에 이름을 나열하는 최대 수.
+const MAX_NAMES_IN_MESSAGE: usize = 3;
+
+/// 프로세스 자신의 오류로 나는 시그널. 이 시그널로 끝났으면 프로그램 결함이나 메모리 오류다.
+const FAULT_SIGNALS: &[(u64, &str)] = &[
+    (4, "SIGILL"),
+    (6, "SIGABRT"),
+    (7, "SIGBUS"),
+    (8, "SIGFPE"),
+    (11, "SIGSEGV"),
+];
+const SIGKILL: u64 = 9;
+
+fn signal_name(sig: u64) -> String {
+    match sig {
+        SIGKILL => "SIGKILL".to_string(),
+        15 => "SIGTERM".to_string(),
+        _ => FAULT_SIGNALS
+            .iter()
+            .find(|(n, _)| *n == sig)
+            .map(|(_, name)| (*name).to_string())
+            .unwrap_or_else(|| format!("signal {sig}")),
+    }
+}
+
+fn finding(kind: &str, warning: bool, message: String) -> Value {
+    json!({
+        "kind": kind,
+        "severity": if warning { "warning" } else { "info" },
+        "message": message,
+    })
+}
+
+/// 트리 원문에서 판정을 만든다. 순수 함수이며 원문(`nodes`·`exited`)이 있어야 한다.
+///
+/// 보수적으로 판정한다:
+/// - `closed_by:"reconcile"` 종료는 시각·원인을 모르므로 근거로 쓰지 않는다.
+/// - SIGKILL만으로 OOM이라고 하지 않는다(OOM은 oom 신호와 맞춰 봐야 한다). `kill_sender`가
+///   있으면 `si_code_name`과 송신 문맥을 그대로 적는다.
+/// - `loss_in_window`이면 손실을 먼저 알린다. 그 창에서는 "없었다"는 판단을 믿을 수 없다.
+pub(crate) fn findings(tree: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if tree.get("loss_in_window").and_then(Value::as_bool) == Some(true) {
+        let keys: Vec<&str> = tree
+            .get("loss_keys")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        out.push(finding(
+            "loss",
+            false,
+            format!(
+                "프로세스 트리 이벤트 일부 손실({}). 이 창의 종료 이력과 부재 판단은 불완전할 수 있음",
+                keys.join(", ")
+            ),
+        ));
+    }
+    let exits: Vec<&Value> = tree
+        .get("exited")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|e| e.get("in_window").and_then(Value::as_bool) == Some(true))
+                .filter(|e| e.get("closed_by").and_then(Value::as_str) == Some("exit_event"))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.extend(crash_loops(&exits));
+    out.extend(signal_exits(&exits));
+    if let Some(f) = d_state_finding(tree) {
+        out.push(f);
+    }
+    out
+}
+
+fn abnormal(exit: &Value) -> bool {
+    exit.get("signal").and_then(Value::as_u64).is_some()
+        || exit
+            .get("exit_status")
+            .and_then(Value::as_u64)
+            .is_some_and(|s| s != 0)
+}
+
+fn process_name(exit: &Value) -> &str {
+    exit.get("exe")
+        .and_then(Value::as_str)
+        .or_else(|| exit.get("comm").and_then(Value::as_str))
+        .unwrap_or("?")
+}
+
+fn outcome(exit: &Value) -> String {
+    match (
+        exit.get("signal").and_then(Value::as_u64),
+        exit.get("exit_status").and_then(Value::as_u64),
+    ) {
+        (Some(sig), _) => signal_name(sig),
+        (None, Some(status)) => format!("exit {status}"),
+        _ => "?".to_string(),
+    }
+}
+
+/// 같은 부모(`fork_ppid`)가 띄운 같은 실행 파일이 창 안에서 `CRASH_LOOP_MIN_EXITS`번 이상
+/// 비정상 종료했으면 크래시 루프다.
+fn crash_loops(exits: &[&Value]) -> Vec<Value> {
+    let mut groups: HashMap<(u64, &str), Vec<&Value>> = HashMap::new();
+    for exit in exits.iter().copied().filter(|e| abnormal(e)) {
+        let ppid = exit.get("fork_ppid").and_then(Value::as_u64).unwrap_or(0);
+        groups
+            .entry((ppid, process_name(exit)))
+            .or_default()
+            .push(exit);
+    }
+    let mut loops: Vec<((u64, &str), Vec<&Value>)> = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() >= CRASH_LOOP_MIN_EXITS)
+        .collect();
+    loops.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    loops
+        .into_iter()
+        .take(MAX_FINDINGS_PER_KIND)
+        .map(|((ppid, name), group)| {
+            let mut outcomes: Vec<String> = group.iter().map(|e| outcome(e)).collect();
+            outcomes.sort();
+            outcomes.dedup();
+            finding(
+                "crash_loop",
+                true,
+                format!(
+                    "크래시 루프 의심: {name}(부모 pid {ppid})가 창 안에서 {}번 비정상 종료({})",
+                    group.len(),
+                    outcomes.join(", ")
+                ),
+            )
+        })
+        .collect()
+}
+
+/// fault 시그널·코어 덤프·SIGKILL로 끝난 개별 종료. fault와 코어 덤프는 warning, SIGKILL은
+/// 원인을 단정할 수 없어 info로 싣는다.
+fn signal_exits(exits: &[&Value]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for exit in exits {
+        let Some(sig) = exit.get("signal").and_then(Value::as_u64) else {
+            continue;
+        };
+        let core = exit.get("core_dumped").and_then(Value::as_bool) == Some(true);
+        let fault = FAULT_SIGNALS.iter().any(|(n, _)| *n == sig);
+        if !fault && !core && sig != SIGKILL {
+            continue;
+        }
+        let pid = exit.get("pid").and_then(Value::as_u64).unwrap_or(0);
+        let mut message = format!(
+            "{}({pid})가 {}로 종료{}",
+            process_name(exit),
+            signal_name(sig),
+            if core { ", 코어 덤프" } else { "" }
+        );
+        if let Some(sender) = exit.get("kill_sender") {
+            let code = sender
+                .get("si_code_name")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let comm = sender.get("comm").and_then(Value::as_str).unwrap_or("?");
+            let same = sender.get("same_process").and_then(Value::as_bool) == Some(true);
+            message.push_str(&format!(
+                " (시그널 생성 문맥: {}, {code})",
+                if same {
+                    "자기 자신".to_string()
+                } else {
+                    comm.to_string()
+                }
+            ));
+        } else if sig == SIGKILL {
+            message.push_str(" (송신 정보 없음. OOM 여부는 oom 신호와 맞춰 볼 것)");
+        }
+        out.push(finding("signal_exit", fault || core, message));
+        if out.len() >= MAX_FINDINGS_PER_KIND {
+            break;
+        }
+    }
+    out
+}
+
+fn d_state_finding(tree: &Value) -> Option<Value> {
+    let names: Vec<String> = tree
+        .get("nodes")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|n| n.get("proc_state").and_then(Value::as_str) == Some("D"))
+        .map(label)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = names
+        .iter()
+        .take(MAX_NAMES_IN_MESSAGE)
+        .map(String::as_str)
+        .collect();
+    let more = names.len().saturating_sub(shown.len());
+    Some(finding(
+        "d_state",
+        names.len() >= D_STATE_WARN_NODES,
+        format!(
+            "D state(I/O 대기 등 중단 불가) 프로세스 {}개: {}{}",
+            names.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(" 외 {more}개")
+            } else {
+                String::new()
+            }
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +736,125 @@ mod tests {
         assert_eq!(s["top_nodes"], json!({}));
         assert_eq!(s["d_state"]["total"], 0);
         assert_eq!(s["exits_in_window"]["records"][0]["exit_status"], 7);
+    }
+
+    fn exit(pid: u64, ppid: u64, extra: Value) -> Value {
+        let mut e = json!({"pid": pid, "fork_ppid": ppid, "comm": "java",
+                           "exe": "/usr/bin/java", "in_window": true, "closed_by": "exit_event"});
+        if let (Value::Object(base), Value::Object(more)) = (&mut e, extra) {
+            base.extend(more);
+        }
+        e
+    }
+
+    fn kinds(fs: &[Value]) -> Vec<(&str, &str)> {
+        fs.iter()
+            .map(|f| (f["kind"].as_str().unwrap(), f["severity"].as_str().unwrap()))
+            .collect()
+    }
+
+    /// 문서 예시: SIGKILL 1건(kill_sender SI_USER)과 D state 1개. 둘 다 원인을 단정하지 않는 info다.
+    #[test]
+    fn doc_example_yields_info_findings_only() {
+        let fs = findings(&doc_example());
+        assert_eq!(
+            kinds(&fs),
+            vec![("signal_exit", "info"), ("d_state", "info")]
+        );
+        let msg = fs[0]["message"].as_str().unwrap();
+        assert!(msg.contains("SIGKILL") && msg.contains("SI_USER"), "{msg}");
+        assert!(msg.contains("containerd-shim"), "{msg}");
+    }
+
+    #[test]
+    fn repeated_abnormal_exits_from_same_parent_are_a_crash_loop() {
+        let tree = json!({"exited": [
+            exit(1, 100, json!({"exit_status": 1})),
+            exit(2, 100, json!({"exit_status": 1})),
+            exit(3, 100, json!({"signal": 15})),
+            // 정상 종료, 다른 부모, reconcile, 창 밖 종료는 세지 않는다.
+            exit(4, 100, json!({"exit_status": 0})),
+            exit(5, 200, json!({"exit_status": 1})),
+            exit(6, 100, json!({"closed_by": "reconcile"})),
+            exit(7, 100, json!({"exit_status": 1, "in_window": false})),
+        ]});
+        let fs = findings(&tree);
+        assert_eq!(kinds(&fs), vec![("crash_loop", "warning")]);
+        let msg = fs[0]["message"].as_str().unwrap();
+        assert!(msg.contains("3번"), "{msg}");
+        assert!(msg.contains("exit 1") && msg.contains("SIGTERM"), "{msg}");
+    }
+
+    #[test]
+    fn two_abnormal_exits_are_not_a_crash_loop() {
+        let tree = json!({"exited": [
+            exit(1, 100, json!({"exit_status": 1})),
+            exit(2, 100, json!({"exit_status": 1})),
+        ]});
+        assert!(findings(&tree).is_empty());
+    }
+
+    #[test]
+    fn fault_signal_and_core_dump_are_warnings() {
+        let tree = json!({"exited": [
+            exit(1, 100, json!({"signal": 11,
+                "kill_sender": {"si_code_name": "SEGV_MAPERR", "same_process": true, "comm": "java"}})),
+            exit(2, 200, json!({"signal": 3, "core_dumped": true})),
+            // SIGTERM 단독 종료는 개별 판정을 내지 않는다.
+            exit(3, 300, json!({"signal": 15})),
+        ]});
+        let fs = findings(&tree);
+        assert_eq!(
+            kinds(&fs),
+            vec![("signal_exit", "warning"), ("signal_exit", "warning")]
+        );
+        let msg = fs[0]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("SIGSEGV") && msg.contains("자기 자신"),
+            "{msg}"
+        );
+        assert!(fs[1]["message"].as_str().unwrap().contains("코어 덤프"));
+    }
+
+    #[test]
+    fn sigkill_without_sender_does_not_claim_oom() {
+        let tree = json!({"exited": [exit(1, 100, json!({"signal": 9}))]});
+        let fs = findings(&tree);
+        assert_eq!(kinds(&fs), vec![("signal_exit", "info")]);
+        assert!(fs[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("oom 신호와 맞춰"));
+    }
+
+    #[test]
+    fn loss_is_reported_first() {
+        let tree =
+            json!({"loss_in_window": true, "loss_keys": ["ringbuf_drops_exit"], "exited": []});
+        let fs = findings(&tree);
+        assert_eq!(kinds(&fs), vec![("loss", "info")]);
+        assert!(fs[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ringbuf_drops_exit"));
+    }
+
+    #[test]
+    fn many_d_state_nodes_are_a_warning() {
+        let nodes: Vec<Value> = (1..=D_STATE_WARN_NODES as u64)
+            .map(|pid| json!({"pid": pid, "comm": "kworker", "proc_state": "D"}))
+            .collect();
+        let fs = findings(&json!({"nodes": nodes}));
+        assert_eq!(kinds(&fs), vec![("d_state", "warning")]);
+        assert!(fs[0]["message"].as_str().unwrap().contains("외 2개"));
+    }
+
+    #[test]
+    fn findings_survive_summary() {
+        let mut tree = doc_example();
+        let fs = findings(&tree);
+        tree[FINDINGS_KEY] = Value::Array(fs.clone());
+        assert_eq!(summarize(&tree).unwrap()[FINDINGS_KEY], Value::Array(fs));
     }
 
     #[test]
