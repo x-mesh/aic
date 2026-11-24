@@ -99,6 +99,7 @@ struct FileIdentity {
 enum ContainerRuntime {
     Docker,
     Containerd,
+    CriO,
     Podman,
     Lxc,
     PidNamespace,
@@ -111,6 +112,7 @@ impl ContainerRuntime {
         match self {
             Self::Docker => "docker",
             Self::Containerd => "containerd",
+            Self::CriO => "cri-o",
             Self::Podman => "podman",
             Self::Lxc => "lxc",
             Self::PidNamespace => "pidns",
@@ -124,7 +126,7 @@ impl ContainerRuntime {
     fn identifies_container(self) -> bool {
         matches!(
             self,
-            Self::Docker | Self::Containerd | Self::Podman | Self::Lxc
+            Self::Docker | Self::Containerd | Self::CriO | Self::Podman | Self::Lxc
         )
     }
 }
@@ -990,6 +992,8 @@ fn container_marker_from_cgroup(text: &str) -> Option<ContainerEvidence> {
             for (prefix, suffix, runtime) in [
                 ("docker-", ".scope", ContainerRuntime::Docker),
                 ("cri-containerd-", ".scope", ContainerRuntime::Containerd),
+                // CRI-O 컨테이너. 같은 pod의 감시 프로세스는 `crio-conmon-<id>.scope`라 hex 검사에서 빠진다.
+                ("crio-", ".scope", ContainerRuntime::CriO),
                 ("libpod-", ".scope", ContainerRuntime::Podman),
             ] {
                 if let Some(id) = component
@@ -2581,6 +2585,10 @@ mod tests {
                 ContainerRuntime::Podman,
             ),
             (
+                format!("0::/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/crio-{id}.scope"),
+                ContainerRuntime::CriO,
+            ),
+            (
                 format!("0::/kubepods.slice/{id}"),
                 ContainerRuntime::Containerd,
             ),
@@ -2592,6 +2600,11 @@ mod tests {
         let lxc = container_marker_from_cgroup("0::/lxc/web1").unwrap();
         assert_eq!(lxc.runtime, ContainerRuntime::Lxc);
         assert_eq!(lxc.key, "web1");
+        // CRI-O의 conmon(컨테이너 감시 프로세스)은 컨테이너가 아니다.
+        assert!(container_marker_from_cgroup(&format!(
+            "0::/kubepods.slice/kubepods-burstable.slice/crio-conmon-{id}.scope"
+        ))
+        .is_none());
     }
 
     #[test]

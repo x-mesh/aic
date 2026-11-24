@@ -1011,6 +1011,10 @@ mod tests {
             (format!("/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod1a2b.slice/cri-containerd-{HEX64}.scope"), Some("containerd")),
             (format!("/system.slice/docker-{HEX64}.scope"), Some("docker")),
             (format!("/machine.slice/libpod-{HEX64}.scope"), Some("podman")),
+            (
+                format!("/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod9.slice/crio-{HEX64}.scope"),
+                Some("cri-o"),
+            ),
             ("/system.slice/nginx.service".to_string(), None),
             ("/init.scope".to_string(), None),
         ];
